@@ -164,14 +164,19 @@ type Config struct {
 	// style (a typo in a container-warmth knob must not silently change runtime
 	// behavior). It is always positive after Load.
 	WarmContainerIdleTimeout time.Duration
-	// SourceMount is the optional SOURCE_MOUNT value (default false): whether
-	// the app source tree is bind-mounted into execution containers instead of
-	// being copied/baked into the runtime image. It is a plain boolean and is
-	// parsed with strconv.ParseBool's accepted forms (see ParseBool); an
-	// unparseable value is a returned configuration error naming the variable
-	// rather than being silently coerced. It is consumed by the runtime layer;
-	// this package only resolves and validates it.
-	SourceMount bool
+	// HotReload is the optional HOT_RELOAD value (default false): whether a
+	// runtime whose dependency layout permits it (Python and Node) builds a
+	// source-independent app image and bind-mounts the app's live source tree
+	// read-only into execution and entrypoint-service containers, instead of
+	// baking the source into the image. It is the public trigger for Relay's
+	// internal source-mount mechanism. It is a plain boolean and is parsed with
+	// strconv.ParseBool's accepted forms (see ParseBool); an unparseable value
+	// is a returned configuration error naming HOT_RELOAD rather than being
+	// silently coerced. It is consumed by the runtime layer; this package only
+	// resolves and validates it. False (the default) preserves the historical
+	// baked-source behavior exactly. SOURCE_MOUNT is deliberately NOT read (and
+	// not aliased): it is not a Relay configuration variable.
+	HotReload bool
 }
 
 // Default max-concurrency, max-build-concurrency, and max-buffered-events
@@ -363,11 +368,11 @@ func Load(logger *slog.Logger) (Config, error) {
 	}
 	cfg.WarmContainerIdleTimeout = warmTimeout
 
-	sourceMount, err := loadBool("SOURCE_MOUNT", getEnv("SOURCE_MOUNT", "false"))
+	hotReload, err := loadBool("HOT_RELOAD", getEnv("HOT_RELOAD", "false"))
 	if err != nil {
 		return Config{}, err
 	}
-	cfg.SourceMount = sourceMount
+	cfg.HotReload = hotReload
 
 	return cfg, nil
 }

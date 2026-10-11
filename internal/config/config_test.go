@@ -1026,26 +1026,26 @@ func TestLoadInvalidMaxEventBytesReturnsError(t *testing.T) {
 	}
 }
 
-// TestLoadSourceMountDefault pins that SOURCE_MOUNT is opt-out by default: the
+// TestLoadHotReloadDefault pins that HOT_RELOAD is opt-out by default: the
 // variable truly UNSET and an explicitly EMPTY value both resolve to false.
-func TestLoadSourceMountDefault(t *testing.T) {
+func TestLoadHotReloadDefault(t *testing.T) {
 	setRequiredEnv(t)
 
-	t.Setenv("SOURCE_MOUNT", "")
-	os.Unsetenv("SOURCE_MOUNT")
-	if cfg := mustLoad(t); cfg.SourceMount {
-		t.Fatalf("SourceMount = true, want false when unset")
+	t.Setenv("HOT_RELOAD", "")
+	os.Unsetenv("HOT_RELOAD")
+	if cfg := mustLoad(t); cfg.HotReload {
+		t.Fatalf("HotReload = true, want false when unset")
 	}
 
-	t.Setenv("SOURCE_MOUNT", "")
-	if cfg := mustLoad(t); cfg.SourceMount {
-		t.Fatalf("SourceMount = true, want false when empty")
+	t.Setenv("HOT_RELOAD", "")
+	if cfg := mustLoad(t); cfg.HotReload {
+		t.Fatalf("HotReload = true, want false when empty")
 	}
 }
 
-// TestLoadSourceMountExplicit pins that SOURCE_MOUNT resolves through Load for
+// TestLoadHotReloadExplicit pins that HOT_RELOAD resolves through Load for
 // every strconv.ParseBool accepted form, including the compose-style "1".
-func TestLoadSourceMountExplicit(t *testing.T) {
+func TestLoadHotReloadExplicit(t *testing.T) {
 	tests := []struct {
 		value string
 		want  bool
@@ -1066,10 +1066,35 @@ func TestLoadSourceMountExplicit(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.value, func(t *testing.T) {
 			setRequiredEnv(t)
-			t.Setenv("SOURCE_MOUNT", tt.value)
+			t.Setenv("HOT_RELOAD", tt.value)
 			cfg := mustLoad(t)
-			if cfg.SourceMount != tt.want {
-				t.Fatalf("SourceMount = %v, want %v for %q", cfg.SourceMount, tt.want, tt.value)
+			if cfg.HotReload != tt.want {
+				t.Fatalf("HotReload = %v, want %v for %q", cfg.HotReload, tt.want, tt.value)
+			}
+		})
+	}
+}
+
+// TestLoadIgnoresSourceMount pins that SOURCE_MOUNT is NOT a config knob: the
+// renamed public option is HOT_RELOAD. A SOURCE_MOUNT value — valid boolean or
+// not — is never read, so it can neither enable hot reload nor fail startup.
+func TestLoadIgnoresSourceMount(t *testing.T) {
+	for _, value := range []string{"1", "true", "0", "false", "yes", "on"} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("SOURCE_MOUNT", value)
+			os.Unsetenv("HOT_RELOAD")
+
+			logger, buf := testLogger()
+			cfg, err := Load(logger)
+			if err != nil {
+				t.Fatalf("Load returned error for SOURCE_MOUNT=%q; want it ignored: %v", value, err)
+			}
+			if cfg.HotReload {
+				t.Fatalf("HotReload = true for SOURCE_MOUNT=%q; want SOURCE_MOUNT ignored", value)
+			}
+			if buf.Len() != 0 {
+				t.Fatalf("Load logged %q for SOURCE_MOUNT=%q; want it ignored silently", buf.String(), value)
 			}
 		})
 	}
@@ -1100,12 +1125,12 @@ func TestParseBool(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ParseBool("SOURCE_MOUNT", tt.value)
+			got, err := ParseBool("HOT_RELOAD", tt.value)
 			if tt.wantError {
 				if err == nil {
 					t.Fatalf("ParseBool(%q) = %v, nil; want error", tt.value, got)
 				}
-				if !strings.Contains(err.Error(), "SOURCE_MOUNT") {
+				if !strings.Contains(err.Error(), "HOT_RELOAD") {
 					t.Fatalf("error should name the variable: %v", err)
 				}
 				return
@@ -1120,21 +1145,21 @@ func TestParseBool(t *testing.T) {
 	}
 }
 
-// TestLoadInvalidSourceMountReturnsError pins the invalid SOURCE_MOUNT contract:
+// TestLoadInvalidHotReloadReturnsError pins the invalid HOT_RELOAD contract:
 // Load RETURNS an error naming the variable and its boolean requirement, and
 // logs nothing, so a typo fails startup instead of silently coercing.
-func TestLoadInvalidSourceMountReturnsError(t *testing.T) {
+func TestLoadInvalidHotReloadReturnsError(t *testing.T) {
 	for _, value := range []string{"yes", "2", "-1", "on", "off"} {
 		t.Run(value, func(t *testing.T) {
 			setRequiredEnv(t)
-			t.Setenv("SOURCE_MOUNT", value)
+			t.Setenv("HOT_RELOAD", value)
 
 			logger, buf := testLogger()
 			_, err := Load(logger)
 			if err == nil {
-				t.Fatalf("Load returned nil error for invalid SOURCE_MOUNT=%q; want an error", value)
+				t.Fatalf("Load returned nil error for invalid HOT_RELOAD=%q; want an error", value)
 			}
-			for _, want := range []string{"SOURCE_MOUNT", "boolean"} {
+			for _, want := range []string{"HOT_RELOAD", "boolean"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Fatalf("error %q does not mention %q", err, want)
 				}

@@ -512,11 +512,13 @@ func Run(logger *slog.Logger) error {
 				// preflight step before any app is prepared or any container
 				// created.
 				runtime.WithNetworks(cfg.Networks),
-				// SOURCE_MOUNT: bind-mount the live app source read-only for a
-				// runtime whose dependency layout permits it, instead of baking
-				// it into the image. Startup configuration; a change requires a
-				// worker restart.
-				runtime.WithSourceMount(cfg.SourceMount),
+				// HOT_RELOAD: bind-mount the live app source read-only for a
+				// runtime whose dependency layout permits it (Python and Node),
+				// instead of baking it into the image, so a source-only edit
+				// takes effect without rebuilding. It is the public trigger for
+				// the runtime's internal source-mount mechanism. Startup
+				// configuration; a change requires a worker restart.
+				runtime.WithSourceMount(cfg.HotReload),
 				// Root Dockerfile builds in the WORKER LIFECYCLE (ctx), not the
 				// startup-span context: they get an independent 10m bound
 				// (runtime.buildTimeout) but are still cancelled when Relay shuts

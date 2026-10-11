@@ -74,12 +74,13 @@ const (
 	// per container.
 	labelNetworks = "relay.networks"
 
-	// labelSource pins the source fingerprint a SOURCE_MOUNT service container's
+	// labelSource pins the source fingerprint a HOT_RELOAD service container's
 	// live read-only bind mount corresponds to. It is stamped only for a managed
 	// entrypoint service whose runtime permits source mounting; the reconciler
 	// compares it against the freshly resolved source fingerprint so a source-only
 	// edit — which never changes the (source-independent) image reference —
-	// replaces the running container instead of leaving stale code. It is omitted
+	// restarts the running container in place (or replaces it where in-place
+	// restart is unavailable) instead of leaving stale code. It is omitted
 	// for every other container, so a container carries it only when it actually
 	// has a source mount.
 	labelSource = "relay.source"

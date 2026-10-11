@@ -213,7 +213,7 @@ type Manager struct {
 	// pullMu.
 	pullMu     sync.Mutex
 	pullChecks map[string]time.Time
-	// sourceMount is the worker-global SOURCE_MOUNT switch: when true, a runtime
+	// sourceMount is the worker-global HOT_RELOAD switch: when true, a runtime
 	// whose dependency layout permits it (plan.Spec.MountableSource) builds a
 	// source-independent app image and bind-mounts the app's live /apps source
 	// read-only at runtime instead of baking it. It is set once at construction
@@ -228,7 +228,7 @@ type Manager struct {
 	mountMu sync.RWMutex
 	mounts  map[string]SourceMount
 	// selfMounts caches the lazy resolution of Relay's OWN container's mounts,
-	// used to translate a SOURCE_MOUNT app path into the path the Docker daemon
+	// used to translate a HOT_RELOAD app path into the path the Docker daemon
 	// actually sees when Relay is itself a container (see daemonSourcePath). A
 	// zero value resolves on first use.
 	selfMounts containerMounts
@@ -348,7 +348,7 @@ type managerOptions struct {
 	// explicitly with StartMaintenance once its own prerequisites (the worker's
 	// NETWORKS verification) hold. False preserves the historical eager start.
 	deferredMaintenance bool
-	// sourceMount is the worker-global SOURCE_MOUNT switch (WithSourceMount).
+	// sourceMount is the worker-global HOT_RELOAD switch (WithSourceMount).
 	// False preserves the historical baked-source behavior.
 	sourceMount bool
 }
@@ -427,12 +427,12 @@ func WithLifecycleContext(lifecycle context.Context) ManagerOption {
 	return func(o *managerOptions) { o.lifecycle = lifecycle }
 }
 
-// WithSourceMount enables or disables SOURCE_MOUNT for this worker: when true,
+// WithSourceMount enables or disables HOT_RELOAD for this worker: when true,
 // a runtime whose dependency layout permits it (plan.Spec.MountableSource, i.e.
 // Python and Node) builds a source-independent app image and bind-mounts the
 // app's live /apps source read-only into its execution and entrypoint-service
 // containers instead of baking it. The worker wires config's resolved
-// SOURCE_MOUNT value; a direct NewManager caller that omits it gets the
+// HOT_RELOAD value; a direct NewManager caller that omits it gets the
 // historical baked-source behavior (false). It is startup configuration:
 // changing it requires a worker restart.
 func WithSourceMount(enabled bool) ManagerOption {
@@ -1179,7 +1179,7 @@ func (m *Manager) prepare(
 		return nil, fmt.Errorf("app %q: %w", fn.Name, err)
 	}
 
-	// mountSource is the SOURCE_MOUNT decision for THIS app: enabled globally and
+	// mountSource is the HOT_RELOAD decision for THIS app: enabled globally and
 	// permitted by the runtime's dependency layout. It is resolved BEFORE Plan so
 	// the engine can shape a source-mounted image (Node persists its pinned
 	// esbuild for runtime TypeScript transpilation instead of baking generated
@@ -1272,7 +1272,7 @@ func (m *Manager) prepare(
 
 	// The app image reference. For the historical baked-source image it embeds
 	// the source fingerprint, so every source version is a distinct image. Under
-	// SOURCE_MOUNT the live source is bind-mounted instead of baked, so the tag
+	// HOT_RELOAD the live source is bind-mounted instead of baked, so the tag
 	// is derived from the non-source inputs (runtime, dependency, bootstrap) and
 	// a source-only change reuses the same image; the reconciler advances the
 	// warm/service generation from the source fingerprint instead (see
@@ -1451,14 +1451,14 @@ func (m *Manager) prepare(
 	// buildCtx. Only a real build is spanned; a reuse probe (above) is not.
 	_, buildSpan := startRuntimeSpan(ctx, "runtime.build", fn.Name, image)
 	// The managed-image relay.fingerprint label. For a baked-source image it is
-	// the source fingerprint the tag embeds. For a SOURCE_MOUNT image it is
+	// the source fingerprint the tag embeds. For a HOT_RELOAD image it is
 	// deliberately EMPTY: the image is source-independent, and Execute derives
 	// the warm generation identity from Prepared.Fingerprint (the live source
 	// fingerprint) by falling back to it when no label is present. Stamping the
 	// build-time fingerprint would freeze the generation identity at build time
 	// and a later source-only change would not recycle the warm containers.
 	// The managed-image relay.fingerprint label. For a baked-source image it is
-	// the source fingerprint the tag embeds. For a SOURCE_MOUNT image it is
+	// the source fingerprint the tag embeds. For a HOT_RELOAD image it is
 	// deliberately EMPTY: the image is source-independent, and Execute derives
 	// the warm generation identity from Prepared.Fingerprint (the live source
 	// fingerprint) by falling back to it when no label is present. Stamping the

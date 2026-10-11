@@ -82,10 +82,11 @@ type ServiceSpec struct {
 	// verification surfaces as a create error rather than a chaos fix-up.
 	Networks []string
 	// SourceMount, when non-nil, is the app's live read-only source mount
-	// (SOURCE_MOUNT). It is set only for an entrypoint service whose runtime
+	// (HOT_RELOAD). It is set only for an entrypoint service whose runtime
 	// permits it; an external `image` service never receives one. Its Identity is
-	// stamped as relay.source so the reconciler can replace the container on a
-	// source-only change.
+	// stamped as relay.source so the reconciler can detect a source-only change
+	// and restart the container in place (or, where in-place restart is
+	// unavailable, replace it).
 	SourceMount *SourceMount
 }
 
@@ -133,12 +134,13 @@ type ServiceContainer struct {
 	// before the label existed). The service reconciler compares it to the
 	// desired set to detect a network change.
 	Networks string
-	// SourceID is the source fingerprint a SOURCE_MOUNT container's live
+	// SourceID is the source fingerprint a HOT_RELOAD container's live
 	// read-only bind mount corresponds to, parsed from relay.source. It is "" for
 	// a container with no source mount (including every container created before
-	// SOURCE_MOUNT, and every external-image service). The service reconciler
-	// compares it to the desired fingerprint to replace a container whose mounted
-	// source has changed under an unchanged image reference.
+	// HOT_RELOAD, and every external-image service). The service reconciler
+	// compares it to the desired fingerprint to detect a container whose mounted
+	// source has changed under an unchanged image reference and restart it in
+	// place (or replace it where in-place restart is unavailable).
 	SourceID string
 	// Labels is the container's FULL label set (nil-safe; nil when the
 	// container has none). The service reconciler compares routing metadata
@@ -506,7 +508,7 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		// ENTRYPOINT/CMD.
 		cfg.Entrypoint = spec.Entry
 	}
-	// A SOURCE_MOUNT entrypoint service runs with the app's source root as its
+	// A HOT_RELOAD entrypoint service runs with the app's source root as its
 	// working directory (Node's /app/src), matching the pooled runtime so
 	// process.cwd() and relative paths see the app root. Empty preserves the
 	// image WORKDIR (/app) exactly.
@@ -524,9 +526,9 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		// be created while the generation it replaces is still running.
 		Name: serviceContainerNameForStart(spec.App, spec.Name, replica),
 	}
-	// A SOURCE_MOUNT entrypoint service mounts its live source read-only; an
+	// A HOT_RELOAD entrypoint service mounts its live source read-only; an
 	// external `image` service never does, so its HostConfig is byte-for-byte the
-	// pre-SOURCE_MOUNT shape.
+	// pre-HOT_RELOAD shape.
 	if mounts := bindMounts(spec.SourceMount); len(mounts) > 0 {
 		createOps.HostConfig.Mounts = mounts
 	}
@@ -592,6 +594,35 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		"container", id,
 	)
 	return id, nil
+}
+
+// RestartServiceContainer restarts ONE persistent service container IN PLACE:
+// Docker stops and starts the SAME container (same ID, same Config, same bind
+// mounts) rather than creating a replacement. It is how a source-only change is
+// applied under HOT_RELOAD: the live read-only source bind is re-read by the
+// fresh process, so the managed service runs the edited code while retaining its
+// container identity.
+//
+// It returns only after Docker confirms the restarted container is RUNNING,
+// mirroring StartService's running gate: a container that stops but fails to come
+// back (e.g. the edited source crashes on boot) is reported as an error rather
+// than treated as reloaded, so the reconciler can fall back to its normal crash
+// replacement instead of recording a phantom reload. A restart is not free of a
+// brief stop/start window; callers use it only for a source-only change, where a
+// replacement is unnecessary because the image and configuration are unchanged.
+func (m *Manager) RestartServiceContainer(ctx context.Context, containerID string) error {
+	if _, err := m.cli.ContainerRestart(ctx, containerID, client.ContainerRestartOptions{}); err != nil {
+		return fmt.Errorf("service: restart container: %w", err)
+	}
+	insp, err := m.cli.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+	if err != nil {
+		return fmt.Errorf("service: inspect restarted container: %w", err)
+	}
+	if insp.Container.State == nil || !insp.Container.State.Running {
+		return fmt.Errorf("service: restarted container is not running")
+	}
+	m.log.Info("Service: restarted", "container", containerID)
+	return nil
 }
 
 // ServiceContainerList discovers every service container on the daemon. The
@@ -809,7 +840,7 @@ func validateServiceEntrypoint(entrypoint string) error {
 }
 
 // serviceEntryForSourceMount rewrites a service entry override so it addresses
-// the app's live source at the SOURCE_MOUNT target instead of the baked image
+// the app's live source at the HOT_RELOAD target instead of the baked image
 // workdir, and preloads the runtime's shared resolve hook where one exists.
 // A node entry is `node /app/<entrypoint>`; when the mount places the source
 // elsewhere (Node mounts at /app/src so node_modules stays visible) the path

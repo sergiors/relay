@@ -132,7 +132,7 @@ func startExecutionContainer(
 	mounts ...mount.Mount,
 ) (*executionContainer, error) {
 	hostConfig := hardenedHostConfig(true, limits)
-	// A SOURCE_MOUNT app mounts its live source read-only at the engine workdir
+	// A HOT_RELOAD app mounts its live source read-only at the engine workdir
 	// (managed by the caller). An empty list is the historical no-mount shape.
 	if len(mounts) > 0 {
 		hostConfig.Mounts = mounts
@@ -141,7 +141,7 @@ func startExecutionContainer(
 		Config: &container.Config{
 			Image: image,
 			Env:   env,
-			// workDir is the SOURCE_MOUNT app root (Node's /app/src) so
+			// workDir is the HOT_RELOAD app root (Node's /app/src) so
 			// process.cwd() and relative filesystem operations see the app's
 			// source; empty preserves the image WORKDIR (/app) exactly.
 			WorkingDir: workDir,
@@ -163,7 +163,7 @@ func startExecutionContainer(
 		// running. The read-only rootfs, dropped caps, bounded /tmp tmpfs, and
 		// non-root user baked into the image are identical to the one-shot
 		// containers; only the memory/CPU/pids limits follow the app's
-		// effective resource configuration. The optional SOURCE_MOUNT bind is
+		// effective resource configuration. The optional HOT_RELOAD bind is
 		// read-only and adds no writable surface.
 		HostConfig: hostConfig,
 	}

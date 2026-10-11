@@ -1,10 +1,10 @@
-// Relay's Node.js ESM/CJS resolve hook for SOURCE_MOUNT.
+// Relay's Node.js ESM/CJS resolve hook for HOT_RELOAD.
 //
 // This module is the ONE shared implementation of the bare-specifier
 // re-anchoring that keeps a source-mounted container's dependency image
 // authoritative. The Node engine writes it into the image at
-// /relay/resolve-hook.mjs (only for a SOURCE_MOUNT image; a baked image never
-// receives it) and it is consumed two ways:
+// /relay/resolve-hook.mjs (only for a source-mounted (HOT_RELOAD) image; a baked
+// image never receives it) and it is consumed two ways:
 //
 //   - the pooled invocation bootstrap (bootstrap.mjs) dynamically imports it
 //     when it runs in source-mount mode, so a handler's bare imports resolve

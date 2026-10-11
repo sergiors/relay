@@ -28,7 +28,7 @@ services:
 
       - LOG_LEVEL=DEBUG
 
-      - SOURCE_MOUNT=1
+      - HOT_RELOAD=1
 
     volumes:
       - ./examples/apps:/apps:ro

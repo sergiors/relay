@@ -108,6 +108,18 @@ type Docker interface {
 	NetworkExists(ctx context.Context, network string) (bool, error)
 }
 
+// ServiceRestarter is the optional in-place restart capability of a Docker
+// implementation. The production runtime Manager implements it; the service
+// reconciler type-asserts the configured Docker for it, so a Docker that does
+// not (a minimal fake, or an older implementation) silently keeps the
+// historical replace-on-source-change behavior. It restarts the SAME container
+// (same ID, same Config, same bind mounts), which is what lets a HOT_RELOAD
+// source-only change retain the running container's identity while the live
+// read-only source bind is re-read by the fresh process.
+type ServiceRestarter interface {
+	RestartServiceContainer(ctx context.Context, containerID string) error
+}
+
 // SecretResolver resolves a secret reference to its value. It is a structural
 // alias for secrets.Provider so the Worker can pass its shared provider without
 // a new concrete type.
@@ -188,6 +200,94 @@ func reconcileAuthorityFrom(ctx context.Context) func() bool {
 	return current
 }
 
+// sourceApplyTracker records, per service container ID, the live source
+// fingerprint an in-place restart has already applied. Docker labels are
+// immutable, so a restarted container's relay.source label still names the
+// fingerprint it was CREATED with; without this record convergence would see a
+// permanent mismatch and restart the container on every pass. The record is
+// in-memory and worker-lifetime only: after a worker restart the first pass
+// restarts each stale container once more (idempotent) and re-records it. It is
+// safe for concurrent use — different apps may reconcile concurrently.
+type sourceApplyTracker struct {
+	mu      sync.Mutex
+	applied map[string]appliedSource
+}
+
+// appliedSource is one tracker record: the app that owns the container and the
+// source fingerprint already applied to it. The app field scopes pruning to the
+// reconciling app so a concurrent app's records are never touched.
+type appliedSource struct {
+	app    string
+	source string
+}
+
+// newSourceApplyTracker returns an empty tracker.
+func newSourceApplyTracker() *sourceApplyTracker {
+	return &sourceApplyTracker{applied: map[string]appliedSource{}}
+}
+
+// appliedFor returns the fingerprint recorded for a container when the record
+// belongs to app; the second result is false when there is no such record. The
+// app guard keeps a recycled or foreign container ID from inheriting another
+// app's applied source. It is nil-receiver-safe so a reconciler constructed
+// without a tracker disables in-place reload without a nil check at every call.
+func (t *sourceApplyTracker) appliedFor(id, app string) (string, bool) {
+	if t == nil {
+		return "", false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	rec, ok := t.applied[id]
+	if !ok || rec.app != app {
+		return "", false
+	}
+	return rec.source, true
+}
+
+// record stamps the fingerprint an in-place restart applied to a container.
+func (t *sourceApplyTracker) record(id, app, source string) {
+	if t == nil || id == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.applied == nil {
+		t.applied = map[string]appliedSource{}
+	}
+	t.applied[id] = appliedSource{app: app, source: source}
+}
+
+// prune drops the records for app whose container IDs are not in live, so a
+// removed or replaced container's record does not leak. Only this app's records
+// are considered, so a concurrent app's records are never touched.
+func (t *sourceApplyTracker) prune(app string, live map[string]bool) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for id, rec := range t.applied {
+		if rec.app == app && !live[id] {
+			delete(t.applied, id)
+		}
+	}
+}
+
+// forgetApp drops every record for app. It is called when an app is removed, so
+// the tracker does not retain records for containers that no longer exist.
+func (t *sourceApplyTracker) forgetApp(app string) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for id, rec := range t.applied {
+		if rec.app == app {
+			delete(t.applied, id)
+		}
+	}
+}
+
 // Reconcile converges the set of fnName's running service containers to
 // tmpl.Services (with the freshly prepared image). It is a best-effort pass:
 // per-operation failures are logged by the caller-facing style and the first
@@ -234,7 +334,10 @@ func reconcileAuthorityFrom(ctx context.Context) func() bool {
 // the old name's containers are preserved until the new name's service has fully
 // converged; a FAILED new service preserves the old name's running containers
 // (see the removal cleanup below). Changing only the source under the same name
-// is NOT a rename: it replaces the same replica slots via start-before-stop.
+// is NOT a rename: under HOT_RELOAD a source-only change is applied by an
+// in-place restart of the same replica slots (retaining the container IDs, when
+// the Docker implementation supports it), while any image/config/dependency
+// change still replaces the same replica slots via start-before-stop.
 //
 // Container ownership is always label-derived. A container belongs to fnName
 // when its App == fnName; containers of other apps are never touched.
@@ -255,7 +358,7 @@ func Reconcile(
 ) (bool, error) {
 	return reconcileWithObserver(
 		ctx, reconcileTimeout, docker, fnName, tmpl, appImage, preparedEnv,
-		serviceNetworks, secrets, traefik, log, nil,
+		serviceNetworks, secrets, traefik, log, nil, nil,
 	)
 }
 
@@ -272,6 +375,7 @@ func reconcileWithObserver(
 	traefik routing.TraefikConfig,
 	log *slog.Logger,
 	reconcileStarted func(),
+	apply *sourceApplyTracker,
 ) (bool, error) {
 	// A fresh normal-operation bound for the container listing. reconcileTimeout
 	// is always positive from the worker; a non-positive value means "no
@@ -288,6 +392,29 @@ func reconcileWithObserver(
 		// rather than guessing whether to start/stop anything.
 		return false, fmt.Errorf("service: list containers: %w", err)
 	}
+
+	// restarter is the optional in-place restart capability. When the configured
+	// Docker implements it AND a source-apply tracker is present (the worker's
+	// ServiceReconciler always supplies one), a source-only change restarts the
+	// existing container instead of replacing it. A Docker without the capability
+	// — or a direct Reconcile call with no tracker — keeps the historical
+	// replace-on-source-change behavior.
+	restarter, _ := docker.(ServiceRestarter)
+	if apply == nil {
+		restarter = nil
+	}
+	// Drop tracker records for containers of this app no longer present, so a
+	// removed or replaced container's record does not accumulate.
+	if apply != nil {
+		live := make(map[string]bool, len(containers))
+		for _, ctr := range containers {
+			if ctr.App == fnName {
+				live[ctr.ID] = true
+			}
+		}
+		apply.prune(fnName, live)
+	}
+
 	// changed reports whether any convergence action (a stop or a start
 	// attempt) was issued during this pass. It starts false and is set by the
 	// removed-service cleanup below and by the classify/start work further down.
@@ -565,15 +692,25 @@ func reconcileWithObserver(
 		// container still carries the old relay.identity and must be replaced so
 		// its label reflects the configured source.
 		//
-		// desiredSourceID is the live source fingerprint for a SOURCE_MOUNT
-		// entrypoint service ("" otherwise). It never changes the image reference,
-		// so without this comparison a source-only edit would leave the running
-		// container serving stale code.
+		// desiredSourceID is the live source fingerprint for a HOT_RELOAD
+		// (source-mounted) entrypoint service ("" otherwise). It never changes the
+		// image reference, so without this comparison a source-only edit would
+		// leave the running container serving stale code.
 		desiredSourceID := ""
 		if resolved.Mount != nil {
 			desiredSourceID = resolved.Mount.Identity
 		}
+		// converged accepts a container whose immutable relay.source label equals
+		// the desired fingerprint, OR one already reloaded in place onto it (the
+		// applied-source tracker records the restarted container's ID, since its
+		// label can never be updated).
 		converged := func(ctr runtime.ServiceContainer) bool {
+			sourceOK := ctr.SourceID == desiredSourceID
+			if !sourceOK && desiredSourceID != "" {
+				if applied, ok := apply.appliedFor(ctr.ID, fnName); ok && applied == desiredSourceID {
+					sourceOK = true
+				}
+			}
 			return ctr.State == container.StateRunning &&
 				ctr.SourceRef == sourceRef &&
 				ctr.Image == resolved.Ref &&
@@ -582,7 +719,29 @@ func reconcileWithObserver(
 				ctr.EnvHash == envHash &&
 				ctr.Resources == resourceHash &&
 				ctr.Networks == desiredNetworks &&
-				ctr.SourceID == desiredSourceID &&
+				sourceOK &&
+				ctr.Replica >= 0 &&
+				routingLabelsMatch(routeLabels, ctr.Labels)
+		}
+
+		// sourceOnlyStale reports whether ctr is running and correctly configured
+		// EXCEPT for its live source fingerprint: the exact case an in-place
+		// restart resolves under HOT_RELOAD. It requires a real source mount
+		// (desiredSourceID != "") and an immutable relay.source label that differs;
+		// every other field — image, image content, port, env, resources,
+		// networks, replica slot, routing labels — must already match, so a
+		// configuration or dependency change still replaces rather than restarts.
+		sourceOnlyStale := func(ctr runtime.ServiceContainer) bool {
+			return desiredSourceID != "" &&
+				ctr.SourceID != desiredSourceID &&
+				ctr.State == container.StateRunning &&
+				ctr.SourceRef == sourceRef &&
+				ctr.Image == resolved.Ref &&
+				ctr.ImageID == resolved.ID &&
+				ctr.Port == svc.Port &&
+				ctr.EnvHash == envHash &&
+				ctr.Resources == resourceHash &&
+				ctr.Networks == desiredNetworks &&
 				ctr.Replica >= 0 &&
 				routingLabelsMatch(routeLabels, ctr.Labels)
 		}
@@ -653,6 +812,53 @@ func reconcileWithObserver(
 				stale = append(stale, matches[1:]...)
 				stale = append(stale, olds...)
 				continue
+			}
+
+			// A source-only change under an unchanged image and configuration is
+			// applied by restarting the SAME container in place (Docker
+			// ContainerRestart), when the Docker implementation supports it: the
+			// live read-only source bind is re-read by the fresh process, and the
+			// container's identity is retained. The applied fingerprint is
+			// recorded so later passes recognize the restarted container as
+			// converged despite its immutable relay.source label. Every other
+			// generation in the slot is superseded once the restart is confirmed
+			// running.
+			if restarter != nil {
+				var restartTarget *runtime.ServiceContainer
+				for i := range olds {
+					if sourceOnlyStale(olds[i]) {
+						restartTarget = &olds[i]
+						break
+					}
+				}
+				if restartTarget != nil {
+					changed = true
+					corrective = true
+					notifyReconcile()
+					if err := restarter.RestartServiceContainer(postCtx, restartTarget.ID); err != nil {
+						fail(fmt.Errorf("service %q replica %d: source reload restart: %w", name, slot, err))
+						desiredFailed = true
+						log.Warn("Service: source reload restart failed; keeping generation",
+							"app", fnName, "service", name, "replica", slot, "error", err)
+						// Preserve usable olds (the restart may have left the
+						// container running); a non-usable old can never serve, so
+						// it is cleaned up. The next pass retries the reload, or the
+						// normal crash replacement takes over.
+						for i := range olds {
+							if !usableServiceContainer(olds[i]) {
+								stale = append(stale, olds[i])
+							}
+						}
+						continue
+					}
+					apply.record(restartTarget.ID, fnName, desiredSourceID)
+					for i := range olds {
+						if olds[i].ID != restartTarget.ID {
+							stale = append(stale, olds[i])
+						}
+					}
+					continue
+				}
 			}
 
 			// No converged replica holds the slot. The lowest-ID usable
@@ -1023,6 +1229,14 @@ type ServiceReconciler struct {
 	// passes WithMetrics). It is never used to gate behavior.
 	metrics *metrics.Registry
 
+	// sourceApply tracks source-only in-place restarts (HOT_RELOAD). It is
+	// constructed by NewServiceReconciler and shared across this reconciler's
+	// passes so a restarted container is recognized as converged on later passes
+	// despite its immutable relay.source label. A directly-constructed
+	// ServiceReconciler leaves it nil, which disables in-place reload (source
+	// changes then replace, the historical behavior).
+	sourceApply *sourceApplyTracker
+
 	mu sync.Mutex
 }
 
@@ -1068,6 +1282,7 @@ func NewServiceReconciler(
 		traefik:          traefik,
 		log:              log,
 		reconcileTimeout: reconcileTimeout,
+		sourceApply:      newSourceApplyTracker(),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -1124,7 +1339,7 @@ func (c *ServiceReconciler) apply(
 	start := time.Now()
 	changed, err := reconcileWithObserver(
 		ctx, c.reconcileTimeout, c.docker, fnName, tmpl, image, preparedEnv,
-		c.networks, c.secrets, c.traefik, c.log, reconcileStarted,
+		c.networks, c.secrets, c.traefik, c.log, reconcileStarted, c.sourceApply,
 	)
 	c.observeReconcile(fnName, changed, err, time.Since(start))
 	if err != nil {
@@ -1184,6 +1399,7 @@ func (c *ServiceReconciler) observeReconcile(
 func (c *ServiceReconciler) Remove(ctx context.Context, fnName string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.sourceApply.forgetApp(fnName)
 	RemoveAll(ctx, c.docker, fnName, c.log)
 }
 

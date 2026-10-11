@@ -15,7 +15,7 @@ import (
 )
 
 // SourceMount describes a read-only bind mount of an app's live source tree into
-// its execution and entrypoint-service containers, used when SOURCE_MOUNT is
+// its execution and entrypoint-service containers, used when HOT_RELOAD is
 // enabled and the runtime's dependency layout permits it (see
 // plan.Spec.MountableSource). The source is mounted from the app's directory on
 // the Docker daemon's host filesystem, so the daemon — not the Relay process —
@@ -59,7 +59,7 @@ type SourceMount struct {
 
 // bindMounts converts a SourceMount into the Docker mount list applied at
 // container create. It returns nil for a nil/zero mount, so every unmounted
-// container is byte-for-byte the pre-SOURCE_MOUNT behavior. The bind is always
+// container is byte-for-byte the pre-HOT_RELOAD behavior. The bind is always
 // read-only: Relay never lets a container write back into /apps.
 //
 // Each mask becomes an additional empty, read-only tmpfs at its in-container
@@ -95,7 +95,7 @@ func bindMounts(sm *SourceMount) []mount.Mount {
 }
 
 // sourceMountImageFingerprint derives the app image identity when the source is
-// NOT baked into the image (SOURCE_MOUNT). It hashes exactly the non-source
+// NOT baked into the image (HOT_RELOAD). It hashes exactly the non-source
 // build inputs — the runtime name, the dependency reference the image is built
 // FROM, and the effective Dockerfile rendered with the source COPY omitted — so
 // a dependency, runtime/tool, bootstrap, user, or entrypoint change produces a
@@ -126,7 +126,7 @@ func (m *Manager) setSourceMount(name string, sm SourceMount) {
 }
 
 // clearSourceMount drops an app's recorded source mount, so an app that stops
-// being mountable (a runtime change, or SOURCE_MOUNT disabled across a restart)
+// being mountable (a runtime change, or HOT_RELOAD disabled across a restart)
 // never has a stale mount applied.
 func (m *Manager) clearSourceMount(name string) {
 	if name == "" {
@@ -146,10 +146,10 @@ func (m *Manager) sourceMountFor(name string) (SourceMount, bool) {
 	return sm, ok
 }
 
-// executionSourceMount returns the SOURCE_MOUNT container configuration for an
+// executionSourceMount returns the HOT_RELOAD container configuration for an
 // app's execution containers: the working directory (empty preserves the image
 // workdir) and the bind/mask mounts. Both are nil/empty when the app has no
-// recorded source mount, which is the exact pre-SOURCE_MOUNT create shape.
+// recorded source mount, which is the exact pre-HOT_RELOAD create shape.
 func (m *Manager) executionSourceMount(fnName string) (string, []mount.Mount) {
 	sm, ok := m.sourceMountFor(fnName)
 	if !ok {
@@ -222,7 +222,7 @@ func (m *Manager) daemonMounts(ctx context.Context) []container.MountPoint {
 	m.selfMounts.resolved = true
 	// Log only the count: the individual source paths can be high-cardinality
 	// and must never be logged.
-	m.Logger().Debug("Runtime: resolved Relay's own container mounts for SOURCE_MOUNT",
+	m.Logger().Debug("Runtime: resolved Relay's own container mounts for HOT_RELOAD",
 		"mounts", len(m.selfMounts.mounts))
 	return m.selfMounts.mounts
 }

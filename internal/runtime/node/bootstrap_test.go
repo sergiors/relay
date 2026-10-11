@@ -35,7 +35,7 @@ func TestBootstrapIsEmbeddedAndResolvesModulesByStat(t *testing.T) {
 }
 
 // TestBootstrapSourceMountConstantsMatchEngine pins the bootstrap/engine
-// agreement on the SOURCE_MOUNT layout: the argv flag, the mount target, the
+// agreement on the HOT_RELOAD layout: the argv flag, the mount target, the
 // persisted esbuild path, and the shared resolve-hook preload are embedded
 // verbatim in the bootstrap (or the hook module it imports) and must equal the
 // engine's constants, since the plan writes the matching ENTRYPOINT, install
@@ -162,7 +162,7 @@ func writeModule(t *testing.T, root, modPath, src string) {
 	}
 }
 
-// writeMountedModule writes a handler under the SOURCE_MOUNT root (root/app/src),
+// writeMountedModule writes a handler under the HOT_RELOAD root (root/app/src),
 // mirroring the in-image /app/src bind target.
 func writeMountedModule(t *testing.T, root, modPath, src string) {
 	t.Helper()
@@ -273,7 +273,7 @@ func resolveHookForMounted(root string) string {
 	)
 }
 
-// startNodeMounted starts the real embedded bootstrap in SOURCE_MOUNT mode (the
+// startNodeMounted starts the real embedded bootstrap in HOT_RELOAD mode (the
 // --source-mount ENTRYPOINT flag) with the mount root and generated overlay
 // rewritten under root. It writes the shared resolve hook beside the bootstrap
 // (root/relay/resolve-hook.mjs) exactly as a source-mounted image would, so the
@@ -467,7 +467,7 @@ export function send(event) {
 }
 
 // TestNodeRuntimeSourceMountResolvesFromMountedRootAndDeps proves the
-// SOURCE_MOUNT bootstrap resolves handlers from the mounted root (/app/src) and
+// HOT_RELOAD bootstrap resolves handlers from the mounted root (/app/src) and
 // still resolves bare packages from /app/node_modules (an ancestor of the mount
 // target), i.e. the distinct mount target does not hide the dependency tree.
 // TypeScript transpilation at container startup needs the persisted esbuild and

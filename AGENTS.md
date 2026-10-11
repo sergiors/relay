@@ -105,22 +105,27 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 
 ## Runtime identity and generation
 
-- By default (`SOURCE_MOUNT=false`) one image per app is versioned by source
+- By default (`HOT_RELOAD=false`) one image per app is versioned by source
   fingerprint (selected source plus applicable `.gitignore` files; `template.yaml`
   verbatim; `resources` excluded), so the immutable baked image IS the source
   identity. A rebuild is a new immutable image; the old version keeps serving
   until the new one is prepared and swapped in; resource-only edits instead reuse
   the image and rotate containers.
-- `SOURCE_MOUNT` (startup configuration, default `false`) makes a mountable
+- `HOT_RELOAD` (startup configuration, default `false`) makes a mountable
   runtime's app image source-INDEPENDENT: Python and Node images are built
   without baking the source and bind-mount the app's live directory read-only at
-  container create, so a source-only edit reuses the same image. The
-  selected-source fingerprint still advances the runtime generation, recycling
-  and draining pooled execution containers and replacing managed
-  entrypoint-service replicas through the normal start-before-stop path, so a
-  container that already imported the old modules never serves stale code.
+  container create, so a source-only edit reuses the same image. It is the public
+  trigger for the runtime's internal source-mount mechanism. The selected-source
+  fingerprint still advances the runtime generation, recycling and draining
+  pooled execution containers. Managed entrypoint-service replicas are instead
+  restarted IN PLACE (Docker ContainerRestart: same container ID, same image,
+  same bind) so the process re-reads the live source without a replace; the
+  reconciler records the applied source fingerprint in memory because Docker
+  labels are immutable, so a restarted service is not restarted again on every
+  pass (after a worker restart each stale service is restarted once more).
   Dependency fingerprints/images stay authoritative — a manifest change still
-  rebuilds the dependency layer and the app image. Placements are
+  rebuilds the dependency layer and the app image and replaces the service
+  container normally. Placements are
   runtime-specific: Python mounts the app root at `/app` (dependencies live in
   system site-packages, outside the mount); Node mounts the source at the
   distinct `/app/src` and keeps `node_modules` and its pinned esbuild under
@@ -134,7 +139,7 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   dependency layout keeps the baked image.
 - Dependency layers are content-addressed, shared, and never auto-pruned; Relay
   removes only its own images, and only once unreferenced. A container's version
-  is its resolved image content (the live source fingerprint under `SOURCE_MOUNT`,
+  is its resolved image content (the live source fingerprint under `HOT_RELOAD`,
   where the image deliberately carries no fingerprint label), not its tag: a
   version change drains the old generation (idle containers discarded, busy ones
   finish then discarded) with no new invocation leased to it.
@@ -263,7 +268,11 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   provisional replacement and leaves convergence to the newer request.
 - Containers are replaced when the source descriptor, image content, port,
   effective environment, resources, or routing labels change, otherwise
-  preserved; external image freshness is checked at most hourly per source
+  preserved; under HOT_RELOAD a change confined to the live source fingerprint
+  (relay.source) of a source-mounted entrypoint service restarts the SAME
+  container in place (Docker ContainerRestart; the applied fingerprint is tracked
+  in memory because the label is immutable) instead of replacing it. External
+  image freshness is checked at most hourly per source
   reference, in memory only.
 - Persistent service containers receive their environment (including resolved
   secrets) at process start — the one documented place a secret value reaches the

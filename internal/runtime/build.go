@@ -61,7 +61,7 @@ func renderDockerfile(p plan.BuildPlan) (string, error) {
 }
 
 // renderDockerfileWithSource is renderDockerfile with the source COPY made
-// optional. copySource is false for a SOURCE_MOUNT app image: the app's live
+// optional. copySource is false for a HOT_RELOAD app image: the app's live
 // source is bind-mounted at runtime instead of being copied, so the generated
 // plan files (the bootstrap, an injected package.json) and the install/user/
 // entrypoint steps are emitted exactly as before but the `COPY . WorkDir` line
@@ -299,7 +299,7 @@ func quoteEntrypointJSON(args []string) string {
 
 // buildImage stages one app image from the immutable source snapshot and the
 // engine's build plan. copySource is true for the historical baked-source image
-// and false for a SOURCE_MOUNT app image, whose live source is bind-mounted at
+// and false for a HOT_RELOAD app image, whose live source is bind-mounted at
 // runtime instead of copied; either way the generated plan files and the build
 // context come from the one captured snapshot.
 func buildImage(

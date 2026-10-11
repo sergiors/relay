@@ -24,7 +24,7 @@ import (
 )
 
 // stagedFileBytes returns the exact bytes of one file from a captured build
-// context tar, or fails when the file is absent. It is how the SOURCE_MOUNT
+// context tar, or fails when the file is absent. It is how the HOT_RELOAD
 // tests read the Dockerfile the builder actually generated.
 func stagedFileBytes(t *testing.T, raw []byte, name string) []byte {
 	t.Helper()
@@ -74,7 +74,7 @@ func TestSourceMountImageFingerprint(t *testing.T) {
 }
 
 // TestBindMountsReadOnly pins that a source mount is one read-only bind, and
-// that a nil/zero mount yields no Docker mount at all (the exact pre-SOURCE_MOUNT
+// that a nil/zero mount yields no Docker mount at all (the exact pre-HOT_RELOAD
 // shape).
 func TestBindMountsReadOnly(t *testing.T) {
 	if got := bindMounts(nil); got != nil {
@@ -129,7 +129,7 @@ func TestWithSourceMountResolves(t *testing.T) {
 }
 
 // TestPrepareSourceMountBakesNoSourceAndRecordsMount drives a real Manager.Prepare
-// build (scripted daemon) for a Python app with SOURCE_MOUNT enabled and proves
+// build (scripted daemon) for a Python app with HOT_RELOAD enabled and proves
 // the three defining behaviors: the image tag is NOT the source fingerprint, the
 // generated Dockerfile never copies the source, and the live mount is recorded
 // with the app dir, engine workdir, and source fingerprint.
@@ -164,22 +164,22 @@ func TestPrepareSourceMountBakesNoSourceAndRecordsMount(t *testing.T) {
 		t.Fatalf("built tag = %q, want the returned image %q", tag, got.Image)
 	}
 	if got.Image == ImageRef(fn.Name, got.Fingerprint) {
-		t.Fatalf("SOURCE_MOUNT image %q must not be tagged by the source fingerprint", got.Image)
+		t.Fatalf("HOT_RELOAD image %q must not be tagged by the source fingerprint", got.Image)
 	}
 	df := string(stagedFileBytes(t, contextTar, "Dockerfile"))
 	if strings.Contains(df, "COPY . ") {
-		t.Fatalf("SOURCE_MOUNT build must not copy the source into the image:\n%s", df)
+		t.Fatalf("HOT_RELOAD build must not copy the source into the image:\n%s", df)
 	}
 	var labels map[string]string
 	if err := json.Unmarshal([]byte(labelsJSON), &labels); err != nil {
 		t.Fatalf("decode image labels %q: %v", labelsJSON, err)
 	}
 	if v, ok := labels[labelFingerprint]; !ok || v != "" {
-		t.Fatalf("SOURCE_MOUNT image must clear the relay.fingerprint label so an inherited dependency label cannot freeze the generation (got %v)", labels)
+		t.Fatalf("HOT_RELOAD image must clear the relay.fingerprint label so an inherited dependency label cannot freeze the generation (got %v)", labels)
 	}
 	sm, ok := m.sourceMountFor(fn.Name)
 	if !ok {
-		t.Fatal("SOURCE_MOUNT prepare must record a source mount")
+		t.Fatal("HOT_RELOAD prepare must record a source mount")
 	}
 	if sm.HostPath != dir || sm.Target != "/app" || sm.Identity != got.Fingerprint {
 		t.Fatalf("recorded mount = %+v, want host=%q target=/app identity=%q", sm, dir, got.Fingerprint)
@@ -257,7 +257,7 @@ func TestPrepareSourceMountReusesImageAcrossSourceOnlyChange(t *testing.T) {
 
 // TestStartExecutionContainerSerializesSourceMount drives the real
 // startExecutionContainer client path and inspects the serialized create request,
-// proving the SOURCE_MOUNT bind reaches Docker's HostConfig.Mounts as a
+// proving the HOT_RELOAD bind reaches Docker's HostConfig.Mounts as a
 // read-only bind.
 func TestStartExecutionContainerSerializesSourceMount(t *testing.T) {
 	var createBody []byte
@@ -289,7 +289,7 @@ func TestStartExecutionContainerSerializesSourceMount(t *testing.T) {
 }
 
 // TestStartExecutionContainerSerializesNodeSourceMountConfig pins the Node
-// SOURCE_MOUNT create shape on the wire: the app root work dir and the
+// HOT_RELOAD create shape on the wire: the app root work dir and the
 // node_modules mask both reach Docker alongside the read-only source bind, so
 // cwd sees /app/src and host modules can never shadow /app/node_modules.
 func TestStartExecutionContainerSerializesNodeSourceMountConfig(t *testing.T) {
@@ -355,8 +355,8 @@ func TestPrepareDependencyFingerprintFailureRemovesSnapshot(t *testing.T) {
 	}
 }
 
-// TestPrepareSourceMountNodeUsesDistinctTarget pins the Node SOURCE_MOUNT
-// boundary: a Node app under SOURCE_MOUNT IS mounted, but at a DISTINCT target
+// TestPrepareSourceMountNodeUsesDistinctTarget pins the Node HOT_RELOAD
+// boundary: a Node app under HOT_RELOAD IS mounted, but at a DISTINCT target
 // (/app/src) so the image's /app/node_modules and persisted esbuild stay
 // visible. The image is source-independent (no COPY, no relay.fingerprint label)
 // and the mount is recorded with the distinct target, exactly like Python's
@@ -396,25 +396,25 @@ func TestPrepareSourceMountNodeUsesDistinctTarget(t *testing.T) {
 		t.Fatalf("built tag = %q, want the returned image %q", tag, got.Image)
 	}
 	if got.Image == ImageRef(fn.Name, got.Fingerprint) {
-		t.Fatalf("Node SOURCE_MOUNT image %q must not be tagged by the source fingerprint", got.Image)
+		t.Fatalf("Node HOT_RELOAD image %q must not be tagged by the source fingerprint", got.Image)
 	}
 	df := string(stagedFileBytes(t, contextTar, "Dockerfile"))
 	if strings.Contains(df, "COPY . ") {
-		t.Fatalf("Node SOURCE_MOUNT build must not copy the source into the image:\n%s", df)
+		t.Fatalf("Node HOT_RELOAD build must not copy the source into the image:\n%s", df)
 	}
 	if !strings.Contains(df, "/relay/esbuild") {
-		t.Fatalf("Node SOURCE_MOUNT image must persist esbuild for runtime transpilation:\n%s", df)
+		t.Fatalf("Node HOT_RELOAD image must persist esbuild for runtime transpilation:\n%s", df)
 	}
 	var labels map[string]string
 	if err := json.Unmarshal([]byte(labelsJSON), &labels); err != nil {
 		t.Fatalf("decode image labels %q: %v", labelsJSON, err)
 	}
 	if v, ok := labels[labelFingerprint]; !ok || v != "" {
-		t.Fatalf("Node SOURCE_MOUNT image must clear the relay.fingerprint label so an inherited dependency label cannot freeze the generation (got %v)", labels)
+		t.Fatalf("Node HOT_RELOAD image must clear the relay.fingerprint label so an inherited dependency label cannot freeze the generation (got %v)", labels)
 	}
 	sm, ok := m.sourceMountFor(fn.Name)
 	if !ok {
-		t.Fatal("Node SOURCE_MOUNT prepare must record a source mount")
+		t.Fatal("Node HOT_RELOAD prepare must record a source mount")
 	}
 	if sm.HostPath != dir || sm.Target != "/app/src" || sm.Identity != got.Fingerprint {
 		t.Fatalf("recorded mount = %+v, want host=%q target=/app/src identity=%q", sm, dir, got.Fingerprint)
@@ -520,7 +520,7 @@ func TestResolveServiceImagePythonMountKeepsEntry(t *testing.T) {
 }
 
 // TestStartServiceSerializesSourceMountAndLabel proves StartService sends the
-// bind and stamps relay.source for a SOURCE_MOUNT entrypoint service, and sends
+// bind and stamps relay.source for a HOT_RELOAD entrypoint service, and sends
 // neither when the spec has no mount.
 func TestStartServiceSerializesSourceMountAndLabel(t *testing.T) {
 	withMount := decodeCreateRequest(t, captureServiceCreate(t, ServiceSpec{
@@ -618,7 +618,7 @@ func countBuildsRoute(c *buildCounts, depCtx, appCtx *[]byte) dockerRoute {
 }
 
 // TestPrepareSourceMountDependencyChangeBuildsNewGeneration pins the
-// SOURCE_MOUNT dependency lifecycle: mutating the manifest yields a DIFFERENT
+// HOT_RELOAD dependency lifecycle: mutating the manifest yields a DIFFERENT
 // dependency fingerprint/reference and a NEW dependency image generation (built
 // from the edited bytes), and the app image is rebuilt FROM that new dependency
 // reference. Dependency and app builds are counted separately, so the new

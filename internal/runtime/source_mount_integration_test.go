@@ -13,6 +13,7 @@ import (
 	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 
 	"relay/internal/app"
@@ -22,14 +23,14 @@ import (
 )
 
 // TestIntegrationSourceMountPythonReflectsSourceChange is the end-to-end proof
-// of SOURCE_MOUNT for a Python app: the image is built WITHOUT the source, the
+// of HOT_RELOAD for a Python app: the image is built WITHOUT the source, the
 // live /apps tree is bind-mounted read-only, a source-only edit reuses the exact
 // same image (no rebuild), and the next invocation runs the edited code because
 // the advanced source fingerprint rotates the warm generation onto a fresh
 // container.
 //
 // It runs natively (the app dir is a real host path the daemon can bind-mount),
-// which is the deployment shape SOURCE_MOUNT requires.
+// which is the deployment shape HOT_RELOAD requires.
 func TestIntegrationSourceMountPythonReflectsSourceChange(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -77,7 +78,7 @@ func TestIntegrationSourceMountPythonReflectsSourceChange(t *testing.T) {
 }
 
 // TestIntegrationSourceMountNodeJSReflectsSourceChange is the end-to-end proof of
-// SOURCE_MOUNT for Node JavaScript: the image is built WITHOUT the source, the
+// HOT_RELOAD for Node JavaScript: the image is built WITHOUT the source, the
 // live tree is bind-mounted read-only at the DISTINCT target /app/src (so
 // /app/node_modules and the persisted esbuild stay visible), a source-only edit
 // reuses the exact same image, and the next invocation runs the edited code while
@@ -232,7 +233,7 @@ exports.handler = function (event) {
 }
 
 // TestIntegrationSourceMountNodeTSReflectsSourceChange is the end-to-end proof of
-// SOURCE_MOUNT for Node TypeScript: the image is built WITHOUT the source and
+// HOT_RELOAD for Node TypeScript: the image is built WITHOUT the source and
 // carries a PERSISTENT pinned esbuild, the live .ts graph is bind-mounted at
 // /app/src, and the bootstrap bundles it at container startup. A source-only edit
 // reuses the same image and the next invocation runs the re-bundled code, with
@@ -415,7 +416,7 @@ export function where(): string {
 
 // TestIntegrationSourceMountNodeHostNodeModulesDoesNotShadow is the end-to-end
 // proof that a host app directory containing node_modules cannot shadow the
-// dependency image under SOURCE_MOUNT. The host ships a deliberately conflicting
+// dependency image under HOT_RELOAD. The host ships a deliberately conflicting
 // `picocolors` stub that returns a sentinel string; the dependency image installs
 // the real `picocolors`. The mounted handler imports it and prints the result, so
 // the output proves Node resolved the bare import from /app/node_modules (the
@@ -564,7 +565,7 @@ export function handler(event) {
 }
 
 // TestIntegrationSourceMountNodeWorkingDirIsAppRoot is the end-to-end proof that
-// a SOURCE_MOUNT Node execution container runs with the app's source root as its
+// a HOT_RELOAD Node execution container runs with the app's source root as its
 // working directory: the mounted handler observes process.cwd() == /app/src and
 // resolves a relative file path against the mounted app root.
 func TestIntegrationSourceMountNodeWorkingDirIsAppRoot(t *testing.T) {
@@ -739,7 +740,7 @@ setInterval(() => {}, 1 << 30);
 }
 
 // TestIntegrationSourceMountNodeServiceWorkingDir proves a managed entrypoint
-// service under SOURCE_MOUNT runs with the same app-root working directory as the
+// service under HOT_RELOAD runs with the same app-root working directory as the
 // pooled runtime: its container WorkingDir is /app/src and the service process
 // observes process.cwd() == /app/src with relative paths resolving against the
 // mounted app root.
@@ -834,7 +835,7 @@ setInterval(() => {}, 1 << 30);
 }
 
 // TestIntegrationSourceMountNodeDependencyChangeBuildsAndExecutes verifies the
-// SOURCE_MOUNT dependency lifecycle end to end: mutating the package manifest
+// HOT_RELOAD dependency lifecycle end to end: mutating the package manifest
 // changes the dependency fingerprint/reference, produces a NEW dependency image
 // generation on the daemon, and a replacement invocation resolves a package that
 // exists ONLY in the new dependency layer while running the current mounted
@@ -921,14 +922,14 @@ export function handler(event) {
 // blocked handler waits on. The gate is listed in .gitignore, so it is excluded
 // from the selected source and flipping it releases a handler WITHOUT advancing
 // the app fingerprint, keeping the release independent of the generation under
-// test. It is still visible in the container because SOURCE_MOUNT binds the
+// test. It is still visible in the container because HOT_RELOAD binds the
 // whole app directory read-only (fn.Dir), not merely the selected source.
 const (
 	sourceMountGateClosed = "closed"
 	sourceMountGateOpen   = "release"
 )
 
-// writeSourceMountGateApp writes a SOURCE_MOUNT Node app whose v1 handler prints
+// writeSourceMountGateApp writes a HOT_RELOAD Node app whose v1 handler prints
 // "START v1" and then blocks until the git-ignored gate file is released. A test
 // flips <dir>/gate.txt to sourceMountGateOpen to complete the invocation
 // deterministically (no sleep), and swaps index.js for the ungated v2 handler
@@ -996,7 +997,7 @@ func waitForContainerIDGone(ctx context.Context, cli *client.Client, id string) 
 	})
 }
 
-// newSourceMountWarmManager builds a SOURCE_MOUNT Manager with a fresh metrics
+// newSourceMountWarmManager builds a HOT_RELOAD Manager with a fresh metrics
 // registry and an explicit worker-global warm-container bound
 // (MAX_WARM_CONTAINERS), so a test can assert the global warm count and the
 // warm-budget backpressure counter end to end. Close is registered as cleanup.
@@ -1121,7 +1122,7 @@ func TestIntegrationSourceMountBusyGenerationAdvanceDrains(t *testing.T) {
 }
 
 // TestIntegrationSourceMountWarmBoundBackpressuresBusyGeneration proves the
-// worker-global MAX_WARM_CONTAINERS bound holds across a SOURCE_MOUNT
+// worker-global MAX_WARM_CONTAINERS bound holds across a HOT_RELOAD
 // generation advance: with the bound at 1, while the old generation's only
 // container is busy an invocation for the advanced generation is
 // backpressured — it neither starts a second container nor exceeds the warm
@@ -1248,13 +1249,16 @@ func TestIntegrationSourceMountWarmBoundBackpressuresBusyGeneration(t *testing.T
 	}
 }
 
-// TestIntegrationSourceMountNodeServiceSourceReplacementReusesDependency is the
-// end-to-end proof of a managed Node entrypoint service's source replacement
-// under SOURCE_MOUNT: a source-only edit advances the source fingerprint and the
-// service container is replaced start-before-stop (the new generation runs the
-// edited mounted source while the old one is still up), while the dependency
-// image is REUSED (no new relay-dep-* generation and the app image tag is
-// unchanged). The service never runs the invocation bootstrap: it is launched as
+// TestIntegrationSourceMountNodeServiceSourceReplacementReusesDependency proves
+// the managed Node entrypoint service REPLACEMENT path under HOT_RELOAD: a
+// source-only edit advances the source fingerprint and a manual start-before-stop
+// replacement (the new generation runs the edited mounted source while the old
+// one is still up) reuses the dependency image (no new relay-dep-* generation and
+// the app image tag is unchanged). This is the path the reconciler still uses for
+// a dependency/configuration change and for a Docker implementation without the
+// in-place restart capability; for a source-only change the reconciler restarts
+// the same container in place instead (see internal/reconciler). The service
+// never runs the invocation bootstrap: it is launched as
 // `node --import /relay/resolve-hook.mjs /app/src/app/service.js` and resolves its
 // bare imports from the dependency image through the preloaded hook.
 func TestIntegrationSourceMountNodeServiceSourceReplacementReusesDependency(t *testing.T) {
@@ -1417,6 +1421,112 @@ setInterval(() => {}, 1 << 30);
 			countContainersByLabel(ctx, cli, labelApp, appName))
 	}
 	awaitServiceLog(t, ctx, cli, id2, "svc ", "V2")
+}
+
+// TestIntegrationSourceMountServiceRestartInPlaceReloadsSource is the Docker
+// proof of the HOT_RELOAD in-place service reload primitive: a managed
+// source-mounted entrypoint service is restarted with Docker ContainerRestart
+// (SAME container id, same image, same read-only bind), the image is reused, and
+// the restarted process re-reads the edited live source. This is the exact
+// operation the service reconciler performs for a source-only change.
+func TestIntegrationSourceMountServiceRestartInPlaceReloadsSource(t *testing.T) {
+	cli := testutil.RequireDocker(t)
+	depBefore := depTagSet(context.Background(), cli)
+	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
+
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "app"), 0o755); err != nil {
+		t.Fatalf("mkdir app: %v", err)
+	}
+	writeFile(t, dir, "app/service.js", `
+process.on("SIGTERM", () => process.exit(0));
+console.log("svc V1");
+setInterval(() => {}, 1 << 30);
+`)
+
+	appName := "src-mount-restart-it"
+	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+
+	m, err := NewManager(testutil.DiscardLogger(), nil, "test-host", WithSourceMount(true))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	defer func() { _ = m.Close() }()
+	t.Cleanup(func() {
+		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		_, _ = m.RemoveAppServiceContainers(cc, appName)
+		cleanupImagePrefixes(cli, "relay-app-"+appName+":")()
+	})
+
+	first, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare v1: %v", err)
+	}
+	defer cleanupImage(cli, ctx, first.Image)
+
+	tmpl := &app.Template{Runtime: "node24"}
+	svc := app.Service{Name: "svc", Entrypoint: "app/service.js", Port: 3000}
+	resolved1, err := m.ResolveServiceImage(ctx, appName, tmpl, svc, first.Image)
+	if err != nil {
+		t.Fatalf("resolve v1 service: %v", err)
+	}
+	id1, err := m.StartService(ctx, ServiceSpec{
+		App: appName, Name: svc.Name, SourceRef: svc.Entrypoint,
+		Port: svc.Port, Image: resolved1.Ref, ImageID: resolved1.ID,
+		Entry: resolved1.Entry, Env: []string{"PORT=3000"},
+		SourceMount: resolved1.Mount,
+	}, 0)
+	if err != nil {
+		t.Fatalf("start v1 service: %v", err)
+	}
+	waitForContainerRunning(t, ctx, cli, id1)
+	awaitServiceLog(t, ctx, cli, id1, "svc ", "V1")
+
+	// Source-only edit: the app image and dependency layer must be reused, and
+	// only the source fingerprint advances.
+	writeFile(t, dir, "app/service.js", `
+process.on("SIGTERM", () => process.exit(0));
+console.log("svc V2");
+setInterval(() => {}, 1 << 30);
+`)
+	second, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare v2: %v", err)
+	}
+	if second.Image != first.Image {
+		t.Fatalf("source-only change moved the app image: %q -> %q", first.Image, second.Image)
+	}
+	if second.Fingerprint == first.Fingerprint {
+		t.Fatal("source-only change must advance the source fingerprint")
+	}
+
+	// The reconciler's source-only reload: restart the SAME container. The
+	// restarted process reads the edited live source; the container id is
+	// unchanged.
+	if err := m.RestartServiceContainer(ctx, id1); err != nil {
+		t.Fatalf("restart service in place: %v", err)
+	}
+	awaitServiceLog(t, ctx, cli, id1, "V2")
+
+	list, err := m.ServiceContainerList(ctx)
+	if err != nil {
+		t.Fatalf("list services: %v", err)
+	}
+	found := false
+	for _, c := range list {
+		if c.ID == id1 {
+			found = true
+			if c.State != container.StateRunning {
+				t.Errorf("restarted container %s state = %s, want running", id1, c.State)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("the restarted container %s is missing from the service list; want the same id retained", id1)
+	}
 }
 
 // awaitServiceLog polls a service container's logs until every want fragment is

@@ -113,7 +113,7 @@ const (
 	esbuildBin    = esbuildPrefix + "/node_modules/.bin/esbuild"
 )
 
-// Source-mount (SOURCE_MOUNT) layout for Node.
+// Source-mount (HOT_RELOAD) layout for Node.
 //
 // The live app source is bind-mounted read-only at SourceMountTarget, a
 // subdirectory of the image workdir, so /app/node_modules (installed by the
@@ -156,10 +156,10 @@ const (
 const (
 	// sourceMountFlag marks a source-mounted image's bootstrap invocation.
 	sourceMountFlag = "--source-mount"
-	// SourceMountTarget is where a SOURCE_MOUNT bind mounts the app source.
+	// SourceMountTarget is where a HOT_RELOAD bind mounts the app source.
 	SourceMountTarget = "/app/src"
 	// SourceMountNodeModules is the path masked with an empty read-only
-	// filesystem under SOURCE_MOUNT WHEN the host already carries it at prepare
+	// filesystem under HOT_RELOAD WHEN the host already carries it at prepare
 	// time. The host app directory is mounted whole at SourceMountTarget, so a
 	// host node_modules would sit at /app/src/node_modules and Node's module
 	// resolution would find it BEFORE /app/node_modules, letting host modules
@@ -324,10 +324,10 @@ func (Engine) Plan(spec plan.Spec, fnDir string, handlers []string) (plan.BuildP
 	// bundles TypeScript on demand; a baked image keeps the two-element form
 	// byte-for-byte.
 	entry := entrypoint
-	// mountTarget is the in-container path a SOURCE_MOUNT bind targets (empty for
+	// mountTarget is the in-container path a HOT_RELOAD bind targets (empty for
 	// a baked image, where the caller mounts nothing).
 	var mountTarget string
-	// mountWorkDir is the working directory a SOURCE_MOUNT container runs with so
+	// mountWorkDir is the working directory a HOT_RELOAD container runs with so
 	// process.cwd() and relative paths see the app root (empty preserves the
 	// image workdir).
 	var mountWorkDir string
@@ -649,7 +649,7 @@ func fileExists(fnDir, name string) bool {
 }
 
 // dirExists reports whether name exists in fnDir as a directory (following
-// symlinks). It is used to decide whether the whole-directory SOURCE_MOUNT bind
+// symlinks). It is used to decide whether the whole-directory HOT_RELOAD bind
 // carries a node_modules that could shadow the dependency image; a non-directory
 // entry is not a shadowing tree.
 func dirExists(fnDir, name string) bool {

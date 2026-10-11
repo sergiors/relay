@@ -34,11 +34,12 @@ const serviceImagePullInterval = time.Hour
 // container preserves the image's own ENTRYPOINT/CMD — true for the `image`
 // source. Only the runtime-managed `entrypoint` source overrides it.
 //
-// Mount, when non-nil, is the app's live source mount (SOURCE_MOUNT) for an
+// Mount, when non-nil, is the app's live source mount (HOT_RELOAD) for an
 // entrypoint service whose runtime permits it. It is nil for an `image` source
 // (Relay does not mount into external images). Its Identity is the source
 // fingerprint the service reconciler compares to detect a source-only change and
-// replace the container; its Target is the source root the Entry override was
+// restart the container in place (or replace it where in-place restart is
+// unavailable); its Target is the source root the Entry override was
 // re-rooted at.
 type ServiceImage struct {
 	Ref   string
@@ -74,9 +75,10 @@ func (m *Manager) ResolveServiceImage(
 			return ServiceImage{}, err
 		}
 		img := ServiceImage{Ref: appImage, Entry: entry}
-		// An entrypoint service runs the app image. When SOURCE_MOUNT applies to
+		// An entrypoint service runs the app image. When HOT_RELOAD applies to
 		// this app/runtime, its live source is mounted read-only and the service
-		// reconciler replaces the container when the source fingerprint changes.
+		// reconciler restarts the container in place (or replaces it where
+		// in-place restart is unavailable) when the source fingerprint changes.
 		// The mount is recorded by Prepare; an unresolved record (no Prepare yet)
 		// yields no mount, i.e. the historical baked-image behavior. The mount may
 		// place the source at a path other than the baked workdir (Node mounts at

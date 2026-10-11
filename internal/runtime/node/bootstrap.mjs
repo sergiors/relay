@@ -30,7 +30,7 @@ import * as readline from "node:readline";
 import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 
-// Source-mount (SOURCE_MOUNT) support, mirroring internal/runtime/node/engine.go
+// Source-mount (HOT_RELOAD) support, mirroring internal/runtime/node/engine.go
 // (SourceMountTarget, the mounted esbuild path, and the pinned esbuild version).
 //
 // A source-mounted image appends --source-mount to the ENTRYPOINT and bind-mounts

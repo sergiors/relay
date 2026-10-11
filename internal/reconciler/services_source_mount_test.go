@@ -23,7 +23,7 @@ func runningSourceIDs(f *fakeDocker, fn, service string) []string {
 	return ids
 }
 
-// TestReconcileReplacesOnSourceMountChange pins the SOURCE_MOUNT reconciliation
+// TestReconcileReplacesOnSourceMountChange pins the HOT_RELOAD reconciliation
 // contract: an unchanged source fingerprint keeps the running service (no
 // churn), while a changed fingerprint — which never changes the image reference —
 // replaces the container via the existing start-before-stop path.

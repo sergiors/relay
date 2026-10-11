@@ -31,7 +31,7 @@ automatically.
 | `MAX_BUFFERED_EVENTS`         | `16`               | positive integer                                                        | Fails startup. Bounds messages read from Redis and held locally per worker.                                                                                                                                                 |
 | `MAX_EVENT_BYTES`             | `256KiB`           | human-readable binary size (`256B`, `256KiB`, `1MiB`; bare integer bytes accepted) | Fails startup on zero/negative/malformed/decimal-unit/above-1MiB. Byte length of a message's raw `event` value; over-limit messages are non-retryably dead-lettered with a bounded summary.                                |
 | `WARM_CONTAINER_IDLE_TIMEOUT` | `5m`               | positive Go duration (`90s`, `10m`, `1h30m`)                            | Fails startup.                                                                                                                                                                                                              |
-| `SOURCE_MOUNT`                | `false`            | boolean (`1`, `t`, `true`, `0`, `f`, `false`; trimmed)                  | Fails startup on an unparseable value. Bind-mounts the live app source read-only into containers instead of baking it, for runtimes with a mountable dependency layout (Python and Node). See below.                  |
+| `HOT_RELOAD`                  | `false`            | boolean (`1`, `t`, `true`, `0`, `f`, `false`; trimmed)                  | Fails startup on an unparseable value. Bind-mounts the live app source read-only into containers instead of baking it, for runtimes with a mountable dependency layout (Python and Node); a source-only edit reuses the image, managed services restart in place, and pooled execution containers are recycled. See below. |
 | `METRICS_ADDR`                | unset              | listen address (`:9090`)                                                | Empty disables the Prometheus endpoint. A bind failure is fatal at startup.                                                                                                                                                 |
 | `GIT_WEBHOOK_ADDR`            | unset              | listen address (`:8081`)                                                | Empty disables the GitHub webhook. A bind failure is fatal. Starts only when the git source also names a webhook secret.                                                                                                    |
 | `NETWORKS`                    | unset              | comma-separated Docker network names                                    | Parsed at startup (trimmed, de-duplicated, declaration order kept). Every name is verified to exist; a missing network fails startup. Applied to execution containers and (as an order-independent set) service containers. |
@@ -158,9 +158,9 @@ The `relay_runtime_warm_capacity` and `relay_runtime_warm_containers` gauges
 report the configured bound and current usage; `relay_runtime_warm_waits_total`
 counts invocations that had to wait at the bound.
 
-### Source mount
+### Hot reload
 
-`SOURCE_MOUNT` (default `false`) changes how a runtime-backed app's **source**
+`HOT_RELOAD` (default `false`) changes how a runtime-backed app's **source**
 reaches its containers. When enabled, for every runtime with a mountable
 dependency layout — Python, whose dependencies install into the system
 site-packages *outside* the app directory, and Node, whose `node_modules` and
@@ -171,18 +171,24 @@ entrypoint-service containers. Python mounts at the engine work directory
 (`/app`); Node mounts at `/app/src` so the bind never hides `/app/node_modules`,
 and its bootstrap bundles any TypeScript handler at container startup with the
 same pinned esbuild the baked build used. It is startup configuration: changing
-it requires a worker restart. `SOURCE_MOUNT=false` preserves the historical
-baked-source image exactly.
+it requires a worker restart. `HOT_RELOAD=false` preserves the historical
+baked-source image exactly. `SOURCE_MOUNT` is **not** a Relay configuration
+variable: it is neither read nor accepted (setting it has no effect).
 
 Consequences:
 
 - **Source edits do not rebuild.** The app image becomes a function of the
   runtime, dependencies, bootstrap, and entrypoint only; a source-only change
   reuses the same image. The reconciler still detects the edit from the source
-  fingerprint and **advances the runtime generation**, so warm execution
-  containers are recycled (idle discarded, busy drained) and entrypoint service
-  replicas are replaced through the normal start-before-stop path — a warm
-  container that had already imported the old modules never serves stale code.
+  fingerprint and applies it: a managed entrypoint service is **restarted in
+  place** (the same Docker container, same image, same bind) so its process
+  re-reads the live source, and warm execution containers are recycled (idle
+  discarded, busy drained) onto fresh containers — a warm container that had
+  already imported the old modules never serves stale code. Because Docker labels
+  are immutable, the reconciler records the applied source fingerprint in memory
+  so a restarted service is recognized as converged instead of being restarted on
+  every pass; after a worker restart each stale service is restarted once more,
+  then left alone.
 - **Dependency changes still rebuild.** A changed manifest changes the content
   addressed dependency image and therefore the app image tag, exactly as before;
   the dependency lifecycle is unchanged.
@@ -235,9 +241,9 @@ Operational caveats:
   metadata, and files excluded from the build by `.gitignore` (for example a
   local `.env`). `template.yaml` holds environment *values* and secret
   *references* (never resolved secret values), which the baked image
-  deliberately omits. Enable `SOURCE_MOUNT` only for app directories you are
+  deliberately omits. Enable `HOT_RELOAD` only for app directories you are
   willing to expose to the handler process and its container.
-- `SOURCE_MOUNT` does not add anything to the application environment.
+- `HOT_RELOAD` does not add anything to the application environment.
 
 ### Event size limit
 

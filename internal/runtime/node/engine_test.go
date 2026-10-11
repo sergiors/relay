@@ -540,7 +540,7 @@ func TestPlanTSWithTsconfig(t *testing.T) {
 	}
 }
 
-// TestPlanSourceMountedPersistsEsbuildAndMountsSource pins the SOURCE_MOUNT
+// TestPlanSourceMountedPersistsEsbuildAndMountsSource pins the HOT_RELOAD
 // Node plan: no source is baked, the pinned esbuild is installed PERSISTENTLY
 // (never removed) so the bootstrap can bundle TypeScript at container startup,
 // the live source is mounted at the DISTINCT SourceMountTarget (/app/src, so
@@ -653,7 +653,7 @@ func TestPlanSourceMountedShipsSharedResolveHook(t *testing.T) {
 	}
 }
 
-// TestPlanBakedHasNoSourceMountLayout pins the SOURCE_MOUNT=false invariant: a
+// TestPlanBakedHasNoSourceMountLayout pins the HOT_RELOAD=false invariant: a
 // baked plan declares no work-dir override and no mask, so its rendered
 // Dockerfile and container create shape are byte-for-byte the historical one.
 func TestPlanBakedHasNoSourceMountLayout(t *testing.T) {
@@ -723,13 +723,13 @@ func TestPlanSourceMountedDepsUnchanged(t *testing.T) {
 		t.Fatalf("mounted plan: %v", err)
 	}
 	if !baked.Deps.Equal(mounted.Deps) {
-		t.Errorf("deps changed under SOURCE_MOUNT: baked %+v mounted %+v", baked.Deps, mounted.Deps)
+		t.Errorf("deps changed under HOT_RELOAD: baked %+v mounted %+v", baked.Deps, mounted.Deps)
 	}
 	if baked.BaseImage != mounted.BaseImage {
-		t.Errorf("base image changed under SOURCE_MOUNT: %q -> %q", baked.BaseImage, mounted.BaseImage)
+		t.Errorf("base image changed under HOT_RELOAD: %q -> %q", baked.BaseImage, mounted.BaseImage)
 	}
 	if baked.UserSetup != mounted.UserSetup || baked.User != mounted.User {
-		t.Errorf("user setup changed under SOURCE_MOUNT")
+		t.Errorf("user setup changed under HOT_RELOAD")
 	}
 }
 
@@ -744,14 +744,14 @@ func TestPlanSourceMountedStillValidatesHandlers(t *testing.T) {
 	dir := t.TempDir()
 	writeSource(t, dir, "x.ts", "export function handler(e) {}\n")
 	if _, err := (Engine{}).Plan(spec, dir, []string{"missing"}); err == nil {
-		t.Error("expected a missing-module error under SOURCE_MOUNT")
+		t.Error("expected a missing-module error under HOT_RELOAD")
 	}
 
 	ambiguous := t.TempDir()
 	writeSource(t, ambiguous, "x.js", "export function handler(e) {}\n")
 	writeSource(t, ambiguous, "x.ts", "export function handler(e) {}\n")
 	if _, err := (Engine{}).Plan(spec, ambiguous, []string{"x"}); err == nil {
-		t.Error("expected an ambiguity error under SOURCE_MOUNT")
+		t.Error("expected an ambiguity error under HOT_RELOAD")
 	}
 }
 

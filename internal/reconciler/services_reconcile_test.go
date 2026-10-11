@@ -54,7 +54,7 @@ func (c *fakeContainer) effectiveSourceRef() string {
 }
 
 // sourceMountIdentity mirrors production serviceLabels: the relay.source value a
-// StartService call stamps for a SOURCE_MOUNT spec ("" when there is no mount).
+// StartService call stamps for a HOT_RELOAD spec ("" when there is no mount).
 func sourceMountIdentity(spec runtime.ServiceSpec) string {
 	if spec.SourceMount == nil {
 		return ""
@@ -84,7 +84,7 @@ type fakeDocker struct {
 	resolvedImages  map[string]string
 	// mountIdentity, when a source reference has an entry, makes
 	// ResolveServiceImage return an entrypoint source with a live source Mount
-	// carrying that identity, so tests can exercise SOURCE_MOUNT convergence.
+	// carrying that identity, so tests can exercise HOT_RELOAD convergence.
 	mountIdentity map[string]string
 	// startGate, when non-nil, is called AFTER a container is created and BEFORE
 	// StartService returns, with the lock released. It lets a test park a
@@ -261,7 +261,7 @@ func (f *fakeDocker) setState(id string, st container.ContainerState) {
 	}
 }
 
-// setMountIdentity sets the SOURCE_MOUNT identity ResolveServiceImage reports
+// setMountIdentity sets the HOT_RELOAD identity ResolveServiceImage reports
 // for a source reference (empty disables the mount).
 func (f *fakeDocker) setMountIdentity(sourceRef, identity string) {
 	f.mu.Lock()

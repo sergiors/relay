@@ -69,7 +69,13 @@
 // nil-safe), which the worker wires to a *ServiceReconciler constructed from the
 // runtime Manager's Docker seam. A service's source (entrypoint or image) is
 // resolved to a runnable image BEFORE any container action; a source that cannot
-// be resolved leaves the service's existing healthy containers untouched.
+// be resolved leaves the service's existing healthy containers untouched. Under
+// HOT_RELOAD a source-only change to a source-mounted entrypoint service is
+// applied by an in-place restart (the same Docker container, same image, same
+// bind) rather than a replace; the applied source fingerprint is tracked in
+// memory because the container's relay.source label is immutable. A dependency
+// or configuration change still replaces the container through the normal
+// start-before-stop path.
 //
 // Reconcile owns its timeouts: it receives the LIFECYCLE context (the worker
 // passes its signal context, never a pass-wide short deadline) and a reconcile

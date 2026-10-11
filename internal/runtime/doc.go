@@ -15,7 +15,7 @@
 //     embedders and tests may call with any context), and a caller's deadline
 //     must never cut off a legitimate image build; the lifecycle root keeps
 //     builds cancellable on Relay shutdown.
-//   - Source mount (SOURCE_MOUNT): when enabled, a runtime whose dependency
+//   - Source mount (HOT_RELOAD): when enabled, a runtime whose dependency
 //     layout permits it (Python and Node; see plan.Spec.MountableSource) builds
 //     the app image WITHOUT the source and bind-mounts the app's live directory
 //     read-only at the runtime's source root. Python mounts at the workdir
@@ -30,9 +30,10 @@
 //     CommonJS require) even when it appears after
 //     preparation (and therefore carries no mask). A
 //     source-only edit then reuses the same image while the advanced source
-//     fingerprint recycles the app's warm containers and replaces its entrypoint
-//     service replicas. SOURCE_MOUNT=false is the historical baked-source
-//     behavior. The bind source is normally the app dir (fn.Dir), which the
+//     fingerprint recycles the app's warm execution containers and restarts its
+//     entrypoint service containers in place (same container ID, same image,
+//     same bind; see internal/reconciler). HOT_RELOAD=false is the historical
+//     baked-source behavior. The bind source is normally the app dir (fn.Dir), which the
 //     Docker daemon resolves on its own host filesystem; when Relay itself runs
 //     in a container on that daemon (the bundled Compose layout) and the app dir
 //     lies under one of Relay's own bind mounts, Relay inspects its own container
