@@ -278,7 +278,12 @@ func imageIdentityKey(ref, id, fingerprint string) string {
 // labels are OPTIONAL: an image without them still yields its content ID, so an
 // external service image is never required to carry Relay metadata.
 func (m *Manager) imageInspectContent(ctx context.Context, ref string) (id, fingerprint string, present bool, err error) {
-	insp, err := m.cli.ImageInspect(ctx, ref)
+	opCtx, release, err := m.beginDockerOp(ctx)
+	if err != nil {
+		return "", "", false, err
+	}
+	defer release()
+	insp, err := m.cli.ImageInspect(opCtx, ref)
 	if err != nil {
 		if cerrdefs.IsNotFound(err) {
 			return "", "", false, nil
@@ -440,16 +445,27 @@ func (m *Manager) RemoveImageNow(ctx context.Context, image string) error {
 // when false a still-held lease is reported as ErrImageRetiring immediately.
 // removed reports whether this call actually issued a successful removal.
 //
-// The whole operation is lifecycle-owned: its context is derived from both the
-// caller's ctx and the manager's shutdown signals (see Manager.removalContext),
-// and it is registered with the coordinator's beginRemoval, so manager shutdown
-// refuses new removals and joins this one before the Docker client closes.
+// The whole operation is lifecycle-owned: it is admitted through the Manager's
+// general Docker operation gate (so its context observes both the caller's ctx
+// and Manager shutdown) and registered with the coordinator's beginRemoval, so
+// manager shutdown refuses new removals and drains this one before the Docker
+// client closes.
 func (m *Manager) retireOwned(ctx context.Context, image string, wait bool) (removed bool, err error) {
 	if image == "" {
 		return false, nil
 	}
-	rmCtx, stop := m.removalContext(ctx)
-	defer stop()
+	rmCtx, release, err := m.beginDockerOp(ctx)
+	if err != nil {
+		// The manager is shutting down: no new Docker removal may begin. A
+		// caller whose own context is already done sees its own error (the
+		// cancellation, not a synthesized shutdown sentinel), preserving caller
+		// cancellation semantics.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
+		}
+		return false, err
+	}
+	defer release()
 	coord := m.leaseCoord()
 	drained, owner, err := coord.beginRemoval(image)
 	if err != nil {

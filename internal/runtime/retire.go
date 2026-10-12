@@ -5,64 +5,6 @@ import (
 	"time"
 )
 
-// removalContext derives the context for one manager-owned Docker image-removal
-// or removal-guard operation. It is a child of the caller's ctx, so a caller's
-// deadline/cancellation is preserved exactly; it is ALSO cancelled when the
-// manager begins shutting down, whichever of these happens first:
-//
-//   - the manager lifecycle is cancelled (the worker's signal context, or
-//     CloseContext's lifecycleCancel); or
-//   - the lease coordinator's shutdown context is cancelled (CloseContext's
-//     beginShutdown, which also covers a Manager constructed directly by tests
-//     with no lifecycle context).
-//
-// Deriving from both is what makes removal lifecycle-owned: once shutdown
-// begins, an in-flight removal's Docker calls observe cancellation and abort
-// instead of racing a closing client, and there is no window where the manager
-// lifecycle is unset (a direct test Manager) yet shutdown is not honoured.
-//
-// Already-done parents are wired SYNCHRONOUSLY (the explicit Err check), not
-// solely via context.AfterFunc, because AfterFunc invokes its callback in a new
-// goroutine: a removal starting just after lifecycle cancellation must observe
-// the cancellation immediately, not one scheduler tick later, or it could slip a
-// Docker call past the beginShutdown/waitRetirements barrier.
-//
-// The returned stop must be called when the operation concludes. It releases
-// the shutdown watchers (so registrations do not accumulate over a long-lived
-// manager) and cancels the derived context.
-func (m *Manager) removalContext(ctx context.Context) (context.Context, func()) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	merged, cancel := context.WithCancel(ctx)
-
-	var parents []context.Context
-	if m != nil {
-		if m.lifecycle != nil {
-			parents = append(parents, m.lifecycle)
-		}
-		if coord := m.leaseCoord(); coord != nil {
-			parents = append(parents, coord.shutdownContext())
-		}
-	}
-	var stops []func() bool
-	for _, p := range parents {
-		if p.Err() != nil {
-			// Already cancelled: propagate synchronously.
-			cancel()
-			continue
-		}
-		stops = append(stops, context.AfterFunc(p, cancel))
-	}
-	stop := func() {
-		for _, s := range stops {
-			s()
-		}
-		cancel()
-	}
-	return merged, stop
-}
-
 // leaseCoord returns the manager's image-lease coordinator, lazily initializing
 // it on first use. Exactly one coordinator exists per Manager and it lives for
 // the manager's whole lifetime: it is the single ownership authority every
@@ -88,21 +30,25 @@ func (m *Manager) leaseCoord() *imageCoordinator {
 
 // beginRemovalOperation starts a lifecycle-owned removal-RELATED Docker
 // operation (a container/image listing that guards removal) that does not itself
-// commit an image to retirement. It derives the operation's context from both
-// ctx and the manager shutdown signals and registers it with the coordinator, so
-// manager shutdown refuses new operations with ErrManagerShuttingDown and joins
-// this one before the Docker client closes. The returned finish must be called
-// (defer) when the operation concludes.
+// commit an image to retirement. It admits the operation through the Manager's
+// general Docker operation gate (so its context observes both the caller's ctx
+// and Manager shutdown) and ALSO registers it with the coordinator's listing
+// gate, so manager shutdown refuses new operations with ErrManagerShuttingDown
+// and joins this one before the Docker client closes. The returned finish must be
+// called (defer) when the operation concludes.
 func (m *Manager) beginRemovalOperation(ctx context.Context) (context.Context, func(), error) {
+	opCtx, release, err := m.beginDockerOp(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
 	coord := m.leaseCoord()
-	opCtx, stop := m.removalContext(ctx)
 	if err := coord.beginRemovalOp(); err != nil {
-		stop()
+		release()
 		return nil, nil, err
 	}
 	return opCtx, func() {
 		coord.finishRemovalOp()
-		stop()
+		release()
 	}, nil
 }
 

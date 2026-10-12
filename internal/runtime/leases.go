@@ -129,11 +129,12 @@ type imageCoordinator struct {
 	// shuttingDown is set once by beginShutdown. It is the removal gate: no new
 	// removal may begin after it is set.
 	shuttingDown bool
-	// shutdownCtx is cancelled by beginShutdown. Every removal operation derives
-	// its context from it (see Manager.removalContext), so shutdown cancels an
-	// in-flight Docker removal even for a Manager constructed directly by tests
-	// with no lifecycle context. It is created lazily so a zero-valued
-	// coordinator still works.
+	// shutdownCtx is cancelled by beginShutdown. Every removal operation
+	// registers through the Manager's general Docker operation gate (see
+	// Manager.beginDockerOp), whose context observes the same shutdown, so
+	// shutdown cancels an in-flight Docker removal even for a Manager
+	// constructed directly by tests with no lifecycle context. It is created
+	// lazily so a zero-valued coordinator still works.
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
 	// retireOps counts OWNED removal operations from beginRemoval to
@@ -418,10 +419,10 @@ func (c *imageCoordinator) finishRemoval(image string, success bool) {
 }
 
 // beginShutdown closes the removal gate and cancels the coordinator's shutdown
-// context, so no new removal can begin and every in-flight removal's derived
-// context (see Manager.removalContext) is cancelled. It is idempotent and does
-// NOT wait for in-flight operations; waitRetirements performs the join after
-// the gate is closed.
+// context, so no new removal can begin and every in-flight removal's operation
+// context (see Manager.beginDockerOp, which also observes this shutdown) is
+// cancelled. It is idempotent and does NOT wait for in-flight operations;
+// Manager.CloseContext drains them after the gate is closed.
 func (c *imageCoordinator) beginShutdown() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -479,8 +480,17 @@ func (c *imageCoordinator) shutdownErr(ctx context.Context, err error) error {
 // operation's derived context, the join is prompt: an operation blocked on a
 // lease drain or inside a Docker call observes the cancellation, concludes
 // (clearing its gate so the image is retryable next boot), and decrements its
-// registration. This is the barrier that lets CloseContext close the Docker
-// client only after no removal can still issue a request against it.
+// registration.
+//
+// It is NOT on the Manager close path: every production removal also registers
+// with the Manager's general Docker operation lifecycle (see
+// Manager.beginDockerOp), and Manager.CloseContext closes the client only after
+// managerOps.drainNormal (and, for cache teardown, drainTeardown) — both take no
+// context and therefore cannot return early on an expired caller bound. This
+// coordinator-scoped join is retained for the coordinator's own
+// diagnostics/tests and for a caller that wants to wait on the
+// image-retirement subset alone; its ctx early return can never bypass the
+// Manager's phase drains.
 func (c *imageCoordinator) waitRetirements(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()

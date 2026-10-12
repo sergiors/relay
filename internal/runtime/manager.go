@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/client"
 	"go.opentelemetry.io/otel/codes"
 
@@ -192,6 +193,15 @@ type Manager struct {
 	// by tests lazily initializes it on first use (leaseInit).
 	leases    *imageCoordinator
 	leaseInit sync.Once
+	// ops is the Manager's single Docker operation lifecycle: it gates admission
+	// of Manager-owned Docker work, tracks it, owns the cancellation every
+	// detached path derives from, and drains it before CloseContext closes the
+	// Docker client. It is created by NewManager; a Manager constructed directly
+	// by tests lazily initializes it on first use (opsInit). It is deliberately
+	// separate from leases: leases specialize in image ownership/retirement,
+	// while ops owns every Docker operation uniformly. See operations.go.
+	ops     *managerOps
+	opsInit sync.Once
 	// lifecycle is the manager's lifecycle context: Dockerfile builds are
 	// rooted here (see buildContext), so a long build is bounded by buildTimeout
 	// but still cancelled when Relay shuts down, without ever inheriting a
@@ -288,6 +298,13 @@ type Manager struct {
 	// generation keying on image content can be exercised without a Docker
 	// daemon. A returned zero value falls back to the reference identity.
 	resolveImageIdentityFn func(ctx context.Context, ref, fingerprint string) (resolvedImage, error)
+	// startExecutionContainerFn replaces the production startExecutionContainer
+	// call inside Manager.startContainer. It is nil in production and set only by
+	// in-package tests so the create-window operation admission, the
+	// shutdown-race cleanup, and the release path can be exercised
+	// deterministically without a Docker attach hijack (which the scripted
+	// daemon cannot perform).
+	startExecutionContainerFn func(ctx context.Context, ops containerOps, cli *client.Client, log *slog.Logger, fn, image string, env []string, networks []string, limits app.ResourceLimits, meta RunMeta, workDir string, mounts ...mount.Mount) (reusableContainer, error)
 	// afterSourceSnapshot is the deterministic seam around the captured source
 	// snapshot: Prepare calls it (test-only) ONCE, immediately after
 	// CaptureSourceSnapshot and before the fingerprint is derived, passing the
@@ -544,12 +561,19 @@ func NewManager(
 	// shutdown) propagates too. Builds are bounded by buildTimeout on top of
 	// this; they are never rooted in a caller's short reconcile context.
 	mgr.lifecycle, mgr.lifecycleCancel = lifecycle, lifecycleCancel
+	// The Docker operation lifecycle shares the manager lifecycle: closing the
+	// manager (or a parent cancellation, e.g. Relay shutdown) cancels every
+	// admitted operation, and CloseContext drains them before closing the client.
+	mgr.ops = newManagerOps(lifecycle)
 	mgr.containers = newContainerCache()
 	mgr.containers.idleTimeout = resolved.idleTimeout
 	mgr.containers.now = resolved.now
 	mgr.containers.metrics = registry
 	mgr.containers.maxWarm = resolved.maxWarmContainers
 	mgr.containers.publishWarmCapacity()
+	// The container cache admits ordinary pool teardowns as normal Manager
+	// operations through the same lifecycle, so shutdown owns every discard.
+	mgr.containers.ops = mgr.ops
 	mgr.leases = newImageCoordinator()
 	mgr.maintInterval = maintenanceInterval(resolved.idleTimeout)
 	if !resolved.deferredMaintenance {
@@ -582,14 +606,28 @@ func (m *Manager) Logger() *slog.Logger {
 // honoring ctx (the caller supplies its own deadline). It is the live
 // dependency check the worker's readiness probe uses in steady state: the
 // manager's startup ping happened once at construction, but readiness must
-// reflect whether the daemon is still reachable. It deliberately does NOT use
-// the manager lifecycle or an internal timeout — the caller owns the bound, so
-// a readiness query can never stall and a cancelled query aborts promptly.
+// reflect whether the daemon is still reachable.
+//
+// It is admitted through the manager's Docker operation gate, so a readiness
+// query in flight when Manager shutdown begins is cancelled and joined before
+// the Docker client closes, and a query after admission has closed is refused
+// (readiness correctly reports not-ready). The caller still owns the bound: the
+// caller's ctx is merged with, never replaced by, the manager lifecycle, so a
+// cancelled query aborts promptly and can never stall readiness.
+//
+// The STARTUP ping in NewManager is deliberately not this method: it runs on the
+// local ping context before the manager is returned, so no caller can hold the
+// manager — and therefore no Close can race it.
 func (m *Manager) Ping(ctx context.Context) error {
 	if m == nil || m.cli == nil {
 		return fmt.Errorf("docker client unavailable")
 	}
-	_, err := m.cli.Ping(ctx, client.PingOptions{})
+	opCtx, release, err := m.beginDockerOp(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	_, err = m.cli.Ping(opCtx, client.PingOptions{})
 	return err
 }
 
@@ -793,21 +831,31 @@ func (m *Manager) Close() error {
 //     its teardowns on this lifecycle, an eviction pass already in flight is
 //     cancelled too, so the join below returns promptly;
 //  2. joins the maintenance loop, so no eviction races the teardown;
-//  3. closes the image-removal gate (beginShutdown): after this point no NEW
-//     manager-owned removal may begin (a runner async cleanup that fires after
-//     lifecycle cancellation is refused with ErrManagerShuttingDown), and every
-//     in-flight removal's derived context is cancelled;
-//  4. joins every in-progress manager-owned removal (waitRetirements) — the
-//     join is prompt because step 3 cancelled their contexts — so no removal can
-//     still issue a Docker request after this point;
-//  5. tears down every cached execution container through a bounded parallel
-//     worker pool (containerShutdownConcurrency), each teardown context-aware,
-//     so a large warm pool is not discarded with O(N) serial Docker delays and
-//     an expired ctx stops waiting;
-//  6. drops any outstanding image leases (reset); it no longer wakes removal
-//     waiters (they were already joined, and waking them would let a remover
-//     race the close);
+//  3. PHASE 1 (normal): closes normal admission atomically (ops.closeNormal),
+//     cancelling every normal operation's context, then DRAINS every normal
+//     operation (ops.drainNormal). After this point no ordinary Manager-owned
+//     Docker operation may begin — a synchronous method, a runner async cleanup,
+//     a service pass, an execution-container create, or an execution-container
+//     discard/watcher all receive ErrManagerShuttingDown — and no ordinary
+//     operation (including a pool discard reserved before close) is still in
+//     flight when the cache is torn down. A pool discard that races this
+//     transition is refused and leaves its container in the pool, owned by cache
+//     teardown. The specialized image-retirement gate is closed here too
+//     (beginShutdown);
+//  4. PHASE 2 (teardown): opens the teardown phase (ops.openTeardown), which
+//     ONLY Manager cache teardown may use, then tears down every cached
+//     execution container through a bounded parallel worker pool
+//     (containerShutdownConcurrency), each teardown context-aware;
+//  5. drops any outstanding image leases (reset); it does not wake removal
+//     waiters — waking one would let a remover race the close;
+//  6. closes teardown admission atomically (ops.closeTeardown) and DRAINS the
+//     teardown operations (ops.drainTeardown), so no operation can be admitted
+//     after the final drain starts and the client cannot close beneath one;
 //  7. closes the Docker Engine client only after every step above returns.
+//
+// The caller's ctx bounds only the cooperative work of the teardown phase; the
+// drains deliberately take no context, because a best-effort cleanup that
+// outlives its bound must still be joined before the client closes.
 //
 // Idempotent: a second call returns the stored client-close result without
 // re-running the teardown, exactly like Close. Safe to call more than once
@@ -844,23 +892,46 @@ func (m *Manager) CloseContext(ctx context.Context) error {
 			m.closed = true
 			m.maintMu.Unlock()
 		}
-		// Make retirement/removal lifecycle-owned: close the removal gate BEFORE
-		// joining, so no new manager-owned removal can begin once shutdown has
-		// started and every in-flight one is cancelled. Then join them, so the
-		// Docker client is only closed once no removal is still using it.
-		// leaseCoord() (not a raw field read) is used so a coordinator lazily
-		// created by a concurrent removal is the exact one gated and joined.
+		// Make every Manager-owned Docker operation lifecycle-owned, in explicit
+		// phases. opsCoord()/leaseCoord() (not raw field reads) are used so
+		// authorities lazily created by a concurrent operation are the exact ones
+		// gated and drained.
+		ops := m.opsCoord()
 		coord := m.leaseCoord()
+
+		// PHASE 1 — normal. Close ordinary admission atomically and cancel every
+		// normal operation's context, then DRAIN every normal operation. No
+		// normal operation may be admitted after this point, and no cache
+		// teardown runs until every normal operation (including execution
+		// container teardown and the exit-wait watcher) has concluded.
+		ops.closeNormal()
 		coord.beginShutdown()
-		coord.waitRetirements(ctx)
+		ops.drainNormal()
+
+		// PHASE 2 — teardown. Open the teardown phase, which ONLY Manager cache
+		// teardown may use. Nothing is admitted through it before normal
+		// admission is closed and fully drained.
+		ops.openTeardown()
+		teardownCtx, releaseTeardown, terr := ops.beginTeardown(ctx)
+		if terr != nil {
+			// Defensive: we just opened the phase, so admission cannot be
+			// refused. Fall back to a plain context so cache teardown still runs.
+			teardownCtx, releaseTeardown = ctx, func() {}
+		}
 		if m.containers != nil {
-			m.containers.closeContext(ctx)
+			m.containers.closeContext(teardownCtx)
 		}
 		// Drop any outstanding image leases: the manager is shutting down, so
 		// every admitted reference ends here. This is defense against a caller
-		// that never released a Prepared handle it did not publish. It does not
-		// wake retirement waiters; those operations were already joined above.
+		// that never released a Prepared handle it did not publish.
 		coord.reset()
+		// Close teardown admission atomically, then drain it: after closeTeardown
+		// no operation of either kind can be admitted, and the final drain cannot
+		// be raced by a late discard.
+		ops.closeTeardown()
+		releaseTeardown()
+		ops.drainTeardown()
+
 		if m.cli == nil {
 			// A Manager constructed directly by a test (no Docker) still owns a
 			// cache and maintenance loop, so Close must be safe without a client.
@@ -885,6 +956,15 @@ func (m *Manager) CloseContext(ctx context.Context) error {
 // fields left empty — labels are immutable while the container outlives
 // invocations). Every container joins the worker-global network set
 // (WithNetworks).
+//
+// The create+attach+start window is one admitted Manager-owned Docker operation:
+// create and its cleanup-on-failure happen inside the tracked op, and if the
+// manager begins closing while the create is in flight the fresh container is
+// torn down inside the op before it is released, so a create can never hand a
+// container to a closing manager and the client is never closed under a
+// still-live create. The returned container also carries the manager shutdown
+// context as its lifecycle, so its detached exit wait and self-initiated
+// teardown observe Manager close instead of running detached.
 func (m *Manager) startContainer(
 	ctx context.Context,
 	fnName string,
@@ -896,8 +976,74 @@ func (m *Manager) startContainer(
 	if m.startContainerFn != nil {
 		return m.startContainerFn(ctx, fnName, img, env, limits, meta)
 	}
+	opCtx, release, err := m.beginDockerOp(ctx)
+	if err != nil {
+		return nil, err
+	}
 	workDir, mounts := m.executionSourceMount(fnName)
-	return startExecutionContainer(ctx, m.cli, m.log, fnName, img.createImage(), env, m.networks, limits, meta, workDir, mounts...)
+	c, err := m.createExecutionContainer(
+		opCtx, m.containerOps(), m.cli, m.log, fnName, img.createImage(), env,
+		m.networks, limits, meta, workDir, mounts...,
+	)
+	if err != nil {
+		// startExecutionContainer has already removed any container it created
+		// before returning the error, so the create result is cleaned up before
+		// the operation is released.
+		release()
+		return nil, err
+	}
+	if m.opsCoord().isClosing() {
+		// Manager shutdown began while this create was in flight: never hand a
+		// fresh container back to a closing manager. The cleanup runs INSIDE this
+		// still-open create operation — it is not separately admitted and does
+		// not use the teardown phase — on a fresh background context, NOT the
+		// caller's ctx or the create operation's own context (both of which may
+		// already be cancelled by shutdown), so the cleanup actually runs
+		// (bounded per call by containerOpTimeout). It is counted by the create
+		// operation and therefore joined by drainNormal before the client closes.
+		// Report the pool as closed, exactly as the pool's own closed-race path
+		// would.
+		discardOnContext(c, context.Background(), reasonShutdown)
+		release()
+		return nil, errPoolClosed
+	}
+	release()
+	return c, nil
+}
+
+// createExecutionContainer builds the production execution container, or a
+// test's injected alternative (startExecutionContainerFn). The seam exists so
+// the create-window admission, the shutdown-race cleanup, and the release path
+// in startContainer are unit-testable without a real Docker attach hijack.
+func (m *Manager) createExecutionContainer(
+	ctx context.Context,
+	ops containerOps,
+	cli *client.Client,
+	log *slog.Logger,
+	fn, image string,
+	env []string,
+	networks []string,
+	limits app.ResourceLimits,
+	meta RunMeta,
+	workDir string,
+	mounts ...mount.Mount,
+) (reusableContainer, error) {
+	if m.startExecutionContainerFn != nil {
+		return m.startExecutionContainerFn(ctx, ops, cli, log, fn, image, env, networks, limits, meta, workDir, mounts...)
+	}
+	return startExecutionContainer(ctx, ops, cli, log, fn, image, env, networks, limits, meta, workDir, mounts...)
+}
+
+// containerOps returns the manager-owned lifecycle an execution container uses
+// for its detached Docker work. It carries BOTH the manager shutdown context
+// (so the container's exit wait is cancelled at Manager close) and the manager
+// operation gate (so every teardown and the wait watcher itself are admitted,
+// tracked, and drained). A Manager with no operation authority (direct test
+// construction) uses the zero value, preserving the historical detached
+// behavior.
+func (m *Manager) containerOps() containerOps {
+	gate := m.opsCoord()
+	return containerOps{lifecycle: gate.context(), gate: gate}
 }
 
 // Prepared is an app whose image has been built.
@@ -1057,6 +1203,20 @@ func (m *Manager) prepare(
 	fingerprint string,
 	suppliedSelection *source.Selection,
 ) (*Prepared, error) {
+	// Gate the whole preparation as one Manager-owned Docker operation: the
+	// reuse probes (imageExists/bootstrapLabelMatches), the self-mount inspect,
+	// and the build's Docker calls all run inside it, so a preparation that
+	// overlaps Manager shutdown is cancelled and joined before the Docker client
+	// closes. The build itself keeps its own lifecycle-rooted buildTimeout
+	// context (see buildContext); this admission only tracks/authorizes the
+	// preparation, it does not shorten a legitimate build.
+	opCtx, release, err := m.beginDockerOp(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	ctx = opCtx
+
 	// A template that needs no runtime (its services all use the external
 	// `image` source, and it has no events or schedules) has no app image
 	// to build: the services bring their own images. Prepare still succeeds so

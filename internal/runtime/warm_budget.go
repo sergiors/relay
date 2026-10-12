@@ -476,8 +476,21 @@ func (p *appPool) oldestIdle() (*pooledContainer, time.Time) {
 // slot exactly once — and only on confirmed removal.
 func (p *appPool) evictIdleContainer(ctx context.Context, pc *pooledContainer) bool {
 	p.mu.Lock()
-	if p.closed || p.removing || !p.removeIdleLocked(pc) {
+	if p.closed || p.removing {
 		p.mu.Unlock()
+		return false
+	}
+	// Reserve the teardown as a normal operation BEFORE removing the idle
+	// container, so a shutdown race never leaves it removed-but-unowned (cache
+	// teardown owns it instead).
+	op, ok := p.cache.reserveDiscard(ctx)
+	if !ok {
+		p.mu.Unlock()
+		return false
+	}
+	if !p.removeIdleLocked(pc) {
+		p.mu.Unlock()
+		op.release()
 		return false
 	}
 	pc.retired = true
@@ -485,7 +498,7 @@ func (p *appPool) evictIdleContainer(ctx context.Context, pc *pooledContainer) b
 	p.publishPoolGaugesLocked()
 	p.signalLocked()
 	p.mu.Unlock()
-	return p.discardContainerContext(ctx, pc, reasonWarmEviction)
+	return p.discardReserved(op, pc, reasonWarmEviction)
 }
 
 // removeIdleLocked removes pc from the active or draining idle list if present

@@ -87,13 +87,79 @@ func containerRemovalConfirmed(ctx context.Context, c reusableContainer) bool {
 
 // discardOnContext tears c down on ctx when the container supports a
 // context-aware teardown, falling back to its detached discard otherwise. Every
-// pool teardown funnels through it so the shutdown path is context-bounded while
-// non-shutdown paths keep their historical detached behavior.
+// pool teardown funnels through it: the production executionContainer runs the
+// teardown on the admitted operation context the caller supplied (see
+// reserveDiscard/discardReserved), so no Manager-owned execution-container
+// Docker call escapes the lifecycle; a test fake without that capability keeps
+// its historical detached discard.
 func discardOnContext(c reusableContainer, ctx context.Context, reason string) bool {
 	if cd, ok := c.(contextDiscarder); ok {
 		return cd.discardContext(ctx, reason)
 	}
 	return c.discard(reason)
+}
+
+// discardOp is one admitted NORMAL Manager operation covering a container
+// teardown. A pool reserves it BEFORE removing the container from the pool, so a
+// container can never be removed without either an admitted operation (whose
+// context the teardown runs on) or shutdown-owned cache-teardown ownership.
+type discardOp struct {
+	ctx     context.Context
+	release func()
+}
+
+// reserveDiscard admits a NORMAL Manager operation for one container teardown.
+// It returns ok=false when Manager shutdown has closed normal admission (or ctx
+// is already done): the caller MUST then leave the container in the pool (must
+// not remove it), so the shutdown-owned cache teardown phase owns and cleans it.
+//
+// The returned operation context is the CALLER's ctx, not the operation's normal
+// shutdown context: a teardown admitted before Manager close must be able to RUN
+// (bounded per call by containerOpTimeout) rather than being aborted by close,
+// while still observing the caller's own cancellation (e.g. the maintenance
+// loop's lifecycle context). It is the operation COUNT — discharged by the
+// returned release — that makes drainNormal wait for it. A cache with no manager
+// lifecycle (direct tests) succeeds with ctx.
+func (cc *containerCache) reserveDiscard(ctx context.Context) (*discardOp, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if cc.ops == nil {
+		return &discardOp{ctx: ctx, release: func() {}}, true
+	}
+	_, release, err := cc.ops.begin(ctx)
+	if err != nil {
+		return nil, false
+	}
+	return &discardOp{ctx: ctx, release: release}, true
+}
+
+// discardReserved tears a SINGLE container down on the operation reserved for it,
+// discharges the reservation, and reports whether this call freed the container's
+// global warm-budget slot. It is the production pool disposal path for a
+// one-container reservation (release, warm eviction).
+func (p *appPool) discardReserved(op *discardOp, pc *pooledContainer, reason string) bool {
+	if op == nil {
+		return false
+	}
+	defer op.release()
+	return p.discardContainerContext(op.ctx, pc, reason)
+}
+
+// discardReservedBatch tears down EVERY container in items on the operation
+// reserved for the whole batch and discharges the reservation EXACTLY ONCE,
+// after the entire batch — never per item. Releasing per item would drop the
+// operation count while later items' Docker teardowns are still outstanding, so
+// a Manager drain could observe zero and close the client between item calls.
+// The deferred release discharges on every return and panic path.
+func (p *appPool) discardReservedBatch(op *discardOp, items []*pooledContainer, reasonFor func(*pooledContainer) string) {
+	if op == nil {
+		return
+	}
+	defer op.release()
+	for _, pc := range items {
+		p.discardContainerContext(op.ctx, pc, reasonFor(pc))
+	}
 }
 
 // Discard reasons. They are labels on the discard path (logs, metrics, tests),
@@ -212,6 +278,12 @@ type containerCache struct {
 	// all pool metric recording; every call is a no-op. Set once at construction
 	// and read without the lock.
 	metrics *metrics.Registry
+	// ops is the Manager's Docker operation lifecycle, used to admit ordinary
+	// pool teardowns as NORMAL operations BEFORE a container is removed from the
+	// pool, so a shutdown race can never leave a removed container unowned (see
+	// reserveDiscard). It is nil for a cache constructed directly by tests, in
+	// which case teardowns run unguarded as before.
+	ops *managerOps
 }
 
 // generation is one container VERSION's set inside an app pool. A version is
@@ -580,28 +652,39 @@ func (cc *containerCache) setAppResources(fnName string, limits app.ResourceLimi
 	// retire the current active generation now rather than waiting for a lazy
 	// acquire: idle old-config containers must not be served, and the drain
 	// begins immediately.
-	for _, pc := range p.replaceConfig(limits.Fingerprint()) {
-		p.discardContainer(pc, reasonResourcesChanged)
-	}
+	discard, op := p.replaceConfig(limits.Fingerprint())
+	p.discardReservedBatch(op, discard, func(*pooledContainer) string { return reasonResourcesChanged })
 }
 
 // replaceConfig supersedes the active generation's resource config with
 // newConfig. It un-retires newConfig (a revert to a previously-retired config
 // must warm again), retires the currently-active config, discards its idle
 // containers immediately, and moves its busy ones to a draining generation. It
-// returns the idle containers to discard outside the lock, and must not be called
-// with p.mu held.
-func (p *appPool) replaceConfig(newConfig string) []*pooledContainer {
+// returns the idle containers to discard outside the lock together with the
+// normal Manager operation reserved for them (see reserveDiscard): on refusal
+// (Manager shutdown) it returns (nil, nil) and leaves the generation untouched,
+// so the shutdown-owned cache teardown owns it. It must not be called with p.mu
+// held.
+func (p *appPool) replaceConfig(newConfig string) ([]*pooledContainer, *discardOp) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.retiredConfigs, newConfig)
 	if p.closed || p.removing {
-		return nil
+		return nil, nil
 	}
 	if p.active == nil || p.active.config == newConfig {
-		return nil
+		return nil, nil
 	}
 	old := p.active
+	// Reserve the idle-container teardown BEFORE mutating the generation: a
+	// refusal must leave the containers in place for cache teardown.
+	var op *discardOp
+	if len(old.idle) > 0 {
+		var ok bool
+		if op, ok = p.cache.reserveDiscard(context.Background()); !ok {
+			return nil, nil
+		}
+	}
 	p.retiredConfigs[old.config] = true
 	var discard []*pooledContainer
 	for _, pc := range old.idle {
@@ -626,7 +709,7 @@ func (p *appPool) replaceConfig(newConfig string) []*pooledContainer {
 	p.active = nil
 	p.publishPoolGaugesLocked()
 	p.signalLocked()
-	return discard
+	return discard, op
 }
 
 // appResources returns fnName's current effective per-container resource
@@ -676,21 +759,23 @@ func (cc *containerCache) setAppConcurrency(fnName string, max int) {
 	if p == nil {
 		return
 	}
-	for _, pc := range p.setMax(max) {
-		p.discardContainer(pc, reasonConcurrencyShrink)
-	}
+	discard, op := p.setMax(max)
+	p.discardReservedBatch(op, discard, func(*pooledContainer) string { return reasonConcurrencyShrink })
 }
 
 // setMax applies a new bound to this pool and returns the excess IDLE containers
-// to discard (the caller tears them down outside the lock). It is a no-op for an
+// to discard (the caller tears them down outside the lock) together with the
+// normal Manager operation reserved for them (see reserveDiscard). On refusal
+// (Manager shutdown) it returns (nil, nil) and leaves the excess idle containers
+// in place, so the shutdown-owned cache teardown owns them. It is a no-op for an
 // equal bound or a closed/removing pool. It is the single pool-level bound
 // operation, so acquisition, PoolSnapshot/socket/CLI, and the capacity gauge all
 // read the same p.max. It must not be called with p.mu held.
-func (p *appPool) setMax(max int) []*pooledContainer {
+func (p *appPool) setMax(max int) ([]*pooledContainer, *discardOp) {
 	p.mu.Lock()
 	if p.closed || p.removing || max == p.max {
 		p.mu.Unlock()
-		return nil
+		return nil, nil
 	}
 	p.max = max
 	p.publishPoolCapacityLocked()
@@ -698,14 +783,27 @@ func (p *appPool) setMax(max int) []*pooledContainer {
 	// containers are never killed; a container returned to an over-bound pool is
 	// retired on release instead (see release), so the pool converges as leases
 	// drain. An increase is lazy: nothing is started here, only admission opens.
-	discard := p.takeExcessIdleLocked(p.usedLocked() - p.max)
+	excess := p.usedLocked() - p.max
+	var op *discardOp
+	if excess > 0 {
+		var ok bool
+		if op, ok = p.cache.reserveDiscard(context.Background()); !ok {
+			p.mu.Unlock()
+			return nil, nil
+		}
+	}
+	discard := p.takeExcessIdleLocked(excess)
 	if len(discard) > 0 {
 		// The idle gauges must drop with the containers the shrink retires.
 		p.publishPoolGaugesLocked()
 	}
+	if len(discard) == 0 && op != nil {
+		op.release()
+		op = nil
+	}
 	p.signalLocked()
 	p.mu.Unlock()
-	return discard
+	return discard, op
 }
 
 // takeExcessIdleLocked removes up to n idle containers from the active then
@@ -851,6 +949,26 @@ func (cc *containerCache) acquireVersion(
 	max int,
 	start func() (reusableContainer, error),
 ) (*containerLease, error) {
+	// The whole acquire — the capacity wait, the lazy create, and the
+	// post-create settle/reap — is ONE normal Manager operation. That makes the
+	// create and any teardown it produces (a fresh container the pool refuses
+	// because it closed) part of an existing normal op scope: it is counted, so
+	// Manager close refuses a new acquire, cancels and joins an in-flight one
+	// (drainNormal) before cache teardown, and can neither leak a created
+	// container nor issue a detached Docker call. A cache with no manager
+	// lifecycle (direct tests) skips admission.
+	if cc.ops != nil {
+		opCtx, release, err := cc.ops.begin(ctx)
+		if err != nil {
+			if errors.Is(err, ErrManagerShuttingDown) {
+				return nil, errPoolClosed
+			}
+			return nil, fmt.Errorf("docker run: %w", err)
+		}
+		defer release()
+		ctx = opCtx
+	}
+
 	// acquiredAt bounds the SUCCESSFUL acquire duration recorded below: it
 	// covers the whole call including any capacity wait, but is observed only
 	// when a lease is actually returned. waitRecorded makes the waits counter
@@ -1057,7 +1175,7 @@ func (cc *containerCache) acquireVersion(
 			p.publishPoolGaugesLocked()
 			p.recordAcquireLocked(metrics.RuntimeOutcomeWarm, time.Since(acquiredAt))
 			p.mu.Unlock()
-			p.discardReaped(ctx, reaped)
+			p.discardReaped(context.Background(), reaped)
 			return &containerLease{pool: p, pc: pc}, nil
 		}
 
@@ -1067,7 +1185,7 @@ func (cc *containerCache) acquireVersion(
 			p.publishPoolGaugesLocked()
 			reserved = p
 			p.mu.Unlock()
-			p.discardReaped(ctx, reaped)
+			p.discardReaped(context.Background(), reaped)
 
 			// Global warm budget (MAX_WARM_CONTAINERS): reserve a COUNTED slot
 			// for the container about to be created. A pre-admitted counted permit
@@ -1152,7 +1270,7 @@ func (cc *containerCache) acquireVersion(
 		recordWait(p)
 		notify := p.notify
 		p.mu.Unlock()
-		p.discardReaped(ctx, reaped)
+		p.discardReaped(context.Background(), reaped)
 
 		select {
 		case <-notify:
@@ -1274,6 +1392,13 @@ func (p *appPool) invalidateImage(image string) {
 	// any later stale acquire resolving this tag to any content) produces a
 	// throwaway container that is discarded on release rather than pooled.
 	p.retiredImages[image] = true
+	// Reserve the idle-container teardown BEFORE removing anything. On refusal
+	// (Manager shutdown) leave the containers in place for cache teardown.
+	op, ok := p.cache.reserveDiscard(context.Background())
+	if !ok {
+		p.mu.Unlock()
+		return
+	}
 	var discard []*pooledContainer
 	if p.active != nil && identityRef(p.active.image) == image {
 		discard = append(discard, p.active.idle...)
@@ -1305,9 +1430,11 @@ func (p *appPool) invalidateImage(image string) {
 	}
 	p.mu.Unlock()
 
-	for _, pc := range discard {
-		p.discardContainer(pc, reasonImageChanged)
+	if len(discard) == 0 {
+		op.release()
+		return
 	}
+	p.discardReservedBatch(op, discard, func(*pooledContainer) string { return reasonImageChanged })
 }
 
 // removeApp requests the removal of fnName's warm container state. The
@@ -1338,9 +1465,10 @@ func (cc *containerCache) removeApp(fnName string) {
 	delete(cc.capacity, fnName)
 	p := cc.pools[fnName]
 	var discard []*pooledContainer
+	var op *discardOp
 	if p != nil {
 		p.mu.Lock()
-		discard = p.beginRemoveLocked()
+		discard, op = p.beginRemoveLocked()
 		cc.deleteRuntimePoolMetrics(fnName)
 		p.mu.Unlock()
 	} else {
@@ -1355,7 +1483,7 @@ func (cc *containerCache) removeApp(fnName string) {
 	if p == nil {
 		return
 	}
-	p.teardownDiscards(discard)
+	p.teardownDiscards(op, discard)
 	p.cache.maybeDeletePool(p.name, p)
 }
 
@@ -1434,15 +1562,24 @@ func (p *appPool) activate(image string) (detach bool) {
 // must be torn down immediately: active and draining idle containers, while
 // active and draining busy containers are marked retired (discarded on release)
 // and transient throwaways are marked retired. It is idempotent and returns the
-// discards to perform outside the pool lock. It must be called with p.mu held
+// discards to perform outside the pool lock together with the normal Manager
+// operation reserved for them (see reserveDiscard). On refusal (Manager
+// shutdown) it returns (nil, nil) and leaves the containers in place, so the
+// shutdown-owned cache teardown owns them. It must be called with p.mu held
 // (and, for the removeApp path, with cc.mu held so the mark is linearized
 // against activation).
-func (p *appPool) beginRemoveLocked() []*pooledContainer {
+func (p *appPool) beginRemoveLocked() ([]*pooledContainer, *discardOp) {
 	if p.removing {
-		return nil
+		return nil, nil
 	}
 	p.removing = true
 	p.signalLocked()
+
+	op, ok := p.cache.reserveDiscard(context.Background())
+	if !ok {
+		// Manager shutdown: leave the containers for cache teardown.
+		return nil, nil
+	}
 
 	var discard []*pooledContainer
 	retire := func(gens []*generation) {
@@ -1472,16 +1609,19 @@ func (p *appPool) beginRemoveLocked() []*pooledContainer {
 	// tombstone (publishPoolGaugesLocked is a no-op). The caller
 	// (containerCache.removeApp) deletes the app's runtime-pool series
 	// in this same critical section, which is the removal-visible transition.
-	return discard
+	if len(discard) == 0 {
+		op.release()
+		return nil, nil
+	}
+	return discard, op
 }
 
 // teardownDiscards discards the containers beginRemoveLocked removed from the
-// pool's ownership. It runs outside the pool lock; dead containers are still
-// recorded (their own path already tore them down) but not discarded again.
-func (p *appPool) teardownDiscards(discard []*pooledContainer) {
-	for _, pc := range discard {
-		p.discardContainer(pc, reasonAppRemove)
-	}
+// pool's ownership using the operation reserved for the whole batch. It runs
+// outside the pool lock; dead containers are still recorded (their own path
+// already tore them down) but not discarded again.
+func (p *appPool) teardownDiscards(op *discardOp, discard []*pooledContainer) {
+	p.discardReservedBatch(op, discard, func(*pooledContainer) string { return reasonAppRemove })
 }
 
 // maybeDeletePool deletes p from the cache map when it has been removed and is
@@ -1591,6 +1731,15 @@ func (p *appPool) evictIdle(ctx context.Context, now time.Time, timeout time.Dur
 		p.mu.Unlock()
 		return
 	}
+	// Reserve the teardown as a normal operation BEFORE removing any idle
+	// container. On refusal (Manager shutdown) leave them in place for cache
+	// teardown. The maintenance loop is joined before normal admission closes,
+	// so this normally succeeds.
+	op, ok := p.cache.reserveDiscard(ctx)
+	if !ok {
+		p.mu.Unlock()
+		return
+	}
 	var evict []*pooledContainer
 	evictFrom := func(g *generation) {
 		kept := g.idle[:0]
@@ -1626,13 +1775,16 @@ func (p *appPool) evictIdle(ctx context.Context, now time.Time, timeout time.Dur
 	}
 	p.mu.Unlock()
 
-	for _, pc := range evict {
-		reason := pc.retireReason
-		if reason == "" {
-			reason = reasonIdleTimeout
-		}
-		p.discardContainerContext(ctx, pc, reason)
+	if len(evict) == 0 {
+		op.release()
+		return
 	}
+	p.discardReservedBatch(op, evict, func(pc *pooledContainer) string {
+		if pc.retireReason == "" {
+			return reasonIdleTimeout
+		}
+		return pc.retireReason
+	})
 }
 
 // close discards EVERY pooled container with reason "shutdown", wakes all
@@ -1819,7 +1971,6 @@ func (p *appPool) signalLocked() {
 func (p *appPool) release(pc *pooledContainer) {
 	p.mu.Lock()
 	if _, transient := p.transient[pc]; transient {
-		delete(p.transient, pc)
 		reason := pc.retireReason
 		if reason == "" {
 			reason = reasonImageChanged
@@ -1830,11 +1981,20 @@ func (p *appPool) release(pc *pooledContainer) {
 		} else if removing {
 			reason = reasonAppRemove
 		}
+		// Reserve the teardown as a normal operation BEFORE removing the
+		// transient. On refusal (Manager shutdown) leave it in p.transient so the
+		// shutdown-owned cache teardown owns it.
+		op, ok := p.cache.reserveDiscard(context.Background())
+		if !ok {
+			p.mu.Unlock()
+			return
+		}
+		delete(p.transient, pc)
 		// Wake a stale-request waiter now that a transient slot has freed.
 		p.publishPoolGaugesLocked()
 		p.signalLocked()
 		p.mu.Unlock()
-		p.discardContainer(pc, reason)
+		p.discardReserved(op, pc, reason)
 		if removing {
 			p.cache.maybeDeletePool(p.name, p)
 		}
@@ -1879,29 +2039,42 @@ func (p *appPool) release(pc *pooledContainer) {
 	if !drop {
 		pc.idleSince = p.clock()
 		gen.idle = append(gen.idle, pc)
-	}
-	p.pruneDrainingLocked()
-	removing := p.removing
-	becameIdle := !drop
-	p.publishPoolGaugesLocked()
-	p.signalLocked()
-	p.mu.Unlock()
-
-	if becameIdle {
+		p.pruneDrainingLocked()
+		p.publishPoolGaugesLocked()
+		p.signalLocked()
+		p.mu.Unlock()
 		// A container just became idle: a global warm-budget waiter that was
 		// admitted non-counting but found no reusable idle container at
 		// admission time can now reuse it. Signalled after p.mu is dropped to
 		// respect the warmMu -> cache.mu -> pool.mu lock order.
 		p.cache.signalWarm()
+		return
 	}
 
-	// Always funnel through discardContainer: when reason is "" the container
-	// already tore itself down (timeout/process_exit/protocol_error) and its own
-	// recorded reason is used for the discard metric; otherwise the pool reason
-	// is applied.
-	if drop {
-		p.discardContainer(pc, reason)
+	// Reserve the teardown as a normal operation BEFORE committing the drop. On
+	// refusal (Manager shutdown) re-insert the container so the shutdown-owned
+	// cache teardown owns and cleans it.
+	op, ok := p.cache.reserveDiscard(context.Background())
+	if !ok {
+		if gen != nil {
+			gen.busy[pc] = struct{}{}
+		}
+		p.pruneDrainingLocked()
+		p.publishPoolGaugesLocked()
+		p.signalLocked()
+		p.mu.Unlock()
+		return
 	}
+	p.pruneDrainingLocked()
+	removing := p.removing
+	p.publishPoolGaugesLocked()
+	p.signalLocked()
+	p.mu.Unlock()
+
+	// When reason is "" the container already tore itself down
+	// (timeout/process_exit/protocol_error) and its own recorded reason is used
+	// for the discard metric; otherwise the pool reason is applied.
+	p.discardReserved(op, pc, reason)
 	if removing {
 		p.cache.maybeDeletePool(p.name, p)
 	}

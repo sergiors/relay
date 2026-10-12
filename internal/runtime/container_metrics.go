@@ -231,8 +231,12 @@ func (p *appPool) recordDiscard(pc *pooledContainer, fallback string) {
 // discardContainer tears pc down (idempotently) and records the discard metric
 // exactly once, using the container's own reason when it already died. It is the
 // single disposal helper every pool path funnels through, so no discard can be
-// missed or double-counted. It uses detached, bounded Docker calls (the
-// historical behavior); discardContainerContext is the bound-aware form.
+// missed or double-counted. Its context is background; production pool paths
+// reserve a normal Manager operation BEFORE removing the container (see
+// reserveDiscard/discardReserved) and use discardContainerContext with that
+// operation context; discardContainer remains for callers that hold no
+// reservation (the acquire-internal settle path, which is itself inside an
+// admitted operation, and tests).
 func (p *appPool) discardContainer(pc *pooledContainer, reason string) {
 	p.discardContainerContext(context.Background(), pc, reason)
 }
@@ -264,11 +268,16 @@ func (p *appPool) discardContainerContext(ctx context.Context, pc *pooledContain
 }
 
 // discardReaped disposes the containers an acquire removed from the idle list
-// or discarded on a transition. It runs outside the pool lock; dead containers
+// or discarded on a transition. It runs outside the pool lock and, like the
+// acquire it belongs to, inside that acquire's admitted Manager operation, so its
+// teardown is tracked by the operation counter and joined by drainNormal. Its
+// context is deliberately context.Background: the reaped containers are already
+// removed from the pool, so a cancelled acquire must still finish (or confirm)
+// their teardown rather than abandon it — the (rare) wait for an in-flight
+// self-teardown to report its removal outcome and each Docker call are separately
+// bounded by containerOpTimeout, so this cannot block forever. Dead containers
 // are still recorded (their own path tore them down, e.g. process_exit while
-// idle), but their discard is not attempted again. ctx bounds the (rare) wait for
-// an in-flight self-teardown to report its removal outcome, so a cancelled
-// acquire is never held past its bound.
+// idle), but their discard is not attempted again.
 func (p *appPool) discardReaped(ctx context.Context, reaped []*pooledContainer) {
 	for _, pc := range reaped {
 		reason := pc.retireReason

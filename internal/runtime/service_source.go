@@ -193,9 +193,14 @@ func pullCheckKey(fnName, sourceRef string) string {
 // digest the service names is fetched, never every tag in the repository). The
 // response stream is drained to completion so the pull's errors surface.
 func (m *Manager) pullImage(ctx context.Context, ref string) error {
-	resp, err := m.cli.ImagePull(ctx, ref, client.ImagePullOptions{})
+	opCtx, release, err := m.beginDockerOp(ctx)
 	if err != nil {
 		return err
 	}
-	return resp.Wait(ctx)
+	defer release()
+	resp, err := m.cli.ImagePull(opCtx, ref, client.ImagePullOptions{})
+	if err != nil {
+		return err
+	}
+	return resp.Wait(opCtx)
 }

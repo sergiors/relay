@@ -96,6 +96,15 @@
 //
 // Key Features:
 //   - A single reused Docker Engine client for every build and invocation
+//   - One Manager-owned Docker operation lifecycle (operations.go) admits,
+//     tracks, cancels, and drains every Manager-owned Docker call — preparation
+//     (reuse probes, self-mount inspect, build), service start/stop/list, orphan
+//     sweeps, image inspect/pull/listing/removal, readiness Ping,
+//     execution-container create, and every execution-container teardown and
+//     exit-wait watcher. Manager shutdown closes normal admission atomically,
+//     cancels every in-flight operation's context, runs teardown as a tracked
+//     shutdown-owned phase, and drains all of them before the Docker client
+//     closes, so the client is never closed beneath a live call.
 //   - Engines (python, node) answer "what does this runtime need?" as plan data;
 //     this package answers "how do I build it?" and knows nothing about Python
 //     imports or Node module resolution. Engines declare an app's reusable

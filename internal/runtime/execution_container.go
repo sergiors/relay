@@ -38,6 +38,50 @@ func executionEndpoints(networks []string) map[string]*network.EndpointSettings 
 	return endpoints
 }
 
+// containerOps is the narrow Manager-owned operation seam threaded into an
+// execution container. It carries two things:
+//
+//   - lifecycle, the manager shutdown context the container's detached exit wait
+//     is rooted in, so Manager close cancels the wait request; and
+//   - gate, the Manager's operation lifecycle, which every container teardown
+//     (a pool-initiated discard, a monitor self-discard) and the exit-wait
+//     watcher itself is admitted through, so no Manager-owned execution-container
+//     Docker call can run outside the lifecycle CloseContext drains.
+//
+// A zero value (directly constructed test containers, callers without a manager)
+// falls back to context.Background and no gate, preserving the historical
+// detached behavior.
+type containerOps struct {
+	lifecycle context.Context
+	gate      *managerOps
+}
+
+// opCtx returns the container's operation lifecycle, or context.Background when
+// no manager-owned lifecycle was supplied.
+func (o containerOps) opCtx() context.Context {
+	if o.lifecycle != nil {
+		return o.lifecycle
+	}
+	return context.Background()
+}
+
+// admitNormal admits one NORMAL Manager operation for a container's ordinary
+// Docker work (a pool- or monitor-initiated teardown, or the exit-wait watcher).
+// ok is false when Manager shutdown has closed normal admission: the caller must
+// then issue no Docker call and leave the container to the shutdown-owned cache
+// teardown phase. With no gate (a directly constructed test container) it
+// returns ctx and a no-op release.
+func (o containerOps) admitNormal(ctx context.Context) (context.Context, func(), bool) {
+	if o.gate == nil {
+		return ctx, func() {}, true
+	}
+	opCtx, release, err := o.gate.begin(ctx)
+	if err != nil {
+		return nil, nil, false
+	}
+	return opCtx, release, true
+}
+
 // executionContainer is one reused execution container for an app. It holds
 // a long-running bootstrap process (python/node) speaking the line-JSON
 // invocation protocol (see protocol.go): Start creates and starts the container
@@ -57,6 +101,11 @@ type executionContainer struct {
 	log   *slog.Logger
 	fn    string
 	image string
+	// ops is the Manager-owned operation lifecycle this container's detached
+	// Docker work (the exit wait request and a self-initiated discard) is rooted
+	// in. It replaces a detached context.Background so neither outlives the
+	// Manager's Docker client. A zero value is the detached historical behavior.
+	ops containerOps
 	// meta is the creation-time RunMeta stamped as labels. Identity fields
 	// (Type/App/Hostname/Image) are set; per-invocation fields
 	// (Handler/MessageID/EventID/EventName) are left EMPTY because
@@ -113,6 +162,12 @@ type failEvent struct {
 // successful start the container cleans itself up via AutoRemove the moment
 // its process exits, or via an explicit kill/remove on our discard paths.
 //
+// ops is the Manager-owned operation lifecycle the container's detached Docker
+// work is rooted in: the exit wait request and a self-initiated discard derive
+// from it instead of context.Background, so Manager close aborts them rather
+// than letting them outlive the Docker client. A zero value preserves the
+// detached behavior for callers (tests) without a manager.
+//
 // networks is the worker-global network set (NETWORKS): every execution
 // container joins them at create time so it can reach (and be reached on) those
 // Docker networks. The networks are infrastructure owned OUTSIDE Relay — Relay
@@ -121,6 +176,7 @@ type failEvent struct {
 // create surfaces as a create error here.
 func startExecutionContainer(
 	ctx context.Context,
+	ops containerOps,
 	cli *client.Client,
 	log *slog.Logger,
 	fn, image string,
@@ -200,6 +256,7 @@ func startExecutionContainer(
 		log:      log,
 		fn:       fn,
 		image:    image,
+		ops:      ops,
 		meta:     meta,
 		id:       id,
 		attach:   &attach,
@@ -232,44 +289,8 @@ func startExecutionContainer(
 
 	// Exit watcher: the container is expected to keep running between
 	// invocations, so the wait request lives for the container's whole
-	// lifetime and is detached from any single invocation's ctx. It delivers
-	// the exit status (or a wait error) once; the monitor routes it. A bounded
-	// give-up guards against a broken daemon that never delivers.
-	go func() {
-		wait := cli.ContainerWait(context.Background(), id, client.ContainerWaitOptions{
-			Condition: container.WaitConditionNotRunning,
-		})
-		timer := time.NewTimer(24 * time.Hour)
-		defer timer.Stop()
-		select {
-		case res := <-wait.Result:
-			info := exitInfo{code: res.StatusCode}
-			if res.Error != nil {
-				info.err = errors.New(res.Error.Message)
-			}
-			signalExit(c.exitInfo, info)
-		case err := <-wait.Error:
-			signalExit(c.exitInfo, exitInfo{err: err})
-		case <-c.closed:
-			// Discarded: kill makes the daemon exit the container shortly, so
-			// the wait delivery lands; drain it so the client's request
-			// goroutine can exit, bounded like drainWait.
-			select {
-			case <-wait.Result:
-			case <-wait.Error:
-			case <-time.After(5 * time.Second):
-			}
-			return
-		case <-timer.C:
-			return
-		}
-		<-c.closed // drain: the monitor owns routing from here
-		select {
-		case <-wait.Result:
-		case <-wait.Error:
-		case <-time.After(5 * time.Second):
-		}
-	}()
+	// lifetime and is detached from any single invocation's ctx.
+	go c.watchExit()
 
 	// Exit monitor: reacts to process exit, stdout EOF, and unexpected
 	// protocol frames. An idle container death discards immediately; a death
@@ -317,6 +338,76 @@ func (c *executionContainer) startOutputReader() <-chan struct{} {
 		signal(c.eof)
 	}()
 	return done
+}
+
+// watchExit runs the container's exit wait request for its whole lifetime. The
+// watcher's LIFETIME is itself a NORMAL Manager operation (ops.admitNormal), so
+// it is counted and Manager shutdown cancels and joins it (drainNormal) before
+// cache teardown begins. If normal admission has already closed, the watcher is
+// NOT admitted late and issues no wait request: the container is being torn down
+// by cache teardown. The request context is the admitted normal context, so
+// Manager close both aborts the request and (via the operation release below) is
+// joined by the drain. It delivers the exit status (or a wait error) once; the
+// monitor routes it. A bounded give-up guards against a broken daemon that never
+// delivers.
+func (c *executionContainer) watchExit() {
+	waitCtx, release, ok := c.ops.admitNormal(c.ops.opCtx())
+	if !ok {
+		// Normal admission closed: never admit a watcher late after close. The
+		// container's teardown is owned by the cache teardown phase.
+		return
+	}
+	defer release()
+	waitCtx, waitCancel := context.WithCancel(waitCtx)
+	defer waitCancel()
+	wait := c.cli.ContainerWait(waitCtx, c.id, client.ContainerWaitOptions{
+		Condition: container.WaitConditionNotRunning,
+	})
+	// drainWait releases the wait request's reader goroutine: the SDK delivers
+	// at most one result/error, and a cancelled request reports through the
+	// buffered Error channel, so a bounded drain lets the goroutine exit without
+	// blocking on an unread Result. It runs before the operation release, so the
+	// drain barrier covers the SDK reader too.
+	drainWait := func() {
+		select {
+		case <-wait.Result:
+		case <-wait.Error:
+		case <-time.After(5 * time.Second):
+		}
+	}
+	timer := time.NewTimer(24 * time.Hour)
+	defer timer.Stop()
+	select {
+	case res := <-wait.Result:
+		info := exitInfo{code: res.StatusCode}
+		if res.Error != nil {
+			info.err = errors.New(res.Error.Message)
+		}
+		signalExit(c.exitInfo, info)
+	case err := <-wait.Error:
+		signalExit(c.exitInfo, exitInfo{err: err})
+	case <-c.closed:
+		// Discarded: cancel so the wait request aborts, then drain it so the
+		// client's reader goroutine can exit.
+		waitCancel()
+		drainWait()
+		return
+	case <-waitCtx.Done():
+		// Manager close (or discard) cancelled the wait request: drain the
+		// aborting request so its reader goroutine exits, then return.
+		drainWait()
+		return
+	case <-timer.C:
+		return
+	}
+	// The single wait delivery landed (the SDK reader goroutine has exited); the
+	// monitor owns routing from here until the container is discarded OR the
+	// manager closes (which cancels waitCtx), whichever comes first. Returning on
+	// the cancellation is what lets drainNormal complete before cache teardown.
+	select {
+	case <-c.closed:
+	case <-waitCtx.Done():
+	}
 }
 
 // monitor funnels container-death events: exit status, stdout EOF, unexpected
@@ -561,23 +652,37 @@ func newRequestID() string {
 // losers are no-ops. Removal is idempotent w.r.t. AutoRemove having already
 // deleted the container (benign not-found/conflict). A genuine removal failure
 // is logged Warn (a discard that could not remove anything is worth surfacing).
-// It runs on detached, bounded Docker calls.
+//
+// It admits the teardown as a NORMAL Manager operation first, so a
+// self-initiated teardown (a death observed while idle, a protocol error) is
+// ordinary work. If normal admission has already closed, it issues NO Docker
+// call and reports false: the container is still owned by its pool, so the
+// shutdown-owned cache teardown phase cleans it. The per-call containerOpTimeout
+// still applies on top.
 func (c *executionContainer) discard(reason string) bool {
-	return c.discardContext(context.Background(), reason)
+	opCtx, release, ok := c.ops.admitNormal(c.ops.opCtx())
+	if !ok {
+		return false
+	}
+	defer release()
+	return c.discardContext(opCtx, reason)
 }
 
-// discardContext is discard with a caller-supplied bound (the pool's shutdown
-// context). The kill and remove observe ctx, so a shutdown teardown stops
-// waiting promptly when the shutdown step's bound expires instead of running on
-// the container's own detached 5s-per-call context. The CAS/reason/closed
-// bookkeeping is shared with discard and idempotent.
+// discardContext runs the teardown on ctx. It performs NO admission: the caller
+// owns that. A pool-initiated discard passes the Manager operation it reserved
+// BEFORE removing the container from the pool (or the cache-teardown phase's
+// context for shutdown teardown); the monitor's discard passes the normal
+// operation it admitted in discard. The kill and remove observe ctx, so a
+// shutdown teardown stops waiting promptly when its bound expires instead of
+// running on the container's own detached 5s-per-call context. The
+// CAS/reason/closed bookkeeping is idempotent.
 //
-// The return value reports whether THIS call performed the teardown; race losers
-// (an earlier discard already set dying) return false without touching the
-// container. `removed` is set only when removeContainerContext reports success
-// (or the container was already gone, see benignRemovalErr), so the pool can tell
-// a torn-down-and-gone container from one whose physical removal failed and keep
-// the latter's global warm-budget slot reserved.
+// The return value reports whether THIS call performed the teardown; a race
+// loser (an earlier discard already set dying) returns false without touching
+// the container. `removed` is set only when removeContainerContext reports
+// success (or the container was already gone, see benignRemovalErr), so the pool
+// can tell a torn-down-and-gone container from one whose physical removal failed
+// and keep the latter's global warm-budget slot reserved.
 func (c *executionContainer) discardContext(ctx context.Context, reason string) bool {
 	if !c.dying.CompareAndSwap(false, true) {
 		return false

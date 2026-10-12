@@ -470,6 +470,17 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 // retirement grouped under AppImageTags with no separate service images.
 // An `image` source instead runs its external reference with Entry empty.
 func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica int) (string, error) {
+	// Admit the whole create+start+inspect window as ONE Manager-owned Docker
+	// operation: manager shutdown refuses a new start and cancels an in-flight
+	// one, and CloseContext drains it before the Docker client closes.
+	opCtx, release, err := m.beginDockerOp(ctx)
+	if err != nil {
+		return "", fmt.Errorf("service: %w", err)
+	}
+	defer release()
+	callerCtx := ctx
+	ctx = opCtx
+
 	// Pin the service image for the whole create+start window. For a Relay-owned
 	// image (an entrypoint-source service runs the app image) this prevents
 	// a concurrent retirement from committing removal between the caller's
@@ -547,7 +558,7 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 	}
 	createResp, err := m.cli.ContainerCreate(ctx, createOps)
 	if err != nil {
-		return "", fmt.Errorf("service: create container: %w", err)
+		return "", fmt.Errorf("service: create container: %w", m.classifyDockerErr(callerCtx, err))
 	}
 	id := createResp.ID
 
@@ -572,7 +583,7 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 
 	if _, err := m.cli.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
 		// Created but never started; never leaves a live service behind.
-		return "", discard("start_error", fmt.Errorf("service: start container: %w", err))
+		return "", discard("start_error", fmt.Errorf("service: start container: %w", m.classifyDockerErr(callerCtx, err)))
 	}
 
 	// The running gate: confirm the started container is actually running before
@@ -581,7 +592,7 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 	// reconciler would stop the old generation and take the service down.
 	insp, err := m.cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
 	if err != nil {
-		return "", discard("inspect_error", fmt.Errorf("service: inspect started container: %w", err))
+		return "", discard("inspect_error", fmt.Errorf("service: inspect started container: %w", m.classifyDockerErr(callerCtx, err)))
 	}
 	if insp.Container.State == nil || !insp.Container.State.Running {
 		return "", discard("not_running", fmt.Errorf("service: started container is not running"))
@@ -611,12 +622,19 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 // brief stop/start window; callers use it only for a source-only change, where a
 // replacement is unnecessary because the image and configuration are unchanged.
 func (m *Manager) RestartServiceContainer(ctx context.Context, containerID string) error {
+	opCtx, release, err := m.beginDockerOp(ctx)
+	if err != nil {
+		return fmt.Errorf("service: %w", err)
+	}
+	defer release()
+	callerCtx := ctx
+	ctx = opCtx
 	if _, err := m.cli.ContainerRestart(ctx, containerID, client.ContainerRestartOptions{}); err != nil {
-		return fmt.Errorf("service: restart container: %w", err)
+		return fmt.Errorf("service: restart container: %w", m.classifyDockerErr(callerCtx, err))
 	}
 	insp, err := m.cli.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
 	if err != nil {
-		return fmt.Errorf("service: inspect restarted container: %w", err)
+		return fmt.Errorf("service: inspect restarted container: %w", m.classifyDockerErr(callerCtx, err))
 	}
 	if insp.Container.State == nil || !insp.Container.State.Running {
 		return fmt.Errorf("service: restarted container is not running")
@@ -635,9 +653,16 @@ func (m *Manager) RestartServiceContainer(ctx context.Context, containerID strin
 // logging. Replica is parsed from labelReplica, defaulting to -1 when
 // missing/invalid.
 func (m *Manager) ServiceContainerList(ctx context.Context) ([]ServiceContainer, error) {
+	opCtx, release, err := m.beginDockerOp(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	callerCtx := ctx
+	ctx = opCtx
 	list, err := m.cli.ContainerList(ctx, client.ContainerListOptions{All: true})
 	if err != nil {
-		return nil, fmt.Errorf("service: list containers: %w", err)
+		return nil, fmt.Errorf("service: list containers: %w", m.classifyDockerErr(callerCtx, err))
 	}
 	var out []ServiceContainer
 	for _, c := range list.Items {
@@ -698,11 +723,18 @@ func (m *Manager) ServiceContainerList(ctx context.Context) ([]ServiceContainer,
 // failure (a broken daemon, a permission error) is surfaced as a genuine error
 // so it is never mistaken for a missing network.
 func (m *Manager) NetworkExists(ctx context.Context, network string) (bool, error) {
+	opCtx, release, err := m.beginDockerOp(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	callerCtx := ctx
+	ctx = opCtx
 	if _, err := m.cli.NetworkInspect(ctx, network, client.NetworkInspectOptions{}); err != nil {
 		if cerrdefs.IsNotFound(err) {
 			return false, nil
 		}
-		return false, fmt.Errorf("network inspect %q: %w", network, err)
+		return false, fmt.Errorf("network inspect %q: %w", network, m.classifyDockerErr(callerCtx, err))
 	}
 	return true, nil
 }
@@ -747,6 +779,13 @@ func (m *Manager) VerifyNetworks(ctx context.Context, networks []string) (string
 // round trip. The first context error is returned (via the removal/stop error)
 // like any other failure.
 func (m *Manager) StopServiceContainers(ctx context.Context, containers []ServiceContainer) error {
+	callerCtx := ctx
+	opCtx, release, err := m.beginDockerOp(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	ctx = opCtx
 	var firstErr error
 	for _, c := range containers {
 		if err := ctx.Err(); err != nil {
@@ -782,7 +821,10 @@ func (m *Manager) StopServiceContainers(ctx context.Context, containers []Servic
 			)
 		}
 	}
-	return firstErr
+	// A failure that concludes after Manager shutdown began is classified as the
+	// terminal ErrManagerShuttingDown deferral rather than a spurious cleanup
+	// failure; a genuine caller-owned cancellation is returned unchanged.
+	return m.classifyDockerErr(callerCtx, firstErr)
 }
 
 // RemoveAppServiceContainers stops and removes every service container

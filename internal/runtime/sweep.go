@@ -57,15 +57,28 @@ func sweepSkips(labels map[string]string) bool {
 // hostnames), so it is a documented, accepted hazard of the hostname-as-identity
 // model rather than a correctness bug in normal deployments.
 func (m *Manager) SweepOrphanContainers(ctx context.Context, hostname string) (int, error) {
+	callerCtx := ctx
+	opCtx, release, err := m.beginDockerOp(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+	ctx = opCtx
 	list, err := m.cli.ContainerList(ctx, client.ContainerListOptions{All: true})
 	if err != nil {
-		return 0, fmt.Errorf("orphan sweep: list containers: %w", err)
+		return 0, fmt.Errorf("orphan sweep: list containers: %w", m.classifyDockerErr(callerCtx, err))
 	}
 
 	skippedOther := 0
 	removed := 0
 	var firstErr error
 	for _, c := range list.Items {
+		if err := ctx.Err(); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			break
+		}
 		if sweepSkips(c.Labels) {
 			continue
 		}
@@ -74,7 +87,7 @@ func (m *Manager) SweepOrphanContainers(ctx context.Context, hostname string) (i
 			skippedOther++
 			continue
 		}
-		if err := removeContainer(m.cli, c.ID); err != nil {
+		if err := removeContainerContext(ctx, m.cli, c.ID); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -92,7 +105,11 @@ func (m *Manager) SweepOrphanContainers(ctx context.Context, hostname string) (i
 		m.log.Debug("Orphan sweep: skipped containers owned by other hostnames", "count", skippedOther)
 	}
 	if firstErr != nil {
-		return removed, firstErr
+		// A sweep error that races Manager shutdown is reported as the terminal
+		// deferral (ErrManagerShuttingDown); a genuine Docker failure, or the
+		// caller's own cancellation, is returned unchanged (classify never masks
+		// a caller-owned context error).
+		return removed, m.classifyDockerErr(callerCtx, firstErr)
 	}
 	return removed, nil
 }

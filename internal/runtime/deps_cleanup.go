@@ -122,8 +122,11 @@ func (m *Manager) CleanupUnusedDependencies(ctx context.Context) (int, error) {
 // matching RemoveImage. A concurrent retirement of the same dependency reports
 // a wrapped ErrImageRetiring so the caller keeps it and retries later.
 func (m *Manager) removeUnreferencedDependencyImage(ctx context.Context, dep string) error {
-	rmCtx, stop := m.removalContext(ctx)
-	defer stop()
+	rmCtx, release, err := m.beginDockerOp(ctx)
+	if err != nil {
+		return fmt.Errorf("remove dependency image %s: %w", dep, err)
+	}
+	defer release()
 	coord := m.leaseCoord()
 	drained, owner, err := coord.beginRemoval(dep)
 	if err != nil {
