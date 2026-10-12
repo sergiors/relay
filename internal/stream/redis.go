@@ -832,7 +832,8 @@ const missingPayloadUnknownDeliveries = int64(-1)
 // dead-lettered, and no handler attempt, retry, or DLQ entry is fabricated. It
 // is surfaced explicitly with a high-signal Warn log and the missing_payload_total
 // counter, then (only when ack is true) the dangling PEL reference is cleared
-// with a single conservative XAck so the recovery loop cannot spin on it forever.
+// with a single conservative atomic ack-and-retain so the recovery loop cannot
+// spin on it forever.
 //
 // ack is false for ids the server already purged from the PEL during the scan:
 // acking them is a no-op at best and misleading at worst, so it is skipped.
@@ -841,13 +842,16 @@ const missingPayloadUnknownDeliveries = int64(-1)
 // (missingPayloadUnknownDeliveries otherwise), reported for diagnosis only; it
 // is never converted into a handler attempt.
 //
-// Invocation state: once the dangling PEL reference is gone (XACKed here, or
+// Invocation state: once the dangling PEL reference is gone (ACKed here, or
 // already purged by the server during the scan) the message is no longer
 // recoverable, so its state hash is switched to terminal retention. Without
-// that, a persistent hash written for a body-less invocation before this change
-// would leak forever. When the conservative XAck fails the entry may still be in
-// the PEL, so the state is deliberately left recoverable (persistent, no TTL):
-// a leak is safer than dropping state a redelivery might still need.
+// that, a persistent hash written for a body-less invocation would leak forever.
+// When ack is true the ACK and the retention happen in ONE atomic script
+// (ackAndRetainTerminal): a failed ACK leaves the marker PERSISTENT (no TTL), so
+// the entry stays pending/recoverable and nothing expires — a leak is safer than
+// dropping state a redelivery might still need. When ack is false there is no ACK
+// to run, so the server-purged reference is retained via the non-XACK
+// retainTerminal path.
 func (c *Consumer) clearMissingValueEntry(ctx context.Context, msg redis.XMessage, deliveries int64, ack bool) {
 	c.metrics.Inc(metrics.MetricMissingPayload)
 	attrs := []any{
@@ -859,14 +863,22 @@ func (c *Consumer) clearMissingValueEntry(ctx context.Context, msg redis.XMessag
 	}
 	c.log.Warn("Message: pending entry has no stream body (trimmed or deleted); not processed", attrs...)
 	if ack {
-		if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
-			// The reference may still be pending: keep state recoverable.
+		// Acknowledge the dangling PEL reference AND switch the invocation state
+		// to terminal retention in ONE atomic script: the ACK and the
+		// retention can no longer be split by a crash or error, and a failed ACK
+		// can never leave an expiring TTL on still-pending state (the script
+		// stages only a persistent marker before the XACK). On failure nothing is
+		// guaranteed, so the entry is left pending/recoverable for a later pass.
+		if _, err := c.invStateStore.ackAndRetainTerminal(ctx, c.stream, c.group, msg.ID, c.invocationRetention); err != nil {
 			c.log.Warn("Message: ack missing-value entry failed", "message_id", msg.ID, "error", err)
 			return
 		}
+		return
 	}
-	// The dangling PEL reference is gone: retain the (never-completing)
-	// invocation state under the retention TTL instead of leaking it.
+	// The server already purged the dangling PEL reference during the scan, so
+	// there is no XACK to run. Switch the (never-completing) invocation state to
+	// terminal retention under the retention TTL instead of leaking it: this is
+	// the non-XACK retention path.
 	if err := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msg.ID, c.invocationRetention); err != nil {
 		c.log.Warn("Message: retain invocation state for missing-value entry failed",
 			"message_id", msg.ID, "error", err)
@@ -1147,7 +1159,7 @@ func (c *Consumer) processMessage(
 	}
 
 	ackCtx, ackSpan := redisSpan(ctx, "redis.ack")
-	if err := c.client.XAck(ackCtx, c.stream, c.group, msg.ID).Err(); err != nil {
+	if _, err := c.invStateStore.ackAndRetainTerminal(ackCtx, c.stream, c.group, msg.ID, c.invocationRetention); err != nil {
 		ackSpan.RecordError(err)
 		ackSpan.SetStatus(codes.Error, err.Error())
 		ackSpan.End()
@@ -1157,16 +1169,13 @@ func (c *Consumer) processMessage(
 	}
 	ackSpan.End()
 	outcome = "acked"
-	// The message is fully processed and acknowledged: switch its invocation
-	// state to terminal retention. Ordering matters — retain only AFTER a
-	// successful ACK. If the ACK failed (handled above) the message stays in the
-	// PEL and may be redelivered, so its state must remain recoverable
-	// (persistent, no TTL) for the redelivery to skip completed handlers. A
-	// retention failure is logged only: the state is simply left persistent (a
-	// leak, never a premature loss).
-	if err := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msg.ID, c.invocationRetention); err != nil {
-		c.log.Warn("Message: retain invocation state failed", "message_id", msg.ID, "error", err)
-	}
+	// The message is fully processed and acknowledged, and its invocation state
+	// was switched to terminal retention in the SAME atomic script, so
+	// there is no post-ACK orphan window. If the ACK failed (handled above) the
+	// message stays in the PEL; the script's marker staging is persistent (no
+	// TTL), so a redelivery still observes completed handlers and the state never
+	// expires. A retention/ack failure is a single error: logged here, never
+	// fatal.
 }
 
 // processScheduleMessage routes a schedule-occurrence message directly to the
@@ -1257,17 +1266,14 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 				"delivery_attempt", deliveryNum,
 				"reason", err,
 			)
-			ackErr := c.client.XAck(ctx, c.stream, c.group, msgID).Err()
-			if ackErr != nil {
+			// Acknowledge AND switch the invocation state to terminal retention in
+			// one atomic script, exactly like the success tail. An ACK
+			// failure means the message stays pending (the script's staged marker is
+			// persistent, so a redelivery still resolves it and nothing expires).
+			if _, ackErr := c.invStateStore.ackAndRetainTerminal(ctx, c.stream, c.group, msgID, c.invocationRetention); ackErr != nil {
 				c.log.Warn("Schedule: message ack failed", "message_id", msgID, "error", ackErr)
 				c.noteOutcome(ackErr, 0)
 				return "pending", ackErr
-			}
-			// Retain the invocation-state hash after a successful ACK, exactly
-			// like the success tail. A retention failure is logged only; the
-			// state is left persistent (a leak, never a premature loss).
-			if cerr := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msgID, c.invocationRetention); cerr != nil {
-				c.log.Warn("Schedule: message retain invocation state failed", "message_id", msgID, "error", cerr)
 			}
 			return "acked", nil
 		}
@@ -1319,17 +1325,14 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 		return "pending", nil
 	}
 
-	if err := c.client.XAck(ctx, c.stream, c.group, msgID).Err(); err != nil {
+	if _, err := c.invStateStore.ackAndRetainTerminal(ctx, c.stream, c.group, msgID, c.invocationRetention); err != nil {
 		c.log.Warn("Schedule: message ack failed", "message_id", msgID, "error", err)
 		c.noteOutcome(err, 0)
 		return "pending", err
 	}
-	// Switch the invocation-state hash to terminal retention after a successful
-	// ACK, exactly like processMessage. A retention failure is logged only; the
-	// state is left persistent (a leak, never a premature loss).
-	if err := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msgID, c.invocationRetention); err != nil {
-		c.log.Warn("Schedule: message retain invocation state failed", "message_id", msgID, "error", err)
-	}
+	// The ACK and the terminal-retention switch happened in the SAME atomic
+	// script, exactly like processMessage, so no post-ACK orphan window
+	// exists.
 	return "acked", nil
 }
 
@@ -1517,23 +1520,18 @@ func (c *Consumer) routeToDLQ(
 			"reason", spec.reason,
 		)
 	}
-	if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
+	if _, err := c.invStateStore.ackAndRetainTerminal(ctx, c.stream, c.group, msg.ID, c.invocationRetention); err != nil {
 		dlqSpan.RecordError(err)
 		dlqSpan.SetStatus(codes.Error, err.Error())
 		c.log.Warn("Message: ack after DLQ failed", "message_id", msg.ID, "error", err)
 		c.noteOutcome(err, 0)
 		return
 	}
-	// The message is dead-lettered and the original acked: switch its
-	// invocation-state hash to terminal retention. Ordering matters — retain only
-	// after BOTH every DLQ write and the ACK succeed. If the ACK failed (handled
-	// above) the message stays in the PEL and may be redelivered, so its state
-	// (including the per-invocation DLQ-persisted markers) must remain
-	// recoverable (persistent, no TTL). A retention failure is logged only; the
-	// state is left persistent (a leak, never a premature loss).
-	if err := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msg.ID, c.invocationRetention); err != nil {
-		c.log.Warn("Message: retain invocation state after DLQ failed", "message_id", msg.ID, "error", err)
-	}
+	// The message is dead-lettered and the original acknowledged, and its
+	// invocation-state hash was switched to terminal retention in the SAME atomic
+	// script. Every DLQ entry was persisted before this call, so a failed
+	// ACK can never lose an entry: the message stays pending (the staged marker
+	// is persistent, no TTL) and a redelivery re-acks idempotently.
 }
 
 func isBusyGroup(err error) bool {

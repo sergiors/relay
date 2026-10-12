@@ -73,7 +73,12 @@
 //     switch to terminal retention (a reserved marker plus the configured
 //     invocation retention, REDIS_INVOCATION_RETENTION, default 48h) so a stale
 //     in-memory delivery can neither mutate
-//     nor resurrect it. A schedule occurrence additionally pins an immutable
+//     nor resurrect it. The ACK and that retention switch are performed by ONE
+//     atomic Lua script (ackAndRetainTerminal), so a crash or error can never
+//     leave a hash whose message already left the PEL without a marker/TTL; a
+//     failed ACK stages only a persistent marker (no TTL), so a still-pending
+//     message's state never expires. A schedule occurrence additionally pins an
+//     immutable
 //     admission descriptor under the reserved "__schedule" field, atomically
 //     with its first successful claim (see ScheduleDescriptor and
 //     TryStartScheduled), so the handler/timeout/retries it was admitted under
@@ -101,11 +106,13 @@
 // success. Tokens are never logged, used as metric labels, or written to the DLQ.
 //
 // Invocation-state transitions are atomic: every lifecycle write (claim,
-// failure, completion, exhaustion, classification, trace) and the DLQ
-// append+marker pair are single Lua scripts, so concurrent replicas cannot both
+// failure, completion, exhaustion, classification, trace), the DLQ
+// append+marker pair, and the terminal ACK+retention switch are single Lua
+// scripts, so concurrent replicas cannot both
 // start the same invocation, a stale claim can never overwrite a newer claim's
-// or a terminal marker, and a DLQ entry can never be appended without its
-// persistence marker (or vice versa).
+// or a terminal marker, a DLQ entry can never be appended without its
+// persistence marker (or vice versa), and a message can never leave the PEL
+// while its hash is left unretained.
 //
 // The per-invocation state machine is:
 //
@@ -188,6 +195,10 @@
 //     a duplicate could race a replica that won the same claim, and a
 //     makeRecoverable failure, because a legacy-TTL hash that could not be made
 //     persistent may expire mid-delivery, so the state cannot be relied on.
+//   - The terminal ACK and its retention are one atomic operation
+//     (ackAndRetainTerminal), so the message cannot leave the PEL before its
+//     hash carries the terminal marker; a failed ACK stages only a persistent
+//     marker and never leaves an expiring TTL on still-pending state.
 //   - A pending entry whose stream body no longer exists is data loss, not a
 //     success: it is counted as missing_payload_total, never run through a
 //     handler, and never turned into a fabricated payload or DLQ entry.

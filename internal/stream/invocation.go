@@ -24,19 +24,24 @@ import (
 // NewConsumer callers and internal construction only.
 //
 // It is how long a message's invocation-state hash survives AFTER the message
-// has left the PEL — a successful XACK on the success, obsolete, or DLQ path, or
-// a cleared missing-payload PEL reference. Recoverable state (any hash whose
-// message is still pending and can therefore be redelivered) is deliberately
-// PERSISTENT, with NO TTL: it must never expire out from under a redelivery,
-// which would reset the attempt/reclaim accounting. The retention TTL is applied
-// only by retainTerminal, atomically with the reserved terminal marker, once the
-// message is no longer recoverable.
+// has left the PEL — a successful atomic ack+retain on the success, obsolete, or
+// DLQ path, or a purged missing-payload PEL reference retained without an ACK.
+// Recoverable state (any hash whose message is still pending and can therefore
+// be redelivered) is deliberately PERSISTENT, with NO TTL: it must never expire
+// out from under a redelivery, which would reset the attempt/reclaim accounting.
+// The retention TTL is applied only once the message is no longer recoverable:
+// by ackAndRetainTerminal (the ACK and the marker+TTL in one atomic script) for
+// every path that ACKs, or by retainTerminal (marker+TTL only, no ACK) for a
+// missing-payload PEL reference the server already purged.
 //
 // It is a retention window for terminal bookkeeping (so a completed/exhausted
 // marker survives long enough to be inspected) and a cleanup safety net: if the
-// post-ACK retention never runs (a crash in the ACK→retain gap), the hash is
-// simply leaked rather than lost — a persistent leak is strictly safer than
-// premature state loss.
+// retention never runs, the hash is simply leaked rather than lost — a
+// persistent leak is strictly safer than premature state loss. Since the ACK and
+// the retention share one atomic script, there is no longer a crash window in
+// which a hash is left persistent after its message has left the PEL; a
+// failed ACK stages only a PERSISTent marker (no TTL) and the TTL is applied
+// once the ACK succeeds.
 const DefaultInvocationRetention = 48 * time.Hour
 
 // claimTokenBytes is the size of the crypto-random per-claim nonce. 16 bytes
@@ -242,12 +247,12 @@ func ttlMillis(d time.Duration) int64 {
 
 // terminalField is the reserved invocation-state hash field that marks a hash as
 // no longer recoverable: the message it belongs to has left the PEL (a
-// successful XACK on the success/obsolete/DLQ path, or a cleared/purged
-// missing-payload PEL reference), so retainTerminal switched the hash to
-// terminal retention. While the field is present every lifecycle script is
-// inert: a stale transition from an in-memory delivery can neither mutate the
-// retained state nor remove the retention TTL (which would resurrect an
-// unrecoverable hash). Like classificationField and traceFieldPrefix
+// successful XACK on the success/obsolete/DLQ path, or a purged missing-payload
+// PEL reference), so ackAndRetainTerminal (or, without an ACK, retainTerminal)
+// switched the hash to terminal retention. While the field is present every
+// lifecycle script is inert: a stale transition from an in-memory delivery can
+// neither mutate the retained state nor remove the retention TTL (which would
+// resurrect an unrecoverable hash). Like classificationField and traceFieldPrefix
 // it cannot collide with a real invocation ID (a leading "__" is not a legal
 // app name).
 const terminalField = "__terminal"
@@ -542,7 +547,8 @@ return 1
 	//
 	// The success marker is written while the message is still recoverable, so it
 	// keeps the key PERSISTENT (no TTL): retention is applied only after the
-	// successful XACK via retainTerminal.
+	// successful XACK, by ackAndRetainTerminal (the ACK and the retention share
+	// one atomic script).
 	markCompleteScript = redis.NewScript(luaInvocationHelpers + `
 if redis.call('HEXISTS', KEYS[1], ARGV[4]) == 1 then return 0 end
 local v = redis.call('HGET', KEYS[1], ARGV[1])
@@ -716,9 +722,11 @@ return 1
 
 	// retainTerminalScript switches a message's invocation-state hash to TERMINAL
 	// retention: it writes the reserved terminal marker and applies the retention
-	// TTL, both in one atomic step. It is called only AFTER the message is no
-	// longer recoverable (a successful XACK on the success/obsolete/DLQ path, or
-	// a cleared/purged missing-payload PEL reference).
+	// TTL, both in one atomic step. It is used only for the NON-XACK retention
+	// case: a missing-payload PEL reference the server already purged (nothing to
+	// ACK), plus store-level tests. Every production path that ACKs the message
+	// uses ackAndRetainTerminalScript, which performs the ACK and the retention in
+	// one script so no post-ACK orphan window exists.
 	//
 	// The marker makes every lifecycle script inert (see each script's HEXISTS
 	// guard), so a stale transition from an in-memory delivery can neither mutate
@@ -751,6 +759,77 @@ else
   redis.call('PEXPIRE', KEYS[1], ttl)
 end
 return 1
+`)
+
+	// ackAndRetainTerminalScript atomically acknowledges a message AND switches
+	// its invocation-state hash to terminal retention in ONE script, so the
+	// post-XACK orphan window cannot exist: a crash or error can no
+	// longer leave a hash whose message already left the PEL without a terminal
+	// marker/TTL.
+	//
+	// Ordering is deliberate and PEL-safe:
+	//
+	//   1. Validate everything that could fail AFTER the irreversible XACK:
+	//      parse the retention TTL and inspect the state key's type. A non-hash
+	//      state key is refused (an error reply) BEFORE any write or ACK, so a
+	//      wrong-type key leaves no partial effect and the caller leaves the
+	//      message pending.
+	//   2. When the hash exists and is not already terminal, stage the terminal
+	//      marker and PERSIST it (NO TTL) BEFORE the ACK. Staging before the ACK
+	//      is what makes a failed ACK safe: the marker is PERSISTENT, so a
+	//      still-pending message's state can never acquire (or keep) an expiring
+	//      TTL and expire out from under a redelivery; a redelivery merely
+	//      observes the terminal marker (its lifecycle transitions are inert) and
+	//      re-acks.
+	//   3. XACK. A returned count of 0 (the entry was already absent) is a
+	//      success, exactly like the former bare XAck whose .Err() ignored it.
+	//      XACK runs after the marker is staged, so even if XACK raises (e.g. a
+	//      wrong-type stream) the hash is left terminal-marked and persistent,
+	//      never an unmarked orphan and never expiring.
+	//   4. Apply the retention TTL ONLY now, after the ACK, and only when
+	//      retention is enabled (ttl > 0) and the hash HAS NO TTL already
+	//      (PTTL < 0). Never re-extend or shorten an existing retention TTL, so
+	//      repeated calls are monotonic; but a marker a previous failed ACK
+	//      staged without a TTL DOES get its window once the ACK finally
+	//      succeeds, so an interrupted terminal-ack cannot leave a permanent
+	//      leak either. The TTL can no longer land on a still-pending message,
+	//      and PTTL/PEXPIRE on the validated hash cannot error, so no command
+	//      after the ACK can fail and recreate an unmarked orphan.
+	//
+	// KEYS[1] = invocation-state hash; KEYS[2] = stream.
+	// ARGV[1] = group, ARGV[2] = message ID, ARGV[3] = terminal marker field,
+	// ARGV[4] = retention TTL ms (>0) or <=0 for disabled.
+	// Returns {removed, retained}: removed 1 when the message left the PEL (0
+	// when it was already absent), retained 1 when the hash existed and now
+	// carries the terminal marker.
+	ackAndRetainTerminalScript = redis.NewScript(`
+local ttl = tonumber(ARGV[4])
+if ttl == nil then ttl = 0 end
+
+local kt = redis.call('TYPE', KEYS[1])
+local kind = kt['ok']
+if kind ~= 'none' and kind ~= 'hash' then
+  return redis.error_reply('ackAndRetainTerminal: invocation-state key is not a hash')
+end
+
+local hasHash = kind == 'hash'
+local alreadyTerminal = false
+if hasHash then
+  alreadyTerminal = redis.call('HEXISTS', KEYS[1], ARGV[3]) == 1
+end
+
+if hasHash and not alreadyTerminal then
+  redis.call('HSET', KEYS[1], ARGV[3], '1')
+  redis.call('PERSIST', KEYS[1])
+end
+
+local removed = redis.call('XACK', KEYS[2], ARGV[1], ARGV[2])
+
+if hasHash and ttl > 0 and redis.call('PTTL', KEYS[1]) < 0 then
+  redis.call('PEXPIRE', KEYS[1], ttl)
+end
+
+return {removed, hasHash and 1 or 0}
 `)
 )
 
@@ -805,6 +884,21 @@ const (
 	kindExhausted
 )
 
+// terminalAckResult is the unambiguous outcome of ackAndRetainTerminal,
+// reported from ONE atomic operation: whether the message left the group PEL
+// and whether its invocation-state hash was switched to terminal retention.
+type terminalAckResult struct {
+	// Removed is true when the XACK removed the message from the group PEL.
+	// false means the message was already not pending (an idempotent no-op),
+	// which is still a terminal disposition.
+	Removed bool
+	// Retained is true when the invocation-state hash existed and now carries
+	// the terminal marker (plus, when retention is enabled, the retention TTL).
+	// false means there was no hash to retain (a stateless message): the ACK
+	// still happened and no empty key was created.
+	Retained bool
+}
+
 // invocationStateStore is the per-message invocation-state persistence seam:
 // the concrete *invocationStore implements it against Redis; tests may
 // substitute a fake. Every active-claim-originated transition takes the
@@ -812,6 +906,25 @@ const (
 // current ACTIVE marker; a mismatch is returned as an explicit stale result
 // (false), never a Redis error.
 type invocationStateStore interface {
+	// ackAndRetainTerminal acknowledges the message AND switches its
+	// invocation-state hash to terminal retention in ONE Lua script, so the
+	// post-XACK orphan window (a hash whose message left the PEL but never got a
+	// terminal marker/TTL) cannot exist. It is the production ACK
+	// boundary: the success, obsolete-schedule, malformed/DLQ, and
+	// missing-payload paths all acknowledge through it, never a separate
+	// XAck + retainTerminal pair.
+	//
+	// The terminal marker is staged (PERSISTent, no TTL) BEFORE the XACK and the
+	// retention TTL is applied only AFTER it, so a failed ACK never leaves an
+	// expiring TTL on a still-pending message. An absent hash is still
+	// acknowledged (no empty key is created); an already-terminal hash is an
+	// idempotent no-op. retention is the resolved window: >0 applies that
+	// PEXPIRE TTL, <=0 writes the marker but leaves the hash PERSISTENT.
+	//
+	// A returned error means the ACK did not resolve (a wrong-type state key
+	// refused before any write, or a Redis/transport failure): the caller MUST
+	// leave the message pending.
+	ackAndRetainTerminal(ctx context.Context, stream, group, msgID string, retention time.Duration) (terminalAckResult, error)
 	completed(ctx context.Context, stream, group, msgID, invocation string) (bool, error)
 	// tryStart atomically claims the invocation for a new execution when
 	// eligible. On success it returns (started=true, claim) where claim carries
@@ -915,6 +1028,11 @@ type invocationStateStore interface {
 	// never re-extends an already-terminal hash. A retention failure is logged,
 	// never fatal: the hash is simply left persistent (a leak, never a premature
 	// loss).
+	//
+	// It is the NON-XACK retention path: a missing-payload PEL reference the
+	// server already purged (so there is no ACK to run), plus store-level tests.
+	// Every production path that ACKs uses ackAndRetainTerminal instead, which
+	// performs the ACK and the retention in a single script.
 	//
 	// retention is the resolved terminal window: a positive value applies that
 	// PEXPIRE TTL, while zero (or negative) DISABLES retention — the marker is
@@ -1033,10 +1151,13 @@ func traceField(invocation string) string {
 //
 // Lifetime: while the message is still recoverable (present in the PEL and
 // therefore redeliverable) the hash is PERSISTENT — no TTL. Only once the
-// message has left the PEL (a successful XACK on the success/obsolete/DLQ path,
-// or a cleared/purged missing-payload PEL reference) does retainTerminal switch
-// it to terminal retention (the configured invocation window). A hash that never
-// gets retained is leaked, never prematurely expired: safe by construction.
+// message has left the PEL (a successful atomic ACK on the success/obsolete/DLQ
+// path, or a purged missing-payload PEL reference) does the hash switch to
+// terminal retention (the configured invocation window): every ACK path does it
+// in the SAME script as the XACK (ackAndRetainTerminal), so no post-ACK orphan
+// window exists; a purged reference with no ACK to run uses retainTerminal. A
+// hash that never gets retained is leaked, never prematurely expired: safe by
+// construction.
 //
 // It is the stream layer's domain (Redis), but the runner decides which
 // invocations match, so the store is exposed to the runner through the
@@ -1481,12 +1602,49 @@ func (store *invocationStore) exhaustedState(
 	return exClaim, dlq, true, nil
 }
 
+// ackAndRetainTerminal acknowledges the message and switches its
+// invocation-state hash to terminal retention via ONE atomic script (see
+// ackAndRetainTerminalScript). It is the production ACK boundary: it replaces
+// the former bare XAck followed by a separate retainTerminal call, whose gap
+// could leak a persistent invocation hash once the message had already left the
+// PEL. The store shells out to a single EVAL, so the ACK and the
+// retention always take effect together (or, on a transport failure, neither
+// does).
+func (store *invocationStore) ackAndRetainTerminal(
+	ctx context.Context,
+	stream,
+	group,
+	msgID string,
+	retention time.Duration,
+) (terminalAckResult, error) {
+	res, err := ackAndRetainTerminalScript.Run(ctx, store.client,
+		[]string{invocationStateKey(stream, group, msgID), stream},
+		group,
+		msgID,
+		terminalField,
+		retentionTTLMillis(retention),
+	).Slice()
+	if err != nil {
+		return terminalAckResult{}, err
+	}
+	if len(res) < 2 {
+		// The script always returns two elements; a short reply is a protocol
+		// violation, so treat the outcome as unconfirmed rather than guess.
+		return terminalAckResult{}, fmt.Errorf("ackAndRetainTerminal: unexpected script reply of length %d", len(res))
+	}
+	return terminalAckResult{
+		Removed:  toInt64(res[0]) == 1,
+		Retained: toInt64(res[1]) == 1,
+	}, nil
+}
+
 // retainTerminal switches the message's invocation-state hash to terminal
 // retention via the atomic retainTerminal script: it writes the reserved
-// terminal marker and applies the retention TTL in one step. It is called only
-// AFTER the message is no longer recoverable — a successful XACK on the
-// success/obsolete/DLQ path, or a cleared/purged missing-payload PEL reference —
-// because retention removes recoverability. The marker makes every lifecycle
+// terminal marker and applies the retention TTL in one step. It is the
+// NON-XACK retention path: it runs only when there is no message to ACK — a
+// missing-payload PEL reference the server already purged — plus store-level
+// tests. Every production path that ACKs uses ackAndRetainTerminal, which does
+// the ACK and the retention in a single script. The marker makes every lifecycle
 // script inert, so a stale in-memory delivery cannot mutate the retained state
 // or remove the TTL. The upgrade is monotonic: a repeated call never re-extends
 // an already-terminal hash. A missing key is a no-op (nothing to retain).

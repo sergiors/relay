@@ -39,6 +39,9 @@ func TestProcessMessageMakeRecoverableFailureLeavesPending(t *testing.T) {
 	if store.retainCalls != 0 {
 		t.Fatalf("retainTerminal called %d times; the message must not be ACKed", store.retainCalls)
 	}
+	if store.ackRetainCalls != 0 {
+		t.Fatalf("ackAndRetainTerminal called %d times; the message must not be ACKed", store.ackRetainCalls)
+	}
 	if got := attrString(spanByName(t, rec, "stream.message"), "relay.outcome"); got != "pending" {
 		t.Fatalf("relay.outcome = %q, want pending (no dispatch, no ACK)", got)
 	}
@@ -95,6 +98,9 @@ func TestProcessScheduleMessageMakeRecoverableFailureLeavesPending(t *testing.T)
 	}
 	if store.retainCalls != 0 {
 		t.Fatalf("retainTerminal called %d times; the schedule message must not be ACKed", store.retainCalls)
+	}
+	if store.ackRetainCalls != 0 {
+		t.Fatalf("ackAndRetainTerminal called %d times; the schedule message must not be ACKed", store.ackRetainCalls)
 	}
 	if got := attrString(spanByName(t, rec, "stream.message"), "relay.outcome"); got != "pending" {
 		t.Fatalf("relay.outcome = %q, want pending", got)

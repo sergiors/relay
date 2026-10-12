@@ -49,6 +49,10 @@ type fakeInvocationStore struct {
 	// retainCalls counts retainTerminal invocations, so tests can assert the
 	// post-ACK retention ran exactly once per message.
 	retainCalls int
+	// ackRetainCalls counts ackAndRetainTerminal invocations, so tests can assert
+	// the production ACK boundary (atomic ack + terminal retention) was used and
+	// the former split XAck + retainTerminal path was not.
+	ackRetainCalls int
 	// recoverableCalls counts makeRecoverable invocations for non-terminal
 	// hashes, so tests can assert the legacy-TTL migration ran.
 	recoverableCalls int
@@ -415,6 +419,20 @@ func (f *fakeInvocationStore) retainTerminal(_ context.Context, _, _, _ string, 
 	f.retainCalls++
 	f.retained = true
 	return nil
+}
+
+// ackAndRetainTerminal models ackAndRetainTerminalScript: the message leaves the
+// PEL (not modelled in memory) and the message-level terminal marker is set
+// monotonically. An absent hash still acks but retains nothing (no empty key is
+// created), mirroring the script's EXISTS/type guard; the fake reports the ACK
+// as removed so callers can distinguish a stateless message.
+func (f *fakeInvocationStore) ackAndRetainTerminal(_ context.Context, _, _, _ string, _ time.Duration) (terminalAckResult, error) {
+	f.ackRetainCalls++
+	if len(f.fields) == 0 && !f.retained {
+		return terminalAckResult{Removed: true, Retained: false}, nil
+	}
+	f.retained = true
+	return terminalAckResult{Removed: true, Retained: true}, nil
 }
 
 // makeRecoverable models makeRecoverableScript: it marks a pre-existing,

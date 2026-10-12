@@ -757,18 +757,25 @@ func TestIntegrationProcessMessageRetainsStateOnlyAfterAck(t *testing.T) {
 	e.waitRetained(t, key)
 }
 
-// retainCountingStore decorates an invocationStateStore, recording how many
-// times retainTerminal is invoked while delegating every method to the wrapped
-// store. Because retainTerminal's only real effect can be observed through Redis
-// (which this test deliberately makes unreachable for the ACK), the count is
-// what proves the ordering contract directly: the failed-ACK path must never
-// even attempt terminal retention.
-type retainCountingStore struct {
+// ackCountingStore decorates an invocationStateStore, recording how many times
+// the atomic ackAndRetainTerminal and the lower-level retainTerminal are invoked
+// while delegating every method to the wrapped store. Because the atomic
+// operation's only real effect can be observed through Redis (which this test
+// deliberately makes unreachable for the ACK), the counts prove the ordering
+// contract directly: the failed-ACK path must go through the single atomic
+// ack+retain call, never the former split XAck + retainTerminal pair.
+type ackCountingStore struct {
 	invocationStateStore
-	retainCalls atomic.Int64
+	ackRetainCalls atomic.Int64
+	retainCalls    atomic.Int64
 }
 
-func (s *retainCountingStore) retainTerminal(ctx context.Context, stream, group, msgID string, retention time.Duration) error {
+func (s *ackCountingStore) ackAndRetainTerminal(ctx context.Context, stream, group, msgID string, retention time.Duration) (terminalAckResult, error) {
+	s.ackRetainCalls.Add(1)
+	return s.invocationStateStore.ackAndRetainTerminal(ctx, stream, group, msgID, retention)
+}
+
+func (s *ackCountingStore) retainTerminal(ctx context.Context, stream, group, msgID string, retention time.Duration) error {
 	s.retainCalls.Add(1)
 	return s.invocationStateStore.retainTerminal(ctx, stream, group, msgID, retention)
 }
@@ -776,28 +783,30 @@ func (s *retainCountingStore) retainTerminal(ctx context.Context, stream, group,
 // TestIntegrationSuccessfulHandlerXACKFailureLeavesPendingAndRecoverable pins
 // the failed-ACK half of the post-success contract against real Redis: the
 // handler's invocation-state mutations SUCCEED (TryStart then MarkComplete, the
-// completed marker the redelivery must observe), but the XACK fails, so the
-// message must stay in the PEL and its hash must remain RECOVERABLE — present,
-// still carrying the completed marker, PERSISTENT (PTTL == -1), and with NO
-// terminal marker. retainTerminal must NOT be attempted at all: it is only ever
-// called after a successful XACK, and running it here would apply the retention
-// TTL to state a redelivery still needs to skip the completed handler.
+// completed marker the redelivery must observe), but the atomic ACK+retain
+// fails, so the message must stay in the PEL and its hash must remain
+// RECOVERABLE — present, still carrying the completed marker, PERSISTENT
+// (PTTL == -1), and with NO terminal marker and no expiring TTL. The failed ACK
+// goes through the single atomic ackAndRetainTerminal call and NEVER the former
+// split XAck + retainTerminal pair (retainTerminal must not be attempted at
+// all): split retention after a failed ACK could apply the retention TTL to
+// state a redelivery still needs to skip the completed handler.
 //
 // The ACK failure is made deterministic by closing the consumer's Redis client
 // INSIDE the handler, after the state writes and before returning nil, so the
-// XAck that follows fails with redis.ErrClosed. Every post-close assertion goes
-// through a separate inspection client, because the consumer's own client is
-// closed.
+// atomic EVAL that follows fails with redis.ErrClosed (and therefore never
+// staged its persistent marker). Every post-close assertion goes through a
+// separate inspection client, because the consumer's own client is closed.
 func TestIntegrationSuccessfulHandlerXACKFailureLeavesPendingAndRecoverable(t *testing.T) {
 	// A separate client for inspecting Redis after the consumer's client is
 	// closed. RequireRedis owns its lifecycle (closed last, after this test's
 	// cleanup), so it stays usable for the assertions.
 	inspect := testutil.RequireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
-	// Observe retainTerminal attempts directly: the closed client means a
-	// (buggy) retain attempt could not have any Redis effect, so the call count
-	// is the assertion that survives the outage.
-	store := &retainCountingStore{invocationStateStore: e.consumer.invStateStore}
+	// Observe the ACK-boundary calls directly: the closed client means a (buggy)
+	// retain attempt could not have any Redis effect, so the call count is the
+	// assertion that survives the outage.
+	store := &ackCountingStore{invocationStateStore: e.consumer.invStateStore}
 	e.consumer.invStateStore = store
 
 	id := e.xadd(t, `{"a":1}`)
@@ -811,7 +820,7 @@ func TestIntegrationSuccessfulHandlerXACKFailureLeavesPendingAndRecoverable(t *t
 		_ = inspect.Del(ctx, key, e.stream, e.consumer.dlqStream).Err()
 	})
 
-	// Read the message into the group's PEL so XAck has an entry to remove.
+	// Read the message into the group's PEL so the XACK has an entry to remove.
 	msg := e.readOneIntoPEL(t)
 	if msg.ID != id {
 		t.Fatalf("read message %s, want %s", msg.ID, id)
@@ -819,7 +828,7 @@ func TestIntegrationSuccessfulHandlerXACKFailureLeavesPendingAndRecoverable(t *t
 
 	// The handler mirrors the runner's success path: it claims the invocation and
 	// marks it complete (persisting "ok"), then closes the consumer's client so
-	// the subsequent XAck cannot run, and returns nil (success).
+	// the subsequent atomic ACK+retain cannot run, and returns nil (success).
 	closeErr := make(chan error, 1)
 	e.consumer.processMessage(context.Background(), msg, 1,
 		func(ctx context.Context, msgID string, ev map[string]any) error {
@@ -838,7 +847,7 @@ func TestIntegrationSuccessfulHandlerXACKFailureLeavesPendingAndRecoverable(t *t
 				return fmt.Errorf("MarkComplete refused")
 			}
 			// Deterministic ACK failure: the state writes above already succeeded,
-			// so closing the client here only breaks the XACK that follows.
+			// so closing the client here only breaks the atomic EVAL that follows.
 			closeErr <- e.client.Close()
 			return nil
 		})
@@ -846,9 +855,13 @@ func TestIntegrationSuccessfulHandlerXACKFailureLeavesPendingAndRecoverable(t *t
 		t.Fatalf("close consumer client in handler: %v", err)
 	}
 
-	// The failed-ACK path must not even attempt terminal retention.
+	// The failed-ACK path must use the atomic ack+retain boundary once and never
+	// the split retainTerminal call.
+	if got := store.ackRetainCalls.Load(); got != 1 {
+		t.Fatalf("ackAndRetainTerminal attempted %d times after a failed ACK; want 1", got)
+	}
 	if got := store.retainCalls.Load(); got != 0 {
-		t.Fatalf("retainTerminal attempted %d times after a failed XACK; want 0", got)
+		t.Fatalf("retainTerminal attempted %d times after a failed ACK; want 0 (no split call)", got)
 	}
 
 	// The XACK failed, so the message must still be pending. No Consume loop runs
@@ -879,7 +892,7 @@ func TestIntegrationSuccessfulHandlerXACKFailureLeavesPendingAndRecoverable(t *t
 		t.Fatalf("invocation marker = %q err=%v, want %q persisted for the redelivery", v, err, "ok")
 	}
 	if ok, err := inspect.HExists(context.Background(), key, terminalField).Result(); err != nil || ok {
-		t.Fatalf("retainTerminal must NOT run after a failed XACK: terminal marker present (ok=%v err=%v)", ok, err)
+		t.Fatalf("retention must NOT run after a failed XACK: terminal marker present (ok=%v err=%v)", ok, err)
 	}
 	if d, err := inspect.PTTL(context.Background(), key).Result(); err != nil || d != -1 {
 		t.Fatalf("recoverable invocation state must be persistent; pttl=%s err=%v (want -1)", d, err)
