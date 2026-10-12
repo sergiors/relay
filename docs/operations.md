@@ -302,10 +302,13 @@ next_attempt_at:<deadline>`, `exhausted`, and `exhausted:…:dlq`. Every
   versa); a malformed-message placeholder records a reserved message-scoped field
   instead of a handler identity. While the message is pending the hash is
   **persistent**;
-  only after it leaves the PEL (successful XACK or a cleared
+  only after it leaves the PEL (successful XACK or a purged
   missing-payload reference) does it switch to terminal retention with the
   configured `REDIS_INVOCATION_RETENTION` TTL (default 48h; empty/0/negative
-  disables the expiry, leaving the marked hash persistent). A hash whose
+  disables the expiry, leaving the marked hash persistent). The ACK and that
+  retention switch are one atomic script, so the message can never leave the PEL
+  before its hash carries the marker; a failed ACK stages only a persistent
+  marker (no TTL) and never leaves pending state expiring. A hash whose
   retention never runs is leaked, never prematurely expired.
 - Deadlines are integer Unix milliseconds, compared exactly (`now_ms <
 deadline_ms` is protected).
@@ -335,8 +338,10 @@ summary, never the oversized payload; use `inspect`/`rm` on it.
 - Delivery is at-least-once; there is a crash window between a handler's side
   effect and its recorded completion, so a handler can run twice. Idempotency is
   the application's responsibility; exactly-once is not claimed.
-- Retry backoff, exhaustion limits, reclaim cadence, and the stats flush interval
-  are fixed internals, not configurable.
+- Per-invocation retry budgets are configured by each app rule's `retries`
+  property (default `4`, maximum `100` additional attempts); see
+  [Application templates](apps.md#timeouts-and-retries). Retry backoff, reclaim
+  cadence, and the stats flush interval are fixed internals, not configurable.
 - `resources` are per container; there is no aggregate per-app budget.
 - Networking is enabled (outbound access is a legitimate app need);
   per-app network policy is not implemented. Relay never creates or removes

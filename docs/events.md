@@ -189,7 +189,8 @@ once, so handlers must be idempotent.
 - A message is acknowledged (XACK) only after **every** matching invocation is
   terminal: each succeeded, or was exhausted and routed to the DLQ.
 - A failing invocation is retried per its rule's `retries` (default `4`, so `5`
-  total attempts) with a fixed backoff — 1m, 2m, 5m, then 10m capped — recorded
+  total attempts; maximum `100`, so at most `101` total attempts) with a fixed
+  backoff — 1m, 2m, 5m, then 10m capped — recorded
   as a `next_attempt_at` deadline in per-invocation state. A redelivery before
   that deadline skips the invocation without executing it.
 - The persisted attempt count is the number of **admitted claims** (`TryStart`),
@@ -266,14 +267,19 @@ Per-message invocation state is a Redis hash keyed by message and
 be redelivered from the PEL) that hash is **persistent with no TTL**, so however
 long a message sits pending its `running`/`next_attempt_at`/terminal markers are
 still there when a reclaim reads them. Only after the message has left the PEL —
-a successful XACK on the success, obsolete-schedule, or DLQ path, or a cleared
+a successful XACK on the success, obsolete-schedule, or DLQ path, or a purged
 missing-payload PEL reference — is the hash switched to **terminal retention**:
 a reserved marker plus the configured `REDIS_INVOCATION_RETENTION` TTL (default
 `48h`; empty/`0`/negative disables the expiry while still writing the marker, so
-the hash stays persistent). Once retained, every lifecycle transition
+the hash stays persistent). For every path that ACKs, the XACK and that retention
+switch are performed by **one atomic Lua script**, so a crash or error can never
+leave a hash whose message already left the PEL without a marker/TTL; a failed
+ACK stages only a persistent marker (no TTL), so a still-pending message's state
+never expires (the terminal marker is nonetheless present, and a redelivery just
+re-acks). Once retained, every lifecycle transition
 from a stale in-memory delivery is inert, so it can neither mutate the retained
-state nor remove the retention TTL. A hash left un-retained (for example a crash
-in the ACK→retain window) is simply leaked, never prematurely expired.
+state nor remove the retention TTL. A hash whose retention never runs is simply
+leaked, never prematurely expired.
 
 ## Dead-letter queue
 

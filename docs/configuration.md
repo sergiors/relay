@@ -329,8 +329,11 @@ XACK flow**, so it is trimmed **age-only**:
 `REDIS_INVOCATION_RETENTION` (default `48h`) is **not a stream trim**: it is the
 TTL applied to a message's per-invocation Redis hash (`relay:invocation:…`) only
 **after the message has left the PEL** — a successful XACK on the success,
-obsolete-schedule, or DLQ path, or a cleared missing-payload PEL reference.
-While the message is recoverable (still in the PEL and therefore redeliverable)
+obsolete-schedule, or DLQ path, or a purged missing-payload PEL reference. For
+every path that ACKs, the XACK and the retention are one atomic script, so no
+post-ACK window can leave an unretained hash; a failed ACK stages only a
+persistent marker (no TTL). While the message is recoverable (still in the PEL
+and therefore redeliverable)
 the hash is **persistent with no TTL**, regardless of this value; the window
 starts only once the message is no longer recoverable.
 

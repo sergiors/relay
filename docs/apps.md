@@ -46,7 +46,7 @@ events: # rules that consume stream events
     pattern:
       event_name: [INSERT]
     timeout: 6s # optional, default 6s, max 5m
-    retries: 4 # optional, additional attempts, default 4
+    retries: 4 # optional, additional attempts, default 4, max 100
 
 schedules: # triggers that publish uniquely identified occurrences
   - name: nightly-cleanup # mandatory stable identity, unique per app
@@ -54,7 +54,7 @@ schedules: # triggers that publish uniquely identified occurrences
     cron: "0 3 * * *"
     timezone: Europe/Rome # optional, default UTC
     timeout: 20s
-    retries: 4
+    retries: 4 # optional, additional attempts, default 4, max 100
 
 services: # persistent long-running containers
   - name: web # mandatory stable identity, unique per app
@@ -150,8 +150,10 @@ no trailing `.`).
   positive and at most `5m`; a larger, zero, negative, or unparseable value
   fails template validation.
 - `retries` is the number of **additional** executions after the initial one
-  (default `4`, so `1 + retries = 5` total attempts). It must be a non-negative
-  integer. The backoff schedule is fixed (1m/2m/5m/10m capped) and not
+  (default `4`, so `1 + retries = 5` total attempts; maximum `100`, so at most
+  `101` total attempts). It must be an integer between `0` and `100`; a
+  negative, non-integer, or greater-than-`100` value fails template
+  validation. The backoff schedule is fixed (1m/2m/5m/10m capped) and not
   template-configurable.
 
 ### Concurrency

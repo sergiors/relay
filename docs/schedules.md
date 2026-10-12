@@ -31,7 +31,7 @@ schedules:
     cron: "0 3 * * *" # minute hour day-of-month month day-of-week
     timezone: Europe/Rome # optional IANA timezone, default UTC
     timeout: 20s # optional, same rules as event rules
-    retries: 2 # optional, same rules as event rules
+    retries: 2 # optional, additional attempts, default 4, max 100
 ```
 
 `name` is the schedule's stable identity: it keys the cron job, the occurrence
@@ -41,6 +41,13 @@ trailing `.`) and must be unique among an app's schedules. **Multiple
 schedules may share a handler** (the same job at different times); each name is
 an independently addressable schedule. Editing a schedule's cron, handler,
 timezone, timeout, or retries under the same `name` replaces only that job.
+
+`retries` carries the same semantics as an event rule's: the number of
+**additional** executions after the initial one, default `4` (so `5` total
+attempts) and at most `100` (so `101` total attempts). It must be an integer
+between `0` and `100`; a negative, non-integer, or greater-than-`100` value
+fails template validation. Once an occurrence is admitted, its retry contract is
+frozen in the invocation state (see [Live changes](#live-changes)).
 
 Accepted forms, at **minute granularity**:
 

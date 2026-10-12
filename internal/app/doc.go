@@ -50,11 +50,15 @@
 //     persist (stream layer) and the message-reclaim backstop derived from it.
 //   - A rule that omits `retries` resolves to DefaultRetries (4): the number of
 //     additional executions attempted after the initial one, so a failing
-//     invocation is attempted 1 + Retries times in total. `retries` must be a
-//     non-negative integer; a negative or non-integer value (e.g. "abc", "1.5")
-//     fails template validation. `retries: 0` is valid (only the initial
-//     attempt). The per-invocation attempt count and retry backoff are owned by
-//     the stream/runner layers, not here.
+//     invocation is attempted 1 + Retries times in total. `retries` must be an
+//     integer in [0, MaxRetries] (0..100); a negative, above-max, or
+//     non-integer value (e.g. "abc", "1.5") fails template validation.
+//     `retries: 0` is valid (only the initial attempt). The cap is enforced at
+//     this parse boundary — both event and schedule entries resolve through the
+//     same helper — so the downstream 1 + Retries attempt arithmetic can never
+//     overflow and an unbounded retry budget can never be persisted. The
+//     per-invocation attempt count and retry backoff are owned by the
+//     stream/runner layers, not here.
 //
 // Env and secrets:
 //   - `env` maps an env-var name to a literal string value, injected into every

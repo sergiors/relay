@@ -1,6 +1,7 @@
 package app
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -323,6 +324,106 @@ events:
 			if !strings.Contains(err.Error(), "retries") {
 				t.Errorf("expected error to mention retries, got: %v", err)
 			}
+		})
+	}
+}
+
+// retriesSchema is one of the two template schemas that carry a `retries`
+// field. Both resolve through the SAME resolveRetries helper, so a single
+// table-driven boundary test can prove both schemas accept the maximum and
+// reject above it without duplicating the parser YAML per schema.
+type retriesSchema struct {
+	name string
+	// build renders a minimal template with the schema's single `retries` set to
+	// raw, or omitted entirely when raw is empty.
+	build func(raw string) string
+	// resolved returns the parsed retry count from the rendered template.
+	resolved func(*Template) int
+}
+
+// retriesSchemas returns the event-rule and schedule schemas plus the small
+// amounts of schema-specific YAML each needs.
+func retriesSchemas() []retriesSchema {
+	return []retriesSchema{
+		{
+			name: "event",
+			build: func(raw string) string {
+				line := ""
+				if raw != "" {
+					line = "\n    retries: " + raw
+				}
+				return `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]` + line + "\n"
+			},
+			resolved: func(t *Template) int { return t.Events[0].Retries },
+		},
+		{
+			name: "schedule",
+			build: func(raw string) string {
+				line := ""
+				if raw != "" {
+					line = "\n    retries: " + raw
+				}
+				return `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+schedules:
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
+    cron: "0 3 * * *"` + line + "\n"
+			},
+			resolved: func(t *Template) int { return t.Schedules[0].Retries },
+		},
+	}
+}
+
+// TestParseRetriesBoundary pins the accepted retry range at the parse boundary
+// for BOTH schemas that carry `retries`: an omitted key resolves to
+// DefaultRetries, the whole inclusive range 0..MaxRetries is accepted (boundary
+// values 0, MaxRetries-1, and MaxRetries), and one above MaxRetries is rejected
+// with an actionable error naming both the value and the range. Negatives and
+// non-integers remain rejected (see the per-schema rejection tests). MaxRetries
+// is enforced here, before any `1 + retries` arithmetic downstream.
+func TestParseRetriesBoundary(t *testing.T) {
+	for _, schema := range retriesSchemas() {
+		t.Run(schema.name, func(t *testing.T) {
+			accepted := []struct {
+				name string
+				raw  string
+				want int
+			}{
+				{"omitted defaults", "", DefaultRetries},
+				{"zero", "0", 0},
+				{"below max", strconv.Itoa(MaxRetries - 1), MaxRetries - 1},
+				{"max", strconv.Itoa(MaxRetries), MaxRetries},
+			}
+			for _, tc := range accepted {
+				t.Run("accept "+tc.name, func(t *testing.T) {
+					tmpl := mustParse(t, schema.build(tc.raw))
+					if got := schema.resolved(tmpl); got != tc.want {
+						t.Fatalf("retries = %d, want %d", got, tc.want)
+					}
+				})
+			}
+
+			t.Run("reject above max", func(t *testing.T) {
+				above := strconv.Itoa(MaxRetries + 1)
+				_, err := ParseTemplate([]byte(schema.build(above)))
+				if err == nil {
+					t.Fatalf("expected error for retries %s", above)
+				}
+				if !strings.Contains(err.Error(), "retries") ||
+					!strings.Contains(err.Error(), "between 0 and "+strconv.Itoa(MaxRetries)) {
+					t.Fatalf("error = %v, want it to name retries and the range 0..%d", err, MaxRetries)
+				}
+			})
 		})
 	}
 }

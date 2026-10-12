@@ -21,6 +21,22 @@ const DefaultTimeout = 6 * time.Second
 // exhausted and the message is routed to the DLQ.
 const DefaultRetries = 4
 
+// MaxRetries is the inclusive upper bound on a rule's `retries`: the accepted
+// range is 0..MaxRetries, so a failing invocation is attempted at most
+// 1 + MaxRetries = 101 times before it is exhausted and routed to the DLQ. It
+// exists so a typo or generated value cannot keep an invocation pending for an
+// impractically long time (the retry backoff caps at ten minutes, but the
+// attempt budget would not otherwise bound), and so the downstream `1 + retries`
+// attempt arithmetic can never overflow (a value near MaxInt would wrap negative
+// and never reach the exhaustion test).
+//
+// The bound is enforced ONLY at the template parse boundary (resolveRetries),
+// which is the single construction point for every rule: both the event and the
+// schedule schema resolve through it, and no other production path builds an
+// EventRule/Schedule from untrusted input. Nothing downstream re-validates, so
+// this cap is what guarantees the attempt arithmetic stays in range.
+const MaxRetries = 100
+
 // DefaultConcurrency is the per-app concurrency applied to a template that
 // omits the top-level `concurrency` key. It bounds how many invocations of THIS
 // app's handlers may execute concurrently within a single Relay worker
@@ -154,9 +170,9 @@ type Schedule struct {
 	Timeout  time.Duration
 	// Retries is the number of additional executions attempted after the
 	// initial one (0 = only the initial attempt). Schedule entries carry the
-	// same semantics as EventRule.Retries: it is always non-negative after
-	// ParseTemplate; omitted schedules default to DefaultRetries. The total
-	// number of attempts for a failing invocation is 1 + Retries.
+	// same semantics as EventRule.Retries: it is always within [0, MaxRetries]
+	// after ParseTemplate; omitted schedules default to DefaultRetries. The
+	// total number of attempts for a failing invocation is 1 + Retries.
 	Retries int
 }
 
@@ -283,9 +299,10 @@ type EventRule struct {
 	// always positive and never exceeds MaxTimeout after ParseTemplate.
 	Timeout time.Duration
 	// Retries is the number of additional executions attempted after the
-	// initial one (0 = only the initial attempt). It is always non-negative
-	// after ParseTemplate; omitted event rules default to DefaultRetries. The
-	// total number of attempts for a failing invocation is 1 + Retries.
+	// initial one (0 = only the initial attempt). It is always within
+	// [0, MaxRetries] after ParseTemplate; omitted event rules default to
+	// DefaultRetries. The total number of attempts for a failing invocation is
+	// 1 + Retries.
 	Retries int
 }
 
@@ -1018,7 +1035,15 @@ func resolveConcurrency(raw any) (int, error) {
 
 // resolveRetries parses an optional rule retry count. A nil value (omitted)
 // yields the default; any non-integer value (a string, a float, a bool, ...) or
-// a negative integer is rejected. Zero is valid (only the initial attempt).
+// an integer outside [0, MaxRetries] is rejected. Zero is valid (only the
+// initial attempt).
+//
+// This is the shared resolver for BOTH the event and the schedule schema, and
+// it is the parse-boundary enforcement point for MaxRetries: every rule is
+// built through ParseTemplate, so the downstream `1 + retries` attempt bound
+// (runner.recordFailure) can never overflow and a runaway attempt budget can
+// never be persisted. The upper-bound error is actionable: it names the value
+// and the accepted range.
 func resolveRetries(raw any) (int, error) {
 	if raw == nil {
 		return DefaultRetries, nil
@@ -1029,6 +1054,9 @@ func resolveRetries(raw any) (int, error) {
 	}
 	if n < 0 {
 		return 0, fmt.Errorf("retries %d must be non-negative", n)
+	}
+	if n > MaxRetries {
+		return 0, fmt.Errorf("retries %d must be between 0 and %d", n, MaxRetries)
 	}
 	return n, nil
 }
