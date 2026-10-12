@@ -8,6 +8,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -97,6 +98,152 @@ func waitForContainersCount(ctx context.Context, cli *client.Client, key, value 
 	return pollUntil(ctx, 15*time.Second, func() bool {
 		return countContainersByLabel(ctx, cli, key, value) == want
 	})
+}
+
+// listAppServiceContainers returns every persistent Relay service container
+// (relay.type=service) whose relay.app label is exactly appName, read straight
+// from the RAW Docker client. It deliberately does not go through
+// Manager.ServiceContainerList: a container leaked by a prior run outlives its
+// Manager, and a closed Manager refuses service work, which is exactly the state
+// a leaked container's owner is left in. The summaries carry the id, image,
+// state, and full label set used by the scoped cleanup and the failure
+// diagnostics below. A container-list failure is RETURNED, never flattened into
+// an empty result: "no matching container" is a meaningful assertion outcome
+// here, so an unreadable daemon must not masquerade as one.
+func listAppServiceContainers(ctx context.Context, cli *client.Client, appName string) ([]container.Summary, error) {
+	list, err := cli.ContainerList(ctx, client.ContainerListOptions{All: true})
+	if err != nil {
+		return nil, fmt.Errorf("list containers for %s: %w", appName, err)
+	}
+	var out []container.Summary
+	for _, c := range list.Items {
+		if isServiceContainer(c.Labels) && c.Labels[labelApp] == appName {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
+// describeAppServiceContainers renders every service container for the named app
+// as a leading-newline-prefixed multi-line diagnostic (id, image, image id,
+// state, and the full label set), " (none)" when there are none, or the
+// container-list error when the daemon could not be read. It lists ALL of the
+// app's service containers, not merely the service identity an assertion filters
+// on, so an unexpected extra service name is still visible in the failure
+// output.
+func describeAppServiceContainers(ctx context.Context, cli *client.Client, appName string) string {
+	containers, err := listAppServiceContainers(ctx, cli, appName)
+	if err != nil {
+		return fmt.Sprintf(" (list error: %v)", err)
+	}
+	if len(containers) == 0 {
+		return " (none)"
+	}
+	var b strings.Builder
+	for _, c := range containers {
+		fmt.Fprintf(&b, "\n  id=%s image=%s image_id=%s state=%s labels=%v",
+			c.ID, c.Image, c.ImageID, c.State, c.Labels)
+	}
+	return b.String()
+}
+
+// countAppServiceContainers counts the service containers for one service
+// identity: relay.type=service AND relay.app=appName AND relay.service=name. It
+// reports a container-list failure as an error so a caller never mistakes an
+// unreadable daemon for a zero count. Scoping to the service population (rather
+// than every container carrying relay.app) is what makes a rerun deterministic,
+// while still counting a leaked OR genuinely duplicated container for THIS
+// identity: an assertion still fails on a third replica of the same service, it
+// just ignores unrelated event/schedule containers that share the app label.
+func countAppServiceContainers(ctx context.Context, cli *client.Client, appName, serviceName string) (int, error) {
+	containers, err := listAppServiceContainers(ctx, cli, appName)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, c := range containers {
+		if c.Labels[labelService] == serviceName {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// waitForAppServiceContainersCount polls until exactly want service containers
+// for the given app/service identity exist, or the deadline passes. A
+// container-list failure never satisfies the wait — not even want == 0 — so a
+// broken daemon cannot make an "expect none" assertion pass.
+func waitForAppServiceContainersCount(ctx context.Context, cli *client.Client, appName, serviceName string, want int) bool {
+	return pollUntil(ctx, 15*time.Second, func() bool {
+		n, err := countAppServiceContainers(ctx, cli, appName, serviceName)
+		return err == nil && n == want
+	})
+}
+
+// appServiceContainersDiagnostic renders the current service-container state for
+// an assertion failure message: the count for the given service identity plus a
+// per-container listing, or the container-list error (never a bare zero) when
+// the daemon could not be read.
+func appServiceContainersDiagnostic(ctx context.Context, cli *client.Client, appName, serviceName string) string {
+	n, err := countAppServiceContainers(ctx, cli, appName, serviceName)
+	if err != nil {
+		return fmt.Sprintf("unknown (list error: %v)", err)
+	}
+	return fmt.Sprintf("%d%s", n, describeAppServiceContainers(ctx, cli, appName))
+}
+
+// removeAppServiceContainers force-removes every service container for the named
+// app through the RAW Docker client, returning the ids it removed and the first
+// failure (if any). It is manager-independent, so it is safe BOTH before a
+// scenario (isolating a fixed app name from containers a prior run leaked) and
+// from t.Cleanup, including after Manager.Close. Removals are best-effort: a
+// failure on one container does not stop the others, and because cleanup must
+// never fail a test the caller logs the returned error rather than calling
+// t.Fatal. A container-list failure removes nothing and is returned, so a
+// cleanup can report that it could not even discover the containers.
+func removeAppServiceContainers(ctx context.Context, cli *client.Client, appName string) ([]string, error) {
+	containers, err := listAppServiceContainers(ctx, cli, appName)
+	if err != nil {
+		return nil, err
+	}
+	var removed []string
+	var firstErr error
+	for _, c := range containers {
+		if c.State == container.StateRunning {
+			timeout := 10
+			if _, err := cli.ContainerStop(ctx, c.ID, client.ContainerStopOptions{Timeout: &timeout}); err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("stop service container %s: %w", c.ID, err)
+				}
+				continue
+			}
+		}
+		if err := removeContainerContext(ctx, cli, c.ID); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("remove service container %s: %w", c.ID, err)
+			}
+			continue
+		}
+		removed = append(removed, c.ID)
+	}
+	return removed, firstErr
+}
+
+// isolateAppServiceContainers removes this test app's stale service containers
+// before a scenario, failing the test when they cannot be listed or removed. A
+// fixed app name plus whole-daemon container queries makes a leak from a killed
+// prior run (cleanup never ran) or from a run whose cleanup raced Manager.Close
+// (a closed Manager refuses service work) visible as a phantom extra container;
+// this makes every run start clean.
+func isolateAppServiceContainers(t *testing.T, ctx context.Context, cli *client.Client, appName string) {
+	t.Helper()
+	removed, err := removeAppServiceContainers(ctx, cli, appName)
+	if err != nil {
+		t.Fatalf("remove stale service containers before scenario: %v", err)
+	}
+	if len(removed) > 0 {
+		t.Logf("removed %d stale service container(s) for %s before scenario: %v", len(removed), appName, removed)
+	}
 }
 
 // waitForContainerGone polls until no running-or-exited container carries the

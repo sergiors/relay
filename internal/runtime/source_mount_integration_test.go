@@ -645,6 +645,10 @@ setInterval(() => {}, 1 << 30);
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
+	// Fixed app name: start from a clean slate so a container a prior run leaked
+	// cannot accumulate.
+	isolateAppServiceContainers(t, ctx, cli, appName)
+
 	fpBefore, err := app.FingerprintApp(dir, fn.Template)
 	if err != nil {
 		t.Fatalf("fingerprint before prepare: %v", err)
@@ -654,19 +658,25 @@ setInterval(() => {}, 1 << 30);
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
-	defer func() { _ = m.Close() }()
+	// Manager.Close is registered BEFORE the service cleanup so, under t.Cleanup's
+	// LIFO order, the app's service containers are stopped/removed while the
+	// manager is still open (a closed manager refuses service work) and its
+	// images are removed only after no container references them.
+	t.Cleanup(func() { _ = m.Close() })
+	t.Cleanup(func() { cleanupImagePrefixes(cli, "relay-app-"+appName+":")() })
 	t.Cleanup(func() {
 		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
 		_, _ = m.RemoveAppServiceContainers(cc, appName)
-		cleanupImagePrefixes(cli, "relay-app-"+appName+":")()
+		if removed, rerr := removeAppServiceContainers(cc, cli, appName); rerr != nil {
+			t.Logf("raw service container cleanup for %s: %v (removed %v)", appName, rerr, removed)
+		}
 	})
 
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
-	defer cleanupImage(cli, ctx, prepared.Image)
 	if prepared.Dependency == "" {
 		t.Fatal("expected the Node app to build FROM a dependency image")
 	}
@@ -767,23 +777,33 @@ setInterval(() => {}, 1 << 30);
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
+	// Fixed app name: start from a clean slate so a container a prior run leaked
+	// cannot accumulate.
+	isolateAppServiceContainers(t, ctx, cli, appName)
+
 	m, err := NewManager(testutil.DiscardLogger(), nil, "test-host", WithSourceMount(true))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
-	defer func() { _ = m.Close() }()
+	// Manager.Close is registered BEFORE the service cleanup so, under t.Cleanup's
+	// LIFO order, the app's service containers are stopped/removed while the
+	// manager is still open (a closed manager refuses service work) and its
+	// images are removed only after no container references them.
+	t.Cleanup(func() { _ = m.Close() })
+	t.Cleanup(func() { cleanupImagePrefixes(cli, "relay-app-"+appName+":")() })
 	t.Cleanup(func() {
 		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
 		_, _ = m.RemoveAppServiceContainers(cc, appName)
-		cleanupImagePrefixes(cli, "relay-app-"+appName+":")()
+		if removed, rerr := removeAppServiceContainers(cc, cli, appName); rerr != nil {
+			t.Logf("raw service container cleanup for %s: %v (removed %v)", appName, rerr, removed)
+		}
 	})
 
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
-	defer cleanupImage(cli, ctx, prepared.Image)
 
 	tmpl := &app.Template{Runtime: "node24"}
 	svc := app.Service{Name: "svc", Entrypoint: "app/service.js", Port: 3000}
@@ -1289,23 +1309,49 @@ setInterval(() => {}, 1 << 30);
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 
+	// Isolation: appName is fixed and every count below is a whole-daemon query,
+	// so a service container a prior run leaked would make the coexistence
+	// assertion see three. A prior run DOES leak one: its t.Cleanup removed the
+	// containers only after Manager.Close had run, and a closed manager refuses
+	// service work. Remove only THIS app's service containers, through the raw
+	// client (no live Manager required), before the scenario starts.
+	isolateAppServiceContainers(t, ctx, cli, appName)
+
 	m, err := NewManager(testutil.DiscardLogger(), nil, "test-host", WithSourceMount(true))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
-	defer func() { _ = m.Close() }()
+	// Cleanup order is load-bearing. t.Cleanup runs LIFO, so the step registered
+	// LAST runs FIRST; the registrations below therefore run:
+	//  1. stop/remove THIS app's service containers while the manager is still
+	//     open (a closed manager refuses service work, which is exactly how
+	//     containers leaked between runs);
+	//  2. remove this app's images, now that no container references them (an
+	//     image removed while a container still uses it is merely untagged and
+	//     survives as a dangling layer);
+	//  3. close the manager;
+	//  4. remove only the dependency images this test's builds added
+	//     (cleanupNewDepImagesSince, registered first at the top of the test).
+	t.Cleanup(func() { _ = m.Close() })
+	t.Cleanup(func() { cleanupImagePrefixes(cli, "relay-app-"+appName+":")() })
 	t.Cleanup(func() {
 		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
-		_, _ = m.RemoveAppServiceContainers(cc, appName)
-		cleanupImagePrefixes(cli, "relay-app-"+appName+":")()
+		// The manager path is the same one the reconciler uses; the raw sweep is
+		// the manager-independent backstop for anything it misses (including
+		// containers a run predating this cleanup order left behind).
+		if _, rerr := m.RemoveAppServiceContainers(cc, appName); rerr != nil {
+			t.Logf("manager service cleanup for %s: %v", appName, rerr)
+		}
+		if removed, rerr := removeAppServiceContainers(cc, cli, appName); rerr != nil {
+			t.Logf("raw service container cleanup for %s: %v (removed %v)", appName, rerr, removed)
+		}
 	})
 
 	first, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare v1: %v", err)
 	}
-	defer cleanupImage(cli, ctx, first.Image)
 	if first.Dependency == "" {
 		t.Fatal("expected the Node app to build FROM a dependency image")
 	}
@@ -1391,9 +1437,9 @@ setInterval(() => {}, 1 << 30);
 		t.Fatal("the replacement returned the same container id as v1")
 	}
 	// Both generations coexist at the start-before-stop boundary.
-	if !waitForContainersCount(ctx, cli, labelApp, appName, 2) {
-		t.Fatalf("expected v1 and v2 service containers to coexist during replacement, got %d",
-			countContainersByLabel(ctx, cli, labelApp, appName))
+	if !waitForAppServiceContainersCount(ctx, cli, appName, svc.Name, 2) {
+		t.Fatalf("expected v1 and v2 service containers to coexist during replacement, got %s",
+			appServiceContainersDiagnostic(ctx, cli, appName, svc.Name))
 	}
 
 	// Stop the old generation; the replacement stays up and keeps running V2.
@@ -1416,9 +1462,9 @@ setInterval(() => {}, 1 << 30);
 	if !waitForContainerIDGone(ctx, cli, id1) {
 		t.Errorf("the replaced v1 service container %s should be gone", id1)
 	}
-	if !waitForContainersCount(ctx, cli, labelApp, appName, 1) {
-		t.Errorf("expected exactly the v2 service container after replacement, got %d",
-			countContainersByLabel(ctx, cli, labelApp, appName))
+	if !waitForAppServiceContainersCount(ctx, cli, appName, svc.Name, 1) {
+		t.Errorf("expected exactly the v2 service container after replacement, got %s",
+			appServiceContainersDiagnostic(ctx, cli, appName, svc.Name))
 	}
 	awaitServiceLog(t, ctx, cli, id2, "svc ", "V2")
 }
@@ -1449,23 +1495,33 @@ setInterval(() => {}, 1 << 30);
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 
+	// Fixed app name: start from a clean slate so a container a prior run leaked
+	// cannot accumulate.
+	isolateAppServiceContainers(t, ctx, cli, appName)
+
 	m, err := NewManager(testutil.DiscardLogger(), nil, "test-host", WithSourceMount(true))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
-	defer func() { _ = m.Close() }()
+	// Manager.Close is registered BEFORE the service cleanup so, under t.Cleanup's
+	// LIFO order, the app's service containers are stopped/removed while the
+	// manager is still open (a closed manager refuses service work) and its
+	// images are removed only after no container references them.
+	t.Cleanup(func() { _ = m.Close() })
+	t.Cleanup(func() { cleanupImagePrefixes(cli, "relay-app-"+appName+":")() })
 	t.Cleanup(func() {
 		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
 		_, _ = m.RemoveAppServiceContainers(cc, appName)
-		cleanupImagePrefixes(cli, "relay-app-"+appName+":")()
+		if removed, rerr := removeAppServiceContainers(cc, cli, appName); rerr != nil {
+			t.Logf("raw service container cleanup for %s: %v (removed %v)", appName, rerr, removed)
+		}
 	})
 
 	first, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare v1: %v", err)
 	}
-	defer cleanupImage(cli, ctx, first.Image)
 
 	tmpl := &app.Template{Runtime: "node24"}
 	svc := app.Service{Name: "svc", Entrypoint: "app/service.js", Port: 3000}
