@@ -31,7 +31,7 @@ automatically.
 | `MAX_BUFFERED_EVENTS`         | `16`               | positive integer                                                        | Fails startup. Bounds messages read from Redis and held locally per worker.                                                                                                                                                 |
 | `MAX_EVENT_BYTES`             | `256KiB`           | human-readable binary size (`256B`, `256KiB`, `1MiB`; bare integer bytes accepted) | Fails startup on zero/negative/malformed/decimal-unit/above-1MiB. Byte length of a message's raw `event` value; over-limit messages are non-retryably dead-lettered with a bounded summary.                                |
 | `WARM_CONTAINER_IDLE_TIMEOUT` | `5m`               | positive Go duration (`90s`, `10m`, `1h30m`)                            | Fails startup.                                                                                                                                                                                                              |
-| `HOT_RELOAD`                  | `false`            | boolean (`1`, `t`, `true`, `0`, `f`, `false`; trimmed)                  | Fails startup on an unparseable value. Bind-mounts the live app source read-only into containers instead of baking it, for runtimes with a mountable dependency layout (Python and Node); a source-only edit reuses the image, managed services restart in place, and pooled execution containers are recycled. See below. |
+| `HOT_RELOAD`                  | `false`            | boolean (`1`, `t`, `true`, `0`, `f`, `false`; trimmed)                  | Fails startup on an unparseable value. `false` bakes the source into the immutable runtime image; `true` source-mounts the live app directory from `/apps` read-only into containers for runtimes with a mountable dependency layout (Python and Node), so a source-only edit reuses the app and dependency images, managed services restart in place, and pooled execution containers are recycled. See below. |
 | `METRICS_ADDR`                | unset              | listen address (`:9090`)                                                | Empty disables the Prometheus endpoint. A bind failure is fatal at startup.                                                                                                                                                 |
 | `GIT_WEBHOOK_ADDR`            | unset              | listen address (`:8081`)                                                | Empty disables the GitHub webhook. A bind failure is fatal. Starts only when the git source also names a webhook secret.                                                                                                    |
 | `NETWORKS`                    | unset              | comma-separated Docker network names                                    | Parsed at startup (trimmed, de-duplicated, declaration order kept). Every name is verified to exist; a missing network fails startup. Applied to execution containers and (as an order-independent set) service containers. |
@@ -160,35 +160,45 @@ counts invocations that had to wait at the bound.
 
 ### Hot reload
 
-`HOT_RELOAD` (default `false`) changes how a runtime-backed app's **source**
-reaches its containers. When enabled, for every runtime with a mountable
-dependency layout — Python, whose dependencies install into the system
-site-packages *outside* the app directory, and Node, whose `node_modules` and
-persisted esbuild live under `/app` while the source is mounted at the distinct
-`/app/src` — Relay builds the app image **without baking the source** and
-bind-mounts the app's live directory read-only into its execution and
-entrypoint-service containers. Python mounts at the engine work directory
-(`/app`); Node mounts at `/app/src` so the bind never hides `/app/node_modules`,
-and its bootstrap bundles any TypeScript handler at container startup with the
-same pinned esbuild the baked build used. It is startup configuration: changing
-it requires a worker restart. `HOT_RELOAD=false` preserves the historical
-baked-source image exactly. `SOURCE_MOUNT` is **not** a Relay configuration
-variable: it is neither read nor accepted (setting it has no effect).
+`HOT_RELOAD` (default `false`) controls how a runtime-backed app's **source**
+reaches its containers.
+
+- With `HOT_RELOAD=false`, the app's source is **baked into the immutable
+  runtime image**. The image is the app's source identity: a source edit
+  produces a new image version, and the previous version keeps serving until
+  the new one is prepared and swapped in.
+- With `HOT_RELOAD=true`, Relay builds the app image **without baking the
+  source** and **source-mounts** the app's live directory under `/apps`
+  read-only into its execution and entrypoint-service containers. A source-only
+  change reuses the existing app and dependency images (neither is rebuilt) and
+  takes effect by reloading or restarting the application process.
+
+Source mounting applies to every runtime with a mountable dependency layout —
+Python, whose dependencies install into the system site-packages *outside* the
+app directory, and Node, whose `node_modules` and persisted esbuild live under
+`/app` while the source is mounted at the distinct `/app/src`. Python mounts at
+the engine work directory (`/app`); Node mounts at `/app/src` so the bind never
+hides `/app/node_modules`, and its bootstrap bundles any TypeScript handler at
+container startup with the same pinned esbuild the baked build used. It is
+startup configuration: changing it requires a worker restart.
 
 Consequences:
 
 - **Source edits do not rebuild.** The app image becomes a function of the
-  runtime, dependencies, bootstrap, and entrypoint only; a source-only change
-  reuses the same image. The reconciler still detects the edit from the source
-  fingerprint and applies it: a managed entrypoint service is **restarted in
-  place** (the same Docker container, same image, same bind) so its process
-  re-reads the live source, and warm execution containers are recycled (idle
-  discarded, busy drained) onto fresh containers — a warm container that had
-  already imported the old modules never serves stale code. Because Docker labels
-  are immutable, the reconciler records the applied source fingerprint in memory
-  so a restarted service is recognized as converged instead of being restarted on
-  every pass; after a worker restart each stale service is restarted once more,
-  then left alone.
+  runtime, dependencies, bootstrap, and entrypoint only, so a source-only change
+  reuses the existing app and dependency images without rebuilding either. The
+  reconciler still detects the edit from the source fingerprint and applies it by
+  reloading or restarting the application process: a managed entrypoint service
+  is **restarted in place** — the same Docker container ID, same image, same
+  bind, with a brief stop/start — so its process re-reads the live source, and
+  warm execution containers are recycled onto fresh containers, with idle
+  containers discarded immediately and busy containers **drained**: an in-flight
+  invocation finishes before its container is replaced, so a warm container that
+  had already imported the old modules never serves stale code. Because Docker
+  labels are immutable, the reconciler records the applied source fingerprint in
+  memory so a restarted service is recognized as converged instead of being
+  restarted on every pass; after a worker restart each stale service is restarted
+  once more, then left alone.
 - **Dependency changes still rebuild.** A changed manifest changes the content
   addressed dependency image and therefore the app image tag, exactly as before;
   the dependency lifecycle is unchanged.

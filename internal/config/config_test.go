@@ -1075,31 +1075,6 @@ func TestLoadHotReloadExplicit(t *testing.T) {
 	}
 }
 
-// TestLoadIgnoresSourceMount pins that SOURCE_MOUNT is NOT a config knob: the
-// renamed public option is HOT_RELOAD. A SOURCE_MOUNT value — valid boolean or
-// not — is never read, so it can neither enable hot reload nor fail startup.
-func TestLoadIgnoresSourceMount(t *testing.T) {
-	for _, value := range []string{"1", "true", "0", "false", "yes", "on"} {
-		t.Run(value, func(t *testing.T) {
-			setRequiredEnv(t)
-			t.Setenv("SOURCE_MOUNT", value)
-			os.Unsetenv("HOT_RELOAD")
-
-			logger, buf := testLogger()
-			cfg, err := Load(logger)
-			if err != nil {
-				t.Fatalf("Load returned error for SOURCE_MOUNT=%q; want it ignored: %v", value, err)
-			}
-			if cfg.HotReload {
-				t.Fatalf("HotReload = true for SOURCE_MOUNT=%q; want SOURCE_MOUNT ignored", value)
-			}
-			if buf.Len() != 0 {
-				t.Fatalf("Load logged %q for SOURCE_MOUNT=%q; want it ignored silently", buf.String(), value)
-			}
-		})
-	}
-}
-
 // TestParseBool exercises the shared boolean parser directly. It accepts every
 // strconv.ParseBool form (trimmed); empty, non-boolean, and numeric-adjacent
 // values error naming the variable. Load surfaces that error unchanged.

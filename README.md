@@ -121,7 +121,7 @@ long-running containers
 
 Relay keeps those containers aligned with the declared service configuration, restarting or replacing them when necessary.
 
-Relay watches `/apps` for changes. When an app changes, Relay reconciles only the affected app and rebuilds its managed image only when build inputs actually change. Container-only changes such as resource limits do not require a new image. With `HOT_RELOAD` enabled, mountable runtimes (Python and Node) bind-mount the live app source read-only instead of baking it, so a source-only edit reuses the image: managed services are restarted in place (same container, same image) and pooled execution containers are recycled onto the live source; see [docs/configuration.md](docs/configuration.md#hot-reload).
+Relay watches `/apps` for changes. When an app changes, Relay reconciles only the affected app and rebuilds its managed image only when build inputs actually change. Container-only changes such as resource limits do not require a new image. By default the app's source is baked into the immutable runtime image. With `HOT_RELOAD` enabled, mountable runtimes (Python and Node) instead source-mount the live app directory from `/apps` read-only, so a source-only edit reuses the app and dependency images without rebuilding either and the new code takes effect by reloading or restarting the application process: managed services restart in place (same container ID, same image, brief stop/start) and pooled execution containers are recycled onto the live source, with busy invocations draining before replacement; see [docs/configuration.md](docs/configuration.md#hot-reload).
 
 ## Guarantees
 

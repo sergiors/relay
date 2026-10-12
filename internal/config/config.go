@@ -174,8 +174,7 @@ type Config struct {
 	// is a returned configuration error naming HOT_RELOAD rather than being
 	// silently coerced. It is consumed by the runtime layer; this package only
 	// resolves and validates it. False (the default) preserves the historical
-	// baked-source behavior exactly. SOURCE_MOUNT is deliberately NOT read (and
-	// not aliased): it is not a Relay configuration variable.
+	// baked-source behavior exactly.
 	HotReload bool
 }
 

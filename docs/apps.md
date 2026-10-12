@@ -105,6 +105,17 @@ image, and Node downloads the checksum-verified pnpm standalone binary for the
 image's target architecture (only Linux `amd64` and `arm64` are supported; any
 other architecture fails the build rather than installing a mismatched binary).
 
+By default the app's source is **baked into the immutable runtime image**. With
+`HOT_RELOAD` enabled, a mountable runtime (Python and Node) is instead built
+without the source and **source-mounts** the live app directory from `/apps`
+read-only: a source-only edit reuses the app and dependency images (neither is
+rebuilt), managed entrypoint services restart in place, and the app's warm
+execution containers are recycled onto the live source. Python mounts the source
+at `/app` because its dependencies live in the system site-packages outside the
+app directory; Node mounts at `/app/src` so the dependency image's
+`/app/node_modules` stays available. See
+[configuration.md](configuration.md#hot-reload).
+
 ### Handlers
 
 `handler` has the form `module.function`, split at the **last** dot:
@@ -232,12 +243,15 @@ Relay builds **one image per app**, versioned by source fingerprint:
   builds **no app image at all**; its fingerprint is computed over
   `template.yaml` alone, and Relay does not scan the source tree for it.
 - With `HOT_RELOAD` enabled, a mountable runtime (Python and Node) instead
-  builds an image **without** the source and bind-mounts the live app directory
-  read-only (Python at `/app`; Node at `/app/src`, so `/app/node_modules` stays
-  visible and TypeScript is bundled at container startup); the image tag is then
-  derived from the runtime, dependency, and bootstrap only, and a source-only
-  edit reuses the image while restarting managed services in place and recycling
-  the app's warm execution containers. A Node
+  builds an image **without** the source and **source-mounts** the live app
+  directory read-only (Python at `/app`; Node at `/app/src`, so
+  `/app/node_modules` stays visible and TypeScript is bundled at container
+  startup); the image tag is then derived from the runtime, dependency, and
+  bootstrap only, and a source-only edit reuses the app and dependency images
+  (neither is rebuilt) while restarting managed services in place — the same
+  container ID, same image, same bind, with a brief stop/start — and recycling
+  the app's warm execution containers, whose busy invocations drain (finish
+  before replacement). A Node
   source-mounted container runs with `/app/src` as its working directory (so
   `process.cwd()` and relative paths see the app root). A source-mounted Node
   image also carries a shared resolve hook (`/relay/resolve-hook.mjs`) that
@@ -336,10 +350,12 @@ Relay watches `/apps` and reconciles changes live: a new directory is
 built and becomes available to event matching and schedule dispatch; edits to
 template/source/dependencies rebuild only that app; a failed rebuild keeps the
 previous working version and retries on the next change or the 30s periodic pass.
-Under `HOT_RELOAD`, a source-only edit does not rebuild (the source is
-mounted): the advanced fingerprint recycles the app's warm execution containers
-and restarts its entrypoint service containers in place, so the new code takes
-effect.
+Under `HOT_RELOAD`, the source is source-mounted from `/apps` instead of baked,
+so a source-only edit does not rebuild the app or dependency image: the advanced
+fingerprint restarts the app's entrypoint service containers in place (same
+container ID, brief stop/start) and recycles its warm execution containers —
+idle ones discarded, busy ones drained so an in-flight invocation finishes
+before replacement — so the new code takes effect.
 An app whose image cannot be built
 is marked unavailable but is still **matched**: an event matching only an
 unavailable app counts as matched and stays pending (never DLQ'd for
