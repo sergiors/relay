@@ -1,6 +1,9 @@
 package app
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -515,5 +518,144 @@ func TestFingerprintIgnoresIgnoredTypeScript(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "scratch.generated.ts"), "export const scratch = 2\n")
 	if got := fp(t, dir); got != base {
 		t.Fatal("editing a .ts file ignored by .gitignore must not change the fingerprint")
+	}
+}
+
+// oldFingerprintSelection reproduces the pre-streaming FingerprintSelection
+// byte-for-byte: every selected non-directory entry is read whole with os.ReadFile
+// and framed as (rel, NUL, content-or-stripped-template, NUL). It exists only to
+// pin that streaming the same bytes through os.Open + io.Copy yields an identical
+// digest for the same selection, order, and ignore/policy set.
+func oldFingerprintSelection(t *testing.T, selection *source.Selection) string {
+	t.Helper()
+	entries, err := collectSelectionEntries(selection)
+	if err != nil {
+		t.Fatalf("collect entries: %v", err)
+	}
+	templateRel := templateRelFor(selection)
+	h := sha256.New()
+	for _, e := range entries {
+		if e.isDir {
+			continue
+		}
+		raw, rerr := os.ReadFile(e.path)
+		if rerr != nil {
+			t.Fatalf("read %q: %v", e.rel, rerr)
+		}
+		io.WriteString(h, e.rel)
+		h.Write([]byte{0})
+		if e.rel != "" && e.rel == templateRel {
+			raw = stripTemplateResources(raw)
+		}
+		h.Write(raw)
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// TestFingerprintSelectionMatchesOldReadFileAlgorithm pins byte-for-byte
+// compatibility with the previous os.ReadFile implementation across a multi-file
+// tree that exercises directories, an applicable ANCESTOR .gitignore (policy
+// above the selected directory), a nested .gitignore, ignored files, and the
+// top-level resources strip. A different digest would be a silent identity break.
+func TestFingerprintSelectionMatchesOldReadFileAlgorithm(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "services", "fn")
+	writeFile(t, filepath.Join(root, ".gitignore"), "*.generated\n")
+	writeFile(t, filepath.Join(dir, ".gitignore"), "*.tmp\n")
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: python3.14\nresources:\n  memory: 1GiB\n")
+	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e): return 1\n")
+	writeFile(t, filepath.Join(dir, "pkg", "mod.py"), "x = 1\n")
+	writeFile(t, filepath.Join(dir, "pkg", "sub", "deep.py"), "y = 2\n")
+	writeFile(t, filepath.Join(dir, "scratch.tmp"), "ignored by nested rule\n")
+	writeFile(t, filepath.Join(dir, "noise.generated"), "ignored by ancestor rule\n")
+
+	selection, err := source.New(root, dir)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	got, err := FingerprintSelection(selection)
+	if err != nil {
+		t.Fatalf("FingerprintSelection: %v", err)
+	}
+	if want := oldFingerprintSelection(t, selection); got != want {
+		t.Fatalf("streaming fingerprint = %q, want old os.ReadFile fingerprint %q", got, want)
+	}
+}
+
+// TestFingerprintSelectionStreamsLargeFile proves a large synthetic file is hashed
+// identically to the old read-whole algorithm and that its whole content is
+// consumed: the file is generated in fixed-size chunks at test time (no giant
+// in-source fixture) and is several times larger than io.Copy's internal buffer.
+func TestFingerprintSelectionStreamsLargeFile(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: node24\n")
+
+	const chunk = 64 * 1024
+	big := filepath.Join(dir, "big.bin")
+	f, err := os.Create(big)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	pattern := make([]byte, chunk)
+	for i := range pattern {
+		pattern[i] = byte(i % 251)
+	}
+	for i := 0; i < 48; i++ { // 3 MiB total
+		if _, werr := f.Write(pattern); werr != nil {
+			t.Fatalf("write: %v", werr)
+		}
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	selection := mustSnapshotSelection(t, dir)
+	got, err := FingerprintSelection(selection)
+	if err != nil {
+		t.Fatalf("FingerprintSelection: %v", err)
+	}
+	if want := oldFingerprintSelection(t, selection); got != want {
+		t.Fatalf("streamed large-file fingerprint = %q, want %q", got, want)
+	}
+
+	// Flipping a byte at the very end must change the digest, proving the stream
+	// consumed the whole file rather than only a prefix.
+	last := make([]byte, 1)
+	rf, err := os.OpenFile(big, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if _, err := rf.ReadAt(last, int64(48*chunk-1)); err != nil {
+		rf.Close()
+		t.Fatalf("read last byte: %v", err)
+	}
+	if _, err := rf.WriteAt([]byte{last[0] ^ 0xff}, int64(48*chunk-1)); err != nil {
+		rf.Close()
+		t.Fatalf("flip last byte: %v", err)
+	}
+	if err := rf.Close(); err != nil {
+		t.Fatalf("close after flip: %v", err)
+	}
+	if changed, err := FingerprintSelection(selection); err != nil {
+		t.Fatalf("FingerprintSelection after flip: %v", err)
+	} else if changed == got {
+		t.Fatal("flipping the last byte of a large file must change the fingerprint")
+	}
+}
+
+// TestFingerprintSelectionOpenErrorPropagates pins that an unreadable ordinary
+// (non-template) selected file surfaces as an error at the FingerprintSelection
+// seam rather than yielding a partial digest now that the file is opened
+// individually instead of read whole.
+func TestFingerprintSelectionOpenErrorPropagates(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: python3.14\n")
+	writeFile(t, filepath.Join(dir, "pkg", "secret.py"), "s\n")
+	if err := os.Chmod(filepath.Join(dir, "pkg", "secret.py"), 0); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	if _, err := FingerprintSelection(mustSnapshotSelection(t, dir)); err == nil {
+		t.Fatal("expected an error for an unreadable selected file")
 	}
 }

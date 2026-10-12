@@ -155,11 +155,9 @@ func FingerprintSelection(selection *source.Selection) (string, error) {
 		if e.isDir {
 			continue
 		}
-		raw, rerr := os.ReadFile(e.path)
-		if rerr != nil {
-			return "", fmt.Errorf("read %q: %w", e.rel, rerr)
+		if err := fingerprintEntry(h, e.path, e.rel, templateRel); err != nil {
+			return "", err
 		}
-		writeFingerprintEntry(h, e.rel, templateRel, raw)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
@@ -247,19 +245,37 @@ func templateRelFor(selection *source.Selection) string {
 	return rel
 }
 
-// writeFingerprintEntry frames one entry's bytes into the digest using the
-// canonical (path, NUL, content, NUL) serialization, stripping resources from the
-// selected directory's own template.yaml. It is the ONE place that framing is
-// defined, so the streaming fingerprinter and the snapshot fingerprinter can
-// never drift.
-func writeFingerprintEntry(h hash.Hash, rel, templateRel string, raw []byte) {
+// fingerprintEntry frames one selected entry's bytes into the digest using the
+// canonical (path, NUL, content, NUL) serialization. Ordinary source streams
+// straight from disk into the hash, so a large file is never held in memory; only
+// the selected directory's own template.yaml is read whole, because its top-level
+// `resources` mapping must be stripped from the complete document before hashing
+// (see stripTemplateResources). An open, read, or close failure is returned so the
+// caller never accepts a partial digest.
+func fingerprintEntry(h hash.Hash, path, rel, templateRel string) (err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("read %q: %w", rel, err)
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("close %q: %w", rel, cerr)
+		}
+	}()
+
 	io.WriteString(h, rel)
 	h.Write([]byte{0})
 	if rel != "" && rel == templateRel {
-		raw = stripTemplateResources(raw)
+		raw, rerr := io.ReadAll(f)
+		if rerr != nil {
+			return fmt.Errorf("read %q: %w", rel, rerr)
+		}
+		h.Write(stripTemplateResources(raw))
+	} else if _, cerr := io.Copy(h, f); cerr != nil {
+		return fmt.Errorf("read %q: %w", rel, cerr)
 	}
-	h.Write(raw)
 	h.Write([]byte{0})
+	return nil
 }
 
 // snapshotRootPattern is the os.MkdirTemp pattern for a captured source
@@ -406,7 +422,7 @@ func captureSnapshot(selection *source.Selection, entries []snapshotEntry, root 
 }
 
 // captureEntryBytes frames one entry into the fingerprint exactly as
-// writeFingerprintEntry does while staging its bytes into root when stageRel is
+// fingerprintEntry does while staging its bytes into root when stageRel is
 // non-empty. The template's own top-level `resources` stripping requires the
 // whole document, so that one file (never staged) is read into memory; every
 // other entry streams straight from source to hash and destination.
