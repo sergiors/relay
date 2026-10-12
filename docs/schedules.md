@@ -111,7 +111,7 @@ worker's simultaneous evaluation of the same tick is a clean no-op.
   retries, exhaustion, and DLQ are shared with external event work.
 - A duplicate publication is a successful no-op.
 
-Because a failed publish is persisted durably (see
+Because every occurrence is persisted durably before publication (see
 [Publication recovery](#publication-recovery)) and retried with the same
 occurrence identity, an ambiguous `XADD` (the call errored but the entry may have
 been admitted) is eventually resolved as a clean duplicate rather than
@@ -129,26 +129,28 @@ directly to its configured handler rather than matched against event patterns:
 
 A tick is not a single best-effort publish. Schedule publication **requires a
 usable durable store**: before a worker may fire a schedule it must have opened
-the local state database, because a live tick has to be able to persist its
-occurrence if Redis rejects the publish. The durable store is the scheduler's
+the local state database, because every due occurrence's exact intent is written
+to the outbox **before** it is published. The durable store is the scheduler's
 local SQLite outbox — the same state database Relay already uses — and, when it
 cannot be opened, the worker marks the scheduler **unavailable** (see
 [Storage availability](#storage-availability)) rather than firing schedules it
 could not recover.
 
-A tick is also not a single best-effort publish:
+A tick's publication has several layers:
 
+- **The occurrence is durable before it is published.** Every due occurrence's
+  complete immutable intent (its derived id plus
+  app/schedule/handler/scheduled_at) is written to the local state database BEFORE
+  any Redis publish, so a crash between persistence and publication recovers it.
+  The row is deleted only once a publication call resolves with a nil error
+  (published or a clean duplicate), so a row never outlives a resolved
+  publication.
 - A failed publish retries the **same logical occurrence** (the ID is computed
   once and never recomputed) with a bounded exponential backoff — 100ms, 500ms,
   2s, 5s (five attempts total) — that observes the worker lifecycle, so shutdown
   aborts promptly. A success or a clean duplicate ends the loop; a duplicate is
-  never retried.
-- **The failure is durable.** On the FIRST failed attempt the complete immutable
-  occurrence intent (its derived id plus app/schedule/handler/scheduled_at) is
-  written to the local state database. If the bounded in-memory retries then
-  recover it, the row is deleted only once a publication call resolves with a
-  nil error. A healthy first-attempt success — or a clean duplicate — never
-  touches the database.
+  never retried. If the bounded budget is exhausted, the durable row is left for
+  the retry worker, which is woken immediately.
 - A background **durable retry worker** reclaims persisted occurrences and keeps
   republishing each one under a capped backoff (5s, 15s, 30s, 2m, 5m, 10m)
   **until it resolves or expires**. A record is claimed with a per-row database
@@ -182,17 +184,22 @@ A tick is also not a single best-effort publish:
   published and never deleted: it is logged and rescheduled under the same
   bounded backoff so the durable row is retained and repairable (until, like any
   row, it eventually expires).
-- **A durable-store failure pauses publication.** If the persist step above
-  fails (the outbox is wired but the write errors), the worker does not fall
-  back to more in-memory retries: the occurrence is explicitly logged as
-  **unresolved** (it is not claimed to be durably recoverable), the scheduler
-  transitions to **degraded**, and live schedule publication stops until the
-  durable store answers again. The same degraded transition is raised by any
-  outbox operation failure in the retry worker (claim, reschedule, delete, or
-  next-due query). Rows already persisted remain recoverable.
-- On recovery the durable retry worker drains existing rows, re-runs the same
-  bounded **latest-only 24h catch-up** to cover schedule time that passed while
-  paused, and only then re-enables live ticks.
+- **A durable-store write failure withholds the publish.** If the persist step
+  above fails (the outbox is wired but the write errors), the occurrence is NOT
+  published at all: its exact intent is held in a bounded in-memory schedule
+  slot, the scheduler transitions to **degraded**, and live schedule publication
+  stops until the durable store answers again. The durable retry worker is woken
+  immediately and flushes the held occurrences to the outbox (under the existing
+  backoff) before it drains rows and runs the recovery catch-up. The same
+  degraded transition is raised by any outbox operation failure in the retry
+  worker (claim, reschedule, delete, or next-due query). Rows already persisted
+  remain recoverable. A process crash or shutdown before any durable store
+  accepts a held occurrence is the one remaining loss window; it cannot be
+  protected without a third durable failure domain.
+- On recovery the durable retry worker flushes held occurrences to the outbox,
+  drains existing rows, re-runs the same bounded **latest-only 24h catch-up** to
+  cover schedule time that passed while paused, and only then re-enables live
+  ticks.
 - On startup, before jobs begin, each worker also performs a bounded
   **catch-up**: for each schedule it republishes the latest missed occurrence
   within a **24-hour horizon**, using the same bounded retry routine. Only the
@@ -200,13 +207,13 @@ A tick is also not a single best-effort publish:
   dropped (bounded recovery, not unbounded backlog replay) — and future
   occurrences are never synthesized. A catch-up another worker already published
   is a harmless duplicate. The durable outbox is a separate, **bounded** (7-day)
-  retry of occurrences that were **actually attempted**; catch-up remains
+  retry of every due occurrence (persisted before publication); catch-up remains
   latest-only and time-bounded to 24h.
 
-The local state database therefore records a small, bounded outbox of
-unresolved publications — not execution history and never an execution source.
-`/apps` stays authoritative, and the row disappears as soon as publication
-resolves or its 7-day retention expires.
+The local state database therefore records a small, bounded outbox of occurrence
+intents whose publication has not yet resolved — not execution history and never
+an execution source. `/apps` stays authoritative, and a row disappears as soon as
+publication resolves or its 7-day retention expires.
 
 ## Storage availability
 
@@ -330,15 +337,15 @@ Dispositions stay distinct:
 > handler, so scheduled handlers must stay idempotent.
 
 Publication recovery has two layers: the bounded in-memory retry (per tick), and
-a durable outbox that keeps retrying an occurrence that was actually attempted
-but unresolved, across restarts, until publication resolves **or the record's
-7-day retention expires**. The 24h catch-up remains the bounded, latest-only
-recovery for occurrences the worker never got to attempt (a miss while it was
-down); older misses are dropped. The fleet-level single-publication guarantee
-always rests on the atomic publish-if-new: any retry, durable retry, or catch-up
-that finds the key already present is a clean duplicate. The dedup key's 14-day
-TTL outlives the outbox's 7-day retention, so the key is still present for every
-durable retry, and an expired record is removed rather than published.
+a durable outbox that holds every due occurrence's exact intent from before it is
+published and keeps retrying it, across restarts, until publication resolves **or
+the record's 7-day retention expires**. The 24h catch-up remains the bounded,
+latest-only recovery for occurrences the worker never got to attempt (a miss while
+it was down); older misses are dropped. The fleet-level single-publication
+guarantee always rests on the atomic publish-if-new: any retry, durable retry, or
+catch-up that finds the key already present is a clean duplicate. The dedup key's
+14-day TTL outlives the outbox's 7-day retention, so the key is still present for
+every durable retry, and an expired record is removed rather than published.
 
 The durable outbox is required for scheduler correctness: while it is
 unavailable the scheduler does not fire, but that affects **only** schedule

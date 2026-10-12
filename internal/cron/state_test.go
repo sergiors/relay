@@ -195,10 +195,10 @@ func TestNoOutboxNeverPublishes(t *testing.T) {
 }
 
 // TestRuntimeSaveFailureDegradesAndStopsTicks pins the runtime-degraded
-// contract: when a Redis publish fails AND the durable persist fails, the
-// scheduler transitions to degraded immediately, and the occurrence is treated as
-// unresolved. No in-memory retry is attempted as a substitute for persistence,
-// and subsequent ticks are refused.
+// contract under intent-first durability: when the initial durable persist fails,
+// the tick is NOT published (Redis is not even contacted), the exact occurrence
+// is retained in memory for the durable retry worker, and the scheduler
+// transitions to degraded immediately. Subsequent ticks are refused.
 func TestRuntimeSaveFailureDegradesAndStopsTicks(t *testing.T) {
 	m := metrics.New()
 	fp := newFakePublisher(16)
@@ -216,8 +216,13 @@ func TestRuntimeSaveFailureDegradesAndStopsTicks(t *testing.T) {
 	if pub, resolved := s.publishOccurrence(context.Background(), o, false); pub || resolved {
 		t.Fatalf("persist-failed publish = (%v,%v), want (false,false)", pub, resolved)
 	}
-	if got := fp.callCount(); got != 1 {
-		t.Fatalf("publish attempts = %d, want exactly 1 (no in-memory retry after persist failure)", got)
+	if got := fp.callCount(); got != 0 {
+		t.Fatalf("publish attempts = %d, want 0 (intent-first: never publish without a durable row)", got)
+	}
+	// The exact occurrence is retained in memory for the durable retry worker.
+	held := s.unsaved.snapshot()
+	if len(held) != 1 || held[0].ID() != o.ID() {
+		t.Fatalf("unsaved = %+v, want the exact occurrence %s", held, o.ID())
 	}
 	if !s.Degraded() || s.StateLabel() != metrics.SchedulerStateDegraded {
 		t.Fatalf("state = %q, degraded=%v; want degraded", s.StateLabel(), s.Degraded())
@@ -232,8 +237,8 @@ func TestRuntimeSaveFailureDegradesAndStopsTicks(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 	s.fire(context.Background(), "fn", "jobs.a", "jobs.a", parsed)
-	if got := fp.callCount(); got != 1 {
-		t.Fatalf("publish attempts after degradation = %d, want still 1", got)
+	if got := fp.callCount(); got != 0 {
+		t.Fatalf("publish attempts after degradation = %d, want still 0", got)
 	}
 }
 

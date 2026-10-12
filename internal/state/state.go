@@ -354,7 +354,8 @@ func (st *State) initSchema(ctx context.Context) error {
 			updated_at TEXT NOT NULL
 		)`,
 		// schedule_pending is the durable schedule-publication retry outbox: one
-		// row per logical occurrence whose immediate Redis publish failed. The row
+		// row per logical occurrence, written BEFORE its Redis publish (intent-first
+		// durability) and deleted once publication resolves. The row
 		// key is the derived occurrence ID and the COMPLETE immutable occurrence
 		// intent (app/schedule/handler/scheduled_at) is the JSON object in data,
 		// written through jsonb(?) and read back with json(data), so the schema

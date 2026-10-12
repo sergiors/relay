@@ -11,17 +11,20 @@ import (
 // Scheduler storage state, degraded/recovery gating.
 //
 // The scheduler publishes occurrences into the same Redis stream as external
-// events, but a live tick is only safe when its occurrence can be durably
-// persisted if Redis rejects it (see publishOccurrence and the durable outbox).
-// The worker therefore wires a durable outbox (the local SQLite store) before
-// enabling schedule publication and marks the scheduler unavailable when no
-// outbox could be opened. A runtime outbox failure pauses live publication
-// (degraded) until the durable retry worker observes that outbox operations
-// work again, at which point the scheduler recovers: it drains existing rows,
-// re-runs the bounded latest-only catch-up for schedule time that passed while
-// paused, and only then re-enables live ticks. None of this gates the event
-// consumer, services, or worker readiness: schedule firing is not a prerequisite
-// for processing external events.
+// events, but a live tick is only safe when its exact occurrence can be durably
+// persisted BEFORE publication (see publishOccurrence and the durable outbox):
+// the outbox write is intent-first, so a crash between persisting and publishing
+// recovers the occurrence rather than losing it. The worker therefore wires a
+// durable outbox (the local SQLite store) before enabling schedule publication
+// and marks the scheduler unavailable when no outbox could be opened. A runtime
+// outbox failure pauses live publication (degraded); the affected occurrence is
+// retained in memory until the durable retry worker observes that outbox
+// operations work again, at which point the scheduler recovers: it flushes the
+// held occurrences to the outbox FIRST, then drains existing rows, re-runs the
+// bounded latest-only catch-up for schedule time that passed while paused, and
+// only then re-enables live ticks. None of this gates the event consumer,
+// services, or worker readiness: schedule firing is not a prerequisite for
+// processing external events.
 
 // storageUnavailableReason is the fixed low-cardinality reason attached to the
 // unavailable log. It is deliberately constant (no raw error text) so it never
@@ -167,15 +170,57 @@ func (s *Scheduler) installOwnedOutbox(ctx context.Context, ob Outbox, closer io
 // recovered.
 func (s *Scheduler) markRunning(recovered bool) {
 	s.mu.Lock()
-	if s.stopped {
-		s.mu.Unlock()
+	was, recovery, startNow, count, ok := s.markRunningLocked(recovered)
+	s.mu.Unlock()
+	if !ok {
 		return
 	}
-	was := s.state
+	s.logRunning(was, recovery, startNow, count)
+}
+
+// markRunningIfDrained transitions to running only when NO exact occurrence is
+// held in memory and no outbox fault is pending; otherwise it leaves the
+// scheduler degraded and reports false. The recovery path uses it so a
+// concurrent persistence failure is never cleared by a recovery that would
+// enable live ticks while an intent is still stranded in memory.
+//
+// It is robust against a callback that retains an exact intent concurrently with
+// the decision: the held set is evaluated while s.mu is held, and a callback's
+// markDegraded also serializes on s.mu (retain inserts under the set lock and
+// releases it before calling markDegraded). Either the check sees the held intent
+// (and refuses), or the callback's later markDegraded observes the running state
+// and re-degrades with a wake. Lock order here is s.mu -> the set lock; no path
+// takes them in the opposite order.
+func (s *Scheduler) markRunningIfDrained(recovered bool) bool {
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return false
+	}
+	if s.fault.Load() || s.unsaved.len() != 0 {
+		s.mu.Unlock()
+		return false
+	}
+	was, recovery, startNow, count, ok := s.markRunningLocked(recovered)
+	s.mu.Unlock()
+	if !ok {
+		return false
+	}
+	s.logRunning(was, recovery, startNow, count)
+	return true
+}
+
+// markRunningLocked performs the running transition; the caller must hold s.mu.
+// It reports ok=false only when the scheduler is stopped (a no-op).
+func (s *Scheduler) markRunningLocked(recovered bool) (was schedulerState, recovery, startNow bool, count int, ok bool) {
+	if s.stopped {
+		return 0, false, false, 0, false
+	}
+	was = s.state
 	s.state = stateRunning
 	s.paused.Store(false)
 	s.fault.Store(false)
-	startNow := s.startRequested && !s.gocronStarted && s.g != nil
+	startNow = s.startRequested && !s.gocronStarted && s.g != nil
 	if startNow {
 		s.gocronStarted = true
 	}
@@ -185,11 +230,10 @@ func (s *Scheduler) markRunning(recovered bool) {
 	// metrics.Registry methods take only their own internal locks and never call
 	// back into the scheduler, so holding s.mu here cannot invert locks.
 	s.metrics.SetSchedulerState(metrics.SchedulerStateRunning)
-	recovery := recovered && was != stateRunning
+	recovery = recovered && was != stateRunning
 	if recovery {
 		s.metrics.Inc(metrics.MetricSchedulerRecoveries)
 	}
-	count := 0
 	if startNow {
 		count = len(s.g.Jobs())
 		// Call gocron's Start WHILE STILL HOLDING s.mu, serialized against Stop's
@@ -200,8 +244,11 @@ func (s *Scheduler) markRunning(recovered bool) {
 		// handshake.
 		s.startGocronNow()
 	}
-	s.mu.Unlock()
+	return was, recovery, startNow, count, true
+}
 
+// logRunning emits markRunning's transition logs outside s.mu.
+func (s *Scheduler) logRunning(was schedulerState, recovery, startNow bool, count int) {
 	if recovery {
 		s.log.Info("Schedule: scheduler recovered; live schedule publication enabled",
 			"previous_state", was.metricLabel())
@@ -216,6 +263,12 @@ func (s *Scheduler) markRunning(recovered bool) {
 // not re-count the transition. It applies from uninitialized/unavailable too (an
 // outbox that was just opened but cannot be operated is degraded, not
 // unavailable), and a stopped scheduler is ignored.
+//
+// A transition INTO degraded wakes the durable retry worker, so a worker parked
+// on an empty outbox probes recovery immediately instead of sleeping out its
+// indefinite wait. The wake is sent only on the transition (not on every failure
+// in an already-degraded episode), so a persistently failing store still backs
+// off with the existing pending delay instead of spinning.
 func (s *Scheduler) markDegraded(reason error) {
 	s.mu.Lock()
 	if s.stopped {
@@ -240,6 +293,11 @@ func (s *Scheduler) markDegraded(reason error) {
 	s.metrics.Inc(metrics.MetricSchedulerDegraded)
 	s.metrics.SetSchedulerState(metrics.SchedulerStateDegraded)
 	s.mu.Unlock()
+
+	// Wake the durable retry worker OUTSIDE the lock: a parked worker must probe
+	// recovery promptly. wakePending never blocks (a buffered token), and a
+	// transition cannot recur without leaving degraded, so this cannot spin.
+	s.wakePending()
 
 	s.log.Warn("Schedule: scheduler degraded; live schedule publication paused",
 		"previous_state", was.metricLabel(), "reason", reason)

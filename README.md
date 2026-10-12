@@ -334,9 +334,12 @@ worker C ─┘
 
 This avoids leader election while preserving a single published stream entry per occurrence cluster-wide.
 
-Publication retries — including a durable local retry of a tick whose immediate
-publish did not resolve — and startup catch-up reuse the same occurrence
-identity, so duplicates remain harmless.
+Publication durability is intent-first: every due occurrence's exact intent is
+persisted to the durable local outbox **before** it is published, so a crash
+between persistence and publication recovers it. Publication retries — including
+the durable local retry of an occurrence whose publication has not yet resolved —
+and startup catch-up reuse the same occurrence identity, so duplicates remain
+harmless.
 
 Handler execution after publication is still at-least-once.
 

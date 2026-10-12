@@ -1046,8 +1046,9 @@ func Run(logger *slog.Logger) error {
 	// point still joins them. Stop is idempotent and also guards against a
 	// scheduler that was never Started, so an early-return shutdown is safe.
 	shutdown.register(schedulerBarrierStep(sched.Stop))
-	// Schedule firing REQUIRES a usable durable outbox: a live tick must be able
-	// to persist its occurrence if Redis rejects the publish. The outbox is the
+	// Schedule firing REQUIRES a usable durable outbox: every due occurrence is
+	// persisted to it BEFORE it is published (intent-first durability), so a tick
+	// that cannot be persisted must not fire. The outbox is the
 	// local state DB. When the shared handle opened above (st) is available it is
 	// wired directly; when it is nil, the scheduler is explicitly marked
 	// unavailable (it will NOT fire) and a scheduler-owned bootstrap retries

@@ -195,30 +195,33 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   handler.
 - Only minute-granularity schedules are accepted; sub-minute and relative forms
   are rejected because their identity is not deterministic across workers.
-- Publication failures retry the same occurrence with a bounded backoff; the
-  FIRST failed attempt — and a cancellation before any attempt — persists the
-  complete immutable occurrence intent to the local `state` SQLite outbox
-  (`schedule_pending`) BEFORE the bounded in-memory retries continue, so a crash
-  during the backoff window still leaves the occurrence recoverable; a healthy
-  first-attempt success/duplicate never touches the outbox. An outbox write
-  failure makes the occurrence unresolved and the scheduler degraded — in-memory
-  retries never substitute for durability. A `cron`-owned durable retry worker
-  republishes the row, across restarts, until a publication call resolves nil
-  (published or clean duplicate), when the row is deleted, OR until its **7-day
-  retention** (from first insertion, `state.PendingRetention`) expires, when the
-  row is removed without any publish attempt and counted as an expiration. The
-  Redis occurrence dedup key lives **14 days** on the authoritative first publish
-  and is never refreshed, so the original key still protects every retry the
-  outbox can make.
-  The outbox is coordination state only — never history, never an execution
-  source — and is untouched on a healthy first-attempt success/duplicate. Rows are
-  claimed with a per-row DB lease, not a global mutex, and never deleted until a
-  call resolves or the row expires. A record is republished only after its decoded
-  intent is verified to reconstruct the occurrence ID stored in its row key; an
-  undecodable or identity-mismatched row is logged, retained, and rescheduled
-  under the bounded backoff, never published or deleted. Startup catch-up stays
-  the bounded, latest-only 24h recovery for never-attempted misses and is
-  unchanged.
+- Publication durability is **intent-first**: every due occurrence's exact
+  immutable intent (its derived id plus app/schedule/handler/scheduled_at) is
+  written to the local `state` SQLite outbox (`schedule_pending`) BEFORE any Redis
+  publish, so a crash between persistence and publication recovers it. The row is
+  deleted only once a publication call resolves nil (published or clean
+  duplicate). If the outbox write fails, the occurrence is NOT published: the
+  exact intent is held in a bounded in-memory schedule slot, the scheduler is
+  driven degraded, and the durable retry worker is woken to flush it (under the
+  existing backoff) once the store answers again; a process crash before any
+  durable store accepts the intent is the documented fundamental loss window. A
+  `cron`-owned durable retry worker republishes the row, across restarts, until a
+  publication call resolves nil (published or clean duplicate), when the row is
+  deleted, OR until its **7-day retention** (from first insertion,
+  `state.PendingRetention`) expires, when the row is removed without any publish
+  attempt and counted as an expiration. The Redis occurrence dedup key lives
+  **14 days** on the authoritative first publish and is never refreshed, so the
+  original key still protects every retry the outbox can make.
+  Recovery flushes the held exact occurrences to the outbox BEFORE the bounded
+  latest-only catch-up runs, so a held occurrence is never reconstructed from the
+  current time or lost behind a newer one. The outbox is coordination state only —
+  never history, never an execution source. Rows are claimed with a per-row DB
+  lease, not a global mutex, and never deleted until a call resolves or the row
+  expires. A record is republished only after its decoded intent is verified to
+  reconstruct the occurrence ID stored in its row key; an undecodable or
+  identity-mismatched row is logged, retained, and rescheduled under the bounded
+  backoff, never published or deleted. Startup catch-up stays the bounded,
+  latest-only 24h recovery for never-attempted misses and is unchanged.
 - The durable outbox is REQUIRED for scheduler correctness but is NOT a global
   Relay dependency. The scheduler evaluates/publishes an occurrence only while a
   usable outbox is installed; when `state.Open` fails at startup the scheduler is
@@ -229,9 +232,9 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   global handle is never touched), recovers rows, re-runs the same bounded
   latest-only 24h catch-up, then enables live jobs. A runtime outbox failure
   pauses live publication (degraded) and is never substituted by in-memory
-  retries; a publish+persist double failure is logged as unresolved, not durably
-  recoverable. Schedule firing is not a prerequisite for consumers, functions,
-  services, metrics/logging/tracing, readiness, or health.
+  retries; the affected exact occurrence is retained in memory and flushed once
+  the store answers again. Schedule firing is not a prerequisite for consumers,
+  functions, services, metrics/logging/tracing, readiness, or health.
 - Once published it reuses the stream retry/claim/DLQ machinery, so handler
   execution stays at-least-once. The execution contract is frozen at the
   occurrence's FIRST successful admission: before admission a delivery resolves

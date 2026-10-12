@@ -50,6 +50,10 @@ type fakeOutbox struct {
 	expireErr  error
 	dueErr     error
 
+	// dueCalls counts NextPendingDue probes, so a test can prove a degrade wake
+	// caused an immediate recovery probe without polling.
+	dueCalls int
+
 	nowFn       func() time.Time
 	ignoreLease bool
 }
@@ -178,6 +182,7 @@ func (f *fakeOutbox) NextPendingDue(ctx context.Context, now time.Time) (time.Ti
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.dueCalls++
 	if f.dueErr != nil {
 		return time.Time{}, false, f.dueErr
 	}
@@ -232,6 +237,28 @@ func (f *fakeOutbox) gotExpired() []string {
 	return append([]string(nil), f.expired...)
 }
 
+// gotDueCalls returns how many NextPendingDue probes the fake has served.
+func (f *fakeOutbox) gotDueCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.dueCalls
+}
+
+// setDueErr installs a NextPendingDue failure under the fake's lock, so a test
+// can flip the store to "failing" without racing the retry worker.
+func (f *fakeOutbox) setDueErr(err error) {
+	f.mu.Lock()
+	f.dueErr = err
+	f.mu.Unlock()
+}
+
+// setSaveErr installs a SavePendingOccurrence failure under the fake's lock.
+func (f *fakeOutbox) setSaveErr(err error) {
+	f.mu.Lock()
+	f.saveErr = err
+	f.mu.Unlock()
+}
+
 // pendingOccurrence builds the occurrence a persisted record reconstructs.
 func pendingOccurrence(id, handler string) schedule.Occurrence {
 	return schedule.Occurrence{
@@ -265,10 +292,60 @@ func seedPending(t *testing.T, ob *fakeOutbox, o schedule.Occurrence, due time.T
 	}
 }
 
-// TestPublishHealthyPathsDoNotTouchOutbox pins that the durable outbox is
-// untouched on the healthy paths: a first-attempt success and a clean duplicate
-// write no row and delete nothing.
-func TestPublishHealthyPathsDoNotTouchOutbox(t *testing.T) {
+// stepRecorder is an ordered log shared by the recording outbox and publisher so
+// a test can assert the intent-first ordering of the publication path.
+type stepRecorder struct {
+	mu    sync.Mutex
+	steps []string
+}
+
+func (r *stepRecorder) append(s string) {
+	r.mu.Lock()
+	r.steps = append(r.steps, s)
+	r.mu.Unlock()
+}
+
+func (r *stepRecorder) got() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.steps...)
+}
+
+// recordingOutbox wraps the deterministic fake and logs each write, so a test
+// can prove the durable row is written BEFORE the publish and deleted only after
+// it resolves.
+type recordingOutbox struct {
+	*fakeOutbox
+	rec *stepRecorder
+}
+
+func (o *recordingOutbox) SavePendingOccurrence(ctx context.Context, p state.PendingOccurrence) (bool, error) {
+	o.rec.append("save:" + p.ID)
+	return o.fakeOutbox.SavePendingOccurrence(ctx, p)
+}
+
+func (o *recordingOutbox) DeletePendingOccurrence(ctx context.Context, id string) error {
+	o.rec.append("delete:" + id)
+	return o.fakeOutbox.DeletePendingOccurrence(ctx, id)
+}
+
+// recordingPublisher logs each publish into the same ordered log.
+type recordingPublisher struct {
+	*fakePublisher
+	rec *stepRecorder
+}
+
+func (p *recordingPublisher) PublishOccurrence(ctx context.Context, o schedule.Occurrence) (bool, error) {
+	p.rec.append("publish:" + o.ID())
+	return p.fakePublisher.PublishOccurrence(ctx, o)
+}
+
+// TestPublishHealthyPersistsPublishesResolves pins the intent-first ordering: a
+// healthy tick writes the exact occurrence to the durable outbox BEFORE it
+// publishes, and deletes the row only once the publication resolves (published or
+// a clean duplicate). This replaces the pre-intent-first "healthy path never
+// touches the outbox" contract.
+func TestPublishHealthyPersistsPublishesResolves(t *testing.T) {
 	frozen := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
 		name    string
@@ -280,9 +357,10 @@ func TestPublishHealthyPathsDoNotTouchOutbox(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := metrics.New()
-			fp := newFakePublisher(4)
+			rec := &stepRecorder{}
+			fp := &recordingPublisher{fakePublisher: newFakePublisher(4), rec: rec}
 			fp.published = tc.pub
-			ob := newFakeOutbox()
+			ob := &recordingOutbox{fakeOutbox: newFakeOutbox(), rec: rec}
 			s := testSchedulerWithMetrics(fp, testLogger(), m)
 			s.now = func() time.Time { return frozen }
 			s.wait = noWait
@@ -293,17 +371,31 @@ func TestPublishHealthyPathsDoNotTouchOutbox(t *testing.T) {
 			if !resolved || pub != tc.wantPub {
 				t.Fatalf("publish = (%v,%v), want (%v,true)", pub, resolved, tc.wantPub)
 			}
-			if got := ob.gotSaved(); len(got) != 0 {
-				t.Fatalf("healthy path persisted %v, want none", got)
+			want := []string{"save:" + o.ID(), "publish:" + o.ID(), "delete:" + o.ID()}
+			if got := rec.got(); !equalStrings(got, want) {
+				t.Fatalf("publication steps = %v, want %v (persist -> publish -> resolve)", got, want)
 			}
-			if got := ob.gotDeleted(); len(got) != 0 {
-				t.Fatalf("healthy path deleted %v, want none", got)
+			if ob.has(o.ID()) {
+				t.Fatal("resolved occurrence left a durable row behind")
 			}
-			if got := m.Counter(metrics.MetricSchedulePendingPersisted); got != 0 {
-				t.Fatalf("pending_persisted = %d, want 0 on the healthy path", got)
+			if got := m.Counter(metrics.MetricSchedulePendingPersisted); got != 1 {
+				t.Fatalf("pending_persisted = %d, want 1", got)
 			}
 		})
 	}
+}
+
+// equalStrings reports whether two string slices are equal element-wise.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // TestPublishExhaustionPersistsOccurrence pins the core durability contract: a

@@ -165,12 +165,19 @@ type Scheduler struct {
 	// whether the worker should keep going. Tests substitute a fake to drive the
 	// loop deterministically without timers.
 	pendingWait pendingWaitFunc
+	// unsaved is the bounded in-memory set of exact occurrence intents whose
+	// initial durable persistence failed (see persistBeforePublish). It is owned
+	// by the scheduler and drained by the durable retry worker, which flushes a
+	// held occurrence to the outbox as soon as the store answers again. It is
+	// keyed per schedule, so it is bounded by the number of registered schedules.
+	unsaved *unsavedOccurrences
 
 	// state is the scheduler's storage-state gate. The scheduler may evaluate
 	// and publish occurrences only while state is stateRunning with a usable
 	// outbox installed. It starts stateUnavailable (no outbox) and moves to
 	// stateRunning exactly once a usable outbox is installed via
-	// MarkOutboxReady; a runtime outbox failure moves it to stateDegraded and
+	// SetOutbox (or the bootstrap's installOwnedOutbox); a runtime outbox failure
+	// moves it to stateDegraded and
 	// pauses live publication until a recovery is installed. It is guarded by
 	// mu, but the hot path (fire/publish) reads it via the atomic gate below.
 	state schedulerState
@@ -236,8 +243,10 @@ const (
 	// enabled.
 	stateRunning
 	// stateDegraded: the scheduler was running and paused because a runtime
-	// outbox operation failed; existing durable rows remain recoverable and a
-	// recovery reinstalls the outbox and re-enables publication.
+	// outbox operation failed; existing durable rows remain recoverable, any exact
+	// occurrence whose initial persist failed is held in memory, and a recovery
+	// flushes those held occurrences and drains the rows before re-enabling
+	// publication.
 	stateDegraded
 )
 
@@ -315,6 +324,7 @@ func NewWithMetrics(pub Publisher, logger *slog.Logger, metricsRegistry *metrics
 		wait:        waitContext,
 		pendingWake: make(chan struct{}, 1),
 		pendingWait: waitPendingContext,
+		unsaved:     newUnsavedOccurrences(),
 	}
 	// The scheduler starts unavailable: it may not evaluate or publish an
 	// occurrence until a usable durable outbox is installed (SetOutbox) or it is

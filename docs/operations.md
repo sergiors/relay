@@ -172,8 +172,10 @@ relay_events_matched_total + relay_events_unmatched_total`, classified exactly
   `relay_schedule_publish_retries_total`,
   `relay_schedule_publish_exhausted_total`, `relay_schedule_catchup_total`.
 - **Durable schedule recovery:** `relay_schedule_pending_persisted_total`
-  (occurrences newly written to the local retry outbox after an immediate
-  publication did not resolve), `relay_schedule_pending_retries_total`
+  (occurrence intents newly written to the local retry outbox — every due
+  occurrence is persisted **before** its Redis publish, so this counts all newly
+  inserted intents, not only failed first publishes),
+  `relay_schedule_pending_retries_total`
   (publication attempts made by the durable retry worker), and
   `relay_schedule_pending_expired_total` (outbox records removed because their
   **7-day** retention deadline passed without resolving — an expiration, counted

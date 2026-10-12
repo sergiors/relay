@@ -117,30 +117,33 @@ func latestOccurrence(sch robfigcron.Schedule, now time.Time, horizon time.Durat
 // publishOccurrence publishes one logical occurrence through the Publisher with
 // a bounded retry loop, returning whether it was newly published and whether the
 // publish resolved (success OR duplicate). The occurrence — and therefore its
-// ID — is computed by the caller and NEVER recomputed here, so every attempt
-// targets the same dedup key.
+// ID — is computed by the caller and NEVER recomputed here, so every attempt and
+// every durable retry targets the same dedup key.
+//
+// Durability is intent-first: the EXACT occurrence is written to the durable
+// outbox BEFORE any Redis publish, so a crash between the two leaves a
+// recoverable row rather than a lost occurrence. The row is deleted only once a
+// publication call resolves with a nil error (published or clean duplicate). A
+// store that REJECTS the intent is not a reason to publish anyway: the exact
+// occurrence is retained in memory, the scheduler is driven degraded, and the
+// durable retry worker flushes it to the outbox (with the existing backoff) as
+// soon as the store answers again — so a Redis + SQLite double failure no longer
+// loses the tick within the process.
 //
 // A success or a clean duplicate (published=false, err=nil) is terminal: a
 // duplicate means another worker already published this occurrence, so there is
 // nothing to retry. Only a genuine error (Redis unreachable, script error)
-// schedules another attempt. Retries observe ctx: cancellation (a gocron job
-// shutting down, or the worker lifecycle during catch-up) aborts promptly and
-// resolves=false.
+// schedules another attempt; once the bounded budget is spent the durable row is
+// left for the retry worker, which is woken immediately. Retries observe ctx:
+// cancellation (a gocron job shutting down, or the worker lifecycle during
+// catch-up) aborts promptly and resolves=false, leaving the durable row (if
+// written) recoverable.
 //
-// Durability: the FIRST failed attempt (and a cancellation before any attempt)
-// persists the complete immutable occurrence intent to the configured outbox, so
-// a crash during the bounded backoff window still leaves the occurrence
-// recoverable. The durable row is deleted only when this call resolves with a nil
-// error (published or clean duplicate), so a row never outlives a resolved
-// publication.
-//
-// A persist failure (an outbox is installed but the write errors) is NOT
-// recovered by more in-memory retries: the scheduler is driven degraded and the
-// occurrence is returned unresolved. A low-level invocation of this helper with
-// no outbox installed still runs the bounded in-memory retry with no durable
-// copy (the standalone/test behavior), but production never enters that path:
-// live ticks are gated on stateRunning, which requires a usable outbox, so the
-// worker either installs one or marks the scheduler unavailable.
+// A low-level invocation of this helper with no outbox installed still runs the
+// bounded in-memory retry with no durable copy (the standalone/test behavior),
+// but production never enters that path: live ticks are gated on stateRunning,
+// which requires a usable outbox, so the worker either installs one or marks the
+// scheduler unavailable.
 //
 // One `schedule.publish` logical span wraps the WHOLE retry loop, so all
 // attempts of one occurrence share a single trace. The Publisher opens its own
@@ -185,19 +188,22 @@ func (s *Scheduler) publish(ctx context.Context, o schedule.Occurrence, catchUp,
 		"occurrence_id", id,
 	)
 
-	var queued bool
+	// Intent-first: persist the exact occurrence BEFORE publishing it. A store
+	// that rejects the intent is not a reason to publish anyway — the occurrence
+	// is retained in memory and the scheduler degrades until it can be flushed.
+	durable, ok := s.persistBeforePublish(ctx, o, log, span)
+	if !ok {
+		return false, false
+	}
+
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
-			// Lifecycle cancelled before this attempt. The occurrence was still
-			// computed (fire only calls publishOccurrence with a real due
-			// instant), so it is recorded durably rather than dropped: a later
-			// process recovers it. The write uses a cancellation-independent
-			// context, so this succeeds even though ctx is already done.
-			log.Debug("Schedule: publish cancelled before first attempt", "catchup", catchUp)
+			// Lifecycle cancelled before this attempt: leave the durable row (if
+			// any) for a later process and let the retry worker handle it if it
+			// is still running.
+			log.Debug("Schedule: publish cancelled before attempt", "catchup", catchUp)
 			span.SetAttributes(attribute.String("relay.outcome", "cancelled"))
-			if _, perr := s.persistPending(o, log); perr != nil {
-				s.markDegraded(perr)
-			}
+			s.leavePendingForRetry(durable)
 			return false, false
 		}
 		if attempt > 0 {
@@ -215,46 +221,23 @@ func (s *Scheduler) publish(ctx context.Context, o schedule.Occurrence, catchUp,
 				span.SetAttributes(attribute.String("relay.outcome", "duplicate"))
 			}
 			// A call resolved with a nil error (published or clean duplicate):
-			// remove the durable record, if one was written after an earlier
-			// failure. This is the ONE place a pending row is deleted, so the
-			// row never outlives a resolved publication.
-			if queued {
+			// remove the durable record written by the intent-first persist. This
+			// is the ONE place a pending row is deleted, so the row never outlives
+			// a resolved publication.
+			if durable {
 				s.resolvePending(o, log)
 			}
 			span.SetStatus(codes.Ok, "")
 			return pub, true
 		}
-		if !queued {
-			// The immediate publication failed: persist the complete immutable
-			// occurrence intent BEFORE the in-memory retries continue, so a crash
-			// during the bounded backoff window still leaves the occurrence
-			// recoverable. A healthy first-attempt success/duplicate never
-			// reaches here, so the local DB is untouched on the healthy path.
-			var perr error
-			queued, perr = s.persistPending(o, log)
-			if perr != nil {
-				// An outbox is installed but persisting failed. In-memory
-				// retries cannot substitute for durability: the occurrence would
-				// be lost on a crash. Pause live publication immediately and
-				// surface this occurrence as explicitly UNRESOLVED (not durably
-				// recoverable) rather than continuing to retry in memory.
-				s.markDegraded(perr)
-				span.RecordError(perr)
-				span.SetStatus(codes.Error, perr.Error())
-				span.SetAttributes(attribute.String("relay.outcome", "unresolved"))
-				log.Warn("Schedule: occurrence unresolved; publish and durable persist both failed",
-					"app", o.App, "schedule", o.Schedule, "handler", o.Handler,
-					"occurrence_id", id, "catchup", catchUp, "reason", err)
-				return false, false
-			}
-		}
 		if ctx.Err() != nil {
 			// The attempt failed because the lifecycle was cancelled (the
 			// in-flight publish observed it): do not escalate or schedule an
-			// in-memory retry. The durable record (if configured) already holds
-			// the occurrence for recovery by a later process.
+			// in-memory retry. The durable record (if any) already holds the
+			// occurrence for recovery by a later process.
 			log.Debug("Schedule: publish attempt cancelled", "attempt", attempt+1, "catchup", catchUp)
 			span.SetAttributes(attribute.String("relay.outcome", "cancelled"))
+			s.leavePendingForRetry(durable)
 			return false, false
 		}
 
@@ -264,12 +247,13 @@ func (s *Scheduler) publish(ctx context.Context, o schedule.Occurrence, catchUp,
 			span.SetStatus(codes.Error, err.Error())
 			span.SetAttributes(attribute.String("relay.outcome", "exhausted"))
 			log.Warn("Schedule: publish retries exhausted", "attempts", attempt+1, "catchup", catchUp, "reason", err)
-			// The bounded in-memory budget is spent; the durable record written on
-			// the first failure now carries the occurrence to the retry worker,
-			// which keeps trying across temporary/long outages and restarts. A
+			// The bounded in-memory budget is spent; the durable row written by
+			// the intent-first persist now carries the occurrence to the retry
+			// worker, which is woken here so it does not wait out its backoff. A
 			// low-level invocation with no outbox has no durable copy and simply
 			// gives up here (the standalone/test behavior); production never
 			// enters that path because the storage gate requires a usable outbox.
+			s.leavePendingForRetry(durable)
 			return false, false
 		}
 
@@ -284,6 +268,7 @@ func (s *Scheduler) publish(ctx context.Context, o schedule.Occurrence, catchUp,
 		if !s.wait(ctx, delay) {
 			log.Debug("Schedule: publish retries cancelled", "attempt", attempt+1, "catchup", catchUp)
 			span.SetAttributes(attribute.String("relay.outcome", "cancelled"))
+			s.leavePendingForRetry(durable)
 			return false, false
 		}
 	}

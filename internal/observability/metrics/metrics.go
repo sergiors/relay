@@ -88,17 +88,19 @@ const (
 	MetricSchedulePublishRetries   = metricNamespacePrefix + "schedule_publish_retries_total"
 	MetricSchedulePublishExhausted = metricNamespacePrefix + "schedule_publish_exhausted_total"
 	MetricScheduleCatchUp          = metricNamespacePrefix + "schedule_catchup_total"
-	// Durable schedule-publication recovery. A live tick whose immediate
-	// publication does not resolve (Redis error, or lifecycle cancellation) is
-	// persisted as an immutable occurrence intent in the local state DB and
-	// retried by a background worker until it publishes or is confirmed a clean
-	// duplicate. These two counters describe the durable path specifically;
+	// Durable schedule-publication recovery. The exact occurrence intent of every
+	// due tick is written to the local state DB BEFORE it is published
+	// (intent-first durability), so a crash between persistence and publication
+	// recovers it; a publication that does not resolve is retried by a background
+	// worker until it publishes or is confirmed a clean duplicate. These counters
+	// describe the durable path specifically;
 	// the publish outcomes themselves are still counted by
 	// schedule_occurrences_published_total, schedule_occurrences_duplicate_total,
 	// and schedule_publish_failures_total, which the same publisher increments.
-	// MetricSchedulePendingPersisted counts occurrences newly written to the
-	// outbox (a re-persist of an already-present occurrence is not counted);
-	// MetricSchedulePendingRetries counts publication attempts made by the
+	// MetricSchedulePendingPersisted counts every occurrence intent newly written
+	// to the outbox, not only failed first publishes (a re-persist of an
+	// already-present occurrence is not counted); MetricSchedulePendingRetries
+	// counts publication attempts made by the
 	// durable retry worker. MetricSchedulePendingExpired counts records removed
 	// because their retention deadline passed without resolving: expiration is
 	// its own terminal outcome, deliberately NOT counted as a publish failure,
@@ -272,9 +274,9 @@ var metricHelp = map[string]string{
 	MetricScheduleOccurrencesDuplicate: "Schedule occurrences skipped because another worker had already published them; the publish-if-new check is a clean no-op.",
 	MetricSchedulePublishFailures:      "Schedule occurrence publish attempts that failed, including envelope encoding errors and Redis script errors; a failed attempt is counted here before any bounded retry.",
 	MetricSchedulePublishRetries:       "Retries of a failed schedule occurrence publication within the bounded backoff budget; the initial failed attempt is counted by schedule_publish_failures_total and every subsequent re-attempt counts here.",
-	MetricSchedulePublishExhausted:     "Schedule occurrences whose BOUNDED IMMEDIATE publication retry loop was exhausted without a success or duplicate. This is not a terminal loss: when the failed publication attempt was persisted to the durable SQLite outbox, the retry worker keeps republishing the same occurrence until it resolves (published or a clean duplicate) or its 7-day retention expires; only with no outbox configured does exhaustion leave no durable copy. It is not a handler exhaustion (see function_dlq_total).",
+	MetricSchedulePublishExhausted:     "Schedule occurrences whose BOUNDED IMMEDIATE publication retry loop was exhausted without a success or duplicate. This is not a terminal loss: the occurrence's exact intent was already written to the durable SQLite outbox BEFORE the publish (intent-first durability), so the retry worker keeps republishing it until it resolves (published or a clean duplicate) or its 7-day retention expires; only with no outbox configured does exhaustion leave no durable copy. It is not a handler exhaustion (see function_dlq_total).",
 	MetricScheduleCatchUp:              "Schedule occurrences processed by the startup catch-up scan (the latest missed occurrence per schedule within the bounded horizon). Each is subject to the atomic publish-if-new, so the scan's published/duplicate split is counted by schedule_occurrences_published_total / schedule_occurrences_duplicate_total.",
-	MetricSchedulePendingPersisted:     "Schedule occurrences newly persisted to the durable local retry outbox after their immediate Redis publication did not resolve; a re-persist of an occurrence already present is not counted. The occurrence is retried until it publishes or is confirmed a clean duplicate, then the outbox row is deleted.",
+	MetricSchedulePendingPersisted:     "Schedule occurrences newly persisted to the durable local retry outbox. The exact occurrence intent is written BEFORE the tick is published (intent-first durability), so a crash between persistence and publication recovers it; a re-persist of an occurrence already present is not counted. The occurrence is retried until it publishes or is confirmed a clean duplicate, then the outbox row is deleted.",
 	MetricSchedulePendingRetries:       "Publication attempts made by the durable schedule-publication retry worker for occurrences persisted in the local outbox; a resolved attempt removes the outbox row, a failed one reschedules it.",
 	MetricSchedulePendingExpired:       "Durable schedule-publication outbox records removed because their 7-day retention deadline passed without resolving. Expiration is a terminal outcome distinct from publication: no publish attempt is made for an expired record, so it is counted neither as a success, a failure, nor a duplicate.",
 	MetricSchedulerState:               "Current scheduler storage state as a one-hot gauge: exactly one state series is 1 and every other allowed state is 0. Running means a usable durable outbox is installed and live jobs are enabled; degraded means schedule publication is paused because an outbox operation failed; unavailable means no usable outbox could be opened. Schedule firing is not a prerequisite for consuming external events.",
