@@ -1066,6 +1066,13 @@ func Run(logger *slog.Logger) error {
 	// point still joins them. Stop is idempotent and also guards against a
 	// scheduler that was never Started, so an early-return shutdown is safe.
 	shutdown.register(schedulerBarrierStep(sched.Stop))
+	// The scheduler is a metrics.GaugeSource: register it with the consumer's
+	// single periodic gauge refresher so its durable-outbox depth/age gauges are
+	// sampled on the existing ~15s pass, with no separate ticker or goroutine.
+	// This is safe before Consume starts the refresher; the source reads the
+	// scheduler's CURRENT outbox at each tick, so a bootstrap-recovered
+	// scheduler-owned handle is observed too.
+	consumer.AddGaugeSource(sched)
 	// Schedule firing REQUIRES a usable durable outbox: every due occurrence is
 	// persisted to it BEFORE it is published (intent-first durability), so a tick
 	// that cannot be persisted must not fire. The outbox is the

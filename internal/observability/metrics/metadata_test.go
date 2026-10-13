@@ -30,6 +30,7 @@ func seedAllMetrics(r *Registry) {
 		MetricSchedulePublishRetries,
 		MetricSchedulePublishExhausted,
 		MetricScheduleCatchUp,
+		MetricScheduleCatchupSkipped,
 		MetricSchedulePendingPersisted,
 		MetricSchedulePendingRetries,
 		MetricSchedulePendingExpired,
@@ -70,8 +71,12 @@ func seedAllMetrics(r *Registry) {
 	for _, name := range []string{
 		MetricPendingEntries,
 		MetricPendingOldestAge,
+		MetricStreamGroupLag,
+		MetricDLQDepth,
 		MetricBufferedEvents,
 		MetricInFlightInvocations,
+		MetricScheduleOutboxDepth,
+		MetricScheduleOutboxOldestAge,
 	} {
 		r.SetGauge(name, 1)
 	}
@@ -210,11 +215,11 @@ func TestMetricMetadataDurationHistogramsAreSeconds(t *testing.T) {
 		if !strings.HasSuffix(name, "_seconds") {
 			continue
 		}
-		// pending_oldest_age_seconds is a point-in-time AGE gauge (how old the
-		// oldest pending entry is), not an observed duration histogram. It is
-		// the sole sanctioned _seconds gauge; every other _seconds family must
-		// be a duration histogram.
-		if name == MetricPendingOldestAge {
+		// pending_oldest_age_seconds and schedule_outbox_oldest_age_seconds are
+		// point-in-time AGE gauges (how old the oldest pending/outbox record is),
+		// not observed duration histograms. They are the sanctioned _seconds
+		// gauges; every other _seconds family must be a duration histogram.
+		if name == MetricPendingOldestAge || name == MetricScheduleOutboxOldestAge {
 			if got := f.GetType(); got != dto.MetricType_GAUGE {
 				t.Errorf("family %q must remain a GAUGE (point-in-time age), got %v", name, got)
 			}
@@ -264,6 +269,44 @@ func TestMetricMetadataExpositionHasHelpAndType(t *testing.T) {
 		if !strings.Contains(body, "# TYPE "+name+" ") {
 			t.Errorf("exposition missing TYPE line for %q:\n%s", name, body)
 		}
+	}
+}
+
+// TestObservabilityMetricMetadata pins the exact canonical names and types of
+// the stream-lag/DLQ and schedule-outbox/catch-up-skipped observability metrics,
+// independently of the derived registration tables, so a rename or a type drift
+// is caught here.
+func TestObservabilityMetricMetadata(t *testing.T) {
+	r := New()
+	seedAllMetrics(r)
+
+	want := map[string]dto.MetricType{
+		"relay_stream_group_lag_entries":                   dto.MetricType_GAUGE,
+		"relay_dlq_depth":                                  dto.MetricType_GAUGE,
+		"relay_schedule_outbox_depth":                      dto.MetricType_GAUGE,
+		"relay_schedule_outbox_oldest_age_seconds":         dto.MetricType_GAUGE,
+		"relay_schedule_catchup_skipped_occurrences_total": dto.MetricType_COUNTER,
+	}
+
+	families, err := r.reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, f := range families {
+		wantType, ok := want[f.GetName()]
+		if !ok {
+			continue
+		}
+		delete(want, f.GetName())
+		if got := f.GetType(); got != wantType {
+			t.Errorf("family %q type = %v, want %v", f.GetName(), got, wantType)
+		}
+		if strings.TrimSpace(f.GetHelp()) == "" {
+			t.Errorf("family %q has empty HELP", f.GetName())
+		}
+	}
+	for name := range want {
+		t.Errorf("expected observability family %q was not gathered", name)
 	}
 }
 

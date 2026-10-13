@@ -26,6 +26,8 @@ func TestRecordRedisReadErrorOperationLabels(t *testing.T) {
 	recordRedisReadError(m, metrics.RedisOpPending, errors.New("boom again"))
 	recordRedisReadError(m, metrics.RedisOpAutoclaim, errors.New("boom"))
 	recordRedisReadError(m, metrics.RedisOpPendingGauge, errors.New("boom"))
+	recordRedisReadError(m, metrics.RedisOpGroupLag, errors.New("boom"))
+	recordRedisReadError(m, metrics.RedisOpDLQDepth, errors.New("boom"))
 
 	if got := m.CounterLabels(metrics.MetricRedisReadErrors, []metrics.Label{{Name: "operation", Value: metrics.RedisOpReadGroup}}); got != 1 {
 		t.Fatalf("read_group = %d, want 1", got)
@@ -38,6 +40,12 @@ func TestRecordRedisReadErrorOperationLabels(t *testing.T) {
 	}
 	if got := m.CounterLabels(metrics.MetricRedisReadErrors, []metrics.Label{{Name: "operation", Value: metrics.RedisOpPendingGauge}}); got != 1 {
 		t.Fatalf("pending_gauge = %d, want 1", got)
+	}
+	if got := m.CounterLabels(metrics.MetricRedisReadErrors, []metrics.Label{{Name: "operation", Value: metrics.RedisOpGroupLag}}); got != 1 {
+		t.Fatalf("group_lag = %d, want 1", got)
+	}
+	if got := m.CounterLabels(metrics.MetricRedisReadErrors, []metrics.Label{{Name: "operation", Value: metrics.RedisOpDLQDepth}}); got != 1 {
+		t.Fatalf("dlq_depth = %d, want 1", got)
 	}
 }
 
@@ -73,15 +81,28 @@ func TestRecordRedisReadErrorNoErrorLabel(t *testing.T) {
 	}
 }
 
-// fakePendingSummarizer is the pendingSummarizer seam: it records the exact
-// stream/group the sampler queries and returns a canned XPENDING summary (or
-// error), so the depth/age gauge semantics are unit-testable without Redis.
+// fakePendingSummarizer is the streamMetricsReader seam: it records the exact
+// stream/group the sampler queries and returns canned XPENDING / XINFO GROUPS /
+// XLEN replies (or errors), so the depth/age/lag/DLQ gauge semantics are
+// unit-testable without Redis. The three commands have independent result and
+// error fields so one failing command can be exercised without disturbing the
+// others.
 type fakePendingSummarizer struct {
 	val        *redis.XPending
 	err        error
 	calls      int
 	lastStream string
 	lastGroup  string
+
+	groups    []redis.XInfoGroup
+	groupErr  error
+	infoCalls int
+	lastInfo  string
+
+	lenVal   int64
+	lenErr   error
+	lenCalls int
+	lastLen  string
 }
 
 func (f *fakePendingSummarizer) XPending(ctx context.Context, stream, group string) *redis.XPendingCmd {
@@ -93,16 +114,35 @@ func (f *fakePendingSummarizer) XPending(ctx context.Context, stream, group stri
 	return cmd
 }
 
+func (f *fakePendingSummarizer) XInfoGroups(ctx context.Context, stream string) *redis.XInfoGroupsCmd {
+	f.infoCalls++
+	f.lastInfo = stream
+	cmd := redis.NewXInfoGroupsCmd(ctx, stream)
+	cmd.SetVal(f.groups)
+	cmd.SetErr(f.groupErr)
+	return cmd
+}
+
+func (f *fakePendingSummarizer) XLen(ctx context.Context, stream string) *redis.IntCmd {
+	f.lenCalls++
+	f.lastLen = stream
+	cmd := redis.NewIntCmd(ctx)
+	cmd.SetVal(f.lenVal)
+	cmd.SetErr(f.lenErr)
+	return cmd
+}
+
 // newPendingGaugeTestSource wires a PendingGaugeSource to the fake seam with a
 // discard logger and the given registry. Refresh is called synchronously, so
 // the tests need no sleeps or polling.
 func newPendingGaugeTestSource(f *fakePendingSummarizer, m *metrics.Registry) *PendingGaugeSource {
 	return &PendingGaugeSource{
-		client:  f,
-		stream:  "events",
-		group:   "workers",
-		metrics: m,
-		log:     slog.New(slog.DiscardHandler),
+		client:    f,
+		stream:    "events",
+		group:     "workers",
+		dlqStream: DLQStreamFor("events"),
+		metrics:   m,
+		log:       slog.New(slog.DiscardHandler),
 	}
 }
 
@@ -238,5 +278,312 @@ func TestPendingGaugeSourceRefreshUnparsableOldestIDKeepsPriorAge(t *testing.T) 
 	}
 	if got := m.Gauge(metrics.MetricPendingOldestAge); got != age {
 		t.Fatalf("pending_oldest_age_seconds = %v, want %v (unchanged on unparsable ID)", got, age)
+	}
+}
+
+// TestPendingGaugeSourceRefreshRecordsGroupLag pins the lag happy path: exactly
+// one XINFO GROUPS per Refresh, issued for the source's configured stream, and
+// the CONFIGURED group's lag is recorded (a second group's lag is ignored).
+func TestPendingGaugeSourceRefreshRecordsGroupLag(t *testing.T) {
+	m := metrics.New()
+	f := &fakePendingSummarizer{
+		val: &redis.XPending{},
+		groups: []redis.XInfoGroup{
+			{Name: "other", Lag: 99},
+			{Name: "workers", Lag: 7},
+		},
+	}
+	src := newPendingGaugeTestSource(f, m)
+
+	src.Refresh(context.Background())
+
+	if f.infoCalls != 1 {
+		t.Fatalf("XINFO GROUPS calls = %d, want 1", f.infoCalls)
+	}
+	if f.lastInfo != "events" {
+		t.Fatalf("queried stream %q, want events", f.lastInfo)
+	}
+	if got := m.Gauge(metrics.MetricStreamGroupLag); got != 7 {
+		t.Fatalf("stream_group_lag_entries = %v, want 7 (configured group only)", got)
+	}
+}
+
+// TestPendingGaugeSourceRefreshGroupLagZeroIsRecorded pins that a Redis-reported
+// lag of 0 (the group is fully caught up) IS recorded, distinct from an
+// undeterminable lag.
+func TestPendingGaugeSourceRefreshGroupLagZeroIsRecorded(t *testing.T) {
+	m := metrics.New()
+	f := &fakePendingSummarizer{
+		val:    &redis.XPending{},
+		groups: []redis.XInfoGroup{{Name: "workers", Lag: 5}},
+	}
+	src := newPendingGaugeTestSource(f, m)
+
+	src.Refresh(context.Background())
+	if got := m.Gauge(metrics.MetricStreamGroupLag); got != 5 {
+		t.Fatalf("setup: stream_group_lag_entries = %v, want 5", got)
+	}
+
+	f.groups = []redis.XInfoGroup{{Name: "workers", Lag: 0}}
+	src.Refresh(context.Background())
+
+	if got := m.Gauge(metrics.MetricStreamGroupLag); got != 0 {
+		t.Fatalf("stream_group_lag_entries after catch-up = %v, want 0", got)
+	}
+}
+
+// TestPendingGaugeSourceRefreshGroupLagUndeterminableKeepsPrior pins the
+// no-false-zero rule for lag: a NULL/undeterminable lag (go-redis surfaces -1)
+// and a missing configured group both leave the prior gauge value untouched.
+func TestPendingGaugeSourceRefreshGroupLagUndeterminableKeepsPrior(t *testing.T) {
+	m := metrics.New()
+	f := &fakePendingSummarizer{
+		val:    &redis.XPending{},
+		groups: []redis.XInfoGroup{{Name: "workers", Lag: 4}},
+	}
+	src := newPendingGaugeTestSource(f, m)
+	src.Refresh(context.Background())
+	prior := m.Gauge(metrics.MetricStreamGroupLag)
+	if prior != 4 {
+		t.Fatalf("setup: stream_group_lag_entries = %v, want 4", prior)
+	}
+
+	// Undeterminable lag.
+	f.groups = []redis.XInfoGroup{{Name: "workers", Lag: -1}}
+	src.Refresh(context.Background())
+	if got := m.Gauge(metrics.MetricStreamGroupLag); got != prior {
+		t.Fatalf("stream_group_lag_entries on undeterminable lag = %v, want %v (preserved)", got, prior)
+	}
+
+	// Missing configured group (only another group present).
+	f.groups = []redis.XInfoGroup{{Name: "someone-else", Lag: 123}}
+	src.Refresh(context.Background())
+	if got := m.Gauge(metrics.MetricStreamGroupLag); got != prior {
+		t.Fatalf("stream_group_lag_entries on missing group = %v, want %v (preserved)", got, prior)
+	}
+}
+
+// TestPendingGaugeSourceRefreshGroupLagErrorCountsAndPreserves pins that an
+// XINFO GROUPS failure is counted with its own operation label and preserves the
+// prior lag gauge (fail open, no false zero) without affecting the pending read.
+func TestPendingGaugeSourceRefreshGroupLagErrorCountsAndPreserves(t *testing.T) {
+	m := metrics.New()
+	f := &fakePendingSummarizer{
+		val:    &redis.XPending{Count: 2, Lower: "1234567-0"},
+		groups: []redis.XInfoGroup{{Name: "workers", Lag: 9}},
+	}
+	src := newPendingGaugeTestSource(f, m)
+	src.Refresh(context.Background())
+	prior := m.Gauge(metrics.MetricStreamGroupLag)
+	if prior != 9 {
+		t.Fatalf("setup: stream_group_lag_entries = %v, want 9", prior)
+	}
+
+	f.groupErr = errors.New("connection refused")
+	src.Refresh(context.Background())
+
+	if got := m.Gauge(metrics.MetricStreamGroupLag); got != prior {
+		t.Fatalf("stream_group_lag_entries after error = %v, want %v (preserved)", got, prior)
+	}
+	labels := []metrics.Label{{Name: "operation", Value: metrics.RedisOpGroupLag}}
+	if got := m.CounterLabels(metrics.MetricRedisReadErrors, labels); got != 1 {
+		t.Fatalf("group_lag read errors = %d, want 1", got)
+	}
+	// The independent XPENDING observation still ran and recorded its depth.
+	if got := m.Gauge(metrics.MetricPendingEntries); got != 2 {
+		t.Fatalf("pending_entries = %v, want 2 (independent of the lag failure)", got)
+	}
+}
+
+// TestPendingGaugeSourceRefreshRecordsDLQDepth pins that XLEN is issued once for
+// the derived DLQ stream and a successful read records the depth including a
+// true zero.
+func TestPendingGaugeSourceRefreshRecordsDLQDepth(t *testing.T) {
+	m := metrics.New()
+	f := &fakePendingSummarizer{val: &redis.XPending{}, lenVal: 5}
+	src := newPendingGaugeTestSource(f, m)
+
+	src.Refresh(context.Background())
+
+	if f.lenCalls != 1 {
+		t.Fatalf("XLEN calls = %d, want 1", f.lenCalls)
+	}
+	if f.lastLen != "relay:events:dlq" {
+		t.Fatalf("queried stream %q, want relay:events:dlq", f.lastLen)
+	}
+	if got := m.Gauge(metrics.MetricDLQDepth); got != 5 {
+		t.Fatalf("dlq_depth = %v, want 5", got)
+	}
+
+	// An emptied DLQ records a true zero.
+	f.lenVal = 0
+	src.Refresh(context.Background())
+	if got := m.Gauge(metrics.MetricDLQDepth); got != 0 {
+		t.Fatalf("dlq_depth after empty = %v, want 0", got)
+	}
+}
+
+// TestPendingGaugeSourceRefreshDLQErrorCountsAndPreserves pins that an XLEN
+// failure is counted with its own operation label and preserves the prior depth
+// gauge (fail open, no false zero).
+func TestPendingGaugeSourceRefreshDLQErrorCountsAndPreserves(t *testing.T) {
+	m := metrics.New()
+	f := &fakePendingSummarizer{val: &redis.XPending{}, lenVal: 3}
+	src := newPendingGaugeTestSource(f, m)
+	src.Refresh(context.Background())
+	prior := m.Gauge(metrics.MetricDLQDepth)
+	if prior != 3 {
+		t.Fatalf("setup: dlq_depth = %v, want 3", prior)
+	}
+
+	f.lenErr = errors.New("connection refused")
+	src.Refresh(context.Background())
+
+	if got := m.Gauge(metrics.MetricDLQDepth); got != prior {
+		t.Fatalf("dlq_depth after error = %v, want %v (preserved)", got, prior)
+	}
+	labels := []metrics.Label{{Name: "operation", Value: metrics.RedisOpDLQDepth}}
+	if got := m.CounterLabels(metrics.MetricRedisReadErrors, labels); got != 1 {
+		t.Fatalf("dlq_depth read errors = %d, want 1", got)
+	}
+}
+
+// TestPendingGaugeSourceRefreshIssuesOneCommandEach pins the per-tick command
+// budget: one XPENDING, one XINFO GROUPS, and one XLEN per Refresh.
+func TestPendingGaugeSourceRefreshIssuesOneCommandEach(t *testing.T) {
+	m := metrics.New()
+	f := &fakePendingSummarizer{val: &redis.XPending{}, groups: []redis.XInfoGroup{{Name: "workers", Lag: 1}}}
+	src := newPendingGaugeTestSource(f, m)
+
+	src.Refresh(context.Background())
+
+	if f.calls != 1 || f.infoCalls != 1 || f.lenCalls != 1 {
+		t.Fatalf("commands per refresh = xpending %d, xinfo %d, xlen %d; want 1/1/1",
+			f.calls, f.infoCalls, f.lenCalls)
+	}
+}
+
+// TestPendingGaugeSourceRefreshExposesStreamGauges pins that the lag and DLQ
+// gauges are visible on the wire through the same exposition handler the worker
+// serves, not only in the Registry's typed getters.
+func TestPendingGaugeSourceRefreshExposesStreamGauges(t *testing.T) {
+	m := metrics.New()
+	f := &fakePendingSummarizer{
+		val:    &redis.XPending{},
+		groups: []redis.XInfoGroup{{Name: "workers", Lag: 6}},
+		lenVal: 2,
+	}
+	src := newPendingGaugeTestSource(f, m)
+	src.Refresh(context.Background())
+
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scrape status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, metrics.MetricStreamGroupLag+" 6") {
+		t.Fatalf("exposition missing %q:\n%s", metrics.MetricStreamGroupLag+" 6", body)
+	}
+	if !strings.Contains(body, metrics.MetricDLQDepth+" 2") {
+		t.Fatalf("exposition missing %q:\n%s", metrics.MetricDLQDepth+" 2", body)
+	}
+}
+
+// fakeExtraGaugeSource is a metrics.GaugeSource standing in for a worker-global
+// source registered via Consumer.AddGaugeSource (the scheduler's durable-outbox
+// gauges are the production case). It records its registration order and writes
+// one gauge so the composition test can prove it ran through the composed source
+// path, with no loop and no sleep.
+type fakeExtraGaugeSource struct {
+	name    string
+	order   *[]string
+	metrics *metrics.Registry
+	gauge   string
+	value   float64
+	calls   int
+}
+
+func (f *fakeExtraGaugeSource) Refresh(context.Context) {
+	f.calls++
+	*f.order = append(*f.order, f.name)
+	f.metrics.SetGauge(f.gauge, f.value)
+}
+
+// TestConsumerGaugeSourcesComposition pins Consumer.AddGaugeSource and the
+// gaugeSources composition: the consumer's own stream sampler is first and every
+// registered extra follows in registration order, and driving the composed slice
+// (exactly what Consume hands the Refresher) refreshes each source — the extras'
+// gauges are written — while the stream sampler still records its gauges. It is
+// fully deterministic: Refresh is called synchronously with the Redis seam faked,
+// so there is no new loop and no sleep.
+func TestConsumerGaugeSourcesComposition(t *testing.T) {
+	m := metrics.New()
+	c := NewConsumer(ConsumerConfig{
+		Stream:  "events",
+		Group:   "workers",
+		Log:     slog.New(slog.DiscardHandler),
+		Metrics: m,
+	})
+
+	var order []string
+	first := &fakeExtraGaugeSource{name: "first", order: &order, metrics: m, gauge: metrics.MetricBufferedEvents, value: 3}
+	second := &fakeExtraGaugeSource{name: "second", order: &order, metrics: m, gauge: metrics.MetricInFlightInvocations, value: 5}
+	// A nil extra is ignored by AddGaugeSource and must not appear in the slice.
+	c.AddGaugeSource(nil)
+	c.AddGaugeSource(first)
+	c.AddGaugeSource(second)
+
+	sources := c.gaugeSources()
+	if len(sources) != 3 {
+		t.Fatalf("composed sources = %d, want 3 (stream sampler + two extras)", len(sources))
+	}
+	stream, ok := sources[0].(*PendingGaugeSource)
+	if !ok {
+		t.Fatalf("sources[0] = %T, want *PendingGaugeSource (stream sampler first)", sources[0])
+	}
+	if sources[1] != metrics.GaugeSource(first) || sources[2] != metrics.GaugeSource(second) {
+		t.Fatalf("composed extras = [%T, %T], want the registered extras in order", sources[1], sources[2])
+	}
+
+	// Point the stream sampler at the fake Redis seam so the WHOLE composed slice
+	// can be driven without a Redis server.
+	f := &fakePendingSummarizer{val: &redis.XPending{Count: 4}}
+	stream.client = f
+
+	// Drive each composed source once, in order, exactly as the Refresher does.
+	for _, src := range sources {
+		src.Refresh(context.Background())
+	}
+
+	if first.calls != 1 || second.calls != 1 {
+		t.Fatalf("extra refreshes = (%d, %d), want (1, 1) through the composed path", first.calls, second.calls)
+	}
+	if len(order) != 2 || order[0] != "first" || order[1] != "second" {
+		t.Fatalf("refresh order = %v, want [first second]", order)
+	}
+	if got := m.Gauge(metrics.MetricBufferedEvents); got != 3 {
+		t.Fatalf("first extra gauge = %v, want 3", got)
+	}
+	if got := m.Gauge(metrics.MetricInFlightInvocations); got != 5 {
+		t.Fatalf("second extra gauge = %v, want 5", got)
+	}
+	if got := m.Gauge(metrics.MetricPendingEntries); got != 4 {
+		t.Fatalf("stream sampler pending_entries = %v, want 4 (stream sampler still runs)", got)
+	}
+
+	// No-label behavior preserved: the stream sampler's gauge stays unlabeled on
+	// the wire alongside the registered extra's gauge.
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scrape status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, metrics.MetricPendingEntries+" 4") {
+		t.Fatalf("exposition missing unlabeled %q:\n%s", metrics.MetricPendingEntries+" 4", body)
+	}
+	if strings.Contains(body, metrics.MetricPendingEntries+"{") {
+		t.Fatalf("stream gauge must remain unlabeled:\n%s", body)
 	}
 }

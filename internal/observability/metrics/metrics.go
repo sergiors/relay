@@ -88,6 +88,16 @@ const (
 	MetricSchedulePublishRetries   = metricNamespacePrefix + "schedule_publish_retries_total"
 	MetricSchedulePublishExhausted = metricNamespacePrefix + "schedule_publish_exhausted_total"
 	MetricScheduleCatchUp          = metricNamespacePrefix + "schedule_catchup_total"
+	// MetricScheduleCatchupSkipped counts the older missed occurrences the
+	// bounded latest-only catch-up intentionally DISCARDS: per schedule, every
+	// occurrence in the recovery horizon that is strictly older than the single
+	// latest one the scan republishes. It is process-local and unlabeled; it is
+	// counted at the decision point on each scan (startup and a recovery scan
+	// each count the instants they discard), and it deliberately makes no
+	// cluster-wide de-duplication claim. Occurrences outside the horizon, future
+	// occurrences, the published latest occurrence itself, and schedules with no
+	// candidate are never counted.
+	MetricScheduleCatchupSkipped = metricNamespacePrefix + "schedule_catchup_skipped_occurrences_total"
 	// Durable schedule-publication recovery. The exact occurrence intent of every
 	// due tick is written to the local state DB BEFORE it is published
 	// (intent-first durability), so a crash between persistence and publication
@@ -118,7 +128,17 @@ const (
 	MetricSchedulerState      = metricNamespacePrefix + "scheduler_state"
 	MetricSchedulerDegraded   = metricNamespacePrefix + "scheduler_degraded_total"
 	MetricSchedulerRecoveries = metricNamespacePrefix + "scheduler_recoveries_total"
-	MetricHandlerInvocations  = metricNamespacePrefix + "handler_invocations_total"
+	// Durable schedule-publication outbox gauges, sampled periodically (and
+	// READ-ONLY) from the scheduler's currently installed outbox. MetricSchedule
+	// OutboxDepth is the number of unresolved outbox records currently in
+	// schedule_pending; MetricScheduleOutboxOldestAge is the age of the oldest
+	// such record (derived from its first-insert instant, never from its
+	// scheduled instant or retry deadline). Both are process-local and unlabeled:
+	// the outbox is this worker's own local store, so this is deliberately not a
+	// distributed/cluster aggregate.
+	MetricScheduleOutboxDepth     = metricNamespacePrefix + "schedule_outbox_depth"
+	MetricScheduleOutboxOldestAge = metricNamespacePrefix + "schedule_outbox_oldest_age_seconds"
+	MetricHandlerInvocations      = metricNamespacePrefix + "handler_invocations_total"
 	// MetricAppBuildFailures counts failed app image and dependency-image
 	// builds. It is APP lifecycle (whether an app could be prepared), not handler
 	// execution, so it keeps the app_ namespace alongside the app identity
@@ -147,8 +167,22 @@ const (
 	MetricAppBuild               = metricNamespacePrefix + "app_build_seconds"
 	MetricPendingEntries         = metricNamespacePrefix + "pending_entries"
 	MetricPendingOldestAge       = metricNamespacePrefix + "pending_oldest_age_seconds"
-	MetricBufferedEvents         = metricNamespacePrefix + "buffered_events"
-	MetricInFlightInvocations    = metricNamespacePrefix + "in_flight_invocations"
+	// MetricStreamGroupLag is the configured consumer group's lag on the
+	// configured stream — the number of stream entries not yet delivered to that
+	// group — as reported by XINFO GROUPS (Redis's own lag semantics). A lag
+	// Redis cannot determine is left unobserved rather than reported as zero.
+	// MetricDLQDepth is the current length of the Relay-owned DLQ stream for the
+	// configured stream (XLEN of DLQStreamFor(stream)). Both are unlabeled and
+	// sampled by the same periodic stream-metrics source as the pending backlog.
+	// Their scope is that configured stream/group and its DLQ, which every
+	// process/worker configured with the same stream and group SHARES; neither
+	// is partitioned per worker. Each Registry is process-local, so when more
+	// than one worker shares a stream/group those endpoints report the SAME
+	// underlying observation and must not be summed as if disjoint.
+	MetricStreamGroupLag      = metricNamespacePrefix + "stream_group_lag_entries"
+	MetricDLQDepth            = metricNamespacePrefix + "dlq_depth"
+	MetricBufferedEvents      = metricNamespacePrefix + "buffered_events"
+	MetricInFlightInvocations = metricNamespacePrefix + "in_flight_invocations"
 	// MetricMissingPayload counts reclaimed PEL entries whose stream body no
 	// longer exists (trimmed or XDEL'd before the entry was acknowledged). Such
 	// an entry can never be processed: there is no payload to hand to a handler,
@@ -276,12 +310,15 @@ var metricHelp = map[string]string{
 	MetricSchedulePublishRetries:       "Retries of a failed schedule occurrence publication within the bounded backoff budget; the initial failed attempt is counted by schedule_publish_failures_total and every subsequent re-attempt counts here.",
 	MetricSchedulePublishExhausted:     "Schedule occurrences whose BOUNDED IMMEDIATE publication retry loop was exhausted without a success or duplicate. This is not a terminal loss: the occurrence's exact intent was already written to the durable SQLite outbox BEFORE the publish (intent-first durability), so the retry worker keeps republishing it until it resolves (published or a clean duplicate) or its 7-day retention expires; only with no outbox configured does exhaustion leave no durable copy. It is not a handler exhaustion (see function_dlq_total).",
 	MetricScheduleCatchUp:              "Schedule occurrences processed by the startup catch-up scan (the latest missed occurrence per schedule within the bounded horizon). Each is subject to the atomic publish-if-new, so the scan's published/duplicate split is counted by schedule_occurrences_published_total / schedule_occurrences_duplicate_total.",
+	MetricScheduleCatchupSkipped:       "Older missed schedule occurrences the bounded latest-only catch-up intentionally discarded: for each schedule, the occurrences inside the recovery horizon that are strictly older than the single latest one the scan republishes. Counted at the decision point on every scan (startup and each recovery scan), per process; occurrences outside the horizon, future occurrences, the published latest occurrence, schedules with no candidate, and publish outcomes are never counted. This is a local count of a deliberately bounded policy, not a cluster-wide measure of lost occurrences.",
 	MetricSchedulePendingPersisted:     "Schedule occurrences newly persisted to the durable local retry outbox. The exact occurrence intent is written BEFORE the tick is published (intent-first durability), so a crash between persistence and publication recovers it; a re-persist of an occurrence already present is not counted. The occurrence is retried until it publishes or is confirmed a clean duplicate, then the outbox row is deleted.",
 	MetricSchedulePendingRetries:       "Publication attempts made by the durable schedule-publication retry worker for occurrences persisted in the local outbox; a resolved attempt removes the outbox row, a failed one reschedules it.",
 	MetricSchedulePendingExpired:       "Durable schedule-publication outbox records removed because their 7-day retention deadline passed without resolving. Expiration is a terminal outcome distinct from publication: no publish attempt is made for an expired record, so it is counted neither as a success, a failure, nor a duplicate.",
 	MetricSchedulerState:               "Current scheduler storage state as a one-hot gauge: exactly one state series is 1 and every other allowed state is 0. Running means a usable durable outbox is installed and live jobs are enabled; degraded means schedule publication is paused because an outbox operation failed; unavailable means no usable outbox could be opened. Schedule firing is not a prerequisite for consuming external events.",
 	MetricSchedulerDegraded:            "Transitions of the schedule scheduler into the degraded state because a durable outbox operation (save, claim, reschedule, delete, or next-due query) failed; each transition counts once, so repeated failures in one degraded episode count once.",
 	MetricSchedulerRecoveries:          "Transitions of the schedule scheduler back to running after being degraded or unavailable, once a usable outbox is installed again and the bounded recovery (pending-row retry plus latest-only catch-up) has completed.",
+	MetricScheduleOutboxDepth:          "Current number of unresolved durable schedule-publication records in this worker's local outbox (schedule_pending), sampled read-only on the periodic metrics pass. Records that have passed retention are still counted until the bounded cleanup removes them. It is a local store depth, not a cluster-wide backlog; with no outbox installed it is left unobserved rather than reported as zero.",
+	MetricScheduleOutboxOldestAge:      "Current age in seconds of the oldest unresolved durable schedule-publication record in this worker's local outbox, derived from the record's first-insert instant (its retention deadline minus the retention window), never from its scheduled instant or retry deadline. Sampled read-only on the periodic metrics pass; with no outbox installed it is left unobserved rather than reported as zero.",
 
 	MetricHandlerInvocations:              "Handler invocation outcomes by app and handler, counted once per handler attempt; outcome is success or failure.",
 	MetricAppBuildFailures:                "App image and dependency-image build failures by app.",
@@ -299,6 +336,8 @@ var metricHelp = map[string]string{
 
 	MetricPendingEntries:        "Current number of pending (delivered but unacknowledged) entries in the Redis consumer group, sampled from XPENDING.",
 	MetricPendingOldestAge:      "Current age in seconds of the oldest pending entry in the Redis consumer group, sampled from XPENDING.",
+	MetricStreamGroupLag:        "Current number of entries in the configured Redis stream not yet delivered to the configured consumer group, sampled from XINFO GROUPS using Redis's own lag semantics. Scope is that configured stream/group, which every process/worker configured with the same stream and group shares; each Registry is process-local, so repeated per-worker observations of the same group are the same underlying value and must not be summed as if disjoint. A lag Redis reports as undeterminable is left at its last observed value rather than reported as zero.",
+	MetricDLQDepth:              "Current number of entries in the Relay-owned dead-letter stream for the configured stream (XLEN of relay:<stream>:dlq), sampled periodically. Scope is that DLQ stream, which every process/worker configured with the same stream shares — it is not partitioned per worker — so each process-local Registry reports the same underlying depth and repeated per-worker observations must not be summed as if disjoint. Not a count of exhausted invocations (function_dlq_total) or of successful DLQ writes (dlq_entries_total).",
 	MetricBufferedEvents:        "Current number of events held in the stream consumer's local in-flight buffer, set on each acquire and release.",
 	MetricInFlightInvocations:   "Current number of invocations executing in this worker, set on each concurrency-slot acquire and release.",
 	MetricMissingPayload:        "Reclaimed pending entries whose stream body no longer exists (trimmed or deleted before acknowledgement), counted once per entry when its dangling PEL reference is cleared. These entries cannot be processed and are neither handler attempts nor DLQ entries; a nonzero value signals an unsafe trim or an external delete racing Relay.",
@@ -355,12 +394,17 @@ var SchedulerStates = []string{
 // stream consumer issues. Each labels MetricRedisReadErrors by which command
 // failed; pending_gauge is the periodic XPENDING depth sampler, which is
 // instrumented through the same counter but is distinct from a reclaim-path
-// pending read so the two never double count one command.
+// pending read so the two never double count one command. group_lag and
+// dlq_depth are the sampler's XINFO GROUPS and XLEN observations respectively,
+// kept distinct so a failing stream command never looks like a failing DLQ
+// command.
 const (
 	RedisOpReadGroup    = "read_group"
 	RedisOpPending      = "pending"
 	RedisOpAutoclaim    = "autoclaim"
 	RedisOpPendingGauge = "pending_gauge"
+	RedisOpGroupLag     = "group_lag"
+	RedisOpDLQDepth     = "dlq_depth"
 )
 
 // Service reconcile outcome label values. A pass that changed container state
@@ -597,6 +641,7 @@ func New() *Registry {
 		MetricSchedulePublishRetries,
 		MetricSchedulePublishExhausted,
 		MetricScheduleCatchUp,
+		MetricScheduleCatchupSkipped,
 		// Durable schedule-publication recovery counters (see internal/cron's
 		// durable retry worker). Prometheus-only, like the other schedule counters.
 		MetricSchedulePendingPersisted,
@@ -719,9 +764,13 @@ func New() *Registry {
 	}
 
 	// Pending-backlog gauges fed by the stream consumer's XPENDING sampler.
+	// MetricStreamGroupLag (XINFO GROUPS) and MetricDLQDepth (XLEN) are set by
+	// the same periodic sampler/source (see PendingGaugeSource).
 	for _, name := range []string{
 		MetricPendingEntries,
 		MetricPendingOldestAge,
+		MetricStreamGroupLag,
+		MetricDLQDepth,
 	} {
 		g := prometheus.NewGauge(prometheus.GaugeOpts{Name: name, Help: metricHelp[name]})
 		reg.MustRegister(g)
@@ -840,6 +889,19 @@ func New() *Registry {
 	r.gaugeVecs[MetricSchedulerState] = &labeledGaugeVec{
 		order: []string{"state"},
 		vec:   schedulerStateVec,
+	}
+
+	// Durable schedule-publication outbox gauges, sampled read-only by the
+	// scheduler's periodic metrics source from its currently installed outbox
+	// (see internal/cron). They are process-global and unlabeled: the outbox is
+	// this worker's own local store.
+	for _, name := range []string{
+		MetricScheduleOutboxDepth,
+		MetricScheduleOutboxOldestAge,
+	} {
+		g := prometheus.NewGauge(prometheus.GaugeOpts{Name: name, Help: metricHelp[name]})
+		reg.MustRegister(g)
+		r.gauges[name] = g
 	}
 
 	// Redis read failures, labeled solely by the finite operation set. No error

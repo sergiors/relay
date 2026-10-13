@@ -42,7 +42,9 @@
 //     relay_schedule_occurrences_duplicate_total,
 //     relay_schedule_publish_failures_total, the bounded-retry counters
 //     relay_schedule_publish_retries_total / relay_schedule_publish_exhausted_total,
-//     and relay_schedule_catchup_total, plus the durable schedule-recovery
+//     and relay_schedule_catchup_total plus
+//     relay_schedule_catchup_skipped_occurrences_total, plus the durable
+//     schedule-recovery
 //     counters relay_schedule_pending_persisted_total /
 //     relay_schedule_pending_retries_total / relay_schedule_pending_expired_total,
 //     plus the scheduler storage-state
@@ -64,9 +66,19 @@
 //     (prometheus.DefBuckets; all observed in seconds).
 //   - Gauges: relay_pending_entries and relay_pending_oldest_age_seconds
 //     (Redis backlog depth and age sampled by the stream consumer),
+//     relay_stream_group_lag_entries (the configured consumer group's lag, from
+//     XINFO GROUPS) and relay_dlq_depth (the Relay-owned DLQ stream length for
+//     the configured stream, from XLEN) sampled by the same stream-metrics
+//     source; both are scoped to the configured stream/group and its DLQ, which
+//     every process/worker configured with that stream and group shares, and
+//     each Registry is process-local, so observations of the same shared
+//     stream/group/DLQ must not be summed across workers as if disjoint,
 //     relay_buffered_events (the consumer's local in-flight buffer occupancy),
 //     relay_in_flight_invocations (the runner's current executing
-//     invocation count), relay_app_status{app,status} (one-hot
+//     invocation count), relay_schedule_outbox_depth and
+//     relay_schedule_outbox_oldest_age_seconds (the scheduler's local durable
+//     publication outbox, sampled read-only on the same periodic pass),
+//     relay_app_status{app,status} (one-hot
 //     public lifecycle: exactly one of the closed status set is 1), and
 //     relay_scheduler_state{state=running|degraded|unavailable} (one-hot
 //     scheduler storage state; schedule firing is not a prerequisite for event

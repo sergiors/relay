@@ -352,3 +352,55 @@ func (st *State) NextPendingDue(ctx context.Context, now time.Time) (time.Time, 
 	}
 	return time.UnixMilli(ms.Int64).UTC(), true, nil
 }
+
+// OutboxStats is the READ-ONLY aggregate of the durable schedule-publication
+// outbox, used for observability only. It is a plain value so an observability
+// sampler never materializes outbox rows.
+type OutboxStats struct {
+	// Depth is the number of unresolved rows currently in schedule_pending,
+	// including rows past their retention deadline until the bounded cleanup
+	// removes them: the table represents unresolved outbox records, not history.
+	Depth int64
+	// OldestAge is how long ago the oldest unresolved row was first inserted,
+	// derived from its retention deadline (expires_at_ms - PendingRetention),
+	// never from its scheduled instant or retry deadline. It is zero when the
+	// outbox is empty and clamped to zero if that derived instant is in the
+	// future (a clock skew guard).
+	OldestAge time.Duration
+}
+
+// PendingOutboxStats returns a single read-only aggregate over schedule_pending:
+// its row count and the age of its oldest row's first-insert instant, computed
+// in ONE query (COUNT(*) plus MIN(expires_at_ms)) with no row materialization
+// and no schema change. It never mutates the outbox and never touches scheduler
+// state or rows, so an observability sampler can call it freely.
+//
+// The first-insert instant is recovered as the oldest row's expires_at_ms minus
+// PendingRetention, because the retention deadline is stamped exactly
+// once as first-insert-time + PendingRetention and never refreshed (see
+// SavePendingOccurrence). ScheduledAt, Attempts, and NextAttempt are deliberately
+// NOT age proxies. An empty outbox reports (depth 0, age 0). A non-empty row set
+// always has a non-NULL MIN(expires_at_ms), so the age is well-defined.
+//
+// It reads the injectable clock (State.nowTime) so tests can drive the age
+// deterministically. An error is returned wrapped and leaves the outbox
+// untouched; the caller decides how to surface it.
+func (st *State) PendingOutboxStats(ctx context.Context) (OutboxStats, error) {
+	var (
+		count      int64
+		minExpires sql.NullInt64
+	)
+	if err := st.db.QueryRowContext(ctx,
+		`SELECT COUNT(*), MIN(expires_at_ms) FROM schedule_pending`).Scan(&count, &minExpires); err != nil {
+		return OutboxStats{}, fmt.Errorf("pending outbox stats: %w", err)
+	}
+	if count == 0 || !minExpires.Valid {
+		return OutboxStats{Depth: count}, nil
+	}
+	inserted := time.UnixMilli(minExpires.Int64).UTC().Add(-PendingRetention)
+	age := st.nowTime().UTC().Sub(inserted)
+	if age < 0 {
+		age = 0
+	}
+	return OutboxStats{Depth: count, OldestAge: age}, nil
+}

@@ -56,6 +56,12 @@ type fakeOutbox struct {
 
 	nowFn       func() time.Time
 	ignoreLease bool
+
+	// Read-only aggregate seam (outboxStatsReader), so the scheduler's metrics
+	// source is exercisable with a deterministic fake. statsErr, when set, makes
+	// PendingOutboxStats fail so the stale-gauge path can be pinned.
+	statsAgg state.OutboxStats
+	statsErr error
 }
 
 func newFakeOutbox() *fakeOutbox {
@@ -68,6 +74,16 @@ func (f *fakeOutbox) clock() time.Time {
 		return f.nowFn()
 	}
 	return time.Now()
+}
+
+// PendingOutboxStats makes fakeOutbox satisfy the read-only aggregate the
+// scheduler's metrics source samples (outboxStatsReader). It returns the
+// configured aggregate (or error) and never mutates the fake's rows.
+func (f *fakeOutbox) PendingOutboxStats(context.Context) (state.OutboxStats, error) {
+	if f.statsErr != nil {
+		return state.OutboxStats{}, f.statsErr
+	}
+	return f.statsAgg, nil
 }
 
 func (f *fakeOutbox) SavePendingOccurrence(_ context.Context, p state.PendingOccurrence) (bool, error) {

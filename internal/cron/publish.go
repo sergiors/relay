@@ -341,6 +341,13 @@ func (s *Scheduler) catchUpScan(ctx context.Context, gated bool) int {
 		if !ok {
 			continue
 		}
+		// Count the older missed occurrences this latest-only scan intentionally
+		// discards for the schedule, at the decision point itself and independent
+		// of the publish outcome below. It is a local per-scan count of a
+		// deliberately bounded policy, not a cluster-wide measure.
+		if skipped := skippedOccurrences(e.parsed, now, due, occurrenceHorizon); skipped > 0 {
+			s.metrics.Add(metrics.MetricScheduleCatchupSkipped, skipped)
+		}
 		// Count each occurrence the scan attempts; a duplicate result (another
 		// worker already published it) additionally increments the duplicate
 		// counter, so the two are independent.
@@ -352,6 +359,29 @@ func (s *Scheduler) catchUpScan(ctx context.Context, gated bool) int {
 	}
 	s.log.Debug("Schedule: catch-up scan complete", "schedules", len(entries), "published", published)
 	return published
+}
+
+// skippedOccurrences counts the schedule instants in the SAME bounded recovery
+// window latestOccurrence searches — (now-horizon, now] — that are strictly
+// OLDER than the single latest occurrence the catch-up republishes. Those are
+// exactly the missed occurrences the bounded latest-only policy intentionally
+// discards. The window is bounded (occurrenceHorizon) and the accepted grammar
+// is minute-granularity, so the forward scan visits at most one instant per
+// minute over the horizon and never counts anything outside it. A schedule that
+// has only its latest occurrence in the window (or none) yields 0: the returned
+// count never includes the published latest instant, a future instant, or an
+// older-than-horizon miss.
+func skippedOccurrences(sch robfigcron.Schedule, now, latest time.Time, horizon time.Duration) int64 {
+	now = now.UTC()
+	// Match latestOccurrence's window exactly: it searches forward from the
+	// floor-to-second lower bound, so an occurrence at the boundary second is
+	// included.
+	lo := time.Unix(now.Add(-horizon).Unix(), 0).UTC()
+	var n int64
+	for cur := sch.Next(lo); !cur.IsZero() && !cur.After(now) && cur.Before(latest); cur = sch.Next(cur) {
+		n++
+	}
+	return n
 }
 
 // recoveryCatchUp re-runs the bounded latest-only catch-up after the scheduler

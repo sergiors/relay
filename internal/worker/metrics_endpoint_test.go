@@ -34,6 +34,8 @@ func TestMetricsEndpointScrapeExposesAppSeries(t *testing.T) {
 	metricsInstance.ObserveDurationLabels(metrics.MetricHandlerDuration,
 		[]metrics.Label{{Name: "app", Value: "demo"}, {Name: "handler", Value: "index.hi"}}, 250*time.Millisecond)
 	metricsInstance.SetGauge(metrics.MetricPendingEntries, 3)
+	metricsInstance.SetGauge(metrics.MetricDLQDepth, 1)
+	metricsInstance.SetGauge(metrics.MetricScheduleOutboxDepth, 2)
 	// Warm-container pool observability series.
 	metricsInstance.SetGaugeLabels(metrics.MetricRuntimePoolCapacity, []metrics.Label{{Name: "app", Value: "demo"}}, 2)
 	metricsInstance.SetGaugeLabels(metrics.MetricRuntimeContainers,
@@ -79,6 +81,8 @@ func TestMetricsEndpointScrapeExposesAppSeries(t *testing.T) {
 		`handler_invocations_total{app="demo",handler="index.hi",outcome="success"} 1`,
 		`handler_duration_seconds_count{app="demo",handler="index.hi"} 1`,
 		"relay_pending_entries 3",
+		"relay_dlq_depth 1",
+		"relay_schedule_outbox_depth 2",
 		"# TYPE",
 		// Warm-container pool observability.
 		`relay_runtime_pool_capacity{app="demo"} 2`,

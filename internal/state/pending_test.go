@@ -816,3 +816,101 @@ func TestPendingOccurrenceExpirySurvivesReopen(t *testing.T) {
 		t.Fatalf("expire after reopen = (%d,%v), want (1,nil)", n, err)
 	}
 }
+
+// TestPendingOutboxStatsDepthAndOldestAge pins the read-only aggregate: an empty
+// outbox reports (depth 0, age 0); with rows present the depth is the row count
+// and the age is derived from the OLDEST row's first-insert instant (its
+// retention deadline minus the retention window), never from its scheduled
+// instant or retry deadline; resolving the oldest row advances the age to the
+// next oldest.
+func TestPendingOutboxStatsDepthAndOldestAge(t *testing.T) {
+	ctx := context.Background()
+	c := openTestState(t)
+	base := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+
+	stats, err := c.PendingOutboxStats(ctx)
+	if err != nil {
+		t.Fatalf("empty stats: %v", err)
+	}
+	if stats.Depth != 0 || stats.OldestAge != 0 {
+		t.Fatalf("empty stats = %+v, want depth 0 age 0", stats)
+	}
+
+	// "a" is inserted first; its ScheduledAt is deliberately far from the insert
+	// instant to prove the age is NOT derived from scheduled_at.
+	a := pendingOcc("a", base)
+	a.ScheduledAt = base.Add(-10 * 24 * time.Hour)
+	c.nowFn = func() time.Time { return base }
+	if _, err := c.SavePendingOccurrence(ctx, a); err != nil {
+		t.Fatalf("save a: %v", err)
+	}
+	c.nowFn = func() time.Time { return base.Add(time.Hour) }
+	if _, err := c.SavePendingOccurrence(ctx, pendingOcc("b", base)); err != nil {
+		t.Fatalf("save b: %v", err)
+	}
+
+	c.nowFn = func() time.Time { return base.Add(2 * time.Hour) }
+	stats, err = c.PendingOutboxStats(ctx)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if stats.Depth != 2 {
+		t.Fatalf("depth = %d, want 2", stats.Depth)
+	}
+	if stats.OldestAge != 2*time.Hour {
+		t.Fatalf("oldest age = %v, want 2h (from a's insert instant, not scheduled_at)", stats.OldestAge)
+	}
+
+	// Resolving the oldest record lowers the depth and advances the age to b's
+	// insert instant (one hour after base).
+	if err := c.DeletePendingOccurrence(ctx, "a"); err != nil {
+		t.Fatalf("delete a: %v", err)
+	}
+	stats, err = c.PendingOutboxStats(ctx)
+	if err != nil {
+		t.Fatalf("stats after resolve: %v", err)
+	}
+	if stats.Depth != 1 || stats.OldestAge != time.Hour {
+		t.Fatalf("stats after resolve = %+v, want depth 1 age 1h", stats)
+	}
+}
+
+// TestPendingOutboxStatsErrorIsNonFatalAndNonMutating pins the read-only
+// contract: a closed DB surfaces an error (never a panic) and the failed
+// aggregate query leaves the outbox rows untouched, verified by reopening the
+// same database.
+func TestPendingOutboxStatsErrorIsNonFatalAndNonMutating(t *testing.T) {
+	ctx := context.Background()
+	base := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "db.sqlite3")
+	c, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	c.nowFn = func() time.Time { return base }
+	if _, err := c.SavePendingOccurrence(ctx, pendingOcc("a", base)); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := c.PendingOutboxStats(ctx); err == nil {
+		t.Fatal("PendingOutboxStats on a closed DB must return an error, not panic")
+	}
+
+	// Reopen: the row is intact, so the failed aggregate query never mutated the
+	// outbox.
+	c2, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer c2.Close()
+	c2.nowFn = func() time.Time { return base }
+	stats, err := c2.PendingOutboxStats(ctx)
+	if err != nil {
+		t.Fatalf("stats after reopen: %v", err)
+	}
+	if stats.Depth != 1 {
+		t.Fatalf("depth after reopen = %d, want 1 (row preserved)", stats.Depth)
+	}
+}
