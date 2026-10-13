@@ -1,8 +1,10 @@
 package reconciler
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,6 +68,69 @@ func TestReconcileInvalidDesiredWritesFailureAndKeepsRegistry(t *testing.T) {
 	if b.prepares() != 0 {
 		t.Fatalf("prepares = %d, want 0 (an invalid template never builds)", b.prepares())
 	}
+}
+
+// TestReconcileOverDeepPatternInvalidRetainsActive pins that the fixed
+// per-pattern depth cap is enforced when a reconcile reads an UPDATED template:
+// an over-deep pattern is an invalid desired definition, so it follows the
+// existing invalid-desired path — recorded failed/degraded with its active
+// generation retained, the live registry untouched, and no rebuild attempted.
+func TestReconcileOverDeepPatternInvalidRetainsActive(t *testing.T) {
+	root := t.TempDir()
+	dir := writeFnDir(t, root, "deep")
+
+	fn := initialFn("deep", dir)
+	b := &fakeBuilder{}
+	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
+
+	st.RecordReconcileSuccess("deep", "img-deep", "fp-deep", time.Now(), fn.App())
+	before, ok := st.GetApp("deep")
+	if !ok || before.Status != state.StatusReady {
+		t.Fatalf("precondition: %+v ok=%v, want ready", before, ok)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(overDeepPatternTemplate()), 0o644); err != nil {
+		t.Fatalf("write broken template: %v", err)
+	}
+	r.reconcileApp("deep")
+
+	after, ok := st.GetApp("deep")
+	if !ok {
+		t.Fatal("row must survive an over-deep desired definition")
+	}
+	if after.Status != state.StatusDegraded {
+		t.Fatalf("status = %q, want degraded (active generation retained)", after.Status)
+	}
+	if after.LastReconcileStatus != state.ReconcileFailed || after.LastError == "" {
+		t.Fatalf("outcome = %q/%q, want failed with an error", after.LastReconcileStatus, after.LastError)
+	}
+	if !strings.Contains(after.LastError, "depth") {
+		t.Fatalf("last_error = %q, want it to mention depth", after.LastError)
+	}
+	if after.Image != before.Image || after.Fingerprint != before.Fingerprint {
+		t.Fatalf("active generation changed: %q/%q -> %q/%q",
+			before.Image, before.Fingerprint, after.Image, after.Fingerprint)
+	}
+	if pf := reg.GetByName("deep"); pf == nil || pf.Prepared() == nil {
+		t.Fatal("an over-deep pattern must not modify the live registry")
+	}
+	if b.prepares() != 0 {
+		t.Fatalf("prepares = %d, want 0 (an over-deep pattern never builds)", b.prepares())
+	}
+}
+
+// overDeepPatternTemplate builds a template whose single event pattern is one
+// field level over app.MaxPatternDepth.
+func overDeepPatternTemplate() string {
+	var b strings.Builder
+	b.WriteString("runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n")
+	indent := "      "
+	for i := 1; i <= app.MaxPatternDepth; i++ {
+		fmt.Fprintf(&b, "%sf%d:\n", indent, i)
+		indent += "  "
+	}
+	b.WriteString(indent + "leaf: [x]\n")
+	return b.String()
 }
 
 // TestReconcileMissingTemplateRecordsInvalidButRetains pins the mid-copy case: a

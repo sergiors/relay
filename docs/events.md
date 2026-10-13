@@ -157,6 +157,48 @@ map itself is missing.
 Example: `status: [COMPLETED, FAILED]` matches either value; an `id` field
 with `- prefix: "user_"` matches `user_123` but not `123`.
 
+### Pattern limits
+
+Each `pattern` is bounded by two **fixed limits**. They are not configurable:
+there is no environment variable or template key that changes them.
+
+- **Structural depth 8.** Depth counts field nesting plus nested
+  composite-literal containers. Each top-level pattern field is level 1 and each
+  nested child field is one level deeper, so a pattern whose deepest field is at
+  level 8 is accepted and one at level 9 is rejected. The grammar wrappers add no
+  depth: a field's OR-alternative list (`status: [A, B]`) and a single-key
+  operator map (`id: [{prefix: "x"}]`) do not consume a level, and
+  siblings/alternatives do not accumulate. A nested-map alternative introduces its
+  child fields at the next level, so `new_image: [{status: [COMPLETED]}]` puts
+  `status` at level 2. A **composite literal container** — a list or map used as
+  an equality value, e.g. `tags: [[1, 2]]` — consumes one level per container
+  nesting, so a deeply nested composite cannot bypass the cap.
+- **Size 4096 Unicode characters.** The size is measured per `pattern` (never the
+  whole template, never the sum across a rule's patterns) as the number of
+  Unicode **code points** in that pattern subtree's canonical compact JSON
+  serialization: `encoding/json`'s compact form with object keys sorted. JSON
+  punctuation, quotes, and escaping all count, including `encoding/json`'s
+  HTML-sensitive escapes (`<` becomes `\u003c`). Because it is a code-point count,
+  each multibyte character contributes exactly one code point rather than its
+  UTF-8 byte length; the total serialized pattern, JSON syntax included, must
+  still be <= 4096. Non-finite YAML floats (`.nan`/`.inf`), which JSON cannot
+  represent, are measured as the four-character literal `null`. A mapping with
+  non-string keys has no JSON encoding and can never match a JSON object, so it is
+  rejected as a parse error rather than measured.
+
+Both limits are enforced once when the template is parsed: an over-limit pattern
+fails `template.yaml` validation with an error naming the rule (and, for depth,
+the offending field path) and the exceeded limit. An accepted pattern parses,
+matches, and is indexed exactly as before. A valid nested pattern:
+
+```yaml
+pattern:
+  new_image:
+    status: [COMPLETED]
+    metadata:
+      source: [{prefix: "sync_"}]
+```
+
 ## Dispatch and concurrency
 
 For each delivered external-event message, Relay evaluates every loaded app (in

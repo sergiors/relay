@@ -665,6 +665,12 @@ func ParseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		if err != nil {
 			return nil, fmt.Errorf("rule %q: %w", ev.Handler, err)
 		}
+		// Enforce the fixed per-pattern structural-depth and size caps on the RAW
+		// pattern before it is parsed into the model or indexed (see
+		// MaxPatternDepth/MaxPatternSize). This is the single enforcement point.
+		if err := validatePatternLimits(ev.Pattern); err != nil {
+			return nil, fmt.Errorf("rule %q: %w", ev.Handler, err)
+		}
 		pattern := make(Pattern, len(ev.Pattern))
 		for field, cond := range ev.Pattern {
 			parsed, err := parseFieldCondition(field, cond, now)

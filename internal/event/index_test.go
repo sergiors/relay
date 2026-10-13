@@ -763,6 +763,70 @@ events:
 	})
 }
 
+// TestIndexDepthBoundaryNoFalseNegatives pins that a depth-8 nested pattern —
+// the maximum accepted depth — is matched and indexed with no false negatives:
+// the indexed matcher agrees with a full scan for matching and non-matching
+// events, and the deepest field is still a usable anchor.
+func TestIndexDepthBoundaryNoFalseNegatives(t *testing.T) {
+	t.Parallel()
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.deep
+    pattern:
+      f1:
+        f2:
+          f3:
+            f4:
+              f5:
+                f6:
+                  f7:
+                    f8: [leaf]
+  - handler: handler.deepop
+    pattern:
+      f1:
+        f2:
+          f3:
+            f4:
+              f5:
+                f6:
+                  f7:
+                    f8: [{exists: true}]
+`)
+	ix := NewRuleIndex(tmpl.Events)
+
+	match := nestedEvent(8, "leaf")
+	if got := indexHandlers(ix.MatchingEventRules(match)); strings.Join(got, ",") != "handler.deep,handler.deepop" {
+		t.Fatalf("depth-8 match = %v, want both handlers", got)
+	}
+	nonMatch := nestedEvent(8, "other")
+	if got := indexHandlers(ix.MatchingEventRules(nonMatch)); strings.Join(got, ",") != "handler.deepop" {
+		t.Fatalf("depth-8 non-match = %v, want only handler.deepop", got)
+	}
+	// The deepest field is still an anchor: no false negatives against a full
+	// exact scan across the boundary events.
+	assertIndexEquivalent(t, tmpl, []map[string]any{
+		match,
+		nonMatch,
+		{},
+		{"a": "not-a-map"},
+		{"a": map[string]any{"b": nil}},
+		nestedEvent(8, nil),
+		nestedEvent(7, "leaf"),
+	})
+}
+
+// nestedEvent builds an event object with `depth` nested maps, the deepest
+// field holding leaf.
+func nestedEvent(depth int, leaf any) map[string]any {
+	names := []string{"f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8"}
+	var v any = leaf
+	for i := depth - 1; i >= 0; i-- {
+		v = map[string]any{names[i]: v}
+	}
+	return v.(map[string]any)
+}
+
 func containsIndex(idxs []int, want int) bool {
 	for _, i := range idxs {
 		if i == want {
@@ -827,6 +891,21 @@ events:
     pattern:
       field: [null]
 `, `{"field":null}`},
+		// A structured depth-8 pattern (the maximum accepted depth): the
+		// deepest field must still anchor without false negatives.
+		{`runtime: python3.14
+events:
+  - handler: handler.a
+    pattern:
+      f1:
+        f2:
+          f3:
+            f4:
+              f5:
+                f6:
+                  f7:
+                    f8: [leaf]
+`, `{"f1":{"f2":{"f3":{"f4":{"f5":{"f6":{"f7":{"f8":"leaf"}}}}}}}}`},
 	}
 	for _, s := range seeds {
 		f.Add(s.tmpl, s.event)
