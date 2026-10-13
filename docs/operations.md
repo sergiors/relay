@@ -66,6 +66,14 @@ Two path roots:
 - **`/run/relay`** — ephemeral process state (never persisted):
   - `relay.lock` — the `flock` held by `relay start`; inert after a crash;
   - `relay.sock` — the live worker control socket (`0600`), removed on shutdown.
+- **`os.TempDir()`** — transient build staging (never persisted): a private
+  `relay-tmp/` root holding one owner-locked `session-*` directory per Relay
+  process, each containing the source/dependency snapshot roots that ARE the
+  Docker build context. Removed on normal exit; a crashed process's session is
+  reclaimed at the next startup only when its advisory lock is free. The root's
+  parent must be sticky (e.g. `/tmp`) or a private directory owned by the current
+  user, otherwise scavenging is disabled and build roots fall back to plain
+  `os.TempDir`.
 
 None of these paths are environment-configurable.
 

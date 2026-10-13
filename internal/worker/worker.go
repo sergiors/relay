@@ -581,6 +581,26 @@ func Run(logger *slog.Logger) error {
 		"networks", len(cfg.Networks),
 	)
 
+	// Reclaim build-temp sessions a previous Relay process abandoned (a crash
+	// mid-preparation leaves its private source/dependency roots behind). This
+	// runs AFTER the preflight opened the manager — so this process's own session
+	// exists and its OS advisory owner lock protects it — and BEFORE any app is
+	// loaded, fingerprinted, or prepared, so no source preparation can begin
+	// before the reclaim. A session is removed only when its owner lock is
+	// acquirable (proving no live process owns it), and the shared coordination
+	// lock makes the scan race-free against another Relay creating a session. It
+	// is best-effort: on a coordination timeout or error we log and continue,
+	// leaving the residue for a later restart. Legacy os.TempDir roots from an
+	// older Relay are never touched (see runtime.Manager.ScavengeBuildRoots).
+	scavengeCtx, scavengeCancel := context.WithTimeout(startupCtx, reconcileTimeout)
+	scavenged, scavengeErr := manager.ScavengeBuildRoots(scavengeCtx)
+	scavengeCancel()
+	if scavengeErr != nil {
+		logStartupCleanupFailure(ctx, logger, "Startup: build temp scavenge failed", scavengeErr)
+	} else if scavenged > 0 {
+		logger.Info("Startup: removed abandoned build temp sessions from a previous relay process", "count", scavenged)
+	}
+
 	// A single shared secrets provider, used by both the webhook (below) and the
 	// runner (later). Construction is infallible (the dir is created lazily on
 	// Set, never Resolve); a missing secret surfaces as a per-invocation Resolve

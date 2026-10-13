@@ -46,6 +46,20 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 - Relay touches only its own namespaces (`relay-app-*` / `relay-dep-*` images,
   `relay.`-labelled containers and keys); ownership is the strict `relay.type`
   label, never a name, with no global pruning.
+- Relay's build-temp roots — the staged source/dependency snapshots that ARE the
+  Docker build context — live in a private, owner-locked session under
+  `os.TempDir()` (`internal/buildtemp`), never in `/apps` or the state volume.
+  The owning process holds an OS advisory lock for the session's lifetime; a
+  crashed process's session is reclaimed at the next startup ONLY when no live
+  process can own it (its advisory lock is free, or — under the coordination
+  lock — its owner lock was never created because the creator crashed), so a
+  live session (this or another Relay) is never swept. The scan is serialized by
+  a coordination lock, probes a candidate without mutating it, fails closed
+  without that lock, and never touches legacy `relay-build-*` roots with no
+  ownership metadata. The root's parent is validated once at open (sticky, or a
+  private directory owned by the current user) so the root cannot be swapped for
+  a symlink by another user; an unsafe or unverifiable temp parent disables
+  scavenging, and the worker falls back to plain `os.TempDir` build roots.
 - Matching includes currently-unavailable apps: the event is still
   `matched`, its invocation stays pending, and it is never DLQ'd for
   unavailability alone. Effective concurrency is

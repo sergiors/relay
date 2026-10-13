@@ -56,6 +56,17 @@ const depBuildRootPattern = "relay-dep-build-*"
 // cache). On any error the private root is removed, so a failed capture leaks
 // nothing.
 func snapshotDependency(fnDir string, deps plan.Deps) (dependencySnapshot, error) {
+	return snapshotDependencyIn("", fnDir, deps)
+}
+
+// snapshotDependencyIn is snapshotDependency with an explicit parent directory
+// for the private root. An empty parent keeps the historical os.TempDir location
+// (os.MkdirTemp("", depBuildRootPattern)); a non-empty parent places the root
+// inside it, so a caller that owns a private, lock-protected temp session (the
+// runtime Manager's build-temp session) can have a crashed process's residue
+// reclaimed by that session's scavenger. All other behavior — canonical
+// name-sorted staging, error cleanup, release — is identical.
+func snapshotDependencyIn(parent, fnDir string, deps plan.Deps) (dependencySnapshot, error) {
 	if len(deps.Files) == 0 {
 		return dependencySnapshot{}, fmt.Errorf("fingerprint deps: no manifest files")
 	}
@@ -63,7 +74,7 @@ func snapshotDependency(fnDir string, deps plan.Deps) (dependencySnapshot, error
 	files := append([]string(nil), deps.Files...)
 	sort.Strings(files)
 
-	root, err := os.MkdirTemp("", depBuildRootPattern)
+	root, err := os.MkdirTemp(parent, depBuildRootPattern)
 	if err != nil {
 		return dependencySnapshot{}, fmt.Errorf("dependency snapshot: create root: %w", err)
 	}

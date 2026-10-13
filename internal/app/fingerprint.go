@@ -353,11 +353,22 @@ type SourceSnapshot struct {
 // build an image from a tree it could not fully capture, because that would bake
 // a partial (and so misidentified) source set.
 func CaptureSourceSnapshot(selection *source.Selection) (*SourceSnapshot, error) {
+	return CaptureSourceSnapshotIn("", selection)
+}
+
+// CaptureSourceSnapshotIn is CaptureSourceSnapshot with an explicit parent
+// directory for the private root. An empty parent keeps the historical
+// os.TempDir location (os.MkdirTemp("", snapshotRootPattern)); a non-empty
+// parent places the root inside it, so a caller that owns a private,
+// lock-protected temp session (the runtime Manager's build-temp session) can
+// have a crashed process's residue reclaimed by that session's scavenger. The
+// capture, fingerprint, and Discard semantics are otherwise identical.
+func CaptureSourceSnapshotIn(parent string, selection *source.Selection) (*SourceSnapshot, error) {
 	entries, err := collectSelectionEntries(selection)
 	if err != nil {
 		return nil, err
 	}
-	root, err := os.MkdirTemp("", snapshotRootPattern)
+	root, err := os.MkdirTemp(parent, snapshotRootPattern)
 	if err != nil {
 		return nil, fmt.Errorf("create source snapshot: %w", err)
 	}

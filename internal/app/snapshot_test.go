@@ -3,6 +3,7 @@ package app
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"relay/internal/source"
@@ -292,6 +293,54 @@ func TestSnapshotExcludesTemplateDirSubtreeAndNonRegular(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(snapshot.Root(), "link.js")); !os.IsNotExist(err) {
 		t.Fatalf("a symlink must not be staged, stat err = %v", err)
+	}
+}
+
+// TestCaptureSourceSnapshotInStagesUnderParent proves an explicit parent places
+// the snapshot's private root inside it (the runtime's build-temp session) and
+// that Discard still removes it, so a crashed process's residue can be reclaimed
+// by the session's scavenger.
+func TestCaptureSourceSnapshotInStagesUnderParent(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "index.js"), "export function h(){}\n")
+
+	parent := t.TempDir()
+	snapshot, err := CaptureSourceSnapshotIn(parent, mustSnapshotSelection(t, dir))
+	if err != nil {
+		t.Fatalf("CaptureSourceSnapshotIn: %v", err)
+	}
+	root := snapshot.Root()
+	if filepath.Dir(root) != parent {
+		t.Fatalf("snapshot root %q is not directly under parent %q", root, parent)
+	}
+	if !strings.HasPrefix(filepath.Base(root), "relay-build-") {
+		t.Fatalf("snapshot root %q does not carry the build prefix", filepath.Base(root))
+	}
+	if _, err := os.Stat(filepath.Join(root, "index.js")); err != nil {
+		t.Fatalf("staged file missing: %v", err)
+	}
+	snapshot.Discard()
+	if _, err := os.Lstat(root); !os.IsNotExist(err) {
+		t.Fatalf("snapshot root not removed by Discard: %v", err)
+	}
+}
+
+// TestCaptureSourceSnapshotLegacyParentUsesTempDir proves an empty parent keeps
+// the historical os.TempDir location, so direct/internal callers that do not own
+// a build-temp session are unchanged.
+func TestCaptureSourceSnapshotLegacyParentUsesTempDir(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("TMPDIR", base)
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "index.js"), "export function h(){}\n")
+
+	snapshot, err := CaptureSourceSnapshot(mustSnapshotSelection(t, dir))
+	if err != nil {
+		t.Fatalf("CaptureSourceSnapshot: %v", err)
+	}
+	defer snapshot.Discard()
+	if got := filepath.Dir(snapshot.Root()); got != base {
+		t.Fatalf("snapshot root parent = %q, want TMPDIR %q", got, base)
 	}
 }
 

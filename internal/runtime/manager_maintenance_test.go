@@ -18,9 +18,12 @@ func noopPing(context.Context, *client.Client) error { return nil }
 
 // newDeferredTestManager builds a real NewManager (no daemon; the ping is
 // injected) with deferred maintenance and a deterministic clock, returning the
-// manager and the fake clock. Cleanup closes the manager.
+// manager and the fake clock. Cleanup closes the manager. TMPDIR is isolated so
+// the Manager's private build-temp session is created under the test's own temp
+// dir, never the host's.
 func newDeferredTestManager(t *testing.T) (*Manager, *fakeClock) {
 	t.Helper()
+	isolatedTmpdir(t)
 	clk := newFakeClock()
 	m, err := NewManager(
 		testutil.DiscardLogger(),
@@ -72,6 +75,7 @@ func TestNewManagerDeferredMaintenanceDoesNotStartLoop(t *testing.T) {
 // every non-worker caller: omitting WithDeferredMaintenance preserves the
 // historical eager start.
 func TestNewManagerDefaultStartsMaintenanceEagerly(t *testing.T) {
+	isolatedTmpdir(t)
 	m, err := NewManager(
 		testutil.DiscardLogger(),
 		nil,

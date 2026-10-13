@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 
 	"relay/internal/app"
+	"relay/internal/buildtemp"
 	"relay/internal/observability/metrics"
 	"relay/internal/runtime/node"
 	"relay/internal/runtime/plan"
@@ -246,6 +247,21 @@ type Manager struct {
 	// used by daemonSourcePath. Nil uses the production default (the worker
 	// hostname is container-ID-like). Set only by tests.
 	containerDetect func() bool
+
+	// buildTempStore is the Manager's handle to Relay's private build-temp root
+	// (internal/buildtemp). It is used to create the session below and to
+	// scavenge abandoned sessions at worker startup. Nil when the root could not
+	// be established, in which case the Manager keeps the historical os.TempDir
+	// build roots (correct, just not crash-reclaimable). Set once at
+	// construction and read-only after.
+	buildTempStore *buildtemp.Store
+	// buildTemp is the Manager's private build-temp session: the source and
+	// dependency snapshot roots a preparation stages into live inside it, and
+	// its OS advisory owner lock makes a crashed process's residue reclaimable by
+	// the next startup. Nil when no session could be established (the same
+	// os.TempDir fallback as buildTempStore). Set once at construction, closed
+	// by CloseContext.
+	buildTemp *buildtemp.Session
 
 	// done is closed by Close to stop the single maintenance loop (the only
 	// eviction driver; there is never a ticker or goroutine per container).
@@ -578,6 +594,27 @@ func NewManager(
 	mgr.maintInterval = maintenanceInterval(resolved.idleTimeout)
 	if !resolved.deferredMaintenance {
 		mgr.startMaintenance(mgr.maintInterval)
+	}
+	// Establish the Manager's private build-temp session: the source and
+	// dependency snapshot roots a preparation stages live inside it, protected by
+	// an OS advisory owner lock, so a crashed process's residue is reclaimable at
+	// the next startup (see ScavengeBuildRoots) instead of leaking under
+	// os.TempDir. It is best-effort: if the shared temp root or its lock cannot
+	// be used, the Manager keeps the historical os.TempDir build roots — correct,
+	// just not crash-reclaimable — and logs why. A build must never fail because
+	// temp coordination is unavailable. The session is created under the
+	// coordination lock, so a concurrent Relay (or a concurrent NewManager in a
+	// test) can neither see nor sweep a half-created session.
+	if store, err := buildtemp.Open(buildtemp.DefaultRoot()); err != nil {
+		mgr.Logger().Warn("Runtime: build temp root unavailable; build roots use the system temp dir", "error", err)
+	} else {
+		mgr.buildTempStore = store
+		session, serr := store.NewSession(lifecycle)
+		if serr != nil {
+			mgr.Logger().Warn("Runtime: build temp session unavailable; build roots use the system temp dir", "error", serr)
+		} else {
+			mgr.buildTemp = session
+		}
 	}
 	return mgr, nil
 }
@@ -932,6 +969,16 @@ func (m *Manager) CloseContext(ctx context.Context) error {
 		releaseTeardown()
 		ops.drainTeardown()
 
+		// Release the build-temp session last: every preparation has been
+		// cancelled and drained above, so no source or dependency snapshot is
+		// still staging into it. A cleanup failure is logged, never fatal (the
+		// next startup's scavenger reclaims a session that could not be removed).
+		if m.buildTemp != nil {
+			if cerr := m.buildTemp.Close(ctx); cerr != nil {
+				m.Logger().Warn("Runtime: build temp session cleanup failed", "error", cerr)
+			}
+		}
+
 		if m.cli == nil {
 			// A Manager constructed directly by a test (no Docker) still owns a
 			// cache and maintenance loop, so Close must be safe without a client.
@@ -944,6 +991,35 @@ func (m *Manager) CloseContext(ctx context.Context) error {
 		}
 	})
 	return m.closeErr
+}
+
+// ScavengeBuildRoots removes build-temp sessions abandoned by a crashed Relay
+// process, returning how many were reclaimed. It is the startup reclaim the
+// worker runs once, after the Manager (and so this process's own locked session)
+// exists and before any app source is prepared, so no in-flight preparation can
+// be swept.
+//
+// A session is removed only when its OS advisory owner lock can be acquired,
+// which proves no live process owns it; this process's own session, and any
+// session another live Relay process holds, is left untouched. The scan is
+// serialized by the shared coordination lock, so it can never race a session
+// being created. It never uses age or name as a criterion, and it fails closed:
+// without the coordination lock (or on any filesystem error) it removes nothing
+// and returns the error for the caller to log.
+//
+// Legacy roots created directly under os.TempDir by an older Relay (a bare
+// `relay-build-*` / `relay-dep-build-*` directory with no session and no
+// ownership metadata) are deliberately never touched: under a shared temp dir
+// one could still belong to a running older Relay, and there is no lock to prove
+// otherwise.
+//
+// It returns (0, nil) when no build-temp root was established for this Manager
+// (the os.TempDir fallback), so a caller need not special-case that.
+func (m *Manager) ScavengeBuildRoots(ctx context.Context) (int, error) {
+	if m == nil || m.buildTempStore == nil {
+		return 0, nil
+	}
+	return m.buildTempStore.Scavenge(ctx)
 }
 
 // startContainer builds one fresh execution container for an app version.
@@ -1192,6 +1268,17 @@ func (m *Manager) PrepareWithFingerprintAndSelection(
 	return m.prepare(ctx, fn, fingerprint, selection)
 }
 
+// buildTempParent returns the directory a preparation's private source and
+// dependency snapshot roots are created under: the Manager's build-temp session
+// when one was established, or "" (the historical os.TempDir location) when it
+// was not. It is read-only after construction, so it needs no lock.
+func (m *Manager) buildTempParent() string {
+	if m.buildTemp == nil {
+		return ""
+	}
+	return m.buildTemp.Dir()
+}
+
 // prepare is the shared implementation behind Prepare,
 // PrepareWithFingerprint, and PrepareWithFingerprintAndSelection. fingerprint is
 // the caller-supplied content fingerprint, or "" to compute one here.
@@ -1301,7 +1388,7 @@ func (m *Manager) prepare(
 	// success, error, and cancellation. A read failure is fatal to the prepare —
 	// there is deliberately no fallback that would stage live files under an
 	// identity that was never verified against them.
-	sourceSnapshot, err := app.CaptureSourceSnapshot(selection)
+	sourceSnapshot, err := app.CaptureSourceSnapshotIn(m.buildTempParent(), selection)
 	if err != nil {
 		return nil, fmt.Errorf("app %q: snapshot source: %w", fn.Name, err)
 	}
@@ -1419,7 +1506,7 @@ func (m *Manager) prepare(
 	// removes it; release is nil-safe on the zero snapshot.
 	defer depSnap.release()
 	if !planResult.Deps.IsZero() {
-		depSnap, err = snapshotDependency(fn.Dir, planResult.Deps)
+		depSnap, err = snapshotDependencyIn(m.buildTempParent(), fn.Dir, planResult.Deps)
 		if err != nil {
 			return nil, fmt.Errorf("app %q: %w", fn.Name, fmt.Errorf("dependency fingerprint: %w", err))
 		}
