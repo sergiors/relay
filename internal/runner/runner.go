@@ -30,21 +30,32 @@ import (
 const DefaultMaxConcurrentInvocations = 8
 
 // slotWaitTimeout bounds how long Handle waits for a free concurrency slot
-// (global or per-app) before giving up. It is deliberately well below the
-// stream layer's default MinPendingIdle reclaim threshold (1m): if slots never
-// free within the wait, Handle returns ErrInvocationNotEligible and the message
-// stays pending, so reclaim replays it later — and locally buffered events never
-// sit long enough to defeat the reclaim pacing (see the README's
-// "Concurrency and backpressure" note).
+// (global or per-app) before giving up. The two slots are acquired sequentially,
+// each with its own wait (see reserveSlots), so a single delivery can wait up to
+// roughly 2*slotWaitTimeout, and warm admission (warmAdmitWait) can add more —
+// which may exceed the stream layer's default MinPendingIdle reclaim threshold
+// (1m). That overlap is safe: every wait here happens BEFORE TryStart, so a
+// timed-out delivery claims no handler attempt, records no retry, ACKs nothing,
+// and leaves the message pending in the PEL. A reclaim that overlaps a
+// still-waiting local delivery therefore cannot cause a concurrent execution,
+// because TryStart is the only admission point and invocation state rejects a
+// second concurrent run. On timeout Handle returns ErrInvocationNotEligible and
+// the message stays pending, so reclaim replays it later. The wait absorbs brief
+// contention without churn; it is not a latency guarantee.
 const slotWaitTimeout = 30 * time.Second
 
 // warmAdmitWait bounds how long Handle/InvokeHandler wait for a slot in the
 // worker-global warm-container budget (MAX_WARM_CONTAINERS) before leaving the
-// work pending. It is deliberately much shorter than slotWaitTimeout so the
-// COMBINED wait (concurrency slot + warm budget) stays well below the stream
-// layer's MinPendingIdle reclaim threshold (1m): 30s + 5s = 35s. A saturated
-// budget is relieved as containers free, and the wait avoids reclaim churn on a
-// brief overlap without ever charging a handler attempt.
+// work pending. It is added AFTER the concurrency-slot wait, so the total wait
+// for one delivery can approach 60s (two sequential slot waits) plus this warm
+// wait — it is NOT a bound below the stream layer's MinPendingIdle reclaim
+// threshold (1m). That is safe because every wait happens BEFORE the handler
+// attempt is claimed (TryStart): a delivery that exhausts the wait claims no
+// attempt, records no retry, and stays pending in the PEL, so a reclaim
+// overlapping a still-waiting local delivery cannot execute the same invocation
+// concurrently — invocation state admits exactly one claim. A saturated budget
+// is relieved as containers free, and the wait avoids reclaim churn on a brief
+// overlap without ever charging a handler attempt.
 const warmAdmitWait = 5 * time.Second
 
 // Manual-invocation sentinel errors. They let the worker socket map a manual
@@ -955,8 +966,10 @@ func lifecycleCancelled(ctx context.Context) bool {
 // container was leased) or by the owning container on discard when it is; a
 // caller that admits and then does not execute must release it, which the
 // consume-aware WarmPermit.Release makes safe. The wait is bounded by
-// warmAdmitWait (not r.slotWait) so the combined concurrency-plus-warm wait
-// stays below the stream reclaim threshold; tests may shorten it via r.warmWait.
+// warmAdmitWait (not r.slotWait); it is added AFTER the concurrency-slot wait, so
+// the total wait may exceed the stream reclaim threshold, which is safe because
+// it happens before the claim (see slotWaitTimeout). Tests may shorten it via
+// r.warmWait.
 func (r *Runner) admitWarm(ctx context.Context) (context.Context, bool) {
 	adm := r.warmAdmitterResolver()
 	if adm == nil {
@@ -2014,12 +2027,19 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				var claim stream.InvocationClaim
 				// Reserve the worker-global and per-app concurrency slots
 				// BEFORE TryStart, so a blocked invocation is never counted as an
-				// attempt and does not persist state. If no slot frees within
-				// slotWait (well below MinPendingIdle, so a locally buffered event
-				// never defeats reclaim), the invocation is treated as not
-				// eligible: it stays pending and is replayed by a later reclaim,
-				// with no retry accounting and no DLQ. The slots are released via
-				// defer as soon as THIS invocation finishes.
+				// attempt and does not persist state. reserveSlots acquires the
+				// two semaphores sequentially, each with its own up-to-slotWait
+				// wait, and warm admission can then add warmAdmitWait, so the
+				// total wait may approach 60s + the warm wait — enough to overlap
+				// MinPendingIdle and let a reclaim redeliver this still-waiting
+				// message. That overlap is safe: TryStart is the only admission
+				// point and runs AFTER capacity is reserved, and invocation state
+				// prevents a concurrent second execution, so a reclaim cannot run
+				// the invocation while this delivery still waits. On a timeout
+				// this path claims nothing (pre-claim): it records no retry, ACKs
+				// nothing, and leaves the message pending in the PEL for reclaim.
+				// The slots are released via defer as soon as THIS invocation
+				// finishes.
 				releaseSlots, waited := r.reserveSlots(ctx, pf.fn.Name, pf.fn.Template.Concurrency)
 				if releaseSlots == nil {
 					// No slot freed in time: skip this invocation without marking

@@ -27,6 +27,7 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/config"
+	"relay/internal/observability/metrics"
 	"relay/internal/stream"
 	"relay/internal/testutil"
 )
@@ -50,6 +51,15 @@ type eventEnv struct {
 // the handler via start.
 func newEventEnv(t *testing.T) *eventEnv {
 	t.Helper()
+	return newEventEnvWith(t, 0, nil)
+}
+
+// newEventEnvWith is newEventEnv with an explicit local buffer capacity
+// (ConsumerConfig.MaxBufferedEvents; 0 applies the stream default of 16) and an
+// optional metrics registry so a test can observe the live buffered_events
+// gauge. It is a test-only setup seam; the production consumer is unchanged.
+func newEventEnvWith(t *testing.T, maxBufferedEvents int, m *metrics.Registry) *eventEnv {
+	t.Helper()
 	addr := testutil.EnvOr("REDIS_TEST_ADDR", "localhost:6379")
 	redisOpts, err := config.RedisOptions(addr)
 	if err != nil {
@@ -61,14 +71,16 @@ func newEventEnv(t *testing.T) *eventEnv {
 	streamName := prefix + "-stream"
 	groupName := prefix + "-group"
 	c := stream.NewConsumer(stream.ConsumerConfig{
-		Client:          cli,
-		Stream:          streamName,
-		Group:           groupName,
-		Consumer:        prefix + "-consumer",
-		Log:             testutil.DiscardLogger(),
-		MinPendingIdle:  300 * time.Millisecond,
-		ReclaimInterval: 200 * time.Millisecond,
-		Block:           300 * time.Millisecond,
+		Client:            cli,
+		Stream:            streamName,
+		Group:             groupName,
+		Consumer:          prefix + "-consumer",
+		Log:               testutil.DiscardLogger(),
+		MinPendingIdle:    300 * time.Millisecond,
+		ReclaimInterval:   200 * time.Millisecond,
+		Block:             300 * time.Millisecond,
+		MaxBufferedEvents: maxBufferedEvents,
+		Metrics:           m,
 	})
 	if err := c.EnsureGroup(cctx); err != nil {
 		cancel()

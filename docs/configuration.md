@@ -28,7 +28,7 @@ automatically.
 | `MAX_CONCURRENT_INVOCATIONS`  | `8`                | positive integer                                                        | Fails startup. Bounds concurrent invocations **per worker**.                                                                                                                                                                |
 | `MAX_CONCURRENT_BUILDS`       | `2`                | positive integer                                                        | Fails startup. Bounds concurrent runtime-backed image-preparation pipelines **per worker**.                                                                                                                                  |
 | `MAX_WARM_CONTAINERS`         | `8`                | positive integer                                                        | Fails startup. Hard per-worker bound on warm **execution** containers across all apps (idle + busy); when saturated every idle container is LRU-evicted, and if all are busy the invocation stays pending. See below.        |
-| `MAX_BUFFERED_EVENTS`         | `16`               | positive integer                                                        | Fails startup. Bounds messages read from Redis and held locally per worker.                                                                                                                                                 |
+| `MAX_BUFFERED_EVENTS`         | `16`               | positive integer                                                        | Fails startup. Per-worker bound on messages read from Redis and held locally, including deliveries waiting on execution capacity. It is **not** a bound on the Redis consumer-group PEL. See below.                          |
 | `MAX_EVENT_BYTES`             | `256KiB`           | human-readable binary size (`256B`, `256KiB`, `1MiB`; bare integer bytes accepted) | Fails startup on zero/negative/malformed/decimal-unit/above-1MiB. Byte length of a message's raw `event` value; over-limit messages are non-retryably dead-lettered with a bounded summary.                                |
 | `WARM_CONTAINER_IDLE_TIMEOUT` | `5m`               | positive Go duration (`90s`, `10m`, `1h30m`)                            | Fails startup.                                                                                                                                                                                                              |
 | `HOT_RELOAD`                  | `false`            | boolean (`1`, `t`, `true`, `0`, `f`, `false`; trimmed)                  | Fails startup on an unparseable value. `false` bakes the source into the immutable runtime image; `true` source-mounts the live app directory from `/apps` read-only into containers for runtimes with a mountable dependency layout (Python and Node), so a source-only edit reuses the app and dependency images, managed services restart in place, and pooled execution containers are recycled. See below. |
@@ -58,11 +58,28 @@ configuration: changing it requires a worker restart.
 
 ### Concurrency and backpressure
 
-`MAX_CONCURRENT_INVOCATIONS` and `MAX_BUFFERED_EVENTS` are **per worker**. With
-`N` replicas the effective global totals multiply.
-`MAX_CONCURRENT_INVOCATIONS` is startup configuration (restart to change); a
-template's per-app `concurrency` is clipped to it live and is documented in
-[apps.md](apps.md).
+Three distinct quantities bound work, and they are not the same bound. Two are
+**per worker** and multiply across `N` replicas:
+
+- **Execution concurrency** — `MAX_CONCURRENT_INVOCATIONS` (default `8`) bounds
+  concurrently *executing* invocations in one worker. It is startup configuration
+  (restart to change); a template's per-app `concurrency` is clipped to it live
+  and is documented in [apps.md](apps.md).
+- **Local processing slots** — `MAX_BUFFERED_EVENTS` (default `16`) bounds the
+  messages a worker holds locally after reading them from Redis and before they
+  finish, **including** deliveries that are waiting on execution capacity. It
+  bounds local memory, not the Redis stream.
+
+The third is **group-wide**, not a Relay buffer:
+
+- **Redis PEL** (pending entries list) — the consumer-group-wide set of
+  delivered-but-unacknowledged messages, shared by every worker in the group and
+  **not** bounded by `MAX_BUFFERED_EVENTS`; its size is the sum of all workers'
+  outstanding deliveries. A PEL entry references the original stream entry
+  (owning consumer, idle time, delivery count) and carries **no independent copy
+  of the event payload**. It is distinct from **group lag**, the count of stream
+  entries not yet delivered to the group: lag shrinks when a message is
+  delivered, while the PEL grows until that delivery is acknowledged.
 
 `MAX_CONCURRENT_BUILDS` (default `2`) is also **per worker** and bounds how many
 runtime-backed image-preparation pipelines run at once: one pipeline — source
@@ -92,18 +109,33 @@ the message pending either way). This is a statement about persisted invocation
 state, not telemetry: a post-claim execution that reports an error during
 shutdown is still counted as a handler failure.
 
-Backpressure is local and two-stage. The bounded buffer is independent of the
-execution concurrency: when every execution slot is busy but buffer space
-remains, the consumer may still read the next batch, so those messages are
-delivered into Redis's **PEL** rather than staying unread. That is not a loss —
-they remain recoverable and are replayed once a slot frees — but the pending set
-can grow up to the buffer bound while execution is saturated. Relay applies no
-per-app fairness policy: the global concurrency bound is shared by whichever
-invocation acquires a slot (no reservation, aging, or weighted scheduling), so a
-continuously busy app can delay another app's backlog without a latency
-guarantee. Reclaimed pending work is processed on a single reclaim goroutine, so
-one slow reclaimed handler delays the rest of that batch — bounded by the
-handler timeout — while fresh reads continue on the consume loop.
+Backpressure is local and two-stage. The bounded local buffer is independent of
+execution concurrency: every message an `XREADGROUP` returns is added to the
+Redis **PEL** before it executes, so it is delivered — not merely unread — the
+moment it is read. When execution capacity is saturated but local buffer space
+remains, the consumer may still read the next batch. A delivery that cannot
+claim an execution slot within its wait is left **pending**: no execution
+attempt, no retry accounting, no ACK, no DLQ. It releases its local processing
+slot, so the next read can proceed. Under repeated saturation those released
+slots let the consumer keep reading, so the **cumulative group PEL can grow past
+the local buffer bound**; the local bound caps only what one worker holds at
+once, never the group's outstanding deliveries.
+
+That is not a loss: a pending message stays recoverable and is replayed by a
+later reclaim. The operational consequences are the ones to size for — a larger
+PEL means more Redis metadata and more reclaim work, a rising per-entry delivery
+count, and extra latency, while a saturated or slow worker can hold a temporary
+ownership imbalance of the group's backlog until it catches up. Recovery is the
+reclaim loop, which re-delivers only entries idle longer than the configured
+threshold: there is no immediate hand-off and no latency guarantee.
+At-least-once delivery, no event loss, and the independence of retention from
+ACK are unchanged — a slot-timeout delivery is never counted as a handler
+attempt. Relay applies no per-app fairness policy: the global concurrency bound
+is shared by whichever invocation acquires a slot (no reservation, aging, or
+weighted scheduling), so a continuously busy app can delay another app's backlog
+without a latency guarantee. Reclaimed pending work is processed on a single
+reclaim goroutine, so one slow reclaimed handler delays the rest of that batch —
+bounded by the handler timeout — while fresh reads continue on the consume loop.
 
 ### Warm-container bound
 
