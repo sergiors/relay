@@ -1,8 +1,11 @@
 package cron
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -94,6 +97,45 @@ func TestFireSuccessPathSingleAttempt(t *testing.T) {
 	}
 	if got := m.Counter(metrics.MetricSchedulePublishRetries); got != 0 {
 		t.Fatalf("retries counter = %d, want 0", got)
+	}
+}
+
+// TestFireDropsTickWithoutOccurrence pins the no-occurrence branch of the live
+// callback: a valid schedule whose most recent occurrence is older than the
+// bounded recovery horizon is dropped synchronously rather than stamped with a
+// fabricated instant. The scheduler is genuinely running (a usable outbox is
+// installed, so the storage gate is open) and the callback is invoked directly,
+// so the branch is exercised without gocron's asynchronous dispatch. Nothing is
+// published, no outbox intent is written, and no in-memory intent is retained,
+// so a stale tick can never fabricate or duplicate an occurrence.
+func TestFireDropsTickWithoutOccurrence(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	fp := newFakePublisher(1)
+	ob := newFakeOutbox()
+	s := New(fp, logger)
+	s.SetOutbox(ob) // a usable outbox opens the publication gate
+	defer func() { _ = s.Stop(context.Background()) }()
+
+	// A yearly 1 January schedule observed in July: its last occurrence (1 Jan)
+	// is far beyond the 24h horizon, but the schedule itself is valid.
+	parsed := mustParse(t, "0 0 1 1 *", time.UTC)
+	s.now = func() time.Time { return time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC) }
+
+	// Direct, synchronous call: it returns before any publish or retry.
+	s.fire(context.Background(), "fn", "jobs.a", "jobs.a", parsed)
+
+	if got := fp.callCount(); got != 0 {
+		t.Fatalf("publish attempts = %d, want 0 (no fabricated occurrence)", got)
+	}
+	if saved := ob.gotSaved(); len(saved) != 0 {
+		t.Fatalf("outbox intents = %v, want none (dropped before persistence)", saved)
+	}
+	if held := s.unsaved.len(); held != 0 {
+		t.Fatalf("held intents = %d, want 0", held)
+	}
+	if !strings.Contains(logBuf.String(), "no occurrence within the recovery horizon") {
+		t.Fatalf("expected the bounded-drop warning, got:\n%s", logBuf.String())
 	}
 }
 

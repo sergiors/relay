@@ -438,6 +438,44 @@ func TestParseInertTemplateRejected(t *testing.T) {
 	}
 }
 
+// A schedules-only template is still inert: the structural check requires at
+// least one event rule or one service, and schedules do not satisfy it (a
+// schedule alone has nothing to execute it). The schedule declaration itself is
+// schema-valid — it parses alongside one valid event rule — so the rejection is
+// the intended structural error, not a malformed-schedule error.
+func TestParseSchedulesOnlyTemplateRejected(t *testing.T) {
+	const schedule = `
+schedules:
+  - name: cleanup
+    handler: jobs.cleanup.handler
+    cron: "0 3 * * *"
+`
+	_, err := ParseTemplate([]byte("runtime: node24\n" + schedule))
+	if err == nil {
+		t.Fatal("expected a schedules-only template to be rejected")
+	}
+	if !strings.Contains(err.Error(), "template must contain at least one event rule or one service") {
+		t.Fatalf("err = %v, want the structural-check error", err)
+	}
+
+	// The same schedule is schema-valid: it parses alongside one valid event
+	// rule, proving the rejection above is structural, not a bad schedule.
+	tmpl, err := ParseTemplate([]byte(`
+runtime: node24
+events:
+  - handler: index.main
+    pattern:
+      status: [COMPLETED]
+` + schedule))
+	if err != nil {
+		t.Fatalf("a valid schedule alongside an event must parse: %v", err)
+	}
+	if len(tmpl.Schedules) != 1 || tmpl.Schedules[0].Name != "cleanup" ||
+		tmpl.Schedules[0].Handler != "jobs.cleanup.handler" {
+		t.Fatalf("schedules = %+v, want the cleanup schedule retained", tmpl.Schedules)
+	}
+}
+
 // The shipped users-api-node example parses with its declared values — the
 // example is services-only, so this also pins the services-only contract.
 func TestExampleUsersAPITemplateParses(t *testing.T) {
