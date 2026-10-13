@@ -35,19 +35,19 @@ func (f *invalidatingExecutor) gotInvalidated() []string {
 // capability before attempting removal.
 func TestRetireImageCallsInvalidator(t *testing.T) {
 	exec := &invalidatingExecutor{}
-	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:old", exec)}, testutil.DiscardLogger(), nil)
+	r := newRetirementRunner(t, exec, testutil.DiscardLogger())
 	// Reduce the removal retry backoff so the async removal attempt (which
-	// sleeps bounded delays when a container references the image) does not
+	// retries bounded delays when a container references the image) does not
 	// leak a far-future timer into the test.
 	r.imageCleanupRetryDelays = []time.Duration{time.Millisecond}
 
-	r.RetireImage("relay-app-a:old")
+	r.RetireImage(retiredImage)
 	waitFor(t, func() bool {
 		got := exec.gotInvalidated()
-		return len(got) == 1 && got[0] == "relay-app-a:old"
+		return len(got) == 1 && got[0] == retiredImage
 	})
-	if got := exec.gotInvalidated(); len(got) != 1 || got[0] != "relay-app-a:old" {
-		t.Fatalf("invalidated = %v, want exactly [relay-app-a:old]", got)
+	if got := exec.gotInvalidated(); len(got) != 1 || got[0] != retiredImage {
+		t.Fatalf("invalidated = %v, want exactly [%s]", got, retiredImage)
 	}
 }
 
@@ -56,11 +56,11 @@ func TestRetireImageCallsInvalidator(t *testing.T) {
 // no-invalidator path (the capability is optional).
 func TestRetireImageWithoutInvalidatorCapabilityStillWorks(t *testing.T) {
 	exec := &blockingExecutor{}
-	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:old", exec)}, testutil.DiscardLogger(), nil)
+	r := newRetirementRunner(t, exec, testutil.DiscardLogger())
 	if _, ok := any(r.invalidatorResolver()).(ContainerInvalidator); ok {
 		t.Fatal("blockingExecutor must not satisfy ContainerInvalidator")
 	}
 	// Must not panic; the image is still removed through the cleaner path.
-	r.RetireImage("relay-app-a:old")
+	r.RetireImage(retiredImage)
 	waitFor(t, func() bool { return len(exec.removedImages()) == 1 })
 }

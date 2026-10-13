@@ -13,12 +13,13 @@ import (
 
 // CleanupUnusedDependencies removes managed dependency images that no managed
 // app image references anymore. It is the lifecycle-driven tail of Relay's
-// dependency-image ownership: every successfully retired app image is
-// re-run here so a dependency layer whose last referencing app version has
-// been removed is pruned. It runs once at worker startup (after the boot sweep
-// removed superseded app images) and once after every successful
-// app-image removal in the runner — never periodically, never on a ticker,
-// and never forced.
+// dependency-image ownership. It runs at three natural lifecycle points, and
+// only those: once at worker startup (after the boot sweep removed superseded
+// app images), once after every successful app-image removal in the runner, and
+// once after a FAILED app image build in Prepare (after that preparation
+// releases its dependency lease, so a layer the failed preparation uniquely
+// consumed does not linger unreferenced). It is never periodic, never on a
+// ticker, and never forced.
 //
 // Ownership is derived purely from the managed-image labels (see labels.go):
 //   - a managed APP image is an image whose relay.type == ImageTypeApp;

@@ -4,8 +4,12 @@ package runtime
 
 import (
 	"context"
+	"io"
+	"net"
+	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -284,5 +288,148 @@ events:
 	}
 	if !imageExistsInDaemon(cli, ctx, "relay-dep-evil:1") {
 		t.Error("an unmanaged relay-dep-* image must survive GC even after a real dependency is pruned")
+	}
+}
+
+// faultingBuildTransport forwards every Docker API call to the real daemon and
+// fails ONLY the app image build (POST /build with t=<appImage>) with a synthetic
+// build-stream error. A valid app template cannot be made to fail its app image
+// build on a real daemon, so this seam is what lets an integration test exercise
+// the "dependency image built, app image build failed" path end to end. It
+// records whether the dependency build and the app build were seen, so the test
+// can prove the dependency layer really was built (and consumed) before the
+// failure.
+type faultingBuildTransport struct {
+	base     http.RoundTripper
+	appImage string
+
+	mu           sync.Mutex
+	depBuildSeen bool
+	appBuildSeen bool
+}
+
+func (f *faultingBuildTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == http.MethodPost && strings.Contains(req.URL.Path, "/build") {
+		if req.URL.Query().Get("t") == f.appImage {
+			f.mu.Lock()
+			f.appBuildSeen = true
+			f.mu.Unlock()
+			// Drain the streamed build context exactly as a real transport does,
+			// so the caller's producer cannot be left blocked.
+			if req.Body != nil {
+				_, _ = io.Copy(io.Discard, req.Body)
+			}
+			body := `{"errorDetail":{"message":"injected app image build failure"}}` + "\n"
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Request:    req,
+			}, nil
+		}
+		f.mu.Lock()
+		f.depBuildSeen = true
+		f.mu.Unlock()
+	}
+	return f.base.RoundTrip(req)
+}
+
+func (f *faultingBuildTransport) sawDepBuild() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.depBuildSeen
+}
+
+func (f *faultingBuildTransport) sawAppBuild() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.appBuildSeen
+}
+
+// faultBuildClient returns a Docker client that reaches the real daemon through
+// the env-configured dialer but fails the given app image build. The transport
+// ignores the request host (the dialer already targets the daemon), which is why
+// no WithHost option is applied.
+func faultBuildClient(t *testing.T, appImage string) (*client.Client, *faultingBuildTransport) {
+	t.Helper()
+	envCli, err := client.New(client.FromEnv)
+	if err != nil {
+		t.Fatalf("docker client: %v", err)
+	}
+	t.Cleanup(func() { _ = envCli.Close() })
+	dial := envCli.Dialer()
+	base := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) { return dial(ctx) },
+	}
+	t.Cleanup(base.CloseIdleConnections)
+	proxy := &faultingBuildTransport{base: base, appImage: appImage}
+	cli, err := client.New(client.WithHTTPClient(&http.Client{Transport: proxy}))
+	if err != nil {
+		t.Fatalf("fault docker client: %v", err)
+	}
+	t.Cleanup(func() { _ = cli.Close() })
+	return cli, proxy
+}
+
+// TestIntegrationAppBuildFailurePrunesBuiltDependency is the end-to-end proof of
+// the fixed leak: a unique dependency layer is built for real, then the app image
+// build fails. Prepare must surface the build error and, because it released the
+// dependency lease FIRST and then ran dependency GC, the freshly built layer must
+// be gone — no unreferenced relay-dep-* tag is left behind.
+func TestIntegrationAppBuildFailurePrunesBuiltDependency(t *testing.T) {
+	cli := testutil.RequireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	depBefore := depTagSet(ctx, cli)
+	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-dep-fail-build:"))
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: python3.14
+events:
+  - handler: handler.run
+    pattern:
+      status: [COMPLETED]
+`)
+	writeFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
+	// A per-run manifest marker makes the dependency layer unique to this run, so
+	// asserting its removal never races a sibling test or worker that shares the
+	// canonical six==1.16.0 layer.
+	marker := "# app-build-fail " + strconv.FormatInt(time.Now().UnixNano(), 10) + "\n"
+	writeFile(t, dir, "requirements.txt", marker+"six==1.16.0\n")
+	fn := app.App{Name: "dep-fail-build", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
+
+	fp, err := app.Fingerprint(dir)
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+	appImage := ImageRef(fn.Name, fp)
+	depRef := expectedDependencyRef(t, fn)
+	if imageExistsInDaemon(cli, ctx, depRef) {
+		t.Fatalf("the per-run dependency layer %s must not pre-exist", depRef)
+	}
+
+	faultCli, proxy := faultBuildClient(t, appImage)
+	m := newLifecycleManager(t, faultCli, context.Background())
+
+	if _, err := m.Prepare(ctx, fn); err == nil {
+		t.Fatal("Prepare must fail on the injected app image build failure")
+	}
+	if !proxy.sawDepBuild() {
+		t.Fatal("the dependency image build must have run before the app image build failed")
+	}
+	if !proxy.sawAppBuild() {
+		t.Fatal("the app image build must have been attempted")
+	}
+	if imageExistsInDaemon(cli, ctx, appImage) {
+		t.Errorf("the failed app image %s must not exist", appImage)
+	}
+	// The new behavior: the failure path released the dependency lease before
+	// running GC, so the layer this failed preparation uniquely consumed is
+	// pruned instead of lingering as an unreferenced relay-dep-* tag.
+	if imageExistsInDaemon(cli, ctx, depRef) {
+		t.Errorf("the orphaned dependency layer %s must be pruned by the app build failure path", depRef)
 	}
 }

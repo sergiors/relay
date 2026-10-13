@@ -1113,6 +1113,13 @@ func Run(logger *slog.Logger) error {
 			Root:   app.Dir,
 			State:  st,
 			Retire: func(_ string, oldImage string) { runWorker.RetireImage(oldImage) },
+			// The periodic audit re-drives deferred image cleanup: an image
+			// whose bounded removal retries were exhausted while a service
+			// container still referenced it (or whose removal failed) is retried
+			// here once the reference state may have changed, so it is not left
+			// behind when the initial retry window elapsed. Coalesced and
+			// idempotent, and a no-op when nothing is deferred.
+			Audit: func() { runWorker.RetryDeferredImageRemovals() },
 			RemoveApp: func(name string) {
 				metricsInstance.RemoveApp(name)
 				// Drop the app's reset baseline too, so a re-added app
@@ -1170,7 +1177,18 @@ func Run(logger *slog.Logger) error {
 					tmpl,
 					image,
 					onReconcileStart,
-					onComplete,
+					// A service convergence completing is exactly the lifecycle
+					// moment an old image's last service container may have been
+					// replaced, so it is the precise re-drive point for a
+					// deferred image retirement. It runs after the caller's own
+					// completion bookkeeping and only admits async cleanup, so it
+					// never blocks or changes the completion outcome.
+					func(err error) {
+						if onComplete != nil {
+							onComplete(err)
+						}
+						runWorker.RetryDeferredImageRemovals()
+					},
 				)
 			},
 			UpdateServicesObservationWithStatus: func(
@@ -1188,7 +1206,16 @@ func Run(logger *slog.Logger) error {
 					tmpl,
 					image,
 					onReconcileStart,
-					onComplete,
+					// See UpdateServicesWithStatus: a converged service pass is
+					// the re-drive point for a deferred image retirement. The
+					// periodic audit path converges services too, so a deferred
+					// image is retried on that cadence as well.
+					func(err error) {
+						if onComplete != nil {
+							onComplete(err)
+						}
+						runWorker.RetryDeferredImageRemovals()
+					},
 				)
 			},
 			// On removal, stop the app's service containers BEFORE the images

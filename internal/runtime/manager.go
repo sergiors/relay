@@ -1741,6 +1741,30 @@ func (m *Manager) prepare(
 			"duration", elapsed,
 			"result", "failed",
 		)
+		// The app image build failed AFTER this preparation admitted (and
+		// possibly built) its dependency layer. Release the preparation's
+		// dependency lease FIRST, then run the lifecycle-driven dependency GC:
+		// while the lease is held the layer is deliberately unremovable, so
+		// releasing first is what lets the GC observe a layer THIS failed
+		// preparation uniquely consumed as unreferenced and prune it. Another
+		// concurrent preparation holding its OWN lease on the same
+		// content-addressed layer still keeps it (the GC's lease gate defers),
+		// and any app image that still inherits the layer keeps it too (the
+		// referenced set). The call is best-effort: a cleanup error must NEVER
+		// replace the build error the caller needs to classify and report, and
+		// a layer skipped here is retried at the next natural lifecycle point.
+		// Only a preparation that actually consumed a dependency layer runs it:
+		// a dependency-less app has nothing this failure could orphan.
+		releaseDep()
+		if depRef != "" {
+			if _, cerr := m.CleanupUnusedDependencies(ctx); cerr != nil {
+				m.log.Debug("App: dependency image cleanup after failed build left layers for a later pass",
+					"app", fn.Name,
+					"dep_image", depRef,
+					"error", cerr,
+				)
+			}
+		}
 		return nil, err
 	}
 	buildSpan.End()

@@ -109,6 +109,15 @@ type Config struct {
 	// (and its registry entry and state are dropped) so the runner can retire
 	// every version of that app's images. Nil-safe.
 	RemoveApp func(name string)
+	// Audit, when set, is called once per periodic audit pass (the ticker's
+	// missed-event backstop; see ticker), before that pass reconciles the apps.
+	// It is the lifecycle re-drive hook for DEFERRED image cleanup: the runner
+	// retains retirement ownership for an image whose bounded removal retries
+	// were exhausted (e.g. a service container still referenced it) or whose
+	// removal failed, and a periodic pass re-drives removal once the reference
+	// state may have changed. It runs on the ticker goroutine and must not block
+	// (the runner's re-drive only admits asynchronous cleanup). Nil-safe.
+	Audit func()
 	// UpdateSchedules, when set, is called after an app's new version is
 	// prepared and swapped into the registry (both discovery and update paths;
 	// never on the skip path), so the scheduler can converge its cron jobs to
@@ -166,6 +175,7 @@ type Reconciler struct {
 	// hooks (see Config).
 	retire                              func(name, oldImage string)
 	removeApp                           func(name string)
+	audit                               func()
 	updateSchedules                     func(name string, tmpl *app.Template)
 	updateServices                      func(name string, tmpl *app.Template, image string)
 	updateServicesWithStatus            func(name string, tmpl *app.Template, image string, onReconcileStart func(), onComplete func(error))
@@ -221,6 +231,7 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 		fingerprint:                         fingerprint,
 		retire:                              cfg.Retire,
 		removeApp:                           cfg.RemoveApp,
+		audit:                               cfg.Audit,
 		updateSchedules:                     cfg.UpdateSchedules,
 		updateServices:                      cfg.UpdateServices,
 		updateServicesWithStatus:            cfg.UpdateServicesWithStatus,
@@ -389,6 +400,11 @@ func (r *Reconciler) pump() {
 // correctness, so it is deliberately retained. An unchanged audit finds the
 // same fingerprint and skips (no build), so the cost is the single read the
 // backstop exists to perform.
+//
+// Each pass first fires the Config.Audit hook (when set): it is the re-drive
+// point for deferred image cleanup, so an image whose bounded removal retries
+// were exhausted while a service container still referenced it is removed once
+// the reference state changes, without a timer or goroutine per image.
 func (r *Reconciler) ticker() {
 	defer r.loops.Done()
 	ticker := time.NewTicker(r.interval)
@@ -398,6 +414,9 @@ func (r *Reconciler) ticker() {
 		case <-r.ctx.Done():
 			return
 		case <-ticker.C:
+			if r.audit != nil {
+				r.audit()
+			}
 			r.reconcileAll()
 		}
 	}

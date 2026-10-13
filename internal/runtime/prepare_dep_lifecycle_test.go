@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -150,12 +152,13 @@ func TestPrepareDependencyLeaseReleasedOnDependencyBuildFailure(t *testing.T) {
 	lease.Release()
 }
 
-// TestPrepareDependencyLeaseReleasedOnAppBuildFailure pins the sibling
-// failure half: the dependency build succeeds, then the app image build
-// (which consumes the layer via FROM) fails. The dependency lease held across
-// that build must still be released, leaving the now-orphaned dependency
-// collectible — the very next GC pass removes it.
-func TestPrepareDependencyLeaseReleasedOnAppBuildFailure(t *testing.T) {
+// TestPrepareAppBuildFailurePrunesOrphanedDependency pins the failure half: the
+// dependency build succeeds, then the app image build (which consumes the layer
+// via FROM) fails. The preparation must release its dependency lease FIRST and
+// then run dependency GC, so the now-orphaned layer does not linger: with no app
+// image tagged, the freshly built (or reused) dependency is unreferenced and the
+// very same failure path prunes it. The build error itself is preserved.
+func TestPrepareAppBuildFailurePrunesOrphanedDependency(t *testing.T) {
 	fn, image, depRef := dependencyLifecycleFixture(t, "fn-build-fail")
 
 	dels := 0
@@ -176,8 +179,14 @@ func TestPrepareDependencyLeaseReleasedOnAppBuildFailure(t *testing.T) {
 	)
 	m := newLifecycleManager(t, cli, context.Background())
 
-	if _, err := m.Prepare(context.Background(), fn); err == nil {
+	_, err := m.Prepare(context.Background(), fn)
+	if err == nil {
 		t.Fatal("Prepare must surface the function build failure")
+	}
+	// The failure path's best-effort dependency cleanup must never replace the
+	// build error the caller has to classify and report.
+	if !strings.Contains(err.Error(), "function build failed") {
+		t.Fatalf("Prepare error = %v, want the app image build failure preserved", err)
 	}
 	if got := m.LeaseCount(depRef); got != 0 {
 		t.Fatalf("dependency lease count after a failed function build = %d, want 0", got)
@@ -185,14 +194,145 @@ func TestPrepareDependencyLeaseReleasedOnAppBuildFailure(t *testing.T) {
 	if got := m.LeaseCount(image); got != 0 {
 		t.Fatalf("function lease count after a failed function build = %d, want 0", got)
 	}
-	// No app image was tagged, so the dependency is genuinely orphaned.
-	// The lease being released is what lets the very same GC pass remove it.
+	// No app image was tagged, so the dependency is genuinely orphaned. The
+	// preparation released the dependency lease FIRST and then ran the
+	// lifecycle-driven GC, so that GC removed it (exactly one DELETE).
+	if dels != 1 {
+		t.Fatalf("dependency DELETE calls after the failed app build = %d, want 1 (the failure path must prune the orphaned layer)", dels)
+	}
+	// A successful removal drops the retirement state: the reference is gone and
+	// a later acquisition is admitted cleanly.
+	if m.IsImageRetiring(depRef) {
+		t.Fatal("a successful dependency removal must clear the retirement gate")
+	}
+}
+
+// TestPrepareAppBuildFailureKeepsDependencyHeldByAnotherPreparation pins the
+// shared-layer safety of the app-build-failure cleanup: the dependency image is
+// content-addressed and shared, so while ANOTHER preparation holds its own
+// admitted lease on the same layer, the failing preparation's cleanup must keep
+// it. Only after that lease releases does a later cleanup trigger remove it.
+func TestPrepareAppBuildFailureKeepsDependencyHeldByAnotherPreparation(t *testing.T) {
+	fn, image, depRef := dependencyLifecycleFixture(t, "fn-build-fail-shared")
+
+	dels := 0
+	cli := newScriptedDockerClient(t,
+		dockerRoute{method: http.MethodGet, path: "/images/json", body: depGCImageListJSON(depRef)},
+		dockerRoute{method: http.MethodGet, path: "/images/" + depRef + "/json", status: http.StatusNotFound, body: `{"message":"no such image"}`},
+		dockerRoute{method: http.MethodGet, path: "/images/", status: http.StatusNotFound, body: `{"message":"no such image"}`},
+		dockerRoute{
+			method: http.MethodPost, path: "/build", body: `{"stream":"ok"}`,
+			fail: func(req *http.Request) error {
+				if req.URL.Query().Get("t") == image {
+					return errors.New("function build failed")
+				}
+				return nil
+			},
+		},
+		dockerRoute{method: http.MethodDelete, path: "/images/", body: "[]", onMatch: func() { dels++ }},
+	)
+	m := newLifecycleManager(t, cli, context.Background())
+
+	// A concurrent preparation of ANOTHER app sharing the identical manifest
+	// holds an independent admitted lease on the same content-addressed layer.
+	shared, err := m.AcquireImageLease(depRef)
+	if err != nil {
+		t.Fatalf("acquire shared dependency lease: %v", err)
+	}
+
+	if _, err := m.Prepare(context.Background(), fn); err == nil {
+		t.Fatal("Prepare must surface the function build failure")
+	}
+	if dels != 0 {
+		t.Fatalf("dependency DELETE calls = %d, want 0 while another preparation holds the shared layer", dels)
+	}
+	if m.IsImageRetiring(depRef) {
+		t.Fatal("a deferred shared-layer removal must clear the retirement gate")
+	}
+	// The skipped candidate must stay reusable concurrently.
+	again, err := m.AcquireImageLease(depRef)
+	if err != nil {
+		t.Fatalf("shared dependency must be reusable after a skipped cleanup, got %v", err)
+	}
+	again.Release()
+
+	// The other preparation finishes: a later cleanup trigger now removes the
+	// layer, proving the failing preparation retained no lease of its own.
+	shared.Release()
 	removed, err := m.CleanupUnusedDependencies(context.Background())
 	if err != nil {
-		t.Fatalf("GC after the failed function build: %v", err)
+		t.Fatalf("cleanup after the shared lease released: %v", err)
 	}
 	if removed != 1 || dels != 1 {
-		t.Fatalf("GC removed %d (DELETE %d), want 1 and 1: the dependency lease must have been released", removed, dels)
+		t.Fatalf("cleanup removed %d (DELETE %d), want 1 and 1", removed, dels)
+	}
+}
+
+// TestPrepareAppBuildFailureCleanupErrorPreservesBuildError pins that a failing
+// dependency cleanup on the app-build-failure path is best-effort: the genuine
+// build error is still what Prepare returns, the failed removal clears its
+// retirement gate so the layer stays usable, and a later cleanup trigger removes
+// it.
+func TestPrepareAppBuildFailureCleanupErrorPreservesBuildError(t *testing.T) {
+	fn, image, depRef := dependencyLifecycleFixture(t, "fn-build-fail-gcerr")
+
+	var removeFails atomic.Bool
+	removeFails.Store(true)
+	dels := 0
+	cli := newScriptedDockerClient(t,
+		dockerRoute{method: http.MethodGet, path: "/images/json", body: depGCImageListJSON(depRef)},
+		dockerRoute{method: http.MethodGet, path: "/images/" + depRef + "/json", status: http.StatusNotFound, body: `{"message":"no such image"}`},
+		dockerRoute{method: http.MethodGet, path: "/images/", status: http.StatusNotFound, body: `{"message":"no such image"}`},
+		dockerRoute{
+			method: http.MethodPost, path: "/build", body: `{"stream":"ok"}`,
+			fail: func(req *http.Request) error {
+				if req.URL.Query().Get("t") == image {
+					return errors.New("function build failed")
+				}
+				return nil
+			},
+		},
+		dockerRoute{
+			method: http.MethodDelete, path: "/images/", body: "[]",
+			onMatch: func() { dels++ },
+			fail: func(*http.Request) error {
+				if removeFails.Load() {
+					return errors.New("daemon busy")
+				}
+				return nil
+			},
+		},
+	)
+	m := newLifecycleManager(t, cli, context.Background())
+
+	_, err := m.Prepare(context.Background(), fn)
+	if err == nil {
+		t.Fatal("Prepare must surface the function build failure")
+	}
+	if !strings.Contains(err.Error(), "function build failed") {
+		t.Fatalf("a failed dependency cleanup must not replace the build error, got %v", err)
+	}
+	if dels != 1 {
+		t.Fatalf("dependency DELETE attempts = %d, want exactly 1", dels)
+	}
+	// The failed removal cleared its gate: the layer is still usable and a later
+	// pass can retry it.
+	if m.IsImageRetiring(depRef) {
+		t.Fatal("a failed dependency removal must clear the retirement gate")
+	}
+	if probe, lerr := m.AcquireImageLease(depRef); lerr != nil {
+		t.Fatalf("dependency must be reusable after a failed removal, got %v", lerr)
+	} else {
+		probe.Release()
+	}
+
+	removeFails.Store(false)
+	removed, err := m.CleanupUnusedDependencies(context.Background())
+	if err != nil {
+		t.Fatalf("later cleanup trigger: %v", err)
+	}
+	if removed != 1 || dels != 2 {
+		t.Fatalf("later cleanup removed %d (DELETE %d), want 1 and 2", removed, dels)
 	}
 }
 

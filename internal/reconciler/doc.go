@@ -64,6 +64,15 @@
 // the skip path or a failed build) so the scheduler can converge its cron jobs
 // to the template's schedules. Removal converges via RemoveApp instead.
 //
+// When Config.Audit is set, it is called once per periodic audit pass before
+// that pass reconciles the apps. It is the re-drive point for DEFERRED image
+// cleanup: an image whose bounded removal retries were exhausted (a persistent
+// service container still referenced it) or whose removal failed is owned by the
+// runner as a retained retirement, and the periodic pass retries it once the
+// reference state may have changed. It is deliberately attached to the existing
+// audit cycle — not a separate scheduler, and never a timer or goroutine per
+// image.
+//
 // The service reconciler (services.go) is part of this package. Service
 // convergence is driven by the Config hooks UpdateServices/RemoveServices (both
 // nil-safe), which the worker wires to a *ServiceReconciler constructed from the

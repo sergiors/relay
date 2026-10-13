@@ -283,6 +283,22 @@ func (f *blockingExecutor) setReferenced(image string, v bool) {
 	f.referenced[image] = v
 }
 
+// setRemoveErr toggles whether RemoveImage fails, so a test can let a failed
+// removal succeed on a later re-drive.
+func (f *blockingExecutor) setRemoveErr(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removeErr = v
+}
+
+// referenceChecksCount returns how many managed-container reference checks have
+// run, so a test can prove a coalesced drive ran none.
+func (f *blockingExecutor) referenceChecksCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.referenceChecks
+}
+
 func (f *blockingExecutor) AppImageTags(_ context.Context, name string) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -404,6 +420,36 @@ func fpClean(t *testing.T, name, image string, exec Executor) *PreparedApp {
 	t.Helper()
 	return buildFn(fnSpec{name: name, image: image, rules: []app.EventRule{alwaysMatchRule(time.Second)}}, exec)
 }
+
+// retirementImages are the two image references the runner's image-retirement
+// tests use. The registry PUBLISHES currentImage (the app's live generation)
+// while the tests retire retiredImage (the superseded version), mirroring
+// production: the reconciler puts the new image into the registry BEFORE it
+// retires the old one, so a retired image is never one the registry serves.
+// Retiring an image the registry does serve is (correctly) cancelled, which is
+// pinned separately by TestRetireImageCancelledForServedImage.
+const (
+	currentImage = "relay-app-a:new"
+	retiredImage = "relay-app-a:old"
+)
+
+// newRetirementRunner builds a runner for app "a" whose registry serves
+// currentImage, so retiredImage can be retired exactly as production does. exec
+// must implement ImageCleaner (the retirement capability).
+func newRetirementRunner(t *testing.T, exec Executor, logger *slog.Logger) *Runner {
+	t.Helper()
+	return NewWithMetrics([]*PreparedApp{fpClean(t, "a", currentImage, exec)}, logger, nil)
+}
+
+// holdImage models a stale pre-swap snapshot's use of the superseded
+// image at the refcount boundary: the registry no longer serves retiredImage, so
+// a real Handle could not pick it up, but an execution admitted before the swap
+// still holds it. It is the honest way for a unit test to hold an image that the
+// registry does not serve.
+func holdImage(r *Runner, image string) { r.refs.acquire(image) }
+
+// releaseImage drops a reference held by holdImage.
+func releaseImage(r *Runner, image string) { r.refs.release(image) }
 
 // fnWithTimeout builds a prepared app whose single rule matches any event
 // and carries the given handler timeout and the default retry count.

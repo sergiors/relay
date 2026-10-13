@@ -24,7 +24,7 @@ func seedCurrent(r *Reconciler, fn app.App) {
 // newTestReconciler builds a reconciler over a fresh registry seeded from
 // initial, with a tiny debounce and a long interval so tests drive reconciles
 // explicitly. cfgHook (nil-safe) may mutate the Config to wire optional hooks
-// (Retire, RemoveApp, UpdateSchedules, UpdateServices, RemoveServices,
+// (Retire, RemoveApp, Audit, UpdateSchedules, UpdateServices, RemoveServices,
 // State). When cfg.State is set, each initial app is recorded as discovered
 // first, mirroring production startup wiring so reconcile hooks always find an
 // existing state row.
