@@ -171,6 +171,79 @@ func decodeScheduleDescriptor(v string) (ScheduleDescriptor, bool) {
 	}, true
 }
 
+// ScheduleRejection classifies a TERMINAL pre-admission rejection of a schedule
+// occurrence: the occurrence was never admitted and can never be admitted, so it
+// must be dispositioned without running a handler. The two kinds are distinct and
+// must stay distinct end to end:
+//
+//   - ScheduleRejectionObsolete: the schedule NAME (or its app) is gone from the
+//     current configuration. The removal is intentional, so the occurrence is
+//     ACKed — never retried, never dead-lettered.
+//   - ScheduleRejectionInvalid: the occurrence is well-formed as an envelope but
+//     can never succeed against the current template (a non-firing scheduled_at,
+//     or an unparseable current cron). It is terminal and non-retryable, so it is
+//     dead-lettered.
+//
+// A rejection is RESERVED in the invocation-state hash before any disposition
+// (see reserveScheduleRejectionScript), and the reservation is authoritative for
+// every later delivery: admission refuses a reserved message, and a retry uses
+// the reserved kind rather than re-deriving it from a possibly-changed template.
+// ScheduleRejectionNone means "no rejection": the caller has a descriptor to
+// propose.
+type ScheduleRejection int
+
+const (
+	// ScheduleRejectionNone means no rejection: the caller proposes a descriptor.
+	ScheduleRejectionNone ScheduleRejection = iota
+	// ScheduleRejectionObsolete is a removed schedule/app: ACK, never DLQ.
+	ScheduleRejectionObsolete
+	// ScheduleRejectionInvalid is a non-firing/corrupt occurrence: DLQ.
+	ScheduleRejectionInvalid
+)
+
+// errNoRejectionKind is returned by reserveScheduleRejection when the caller
+// supplies no rejection kind: reserving an empty kind would be meaningless and
+// is a programming error, so it is refused rather than written.
+var errNoRejectionKind = errors.New("schedule rejection requires a kind")
+
+// scheduleRejectionObsoleteValue and scheduleRejectionInvalidValue are the
+// persisted encodings of the reserved rejection field. They are stable strings
+// (not numbers) so the invocation-state hash stays inspectable with redis-cli.
+const (
+	scheduleRejectionObsoleteValue = "obsolete"
+	scheduleRejectionInvalidValue  = "invalid"
+)
+
+// encodeScheduleRejection renders a rejection kind as the value stored in the
+// reserved scheduleRejectionField. ScheduleRejectionNone encodes as "" (no
+// reservation).
+func encodeScheduleRejection(r ScheduleRejection) string {
+	switch r {
+	case ScheduleRejectionObsolete:
+		return scheduleRejectionObsoleteValue
+	case ScheduleRejectionInvalid:
+		return scheduleRejectionInvalidValue
+	default:
+		return ""
+	}
+}
+
+// decodeScheduleRejection parses a reserved rejection value. ok=false for
+// ScheduleRejectionNone and any unrecognized value; the caller treats an
+// unrecognized (corrupt/foreign) reservation as INVALID so it surfaces in the
+// DLQ (recoverable, inspectable) rather than being silently ACKed as removed
+// configuration.
+func decodeScheduleRejection(v string) (ScheduleRejection, bool) {
+	switch v {
+	case scheduleRejectionObsoleteValue:
+		return ScheduleRejectionObsolete, true
+	case scheduleRejectionInvalidValue:
+		return ScheduleRejectionInvalid, true
+	default:
+		return ScheduleRejectionNone, false
+	}
+}
+
 // scheduleStartOutcome classifies one evaluation of the schedule admission
 // boundary. It is internal: the conflict case is resolved by the
 // InvocationState.TryStartScheduled adoption loop and never reaches the runner.
@@ -193,7 +266,107 @@ const (
 	// proposed none (its schedule NAME is gone): the occurrence was never
 	// admitted, so it is obsolete.
 	scheduleStartNoAdmission
+	// scheduleStartRejected means a TERMINAL pre-admission rejection was already
+	// RESERVED for this message by an earlier delivery: no descriptor may ever be
+	// pinned and no invocation may be claimed. The reserved kind (invalid or
+	// obsolete) is carried on the result so the caller dispositions the
+	// occurrence exactly as the first delivery decided, even if the current
+	// template has since changed.
+	scheduleStartRejected
 )
+
+// scheduleRejectionOutcome classifies one evaluation of the rejection-reservation
+// boundary (see invocationStore.reserveScheduleRejection). It is the
+// disposition-side companion of scheduleStartOutcome.
+type scheduleRejectionOutcome int
+
+const (
+	// scheduleRejectionReserved means this call atomically wrote the reservation:
+	// the occurrence is now terminally rejected and no admission can follow.
+	scheduleRejectionReserved scheduleRejectionOutcome = iota
+	// scheduleRejectionAlreadyReserved means a reservation already existed (a
+	// redelivery after a crash, or a concurrent replica): the stored kind is
+	// authoritative and this call wrote nothing.
+	scheduleRejectionAlreadyReserved
+	// scheduleRejectionAdmitted means a descriptor is already pinned: another
+	// delivery ADMITTED the occurrence first, so the rejection is refused and the
+	// caller must adopt the pinned descriptor instead. This is the admission-first
+	// outcome that stops a rejection from cancelling a live admission.
+	scheduleRejectionAdmitted
+	// scheduleRejectionInFlight means an ACTIVE invocation marker (running / retry
+	// backoff) exists for the message but no descriptor is pinned: the occurrence
+	// WAS admitted by a delivery whose descriptor is not readable (a legacy/
+	// pre-pinning claim, or a hand-built hash) and that attempt may still complete.
+	// The rejection is refused and NO write happens; the caller keeps the message
+	// PENDING (never ACK/DLQ) so the in-flight attempt is not cancelled.
+	scheduleRejectionInFlight
+	// scheduleRejectionExhausted means a no-descriptor TERMINAL exhausted marker
+	// ("exhausted:<n>:<token>[:dlq]") owns the message: a legacy/pre-pinning
+	// admitted invocation already exhausted and its DLQ disposition is still owed.
+	// The rejection is refused and NO write happens; the caller routes the
+	// invocation(s) in result.markers to the DLQ (idempotently — an already-":dlq"
+	// marker is skipped by the existing persistence check) and the message is then
+	// ACKed. It never overwrites the exhausted marker.
+	scheduleRejectionExhausted
+	// scheduleRejectionComplete means a no-descriptor TERMINAL "ok" marker owns the
+	// message: a legacy/pre-pinning admitted invocation already succeeded. The
+	// rejection is refused and NO write happens; the caller ACKs the message
+	// idempotently.
+	scheduleRejectionComplete
+	// scheduleRejectionTerminal means the message's hash is terminal-retained
+	// (its message already left the PEL): there is nothing to reject and no
+	// admission can follow.
+	scheduleRejectionTerminal
+)
+
+// scheduleMarker identifies ONE legacy/pre-pinning admitted invocation found by
+// the reserve-only rejection scan: the hash field it was recorded under (the
+// "<app>/<handler>" invocation ID) and, for an exhausted marker, its retained
+// attempt count. Only exhausted markers need this identity (to dead-letter the
+// invocation); active/complete markers carry no per-invocation attribution.
+type scheduleMarker struct {
+	// Invocation is the "<app>/<handler>" hash field the marker was found under.
+	Invocation string
+	// Attempt is the exhausted marker's retained attempt count (>=1).
+	Attempt int
+}
+
+// scheduleMarkerKind classifies the invocation marker(s) found by the reserve
+// scan, with the fixed precedence active > exhausted > complete > none. It is
+// the same classification for a pinned descriptor (a current-version delivery
+// pinned + claimed, then completed/exhausted) and for a no-descriptor legacy
+// marker, so both callers share one disposition.
+type scheduleMarkerKind int
+
+const (
+	// scheduleMarkerNone means no invocation marker was found: for a pinned
+	// descriptor the caller must keep the message pending (admitted, no
+	// disposition yet); with no descriptor the reservation may be written.
+	scheduleMarkerNone scheduleMarkerKind = iota
+	// scheduleMarkerActive means a running / retry-backoff marker exists: the
+	// attempt may still complete, so the message stays pending.
+	scheduleMarkerActive
+	// scheduleMarkerExhausted means a terminal exhausted marker exists: each
+	// listed invocation still owes a per-invocation DLQ entry.
+	scheduleMarkerExhausted
+	// scheduleMarkerComplete means a terminal "ok" marker exists: the admitted
+	// invocation already succeeded (ACK).
+	scheduleMarkerComplete
+)
+
+// scheduleRejectionResult is the store-level result of one reserveScheduleRejection
+// evaluation. kind is the authoritative rejection (the stored one on
+// alreadyReserved, the requested one on reserved); pinned is set on admitted;
+// markerKind/markers classify the invocation marker(s) found by the scan (for the
+// admitted outcome and the no-descriptor marker outcomes).
+type scheduleRejectionResult struct {
+	outcome    scheduleRejectionOutcome
+	kind       ScheduleRejection
+	pinned     ScheduleDescriptor
+	hasPinned  bool
+	markerKind scheduleMarkerKind
+	markers    []scheduleMarker
+}
 
 // scheduleStartResult is the store-level result of ONE atomic schedule-admission
 // attempt (see invocationStore.tryStartScheduled). hasPinned distinguishes a
@@ -205,6 +378,9 @@ type scheduleStartResult struct {
 	wait      time.Duration
 	pinned    ScheduleDescriptor
 	hasPinned bool
+	// rejection is set only for scheduleStartRejected: the reserved terminal
+	// rejection kind (invalid or obsolete) that owns the message.
+	rejection ScheduleRejection
 }
 
 // maxScheduleAdoptionAttempts bounds the descriptor adoption loop: at most one
@@ -214,10 +390,14 @@ const maxScheduleAdoptionAttempts = 4
 
 // ScheduleAdmission is the resolved result of the schedule admission boundary as
 // seen by the runner: the descriptor that owns the message, whether this caller
-// claimed the invocation, and whether the occurrence is obsolete (never admitted
-// and no longer configured). A zero ScheduleAdmission with Obsolete=false and
-// Started=false means the invocation is protected or terminal (Claim/Wait carry
-// the marker details, exactly like TryStart).
+// claimed the invocation, whether the occurrence was terminally REJECTED before
+// admission (never admitted and never admissible), whether an admission exists
+// that this caller must NOT act on (InFlight: keep the message pending), and
+// whether a legacy no-descriptor admitted invocation still owes a DLQ
+// disposition (ExhaustedInvocations). A zero ScheduleAdmission with
+// Started/Rejected/InFlight all false and no ExhaustedInvocations means the
+// invocation is protected or terminal (Claim/Wait carry the marker details,
+// exactly like TryStart).
 type ScheduleAdmission struct {
 	// Started is true when the caller should execute the handler for this attempt.
 	Started bool
@@ -232,12 +412,36 @@ type ScheduleAdmission struct {
 	// one (adopted if this caller's proposal lost a race), or the caller's
 	// proposal on a successful first pin. It is the single source of truth for
 	// the handler, capped timeout, and retry budget for this message from now on,
-	// and is always set unless Obsolete is true.
+	// and is always set unless Rejected, InFlight, or ExhaustedInvocations is set.
 	Descriptor ScheduleDescriptor
-	// Obsolete is true when no descriptor was ever pinned for this message and
-	// the caller had no current schedule to propose (its schedule NAME is gone):
-	// the occurrence is obsolete and must be ACKed, never retried or DLQ'd.
-	Obsolete bool
+	// Rejected is true when the occurrence was terminally rejected before
+	// admission and can never be admitted: no descriptor is pinned and none ever
+	// will be. The rejection is reserved in the invocation-state hash, so every
+	// later delivery (including a redelivery after a crash) reports the SAME
+	// Rejection and dispositions it identically.
+	Rejected bool
+	// Rejection distinguishes the two terminal rejection kinds: obsolete (removed
+	// configuration → ACK) or invalid (non-firing/corrupt → DLQ). It is set only
+	// when Rejected is true.
+	Rejection ScheduleRejection
+	// InFlight is true when the message is already ADMITTED but this caller must
+	// NOT act on the admission: a reserve-only caller whose app is absent and
+	// cannot execute the pinned descriptor, or a rejection arriving after an
+	// admission whose descriptor is not pinned and whose marker is ACTIVE
+	// (a legacy/pre-pinning running or retry-backoff claim that may still
+	// complete). The message must stay PENDING — never ACKed, never DLQ'd — so a
+	// replica that can run the invocation completes it. It is mutually exclusive
+	// with Started, Rejected, and ExhaustedInvocations.
+	InFlight bool
+	// ExhaustedInvocations is set when a legacy/pre-pinning no-descriptor exhausted
+	// marker (or several, under different handler identities) owns the message:
+	// every listed invocation is already exhausted and still owes a per-invocation
+	// DLQ entry. The runner returns a HandlerExhaustedError carrying them, so the
+	// stream persists the missing entries (idempotently — an already-":dlq" marker
+	// is skipped) and then ACKs. It is mutually exclusive with Started, Rejected,
+	// and InFlight. A no-descriptor legacy "ok" marker instead yields a ZERO
+	// admission (nothing to do: the completion ACK is the normal success tail).
+	ExhaustedInvocations []ExhaustedInvocation
 }
 
 // ttlMillis converts a TTL to integer milliseconds for the PEXPIRE argument.
@@ -421,9 +625,10 @@ return {1, 1, '0'}
 	//           executes), ARGV[4] = new claim token, ARGV[5] = terminal marker
 	//           field, ARGV[6] = schedule-descriptor field, ARGV[7] = the caller's
 	//           descriptor (its own proposal, or the one it already pinned and
-	//           verified; "" when it has none).
+	//           verified; "" when it has none), ARGV[8] = schedule-rejection field.
 	//
-	// Returns a 4-element reply {outcome, attempt, deadline, pinned}:
+	// Returns a reply {outcome, attempt, deadline, pinned} (plus a fifth element
+	// {rejection} for outcome 5):
 	//
 	//	0 started       attempt = new 1-based attempt; pinned = owning descriptor
 	//	1 protected     attempt = existing; deadline = existing deadline string;
@@ -435,7 +640,14 @@ return {1, 1, '0'}
 	//	                no claim was made
 	//	4 no admission  no descriptor is pinned and the caller has none → the
 	//	                occurrence was never admitted and its schedule is gone
-	//	                (obsolete)
+	//	                (obsolete). No write: the caller must RESERVE the rejection
+	//	                (reserveScheduleRejectionScript) before dispositioning it,
+	//	                so the decision becomes atomic against a concurrent
+	//	                admission.
+	//	5 rejected      a terminal pre-admission rejection was already reserved for
+	//	                this message; rejection = its kind. No claim was made and
+	//	                the caller must NOT pin or admit: it dispositions the
+	//	                reserved kind instead.
 	//
 	// The claim is made ONLY when the caller supplies the exact descriptor it will
 	// execute (proposed == pinned, or it is the first to pin proposed). This keeps
@@ -471,6 +683,16 @@ if redis.call('HEXISTS', KEYS[1], ARGV[5]) == 1 then
   return {2, 0, '0', redis.call('HGET', KEYS[1], ARGV[6]) or ''}
 end
 
+local rejected = redis.call('HGET', KEYS[1], ARGV[8])
+if rejected then
+  -- A terminal pre-admission rejection was reserved by an earlier delivery (or a
+  -- concurrent replica) BEFORE any admission: the occurrence can never be
+  -- admitted, so no proposal may pin or claim it. The reserved kind is returned
+  -- so the caller dispositions the occurrence exactly as the first delivery
+  -- decided, even if the current template has since changed.
+  return {5, 0, '0', '', rejected}
+end
+
 local pinned = redis.call('HGET', KEYS[1], ARGV[6])
 local proposed = ARGV[7]
 
@@ -484,7 +706,9 @@ if pinned then
   end
 elseif proposed == '' then
   -- No descriptor pinned and the caller has none to propose: the occurrence was
-  -- never admitted and its schedule is gone — obsolete.
+  -- never admitted and its schedule is gone — obsolete. Deliberately NO write:
+  -- the caller reserves the rejection separately, atomically with the check for
+  -- a concurrent admission (see reserveScheduleRejectionScript).
   return {4, 0, '0', ''}
 end
 
@@ -503,6 +727,153 @@ local na = tonumber(decision[2]) + 1
 redis.call('HSET', KEYS[1], ARGV[1], 'running:'..ARGV[3]..':'..na..':'..ARGV[4])
 redis.call('PERSIST', KEYS[1])
 return {0, na, '0', pinned or proposed}
+`)
+
+	// reserveScheduleRejectionScript atomically reserves a TERMINAL pre-admission
+	// rejection (invalid or obsolete) for a schedule occurrence, but only when the
+	// occurrence was never admitted — so a rejection can never cancel or overwrite
+	// a live admission. It is the disposition half of the admission boundary (F-030):
+	// tryStartScheduledScript deliberately writes nothing on a no-admission
+	// observation, and this script is what makes the subsequent disposition atomic
+	// against a concurrent admission.
+	//
+	// It resolves the race in a fixed precedence:
+	//
+	//   - the message's hash is terminal-retained (its message already left the
+	//     PEL): nothing to reject; no write.
+	//   - a reservation already exists (a redelivery after a crash, or a
+	//     concurrent replica): the STORED kind is returned unchanged, so the
+	//     reservation is written exactly once and is idempotent.
+	//   - a descriptor is already pinned (another replica ADMITTED first): the
+	//     rejection is REFUSED and the pinned descriptor returned WITH the
+	//     invocation-marker classification, so the caller adopts it (the
+	//     TryStartScheduled present-app path) or, when it cannot execute an adopted
+	//     descriptor (the reserve-only app-absent path), completes the marker's
+	//     terminal disposition. A pinned descriptor can accompany a terminal
+	//     marker — a current-version delivery pinned + claimed, then marked "ok" or
+	//     exhausted, then crashed before its ACK/DLQ — so the pinned branch must
+	//     still classify markers rather than blindly report "admitted".
+	//   - an ACTIVE invocation marker (running / retry backoff) exists with no
+	//     descriptor: the occurrence was admitted by a delivery whose descriptor
+	//     is not readable (a legacy/pre-pinning claim, or a hand-built hash) and
+	//     that attempt may still complete. The rejection is REFUSED and NO write
+	//     happens; the caller keeps the message PENDING.
+	//   - a TERMINAL invocation marker exists with no descriptor: a legacy/
+	//     pre-pinning admitted invocation already reached success ("ok") or
+	//     exhaustion ("exhausted:<n>:<token>[:dlq]"). The rejection is REFUSED and
+	//     NO write happens, because a reservation would cancel the owed disposition
+	//     and silently drop a DLQ entry. Instead the scan reports the terminal
+	//     outcome so the caller completes it: "exhausted" returns each exhausted
+	//     "<app>/<handler>" + attempt (so the stream can persist the missing DLQ
+	//     entry and ACK), and "ok" reports success (so the caller ACKs). An ACTIVE
+	//     marker always wins over a terminal one: if any active marker exists the
+	//     scan reports only "active", because the message cannot be terminalized
+	//     while an attempt may still complete.
+	//   - otherwise the reservation is written and PERSISTed. Every later
+	//     tryStartScheduledScript then reports outcome 5 (rejected) and can never
+	//     pin or claim, so a rejection that wins the race permanently prevents
+	//     admission.
+	//
+	// The reservation is written while the message is still recoverable (the DLQ
+	// entry may not be persisted and the XACK may not have run), so it keeps the
+	// key PERSISTENT with NO TTL: a redelivery after a crash must observe it to
+	// complete the disposition idempotently, and terminal retention is applied
+	// only later by the ACK path. This script never ACKs and never writes a
+	// terminal marker: an invalid reservation must not leave the PEL until its DLQ
+	// placeholder is persisted.
+	//
+	// KEYS[1] = invocation-state hash;
+	// ARGV[1] = terminal marker field, ARGV[2] = schedule-rejection field,
+	// ARGV[3] = schedule-descriptor field, ARGV[4] = rejection kind
+	// ("obsolete"/"invalid").
+	// Returns a reply {outcome, value, markerKind, ...}:
+	//
+	//	0 terminal          value = ''           (hash terminal-retained; no write)
+	//	1 already reserved  value = stored kind  (idempotent; no write)
+	//	2 admitted          value = pinned, markerKind = active|complete|exhausted|none
+	//	                                          (adopt it; rejection refused)
+	//	3 reserved          value = new kind     (this call wrote the reservation)
+	//	4 active|complete|exhausted [inv attempt]... (no descriptor; the marker's
+	//	                                          disposition; no write)
+	//
+	// For 'exhausted' (code 2 or 4) the reply continues with repeated
+	// {invocation, attempt} pairs for every exhausted marker still owed a DLQ.
+	reserveScheduleRejectionScript = redis.NewScript(luaInvocationHelpers + `
+if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then
+  return {0, ''}
+end
+local existing = redis.call('HGET', KEYS[1], ARGV[2])
+if existing then
+  return {1, existing}
+end
+-- Classify every invocation marker present (if any), with a fixed precedence:
+-- an ACTIVE marker (running/backoff) WINS and keeps the message pending;
+-- otherwise a terminal exhausted marker reports each "<app>/<handler>" + attempt
+-- still owed a DLQ entry; otherwise a terminal "ok" reports a completion ACK.
+-- This runs whether or not a descriptor is pinned, because a pinned descriptor
+-- can accompany a terminal marker (a current-version delivery pinned + claimed,
+-- then completed/exhausted but crashed before its ACK/DLQ): a rejection must
+-- never overwrite that disposition.
+local all = redis.call('HGETALL', KEYS[1])
+local active = false
+local complete = false
+local exhausted = {}
+for i = 1, #all, 2 do
+  local v = all[i+1]
+  if v == 'ok' then
+    complete = true
+  else
+    local dl = parse_active(v, 'running')
+    if not dl then dl = parse_active(v, 'next_attempt_at') end
+    if dl then
+      active = true
+    else
+      local a = parse_exhausted(v)
+      if a then
+        exhausted[#exhausted+1] = all[i]
+        exhausted[#exhausted+1] = a
+      end
+    end
+  end
+end
+local function marker_payload()
+  local out = {}
+  if active then
+    out[1] = 'active'
+    return out
+  end
+  if #exhausted > 0 then
+    out[1] = 'exhausted'
+    for j = 1, #exhausted do out[#out+1] = exhausted[j] end
+    return out
+  end
+  if complete then
+    out[1] = 'complete'
+    return out
+  end
+  out[1] = 'none'
+  return out
+end
+local pinned = redis.call('HGET', KEYS[1], ARGV[3])
+if pinned then
+  -- A descriptor is pinned: return it for adoption PLUS the marker
+  -- classification, so TryStartScheduled still adopts the descriptor while a
+  -- reserve-only (app-absent) caller can complete a terminal disposition.
+  local reply = {2, pinned}
+  local payload = marker_payload()
+  for j = 1, #payload do reply[#reply+1] = payload[j] end
+  return reply
+end
+local payload = marker_payload()
+if payload[1] ~= 'none' then
+  -- No descriptor, but an admitted marker exists: report its disposition.
+  local reply = {4}
+  for j = 1, #payload do reply[#reply+1] = payload[j] end
+  return reply
+end
+redis.call('HSET', KEYS[1], ARGV[2], ARGV[4])
+redis.call('PERSIST', KEYS[1])
+return {3, ARGV[4]}
 `)
 
 	// finishFailureScript atomically records a failed attempt's retry backoff,
@@ -943,11 +1314,13 @@ type invocationStateStore interface {
 	// whether the caller actually knows a descriptor (false when it could neither
 	// read a pinned one nor resolve a current schedule). When known is false the
 	// invocation string is ignored and the script either hands back the pinned
-	// descriptor to adopt (conflict) or reports no admission (obsolete). It
-	// returns the raw scheduleStartResult for ONE script evaluation; the
-	// InvocationState handle wraps it in the bounded adoption loop. A
-	// store/transport error is returned (NOT failed open) so no handler runs on an
-	// ambiguous claim.
+	// descriptor to adopt (conflict) or reports no admission (obsolete). A message
+	// that already carries a RESERVED pre-admission rejection reports
+	// scheduleStartRejected and never pins or claims, so a reserved rejection can
+	// never be raced into an admission. It returns the raw scheduleStartResult for
+	// ONE script evaluation; the InvocationState handle wraps it in the bounded
+	// adoption loop. A store/transport error is returned (NOT failed open) so no
+	// handler runs on an ambiguous claim.
 	tryStartScheduled(
 		ctx context.Context,
 		stream, group, msgID, invocation string,
@@ -955,6 +1328,26 @@ type invocationStateStore interface {
 		desc ScheduleDescriptor,
 		known bool,
 	) (scheduleStartResult, error)
+	// reserveScheduleRejection atomically reserves a TERMINAL pre-admission
+	// rejection (invalid or obsolete) for a schedule occurrence, but only when the
+	// occurrence was never admitted (see reserveScheduleRejectionScript). It is the
+	// disposition half of the admission boundary: a no-admission observation
+	// (tryStartScheduled report 4) is completed by this call, which either writes
+	// the reservation (so every later admission refuses) or reports that the
+	// occurrence was ADMITTED first (so the caller adopts the pinned descriptor
+	// instead of rejecting). The invocation marker(s) are classified with a fixed
+	// precedence (active > exhausted > complete > none), for a pinned descriptor and
+	// a no-descriptor legacy marker alike: scheduleRejectionAdmitted carries the
+	// pinned descriptor plus the classification, scheduleRejectionInFlight keeps the
+	// message pending, scheduleRejectionExhausted carries each still-owed invocation
+	// (DLQ then ACK), and scheduleRejectionComplete is the success tail (ACK). A
+	// store/transport error is returned (NOT failed open) so no rejection is
+	// dispositioned on an ambiguous outcome.
+	reserveScheduleRejection(
+		ctx context.Context,
+		stream, group, msgID string,
+		kind ScheduleRejection,
+	) (scheduleRejectionResult, error)
 	// finishFailure CASes the caller's claim against the current active marker
 	// and, on a match, writes the retry backoff marker at now+backoff. It returns
 	// ok=false (an explicit stale/terminal result, never an error) when the claim
@@ -1088,6 +1481,23 @@ const traceFieldPrefix = "__trace:"
 // TTL); terminal retention applies its TTL to the whole hash after the ACK,
 // exactly like every other field.
 const scheduleField = "__schedule"
+
+// scheduleRejectionField is the reserved invocation-state hash field that
+// reserves a TERMINAL pre-admission rejection (invalid or obsolete) for a
+// schedule occurrence, so the rejection decision is atomic against a concurrent
+// admission (F-030). Like terminalField, classificationField, traceFieldPrefix,
+// and scheduleField it cannot collide with a real invocation ID (a leading "__"
+// is not a legal app name); like them it is a SIBLING of the lifecycle values
+// rather than part of one, so reserving a rejection never disturbs eligibility
+// parsing.
+//
+// It is written exactly once, atomically, and only when no descriptor is pinned
+// (see reserveScheduleRejectionScript): an admitted occurrence can never acquire
+// a reservation, and a reserved occurrence can never be admitted. Its value is
+// the rejection kind (see ScheduleRejection). While the message is recoverable
+// the field persists (the hash has no TTL); terminal retention applies its TTL to
+// the whole hash after the ACK, exactly like every other field.
+const scheduleRejectionField = "__schedule_rejected"
 
 // dlqPlaceholderField is the reserved invocation-state hash field that records
 // that the malformed-message placeholder DLQ entry for this message has already
@@ -1375,13 +1785,14 @@ func (store *invocationStore) tryStartScheduled(
 		terminalField,
 		scheduleField,
 		encoded,
+		scheduleRejectionField,
 	).Slice()
 	if err != nil {
 		return scheduleStartResult{}, err
 	}
 	if len(res) < 4 {
-		// The script always returns four elements; a short reply is a protocol
-		// violation, so treat the claim as unconfirmed rather than guess.
+		// The script always returns at least four elements; a short reply is a
+		// protocol violation, so treat the claim as unconfirmed rather than guess.
 		return scheduleStartResult{}, fmt.Errorf("tryStartScheduled: unexpected script reply of length %d", len(res))
 	}
 	outcomeCode := toInt64(res[0])
@@ -1419,8 +1830,180 @@ func (store *invocationStore) tryStartScheduled(
 		out.outcome = scheduleStartConflict
 	case 4: // no admission
 		out.outcome = scheduleStartNoAdmission
+	case 5: // rejected: a terminal pre-admission rejection is already reserved
+		if len(res) < 5 {
+			return scheduleStartResult{}, fmt.Errorf("tryStartScheduled: rejected reply missing the reservation kind")
+		}
+		rejStr, ok := res[4].(string)
+		if !ok {
+			return scheduleStartResult{}, fmt.Errorf("tryStartScheduled: unexpected rejection reply type %T", res[4])
+		}
+		rej, ok := decodeScheduleRejection(rejStr)
+		if !ok {
+			// A foreign/corrupt reservation must surface (recoverable, inspectable)
+			// rather than be silently ACKed: treat it as invalid so the caller
+			// dead-letters it.
+			rej = ScheduleRejectionInvalid
+		}
+		out.outcome = scheduleStartRejected
+		out.rejection = rej
 	default:
 		return scheduleStartResult{}, fmt.Errorf("tryStartScheduled: unexpected outcome code %d", outcomeCode)
+	}
+	return out, nil
+}
+
+// reserveScheduleRejection atomically reserves a terminal pre-admission
+// rejection for a schedule occurrence via reserveScheduleRejectionScript. It
+// writes the reservation only when the occurrence was never admitted, so a
+// rejection can never cancel a live admission. A message with a pinned descriptor
+// reports scheduleRejectionAdmitted, carrying the pinned descriptor for adoption
+// AND the invocation marker's classification, so a reserve-only (app-absent)
+// caller can complete a terminal disposition while TryStartScheduled still adopts.
+// A no-descriptor marker reports scheduleRejectionInFlight (active → pending),
+// scheduleRejectionExhausted (each exhausted "<app>/<handler>" + attempt still
+// owed a DLQ entry), or scheduleRejectionComplete ("ok" → ACK). It never ACKs and
+// never writes a terminal marker, so an invalid reservation leaves the message
+// pending until its DLQ placeholder is persisted.
+func (store *invocationStore) reserveScheduleRejection(
+	ctx context.Context,
+	stream, group, msgID string,
+	kind ScheduleRejection,
+) (scheduleRejectionResult, error) {
+	if kind == ScheduleRejectionNone {
+		return scheduleRejectionResult{}, errNoRejectionKind
+	}
+	res, err := reserveScheduleRejectionScript.Run(ctx, store.client,
+		[]string{invocationStateKey(stream, group, msgID)},
+		terminalField,
+		scheduleRejectionField,
+		scheduleField,
+		encodeScheduleRejection(kind),
+	).Slice()
+	if err != nil {
+		return scheduleRejectionResult{}, err
+	}
+	if len(res) < 2 {
+		// The script always returns at least two elements; a short reply is a
+		// protocol violation, so treat the reservation as unconfirmed rather than
+		// guess.
+		return scheduleRejectionResult{}, fmt.Errorf("reserveScheduleRejection: unexpected script reply of length %d", len(res))
+	}
+	code := toInt64(res[0])
+	value, ok := res[1].(string)
+	if !ok {
+		return scheduleRejectionResult{}, fmt.Errorf("reserveScheduleRejection: unexpected reply type %T", res[1])
+	}
+	out := scheduleRejectionResult{}
+	switch code {
+	case 0: // terminal-retained
+		out.outcome = scheduleRejectionTerminal
+	case 1: // already reserved: the stored kind is authoritative
+		out.outcome = scheduleRejectionAlreadyReserved
+		if rej, ok := decodeScheduleRejection(value); ok {
+			out.kind = rej
+		} else {
+			out.kind = ScheduleRejectionInvalid
+		}
+	case 2: // admitted first: adopt the pinned descriptor + marker classification
+		desc, ok := decodeScheduleDescriptor(value)
+		if !ok {
+			return scheduleRejectionResult{}, fmt.Errorf("reserveScheduleRejection: pinned descriptor does not decode")
+		}
+		kindStr, ok := res[2].(string)
+		if !ok {
+			return scheduleRejectionResult{}, fmt.Errorf("reserveScheduleRejection: unexpected marker kind reply type %T", res[2])
+		}
+		mk, markers, merr := decodeScheduleMarkerPayload(kindStr, res[3:])
+		if merr != nil {
+			return scheduleRejectionResult{}, merr
+		}
+		out.outcome = scheduleRejectionAdmitted
+		out.pinned, out.hasPinned = desc, true
+		out.markerKind, out.markers = mk, markers
+	case 3: // reserved by this call
+		out.outcome = scheduleRejectionReserved
+		if rej, ok := decodeScheduleRejection(value); ok {
+			out.kind = rej
+		} else {
+			out.kind = kind
+		}
+	case 4: // no-descriptor admitted marker: classify the terminal disposition
+		mk, markers, merr := decodeScheduleMarkerPayload(value, res[2:])
+		if merr != nil {
+			return scheduleRejectionResult{}, merr
+		}
+		out.markerKind, out.markers = mk, markers
+		switch mk {
+		case scheduleMarkerActive:
+			out.outcome = scheduleRejectionInFlight
+		case scheduleMarkerComplete:
+			out.outcome = scheduleRejectionComplete
+		case scheduleMarkerExhausted:
+			out.outcome = scheduleRejectionExhausted
+		default:
+			return scheduleRejectionResult{}, fmt.Errorf("reserveScheduleRejection: unexpected marker kind %q", value)
+		}
+	default:
+		return scheduleRejectionResult{}, fmt.Errorf("reserveScheduleRejection: unexpected outcome code %d", code)
+	}
+	return out, nil
+}
+
+// decodeScheduleMarkerPayload parses a reserve reply's marker kind and its
+// optional trailing {invocation, attempt} pairs. Only 'exhausted' carries pairs;
+// any other kind with trailing elements is a protocol violation. It is the single
+// decoder shared by the admitted (code 2) and no-descriptor (code 4) replies.
+func decodeScheduleMarkerPayload(kindStr string, rest []any) (scheduleMarkerKind, []scheduleMarker, error) {
+	var kind scheduleMarkerKind
+	switch kindStr {
+	case "active":
+		kind = scheduleMarkerActive
+	case "complete":
+		kind = scheduleMarkerComplete
+	case "exhausted":
+		kind = scheduleMarkerExhausted
+	case "none":
+		kind = scheduleMarkerNone
+	default:
+		return scheduleMarkerNone, nil, fmt.Errorf("reserveScheduleRejection: unexpected marker kind %q", kindStr)
+	}
+	if kind != scheduleMarkerExhausted {
+		if len(rest) != 0 {
+			return scheduleMarkerNone, nil, fmt.Errorf("reserveScheduleRejection: %s marker reply has %d unexpected trailing elements", kindStr, len(rest))
+		}
+		return kind, nil, nil
+	}
+	markers, err := decodeScheduleMarkers(rest)
+	if err != nil {
+		return scheduleMarkerNone, nil, err
+	}
+	return kind, markers, nil
+}
+
+// decodeScheduleMarkers parses the trailing {invocation, attempt} pairs of an
+// "exhausted" reserve reply into scheduleMarkers. A malformed pair is a protocol
+// violation (the script writes only field names and canonical attempts), so it is
+// refused rather than guessed. An attempt must be >= 1 (the marker grammar
+// enforces it) and the invocation must be a non-empty "<app>/<handler>" field.
+func decodeScheduleMarkers(rest []any) ([]scheduleMarker, error) {
+	if len(rest) == 0 || len(rest)%2 != 0 {
+		return nil, fmt.Errorf("reserveScheduleRejection: exhausted reply has %d trailing elements, want a positive even count", len(rest))
+	}
+	out := make([]scheduleMarker, 0, len(rest)/2)
+	for i := 0; i < len(rest); i += 2 {
+		inv, ok := rest[i].(string)
+		if !ok {
+			return nil, fmt.Errorf("reserveScheduleRejection: exhausted invocation reply type %T", rest[i])
+		}
+		if inv == "" {
+			return nil, fmt.Errorf("reserveScheduleRejection: exhausted reply has an empty invocation")
+		}
+		attempt := int(toInt64(rest[i+1]))
+		if attempt < 1 {
+			return nil, fmt.Errorf("reserveScheduleRejection: exhausted invocation %q has attempt %d, want >= 1", inv, attempt)
+		}
+		out = append(out, scheduleMarker{Invocation: inv, Attempt: attempt})
 	}
 	return out, nil
 }
@@ -2000,25 +2583,54 @@ type InvocationState interface {
 	// and claims the invocation, so the descriptor, the attempt, and the claim
 	// token become visible together and exactly one of two racing proposals wins.
 	//
-	// proposed is the descriptor resolved from the CURRENT template by schedule
-	// NAME (handler, capped timeout, retries); propose=false means the schedule
-	// NAME is gone, so nothing can be proposed. invocationFor maps a descriptor to
-	// its "<app>/<handler>" invocation ID: on a lost race the winning
-	// descriptor owns the message and its handler (not the caller's) is invoked,
-	// so the callback is re-evaluated for the adopted descriptor. The loop is
-	// bounded and terminates because a pinned descriptor is immutable while the
-	// message is recoverable.
+	// rejection==ScheduleRejectionNone means the caller has a PROPOSAL (desc
+	// resolved from the CURRENT template by schedule NAME). A non-none rejection
+	// (obsolete or invalid) means the caller can PROPOSE NOTHING and the
+	// occurrence is terminally rejected: desc is ignored, and the rejection is
+	// atomically RESERVED in the invocation-state hash before it is reported — so
+	// a rejection can never race a concurrent admission (F-030). If the occurrence
+	// was already ADMITTED (another replica pinned a descriptor first), the
+	// rejection is refused and the pinned descriptor adopted, so an active
+	// admission always beats a rejection.
 	//
-	// It returns a ScheduleAdmission. Obsolete is true only when nothing was ever
-	// pinned and the caller proposed nothing (the occurrence was never admitted
-	// and its schedule is gone → the stream ACKs, never retries or DLQs). An error
-	// is a Redis/transport failure (or token-generation failure): the claim
-	// outcome is unknown, so the caller leaves the message pending and does not
-	// execute.
+	// invocationFor maps a descriptor to its "<app>/<handler>" invocation ID: on a
+	// lost race the winning descriptor owns the message and its handler (not the
+	// caller's) is invoked, so the callback is re-evaluated for the adopted
+	// descriptor. The loop is bounded and terminates because a pinned descriptor is
+	// immutable while the message is recoverable.
 	//
-	// desc/known describe what the caller knows: known=false means it could
-	// neither read a pinned descriptor nor resolve the current schedule.
-	TryStartScheduled(desc ScheduleDescriptor, known bool, invocationFor func(ScheduleDescriptor) string) (ScheduleAdmission, error)
+	// It returns a ScheduleAdmission. Rejected is true only when the occurrence was
+	// terminally rejected before admission (nothing was ever pinned and nothing
+	// ever will be); Rejection distinguishes obsolete (ACK) from invalid (DLQ).
+	// InFlight is true when an ACTIVE no-descriptor admission exists but this
+	// caller must not act on it (keep the message pending), and
+	// ExhaustedInvocations is set when a legacy no-descriptor exhausted marker
+	// must be dead-lettered (the caller routes the missing DLQ entries then the
+	// stream ACKs). An error is a Redis/transport failure (or token-generation
+	// failure): the claim outcome is unknown, so the caller leaves the message
+	// pending and does not execute.
+	TryStartScheduled(desc ScheduleDescriptor, rejection ScheduleRejection, invocationFor func(ScheduleDescriptor) string) (ScheduleAdmission, error)
+	// ReserveScheduleRejection is the RESERVE-ONLY pre-admission rejection
+	// boundary for a replica that can neither propose a descriptor nor execute an
+	// adopted one (its app is absent from the registry). Unlike
+	// TryStartScheduled, it NEVER claims or starts an invocation: it only reserves
+	// the caller's terminal rejection, atomically and exactly once, and refuses it
+	// when the occurrence was already admitted.
+	//
+	// It returns a ScheduleAdmission with Rejected true (Rejection is the
+	// authoritative reserved kind: the caller's, or the one an earlier delivery
+	// stored) when the reservation is in force; a zero admission when the hash is
+	// terminal-retained OR a terminal "ok" marker is present (the admitted
+	// invocation already succeeded: the caller ACKs idempotently); InFlight true
+	// when an ACTIVE marker exists, or when a descriptor is pinned with no
+	// terminal marker (another replica admitted and may still be running it), so
+	// the caller keeps the message PENDING; and ExhaustedInvocations set when an
+	// exhausted marker owns the message (pinned descriptor or legacy no-descriptor
+	// alike), so the caller routes each listed invocation's missing DLQ entry
+	// (idempotently) and the message is then ACKed. An error means the reservation
+	// outcome is UNKNOWN: the caller leaves the message pending and dispositions
+	// nothing.
+	ReserveScheduleRejection(kind ScheduleRejection) (ScheduleAdmission, error)
 	// RecordFailure persists a failed attempt's retry backoff so the invocation
 	// is gated until now+backoff. The claim is the one this caller confirmed via
 	// TryStart; the store CASes attempt+token against the active marker so a
@@ -2424,23 +3036,65 @@ func (state *invocationState) ScheduleDescriptor() (ScheduleDescriptor, bool) {
 // TryStartScheduled is the schedule-occurrence admission boundary. It atomically
 // pins the descriptor (only when none is pinned) and claims the invocation,
 // retrying with the winning descriptor if the message already carries one it did
-// not have. See InvocationState.TryStartScheduled for the contract.
+// not have. When the caller can propose nothing (a non-none rejection) it instead
+// atomically RESERVES the terminal rejection — refusing it if the occurrence was
+// already admitted — so a rejection can never cancel a live admission and an
+// admission can never follow a reservation. See InvocationState.TryStartScheduled
+// for the contract.
 func (state *invocationState) TryStartScheduled(
 	desc ScheduleDescriptor,
-	known bool,
+	rejection ScheduleRejection,
 	invocationFor func(ScheduleDescriptor) string,
 ) (ScheduleAdmission, error) {
 	for attempt := 0; attempt < maxScheduleAdoptionAttempts; attempt++ {
-		invocation := ""
-		now := state.now()
-		deadline := now
-		if known {
-			invocation = invocationFor(desc)
-			deadline = now.Add(desc.Timeout)
+		// Rejection path: the caller can propose nothing. Reserve the terminal
+		// rejection atomically, or adopt a descriptor an earlier delivery pinned.
+		if rejection != ScheduleRejectionNone {
+			rr, err := state.store.reserveScheduleRejection(
+				state.ctx, state.stream, state.group, state.msgID, rejection,
+			)
+			if err != nil {
+				// The reservation outcome is unknown: do NOT disposition a
+				// rejection on an ambiguous result. Leave the message pending.
+				state.log.Debug("Invocation state: schedule rejection reservation failed; leaving pending", "error", err)
+				return ScheduleAdmission{}, err
+			}
+			switch rr.outcome {
+			case scheduleRejectionReserved, scheduleRejectionAlreadyReserved:
+				return ScheduleAdmission{Rejected: true, Rejection: rr.kind}, nil
+			case scheduleRejectionTerminal:
+				// The message's hash is terminal-retained (its message already left
+				// the PEL): nothing to reject. Report terminal so the stream ACKs
+				// idempotently.
+				return ScheduleAdmission{}, nil
+			case scheduleRejectionInFlight, scheduleRejectionComplete, scheduleRejectionExhausted:
+				// A no-descriptor admitted marker (legacy/pre-pinning state): an
+				// admitted invocation always beats a rejection, and there is no
+				// descriptor to adopt. Complete the marker's real disposition.
+				return markerAdmission(rr.markerKind, rr.markers), nil
+			case scheduleRejectionAdmitted:
+				// Admission-first: another delivery admitted the occurrence before
+				// this rejection. An active admission always beats a rejection, so
+				// adopt the pinned descriptor and run the normal admission (the
+				// present-app path re-reads the descriptor's invocation marker in
+				// tryStartScheduled, which already handles a terminal marker).
+				if !rr.hasPinned {
+					return ScheduleAdmission{}, fmt.Errorf(
+						"invocation state: rejected admission without a pinned descriptor for %q", state.msgID)
+				}
+				desc = rr.pinned
+				rejection = ScheduleRejectionNone
+				continue
+			default:
+				return ScheduleAdmission{}, fmt.Errorf("invocation state: unexpected schedule rejection outcome %d", rr.outcome)
+			}
 		}
+
+		invocation := invocationFor(desc)
+		now := state.now()
 		res, err := state.store.tryStartScheduled(
 			state.ctx, state.stream, state.group, state.msgID, invocation,
-			now, deadline, desc, known,
+			now, now.Add(desc.Timeout), desc, true,
 		)
 		if err != nil {
 			// The claim outcome is unknown: do NOT execute and leave the message
@@ -2470,10 +3124,15 @@ func (state *invocationState) TryStartScheduled(
 				Claim:      res.claim,
 				Descriptor: d,
 			}, nil
+		case scheduleStartRejected:
+			// A terminal pre-admission rejection was reserved by an earlier
+			// delivery: no proposal may pin or claim it. Report the reserved kind
+			// so the caller dispositions the occurrence deterministically.
+			return ScheduleAdmission{Rejected: true, Rejection: res.rejection}, nil
 		case scheduleStartNoAdmission:
-			// Nothing was ever pinned and the caller has no descriptor: the
-			// occurrence was never admitted and its schedule is gone (obsolete).
-			return ScheduleAdmission{Obsolete: true}, nil
+			// Unreachable from this loop: a proposal is always supplied here. A
+			// script reply of no-admission would mean a protocol violation.
+			return ScheduleAdmission{}, fmt.Errorf("invocation state: unexpected no-admission with a proposal for %q", state.msgID)
 		case scheduleStartConflict:
 			// The message carries a descriptor the caller did not supply: adopt it
 			// and retry. A pinned descriptor is immutable while the message is
@@ -2483,7 +3142,6 @@ func (state *invocationState) TryStartScheduled(
 					"invocation state: schedule conflict without a pinned descriptor for %q", state.msgID)
 			}
 			desc = res.pinned
-			known = true
 			continue
 		default:
 			return ScheduleAdmission{}, fmt.Errorf("invocation state: unexpected schedule outcome %d", res.outcome)
@@ -2500,6 +3158,83 @@ func pinnedOr(res scheduleStartResult, fallback ScheduleDescriptor) (ScheduleDes
 		return res.pinned, true
 	}
 	return fallback, false
+}
+
+// ReserveScheduleRejection is the reserve-only pre-admission rejection boundary.
+// It never claims or starts an invocation: it atomically reserves the caller's
+// terminal rejection (refusing it if the occurrence was already admitted) and
+// reports the disposition. See InvocationState.ReserveScheduleRejection for the
+// contract. It is used by a replica whose app is absent and therefore cannot
+// execute an adopted descriptor, so the caller must never be handed a Started
+// admission: a pinned descriptor's invocation marker is resolved here (active →
+// pending, complete → ACK, exhausted → DLQ then ACK) rather than adopted.
+func (state *invocationState) ReserveScheduleRejection(kind ScheduleRejection) (ScheduleAdmission, error) {
+	rr, err := state.store.reserveScheduleRejection(state.ctx, state.stream, state.group, state.msgID, kind)
+	if err != nil {
+		// The reservation outcome is unknown: do NOT disposition a rejection on an
+		// ambiguous result. Leave the message pending.
+		state.log.Debug("Invocation state: schedule rejection reservation failed; leaving pending", "error", err)
+		return ScheduleAdmission{}, err
+	}
+	switch rr.outcome {
+	case scheduleRejectionReserved, scheduleRejectionAlreadyReserved:
+		// The reservation is in force (this call wrote it, or an earlier delivery
+		// did): the stored kind is authoritative.
+		return ScheduleAdmission{Rejected: true, Rejection: rr.kind}, nil
+	case scheduleRejectionTerminal:
+		// The message's hash is terminal-retained (its message already left the
+		// PEL): nothing to reject. A zero admission tells the caller to ACK
+		// idempotently.
+		return ScheduleAdmission{}, nil
+	case scheduleRejectionAdmitted, scheduleRejectionInFlight, scheduleRejectionComplete, scheduleRejectionExhausted:
+		// An admitted invocation exists (a pinned descriptor and/or an invocation
+		// marker). This caller cannot execute an adopted descriptor (its app is
+		// absent), so complete the marker's real disposition: active/no marker →
+		// pending; exhausted → the still-owed invocations (DLQ then ACK); complete
+		// → the success tail (ACK).
+		return markerAdmission(rr.markerKind, rr.markers), nil
+	default:
+		return ScheduleAdmission{}, fmt.Errorf("invocation state: unexpected schedule rejection outcome %d", rr.outcome)
+	}
+}
+
+// markerAdmission maps a reserve scan's marker classification to the runner's
+// disposition, shared by the pinned-descriptor and no-descriptor reserve paths so
+// both resolve a terminal marker identically. An ACTIVE marker (or none, i.e. a
+// pinned descriptor whose attempt has not reached a terminal marker) keeps the
+// message PENDING; an exhausted marker reports the still-owed invocations (or
+// pending when the identity is unattributable); a complete marker is the success
+// tail (a zero admission → ACK).
+func markerAdmission(kind scheduleMarkerKind, markers []scheduleMarker) ScheduleAdmission {
+	switch kind {
+	case scheduleMarkerExhausted:
+		if ex := exhaustedInvocationsFromMarkers(markers); len(ex) > 0 {
+			return ScheduleAdmission{ExhaustedInvocations: ex}
+		}
+		return ScheduleAdmission{InFlight: true}
+	case scheduleMarkerComplete:
+		return ScheduleAdmission{}
+	default: // scheduleMarkerActive or scheduleMarkerNone
+		return ScheduleAdmission{InFlight: true}
+	}
+}
+
+// exhaustedInvocationsFromMarkers converts the reserve scan's exhausted markers
+// into the runner's per-invocation exhaustion metadata. Each marker's invocation
+// is the "<app>/<handler>" hash field it was recorded under; a field without a
+// separator (or an empty component, or a non-positive attempt) is not a real
+// invocation identity, so it is skipped rather than dead-lettered as an
+// unattributable entry. The caller falls back to pending when nothing remains.
+func exhaustedInvocationsFromMarkers(markers []scheduleMarker) []ExhaustedInvocation {
+	out := make([]ExhaustedInvocation, 0, len(markers))
+	for _, m := range markers {
+		app, handler, ok := strings.Cut(m.Invocation, "/")
+		if !ok || app == "" || handler == "" || m.Attempt < 1 {
+			continue
+		}
+		out = append(out, ExhaustedInvocation{App: app, Handler: handler, Attempts: m.Attempt})
+	}
+	return out
 }
 
 // RecordFailure persists a failed attempt's retry backoff so a later delivery

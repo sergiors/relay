@@ -2486,6 +2486,100 @@ func obsoleteOccurrence(fnName, scheduleName string) error {
 	)
 }
 
+// rejectAppAbsent disposes of a schedule occurrence whose app is ABSENT from
+// THIS replica's registry. A local absence is NOT proof that the occurrence is
+// obsolete: another replica may already have ADMITTED it (pinning a descriptor
+// and claiming the invocation), and an app-absent replica cannot execute an
+// adopted descriptor — there is no image or executor. The terminal obsolete
+// rejection is therefore RESERVED atomically (stream.InvocationState
+// ReserveScheduleRejection), which refuses it when anything was already admitted:
+//
+//   - reserved / already reserved: the reserved kind is authoritative. An
+//     obsolete reservation is ACKed (never retried or dead-lettered); an invalid
+//     one — reserved earlier, when the app was still present here — is
+//     dead-lettered.
+//   - an ACTIVE marker (a pinned descriptor whose invocation is running/backoff,
+//     or a legacy no-descriptor active marker): the message stays PENDING
+//     (ErrInvocationNotEligible) so the attempt is not cancelled. It is never
+//     ACKed and never DLQ'd.
+//   - an exhausted marker (pinned descriptor OR legacy no-descriptor): the
+//     admitted invocation(s) already exhausted and still owe a per-invocation DLQ
+//     entry, so a typed HandlerExhaustedError is returned — the stream persists
+//     the missing entries (idempotently; an already-":dlq" marker is skipped) and
+//     then ACKs.
+//   - a pinned descriptor with no terminal marker, terminal-retained, or a "ok"
+//     marker: a pinned no-marker admission stays PENDING; a completed invocation
+//     (or a message already off the PEL) returns nil so the stream ACKs and
+//     terminal-retains idempotently.
+//
+// A reservation error means the outcome is unknown: the message is left pending,
+// exactly like an unconfirmed claim, so no rejection is dispositioned on an
+// ambiguous result.
+func (r *Runner) rejectAppAbsent(invState stream.InvocationState, fnName, scheduleName string) error {
+	admission, err := invState.ReserveScheduleRejection(stream.ScheduleRejectionObsolete)
+	if err != nil {
+		r.log.Warn("Schedule: app absent; rejection reservation failed; leaving pending",
+			"app", fnName,
+			"schedule", scheduleName,
+			"error", err,
+		)
+		return fmt.Errorf("%w: %v: %w: %w",
+			stream.ErrInvocationNotEligible, fnName,
+			stream.ErrInvocationClaimUnconfirmed, err)
+	}
+	if admission.InFlight {
+		// An ACTIVE admission already exists (a pinned descriptor admitted
+		// elsewhere, or a legacy active marker with no readable descriptor). This
+		// replica cannot resolve it, so keep the message pending: never reject,
+		// never ACK/DLQ.
+		r.log.Debug("Schedule: app absent here but the occurrence is admitted; leaving pending",
+			"app", fnName,
+			"schedule", scheduleName,
+		)
+		return stream.ErrInvocationNotEligible
+	}
+	if len(admission.ExhaustedInvocations) > 0 {
+		// An exhausted marker owns the message (a pinned descriptor whose
+		// invocation exhausted before its DLQ write, or a legacy no-descriptor
+		// exhausted marker): the admitted invocation(s) already exhausted and still
+		// owe a per-invocation DLQ entry. Return the typed exhaustion error so the
+		// stream persists the missing entries (idempotently — an already-":dlq"
+		// marker is skipped) and then ACKs. This is never a rejection and never
+		// leaves the disposition stuck.
+		r.log.Warn("Schedule: app absent here; exhausted invocation owed a DLQ entry; routing to DLQ",
+			"app", fnName,
+			"schedule", scheduleName,
+			"invocations", len(admission.ExhaustedInvocations),
+		)
+		return &stream.HandlerExhaustedError{Invocations: admission.ExhaustedInvocations}
+	}
+	if admission.Rejected {
+		if admission.Rejection == stream.ScheduleRejectionInvalid {
+			// Reserved invalid by an earlier delivery (when the app was still
+			// present): terminal and non-retryable, so dead-letter it.
+			r.log.Warn("Schedule: occurrence previously rejected as invalid; routing to DLQ",
+				"app", fnName,
+				"schedule", scheduleName,
+			)
+			return fmt.Errorf("%w: schedule app %q schedule %q was rejected as invalid before admission",
+				stream.ErrScheduleInvalid, fnName, scheduleName)
+		}
+		r.log.Warn("Schedule: occurrence obsolete; app removed; acknowledging",
+			"app", fnName,
+			"schedule", scheduleName,
+		)
+		return obsoleteOccurrence(fnName, scheduleName)
+	}
+	// A zero admission is either terminal-retained (the message already left the
+	// PEL) or a legacy no-descriptor "ok" marker (the admitted invocation already
+	// succeeded). Return nil so the stream ACKs and terminal-retains idempotently.
+	r.log.Debug("Schedule: app removed and occurrence already dispositioned; acknowledging",
+		"app", fnName,
+		"schedule", scheduleName,
+	)
+	return nil
+}
+
 // InvokeHandler executes a single schedule-occurrence invocation routed through
 // the stream. Its admission boundary is deliberate and documented here:
 //
@@ -2498,7 +2592,13 @@ func obsoleteOccurrence(fnName, scheduleName string) error {
 // claim, so a reload that completed during the wait is observed. A missing NAME
 // means the schedule was removed while the occurrence was pending; if nothing was
 // ever pinned the occurrence is OBSOLETE, and — with invocation state — the
-// stream ACKs it (never retried, never dead-lettered).
+// obsolete rejection is RESERVED atomically (never a descriptor or attempt) and
+// the stream ACKs it (never retried, never dead-lettered). A locally ABSENT app
+// takes the same reserve-only path: the reservation is refused when another
+// replica already admitted the occurrence, and the message then either stays
+// PENDING (an active no-descriptor attempt) or completes the admitted
+// invocation's real terminal disposition — a legacy "ok" marker is ACKed, and a
+// legacy exhausted marker is dead-lettered (idempotently) then ACKed.
 //
 // AT ADMISSION (the first successful claim): the resolved descriptor — schedule
 // name, handler, the CAPPED timeout, and the retry budget — is pinned ATOMICALLY
@@ -2589,14 +2689,19 @@ func (r *Runner) invokeHandler(
 	// the app is ABSENT (removed) — a present but unavailable app
 	// returns a non-nil entry whose Prepared() is nil. These two cases must be
 	// handled differently:
-	//   - absent (removed): an intentional configuration change, so an occurrence
-	//     for it is OBSOLETE and terminal (ACKed, never retried/DLQ'd) — but only
-	//     on the production state-carrying path; direct callers/tests keep the
-	//     legacy plain error. This holds even for an already-admitted occurrence:
-	//     with no app there is no image or executor to run, so it cannot
-	//     complete. (The schedule NAME, not the app, is what admission pins;
-	//     a still-present app whose schedule was removed is NOT obsolete once
-	//     admitted — see the descriptor path below.)
+	//   - absent (removed): an occurrence for it is OBSOLETE and terminal (ACKed,
+	//     never retried/DLQ'd) — but only on the production state-carrying path;
+	//     direct callers/tests keep the legacy plain error. Because a local
+	//     absence is NOT proof of removal (another replica may have ADMITTED the
+	//     occurrence), the obsolete rejection is RESERVED atomically first
+	//     (rejectAppAbsent), and an already-admitted invocation is completed
+	//     instead of rejected: a pinned descriptor admitted elsewhere or a legacy
+	//     ACTIVE no-descriptor marker leaves the message PENDING, a legacy "ok"
+	//     marker is ACKed, and a legacy exhausted marker is dead-lettered
+	//     (idempotently) then ACKed — this replica has no image or executor, so it
+	//     never executes the adopted descriptor. (The schedule NAME, not the
+	//     app, is what admission pins; a still-present app whose schedule was
+	//     removed is NOT obsolete once admitted — see the descriptor path below.)
 	//   - present but unavailable: temporary (build failed at startup/reconcile),
 	//     retryable exactly as today.
 	//
@@ -2611,11 +2716,11 @@ func (r *Runner) invokeHandler(
 	defer func() { pin.Release() }()
 	if pf == nil {
 		if hasState {
-			r.log.Warn("Schedule: occurrence obsolete; app removed; acknowledging",
-				"app", fnName,
-				"schedule", scheduleName,
-			)
-			return obsoleteOccurrence(fnName, scheduleName)
+			// The app is absent from THIS replica. A local absence is NOT proof
+			// that the occurrence is obsolete: another replica may already have
+			// ADMITTED it, so the terminal obsolete rejection must be RESERVED
+			// atomically, and only when nothing was admitted. See rejectAppAbsent.
+			return r.rejectAppAbsent(invState, fnName, scheduleName)
 		}
 		r.log.Warn("Schedule: app is not available", "app", fnName)
 		return fmt.Errorf("schedule invocation: app %q is not available", fnName)
@@ -2705,11 +2810,12 @@ func (r *Runner) invokeHandler(
 		pf, pin = fresh, freshPin
 	}
 	if pf == nil {
-		r.log.Warn("Schedule: occurrence obsolete; app removed; acknowledging",
-			"app", fnName,
-			"schedule", scheduleName,
-		)
-		return obsoleteOccurrence(fnName, scheduleName)
+		// The app was present at the stale lookup but is gone from the CURRENT
+		// registry now, after the slot wait. Use the SAME absent-app disposition as
+		// the initial lookup: reserve the obsolete rejection atomically, and only
+		// when nothing was admitted (a replica with the app may have admitted it
+		// while this one waited).
+		return r.rejectAppAbsent(invState, fnName, scheduleName)
 	}
 	if pf.Prepared() == nil {
 		// The app exists but its image could not be built yet: temporarily
@@ -2767,6 +2873,25 @@ func (r *Runner) invokeHandler(
 		}
 	}
 
+	// The admission input is either a PROPOSAL (a resolved descriptor) or a
+	// terminal REJECTION. When the occurrence is not admitted and the current
+	// template lets us propose nothing, it is terminally rejected: invalid when
+	// the schedule NAME exists but the occurrence can never be a firing of it,
+	// obsolete when the NAME (or the app) is gone. The rejection is RESERVED
+	// atomically at the admission boundary (stream.InvocationState.TryStartScheduled),
+	// which also refuses it if a concurrent replica admitted the occurrence first —
+	// so a rejection can never race a live admission into an ACK/DLQ (F-030). A
+	// pinned descriptor (admitted==true) always proposes, so an admitted
+	// occurrence is never rejected.
+	rejection := stream.ScheduleRejectionNone
+	if !known {
+		if invalidErr != nil {
+			rejection = stream.ScheduleRejectionInvalid
+		} else {
+			rejection = stream.ScheduleRejectionObsolete
+		}
+	}
+
 	// Cap the timeout exactly like Handle caps each rule's timeout (defense in
 	// depth; template validation enforces the cap at load). When the descriptor is
 	// pinned, its timeout was already capped at admission, so re-capping is a
@@ -2794,7 +2919,7 @@ func (r *Runner) invokeHandler(
 	// pinned descriptor is adopted and the admission retried, so the winning
 	// handler/timeout/retries is what executes and no second invocation field is
 	// ever claimed.
-	admission, err := invState.TryStartScheduled(desc, known, func(d stream.ScheduleDescriptor) string {
+	admission, err := invState.TryStartScheduled(desc, rejection, func(d stream.ScheduleDescriptor) string {
 		return fnName + "/" + d.Handler
 	})
 	if err != nil {
@@ -2812,30 +2937,70 @@ func (r *Runner) invokeHandler(
 			stream.ErrInvocationNotEligible, fnName+"/"+desc.Handler,
 			stream.ErrInvocationClaimUnconfirmed, err)
 	}
-	if admission.Obsolete {
-		// Nothing was ever pinned and the caller proposed nothing. For the
-		// schedule-occurrence entry point that can mean two distinct things:
+	if admission.Rejected {
+		// Nothing was ever pinned and none can be: the occurrence was terminally
+		// rejected before admission. For the schedule-occurrence entry point that
+		// can mean two distinct things, told apart by the RESERVED kind:
 		//
-		//   - the schedule NAME is gone from the current template: an intentional
-		//     removal, so the occurrence is OBSOLETE and the stream ACKs it; or
-		//   - the name exists but the occurrence is semantically invalid (a
-		//     non-firing scheduled_at, or an unparseable current cron): the claim
-		//     can never succeed, so it is INVALID and the stream dead-letters it.
+		//   - invalid: the schedule NAME exists but the occurrence can never be a
+		//     firing of it (a non-firing scheduled_at, or an unparseable current
+		//     cron). The claim can never succeed, so it is dead-lettered.
+		//   - obsolete: the NAME (or the app) is gone from the current template —
+		//     an intentional removal, so the occurrence is ACKed and never retried
+		//     or dead-lettered. Removal semantics are preserved exactly.
 		//
-		// invalidErr distinguishes them. Removal semantics are preserved exactly.
-		if invalidErr != nil {
-			r.log.Warn("Schedule: occurrence invalid; routing to DLQ",
+		// The RESERVED kind is authoritative: a redelivery (or a delivery whose
+		// current template has since changed) dispositions the occurrence exactly
+		// as the delivery that reserved it decided. invalidErr, when present, is
+		// the current delivery's detailed rejection message and is preferred for
+		// the DLQ reason; on a redelivery it may be nil because the template
+		// changed (or the occurrence was already reserved), so a generic invalid
+		// error is returned instead.
+		if admission.Rejection == stream.ScheduleRejectionInvalid {
+			if invalidErr != nil {
+				r.log.Warn("Schedule: occurrence invalid; routing to DLQ",
+					"app", fnName,
+					"schedule", scheduleName,
+					"reason", invalidErr,
+				)
+				return invalidErr
+			}
+			r.log.Warn("Schedule: occurrence previously rejected as invalid; routing to DLQ",
 				"app", fnName,
 				"schedule", scheduleName,
-				"reason", invalidErr,
 			)
-			return invalidErr
+			return fmt.Errorf("%w: schedule app %q schedule %q was rejected as invalid before admission",
+				stream.ErrScheduleInvalid, fnName, scheduleName)
 		}
 		r.log.Warn("Schedule: occurrence obsolete; schedule no longer in template; acknowledging",
 			"app", fnName,
 			"schedule", scheduleName,
 		)
 		return obsoleteOccurrence(fnName, scheduleName)
+	}
+	if admission.InFlight {
+		// An ACTIVE admission already exists but this caller must not act on it (a
+		// no-descriptor running/backoff marker, or a pinned descriptor with no
+		// terminal marker, detected by the rejection boundary). Keep the message
+		// pending so the attempt is not cancelled: never ACK, never DLQ.
+		r.log.Debug("Schedule: admission in flight without an adoptable descriptor; leaving pending",
+			"app", fnName,
+			"schedule", scheduleName,
+		)
+		return stream.ErrInvocationNotEligible
+	}
+	if len(admission.ExhaustedInvocations) > 0 {
+		// An exhausted marker owns the message (the schedule NAME was removed but
+		// the occurrence was admitted — under a pinned descriptor or the legacy
+		// pre-pinning path). The admitted invocation(s) still owe a per-invocation
+		// DLQ entry, so return the typed exhaustion error: the stream persists the
+		// missing entries (idempotently) and then ACKs.
+		r.log.Warn("Schedule: exhausted invocation owed a DLQ entry; routing to DLQ",
+			"app", fnName,
+			"schedule", scheduleName,
+			"invocations", len(admission.ExhaustedInvocations),
+		)
+		return &stream.HandlerExhaustedError{Invocations: admission.ExhaustedInvocations}
 	}
 
 	// The descriptor that owns the message (adopted on a lost race, else our own).

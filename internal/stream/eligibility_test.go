@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -64,6 +65,10 @@ type fakeInvocationStore struct {
 	// (one per persisted invocation/placeholder), so tests can assert the atomic
 	// append without a real Redis stream.
 	dlqAppends []dlqAppend
+	// rejection models the reserved scheduleRejectionField: a terminal
+	// pre-admission rejection recorded by reserveScheduleRejection. A non-none
+	// value makes the message un-admittable, mirroring the real reservation.
+	rejection ScheduleRejection
 }
 
 // dlqAppend is one DLQ entry the fake persistDLQ appended: the target stream,
@@ -221,6 +226,9 @@ func (f *fakeInvocationStore) tryStartScheduled(
 		d, ok := replyDescriptor()
 		return scheduleStartResult{outcome: scheduleStartTerminal, pinned: d, hasPinned: ok}, nil
 	}
+	if f.rejection != ScheduleRejectionNone {
+		return scheduleStartResult{outcome: scheduleStartRejected, rejection: f.rejection}, nil
+	}
 	if hasPinned {
 		if proposed == "" || proposed != pinnedStr {
 			return scheduleStartResult{outcome: scheduleStartConflict, pinned: pinned, hasPinned: true}, nil
@@ -258,6 +266,95 @@ func (f *fakeInvocationStore) tryStartScheduled(
 	claim := InvocationClaim{Attempt: attempt, Token: token}
 	f.fields[invocation] = runningValue(deadline, claim)
 	return scheduleStartResult{outcome: scheduleStartStarted, claim: claim, pinned: pinned, hasPinned: hasPinned}, nil
+}
+
+// reserveScheduleRejection models reserveScheduleRejectionScript: it refuses the
+// rejection when the hash is terminal-retained, or an invocation marker exists —
+// ACTIVE (in-flight: keep pending), TERMINAL exhausted (DLQ the still-owed
+// invocations), or TERMINAL "ok" (ACK) — whether or not a descriptor is pinned
+// (a pinned descriptor is returned for adoption AND its marker classified). It
+// returns an existing reservation unchanged, and otherwise records the
+// reservation so a later admission is refused. Active wins over terminal,
+// mirroring the script.
+func (f *fakeInvocationStore) reserveScheduleRejection(
+	_ context.Context,
+	_, _, _ string,
+	kind ScheduleRejection,
+) (scheduleRejectionResult, error) {
+	if kind == ScheduleRejectionNone {
+		return scheduleRejectionResult{}, errNoRejectionKind
+	}
+	if f.readErr != nil {
+		return scheduleRejectionResult{}, f.readErr
+	}
+	if f.terminalRetained() {
+		return scheduleRejectionResult{outcome: scheduleRejectionTerminal}, nil
+	}
+	if f.rejection != ScheduleRejectionNone {
+		return scheduleRejectionResult{outcome: scheduleRejectionAlreadyReserved, kind: f.rejection}, nil
+	}
+	mk, markers := f.classifyMarkers()
+	if pinnedStr := f.fields[scheduleField]; pinnedStr != "" {
+		// A descriptor is pinned (raw presence, mirroring the script's HEXISTS):
+		// the rejection is refused and the pinned descriptor returned for
+		// adoption, together with the invocation marker's classification.
+		pinned, hasPinned := decodeScheduleDescriptor(pinnedStr)
+		return scheduleRejectionResult{
+			outcome:    scheduleRejectionAdmitted,
+			pinned:     pinned,
+			hasPinned:  hasPinned,
+			markerKind: mk,
+			markers:    markers,
+		}, nil
+	}
+	switch mk {
+	case scheduleMarkerActive:
+		return scheduleRejectionResult{outcome: scheduleRejectionInFlight, markerKind: mk}, nil
+	case scheduleMarkerExhausted:
+		return scheduleRejectionResult{outcome: scheduleRejectionExhausted, markerKind: mk, markers: markers}, nil
+	case scheduleMarkerComplete:
+		return scheduleRejectionResult{outcome: scheduleRejectionComplete, markerKind: mk}, nil
+	}
+	f.rejection = kind
+	return scheduleRejectionResult{outcome: scheduleRejectionReserved, kind: kind}, nil
+}
+
+// classifyMarkers mirrors the reserve script's value scan: it classifies the
+// invocation marker(s) present (skipping the reserved descriptor field) with the
+// fixed precedence active > exhausted > complete > none, returning the exhausted
+// markers' invocation+attempt so a caller can dead-letter them.
+func (f *fakeInvocationStore) classifyMarkers() (scheduleMarkerKind, []scheduleMarker) {
+	active := false
+	complete := false
+	var exhausted []scheduleMarker
+	for field, v := range f.fields {
+		if field == scheduleField {
+			continue
+		}
+		k, _, attempts, ok := parseInvocationState(v)
+		if !ok {
+			continue
+		}
+		switch k {
+		case kindRunning, kindNextAttempt:
+			active = true
+		case kindComplete:
+			complete = true
+		case kindExhausted:
+			exhausted = append(exhausted, scheduleMarker{Invocation: field, Attempt: attempts})
+		}
+	}
+	if active {
+		return scheduleMarkerActive, nil
+	}
+	if len(exhausted) > 0 {
+		sort.Slice(exhausted, func(i, j int) bool { return exhausted[i].Invocation < exhausted[j].Invocation })
+		return scheduleMarkerExhausted, exhausted
+	}
+	if complete {
+		return scheduleMarkerComplete, nil
+	}
+	return scheduleMarkerNone, nil
 }
 
 func (f *fakeInvocationStore) finishFailure(

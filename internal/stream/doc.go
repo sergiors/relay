@@ -255,5 +255,20 @@
 // or dead-lettered. A ScheduleRunner that reports ErrScheduleInvalid (the
 // occurrence is well-formed but is not a real firing of the current schedule
 // definition) causes the message to be dead-lettered — an invalid claim is
-// terminal and is never retried or ACKed as success.
+// terminal and is never retried or ACKed as success. Either rejection is
+// RESERVED in the message's invocation-state hash before it is reported, so it
+// is atomic against a concurrent admission: a rejection arriving after another
+// replica admitted the occurrence is refused and adopts the admitted descriptor
+// instead, and a reserved rejection permanently prevents any later admission
+// (F-030). A replica whose app is absent reserves the obsolete rejection through
+// the reserve-only boundary (InvocationState.ReserveScheduleRejection) instead of
+// adopting, because it can never execute an adopted descriptor: an ACTIVE marker
+// (running/backoff, whether or not a descriptor is pinned) keeps the message
+// pending. A TERMINAL marker completes the admitted invocation's real
+// disposition instead of being cancelled — a "ok" marker is ACKed, and an
+// exhausted marker is dead-lettered (idempotently — an already-":dlq" marker is
+// skipped) and then ACKed — including when a descriptor is pinned (a
+// current-version delivery pinned + claimed, then completed/exhausted but crashed
+// before its ACK/DLQ). A rejection reservation can therefore never leave a
+// terminal disposition stuck or drop a DLQ entry.
 package stream

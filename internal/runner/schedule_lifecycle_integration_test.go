@@ -680,6 +680,17 @@ func TestIntegrationScheduleObsoleteAppRemoved(t *testing.T) {
 	e.eventually("obsolete schedule invocation-state key not leaked", func() bool {
 		return e.notLeaked(id)
 	})
+	// The app-absent ACK is a RESERVED obsolete rejection (F-030): the durable
+	// reservation outweighs a concurrent admission and survives the terminal
+	// retention, so a retry can never be raced into an admission. Wait for the
+	// terminal-retained hash (only a real delivery + ACK produces it) so the read
+	// cannot race an undelivered message.
+	e.eventually("obsolete occurrence terminal-retained", func() bool {
+		return e.isRetained(id)
+	})
+	if v, err := e.client.HGet(context.Background(), e.invocationKey(id), reservedScheduleRejectionField).Result(); err != nil || v != "obsolete" {
+		t.Fatalf("reservation = (%q,%v), want \"obsolete\" (an app-absent ACK must be reserved)", v, err)
+	}
 	if got := exec.count(); got != 0 {
 		t.Fatalf("executor calls = %d, want 0 (removed function must not execute)", got)
 	}
@@ -1097,4 +1108,453 @@ func streamEncodeDescriptor(t *testing.T, d streamScheduleDescriptor) string {
 		":" + strconv.Itoa(d.Retries) +
 		":" + base64.RawURLEncoding.EncodeToString([]byte(d.Schedule)) +
 		":" + base64.RawURLEncoding.EncodeToString([]byte(d.Handler))
+}
+
+// reservedScheduleRejectionField mirrors the stream package's reserved
+// scheduleRejectionField ("__schedule_rejected"), which the runner integration
+// tests seed directly to simulate a rejection reserved by an earlier delivery.
+const reservedScheduleRejectionField = "__schedule_rejected"
+
+// TestIntegrationScheduleReservedInvalidRetryCompletesDLQ pins the F-030 retry
+// contract end to end: an INVALID rejection reserved by a delivery that crashed
+// BEFORE its DLQ write is honored by a later delivery — the occurrence is
+// dead-lettered and the message ACKed — even though the current template would
+// have admitted the (valid) occurrence. The handler never executes.
+func TestIntegrationScheduleReservedInvalidRetryCompletesDLQ(t *testing.T) {
+	_ = redisAvailable(t)
+	exec := &stateAwareExecutor{}
+	r := registerScheduleFn(t, exec, 4)
+	e := newScheduleEnv(t, r)
+	// A valid whole-minute firing: the current template WOULD admit it.
+	o := scheduleOcc(time.Date(2026, 9, 4, 8, 0, 0, 0, time.UTC))
+	id := e.xadd(o)
+	// Simulate the crashed delivery: the rejection is reserved, no DLQ entry was
+	// written, and the message is still pending.
+	if err := e.client.HSet(context.Background(), e.invocationKey(id), reservedScheduleRejectionField, "invalid").Err(); err != nil {
+		t.Fatalf("seed reservation: %v", err)
+	}
+	e.start()
+
+	e.eventually("reserved-invalid occurrence DLQ'd", func() bool { return e.inDlq(id) })
+	e.eventually("reserved-invalid occurrence acked (gone from PEL)", func() bool {
+		_, ok := e.pending(id)
+		return !ok
+	})
+	if got := exec.count(); got != 0 {
+		t.Fatalf("executor calls = %d, want 0 (a reserved occurrence must never run)", got)
+	}
+	m, ok := e.dlqGet()[id]
+	if !ok {
+		t.Fatalf("expected a DLQ entry for %s", id)
+	}
+	reason, _ := m.Values["reason"].(string)
+	if !strings.Contains(reason, stream.ErrScheduleInvalid.Error()) {
+		t.Fatalf("DLQ reason = %q, want it to name the invalid rejection", reason)
+	}
+	// Exactly one entry (no duplicate on the retry).
+	entries := 0
+	for _, msg := range e.dlqGet() {
+		if msg.Values["original_id"] == id {
+			entries++
+		}
+	}
+	if entries != 1 {
+		t.Fatalf("DLQ entries for %s = %d, want 1", id, entries)
+	}
+}
+
+// TestIntegrationScheduleReservedObsoleteRetryAcks pins the obsolete half: a
+// reserved OBSOLETE rejection is ACKed on the retry — never dead-lettered, never
+// executed — even though the current template would admit the occurrence.
+func TestIntegrationScheduleReservedObsoleteRetryAcks(t *testing.T) {
+	_ = redisAvailable(t)
+	exec := &stateAwareExecutor{}
+	r := registerScheduleFn(t, exec, 4)
+	e := newScheduleEnv(t, r)
+	o := scheduleOcc(time.Date(2026, 9, 4, 9, 0, 0, 0, time.UTC))
+	id := e.xadd(o)
+	if err := e.client.HSet(context.Background(), e.invocationKey(id), reservedScheduleRejectionField, "obsolete").Err(); err != nil {
+		t.Fatalf("seed reservation: %v", err)
+	}
+	e.start()
+
+	e.eventually("reserved-obsolete occurrence acked (gone from PEL)", func() bool {
+		_, ok := e.pending(id)
+		return !ok
+	})
+	e.eventually("reserved-obsolete occurrence not DLQ'd", func() bool {
+		if _, ok := e.pending(id); ok {
+			return false
+		}
+		return !e.inDlq(id)
+	})
+	if got := exec.count(); got != 0 {
+		t.Fatalf("executor calls = %d, want 0 (a reserved occurrence must never run)", got)
+	}
+}
+
+// TestIntegrationScheduleInvalidOccurrenceReservesRejection pins that the FIRST
+// delivery of an invalid occurrence records the durable reservation in the
+// invocation-state hash (it survives the terminal ACK's retention), so a retry
+// can never be raced into an admission.
+func TestIntegrationScheduleInvalidOccurrenceReservesRejection(t *testing.T) {
+	_ = redisAvailable(t)
+	exec := &stateAwareExecutor{}
+	r := registerScheduleFn(t, exec, 4)
+	e := newScheduleEnv(t, r)
+	// A non-firing instant (:30s) of the every-minute schedule.
+	o := scheduleOcc(time.Date(2026, 9, 4, 10, 0, 30, 0, time.UTC))
+	id := e.xadd(o)
+	e.start()
+
+	e.eventually("invalid occurrence DLQ'd", func() bool { return e.inDlq(id) })
+	e.eventually("invalid occurrence acked (gone from PEL)", func() bool {
+		_, ok := e.pending(id)
+		return !ok
+	})
+	if got := exec.count(); got != 0 {
+		t.Fatalf("executor calls = %d, want 0 (an invalid occurrence must never run)", got)
+	}
+	v, err := e.client.HGet(context.Background(), e.invocationKey(id), reservedScheduleRejectionField).Result()
+	if err != nil || v != "invalid" {
+		t.Fatalf("reservation = (%q,%v), want \"invalid\"", v, err)
+	}
+}
+
+// scheduleInvocationField is the "<app>/<handler>" invocation-state field the
+// runner integration apps record, used to seed legacy no-descriptor markers.
+const scheduleInvocationField = scheduleFnName + "/" + scheduleHandler
+
+// assertLegacyMarkerUntouched asserts the seeded legacy invocation marker is
+// unchanged and no rejection reservation was written over it.
+func assertLegacyMarkerUntouched(t *testing.T, e *scheduleEnv, id, marker string) {
+	t.Helper()
+	v, err := e.client.HGet(context.Background(), e.invocationKey(id), scheduleInvocationField).Result()
+	if err != nil || v != marker {
+		t.Fatalf("marker = (%q,%v), want %q (never overwritten)", v, err, marker)
+	}
+	if n, err := e.client.HExists(context.Background(), e.invocationKey(id), reservedScheduleRejectionField).Result(); err != nil || n {
+		t.Fatalf("rejection field present = (%v,%v), want absent (no reservation over an admitted marker)", n, err)
+	}
+}
+
+// staysPending asserts the message stays in the PEL and is never dead-lettered
+// for the whole window, so a "must not ACK/DLQ" contract is observed over time
+// rather than at one instant.
+func (e *scheduleEnv) staysPending(t *testing.T, id string, window time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		if _, ok := e.pending(id); !ok {
+			t.Fatalf("message %s left the PEL (ACKed) while it must stay pending", id)
+		}
+		if e.inDlq(id) {
+			t.Fatalf("message %s was dead-lettered while it must stay pending", id)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// TestIntegrationScheduleLegacyOKWithoutDescriptorAcked pins the app-absent
+// legacy success path: a no-descriptor "ok" marker (the pre-descriptor crash
+// window where the invocation succeeded but its ACK never ran) is ACKed
+// idempotently when the app is absent — never left PEL-pending forever, never
+// DLQ'd — and the marker is never overwritten by a reservation.
+func TestIntegrationScheduleLegacyOKWithoutDescriptorAcked(t *testing.T) {
+	_ = redisAvailable(t)
+	exec := &stateAwareExecutor{}
+	r := registerScheduleFn(t, exec, 4)
+	e := newScheduleEnv(t, r)
+	o := scheduleOcc(time.Date(2026, 9, 5, 8, 0, 0, 0, time.UTC))
+	id := e.xadd(o)
+	if err := e.hsetState(id, "ok"); err != nil {
+		t.Fatalf("seed ok marker: %v", err)
+	}
+	// The app is absent on this replica.
+	r.Registry().Replace(scheduleFnName, nil)
+	e.start()
+
+	// Wait for the terminal-retained hash (only a real delivery + ACK produces
+	// it), so the assertion cannot race an undelivered message.
+	e.eventually("legacy ok occurrence acked and terminal-retained", func() bool {
+		return e.isRetained(id)
+	})
+	e.eventually("legacy ok occurrence not DLQ'd", func() bool {
+		if _, ok := e.pending(id); ok {
+			return false
+		}
+		return !e.inDlq(id)
+	})
+	if got := exec.count(); got != 0 {
+		t.Fatalf("executor calls = %d, want 0 (a legacy ok occurrence must never run)", got)
+	}
+	assertLegacyMarkerUntouched(t, e, id, "ok")
+}
+
+// TestIntegrationScheduleLegacyExhaustedWithoutDescriptorDLQOnce pins the
+// app-absent legacy exhaustion path: a no-descriptor exhausted marker still owes
+// its per-invocation DLQ entry, so the occurrence is dead-lettered exactly once
+// (with the exact app/handler and the marker's attempt) and then ACKed. The
+// marker is upgraded to ":dlq", never overwritten by a reservation.
+func TestIntegrationScheduleLegacyExhaustedWithoutDescriptorDLQOnce(t *testing.T) {
+	_ = redisAvailable(t)
+	exec := &stateAwareExecutor{}
+	r := registerScheduleFn(t, exec, 4)
+	e := newScheduleEnv(t, r)
+	o := scheduleOcc(time.Date(2026, 9, 5, 9, 0, 0, 0, time.UTC))
+	id := e.xadd(o)
+	if err := e.hsetState(id, "exhausted:2:deadbeef"); err != nil {
+		t.Fatalf("seed exhausted marker: %v", err)
+	}
+	r.Registry().Replace(scheduleFnName, nil)
+	e.start()
+
+	e.eventually("legacy exhausted occurrence DLQ'd", func() bool { return e.inDlq(id) })
+	e.eventually("legacy exhausted occurrence acked (gone from PEL)", func() bool {
+		_, ok := e.pending(id)
+		return !ok
+	})
+	if got := exec.count(); got != 0 {
+		t.Fatalf("executor calls = %d, want 0 (a legacy exhausted occurrence must never run)", got)
+	}
+	entries := 0
+	for _, msg := range e.dlqGet() {
+		if msg.Values["original_id"] == id {
+			entries++
+		}
+	}
+	if entries != 1 {
+		t.Fatalf("DLQ entries for %s = %d, want exactly 1", id, entries)
+	}
+	m, ok := e.dlqGet()[id]
+	if !ok {
+		t.Fatalf("expected a DLQ entry for %s", id)
+	}
+	if m.Values["app"] != scheduleFnName || m.Values["handler"] != scheduleHandler {
+		t.Fatalf("DLQ app/handler = (%v,%v), want (%s,%s)",
+			m.Values["app"], m.Values["handler"], scheduleFnName, scheduleHandler)
+	}
+	if m.Values["handler_attempts"] != "2" {
+		t.Fatalf("handler_attempts = %v, want 2 (the marker's retained attempt)", m.Values["handler_attempts"])
+	}
+	assertLegacyMarkerUntouched(t, e, id, "exhausted:2:deadbeef:dlq")
+}
+
+// TestIntegrationScheduleLegacyExhaustedDLQAlreadyPersistedAcks pins the
+// idempotent half: an exhausted marker that already carries ":dlq" (its entry was
+// persisted by an earlier delivery) is ACKed with NO duplicate DLQ write.
+func TestIntegrationScheduleLegacyExhaustedDLQAlreadyPersistedAcks(t *testing.T) {
+	_ = redisAvailable(t)
+	exec := &stateAwareExecutor{}
+	r := registerScheduleFn(t, exec, 4)
+	e := newScheduleEnv(t, r)
+	o := scheduleOcc(time.Date(2026, 9, 5, 10, 0, 0, 0, time.UTC))
+	id := e.xadd(o)
+	if err := e.hsetState(id, "exhausted:2:deadbeef:dlq"); err != nil {
+		t.Fatalf("seed exhausted:dlq marker: %v", err)
+	}
+	r.Registry().Replace(scheduleFnName, nil)
+	e.start()
+
+	// Wait for the terminal-retained hash (only a real delivery + ACK produces
+	// it), so the assertion cannot race an undelivered message.
+	e.eventually("legacy exhausted:dlq occurrence acked and terminal-retained", func() bool {
+		return e.isRetained(id)
+	})
+	// The marker already recorded persistence, so no NEW entry is appended.
+	if n, err := e.client.XLen(context.Background(), e.dlq).Result(); err != nil || n != 0 {
+		t.Fatalf("DLQ length = (%d,%v), want 0 (no duplicate write for an already-persisted entry)", n, err)
+	}
+	if got := exec.count(); got != 0 {
+		t.Fatalf("executor calls = %d, want 0", got)
+	}
+	assertLegacyMarkerUntouched(t, e, id, "exhausted:2:deadbeef:dlq")
+}
+
+// TestIntegrationScheduleLegacyActiveMarkerStaysPending pins the active-wins
+// precedence end to end: an app-absent occurrence whose hash carries an ACTIVE
+// running marker AND a terminal "ok" marker stays PENDING — never ACKed, never
+// DLQ'd, no reservation written — because the active attempt may still complete.
+func TestIntegrationScheduleLegacyActiveMarkerStaysPending(t *testing.T) {
+	_ = redisAvailable(t)
+	exec := &stateAwareExecutor{}
+	r := registerScheduleFn(t, exec, 4)
+	e := newScheduleEnv(t, r)
+	o := scheduleOcc(time.Date(2026, 9, 5, 11, 0, 0, 0, time.UTC))
+	id := e.xadd(o)
+	if err := e.hsetState(id, runningValue(time.Now().Add(time.Hour), 1)); err != nil {
+		t.Fatalf("seed active marker: %v", err)
+	}
+	if err := e.client.HSet(context.Background(), e.invocationKey(id), scheduleFnName+"/other.handler", "ok").Err(); err != nil {
+		t.Fatalf("seed terminal marker: %v", err)
+	}
+	r.Registry().Replace(scheduleFnName, nil)
+	e.start()
+
+	// Wait for the first delivery (the active marker keeps it pending), then
+	// assert it stays pending and un-DLQed for a bounded window.
+	e.eventually("legacy active occurrence delivered (in PEL)", func() bool {
+		_, ok := e.pending(id)
+		return ok
+	})
+	e.staysPending(t, id, time.Second)
+	if got := exec.count(); got != 0 {
+		t.Fatalf("executor calls = %d, want 0", got)
+	}
+	if n, err := e.client.HExists(context.Background(), e.invocationKey(id), reservedScheduleRejectionField).Result(); err != nil || n {
+		t.Fatalf("rejection field present = (%v,%v), want absent (an active marker must win over a rejection)", n, err)
+	}
+}
+
+// pinnedScheduleField mirrors the stream package's reserved scheduleField
+// ("__schedule").
+const pinnedScheduleField = "__schedule"
+
+// seedPinnedTerminal seeds the CURRENT-VERSION crash window: a descriptor is
+// pinned (with the app's real schedule/handler) AND the invocation carries a
+// terminal marker, so an app-absent reserve-only delivery must resolve the marker
+// rather than report a blanket "admitted".
+func seedPinnedTerminal(t *testing.T, e *scheduleEnv, id, marker string) {
+	t.Helper()
+	desc := streamEncodeDescriptor(t, streamScheduleDescriptor{
+		Schedule: scheduleHandler,
+		Handler:  scheduleHandler,
+		Timeout:  time.Minute,
+		Retries:  4,
+	})
+	if err := e.client.HSet(context.Background(), e.invocationKey(id), pinnedScheduleField, desc).Err(); err != nil {
+		t.Fatalf("seed pinned descriptor: %v", err)
+	}
+	if err := e.hsetState(id, marker); err != nil {
+		t.Fatalf("seed terminal marker: %v", err)
+	}
+}
+
+// TestIntegrationSchedulePinnedOKAcked pins the descriptor-pinned success crash
+// window: a descriptor is pinned and the invocation is marked "ok", but the ACK
+// never ran and the app is now absent. The occurrence must be ACKed and
+// terminal-retained (never left PEL-pending forever), with no reservation
+// overwriting the marker.
+func TestIntegrationSchedulePinnedOKAcked(t *testing.T) {
+	_ = redisAvailable(t)
+	exec := &stateAwareExecutor{}
+	r := registerScheduleFn(t, exec, 4)
+	e := newScheduleEnv(t, r)
+	o := scheduleOcc(time.Date(2026, 9, 6, 8, 0, 0, 0, time.UTC))
+	id := e.xadd(o)
+	seedPinnedTerminal(t, e, id, "ok")
+	r.Registry().Replace(scheduleFnName, nil)
+	e.start()
+
+	e.eventually("pinned ok occurrence acked and terminal-retained", func() bool {
+		return e.isRetained(id)
+	})
+	if n, err := e.client.XLen(context.Background(), e.dlq).Result(); err != nil || n != 0 {
+		t.Fatalf("DLQ length = (%d,%v), want 0 (a pinned ok is never dead-lettered)", n, err)
+	}
+	if got := exec.count(); got != 0 {
+		t.Fatalf("executor calls = %d, want 0", got)
+	}
+	assertLegacyMarkerUntouched(t, e, id, "ok")
+}
+
+// TestIntegrationSchedulePinnedExhaustedMissingDLQDLQOnce pins the descriptor-
+// pinned exhaustion crash window: a descriptor is pinned and the invocation is
+// exhausted, but the DLQ entry was never persisted and the app is now absent. The
+// occurrence must be dead-lettered exactly once (correct app/handler/attempt),
+// the marker upgraded to ":dlq", and the message ACKed.
+func TestIntegrationSchedulePinnedExhaustedMissingDLQDLQOnce(t *testing.T) {
+	_ = redisAvailable(t)
+	exec := &stateAwareExecutor{}
+	r := registerScheduleFn(t, exec, 4)
+	e := newScheduleEnv(t, r)
+	o := scheduleOcc(time.Date(2026, 9, 6, 9, 0, 0, 0, time.UTC))
+	id := e.xadd(o)
+	seedPinnedTerminal(t, e, id, "exhausted:2:deadbeef")
+	r.Registry().Replace(scheduleFnName, nil)
+	e.start()
+
+	e.eventually("pinned exhausted occurrence DLQ'd", func() bool { return e.inDlq(id) })
+	e.eventually("pinned exhausted occurrence acked (gone from PEL)", func() bool {
+		_, ok := e.pending(id)
+		return !ok
+	})
+	if got := exec.count(); got != 0 {
+		t.Fatalf("executor calls = %d, want 0", got)
+	}
+	entries := 0
+	for _, msg := range e.dlqGet() {
+		if msg.Values["original_id"] == id {
+			entries++
+		}
+	}
+	if entries != 1 {
+		t.Fatalf("DLQ entries for %s = %d, want exactly 1", id, entries)
+	}
+	m, ok := e.dlqGet()[id]
+	if !ok {
+		t.Fatalf("expected a DLQ entry for %s", id)
+	}
+	if m.Values["app"] != scheduleFnName || m.Values["handler"] != scheduleHandler {
+		t.Fatalf("DLQ app/handler = (%v,%v), want (%s,%s)",
+			m.Values["app"], m.Values["handler"], scheduleFnName, scheduleHandler)
+	}
+	if m.Values["handler_attempts"] != "2" {
+		t.Fatalf("handler_attempts = %v, want 2 (the marker's retained attempt)", m.Values["handler_attempts"])
+	}
+	assertLegacyMarkerUntouched(t, e, id, "exhausted:2:deadbeef:dlq")
+}
+
+// TestIntegrationSchedulePinnedExhaustedDLQAlreadyPersistedAcks pins the
+// idempotent half for a pinned descriptor: an exhausted marker that already
+// carries ":dlq" is ACKed with NO duplicate DLQ write.
+func TestIntegrationSchedulePinnedExhaustedDLQAlreadyPersistedAcks(t *testing.T) {
+	_ = redisAvailable(t)
+	exec := &stateAwareExecutor{}
+	r := registerScheduleFn(t, exec, 4)
+	e := newScheduleEnv(t, r)
+	o := scheduleOcc(time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC))
+	id := e.xadd(o)
+	seedPinnedTerminal(t, e, id, "exhausted:2:deadbeef:dlq")
+	r.Registry().Replace(scheduleFnName, nil)
+	e.start()
+
+	e.eventually("pinned exhausted:dlq occurrence acked and terminal-retained", func() bool {
+		return e.isRetained(id)
+	})
+	if n, err := e.client.XLen(context.Background(), e.dlq).Result(); err != nil || n != 0 {
+		t.Fatalf("DLQ length = (%d,%v), want 0 (no duplicate write)", n, err)
+	}
+	if got := exec.count(); got != 0 {
+		t.Fatalf("executor calls = %d, want 0", got)
+	}
+	assertLegacyMarkerUntouched(t, e, id, "exhausted:2:deadbeef:dlq")
+}
+
+// TestIntegrationSchedulePinnedActiveStaysPending pins the descriptor-pinned
+// active branch: a descriptor is pinned and the invocation carries an ACTIVE
+// running marker (the claim may still complete), so an app-absent delivery must
+// keep the message PENDING — never ACK, never DLQ, no reservation.
+func TestIntegrationSchedulePinnedActiveStaysPending(t *testing.T) {
+	_ = redisAvailable(t)
+	exec := &stateAwareExecutor{}
+	r := registerScheduleFn(t, exec, 4)
+	e := newScheduleEnv(t, r)
+	o := scheduleOcc(time.Date(2026, 9, 6, 11, 0, 0, 0, time.UTC))
+	id := e.xadd(o)
+	seedPinnedTerminal(t, e, id, runningValue(time.Now().Add(time.Hour), 1))
+	r.Registry().Replace(scheduleFnName, nil)
+	e.start()
+
+	e.eventually("pinned active occurrence delivered (in PEL)", func() bool {
+		_, ok := e.pending(id)
+		return ok
+	})
+	e.staysPending(t, id, time.Second)
+	if got := exec.count(); got != 0 {
+		t.Fatalf("executor calls = %d, want 0", got)
+	}
+	if n, err := e.client.HExists(context.Background(), e.invocationKey(id), reservedScheduleRejectionField).Result(); err != nil || n {
+		t.Fatalf("rejection field present = (%v,%v), want absent (a pinned active marker must not be rejected)", n, err)
+	}
 }

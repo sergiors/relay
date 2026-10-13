@@ -235,9 +235,11 @@ func TestInvokeHandlerSlotTimeoutLeavesPending(t *testing.T) {
 
 // TestInvokeHandlerObsoleteAppRemoved verifies that on the production
 // (state-carrying) path, an occurrence for an app NO LONGER in the registry
-// returns a wrapped stream.ErrInvocationObsolete — the stream ACKs the message
-// instead of retrying it forever or dead-lettering it. No invocation-state
-// method may be called (the occurrence is obsolete before TryStart).
+// RESERVES a terminal OBSOLETE rejection (so a concurrent admission by another
+// replica cannot be raced into an ACK/DLQ) and returns a wrapped
+// stream.ErrInvocationObsolete — the stream ACKs the message instead of retrying
+// it forever or dead-lettering it. No handler attempt is claimed and no
+// descriptor is pinned.
 func TestInvokeHandlerObsoleteAppRemoved(t *testing.T) {
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
@@ -247,6 +249,9 @@ func TestInvokeHandlerObsoleteAppRemoved(t *testing.T) {
 	err := r.InvokeHandler(ctx, "1-0", "ghost", "sched", "index.run", []byte(`{}`))
 	if !errors.Is(err, stream.ErrInvocationObsolete) {
 		t.Fatalf("err = %v, want wrapped ErrInvocationObsolete", err)
+	}
+	if prog.rejection != stream.ScheduleRejectionObsolete {
+		t.Fatalf("reserved rejection = %v, want obsolete (the rejection must be reserved before the ACK)", prog.rejection)
 	}
 	if len(prog.attempts) != 0 || len(prog.marks) != 0 || len(prog.failures) != 0 || len(prog.exhausted) != 0 {
 		t.Fatalf("invocation state was touched: attempts=%v marks=%v failures=%v exhausted=%v",

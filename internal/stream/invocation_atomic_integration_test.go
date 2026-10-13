@@ -1217,8 +1217,11 @@ func TestIntegrationAtomicScheduleAdmissionAdoptsPinnedWithoutReclaim(t *testing
 }
 
 // TestIntegrationAtomicScheduleAdmissionNoDescriptorNoProposalObsolete pins the
-// never-admitted-removed case against real Redis: no descriptor pinned + no
-// proposal reports no-admission and writes nothing.
+// never-admitted-removed OBSERVATION against real Redis: no descriptor pinned +
+// no proposal reports no-admission and writes NOTHING. The observation is
+// deliberately write-free; the production path completes it with
+// reserveScheduleRejection (see TestIntegrationScheduleRejectionFirstRefusesAdmission),
+// which writes the durable reservation atomically against a concurrent admission.
 func TestIntegrationAtomicScheduleAdmissionNoDescriptorNoProposalObsolete(t *testing.T) {
 	cli := testutil.RequireRedis(t)
 	store, stream, group, msgID := atomicStateStore(t, cli)

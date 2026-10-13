@@ -75,7 +75,7 @@ func claimAfterCrash(t *testing.T, prog *fakeInvocationState, invocation string,
 // call InvokeHandler makes), producing the post-admission crash state.
 func admitAfterCrash(t *testing.T, prog *fakeInvocationState, desc stream.ScheduleDescriptor) {
 	t.Helper()
-	admission, err := prog.TryStartScheduled(desc, true, func(d stream.ScheduleDescriptor) string {
+	admission, err := prog.TryStartScheduled(desc, stream.ScheduleRejectionNone, func(d stream.ScheduleDescriptor) string {
 		return "fn/" + d.Handler
 	})
 	if err != nil {

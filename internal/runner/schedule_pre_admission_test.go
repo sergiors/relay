@@ -161,7 +161,8 @@ func TestInvokeHandlerPreAdmissionRefreshUsesReloadedSchedule(t *testing.T) {
 // TestInvokeHandlerPreAdmissionRefreshAppRemovedObsolete blocks an
 // occurrence in the slot wait, removes the FUNCTION, then releases the slot.
 // The pre-admission refresh observes the removal, so the occurrence is
-// obsolete: no execution, no descriptor, no state.
+// obsolete: the obsolete rejection is RESERVED (never a descriptor or attempt),
+// no execution happens, and the stream ACKs.
 func TestInvokeHandlerPreAdmissionRefreshAppRemovedObsolete(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		exec := newSchedLeaseExecutor()
@@ -187,6 +188,9 @@ func TestInvokeHandlerPreAdmissionRefreshAppRemovedObsolete(t *testing.T) {
 		err := <-done
 		if !errors.Is(err, stream.ErrInvocationObsolete) {
 			t.Fatalf("err = %v, want wrapped ErrInvocationObsolete", err)
+		}
+		if prog.rejection != stream.ScheduleRejectionObsolete {
+			t.Fatalf("reserved rejection = %v, want obsolete (the post-slot refresh must reserve, not just ACK)", prog.rejection)
 		}
 		if got := exec.callCount(); got != 0 {
 			t.Fatalf("executor calls = %d, want 0 (removed function must not run)", got)

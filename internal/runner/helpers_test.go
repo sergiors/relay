@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -548,7 +549,12 @@ type fakeInvocationState struct {
 	// written once, atomically with the first successful schedule admission, and
 	// is never changed while the message is recoverable.
 	scheduleDesc *stream.ScheduleDescriptor
-	now          func() time.Time
+	// rejection models the reserved scheduleRejectionField: a terminal
+	// pre-admission rejection (invalid or obsolete) recorded by the rejection
+	// boundary. A non-none value makes the message un-admittable, exactly like the
+	// real reservation.
+	rejection stream.ScheduleRejection
+	now       func() time.Time
 	// failures records the backoff passed to RecordFailure, for tests to assert
 	// the retry schedule.
 	failures []time.Duration
@@ -659,14 +665,18 @@ func (p *fakeInvocationState) ScheduleDescriptor() (stream.ScheduleDescriptor, b
 	return *p.scheduleDesc, true
 }
 
-// TryStartScheduled models the atomic schedule admission: it pins the caller's
-// descriptor on the first successful admission (only if none is pinned), and
-// adopts a descriptor already pinned by another delivery. It mirrors the real
-// handle's bounded adoption loop, including the conflict/adopt path, so runner
-// tests exercise the same single-winner semantics.
+// TryStartScheduled models the atomic schedule admission plus the rejection
+// boundary: it pins the caller's descriptor on the first successful admission
+// (only if none is pinned) and adopts a descriptor already pinned by another
+// delivery. When the caller can propose nothing (a non-none rejection) it models
+// reserveScheduleRejection: it refuses the rejection if a descriptor is already
+// pinned (admission-first: adopt it), returns an already-reserved kind, or
+// records the reservation (rejection-first) so a later admission is refused. It
+// mirrors the real handle's bounded adoption loop, including the conflict/adopt
+// path, so runner tests exercise the same single-winner semantics.
 func (p *fakeInvocationState) TryStartScheduled(
 	desc stream.ScheduleDescriptor,
-	known bool,
+	rejection stream.ScheduleRejection,
 	invocationFor func(stream.ScheduleDescriptor) string,
 ) (stream.ScheduleAdmission, error) {
 	p.mu.Lock()
@@ -674,17 +684,32 @@ func (p *fakeInvocationState) TryStartScheduled(
 	if p.startErr != nil {
 		return stream.ScheduleAdmission{}, p.startErr
 	}
-	if p.scheduleDesc != nil {
-		// A descriptor is pinned by an earlier delivery: it always wins. If the
-		// caller does not supply exactly it, adopt it and retry with it.
-		if !known || *p.scheduleDesc != desc {
-			desc = *p.scheduleDesc
-			known = true
+	if rejection != stream.ScheduleRejectionNone {
+		// Rejection path.
+		if p.rejection != stream.ScheduleRejectionNone {
+			return stream.ScheduleAdmission{Rejected: true, Rejection: p.rejection}, nil
 		}
+		if p.scheduleDesc == nil {
+			// A no-descriptor invocation marker: an admitted invocation always
+			// beats a rejection. Complete the real terminal disposition (or keep
+			// pending for an active marker).
+			if adm, ok := p.markerAdmission(); ok {
+				return adm, nil
+			}
+			p.rejection = rejection
+			return stream.ScheduleAdmission{Rejected: true, Rejection: rejection}, nil
+		}
+		// Admission-first: a descriptor is already pinned, so the rejection is
+		// refused and the pinned descriptor adopted.
+		desc = *p.scheduleDesc
 	}
-	if !known {
-		// Nothing is pinned and the caller has no descriptor: obsolete.
-		return stream.ScheduleAdmission{Obsolete: true}, nil
+	// A reservation (from any earlier delivery) makes the message un-admittable.
+	if p.rejection != stream.ScheduleRejectionNone {
+		return stream.ScheduleAdmission{Rejected: true, Rejection: p.rejection}, nil
+	}
+	if p.scheduleDesc != nil && desc != *p.scheduleDesc {
+		// A descriptor is pinned by an earlier delivery: it always wins. Adopt it.
+		desc = *p.scheduleDesc
 	}
 	invocation := invocationFor(desc)
 	// Reuse the TryStart marker semantics (complete/exhausted/protected/eligible).
@@ -716,6 +741,73 @@ func (p *fakeInvocationState) TryStartScheduled(
 		Claim:      stream.InvocationClaim{Attempt: attempt, Token: token},
 		Descriptor: desc,
 	}, nil
+}
+
+// ReserveScheduleRejection models the reserve-only rejection boundary used by an
+// app-absent replica: it records the terminal rejection when the message has no
+// pinned descriptor and no invocation marker, honors an existing reservation, and
+// reports the no-descriptor marker's disposition otherwise — InFlight (keep
+// pending) for an active marker or a pinned descriptor admitted by another
+// delivery, ExhaustedInvocations for a legacy exhausted marker (DLQ then ACK),
+// and a zero admission for a legacy "ok" marker (ACK). It never claims or starts
+// an invocation.
+func (p *fakeInvocationState) ReserveScheduleRejection(kind stream.ScheduleRejection) (stream.ScheduleAdmission, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.startErr != nil {
+		return stream.ScheduleAdmission{}, p.startErr
+	}
+	if p.rejection != stream.ScheduleRejectionNone {
+		return stream.ScheduleAdmission{Rejected: true, Rejection: p.rejection}, nil
+	}
+	// Classify any invocation marker first, whether or not a descriptor is pinned:
+	// a pinned descriptor can accompany a terminal marker (a current-version
+	// delivery pinned + claimed, then completed/exhausted before its ACK/DLQ).
+	if adm, ok := p.markerAdmission(); ok {
+		return adm, nil
+	}
+	if p.scheduleDesc != nil {
+		// A pinned descriptor with no marker: another delivery admitted the
+		// occurrence and its attempt is not terminal. Keep pending.
+		return stream.ScheduleAdmission{InFlight: true}, nil
+	}
+	p.rejection = kind
+	return stream.ScheduleAdmission{Rejected: true, Rejection: kind}, nil
+}
+
+// markerAdmission classifies the fake's no-descriptor invocation markers exactly
+// like the reserve scan: an ACTIVE marker (running / retry backoff) wins and keeps
+// the message pending; otherwise a legacy exhausted marker is reported as the
+// still-owed ExhaustedInvocations (sorted for determinism); otherwise a legacy
+// "ok" marker is a zero admission (ACK). ok=false means no marker exists.
+func (p *fakeInvocationState) markerAdmission() (stream.ScheduleAdmission, bool) {
+	if len(p.running) > 0 || len(p.nextAt) > 0 {
+		return stream.ScheduleAdmission{InFlight: true}, true
+	}
+	if len(p.exhausted) > 0 {
+		invocations := make([]string, 0, len(p.exhausted))
+		for inv := range p.exhausted {
+			invocations = append(invocations, inv)
+		}
+		sort.Strings(invocations)
+		ex := make([]stream.ExhaustedInvocation, 0, len(invocations))
+		for _, inv := range invocations {
+			app, handler, ok := strings.Cut(inv, "/")
+			if !ok || app == "" || handler == "" {
+				continue
+			}
+			ex = append(ex, stream.ExhaustedInvocation{App: app, Handler: handler, Attempts: p.exhausted[inv]})
+		}
+		if len(ex) > 0 {
+			return stream.ScheduleAdmission{ExhaustedInvocations: ex}, true
+		}
+		// An unattributable exhausted marker: never DLQ it; keep pending.
+		return stream.ScheduleAdmission{InFlight: true}, true
+	}
+	if len(p.done) > 0 {
+		return stream.ScheduleAdmission{}, true
+	}
+	return stream.ScheduleAdmission{}, false
 }
 
 // RecordFailure records the retry backoff for a failed attempt, gating the

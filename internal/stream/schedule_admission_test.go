@@ -53,7 +53,7 @@ func TestScheduleAdmissionFirstPinWinsAndAdopts(t *testing.T) {
 	p := consumerForStore(t, store)
 
 	old := ScheduleDescriptor{Schedule: "cleanup", Handler: "jobs.old", Timeout: 30 * time.Second, Retries: 4}
-	first, err := p.TryStartScheduled(old, true, func(d ScheduleDescriptor) string { return "fn/" + d.Handler })
+	first, err := p.TryStartScheduled(old, ScheduleRejectionNone, func(d ScheduleDescriptor) string { return "fn/" + d.Handler })
 	if err != nil {
 		t.Fatalf("first TryStartScheduled: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestScheduleAdmissionFirstPinWinsAndAdopts(t *testing.T) {
 	// A second replica proposes a different descriptor: it adopts jobs.old and,
 	// because the first attempt is still protected, is not started.
 	other := ScheduleDescriptor{Schedule: "cleanup", Handler: "jobs.new", Timeout: 10 * time.Second, Retries: 0}
-	second, err := p.TryStartScheduled(other, true, func(d ScheduleDescriptor) string { return "fn/" + d.Handler })
+	second, err := p.TryStartScheduled(other, ScheduleRejectionNone, func(d ScheduleDescriptor) string { return "fn/" + d.Handler })
 	if err != nil {
 		t.Fatalf("second TryStartScheduled: %v", err)
 	}
@@ -85,23 +85,58 @@ func TestScheduleAdmissionFirstPinWinsAndAdopts(t *testing.T) {
 
 // TestScheduleAdmissionNoDescriptorAndNoProposalIsObsolete pins the
 // never-admitted-removed case: with nothing pinned and no proposal, admission
-// reports obsolete and writes no state.
+// RESERVES the obsolete rejection and writes no descriptor or invocation field.
 func TestScheduleAdmissionNoDescriptorAndNoProposalIsObsolete(t *testing.T) {
 	store := newFakeInvocationStore(nil)
 	p := consumerForStore(t, store)
 
-	adm, err := p.TryStartScheduled(ScheduleDescriptor{}, false, func(d ScheduleDescriptor) string { return "fn/" + d.Handler })
+	adm, err := p.TryStartScheduled(ScheduleDescriptor{}, ScheduleRejectionObsolete, func(d ScheduleDescriptor) string { return "fn/" + d.Handler })
 	if err != nil {
 		t.Fatalf("TryStartScheduled: %v", err)
 	}
-	if !adm.Obsolete {
-		t.Fatalf("admission = %+v, want obsolete", adm)
+	if !adm.Rejected || adm.Rejection != ScheduleRejectionObsolete {
+		t.Fatalf("admission = %+v, want rejected(obsolete)", adm)
+	}
+	// The rejection is reserved (so a later admission is refused), but no
+	// descriptor is pinned and no invocation field is claimed.
+	if store.rejection != ScheduleRejectionObsolete {
+		t.Fatalf("reserved rejection = %v, want obsolete", store.rejection)
 	}
 	if _, ok := store.fields[scheduleField]; ok {
 		t.Fatal("an obsolete occurrence must not pin a descriptor")
 	}
 	if len(store.fields) != 0 {
-		t.Fatalf("obsolete occurrence wrote state: %v", store.fields)
+		t.Fatalf("obsolete occurrence wrote invocation state: %v", store.fields)
+	}
+}
+
+// TestScheduleAdmissionRejectionRefusedWhenAdmittedFirst pins the admission-first
+// branch of the rejection boundary: a rejection arriving after the occurrence was
+// ADMITTED is refused and the pinned descriptor adopted, so a rejection can never
+// cancel a live admission (F-030).
+func TestScheduleAdmissionRejectionRefusedWhenAdmittedFirst(t *testing.T) {
+	store := newFakeInvocationStore(nil)
+	p := consumerForStore(t, store)
+
+	pinned := ScheduleDescriptor{Schedule: "cleanup", Handler: "jobs.old", Timeout: 30 * time.Second, Retries: 4}
+	first, err := p.TryStartScheduled(pinned, ScheduleRejectionNone, func(d ScheduleDescriptor) string { return "fn/" + d.Handler })
+	if err != nil || !first.Started {
+		t.Fatalf("first admission = (%+v,%v), want started", first, err)
+	}
+	// The admitted invocation is complete; a rejection arriving now must NOT be
+	// recorded and must report the (terminal) admitted invocation instead.
+	if !p.MarkComplete("fn/jobs.old", first.Claim) {
+		t.Fatal("MarkComplete = false, want true")
+	}
+	adm, err := p.TryStartScheduled(ScheduleDescriptor{}, ScheduleRejectionInvalid, func(d ScheduleDescriptor) string { return "fn/" + d.Handler })
+	if err != nil {
+		t.Fatalf("TryStartScheduled: %v", err)
+	}
+	if adm.Rejected {
+		t.Fatalf("admission = %+v, a rejection must be refused once the occurrence was admitted", adm)
+	}
+	if store.rejection != ScheduleRejectionNone {
+		t.Fatalf("reserved rejection = %v, want none (admission-first refuses the rejection)", store.rejection)
 	}
 }
 
@@ -114,7 +149,7 @@ func TestScheduleAdmissionPinnedDescriptorSurvivesNoProposal(t *testing.T) {
 	p := consumerForStore(t, store)
 
 	pinned := ScheduleDescriptor{Schedule: "cleanup", Handler: "jobs.old", Timeout: 30 * time.Second, Retries: 4}
-	first, err := p.TryStartScheduled(pinned, true, func(d ScheduleDescriptor) string { return "fn/" + d.Handler })
+	first, err := p.TryStartScheduled(pinned, ScheduleRejectionNone, func(d ScheduleDescriptor) string { return "fn/" + d.Handler })
 	if err != nil || !first.Started {
 		t.Fatalf("first admission = (%+v,%v), want started", first, err)
 	}
@@ -124,12 +159,12 @@ func TestScheduleAdmissionPinnedDescriptorSurvivesNoProposal(t *testing.T) {
 	// and re-claim under the SAME handler.
 	store.fields["fn/jobs.old"] = runningValue(
 		time.Now().Add(-time.Hour), InvocationClaim{Attempt: 1, Token: "ab"})
-	adm, err := p.TryStartScheduled(ScheduleDescriptor{}, false, func(d ScheduleDescriptor) string { return "fn/" + d.Handler })
+	adm, err := p.TryStartScheduled(ScheduleDescriptor{}, ScheduleRejectionObsolete, func(d ScheduleDescriptor) string { return "fn/" + d.Handler })
 	if err != nil {
 		t.Fatalf("TryStartScheduled: %v", err)
 	}
-	if adm.Obsolete {
-		t.Fatal("a pinned (admitted) occurrence must not be obsolete when its schedule is removed")
+	if adm.Rejected {
+		t.Fatal("a pinned (admitted) occurrence must not be rejected when its schedule is removed")
 	}
 	if !adm.Started || adm.Descriptor.Handler != "jobs.old" {
 		t.Fatalf("admission = %+v, want started on the pinned jobs.old", adm)
@@ -154,7 +189,7 @@ func TestScheduleDescriptorLifecycleThroughTerminalRetention(t *testing.T) {
 	p := consumerForStore(t, store)
 
 	pinned := ScheduleDescriptor{Schedule: "cleanup", Handler: "jobs.old", Timeout: 30 * time.Second, Retries: 4}
-	adm, err := p.TryStartScheduled(pinned, true, func(d ScheduleDescriptor) string { return "fn/" + d.Handler })
+	adm, err := p.TryStartScheduled(pinned, ScheduleRejectionNone, func(d ScheduleDescriptor) string { return "fn/" + d.Handler })
 	if err != nil || !adm.Started {
 		t.Fatalf("admission = (%+v,%v), want started", adm, err)
 	}
@@ -176,12 +211,12 @@ func TestScheduleDescriptorLifecycleThroughTerminalRetention(t *testing.T) {
 		t.Fatalf("descriptor after retention = (%+v,%v), want the pinned one", got, ok)
 	}
 	// A stale in-memory delivery can neither re-pin nor re-open the invocation.
-	adm2, err := p.TryStartScheduled(ScheduleDescriptor{}, false, func(d ScheduleDescriptor) string { return "fn/" + d.Handler })
+	adm2, err := p.TryStartScheduled(ScheduleDescriptor{}, ScheduleRejectionObsolete, func(d ScheduleDescriptor) string { return "fn/" + d.Handler })
 	if err != nil {
 		t.Fatalf("TryStartScheduled after retention: %v", err)
 	}
-	if adm2.Obsolete {
-		t.Fatal("a terminal-retained occurrence must not be reported obsolete")
+	if adm2.Rejected {
+		t.Fatal("a terminal-retained occurrence must not be reported rejected")
 	}
 	if adm2.Started {
 		t.Fatal("a terminal-retained hash must never be re-opened")

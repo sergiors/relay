@@ -327,9 +327,13 @@ func (n *noopInvocationState) ScheduleDescriptor() (stream.ScheduleDescriptor, b
 	n.touch()
 	return stream.ScheduleDescriptor{}, false
 }
-func (n *noopInvocationState) TryStartScheduled(desc stream.ScheduleDescriptor, _ bool, _ func(stream.ScheduleDescriptor) string) (stream.ScheduleAdmission, error) {
+func (n *noopInvocationState) TryStartScheduled(desc stream.ScheduleDescriptor, _ stream.ScheduleRejection, _ func(stream.ScheduleDescriptor) string) (stream.ScheduleAdmission, error) {
 	n.touch()
 	return stream.ScheduleAdmission{Started: true, Claim: stream.InvocationClaim{Attempt: 1, Token: "noop"}, Descriptor: desc}, nil
+}
+func (n *noopInvocationState) ReserveScheduleRejection(_ stream.ScheduleRejection) (stream.ScheduleAdmission, error) {
+	n.touch()
+	return stream.ScheduleAdmission{}, nil
 }
 func (n *noopInvocationState) RecordFailure(string, stream.InvocationClaim, time.Duration) bool {
 	n.touch()
