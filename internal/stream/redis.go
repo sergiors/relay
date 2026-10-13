@@ -626,6 +626,17 @@ func (c *Consumer) pendingGaugeSource() metrics.GaugeSource {
 	}
 }
 
+// pendingSummarizer is the narrow Redis view the pending-gauge sampler needs:
+// the XPENDING summary form. *redis.Client satisfies it; a test fake can
+// implement it too, so the depth/age gauge semantics are unit-testable without
+// a Redis server (the same seam pattern as groupCreator).
+type pendingSummarizer interface {
+	XPending(ctx context.Context, stream, group string) *redis.XPendingCmd
+}
+
+// The production Redis client must satisfy the pending-gauge seam.
+var _ pendingSummarizer = (*redis.Client)(nil)
+
 // PendingGaugeSource is a metrics.GaugeSource that samples the Redis XPENDING
 // summary (Count and oldest pending ID) and records the pending_depth gauges on
 // each Refresh. It is decoupled from health/backoff/processing: a Redis failure
@@ -633,7 +644,7 @@ func (c *Consumer) pendingGaugeSource() metrics.GaugeSource {
 // registry snapshot is exposed by the worker's MetricsLogger; this source only
 // produces the pending gauges.
 type PendingGaugeSource struct {
-	client  *redis.Client
+	client  pendingSummarizer
 	stream  string
 	group   string
 	metrics *metrics.Registry
@@ -654,6 +665,15 @@ func (source *PendingGaugeSource) Refresh(ctx context.Context) {
 		return
 	}
 	source.metrics.SetGauge(metrics.MetricPendingEntries, float64(pending.Count))
+	// An empty PEL has no oldest pending ID to parse (Lower is ""), so the age
+	// must be cleared explicitly; otherwise it would keep the last non-empty
+	// value and report a pending age for a group with nothing pending. A
+	// non-empty PEL keeps the existing behavior: the age is updated only when
+	// the oldest ID parses.
+	if pending.Count == 0 {
+		source.metrics.SetGauge(metrics.MetricPendingOldestAge, 0)
+		return
+	}
 	if age, ok := pendingAge(pending.Lower); ok {
 		source.metrics.SetGauge(metrics.MetricPendingOldestAge, age.Seconds())
 	}
