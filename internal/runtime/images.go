@@ -22,7 +22,7 @@ const relayRepoPrefix = "relay-app-"
 
 // tagPrefixLen is the number of hex fingerprint characters used as the docker
 // tag. The full fingerprint is a 64-hex SHA-256 over the app directory;
-// that remains authoritative everywhere it is persisted (SQLite, Prepared). The
+// that remains authoritative everywhere it is persisted (PostgreSQL, Prepared). The
 // tag prefix is an opaque, collision-safe short handle: 16 hex chars = 64 bits,
 // and a birthday collision at the app-version counts Relay deals with (a
 // handful per app, tens of apps) is astronomically unlikely. Git's

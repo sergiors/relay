@@ -2153,7 +2153,7 @@ func (m *Manager) SetAppResources(name string, limits app.ResourceLimits) {
 // embedded CLI/provider, tests); the standalone `relay app inspect` process
 // has no access to the worker's memory and therefore renders only the persisted
 // cumulative counters with the live gauges marked unavailable (see
-// internal/cli). The live gauges are deliberately NOT persisted to SQLite: a
+// internal/cli). The live gauges are deliberately NOT persisted to PostgreSQL: a
 // persisted live gauge would go stale between flushes.
 func (m *Manager) PoolSnapshot(name string) (PoolSnapshot, bool) {
 	if m == nil || m.containers == nil {

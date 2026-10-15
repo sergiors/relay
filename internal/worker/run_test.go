@@ -560,6 +560,7 @@ func TestRunInvalidRedisDSNReturnsError(t *testing.T) {
 	t.Setenv("REDIS_URI", "redis://%zz")
 	t.Setenv("REDIS_STREAM", "test-stream")
 	t.Setenv("REDIS_GROUP", "test-group")
+	t.Setenv("DATABASE_URL", "postgres://relay:relay@localhost:5432/relay?sslmode=disable")
 
 	err := Run(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err == nil {

@@ -19,7 +19,7 @@
 // exposition of that same registry, gated on the METRICS_ADDR environment
 // variable. The worker flushes the registry into the local state database on a
 // fixed 5-second cadence independent of METRICS_ADDR: stats accumulate in
-// memory, Prometheus (when exposed) reflects them immediately, and SQLite
+// memory, Prometheus (when exposed) reflects them immediately, and PostgreSQL
 // receives the current absolute snapshot every interval. The stats flusher
 // (which serializes the flush and the reset) lets the socket's `reset stats`
 // command restart the
@@ -64,8 +64,8 @@ import (
 	"relay/internal/stream"
 )
 
-// statsFlushInterval is the fixed SQLite snapshot cadence. Telemetry, not
-// event-processing state: Prometheus stays live in-process, while SQLite
+// statsFlushInterval is the fixed PostgreSQL snapshot cadence. Telemetry, not
+// event-processing state: Prometheus stays live in-process, while PostgreSQL
 // receives the current absolute snapshot every interval. Deliberately NOT
 // env/flag-configurable — a fixed cadence keeps the durability model simple
 // (a hard crash loses at most one interval of telemetry).
@@ -397,7 +397,7 @@ func Run(logger *slog.Logger) error {
 	// METRICS_ADDR. Setup only CREATES them here (server nil when disabled);
 	// STARTING the server happens later, once the startup wiring is complete.
 	// Because the registry exists even with exposition disabled, the persistent
-	// SQLite stats flush is independent of the HTTP listener.
+	// PostgreSQL stats flush is independent of the HTTP listener.
 	metricsInstance, metricsServer := setupMetrics(cfg, logger)
 
 	// The graceful shutdown registry converges here on every return path —
@@ -455,6 +455,54 @@ func Run(logger *slog.Logger) error {
 		startupSpan.End()
 		shutdown.run(logger)
 	}()
+
+	// The state database is a REQUIRED PostgreSQL dependency: the operator state
+	// view, the per-worker stats snapshots, and the durable schedule-publication
+	// outbox all live in it. It is opened FIRST — before the Redis/Docker
+	// preflight, before any app is loaded or fingerprinted, and before the
+	// runtime socket, services, sweeps, preparation, listeners, loops, scheduler,
+	// and reconciler — so no partially initialized runtime exists while a
+	// required dependency is unavailable. A failure is fatal: the deferred
+	// shutdown releases everything acquired so far. The handle's teardown step is
+	// registered here (before any other resource work) so every startup failure
+	// and normal shutdown releases the pool.
+	stateSpanCtx, stateSpan := tracing.Start(startupCtx, "state.initialize")
+	st, err := state.Open(stateSpanCtx, state.Options{
+		DSN:             cfg.DatabaseURL,
+		Owner:           cfg.ConsumerName,
+		Logger:          logger,
+		MaxOpenConns:    config.DefaultDatabaseMaxOpenConns,
+		MaxIdleConns:    config.DefaultDatabaseMaxIdleConns,
+		ConnMaxLifetime: config.DefaultDatabaseConnMaxLifetime,
+		ConnMaxIdleTime: config.DefaultDatabaseConnMaxIdleTime,
+		ConnectTimeout:  config.DefaultDatabaseConnectTimeout,
+	})
+	if err != nil {
+		stateSpan.RecordError(err)
+		stateSpan.SetStatus(codes.Error, err.Error())
+		stateSpan.End()
+		if startupInterrupted(startupCtx, err) {
+			logger.Info("Startup: state database initialization interrupted by shutdown", "error", err)
+			return startupResult(errStartupInterrupted)
+		}
+		return fmt.Errorf("state: open failed: %w", err)
+	}
+	stateSpan.End()
+	// Keep the one-hot app_status gauge in sync with every persisted status
+	// transition, centrally, so startup discovery, the reconciler, and the
+	// service callbacks all flow through one seam. Installed immediately after
+	// open, before any discovery/status write, so no transition is missed.
+	// Metrics stay decoupled from state (state imports nothing
+	// observability-related; the worker owns the closure).
+	wireStatusObserver(st, metricsInstance)
+	// Registered before any further startup work, so an early failure after this
+	// point (and a normal shutdown) always releases the pool. The scheduler
+	// barrier (registered later) joins all scheduler work before this step runs.
+	shutdown.register(shutdownStep{
+		name:    shutdownStepState,
+		timeout: 10 * time.Second,
+		run:     func(context.Context) error { return st.Close() },
+	})
 
 	// External-dependency preflight, in one explicit fixed order: Redis
 	// stream/consumer-group readiness -> Docker runtime-manager readiness ->
@@ -670,57 +718,35 @@ func Run(logger *slog.Logger) error {
 		"duration", time.Since(fingerprintStart),
 	)
 
-	// All state errors are non-fatal to the worker as a whole, but the scheduler
-	// requires the durable outbox for correctness: a nil handle is never
-	// registered for close, the scheduler is marked unavailable and a
-	// scheduler-owned bootstrap retries opening the store (see the scheduler
-	// wiring below). Consumers, services, metrics, and readiness are unaffected.
-	_, stateSpan := tracing.Start(startupCtx, "state.initialize")
-	st, err := state.Open(state.DBPath)
-	if err != nil {
-		logger.Warn("State: open failed; continuing without", "error", err)
-		stateSpan.RecordError(err)
-		st = nil
+	// The already-computed fingerprint pairs feed both the fresh-database
+	// rebuild and the per-app discovery upserts; /apps is never
+	// re-read for state and each app's source is hashed exactly once.
+	// Present-but-invalid desired definitions are persisted alongside the
+	// valid discovery; they stay out of the loaded set, so they never reach
+	// the runtime registry, matching, the scheduler, or preparation. A write
+	// failure is logged (non-fatal): the app set is already loaded and serving.
+	_, discoverySpan := tracing.Start(startupCtx, "state.discovery")
+	if rerr := persistStartupDiscovery(st, app.Dir, discovered, loadIssues, logger); rerr != nil {
+		discoverySpan.RecordError(rerr)
 	}
-	if st != nil {
-		// Keep the one-hot app_status gauge in sync with every persisted
-		// status transition, centrally, so startup discovery, the reconciler, and
-		// the service callbacks all flow through one seam. Installed immediately
-		// after open, before any discovery/status write, so no transition is
-		// missed. Metrics stay decoupled from state (state imports nothing
-		// observability-related; the worker owns the closure).
-		wireStatusObserver(st, metricsInstance)
-		// SQLite close has no context; the shutdown registry bounds its wait.
-		shutdown.register(shutdownStep{
-			name:    shutdownStepState,
-			timeout: 10 * time.Second,
-			run:     func(context.Context) error { return st.Close() },
-		})
-		// The already-computed fingerprint pairs feed both the fresh-database
-		// rebuild and the per-app discovery upserts; /apps is never
-		// re-read for state and each app's source is hashed exactly once.
-		// Present-but-invalid desired definitions are persisted alongside the
-		// valid discovery; they stay out of the loaded set, so they never reach
-		// the runtime registry, matching, the scheduler, or preparation.
-		if rerr := persistStartupDiscovery(st, app.Dir, discovered, loadIssues, logger); rerr != nil {
-			stateSpan.RecordError(rerr)
-		}
-	}
-	stateSpan.End()
+	discoverySpan.End()
 
-	// Seed the fresh registry with the persisted cumulative totals so the first
-	// snapshot writes them back instead of zeroing SQLite. Gauges are NOT
+	// Seed the fresh registry with THIS worker's persisted cumulative totals so
+	// the first snapshot writes them back instead of zeroing PostgreSQL. Each
+	// worker restores only its own rows (stats are keyed by worker identity), so
+	// two workers sharing the database never double-count. Gauges are NOT
 	// restored (they are point-in-time snapshots refreshed each interval).
 	_, statsRestoreSpan := tracing.Start(startupCtx, "state.restore_stats")
 	restorePersistedStats(metricsInstance, st)
 	statsRestoreSpan.End()
 
 	// The stats flusher is the single owner of every write of the registry's
-	// Relay-visible totals into SQLite. It holds a mutex across BOTH the capture
-	// of the current snapshot and the write, so an operator reset over the socket
-	// (flusher.ResetStats) can never race a flush into resurrecting pre-reset
-	// values: a flush either completes before the reset or captures after it.
-	// Shared by statsLoop, finalStatsFlush, and the socket reset command.
+	// Relay-visible totals into PostgreSQL. It holds a mutex across BOTH the
+	// capture of the current snapshot and the write, so an operator reset over
+	// the socket (flusher.ResetStats) can never race a flush into resurrecting
+	// pre-reset values: a flush either completes before the reset or captures
+	// after it. Shared by statsLoop, finalStatsFlush, and the socket reset
+	// command.
 	statsFlusher := newStatsFlusher(st, metricsInstance)
 	shutdown.register(shutdownStep{
 		name:    shutdownStepStatsFlush,
@@ -1061,7 +1087,7 @@ func Run(logger *slog.Logger) error {
 	// callback, the durable retry worker, AND (when storage was unavailable at
 	// startup) the scheduler-owned storage-bootstrap loop, before closing any
 	// scheduler-owned state handle. Redis is released in a later step, so this
-	// guarantees no scheduler work can touch Redis or SQLite after the step
+	// guarantees no scheduler work can touch Redis or PostgreSQL after the step
 	// returns. Registering it here means an early startup failure after this
 	// point still joins them. Stop is idempotent and also guards against a
 	// scheduler that was never Started, so an early-return shutdown is safe.
@@ -1076,14 +1102,14 @@ func Run(logger *slog.Logger) error {
 	// Schedule firing REQUIRES a usable durable outbox: every due occurrence is
 	// persisted to it BEFORE it is published (intent-first durability), so a tick
 	// that cannot be persisted must not fire. The outbox is the
-	// local state DB. When the shared handle opened above (st) is available it is
-	// wired directly; when it is nil, the scheduler is explicitly marked
-	// unavailable (it will NOT fire) and a scheduler-owned bootstrap retries
-	// opening the store on the fixed delay. SQLite is required for scheduler
-	// correctness, but it is NOT a global worker dependency: consumers,
-	// functions, services, metrics, logging, and tracing stay operational either
-	// way, and worker readiness deliberately excludes it.
-	wireSchedulerStorage(ctx, sched, st, schedulerStorageOpener(state.DBPath, logger, metricsInstance))
+	// PostgreSQL state database. The shared handle opened at startup (st) is
+	// always available here (its open is fatal), so it is wired directly; the
+	// scheduler-owned bootstrap opener remains as a defensive recovery seam for a
+	// future where the shared handle could be unavailable. PostgreSQL is required
+	// for scheduler correctness, but it is NOT a global worker dependency:
+	// consumers, functions, services, metrics, logging, and tracing stay
+	// operational either way, and worker readiness deliberately excludes it.
+	wireSchedulerStorage(ctx, sched, st, schedulerStorageOpener(cfg.DatabaseURL, cfg.ConsumerName, logger, metricsInstance))
 	for _, fn := range apps {
 		sched.ReplaceApp(fn.Name, fn.Template)
 	}
@@ -1307,7 +1333,7 @@ func Run(logger *slog.Logger) error {
 	// only after the external preflight, app load/prepare, the socket,
 	// required listeners and loops, and the consumer/schedule/reconciler/
 	// scheduler wiring are all complete. It deliberately does not wait on
-	// asynchronous service convergence/housekeeping, optional tracing, SQLite,
+	// asynchronous service convergence/housekeeping, optional tracing, PostgreSQL,
 	// or per-app success.
 	workerReady.startReady(consumer, manager, cfg.Networks)
 	logger.Info("Worker ready to consume")
@@ -1782,21 +1808,29 @@ func wireSchedulerStorage(
 
 // schedulerStorageOpener returns the cron.OutboxOpener the worker's
 // storage-unavailable bootstrap uses to retry opening the scheduler's durable
-// outbox (the local state DB) when the shared handle could not be opened at
-// startup. path is state.DBPath in production; it is a parameter so the retry
-// path is unit-testable without touching the fixed production location. The
-// opened *state.State is a scheduler-OWNED handle: cron closes it after all
-// scheduler work has stopped, so the shared global handle is never touched. It
-// deliberately calls state.Open path — the smallest clean equivalent — and wires
-// the same status observer so a recovered store's status writes still project
-// onto the app_status gauge.
-func schedulerStorageOpener(path string, logger *slog.Logger, metricsInstance *metrics.Registry) cron.OutboxOpener {
+// outbox (the PostgreSQL state database) when the shared handle could not be
+// opened at startup. dsn is cfg.DatabaseURL and owner the worker's ConsumerName
+// in production; they are parameters so the retry path is unit-testable without
+// a real database. The opened *state.State is a scheduler-OWNED handle: cron
+// closes it after all scheduler work has stopped, so the shared global handle is
+// never touched. It deliberately opens an independent handle on the same DSN —
+// the smallest clean equivalent — and wires the same status observer so a
+// recovered store's status writes still project onto the app_status gauge.
+func schedulerStorageOpener(dsn, owner string, logger *slog.Logger, metricsInstance *metrics.Registry) cron.OutboxOpener {
 	return func() (cron.Outbox, io.Closer, error) {
-		st, err := state.Open(path)
+		st, err := state.Open(context.Background(), state.Options{
+			DSN:             dsn,
+			Owner:           owner,
+			Logger:          logger,
+			MaxOpenConns:    config.DefaultDatabaseMaxOpenConns,
+			MaxIdleConns:    config.DefaultDatabaseMaxIdleConns,
+			ConnMaxLifetime: config.DefaultDatabaseConnMaxLifetime,
+			ConnMaxIdleTime: config.DefaultDatabaseConnMaxIdleTime,
+			ConnectTimeout:  config.DefaultDatabaseConnectTimeout,
+		})
 		if err != nil {
 			return nil, nil, err
 		}
-		st.SetLogger(logger)
 		wireStatusObserver(st, metricsInstance)
 		return st, st, nil
 	}
@@ -1804,7 +1838,7 @@ func schedulerStorageOpener(path string, logger *slog.Logger, metricsInstance *m
 
 // setupMetrics constructs the metrics components. The accounting registry is
 // ALWAYS constructed — it is the single source of truth for the counters the
-// persistent SQLite snapshot flushes, so it must exist even when HTTP
+// persistent PostgreSQL snapshot flushes, so it must exist even when HTTP
 // exposition is disabled. Only the /metrics HTTP server is opt-in: it is nil
 // when METRICS_ADDR is unset. It only CREATES them; STARTING the server happens
 // later in Run once the startup wiring is complete (the server binds
@@ -2542,17 +2576,19 @@ func cleanupStartupDependencies(lifecycle context.Context, manager *runtime.Mana
 }
 
 // restorePersistedStats seeds the fresh process-lifetime metrics registry with
-// the cumulative counters persisted in the state database, so the first
-// snapshot never resets them. The registry only knows this process's lifetime,
-// while the SQLite stats rows are cumulative history; seeding bridges them. It
-// is nil-safe on both the registry and the state handle (a nil st means the DB
-// failed to open, so there is nothing to restore). Gauges are deliberately NOT
-// restored: they are point-in-time backlog snapshots refreshed each snapshot.
+// THIS worker's cumulative counters persisted in the state database, so the
+// first snapshot never resets them. The registry only knows this process's
+// lifetime, while the PostgreSQL stats rows are cumulative history; seeding
+// bridges them. Only the worker's OWN rows (keyed by its ConsumerName identity)
+// are read — never another worker's, so two workers sharing one database never
+// double-count. It is nil-safe on both the registry and the state handle. Gauges
+// are deliberately NOT restored: they are point-in-time backlog snapshots
+// refreshed each snapshot.
 func restorePersistedStats(metricsInstance *metrics.Registry, st *state.State) {
 	if metricsInstance == nil || st == nil {
 		return
 	}
-	if gs, ok := st.Stats(); ok {
+	if gs, ok := st.OwnerStats(); ok {
 		metricsInstance.SeedCounter(metrics.MetricEventsReceived, gs.EventsReceivedTotal)
 		metricsInstance.SeedCounter(metrics.MetricEventsMatched, gs.EventsMatchedTotal)
 		metricsInstance.SeedCounter(metrics.MetricEventsUnmatched, gs.EventsUnmatchedTotal)
@@ -2561,7 +2597,7 @@ func restorePersistedStats(metricsInstance *metrics.Registry, st *state.State) {
 		metricsInstance.SeedCounter(metrics.MetricRetries, gs.RetryTotal)
 		metricsInstance.SeedCounter(metrics.MetricDLQEntries, gs.DLQTotal)
 	}
-	for _, fs := range st.AllAppStats() {
+	for _, fs := range st.OwnerAppStats() {
 		metricsInstance.SeedAppStat(metrics.AppStat{
 			App:                 fs.App,
 			EventsMatchedTotal:  fs.EventsMatchedTotal,
@@ -2784,7 +2820,7 @@ func snapshotAppStats(metricsInstance *metrics.Registry, base *relayBaseline) []
 }
 
 // statsFlusher owns every write of the registry's Relay-visible totals into
-// SQLite and the matching in-memory reset. It is the serialization point that
+// PostgreSQL and the matching in-memory reset. It is the serialization point that
 // makes a socket-triggered `reset stats` deterministic against the periodic
 // flush: mu is held across BOTH capturing the snapshot and writing it, and
 // ResetStats takes the same mutex, so a flush can never interleave a captured
@@ -2885,10 +2921,10 @@ func statsLoop(ctx context.Context, flusher *statsFlusher, interval time.Duratio
 	}
 }
 
-// finalStatsFlush performs a final flush of the registry into SQLite on
+// finalStatsFlush performs a final flush of the registry into PostgreSQL on
 // graceful shutdown, so the last interval of telemetry is not lost. ctx is the
 // shutdown step's fresh, bounded context (the registry derives it from
-// context.Background), so a wedged SQLite cannot hang shutdown; on timeout or
+// context.Background), so a wedged PostgreSQL cannot hang shutdown; on timeout or
 // error the flush logs and returns (telemetry, not state). It is nil-safe on
 // the flusher. The metrics guard is defensive only for direct test callers that
 // deliberately build a flusher over a nil registry: in production the registry
@@ -2909,7 +2945,7 @@ func finalStatsFlush(ctx context.Context, flusher *statsFlusher) {
 // worker-owned reset baseline subtracted from every cumulative counter (nil =
 // no reset yet), so an operator reset starts the persisted totals from zero
 // while Prometheus stays monotonic. Before the write it enforces the
-// metrics/SQLite consistency invariant: it sweeps the registry with
+// metrics/PostgreSQL consistency invariant: it sweeps the registry with
 // SweepAppMetrics against state.AppNames, deleting any app-scoped
 // series whose app no longer has a apps row. This complements the
 // reconciler's RemoveApp hook (which deletes series at removal time) by

@@ -46,11 +46,7 @@ func newTestStateReconcilerLogging(
 	logs *testutil.SyncBuffer,
 ) (*Reconciler, *runner.Registry, *state.State) {
 	t.Helper()
-	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
-	if err != nil {
-		t.Fatalf("open state: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st := testutil.NewState(t)
 	reg := &runner.Registry{}
 	reg.Set(initial)
 	cfg := Config{Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, State: st}

@@ -127,7 +127,7 @@ func latestOccurrence(sch robfigcron.Schedule, now time.Time, horizon time.Durat
 // store that REJECTS the intent is not a reason to publish anyway: the exact
 // occurrence is retained in memory, the scheduler is driven degraded, and the
 // durable retry worker flushes it to the outbox (with the existing backoff) as
-// soon as the store answers again — so a Redis + SQLite double failure no longer
+// soon as the store answers again — so a Redis + PostgreSQL double failure no longer
 // loses the tick within the process.
 //
 // A success or a clean duplicate (published=false, err=nil) is terminal: a

@@ -13,14 +13,15 @@ At startup Relay:
 
 1. loads configuration and initializes tracing (disabled by default) and the
    metrics registry;
-2. runs the external-dependency preflight in a fixed order, before anything
-   touches `/apps` or the state DB: Redis stream/consumer-group readiness
+2. opens the required PostgreSQL state database and initializes its schema
+   (a missing `DATABASE_URL` or an unreachable database fails startup);
+3. runs the external-dependency preflight in a fixed order, before anything
+   touches `/apps`: Redis stream/consumer-group readiness
    (creates the group with `MKSTREAM` at position `0`, tolerating `BUSYGROUP`),
    then Docker daemon readiness (a ping with a 10s bound), then verification that
    every configured `NETWORKS` network exists, then the runtime manager's
    warm-container maintenance loop is started;
-3. loads apps from `/apps` and computes each fingerprint once;
-4. opens the local state database (errors are logged, never fatal);
+4. loads apps from `/apps` and computes each fingerprint once;
 5. runs a conservative orphan sweep (bounded to 30s) removing only stale
    Relay containers owned by this worker hostname;
 6. prepares each app's image and starts the reconciler, scheduler, and
@@ -28,7 +29,7 @@ At startup Relay:
 
 A preflight failure short-circuits every later phase: Redis or the Docker daemon
 being unavailable, or a configured network missing, fails startup instead of
-letting the worker load apps, open the state DB, or create containers. The
+letting the worker load apps or create containers. The
 manager is opened with deferred maintenance, so a preflight failure before the
 final step closes the manager with no background loop ever started. A lifecycle
 cancellation (SIGTERM/SIGINT) during the preflight is a graceful shutdown, not an
@@ -58,11 +59,13 @@ releases it if the process dies).
 Two path roots:
 
 - **`/var/lib/relay`** — persistent state, volume-mountable:
-  - `db.sqlite3` — the local state database (see below);
   - `secrets/` — the local secret files (`0700` dir, `0600` files, atomic
     writes);
   - `ssh/id_ed25519`, `ssh/known_hosts` — deploy key and TOFU host-key pins;
   - `git/source.json`, `git/checkout` — git sync config and managed checkout.
+- **PostgreSQL** — the shared state database (operator state view, per-worker
+  stats snapshots, and the durable schedule outbox), addressed by
+  `DATABASE_URL`. It is **not** a file under a path root; see below.
 - **`/run/relay`** — ephemeral process state (never persisted):
   - `relay.lock` — the `flock` held by `relay start`; inert after a crash;
   - `relay.sock` — the live worker control socket (`0600`), removed on shutdown.
@@ -77,28 +80,39 @@ Two path roots:
 
 None of these paths are environment-configurable.
 
-### Local state database
+### State database
 
-A read-mostly SQLite view of Relay's loaded apps — **not** the source of
+A read-mostly PostgreSQL view of Relay's loaded apps — **not** the source of
 truth (`/apps` is) and not immutable. The worker writes it (discovery,
 reconcile outcomes, a fixed 5s stats flush) and `relay stats reset` writes it;
 every other state-touching subcommand only reads. It never drives matching,
-building, or reconciliation, and a missing/broken database is recreated or
-degraded without stopping the worker.
+building, or reconciliation. Unlike the former file-backed store, the database
+is a **required** dependency: the worker opens it (and initializes the schema)
+before the Redis/Docker preflight and before loading apps, and a missing or
+unreachable `DATABASE_URL` fails startup rather than degrading. Post-startup
+write failures remain non-fatal to the event pipeline.
 
-- Each app is stored as one JSON (JSONB) snapshot: runtime/status/image/
+- Each app is stored as one native JSONB snapshot: runtime/status/image/
   fingerprint/prepared-at/reconcile outcome, env **names** (values redacted) and
   secret **references** (values never stored), handlers, schedules, and services.
 - `status` lifecycle: `preparing` → `building` → `reconciling` → `ready`;
   `degraded` retains a usable previous image, `unavailable` has none. A failed
   reconcile never displaces a still-serving previous generation and never reports
   `ready`.
-- Stats are stored as latest absolute snapshots (no history). A hard crash may
-  lose up to ~5s of telemetry; graceful shutdown flushes once. Prometheus is the
-  time-series source.
+- Stats are stored as latest absolute snapshots (no history), **keyed by worker
+  identity** (the resolved hostname). Two workers sharing one database keep
+  independent rows instead of overwriting each other; `relay stats` aggregates
+  across owners, a worker restores only its own rows, and `relay stats reset`
+  clears every owner's rows. A hard crash may lose up to ~5s of telemetry;
+  graceful shutdown flushes once. Prometheus is the time-series source.
+- The scheduler's durable publication outbox (`schedule_pending`) lives here too;
+  its per-row claims use `FOR UPDATE SKIP LOCKED` and a fencing token so
+  concurrent retriers — in one process or several — never double-claim.
 
-`compose.dev.yaml` mounts a named volume at `/var/lib/relay`, so state, secrets,
-and git material survive container restarts. Deleting the volume deletes them.
+The bundled `compose.yaml` runs an internal PostgreSQL (`postgres` service, no
+published port by default) with a named volume, and points Relay at it via
+`DATABASE_URL`; deleting that volume deletes the state view and the outbox
+(never `/apps`).
 
 ## Health and readiness
 
@@ -118,15 +132,15 @@ cleared first on shutdown; it is bound to the worker lifecycle context, so a
 lifecycle cancellation that precedes the clear also reports not-ready. In steady
 state the answer reflects live Redis consumer health, a bounded Docker ping, and
 `NETWORKS` verification, so a dependency failing reports unhealthy and recovery
-reports healthy again. Per-app degraded/unavailable/invalid status, SQLite (and
-therefore the scheduler's storage state), optional tracing, and asynchronous
+reports healthy again. Per-app degraded/unavailable/invalid status, PostgreSQL
+(and therefore the scheduler's storage state), optional tracing, and asynchronous
 service convergence/housekeeping do not gate worker health.
 
 There is no HTTP health/readiness endpoint; health is a CLI command.
 
-`relay stats` reads the persisted global snapshot from SQLite (no Redis, Docker,
-or worker needed; works when the runtime is down). It may lag live Prometheus by
-up to ~5s. `relay stats reset` zeroes cumulative global and per-app totals —
+`relay stats` reads the persisted snapshot from PostgreSQL, aggregated across
+workers (no Redis, Docker, or worker needed; it does need `DATABASE_URL`). It may
+lag live Prometheus by up to ~5s. `relay stats reset` zeroes cumulative global and per-app totals —
 with a running worker, over the Unix socket so the in-memory source is reset too;
 otherwise directly against the database. It never touches pending events, Redis,
 containers, schedules/services, or Prometheus counters (those stay monotonic; the

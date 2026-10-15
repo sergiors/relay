@@ -16,9 +16,9 @@ import (
 	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 )
 
-// Fixed application-convention paths, mirroring state.DBPath and
-// secrets.SecretsDir: they are constants, not env-configurable, so the compose
-// volume mount at /var/lib/relay persists them across restarts. Every operation
+// Fixed application-convention paths, mirroring the durable secrets/state
+// layout: they are constants, not env-configurable, so the compose volume mount
+// at /var/lib/relay persists them across restarts. Every operation
 // in this package takes directories as explicit parameters (so tests redirect
 // them away from /var/lib/relay); these constants are only the production
 // defaults the CLI wires in.

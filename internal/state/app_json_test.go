@@ -10,16 +10,16 @@ import (
 
 // rawAppData reads apps.data rendered back to JSON text (the exact
 // expression the production read path uses) plus the row's updated_at and the
-// SQLite storage class of the raw blob.
-func rawAppData(t *testing.T, c *State, name string) (data, updatedAt, typeof string) {
+// native JSONB type of the stored value.
+func rawAppData(t *testing.T, c *State, name string) (data, updatedAt, jsonbType string) {
 	t.Helper()
 	if err := c.db.QueryRowContext(context.Background(),
-		`SELECT CASE WHEN json_valid(data, 5) THEN json(data) END, updated_at, typeof(data)
-		 FROM apps WHERE name = ?`, name,
-	).Scan(&data, &updatedAt, &typeof); err != nil {
+		`SELECT data::text, updated_at, jsonb_typeof(data)
+		 FROM apps WHERE name = $1`, name,
+	).Scan(&data, &updatedAt, &jsonbType); err != nil {
 		t.Fatalf("read raw function %q: %v", name, err)
 	}
-	return data, updatedAt, typeof
+	return data, updatedAt, jsonbType
 }
 
 // fullSnapshotTmpl exercises every persisted snapshot field: runtime, env,
@@ -62,9 +62,9 @@ services:
 `
 
 // TestAppSnapshotIsJSONB pins the storage format directly: apps.data
-// is a NOT NULL BLOB holding SQLite binary JSON (JSONB), so typeof(data) is
-// "blob" and json_extract(data, ...) reads the relational-like fields straight
-// out of the stored snapshot.
+// is a NOT NULL JSONB column, so jsonb_typeof(data) is "object" and the JSON
+// operators (->, ->>) read the relational-like fields straight out of the
+// stored snapshot.
 func TestAppSnapshotIsJSONB(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, fullSnapshotTmpl)
@@ -72,9 +72,9 @@ func TestAppSnapshotIsJSONB(t *testing.T) {
 	c.nowFn = func() time.Time { return base }
 	c.RecordReconcileSuccess("demo", "img", "fp", base, fnFor(t, "demo", tmpl))
 
-	data, updatedAt, typeof := rawAppData(t, c, "demo")
-	if typeof != "blob" {
-		t.Fatalf("apps.data storage class = %q, want blob (JSONB)", typeof)
+	data, updatedAt, jsonbType := rawAppData(t, c, "demo")
+	if jsonbType != "object" {
+		t.Fatalf("apps.data JSONB type = %q, want object", jsonbType)
 	}
 	if data == "" {
 		t.Fatal("apps.data must render as JSON text")
@@ -83,30 +83,30 @@ func TestAppSnapshotIsJSONB(t *testing.T) {
 		t.Fatalf("apps.updated_at = %q, want %q", updatedAt, base.Format(time.RFC3339))
 	}
 
-	// json_extract reads the payload's fields without decoding in Go, proving
-	// the stored value is queryable JSONB.
+	// The JSON operators read the payload's fields without decoding in Go,
+	// proving the stored value is queryable JSONB.
 	var runtime, status, image string
 	if err := c.db.QueryRowContext(context.Background(),
-		`SELECT json_extract(data, '$.runtime'), json_extract(data, '$.status'), json_extract(data, '$.image')
+		`SELECT data->>'runtime', data->>'status', data->>'image'
 		 FROM apps WHERE name = 'demo'`,
 	).Scan(&runtime, &status, &image); err != nil {
-		t.Fatalf("json_extract: %v", err)
+		t.Fatalf("jsonb extract: %v", err)
 	}
 	if runtime != "python3.14" || status != StatusReady || image != "img" {
-		t.Fatalf("json_extract = %q/%q/%q, want python3.14/ready/img", runtime, status, image)
+		t.Fatalf("jsonb extract = %q/%q/%q, want python3.14/ready/img", runtime, status, image)
 	}
 
 	// The nested configuration is queryable too: handler/schedule/service
 	// counts AND a nested service's port, proving the payload is real JSONB.
 	var handlers, schedules, services, entrypointPort int
 	if err := c.db.QueryRowContext(context.Background(),
-		`SELECT json_array_length(json_extract(data, '$.handlers')),
-		        json_array_length(json_extract(data, '$.schedules')),
-		        json_array_length(json_extract(data, '$.services')),
-		        json_extract(data, '$.services[1].port')
+		`SELECT jsonb_array_length(data->'handlers'),
+		        jsonb_array_length(data->'schedules'),
+		        jsonb_array_length(data->'services'),
+		        (data->'services'->1->>'port')::int
 		 FROM apps WHERE name = 'demo'`,
 	).Scan(&handlers, &schedules, &services, &entrypointPort); err != nil {
-		t.Fatalf("json_extract nested: %v", err)
+		t.Fatalf("jsonb extract nested: %v", err)
 	}
 	if handlers != 2 || schedules != 1 || services != 2 {
 		t.Fatalf("nested counts = handlers %d schedules %d services %d; want 2/1/2", handlers, schedules, services)
@@ -268,11 +268,11 @@ func TestAppRemovalDeletesSnapshotAndStats(t *testing.T) {
 }
 
 // TestAppSnapshotNeverPersistsLiteralEnvOrSecretValues is the canary guard
-// for the state file: the DB is a local file an operator can read, so a literal
-// template env value must never appear in the raw apps.data payload. The
-// env keys survive (structurally) with the redaction marker; secret references
-// are names only by construction (no resolved value ever reaches
-// appSnapshot).
+// for the persisted snapshot: the state database keeps a snapshot an operator
+// can read, so a literal template env value must never appear in the raw
+// apps.data payload. The env keys survive (structurally) with the redaction
+// marker; secret references are names only by construction (no resolved value
+// ever reaches appSnapshot).
 func TestAppSnapshotNeverPersistsLiteralEnvOrSecretValues(t *testing.T) {
 	c := openTestState(t)
 	const envCanary = "CANARY-ENV-VALUE-7f3a"
@@ -309,23 +309,24 @@ events:
 }
 
 // TestCorruptAppSnapshotFailsClearly pins the corrupt-payload contract for
-// the apps snapshot: a stored data value that is not valid JSON cannot be
-// decoded, so GetApp reports unknown (ok=false) and ListApps skips the
+// the apps snapshot: a stored data value that cannot be decoded into the typed
+// snapshot (here a bare JSON string, which is valid JSONB but not a JSON object)
+// makes GetApp report unknown (ok=false) and ListApps skip the
 // bad row, both logging a clear decode error rather than panicking or returning
-// a partial record. The corrupt write bypasses jsonb() (which validates on
-// write) to simulate on-disk corruption.
+// a partial record. A JSONB column can never hold invalid JSON, so the
+// corruption is a well-formed value of the wrong SHAPE.
 func TestCorruptAppSnapshotFailsClearly(t *testing.T) {
 	c, buf := captureLogger(t)
 	ctx := context.Background()
-	// A valid JSONB row and a corrupt raw row.
+	// A valid JSONB row and a wrong-shape row.
 	if _, err := c.db.ExecContext(ctx,
-		`INSERT INTO apps (name, data, updated_at) VALUES ('good', jsonb(?), ?)`,
+		`INSERT INTO apps (name, data, updated_at) VALUES ('good', $1, $2)`,
 		`{"runtime":"node24","handlers":[{"name":"a.b","timeout":1000000000}]}`, "2020-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("seed good: %v", err)
 	}
 	if _, err := c.db.ExecContext(ctx,
-		`INSERT INTO apps (name, data, updated_at) VALUES ('broken', ?, ?)`,
-		`{not-json`, "2020-01-01T00:00:00Z"); err != nil {
+		`INSERT INTO apps (name, data, updated_at) VALUES ('broken', $1, $2)`,
+		`"not-an-object"`, "2020-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("seed broken: %v", err)
 	}
 

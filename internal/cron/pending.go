@@ -21,7 +21,7 @@ import (
 // retriers cannot both claim one, and deletes a record only once a publication
 // call has resolved with a nil error (published or a clean duplicate).
 // *state.State satisfies it; the narrow interface keeps cron decoupled from the
-// SQLite implementation and lets tests substitute a deterministic fake.
+// PostgreSQL implementation and lets tests substitute a deterministic fake.
 //
 // Every method takes a context. The scheduler calls the write methods with a
 // cancellation-independent context (see pendingWriteCtx) so an in-flight tick
@@ -33,13 +33,21 @@ type Outbox interface {
 	// refreshed by a re-save.
 	SavePendingOccurrence(ctx context.Context, p state.PendingOccurrence) (inserted bool, err error)
 	// ClaimPendingOccurrences leases up to limit due, UNEXPIRED records
-	// atomically and returns them.
+	// atomically and returns them (each carrying its claim fencing token).
 	ClaimPendingOccurrences(ctx context.Context, now, leaseUntil time.Time, limit int) ([]state.PendingOccurrence, error)
 	// ReschedulePendingOccurrence increments a record's attempt count and sets
-	// its next due instant after a failed retry; it never changes retention.
-	ReschedulePendingOccurrence(ctx context.Context, id string, nextAttempt time.Time) error
-	// DeletePendingOccurrence removes a resolved record. It is idempotent.
+	// its next due instant after a failed retry; it never changes retention. It
+	// is conditional on the claim token the caller observed, so a superseded
+	// claimant cannot overwrite a newer lease or attempt state.
+	ReschedulePendingOccurrence(ctx context.Context, id string, claimToken int64, nextAttempt time.Time) error
+	// DeletePendingOccurrence removes a resolved record unconditionally (the
+	// live publication path, which persisted the row itself). It is idempotent.
 	DeletePendingOccurrence(ctx context.Context, id string) error
+	// DeletePendingOccurrenceClaimed removes a resolved or expired record only if
+	// its claim token still matches, so a superseded claimant cannot delete a row
+	// a newer claimant owns. It reports whether a row was removed and is
+	// idempotent.
+	DeletePendingOccurrenceClaimed(ctx context.Context, id string, claimToken int64) (bool, error)
 	// ExpirePendingOccurrences deletes up to limit records whose retention has
 	// passed and returns how many were removed, so the worker can drain an
 	// expired backlog in bounded batches.
@@ -51,7 +59,7 @@ type Outbox interface {
 	NextPendingDue(ctx context.Context, now time.Time) (due time.Time, ok bool, err error)
 }
 
-// The local SQLite state store is the production durable retry outbox; this
+// The local PostgreSQL state store is the production durable retry outbox; this
 // assertion keeps the two in lockstep without state importing cron.
 var _ Outbox = (*state.State)(nil)
 
@@ -66,7 +74,7 @@ const (
 	// reclaimed promptly (the "claim expiry" rescan) and long enough to cover a
 	// normal publication attempt.
 	pendingLease = time.Minute
-	// pendingWriteTimeout bounds one SQLite outbox write/delete. The outbox is
+	// pendingWriteTimeout bounds one PostgreSQL outbox write/delete. The outbox is
 	// written off the publish path and must never hang on a wedged write.
 	pendingWriteTimeout = 5 * time.Second
 	// pendingCleanupBatch bounds how many EXPIRED records one cleanup pass
@@ -649,11 +657,13 @@ func (s *Scheduler) retryPending(ctx context.Context, p state.PendingOccurrence,
 		}
 		// Resolve with a cancellation-independent context: the publication
 		// succeeded, so the row must be removable even if the lifecycle is
-		// shutting down.
+		// shutting down. The delete is conditioned on the claim token this
+		// retrier observed, so a lease that already expired and was re-claimed
+		// elsewhere is left to its new owner (a clean duplicate at worst).
 		ob := s.currentOutbox()
 		if ob != nil {
 			wctx, cancel := pendingWriteCtx()
-			if derr := ob.DeletePendingOccurrence(wctx, p.ID); derr != nil {
+			if _, derr := ob.DeletePendingOccurrenceClaimed(wctx, p.ID, p.ClaimToken); derr != nil {
 				log.Warn("Schedule: delete pending occurrence failed; will retry",
 					"app", o.App, "schedule", o.Schedule, "occurrence_id", p.ID, "reason", derr)
 				s.markDegraded(derr)
@@ -691,7 +701,7 @@ func (s *Scheduler) expirePending(p state.PendingOccurrence, log *slog.Logger) {
 	}
 	wctx, cancel := pendingWriteCtx()
 	defer cancel()
-	if err := ob.DeletePendingOccurrence(wctx, p.ID); err != nil {
+	if _, err := ob.DeletePendingOccurrenceClaimed(wctx, p.ID, p.ClaimToken); err != nil {
 		log.Warn("Schedule: expired pending occurrence delete failed; will retry cleanup",
 			"occurrence_id", p.ID, "expires_at", p.ExpiresAt.UTC().Format(time.RFC3339), "reason", err)
 		s.markDegraded(err)
@@ -736,7 +746,7 @@ func (s *Scheduler) reschedulePending(p state.PendingOccurrence, log *slog.Logge
 	next := s.now().Add(pendingBackoff(p.Attempts))
 	wctx, cancel := pendingWriteCtx()
 	defer cancel()
-	if rerr := ob.ReschedulePendingOccurrence(wctx, p.ID, next); rerr != nil {
+	if rerr := ob.ReschedulePendingOccurrence(wctx, p.ID, p.ClaimToken, next); rerr != nil {
 		log.Warn("Schedule: reschedule pending occurrence failed",
 			"occurrence_id", p.ID, "reason", rerr)
 		s.markDegraded(rerr)

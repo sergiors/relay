@@ -53,7 +53,7 @@ var (
 // wiring are all complete) and is cleared as the FIRST instruction of the
 // shutdown defer, before the lifecycle is cancelled and any teardown runs. It
 // deliberately does not wait on asynchronous service convergence/housekeeping,
-// optional tracing, SQLite, or per-app success: none of those gate the
+// optional tracing, PostgreSQL, or per-app success: none of those gate the
 // worker's readiness to consume.
 //
 // The flag alone is not sufficient: the worker lifecycle context is bound in as

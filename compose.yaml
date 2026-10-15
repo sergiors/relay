@@ -7,6 +7,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
       socket-proxy:
         condition: service_healthy
 
@@ -19,6 +21,11 @@ services:
       - REDIS_URI=redis:6379
       - REDIS_STREAM=events
       - REDIS_GROUP=relay
+
+      # The shared state database (operator state view, per-worker stats
+      # snapshots, and the durable schedule outbox). Relay refuses to start
+      # without it.
+      - DATABASE_URL=postgres://relay:relay@postgres:5432/relay?sslmode=disable
 
       - TRAEFIK_NETWORK=traefik
       - TRAEFIK_HOST_OVERRIDE=localhost
@@ -79,6 +86,33 @@ services:
       start_period: 5s
 
 
+  # The shared PostgreSQL state database. It is internal-only by default (no
+  # published port): Relay reaches it over the compose network by service DNS
+  # (DATABASE_URL above). Enable the commented port mapping only for local
+  # inspection with a client.
+  postgres:
+    image: postgres:17-alpine
+    container_name: postgres
+
+    # ports:
+    #   - 5432:5432
+
+    environment:
+      - POSTGRES_USER=relay
+      - POSTGRES_PASSWORD=relay
+      - POSTGRES_DB=relay
+
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+
   socket-proxy:
     image: tecnativa/docker-socket-proxy
     restart: unless-stopped
@@ -111,6 +145,7 @@ services:
 
 volumes:
   redis-data:
+  postgres-data:
   relay-data:
 
 

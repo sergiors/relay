@@ -15,6 +15,7 @@ pinned libraries (see the last section) and are listed separately.
 | `REDIS_URI`    | `host:port`, `redis://[user:password@]host:port`, or `rediss://…` (TLS) | Redis address or DSN. Missing/empty fails startup.                                                                                                          |
 | `REDIS_STREAM` | stream name                                                             | Stream Relay consumes. Missing/empty fails startup.                                                                                                         |
 | `REDIS_GROUP`  | group name                                                              | Consumer group. Missing/empty fails startup. Created with `MKSTREAM` at position `0` if absent, so a new group over an existing stream replays its backlog. |
+| `DATABASE_URL` | PostgreSQL DSN (`postgres://user:password@host:5432/db?sslmode=disable`) | The shared state database (operator state view, per-worker stats snapshots, and the durable schedule outbox). Missing/empty fails startup; an unreachable database fails startup. The value carries credentials and is never logged. |
 
 The consumer name is **not** configurable: Relay uses the process hostname
 (container ID / pod name), so replicas sharing `REDIS_GROUP` are distinct
@@ -379,9 +380,9 @@ starts only once the message is no longer recoverable.
   re-extends it, and a stale in-memory transition can neither mutate the
   terminal state nor remove the TTL.
 - This window is **independent** of `REDIS_DLQ_RETENTION` (which trims DLQ stream
-  entries) and of the scheduler's SQLite outbox, whose 7-day retention is a
+  entries) and of the scheduler's PostgreSQL outbox, whose 7-day retention is a
   separate, local mechanism. A dead-lettered entry and the terminal hash for the
-  same message are two different Redis/SQLite objects with their own windows.
+  same message are two different Redis/PostgreSQL objects with their own windows.
 
 **Unset vs. explicitly empty.** For all three windows, leaving the variable
 **unset** applies the documented default (`24h` / `168h` / `48h`); setting it to

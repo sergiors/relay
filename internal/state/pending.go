@@ -47,6 +47,15 @@ type PendingOccurrence struct {
 	// record is claimable only while both NextAttempt and LeaseUntil are in the
 	// past.
 	LeaseUntil time.Time
+	// ClaimToken is the fencing generation observed at claim time. It is NOT
+	// part of the persisted intent: it is written to the row's claim_token column
+	// by ClaimPendingOccurrences (one increment per claim) and must be passed
+	// back to the conditional ReschedulePendingOccurrence /
+	// DeletePendingOccurrenceClaimed calls. A superseded claimant (whose lease
+	// already expired and was re-claimed by someone else) presents a stale token,
+	// so its write matches no row and cannot clobber the newer claimant's lease
+	// or delete its row. It is zero for a record built by SavePendingOccurrence.
+	ClaimToken int64
 	// ExpiresAt is the durable retention deadline, stamped by
 	// SavePendingOccurrence as the first-insert instant plus PendingRetention and
 	// never modified afterwards. A record is EXPIRED once now >= ExpiresAt: it is
@@ -55,19 +64,19 @@ type PendingOccurrence struct {
 	// retrier re-checks immediately before attempting a publication.
 	ExpiresAt time.Time
 	// DecodeErr is set ONLY when the row's stored intent could not be decoded
-	// (the data blob is not valid JSON, or is missing/malformed a required
-	// field). When non-nil the App/Schedule/Handler/ScheduledAt fields are empty
-	// and the caller MUST NOT publish the record: publishing would target a
-	// different occurrence than the row represents. The ID and scheduling fields
-	// are still populated so the caller can surface the failure and
-	// retain/reschedule the durable row.
+	// (the JSONB data does not decode into the occurrence intent, or is
+	// missing/malformed a required field). When non-nil the
+	// App/Schedule/Handler/ScheduledAt fields are empty and the caller MUST NOT
+	// publish the record: publishing would target a different occurrence than
+	// the row represents. The ID and scheduling fields are still populated so
+	// the caller can surface the failure and retain/reschedule the durable row.
 	DecodeErr error
 }
 
 // pendingIntent is the occurrence intent stored as the JSON object in
 // schedule_pending.data, mirroring apps.data: the schema keeps only the stable
 // key (id) and the scheduling columns relational, while the intent lives in the
-// BLOB. It is deliberately a distinct type from PendingOccurrence so the
+// JSONB column. It is deliberately a distinct type from PendingOccurrence so the
 // scheduling fields can never leak into the persisted intent.
 type pendingIntent struct {
 	App         string `json:"app"`
@@ -76,10 +85,10 @@ type pendingIntent struct {
 	ScheduledAt string `json:"scheduled_at"`
 }
 
-// marshalPendingIntent encodes p's immutable intent as the JSON object written
-// through jsonb(?) into schedule_pending.data. ScheduledAt is normalized to UTC
-// RFC3339, the same representation occurrence identity is derived from, so a
-// round-trip reconstructs the exact occurrence.
+// marshalPendingIntent encodes p's immutable intent as the JSON object stored in
+// schedule_pending.data. ScheduledAt is normalized to UTC RFC3339, the same
+// representation occurrence identity is derived from, so a round-trip
+// reconstructs the exact occurrence.
 func marshalPendingIntent(p PendingOccurrence) (string, error) {
 	b, err := json.Marshal(pendingIntent{
 		App:         p.App,
@@ -93,11 +102,11 @@ func marshalPendingIntent(p PendingOccurrence) (string, error) {
 	return string(b), nil
 }
 
-// unmarshalPendingIntent decodes a schedule_pending.data value (already rendered
-// to JSON text by json(data)) into its occurrence intent. A payload that is not
-// valid JSON, or that is missing a required field, is returned as an error so the
-// caller can log it and RETAIN the row; it is never treated as an empty
-// occurrence and never deleted.
+// unmarshalPendingIntent decodes a schedule_pending.data value (rendered to JSON
+// text by jsonPayloadExpr, i.e. `data::text`) into its occurrence intent. A
+// payload that is not valid JSON, or that is missing a required field, is
+// returned as an error so the caller can log it and RETAIN the row; it is never
+// treated as an empty occurrence and never deleted.
 func unmarshalPendingIntent(text string) (pendingIntent, error) {
 	var in pendingIntent
 	if err := json.Unmarshal([]byte(text), &in); err != nil {
@@ -112,11 +121,11 @@ func unmarshalPendingIntent(text string) (pendingIntent, error) {
 	return in, nil
 }
 
-// pendingDataExpr renders schedule_pending.data to JSON text, or NULL when the
-// stored blob is not valid JSON/JSONB. It mirrors jsonPayloadExpr: a row written
-// through jsonb(?) always validates, so a NULL rendering is a corrupt payload the
-// caller must retain rather than decode as an empty occurrence.
-const pendingDataExpr = `CASE WHEN json_valid(data, 5) THEN json(data) END`
+// pendingDataExpr renders schedule_pending.data to JSON text. The column is
+// native JSONB and always valid JSON, so no corruption guard is needed; the
+// decode helpers still surface a payload that does not reconstruct a valid
+// occurrence intent.
+const pendingDataExpr = `data::text`
 
 // SavePendingOccurrence atomically persists p's occurrence intent unless a row
 // for the same ID already exists (the ID is the primary key and the write is a
@@ -139,8 +148,8 @@ func (st *State) SavePendingOccurrence(ctx context.Context, p PendingOccurrence)
 	expiresAt := st.nowTime().UTC().Add(PendingRetention).UnixMilli()
 	res, err := st.db.ExecContext(ctx, `
 		INSERT INTO schedule_pending
-			(id, data, attempts, next_attempt_ms, lease_until_ms, expires_at_ms)
-		VALUES (?, jsonb(?), 0, ?, 0, ?)
+			(id, data, attempts, next_attempt_ms, lease_until_ms, expires_at_ms, claim_token)
+		VALUES ($1, $2, 0, $3, 0, $4, 0)
 		ON CONFLICT(id) DO NOTHING`,
 		p.ID,
 		payload,
@@ -157,54 +166,88 @@ func (st *State) SavePendingOccurrence(ctx context.Context, p PendingOccurrence)
 	return n > 0, nil
 }
 
-// DeletePendingOccurrence removes the durable record for id. It is idempotent: a
-// missing row is not an error, so a delete after an ambiguous success or a
-// concurrent retrier's delete is harmless. Callers delete ONLY after a publish
-// call resolved with a nil error (published or clean duplicate); a failed delete
-// leaves the row in place for an idempotent retry.
+// DeletePendingOccurrence removes the durable record for id UNCONDITIONALLY. It
+// is idempotent: a missing row is not an error, so a delete after an ambiguous
+// success or a concurrent retrier's delete is harmless. It is the resolution
+// path for the LIVE publication flow, where the publishing process persisted the
+// row itself (it is not a lease claimant and holds no claim token): deleting a
+// row it just authored is always safe, and a concurrent retrier's later attempt
+// is a clean duplicate whose conditional delete then matches nothing.
+//
+// Callers delete ONLY after a publish call resolved with a nil error (published
+// or clean duplicate); a failed delete leaves the row in place for an idempotent
+// retry. Claim-driven resolution instead uses DeletePendingOccurrenceClaimed, so
+// a superseded claimant cannot delete a row a newer claimant now owns.
 func (st *State) DeletePendingOccurrence(ctx context.Context, id string) error {
-	if _, err := st.db.ExecContext(ctx, `DELETE FROM schedule_pending WHERE id = ?`, id); err != nil {
+	if _, err := st.db.ExecContext(ctx, `DELETE FROM schedule_pending WHERE id = $1`, id); err != nil {
 		return fmt.Errorf("delete pending occurrence %s: %w", id, err)
 	}
 	return nil
+}
+
+// DeletePendingOccurrenceClaimed removes the durable record for id only if its
+// current claim fencing token equals claimToken, returning whether a row was
+// deleted. It is the resolution path for a LEASE CLAIMANT: a claimant that
+// resolved the occurrence after its lease already expired and was re-claimed by
+// another retrier (or after the row was already deleted) presents a stale token,
+// matches no row, and reports false — it can never delete a row a newer claimant
+// owns. A missing/stale row is not an error.
+func (st *State) DeletePendingOccurrenceClaimed(ctx context.Context, id string, claimToken int64) (bool, error) {
+	res, err := st.db.ExecContext(ctx, `DELETE FROM schedule_pending WHERE id = $1 AND claim_token = $2`, id, claimToken)
+	if err != nil {
+		return false, fmt.Errorf("delete pending occurrence %s: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("delete pending occurrence %s: rows affected: %w", id, err)
+	}
+	return n > 0, nil
 }
 
 // ClaimPendingOccurrences atomically leases up to limit records that are due
 // (NextAttempt and any prior LeaseUntil both at or before now) AND not expired
 // (ExpiresAt strictly after now) and returns them. Expired records are excluded
 // so they are never claimed or published; they are removed by the bounded
-// cleanup (ExpirePendingOccurrences) instead. The lease is written in the same
-// statement that selects the rows (UPDATE ... RETURNING), so two concurrent
-// retriers in the same database can never claim the same record: coordination is
-// per-row in the database, never a process-global lock.
+// cleanup (ExpirePendingOccurrences) instead.
 //
-// A claimed row whose stored intent is corrupt (not valid JSON, or missing a
-// required field) is returned with DecodeErr set and empty intent fields — NOT
-// silently skipped. The caller must surface the failure and retain/reschedule the
-// durable row; it must never publish it (which would target the wrong occurrence)
-// and never delete it (which would lose the pending work). Returning the row also
-// keeps its lease advancing under the caller's backoff, so a corrupt row does not
-// spin in a tight reclaim loop. A decode failure is never fatal to the batch —
-// the remaining valid records are still returned.
+// Concurrency: the claiming UPDATE selects its rows with FOR UPDATE SKIP LOCKED,
+// so two concurrent retriers — in the same database, from any process — can
+// never lease the same row: PostgreSQL takes the row lock for the loser, which
+// skips the already-locked row and moves on. Each claimed row's claim_token is
+// incremented as part of the same statement and returned, so the claimant holds
+// a fencing generation for its later conditional reschedule/delete (see
+// PendingOccurrence.ClaimToken). Coordination is per-row in the database, never
+// a process-global lock.
 //
-// The returned records carry their persisted attempt count and retention
-// deadline. A record whose lease later expires without resolving is reclaimed by
-// the next scan, so a crashed or wedged retrier's work is automatically
-// recovered. An expired record is never returned: the caller re-checks ExpiresAt
-// immediately before publishing, so a record that expires between the claim and
-// the publish is rejected rather than published.
+// A claimed row whose stored intent is corrupt (missing a required field, or
+// otherwise not decodable) is returned with DecodeErr set and empty intent
+// fields — NOT silently skipped. The caller must surface the failure and
+// retain/reschedule the durable row; it must never publish it (which would
+// target the wrong occurrence) and never delete it (which would lose the pending
+// work). Returning the row also keeps its lease advancing under the caller's
+// backoff, so a corrupt row does not spin in a tight reclaim loop. A decode
+// failure is never fatal to the batch — the remaining valid records are still
+// returned.
+//
+// The returned records carry their persisted attempt count, claim token, and
+// retention deadline. A record whose lease later expires without resolving is
+// reclaimed by the next scan, so a crashed or wedged retrier's work is
+// automatically recovered. An expired record is never returned: the caller
+// re-checks ExpiresAt immediately before publishing, so a record that expires
+// between the claim and the publish is rejected rather than published.
 func (st *State) ClaimPendingOccurrences(ctx context.Context, now, leaseUntil time.Time, limit int) ([]PendingOccurrence, error) {
 	nowMs := now.UTC().UnixMilli()
 	rows, err := st.db.QueryContext(ctx, `
-		UPDATE schedule_pending SET lease_until_ms = ?
+		UPDATE schedule_pending SET lease_until_ms = $1, claim_token = claim_token + 1
 		WHERE id IN (
 			SELECT id FROM schedule_pending
-			WHERE next_attempt_ms <= ? AND lease_until_ms <= ? AND expires_at_ms > ?
+			WHERE next_attempt_ms <= $2 AND lease_until_ms <= $2 AND expires_at_ms > $2
 			ORDER BY next_attempt_ms
-			LIMIT ?
+			LIMIT $3
+			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING id, `+pendingDataExpr+`, attempts, next_attempt_ms, lease_until_ms, expires_at_ms`,
-		leaseUntil.UTC().UnixMilli(), nowMs, nowMs, nowMs, limit,
+		RETURNING id, `+pendingDataExpr+`, attempts, next_attempt_ms, lease_until_ms, expires_at_ms, claim_token`,
+		leaseUntil.UTC().UnixMilli(), nowMs, limit,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("claim pending occurrences: %w", err)
@@ -220,8 +263,9 @@ func (st *State) ClaimPendingOccurrences(ctx context.Context, now, leaseUntil ti
 			nextMs    int64
 			leaseMs   int64
 			expiresMs int64
+			claimTok  int64
 		)
-		if err := rows.Scan(&id, &data, &attempts, &nextMs, &leaseMs, &expiresMs); err != nil {
+		if err := rows.Scan(&id, &data, &attempts, &nextMs, &leaseMs, &expiresMs, &claimTok); err != nil {
 			return nil, fmt.Errorf("scan pending occurrence: %w", err)
 		}
 		rec := PendingOccurrence{
@@ -230,6 +274,7 @@ func (st *State) ClaimPendingOccurrences(ctx context.Context, now, leaseUntil ti
 			NextAttempt: time.UnixMilli(nextMs).UTC(),
 			LeaseUntil:  time.UnixMilli(leaseMs).UTC(),
 			ExpiresAt:   time.UnixMilli(expiresMs).UTC(),
+			ClaimToken:  claimTok,
 		}
 		// A corrupt/absent rendering is surfaced via DecodeErr, not returned as an
 		// empty occurrence: the caller must not publish or delete it, and must
@@ -266,17 +311,22 @@ func (st *State) ClaimPendingOccurrences(ctx context.Context, now, leaseUntil ti
 
 // ReschedulePendingOccurrence records one FAILED durable retry for id: it
 // increments the persisted attempt count and sets the next due instant, and
-// clears the lease so the record becomes claimable again once due. The increment
-// is done in SQL (attempts = attempts + 1), so overlapping observations never
-// lose a retry. The retention deadline (expires_at_ms) is deliberately NOT
-// touched, so expiry is stable across retries and restarts. Only a resolved
-// (nil-error) publication deletes a row; this is the failure path.
-func (st *State) ReschedulePendingOccurrence(ctx context.Context, id string, nextAttempt time.Time) error {
+// clears the lease so the record becomes claimable again once due. It is
+// CONDITIONAL on the claim fencing token the claimant observed: a superseded
+// claimant (its lease already expired and the row re-claimed) presents a stale
+// token and its update matches no row, so it can never overwrite a newer
+// claimant's lease or reset its attempt accounting. A stale/no-op result is not
+// an error. The increment is done in SQL (attempts = attempts + 1), so
+// overlapping observations never lose a retry. The retention deadline
+// (expires_at_ms) is deliberately NOT touched, so expiry is stable across
+// retries and restarts. Only a resolved (nil-error) publication deletes a row;
+// this is the failure path.
+func (st *State) ReschedulePendingOccurrence(ctx context.Context, id string, claimToken int64, nextAttempt time.Time) error {
 	_, err := st.db.ExecContext(ctx, `
 		UPDATE schedule_pending
-		SET attempts = attempts + 1, next_attempt_ms = ?, lease_until_ms = 0
-		WHERE id = ?`,
-		nextAttempt.UTC().UnixMilli(), id)
+		SET attempts = attempts + 1, next_attempt_ms = $1, lease_until_ms = 0
+		WHERE id = $2 AND claim_token = $3`,
+		nextAttempt.UTC().UnixMilli(), id, claimToken)
 	if err != nil {
 		return fmt.Errorf("reschedule pending occurrence %s: %w", id, err)
 	}
@@ -301,9 +351,9 @@ func (st *State) ExpirePendingOccurrences(ctx context.Context, now time.Time, li
 		DELETE FROM schedule_pending
 		WHERE id IN (
 			SELECT id FROM schedule_pending
-			WHERE expires_at_ms <= ?
+			WHERE expires_at_ms <= $1
 			ORDER BY expires_at_ms
-			LIMIT ?
+			LIMIT $2
 		)`,
 		now.UTC().UnixMilli(), limit)
 	if err != nil {
@@ -338,13 +388,13 @@ func (st *State) NextPendingDue(ctx context.Context, now time.Time) (time.Time, 
 	var ms sql.NullInt64
 	// For each unexpired row the wake instant is MIN(MAX(next_attempt_ms,
 	// lease_until_ms), expires_at_ms) — the earlier of its next claim and its
-	// deadline — and the loop needs the earliest such instant across rows. The
-	// two-argument MIN/MAX are SQLite scalar functions; the single-argument
-	// MIN(...) is the aggregate.
+	// deadline — and the loop needs the earliest such instant across rows.
+	// PostgreSQL's two-argument GREATEST/LEAST are the row-wise max/min, while
+	// the aggregate MIN(...) takes the earliest across rows.
 	if err := st.db.QueryRowContext(ctx,
-		`SELECT MIN(MIN(MAX(next_attempt_ms, lease_until_ms), expires_at_ms))
+		`SELECT MIN(LEAST(GREATEST(next_attempt_ms, lease_until_ms), expires_at_ms))
 		 FROM schedule_pending
-		 WHERE expires_at_ms > ?`, now.UTC().UnixMilli()).Scan(&ms); err != nil {
+		 WHERE expires_at_ms > $1`, now.UTC().UnixMilli()).Scan(&ms); err != nil {
 		return time.Time{}, false, fmt.Errorf("next pending due: %w", err)
 	}
 	if !ms.Valid {

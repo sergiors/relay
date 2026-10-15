@@ -15,7 +15,7 @@ import (
 // persisted BEFORE publication (see publishOccurrence and the durable outbox):
 // the outbox write is intent-first, so a crash between persisting and publishing
 // recovers the occurrence rather than losing it. The worker therefore wires a
-// durable outbox (the local SQLite store) before enabling schedule publication
+// durable outbox (the local PostgreSQL store) before enabling schedule publication
 // and marks the scheduler unavailable when no outbox could be opened. A runtime
 // outbox failure pauses live publication (degraded); the affected occurrence is
 // retained in memory until the durable retry worker observes that outbox

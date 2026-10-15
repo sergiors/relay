@@ -19,13 +19,21 @@ import (
 // value instead of reading environment variables directly.
 //
 // The required fields name the Redis stream, group, and address the worker
-// consumes; ConsumerName is the resolved hostname identity (see consumerNameFromHost);
+// consumes, plus the PostgreSQL state DSN (DATABASE_URL);
+// ConsumerName is the resolved hostname identity (see consumerNameFromHost);
 // and the address values (MetricsAddr, GitWebhookAddr) are empty when disabled,
 // so gating on non-empty keeps them opt-in.
 type Config struct {
-	RedisURI     string
-	RedisStream  string
-	RedisGroup   string
+	RedisURI    string
+	RedisStream string
+	RedisGroup  string
+	// DatabaseURL is the PostgreSQL DSN (DATABASE_URL) of the shared state
+	// database. It is REQUIRED: Relay's operator state view, per-worker stats
+	// snapshots, and the durable schedule-publication outbox all live in
+	// PostgreSQL, so the worker refuses to start without it. The value carries
+	// credentials and is never logged. It is consumed by internal/state as the
+	// sole connection identity.
+	DatabaseURL  string
 	ConsumerName string
 	// StreamRetention is the source-stream retention window
 	// (REDIS_STREAM_RETENTION). Unset defaults to DefaultStreamRetention
@@ -213,7 +221,7 @@ const (
 	// REDIS_DLQ_RETENTION is UNSET; an explicitly empty value disables it. The
 	// DLQ has no consumer group, so its trim is AGE-ONLY (MINID ~, no ACKED).
 	// Seven days mirrors the schedule outbox's retention, so a dead-lettered
-	// entry outlives the schedule occurrence's SQLite-outbox window. It is
+	// entry outlives the schedule occurrence's PostgreSQL-outbox window. It is
 	// INDEPENDENT of the invocation-state terminal TTL below: a DLQ entry is
 	// stream data, a terminal invocation-state hash is a per-message Redis hash.
 	DefaultDLQRetention = 7 * 24 * time.Hour
@@ -228,6 +236,29 @@ const (
 	// Forty-eight hours is the historical terminal-bookkeeping window after
 	// this change (it replaced a hard-coded 7 days).
 	DefaultInvocationRetention = 48 * time.Hour
+)
+
+// State-database pool defaults. Relay's state workload is low-frequency and
+// short-transactional (reconciler status writes, a 5s stats flush, scheduler
+// outbox writes, CLI reads), so a small bounded pool is correct and prevents a
+// single worker from exhausting PostgreSQL connections when several replicas
+// share one database. They are fixed internal defaults, not env knobs:
+// PostgreSQL connection limits are an operator/deployment concern, and these
+// values are deliberately conservative.
+const (
+	// DefaultDatabaseMaxOpenConns bounds each process's PostgreSQL connection
+	// pool. Several Relay workers plus CLI commands may share one database, so
+	// the per-process pool stays small.
+	DefaultDatabaseMaxOpenConns = 8
+	// DefaultDatabaseMaxIdleConns is the retained idle-connection count.
+	DefaultDatabaseMaxIdleConns = 4
+	// DefaultDatabaseConnMaxLifetime retires pooled connections periodically so
+	// a database failover or restart is picked up without a process restart.
+	DefaultDatabaseConnMaxLifetime = 30 * time.Minute
+	// DefaultDatabaseConnMaxIdleTime closes connections idle in the pool.
+	DefaultDatabaseConnMaxIdleTime = 5 * time.Minute
+	// DefaultDatabaseConnectTimeout bounds the startup connectivity check.
+	DefaultDatabaseConnectTimeout = 10 * time.Second
 )
 
 // Load reads Relay's configuration from the environment and returns a Config and
@@ -280,6 +311,16 @@ func Load(logger *slog.Logger) (Config, error) {
 		return Config{}, err
 	}
 	cfg.RedisGroup = group
+
+	// The state database DSN is required: PostgreSQL backs the operator state
+	// view, the per-worker stats snapshots, and the durable schedule outbox. A
+	// missing value is a startup error naming the variable, never a silent
+	// fallback.
+	databaseURL, err := requiredEnv("DATABASE_URL")
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.DatabaseURL = databaseURL
 
 	consumer, err := consumerNameFromHost()
 	if err != nil {
@@ -374,6 +415,55 @@ func Load(logger *slog.Logger) (Config, error) {
 	cfg.HotReload = hotReload
 
 	return cfg, nil
+}
+
+// LoadDatabaseURL resolves just the state-database DSN from the environment.
+// It exists for the administrative commands (`app ls`, `app inspect`, `stats`,
+// `stats reset`) that need PostgreSQL but must work with no REDIS_URI,
+// REDIS_STREAM, REDIS_GROUP, or Docker configured: those commands read/write the
+// operator state view only. A missing DATABASE_URL returns a clear
+// variable-naming error rather than a zero DSN, so an unconfigured CLI reports
+// the real cause instead of a connection failure.
+func LoadDatabaseURL() (string, error) {
+	return requiredEnv("DATABASE_URL")
+}
+
+// RedisConfig is the narrow Redis-only slice of the deployment configuration the
+// `relay dlq` commands need: the Redis address and the source stream whose
+// Relay-owned DLQ stream (`relay:<stream>:dlq`) is inspected/replayed, plus the
+// consumer group (validated for parity with `relay start`, though the DLQ store
+// itself does not use it). It deliberately carries no PostgreSQL state DSN: the
+// DLQ lives entirely in Redis, so those commands must work in a Redis-only
+// environment.
+type RedisConfig struct {
+	URI    string
+	Stream string
+	Group  string
+}
+
+// LoadRedisConfig resolves just the required Redis variables (REDIS_URI,
+// REDIS_STREAM, REDIS_GROUP) with the SAME validation Load applies to them, but
+// WITHOUT its DATABASE_URL dependency. It exists for the `relay dlq` commands,
+// which read and mutate only the Relay-owned DLQ stream in Redis and never touch
+// the PostgreSQL state database. A missing required Redis variable returns a
+// clear, variable-naming error rather than an empty value, so a misconfigured
+// CLI reports the real cause. The address is returned verbatim for
+// config.RedisOptions to parse (a Redis DSN may carry credentials, so the value
+// is never logged here).
+func LoadRedisConfig() (RedisConfig, error) {
+	uri, err := requiredEnv("REDIS_URI")
+	if err != nil {
+		return RedisConfig{}, err
+	}
+	stream, err := requiredEnv("REDIS_STREAM")
+	if err != nil {
+		return RedisConfig{}, err
+	}
+	group, err := requiredEnv("REDIS_GROUP")
+	if err != nil {
+		return RedisConfig{}, err
+	}
+	return RedisConfig{URI: uri, Stream: stream, Group: group}, nil
 }
 
 // loadPositiveInt parses a positive-integer environment value. Defaults are

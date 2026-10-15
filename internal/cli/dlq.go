@@ -17,23 +17,26 @@ import (
 	"relay/internal/worker"
 )
 
-// openRedisDLQStore is the production OpenDLQStore: it loads the process
-// configuration through the same config.Load + config.RedisOptions conventions
-// `relay start` uses, then builds a Redis-backed store over the DLQ stream
-// derived from the configured source stream. config.Load is the configuration
-// boundary: a missing required REDIS_* variable (or any other invalid setting)
-// is RETURNED and propagated to cmd/main.go, which prints it once and owns the
-// process exit — matching the worker's startup behavior.
-func openRedisDLQStore(logger *slog.Logger) (DLQStore, func(), error) {
-	cfg, err := config.Load(logger)
+// openRedisDLQStore is the production OpenDLQStore: it resolves the Redis
+// configuration through the narrow config.LoadRedisConfig (REDIS_URI,
+// REDIS_STREAM, REDIS_GROUP) and builds a Redis-backed store over the DLQ stream
+// derived from the configured source stream. The DLQ lives entirely in Redis, so
+// this path deliberately does NOT require DATABASE_URL: unlike config.Load it
+// never resolves the PostgreSQL state DSN, and `relay dlq` therefore works in a
+// Redis-only environment. Redis configuration validation is unchanged — a missing
+// required REDIS_* variable is RETURNED (as is an invalid REDIS_URI) and
+// propagated to cmd/main.go, which prints it once and owns the process exit,
+// matching the worker's startup behavior.
+func openRedisDLQStore(_ *slog.Logger) (DLQStore, func(), error) {
+	cfg, err := config.LoadRedisConfig()
 	if err != nil {
 		return nil, nil, fmt.Errorf("config: %w", err)
 	}
-	opts, err := config.RedisOptions(cfg.RedisURI)
+	opts, err := config.RedisOptions(cfg.URI)
 	if err != nil {
 		return nil, nil, fmt.Errorf("redis config: %w", err)
 	}
-	store := stream.NewRedisDLQStore(opts, cfg.RedisStream)
+	store := stream.NewRedisDLQStore(opts, cfg.Stream)
 	return store, func() { _ = store.Close() }, nil
 }
 

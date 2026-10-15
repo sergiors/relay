@@ -191,16 +191,20 @@ Building the Relay binary itself requires Go 1.27:
 go build -o relay ./cmd
 ```
 
-Run it against your own Redis and Docker Engine:
+Run it against your own Redis, PostgreSQL, and Docker Engine:
 
 ```sh
 REDIS_URI=localhost:6379 \
 REDIS_STREAM=events \
 REDIS_GROUP=relay \
+DATABASE_URL='postgres://relay:relay@localhost:5432/relay?sslmode=disable' \
 ./relay start
 ```
 
-Relay reads apps from the fixed `/apps` root.
+Relay reads apps from the fixed `/apps` root. The `DATABASE_URL` database is a
+required, shared state view (operator snapshot, per-worker stats, and the durable
+schedule outbox); see [docs/operations.md](docs/operations.md#state-database) and
+[docs/configuration.md](docs/configuration.md).
 
 ## Apps
 

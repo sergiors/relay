@@ -1,0 +1,154 @@
+package state
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"log/slog"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+)
+
+// The state tests run against a real PostgreSQL instance (the suite is a
+// database integration suite). TEST_DATABASE_URL selects it; the default
+// matches the CI service container. When no database is reachable the shared
+// helpers skip, so a host without PostgreSQL can still run the unit suite;
+// CI provisions PostgreSQL for both the unit and integration jobs, where these
+// tests run for real.
+//
+// Every test gets its own uniquely-named schema (search_path-pinned), so tests
+// never share tables or destructively mutate one another. The schema is dropped
+// on cleanup.
+
+func testDatabaseURL() string {
+	if v := os.Getenv("TEST_DATABASE_URL"); v != "" {
+		return v
+	}
+	return "postgres://relay:relay@localhost:5432/relay?sslmode=disable"
+}
+
+func testDatabaseAvailable(t *testing.T) bool {
+	t.Helper()
+	db, err := sql.Open("pgx", testDatabaseURL())
+	if err != nil {
+		return false
+	}
+	defer db.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return db.PingContext(ctx) == nil
+}
+
+// newTestDSN creates a fresh isolated schema and returns a DSN pinned to it.
+func newTestDSN(t *testing.T) string {
+	t.Helper()
+	base := testDatabaseURL()
+	if !testDatabaseAvailable(t) {
+		t.Skipf("state tests require PostgreSQL at TEST_DATABASE_URL (%s); none reachable", base)
+	}
+	schema := "relay_test_" + randHex(t)
+	admin, err := sql.Open("pgx", base)
+	if err != nil {
+		t.Fatalf("open admin connection: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := admin.ExecContext(ctx, `CREATE SCHEMA `+quoteSchemaIdent(schema)); err != nil {
+		_ = admin.Close()
+		t.Fatalf("create test schema: %v", err)
+	}
+	t.Cleanup(func() {
+		dropCtx, dropCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer dropCancel()
+		if _, err := admin.ExecContext(dropCtx, `DROP SCHEMA IF EXISTS `+quoteSchemaIdent(schema)+` CASCADE`); err != nil {
+			t.Logf("drop test schema %s: %v", schema, err)
+		}
+		_ = admin.Close()
+	})
+	return testWithSearchPath(base, schema)
+}
+
+// testOpen opens a state handle on dsn and registers its close. It mirrors the
+// production Open signature shape (*State, error) so call sites that already
+// handle the error read unchanged.
+func testOpen(t *testing.T, dsn string) (*State, error) {
+	t.Helper()
+	st, err := Open(context.Background(), Options{DSN: dsn})
+	if err == nil {
+		t.Cleanup(func() { _ = st.Close() })
+	}
+	return st, err
+}
+
+func randHex(t *testing.T) string {
+	t.Helper()
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	return hex.EncodeToString(b[:])
+}
+
+func quoteSchemaIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+func testWithSearchPath(base, schema string) string {
+	if strings.HasPrefix(base, "postgres://") || strings.HasPrefix(base, "postgresql://") {
+		if u, err := url.Parse(base); err == nil {
+			q := u.Query()
+			q.Set("search_path", schema)
+			u.RawQuery = q.Encode()
+			return u.String()
+		}
+		return base + "?search_path=" + url.QueryEscape(schema)
+	}
+	return base + " search_path=" + schema
+}
+
+// openTestState is the shared helper most tests use: a fresh isolated schema
+// with a debug logger installed.
+func openTestState(t *testing.T) *State {
+	t.Helper()
+	c := testOpenOrFail(t, newTestDSN(t))
+	c.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	return c
+}
+
+func testOpenOrFail(t *testing.T, dsn string) *State {
+	t.Helper()
+	c, err := testOpen(t, dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	return c
+}
+
+// testSyncBuffer is a mutex-protected log buffer for tests whose logger is
+// written by background goroutines while the test goroutine asserts on it. It
+// mirrors testutil.SyncBuffer; the state package's own tests cannot import
+// testutil (testutil imports state, which would be an import cycle).
+type testSyncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *testSyncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *testSyncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}

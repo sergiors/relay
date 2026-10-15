@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -20,10 +19,11 @@ import (
 type fakePending struct {
 	p          state.PendingOccurrence
 	leaseUntil time.Time
+	claimToken int64
 }
 
 // fakeOutbox is a deterministic in-memory Outbox with the same claim/lease
-// semantics as the SQLite store. Error injection seams let each failure window
+// semantics as the PostgreSQL store. Error injection seams let each failure window
 // be exercised without a real database. ignoreLease models a lease race: every
 // caller sees every due row, so callers must tolerate overlapping claims (the
 // Redis publish-if-new is what makes that safe). It is mutex-protected, so it is
@@ -129,7 +129,10 @@ func (f *fakeOutbox) ClaimPendingOccurrences(ctx context.Context, now, leaseUnti
 			continue
 		}
 		r.leaseUntil = leaseUntil
-		out = append(out, r.p)
+		r.claimToken++
+		claimed := r.p
+		claimed.ClaimToken = r.claimToken
+		out = append(out, claimed)
 		if len(out) >= limit {
 			break
 		}
@@ -162,7 +165,7 @@ func (f *fakeOutbox) ExpirePendingOccurrences(_ context.Context, now time.Time, 
 	return n, nil
 }
 
-func (f *fakeOutbox) ReschedulePendingOccurrence(_ context.Context, id string, nextAttempt time.Time) error {
+func (f *fakeOutbox) ReschedulePendingOccurrence(_ context.Context, id string, claimToken int64, nextAttempt time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.reschedErr != nil {
@@ -170,6 +173,10 @@ func (f *fakeOutbox) ReschedulePendingOccurrence(_ context.Context, id string, n
 	}
 	r, ok := f.rows[id]
 	if !ok {
+		return nil
+	}
+	// Mirror the store's fencing: a superseded claimant's write matches nothing.
+	if claimToken != 0 && r.claimToken != claimToken {
 		return nil
 	}
 	r.p.Attempts++
@@ -190,6 +197,26 @@ func (f *fakeOutbox) DeletePendingOccurrence(_ context.Context, id string) error
 		f.deleted = append(f.deleted, id)
 	}
 	return nil
+}
+
+// DeletePendingOccurrenceClaimed mirrors the store's fenced delete: a stale
+// claim token (a superseded claimant) matches nothing and deletes no row.
+func (f *fakeOutbox) DeletePendingOccurrenceClaimed(_ context.Context, id string, claimToken int64) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.deleteErr != nil {
+		return false, f.deleteErr
+	}
+	r, ok := f.rows[id]
+	if !ok {
+		return false, nil
+	}
+	if claimToken != 0 && r.claimToken != claimToken {
+		return false, nil
+	}
+	delete(f.rows, id)
+	f.deleted = append(f.deleted, id)
+	return true, nil
 }
 
 func (f *fakeOutbox) NextPendingDue(ctx context.Context, now time.Time) (time.Time, bool, error) {
@@ -1249,18 +1276,15 @@ func TestPendingBackoffIsCapped(t *testing.T) {
 }
 
 // TestDurableRetryThroughRealStateDB is the end-to-end persistence path with the
-// production SQLite outbox: an exhausted immediate publish persists the row,
+// production PostgreSQL outbox: an exhausted immediate publish persists the row,
 // the DB is closed (simulating a process exit), reopened, and the durable worker
 // resolves the occurrence it finds. It proves the whole chain wires together
 // without a fake store.
 func TestDurableRetryThroughRealStateDB(t *testing.T) {
 	frozen := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
-	path := filepath.Join(t.TempDir(), "db.sqlite3")
+	dsn := testutil.NewStateDSN(t)
 
-	st1, err := state.Open(path)
-	if err != nil {
-		t.Fatalf("open state: %v", err)
-	}
+	st1 := testutil.OpenState(t, dsn)
 	st1.SetLogger(testutil.DiscardLogger())
 	o := pendingOccurrence("a", "jobs.a")
 
@@ -1277,11 +1301,7 @@ func TestDurableRetryThroughRealStateDB(t *testing.T) {
 	}
 
 	// A "restart": reopen and run the durable worker with a healthy publisher.
-	st2, err := state.Open(path)
-	if err != nil {
-		t.Fatalf("reopen state: %v", err)
-	}
-	defer st2.Close()
+	st2 := testutil.OpenState(t, dsn)
 	st2.SetLogger(testutil.DiscardLogger())
 	fp2 := newFakePublisher(4)
 	fp2.published = true
@@ -1526,7 +1546,7 @@ func TestRunPendingOnceExpiredCleanupIsBounded(t *testing.T) {
 }
 
 // TestExpiredRecordIsNotRetryableAfterRestart pins the restart contract with the
-// real SQLite outbox: a row inside retention remains retryable after a process
+// real PostgreSQL outbox: a row inside retention remains retryable after a process
 // restart, while a row whose deadline has passed is cleaned after restart and
 // never published. The scheduler's injectable clock stands in for wall time, so
 // the "expired" case uses a clock past the row's real 7-day deadline.
@@ -1534,10 +1554,7 @@ func TestExpiredRecordIsNotRetryableAfterRestart(t *testing.T) {
 	o := pendingOccurrence("a", "jobs.a")
 	save := func(t *testing.T, path string) {
 		t.Helper()
-		st, err := state.Open(path)
-		if err != nil {
-			t.Fatalf("open state: %v", err)
-		}
+		st := testutil.OpenState(t, path)
 		st.SetLogger(testutil.DiscardLogger())
 		if _, err := st.SavePendingOccurrence(context.Background(), state.PendingOccurrence{
 			ID: o.ID(), App: o.App, Schedule: o.Schedule, Handler: o.Handler,
@@ -1551,13 +1568,9 @@ func TestExpiredRecordIsNotRetryableAfterRestart(t *testing.T) {
 	}
 
 	t.Run("inside retention remains retryable", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "db.sqlite3")
-		save(t, path)
-		st, err := state.Open(path)
-		if err != nil {
-			t.Fatalf("reopen state: %v", err)
-		}
-		defer st.Close()
+		dsn := testutil.NewStateDSN(t)
+		save(t, dsn)
+		st := testutil.OpenState(t, dsn)
 		st.SetLogger(testutil.DiscardLogger())
 		fp := newFakePublisher(4)
 		fp.published = true
@@ -1573,13 +1586,9 @@ func TestExpiredRecordIsNotRetryableAfterRestart(t *testing.T) {
 	})
 
 	t.Run("after expiry is cleaned without publishing", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "db.sqlite3")
-		save(t, path)
-		st, err := state.Open(path)
-		if err != nil {
-			t.Fatalf("reopen state: %v", err)
-		}
-		defer st.Close()
+		dsn := testutil.NewStateDSN(t)
+		save(t, dsn)
+		st := testutil.OpenState(t, dsn)
 		st.SetLogger(testutil.DiscardLogger())
 		fp := newFakePublisher(4)
 		fp.published = true

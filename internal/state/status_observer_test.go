@@ -29,7 +29,7 @@ func recordingObserver() (func(name, status string), *[]statusEvent) {
 // discovery/preparing, building, reconciling, ready, failures (degraded with a
 // usable generation, unavailable without), removal (empty status), and prune.
 func TestStatusObserverTransitions(t *testing.T) {
-	st, err := Open(filepath.Join(t.TempDir(), "db.sqlite3"))
+	st, err := testOpen(t, newTestDSN(t))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestStatusObserverTransitions(t *testing.T) {
 // branch: a failure on an app that never had a usable generation notifies
 // with unavailable.
 func TestStatusObserverFailureWithoutGenerationUnavailable(t *testing.T) {
-	st, err := Open(filepath.Join(t.TempDir(), "db.sqlite3"))
+	st, err := testOpen(t, newTestDSN(t))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestStatusObserverFailureWithoutGenerationUnavailable(t *testing.T) {
 // row) does not notify the observer: the gauge must not claim a transition the
 // database did not record.
 func TestStatusObserverNotNotifiedForMissingRow(t *testing.T) {
-	st, err := Open(filepath.Join(t.TempDir(), "db.sqlite3"))
+	st, err := testOpen(t, newTestDSN(t))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestStatusObserverNotNotifiedForMissingRow(t *testing.T) {
 // removal emits preparing again.
 func TestStatusObserverPruneNotifiesRemoval(t *testing.T) {
 	root := t.TempDir()
-	st, err := Open(filepath.Join(t.TempDir(), "db.sqlite3"))
+	st, err := testOpen(t, newTestDSN(t))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestStatusObserverPruneNotifiesRemoval(t *testing.T) {
 // TestStatusObserverNilSafe pins that a state opened without an observer (the
 // default) tolerates every status write, and that clearing the observer is safe.
 func TestStatusObserverNilSafe(t *testing.T) {
-	st, err := Open(filepath.Join(t.TempDir(), "db.sqlite3"))
+	st, err := testOpen(t, newTestDSN(t))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

@@ -9,7 +9,7 @@ import (
 	"relay/internal/app"
 	"relay/internal/runner"
 	"relay/internal/runtime"
-	"relay/internal/state"
+	"relay/internal/testutil"
 )
 
 // TestFingerprintDiscoveredReusedAcrossStatePhase is the state-phase regression
@@ -65,11 +65,7 @@ func TestFingerprintDiscoveredReusedAcrossStatePhase(t *testing.T) {
 
 	// The state phase as Run wires it: seed an empty DB from the pair, then
 	// upsert the discovery pair. Both must persist the pre-change fingerprint.
-	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
-	if err != nil {
-		t.Fatalf("state open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st := testutil.NewState(t)
 
 	if err := st.RebuildFromApps(discovered); err != nil {
 		t.Fatalf("rebuild from apps: %v", err)
@@ -209,11 +205,7 @@ func TestStartupBuiltFingerprintIsReturnedIdentity(t *testing.T) {
 		t.Fatal("test setup: the on-disk digest must differ from the built identity")
 	}
 
-	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
-	if err != nil {
-		t.Fatalf("state open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st := testutil.NewState(t)
 	st.RecordDiscovered(startup[0].App)
 
 	prepareApps(context.Background(), spy, startup, st, discardLogger())

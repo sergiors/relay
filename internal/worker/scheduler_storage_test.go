@@ -4,12 +4,11 @@ import (
 	"context"
 	"errors"
 	"io"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"relay/internal/cron"
-	"relay/internal/state"
+	"relay/internal/testutil"
 )
 
 // fakeSchedulerStorage records the scheduler-storage wiring decisions so the
@@ -35,11 +34,7 @@ func (f *fakeSchedulerStorage) StartStorageBootstrap(_ context.Context, open cro
 // shared state handle is installed and the durable retry worker is started; no
 // unavailable marking or bootstrap is used.
 func TestWireSchedulerStorageWithSharedHandle(t *testing.T) {
-	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
-	if err != nil {
-		t.Fatalf("state.Open: %v", err)
-	}
-	defer st.Close()
+	st := testutil.NewState(t)
 
 	fake := &fakeSchedulerStorage{}
 	wireSchedulerStorage(context.Background(), fake, st, nil)

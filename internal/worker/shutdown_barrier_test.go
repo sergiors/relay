@@ -756,7 +756,7 @@ func TestSchedulerBarrierGatesRedisTeardownOnEarlyStartupFailure(t *testing.T) {
 	var once sync.Once
 
 	// stop models Scheduler.Stop joining an in-flight durable retry (the
-	// Redis/SQLite-facing work) on a scheduler that was never Started: it
+	// Redis/PostgreSQL-facing work) on a scheduler that was never Started: it
 	// observes its bound (so the registry logs a timeout) but keeps waiting.
 	stop := func(stepCtx context.Context) error {
 		once.Do(func() { close(retryEntered) })

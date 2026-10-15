@@ -35,7 +35,7 @@ import (
 // returned by Manager.PoolSnapshot. It is deliberately a plain value: the live
 // gauges (Capacity/Containers/Busy/Idle/Starting) come from the pool's
 // authoritative state, and the cumulative counters come from the metrics
-// registry. The LIVE gauges are NOT persisted to SQLite (a persisted live gauge
+// registry. The LIVE gauges are NOT persisted to PostgreSQL (a persisted live gauge
 // would go stale); only the cumulative counters are persisted (see
 // state.AppStats), so a standalone CLI can render them without the
 // worker's memory. It is a live, worker-local view.

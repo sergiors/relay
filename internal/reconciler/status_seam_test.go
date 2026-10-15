@@ -146,11 +146,7 @@ func TestReconcileServiceStatusPersistedPreparingReconcilingReady(t *testing.T) 
 	tmpl := mustParse(servicesTemplate)
 	baseFn := app.App{Name: "svc-persist", Dir: dir, Template: tmpl}
 
-	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
-	if err != nil {
-		t.Fatalf("open state: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st := testutil.NewState(t)
 	st.RecordReconcileSuccess(baseFn.Name, "img-svc-persist", "fp", time.Now(), baseFn)
 
 	// Seed an active generation so the reconcile is an update (the skip path is
@@ -202,11 +198,7 @@ func TestReconcileServiceFailureStatusRetainsGeneration(t *testing.T) {
 	tmpl := mustParse(servicesTemplate)
 	baseFn := app.App{Name: "svc-fail", Dir: dir, Template: tmpl}
 
-	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
-	if err != nil {
-		t.Fatalf("open state: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st := testutil.NewState(t)
 	st.RecordReconcileSuccess(baseFn.Name, "img-svc-fail", "fp", time.Now(), baseFn)
 
 	pf := runner.NewPrepared(baseFn, &runtime.Prepared{Name: baseFn.Name, Image: "img-svc-fail"}, &fakeBuilder{})
@@ -259,11 +251,7 @@ func TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus(t *testing
 	tmpl := mustParse(servicesTemplate)
 	baseFn := app.App{Name: "svc-gen", Dir: dir, Template: tmpl}
 
-	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
-	if err != nil {
-		t.Fatalf("open state: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st := testutil.NewState(t)
 	st.RecordReconcileSuccess(baseFn.Name, "img-gen", "fp", time.Now(), baseFn)
 
 	pf := runner.NewPrepared(baseFn, &runtime.Prepared{Name: baseFn.Name, Image: "img-gen"}, &fakeBuilder{})
@@ -316,11 +304,7 @@ func TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus(t *testing
 	// Reverse order: a stale FAILURE after the current SUCCESS must not clobber
 	// the ready status either.
 	t.Run("stale failure after current success is ignored", func(t *testing.T) {
-		st2, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
-		if err != nil {
-			t.Fatalf("open state: %v", err)
-		}
-		t.Cleanup(func() { _ = st2.Close() })
+		st2 := testutil.NewState(t)
 		st2.RecordReconcileSuccess(baseFn.Name, "img-gen", "fp", time.Now(), baseFn)
 
 		var cs []completion

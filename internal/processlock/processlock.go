@@ -24,11 +24,12 @@ import (
 
 // DefaultDir is the fixed application-convention directory for Relay's
 // EPHEMERAL runtime files. It is deliberately separate from the PERSISTENT
-// /var/lib/relay state volume (the SQLite database, secrets store, and git
-// material): /run/relay is tmpfs-backed process state that must not survive a
-// reboot. It holds the process lock below and the worker's live query socket
-// (worker.SocketPath), which is derived from this directory so the two
-// ephemeral runtime paths stay centralized without a separate path package.
+// /var/lib/relay state volume (the secrets store and git material; PostgreSQL
+// state lives in the database, not this volume): /run/relay is tmpfs-backed
+// process state that must not survive a reboot. It holds the process lock below
+// and the worker's live query socket (worker.SocketPath), which is derived from
+// this directory so the two ephemeral runtime paths stay centralized without a
+// separate path package.
 const DefaultDir = "/run/relay"
 
 // DirPerm is the mode for Relay's ephemeral runtime directory (DefaultDir). It

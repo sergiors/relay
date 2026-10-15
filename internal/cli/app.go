@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log/slog"
-	"os"
 	"sort"
 	"text/tabwriter"
 
@@ -110,33 +108,21 @@ func appsCommand(deps Dependencies) *cli.Command {
 // drift in listing, sorting, or argument handling. It rejects ANY positional
 // argument as a usage error — including a stray `inspect` or `invoke`, which
 // must not resolve as a namespace at the alias — and otherwise renders the table
-// from the state database at deps.StatePath. The error text names the canonical
+// through deps.OpenState. The error text names the canonical
 // command, because `app ls` is the form the alias mirrors.
 func appListAction(deps Dependencies) cli.ActionFunc {
 	return func(ctx context.Context, cmd *cli.Command) error {
 		if cmd.Args().Present() {
 			return cli.Exit("app ls: too many arguments", 2)
 		}
-		return appList(ctx, cmd.Writer, deps.StatePath)
+		return appList(ctx, cmd.Writer, deps)
 	}
 }
 
-// openState opens the local state DB at path (creating it if absent) and
-// returns it with a cleanup func. Any failure is returned as an error for the
-// root ExitErrHandler to print once.
-func openState(path string) (*state.State, func(), error) {
-	st, err := state.Open(path)
-	if err != nil {
-		return nil, nil, fmt.Errorf("open state: %w", err)
-	}
-	st.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	return st, func() { _ = st.Close() }, nil
-}
-
-// appList prints a Docker-like table of apps sorted by name from the
-// state database at statePath.
-func appList(ctx context.Context, w io.Writer, statePath string) error {
-	st, cleanup, err := openState(statePath)
+// appList prints a Docker-like table of apps sorted by name, opening the state
+// database through deps.OpenState.
+func appList(ctx context.Context, w io.Writer, deps Dependencies) error {
+	st, cleanup, err := deps.OpenState(ctx)
 	if err != nil {
 		return err
 	}
@@ -145,11 +131,11 @@ func appList(ctx context.Context, w io.Writer, statePath string) error {
 }
 
 // appInspect prints the full detail for one app, reading the state
-// database at deps.StatePath and resolving the live pool gauges (when the
+// database through deps.OpenState and resolving the live pool gauges (when the
 // in-process provider is absent) from the worker socket at deps.SocketPath. An
 // unknown name returns a runtime error (exit 1 via main).
 func appInspect(ctx context.Context, w io.Writer, name string, deps Dependencies) error {
-	st, cleanup, err := openState(deps.StatePath)
+	st, cleanup, err := deps.OpenState(ctx)
 	if err != nil {
 		return err
 	}

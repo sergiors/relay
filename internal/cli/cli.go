@@ -15,6 +15,7 @@ import (
 
 	"github.com/urfave/cli/v3"
 
+	"relay/internal/config"
 	"relay/internal/processlock"
 	"relay/internal/state"
 	"relay/internal/stream"
@@ -36,8 +37,9 @@ type DLQStore interface {
 // returning the store and a cleanup func. It is an app seam so the command
 // tree never reads environment variables or constructs Redis clients itself,
 // and tests (or an embedding host) can inject a fake without mutable globals.
-// Production wires openRedisDLQStore, which follows the same config.Load +
-// config.RedisOptions conventions as `relay start`.
+// Production wires openRedisDLQStore, which follows the same Redis configuration
+// conventions as `relay start` (config.LoadRedisConfig + config.RedisOptions)
+// but needs no PostgreSQL state DSN, because the DLQ is Redis-only.
 type OpenDLQStore func(logger *slog.Logger) (store DLQStore, cleanup func(), err error)
 
 // StartRun is the narrow seam `relay start` delegates to for the long-running
@@ -48,18 +50,26 @@ type OpenDLQStore func(logger *slog.Logger) (store DLQStore, cleanup func(), err
 // hook and without launching the runtime.
 type StartRun func(logger *slog.Logger) error
 
+// OpenState opens the state database for the administrative commands (`app`,
+// `stats`). It is a lazy seam: it is called only by the commands that need the
+// database, so every other command works with no DATABASE_URL configured. It
+// returns the handle and a cleanup func. Production wires openPostgresState
+// (config.LoadDatabaseURL + state.Open); tests (or an embedding host) inject an
+// isolated handle.
+type OpenState func(ctx context.Context) (*state.State, func(), error)
+
 // Dependencies carries the CLI's injectable process seams: the filesystem
-// locations plus the DLQ store opener the `relay dlq` commands need. Production
-// wires the immutable defaults via DefaultDependencies, while tests (and any
-// embedding host) construct their own. It deliberately replaces package-level
-// mutable variables, so a command's paths and connection come from its
-// construction rather than from global state.
+// locations plus the state-database and DLQ-store openers the administrative
+// commands need. Production wires the immutable defaults via
+// DefaultDependencies, while tests (and any embedding host) construct their own.
+// It deliberately replaces package-level mutable variables, so a command's paths
+// and connection come from its construction rather than from global state.
 type Dependencies struct {
-	// StatePath is the local state database the administrative commands
-	// (app, stats) open. It is read-mostly, not read-only: the read paths
+	// OpenState opens the PostgreSQL state database the administrative commands
+	// (app, stats) use. It is read-mostly, not read-only: the read paths
 	// (app inspect, stats) only read, while `stats reset` writes (zeroing
-	// the cumulative counters in place). Production: state.DBPath.
-	StatePath string
+	// the cumulative counters in place). Production: openPostgresState.
+	OpenState OpenState
 	// SocketPath is the live worker control socket: `relay health` dials it to
 	// ask whether the running worker is healthy (worker readiness plus live
 	// dependency health), `relay app inspect` dials it for the live
@@ -76,23 +86,49 @@ type Dependencies struct {
 	Start StartRun
 	// OpenDLQ opens the DLQ store for the `relay dlq` commands. It is called
 	// lazily, only by those commands, so every other command works with no Redis
-	// configured. Production: openRedisDLQStore (config.Load +
+	// configured. Production: openRedisDLQStore (config.LoadRedisConfig +
 	// config.RedisOptions + stream.NewRedisDLQStore).
 	OpenDLQ OpenDLQStore
 }
 
-// DefaultDependencies returns the fixed production seams: the three filesystem
-// locations, the worker lifecycle, and the config-driven DLQ store opener. The
-// referenced constants stay immutable application conventions; there are no
-// environment overrides or setters.
+// DefaultDependencies returns the fixed production seams: the filesystem
+// locations, the worker lifecycle, the config-driven state- and DLQ-store
+// openers. The referenced constants stay immutable application conventions;
+// there are no environment overrides or setters.
 func DefaultDependencies() Dependencies {
 	return Dependencies{
-		StatePath:  state.DBPath,
+		OpenState:  openPostgresState,
 		SocketPath: worker.SocketPath,
 		LockPath:   processlock.DefaultPath,
 		Start:      worker.Run,
 		OpenDLQ:    openRedisDLQStore,
 	}
+}
+
+// openPostgresState is the production OpenState: it resolves the state DSN from
+// DATABASE_URL (without requiring any REDIS_* configuration, so the admin
+// commands work against a database-only environment) and opens a bounded
+// PostgreSQL handle. A missing DATABASE_URL or an unreachable database is a
+// clear error the command returns; the CLI's read/render paths never panic on a
+// missing database.
+func openPostgresState(ctx context.Context) (*state.State, func(), error) {
+	dsn, err := config.LoadDatabaseURL()
+	if err != nil {
+		return nil, nil, fmt.Errorf("database: %w", err)
+	}
+	st, err := state.Open(ctx, state.Options{
+		DSN:             dsn,
+		Logger:          slog.New(slog.NewTextHandler(os.Stderr, nil)),
+		MaxOpenConns:    config.DefaultDatabaseMaxOpenConns,
+		MaxIdleConns:    config.DefaultDatabaseMaxIdleConns,
+		ConnMaxLifetime: config.DefaultDatabaseConnMaxLifetime,
+		ConnMaxIdleTime: config.DefaultDatabaseConnMaxIdleTime,
+		ConnectTimeout:  config.DefaultDatabaseConnectTimeout,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("open state: %w", err)
+	}
+	return st, func() { _ = st.Close() }, nil
 }
 
 // New constructs the fully configured root relay command. logger is the process

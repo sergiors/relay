@@ -41,49 +41,47 @@ var appStatsJSONRequiredKeys = []string{
 }
 
 // rawStatsData reads the stats.data column rendered back to JSON text (the same
-// expression the production read path uses) plus updated_at for the single-row
-// table. A stored value that is not valid JSON renders as an empty string.
+// expression the production read path uses) plus updated_at for this handle's
+// worker row.
 func rawStatsData(t *testing.T, c *State) (data, updatedAt string) {
 	t.Helper()
 	if err := c.db.QueryRowContext(context.Background(),
-		`SELECT CASE WHEN json_valid(data, 5) THEN json(data) END, updated_at FROM stats WHERE id = 1`).Scan(&data, &updatedAt); err != nil {
+		`SELECT data::text, updated_at FROM stats WHERE worker = $1`, c.owner).Scan(&data, &updatedAt); err != nil {
 		t.Fatalf("read raw stats: %v", err)
 	}
 	return data, updatedAt
 }
 
 // rawAppStatsData reads app_stats.data rendered back to JSON text plus
-// updated_at for name. A stored value that is not valid JSON renders as an empty
-// string.
+// updated_at for name's row owned by this handle's worker.
 func rawAppStatsData(t *testing.T, c *State, name string) (data, updatedAt string) {
 	t.Helper()
 	if err := c.db.QueryRowContext(context.Background(),
-		`SELECT CASE WHEN json_valid(data, 5) THEN json(data) END, updated_at FROM app_stats WHERE app_name = ?`, name).Scan(&data, &updatedAt); err != nil {
+		`SELECT data::text, updated_at FROM app_stats WHERE app_name = $1 AND worker = $2`, name, c.owner).Scan(&data, &updatedAt); err != nil {
 		t.Fatalf("read raw function stats: %v", err)
 	}
 	return data, updatedAt
 }
 
-// rawStatsBlob reads the stored stats.data blobs verbatim (no json() rendering)
-// plus its SQLite storage type, so a test can assert the on-disk JSONB format
-// and preserve a corrupt payload byte-for-byte.
-func rawStatsBlob(t *testing.T, c *State) (data []byte, typeof, updatedAt string) {
+// rawStatsBlob reads the stored stats.data JSON text plus its native JSONB type,
+// so a test can assert the persisted native JSONB format.
+func rawStatsBlob(t *testing.T, c *State) (data, jsonbType, updatedAt string) {
 	t.Helper()
 	if err := c.db.QueryRowContext(context.Background(),
-		`SELECT data, typeof(data), updated_at FROM stats WHERE id = 1`).Scan(&data, &typeof, &updatedAt); err != nil {
-		t.Fatalf("read raw stats blob: %v", err)
+		`SELECT data::text, jsonb_typeof(data), updated_at FROM stats WHERE worker = $1`, c.owner).Scan(&data, &jsonbType, &updatedAt); err != nil {
+		t.Fatalf("read stored stats payload: %v", err)
 	}
-	return data, typeof, updatedAt
+	return data, jsonbType, updatedAt
 }
 
 // rawAppStatsBlob is the per-app counterpart of rawStatsBlob.
-func rawAppStatsBlob(t *testing.T, c *State, name string) (data []byte, typeof, updatedAt string) {
+func rawAppStatsBlob(t *testing.T, c *State, name string) (data, jsonbType, updatedAt string) {
 	t.Helper()
 	if err := c.db.QueryRowContext(context.Background(),
-		`SELECT data, typeof(data), updated_at FROM app_stats WHERE app_name = ?`, name).Scan(&data, &typeof, &updatedAt); err != nil {
-		t.Fatalf("read raw function stats blob: %v", err)
+		`SELECT data::text, jsonb_typeof(data), updated_at FROM app_stats WHERE app_name = $1 AND worker = $2`, name, c.owner).Scan(&data, &jsonbType, &updatedAt); err != nil {
+		t.Fatalf("read stored app stats payload: %v", err)
 	}
-	return data, typeof, updatedAt
+	return data, jsonbType, updatedAt
 }
 
 // assertJSONKeysExactly unmarshals data and fails unless its key set is exactly
@@ -137,10 +135,10 @@ func assertJSONKeysAbsent(t *testing.T, data string, keys ...string) {
 	}
 }
 
-// TestStatsPayloadIsCentralizedJSON pins the storage contract: the global stats
-// row keeps only id/updated_at as columns, stores the whole counter/gauge
-// payload as SQLite binary JSON (JSONB) with exactly the expected keys, and
-// round-trips. The direct typeof(data) check pins the on-disk format.
+// TestStatsPayloadIsCentralizedJSON pins the storage contract: the stats row
+// keys on the worker identity, stores the whole counter/gauge payload as native
+// PostgreSQL JSONB with exactly the expected keys, and round-trips. The direct
+// jsonb_typeof(data) check pins the stored JSONB format.
 func TestStatsPayloadIsCentralizedJSON(t *testing.T) {
 	c := openTestState(t)
 	in := Stats{
@@ -154,8 +152,8 @@ func TestStatsPayloadIsCentralizedJSON(t *testing.T) {
 	}
 	c.RecordStats(in)
 
-	if _, typeof, _ := rawStatsBlob(t, c); typeof != "blob" {
-		t.Fatalf("stats.data storage class = %q, want blob (JSONB)", typeof)
+	if _, jsonbType, _ := rawStatsBlob(t, c); jsonbType != "object" {
+		t.Fatalf("stats.data JSONB type = %q, want object", jsonbType)
 	}
 	data, updatedAt := rawStatsData(t, c)
 	assertJSONKeysExactly(t, data, statsJSONKeys)
@@ -179,8 +177,8 @@ func TestStatsPayloadIsCentralizedJSON(t *testing.T) {
 }
 
 // TestAppStatsPayloadIsCentralizedJSON pins the per-app storage
-// contract: app_name and updated_at stay relational columns, the payload
-// is SQLite binary JSON (JSONB) with exactly the expected keys (including the
+// contract: app_name, worker and updated_at stay relational columns, the payload
+// is native PostgreSQL JSONB with exactly the expected keys (including the
 // pool counters and timestamps), and the LIVE pool gauges are absent.
 func TestAppStatsPayloadIsCentralizedJSON(t *testing.T) {
 	c := openTestState(t)
@@ -199,8 +197,8 @@ func TestAppStatsPayloadIsCentralizedJSON(t *testing.T) {
 	}
 	c.RecordAppStats(in)
 
-	if _, typeof, _ := rawAppStatsBlob(t, c, "alpha"); typeof != "blob" {
-		t.Fatalf("app_stats.data storage class = %q, want blob (JSONB)", typeof)
+	if _, jsonbType, _ := rawAppStatsBlob(t, c, "alpha"); jsonbType != "object" {
+		t.Fatalf("app_stats.data JSONB type = %q, want object", jsonbType)
 	}
 	data, updatedAt := rawAppStatsData(t, c, "alpha")
 	// last_execution_at is present (it was set); the other three timestamps are
@@ -248,8 +246,8 @@ func TestStatsAbsentJSONFieldsZero(t *testing.T) {
 	c := openTestState(t)
 	ctx := context.Background()
 	if _, err := c.db.ExecContext(ctx,
-		`INSERT INTO stats (id, data, updated_at) VALUES (1, jsonb(?), ?)`,
-		`{"events_matched_total":7}`, "2020-01-01T00:00:00Z"); err != nil {
+		`INSERT INTO stats (worker, data, updated_at) VALUES ($1, $2, $3)`,
+		c.owner, `{"events_matched_total":7}`, "2020-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("seed partial payload: %v", err)
 	}
 
@@ -280,8 +278,8 @@ func TestAppStatsAbsentJSONFieldsZero(t *testing.T) {
 		{"partial", `{"events_matched_total":7,"warm_acquires_total":2}`},
 	} {
 		if _, err := c.db.ExecContext(ctx,
-			`INSERT INTO app_stats (app_name, data, updated_at) VALUES (?, jsonb(?), ?)`,
-			row.name, row.data, "2020-01-01T00:00:00Z"); err != nil {
+			`INSERT INTO app_stats (app_name, worker, data, updated_at) VALUES ($1, $2, $3, $4)`,
+			row.name, c.owner, row.data, "2020-01-01T00:00:00Z"); err != nil {
 			t.Fatalf("seed %s: %v", row.name, err)
 		}
 	}
@@ -312,8 +310,8 @@ func TestAppStatsAbsentJSONFieldsZero(t *testing.T) {
 func TestInvalidStatsJSONSurfacesErrors(t *testing.T) {
 	c, buf := captureLogger(t)
 	if _, err := c.db.ExecContext(context.Background(),
-		`INSERT INTO stats (id, data, updated_at) VALUES (1, ?, ?)`,
-		`{not-json`, "2020-01-01T00:00:00Z"); err != nil {
+		`INSERT INTO stats (worker, data, updated_at) VALUES ($1, $2, $3)`,
+		c.owner, `"not-an-object"`, "2020-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("seed corrupt stats: %v", err)
 	}
 
@@ -332,17 +330,17 @@ func TestInvalidStatsJSONSurfacesErrors(t *testing.T) {
 func TestInvalidAppStatsJSONSurfacesErrors(t *testing.T) {
 	c, buf := captureLogger(t)
 	ctx := context.Background()
-	// The corrupt row is seeded as raw bytes bypassing jsonb() (which would
-	// reject it at write time), simulating on-disk corruption; the good row is a
+	// The corrupt row is a well-formed JSON value of the wrong shape (a bare
+	// string) so it cannot decode into the typed payload; the good row is a
 	// normal JSONB write.
 	if _, err := c.db.ExecContext(ctx,
-		`INSERT INTO app_stats (app_name, data, updated_at) VALUES (?, ?, ?)`,
-		"broken", `{not-json`, "2020-01-01T00:00:00Z"); err != nil {
+		`INSERT INTO app_stats (app_name, worker, data, updated_at) VALUES ($1, $2, $3, $4)`,
+		"broken", c.owner, `"not-an-object"`, "2020-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("seed broken: %v", err)
 	}
 	if _, err := c.db.ExecContext(ctx,
-		`INSERT INTO app_stats (app_name, data, updated_at) VALUES (?, jsonb(?), ?)`,
-		"good", `{"events_matched_total":3}`, "2020-01-01T00:00:00Z"); err != nil {
+		`INSERT INTO app_stats (app_name, worker, data, updated_at) VALUES ($1, $2, $3, $4)`,
+		"good", c.owner, `{"events_matched_total":3}`, "2020-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("seed good: %v", err)
 	}
 
@@ -369,8 +367,8 @@ func TestRecordAppStatsSelfHealsInvalidJSON(t *testing.T) {
 	c := openTestState(t)
 	ctx := context.Background()
 	if _, err := c.db.ExecContext(ctx,
-		`INSERT INTO app_stats (app_name, data, updated_at) VALUES (?, ?, ?)`,
-		"alpha", `{not-json`, "2020-01-01T00:00:00Z"); err != nil {
+		`INSERT INTO app_stats (app_name, worker, data, updated_at) VALUES ($1, $2, $3, $4)`,
+		"alpha", c.owner, `"not-an-object"`, "2020-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("seed corrupt row: %v", err)
 	}
 
@@ -390,8 +388,8 @@ func TestRecordAppStatsSelfHealsInvalidJSON(t *testing.T) {
 func TestRecordStatsContextSelfHealsInvalidJSON(t *testing.T) {
 	c := openTestState(t)
 	if _, err := c.db.ExecContext(context.Background(),
-		`INSERT INTO stats (id, data, updated_at) VALUES (1, ?, ?)`,
-		`{not-json`, "2020-01-01T00:00:00Z"); err != nil {
+		`INSERT INTO stats (worker, data, updated_at) VALUES ($1, $2, $3)`,
+		c.owner, `"not-an-object"`, "2020-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("seed corrupt row: %v", err)
 	}
 
@@ -407,8 +405,8 @@ func TestRecordStatsContextSelfHealsInvalidJSON(t *testing.T) {
 // cycle with their counters, pool counters, and timestamps intact — the
 // restart/restore contract for the new storage format.
 func TestStatsJSONReopenRoundTrip(t *testing.T) {
-	path := t.TempDir() + "/db.sqlite3"
-	c1, err := Open(path)
+	path := newTestDSN(t)
+	c1, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -429,7 +427,7 @@ func TestStatsJSONReopenRoundTrip(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	c2, err := Open(path)
+	c2, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -491,8 +489,8 @@ func TestRecordStatsSnapshotSelfHealsInvalidJSON(t *testing.T) {
 	c.RecordDiscovered(fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl)))
 	ctx := context.Background()
 	if _, err := c.db.ExecContext(ctx,
-		`INSERT INTO app_stats (app_name, data, updated_at) VALUES (?, ?, ?)`,
-		"alpha", `{not-json`, "2020-01-01T00:00:00Z"); err != nil {
+		`INSERT INTO app_stats (app_name, worker, data, updated_at) VALUES ($1, $2, $3, $4)`,
+		"alpha", c.owner, `"not-an-object"`, "2020-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("seed corrupt row: %v", err)
 	}
 

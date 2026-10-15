@@ -41,8 +41,16 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 
 ## Ownership and invariants
 
-- `/apps` is the source of truth; the SQLite state DB is a view that never
-  drives matching, building, or reconciliation.
+- `/apps` is the source of truth; the PostgreSQL state DB is a view that never
+  drives matching, building, or reconciliation. It is a REQUIRED dependency:
+  the worker opens it (idempotent schema init) before the Redis/Docker preflight
+  and before loading apps, and a missing/unreachable `DATABASE_URL` is a fatal
+  startup error. Post-startup state write failures stay non-fatal (the event
+  pipeline and scheduler-degrade machinery continue). Per-app snapshot writes are
+  serialized by a transaction-scoped advisory lock keyed on the app NAME (not the
+  row), so concurrent read-modify-write writers (reconciler status transitions,
+  discovery, failures, removal) cannot clobber each other's fields across
+  goroutines, pooled connections, or processes.
 - Relay touches only its own namespaces (`relay-app-*` / `relay-dep-*` images,
   `relay.`-labelled containers and keys); ownership is the strict `relay.type`
   label, never a name, with no global pruning.
@@ -95,9 +103,20 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   no-build path, and an unavailable-placeholder reconcile all clear pending so no
   removed rule keeps gating events.
 - Delivery is at-least-once, never exactly-once: handlers must be idempotent.
+- Persisted stats are per-worker absolute snapshots keyed by the resolved
+  hostname identity (`ConsumerName`), so workers sharing one PostgreSQL database
+  never overwrite each other's counters. A worker restores and flushes only its
+  OWN rows; CLI/observability reads aggregate across owners (counters summed,
+  execution-history timestamps maxed, and the shared-backlog gauges taken from
+  the FRESHEST owner snapshot — never a max, so a dead worker's stale gauge
+  cannot mask the live value) and `relay stats reset` clears every owner. Two
+  workers resolving the same hostname share a stats row — the documented
+  limitation of a hostname identity.
 - State, metrics, and cleanup failures are logged, never fatal. Redis/transport
   errors leave messages pending (fail open); a claim error (`TryStart`) fails
-  closed so a duplicate cannot race a winning replica.
+  closed so a duplicate cannot race a winning replica. Opening the state database
+  is the exception: it is a required dependency and its failure is a fatal
+  startup error.
 
 ## Template concepts
 
@@ -211,7 +230,7 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   are rejected because their identity is not deterministic across workers.
 - Publication durability is **intent-first**: every due occurrence's exact
   immutable intent (its derived id plus app/schedule/handler/scheduled_at) is
-  written to the local `state` SQLite outbox (`schedule_pending`) BEFORE any Redis
+  written to the shared `state` PostgreSQL outbox (`schedule_pending`) BEFORE any Redis
   publish, so a crash between persistence and publication recovers it. The row is
   deleted only once a publication call resolves nil (published or clean
   duplicate). If the outbox write fails, the occurrence is NOT published: the
@@ -229,8 +248,9 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   Recovery flushes the held exact occurrences to the outbox BEFORE the bounded
   latest-only catch-up runs, so a held occurrence is never reconstructed from the
   current time or lost behind a newer one. The outbox is coordination state only —
-  never history, never an execution source. Rows are claimed with a per-row DB
-  lease, not a global mutex, and never deleted until a call resolves or the row
+  never history, never an execution source. Rows are claimed with a per-row DB lease
+  (`FOR UPDATE SKIP LOCKED`) fenced by a monotonic claim token, not a global
+  mutex, and never deleted until a call resolves or the row
   expires. A record is republished only after its decoded intent is verified to
   reconstruct the occurrence ID stored in its row key; an undecodable or
   identity-mismatched row is logged, retained, and rescheduled under the bounded
@@ -238,14 +258,16 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   latest-only 24h recovery for never-attempted misses and is unchanged.
 - The durable outbox is REQUIRED for scheduler correctness but is NOT a global
   Relay dependency. The scheduler evaluates/publishes an occurrence only while a
-  usable outbox is installed; when `state.Open` fails at startup the scheduler is
-  marked unavailable (never starts gocron; one-hot `scheduler_state` gauge +
-  `scheduler_degraded_total`/`scheduler_recoveries_total`) and a scheduler-owned,
-  cancellable, joined bootstrap retries opening the store. It opens a
-  scheduler-owned handle (closed only after scheduler work stops; the shared
-  global handle is never touched), recovers rows, re-runs the same bounded
-  latest-only 24h catch-up, then enables live jobs. A runtime outbox failure
-  pauses live publication (degraded) and is never substituted by in-memory
+  usable outbox is installed. In production the shared `state` handle is always
+  available (its open is fatal at startup), so the scheduler is wired directly; a
+  defensive scheduler-owned, cancellable, joined bootstrap remains: were the
+  handle ever unavailable it would mark the scheduler unavailable (never starts
+  gocron; one-hot `scheduler_state` gauge +
+  `scheduler_degraded_total`/`scheduler_recoveries_total`) and retry opening the
+  store, opening a scheduler-owned handle (closed only after scheduler work stops;
+  the shared global handle is never touched), recovering rows, re-running the same
+  bounded latest-only 24h catch-up, then enabling live jobs. A runtime outbox
+  failure pauses live publication (degraded) and is never substituted by in-memory
   retries; the affected exact occurrence is retained in memory and flushed once
   the store answers again. Schedule firing is not a prerequisite for consumers,
   functions, services, metrics/logging/tracing, readiness, or health.
@@ -303,17 +325,19 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 
 ## Lifecycle and command hierarchy
 
-- Startup runs an explicit external-dependency preflight BEFORE app
-  loading/fingerprinting, `state.Open`, the runtime socket/services, sweeps and
-  preparation, listener starts, background loops, the scheduler, and the
-  reconciler. The fixed order is Redis stream/group readiness → Docker
-  runtime-manager readiness → configured `NETWORKS` verification → the runtime
-  manager's deferred warm-container maintenance loop is started; a failure at
-  any step short-circuits every later phase, and a lifecycle cancellation during
-  the preflight is a graceful shutdown, not an error. The manager is opened with
-  deferred maintenance so no manager background loop runs while `NETWORKS` is
-  still unverified; a verification failure closes the manager with no loop ever
-  started.
+- Startup first opens the REQUIRED PostgreSQL state database (`state.Open`, with
+  idempotent schema init) — a missing `DATABASE_URL` or unreachable database is a
+  fatal startup error, before any other resource — then runs an explicit
+  external-dependency preflight BEFORE app loading/fingerprinting, the runtime
+  socket/services, sweeps and preparation, listener starts, background loops, the
+  scheduler, and the reconciler. The fixed preflight order is Redis stream/group
+  readiness → Docker runtime-manager readiness → configured `NETWORKS`
+  verification → the runtime manager's deferred warm-container maintenance loop is
+  started; a failure at any step short-circuits every later phase, and a
+  lifecycle cancellation during the preflight is a graceful shutdown, not an
+  error. The manager is opened with deferred maintenance so no manager background
+  loop runs while `NETWORKS` is still unverified; a verification failure closes
+  the manager with no loop ever started.
 - `relay start` runs in the foreground, holds a process lock, and never
   daemonizes, forks, or writes a PID file. Shutdown cancels the lifecycle first,
   then runs ordered teardown steps; the process lock and Redis are released last.
@@ -330,7 +354,7 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   precedes that clear also reports not-ready. `relay health` queries it over the
   existing control socket; a false flag is not-ready, and in steady state the
   query reflects live Redis consumer health plus a bounded Docker ping and
-  `NETWORKS` verification. Per-app status, SQLite, tracing, and
+  `NETWORKS` verification. Per-app status, PostgreSQL, tracing, and
   asynchronous service/housekeeping convergence do not gate readiness.
 - Tree: `start`; `health`; `stats` (`reset`); `app` (`ls`,
   `inspect`, `invoke`); `dlq` (`ls`, `inspect`, `replay`, `rm`); `secret` (`ls`,
@@ -340,10 +364,11 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 - `health` is worker health over the socket: it asks the RUNNING worker whether
   it is ready with its live dependencies healthy, and needs no Redis/Docker
   configuration or clients in the CLI process (with no running worker it fails).
-  `stats`/`app ls|inspect` read SQLite only; `health`, `invoke`,
+  `stats`/`app ls|inspect` read PostgreSQL only (needing `DATABASE_URL`); `health`, `invoke`,
   `dlq replay`, and a running `stats reset` use the worker socket; `dlq` is the
-  one command needing Redis. Persistent state is under `/var/lib/relay`,
-  ephemeral lock/socket state under `/run/relay`; `/apps` is written only by
+  one command needing Redis. Persistent file state (secrets/git) is under `/var/lib/relay`, the state
+  database is PostgreSQL (`DATABASE_URL`), ephemeral lock/socket state under
+  `/run/relay`; `/apps` is written only by
   `git sync`.
 
 ## Conventions

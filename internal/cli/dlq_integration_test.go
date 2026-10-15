@@ -34,6 +34,9 @@ func TestIntegrationDLQCommandsAgainstRedis(t *testing.T) {
 	t.Setenv("REDIS_URI", addr)
 	t.Setenv("REDIS_STREAM", source)
 	t.Setenv("REDIS_GROUP", "relay")
+	// The dlq commands are Redis-only: no DATABASE_URL is required (proving the
+	// narrow Redis-only configuration path).
+	t.Setenv("DATABASE_URL", "")
 
 	opts, _ := config.RedisOptions(addr)
 	cli := redis.NewClient(opts)

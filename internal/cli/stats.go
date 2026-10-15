@@ -16,7 +16,7 @@ import (
 
 // statsCommand builds the `relay stats ...` subcommand family. It reads and
 // resets the operational snapshot in the local state database at
-// deps.StatePath; a reset with a running worker goes through the worker's Unix
+// deps.OpenState; a reset with a running worker goes through the worker's Unix
 // socket so its in-memory totals are reset too, but the read path never needs
 // Redis, Docker, or the worker, so `relay stats` works with no REDIS_URI set. A
 // missing or unreadable stats row renders a zero snapshot rather than failing,
@@ -37,7 +37,7 @@ func statsCommand(deps Dependencies) *cli.Command {
 			if cmd.Args().Present() {
 				return cli.Exit("stats: too many arguments", 2)
 			}
-			st, cleanup, err := openState(deps.StatePath)
+			st, cleanup, err := deps.OpenState(ctx)
 			if err != nil {
 				return err
 			}
@@ -85,7 +85,7 @@ func statsResetCommand(deps Dependencies) *cli.Command {
 			} else if !errors.Is(err, worker.ErrRuntimeStatsNoWorker) {
 				return fmt.Errorf("stats reset: %w", err)
 			}
-			st, cleanup, err := openState(deps.StatePath)
+			st, cleanup, err := deps.OpenState(ctx)
 			if err != nil {
 				return err
 			}

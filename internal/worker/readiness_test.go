@@ -295,7 +295,7 @@ func TestReadinessNotGatedByStateTracingServicesOrAppFailure(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
 
-	// State: a nil handle models an unopenable SQLite database (logged, never
+	// State: a nil handle models an unopenable PostgreSQL database (logged, never
 	// fatal). It is not an input to readiness.
 
 	// App failure: an invalid desired definition stays out of the loaded

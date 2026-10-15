@@ -1,7 +1,6 @@
 package state
 
 import (
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -82,6 +81,82 @@ func TestStatsOnEmptyDB(t *testing.T) {
 	}
 	if s != (Stats{}) {
 		t.Fatalf("expected zero stats, got %+v", s)
+	}
+}
+
+// TestStatsGaugesOwnedByFreshestSnapshot pins the backlog-gauge aggregation. The
+// two backlog gauges describe the SAME shared Redis backlog, so the aggregate
+// must report the FRESHEST worker's snapshot; taking the maximum across rows
+// would let a dead worker's stale high gauge mask the live value forever.
+func TestStatsGaugesOwnedByFreshestSnapshot(t *testing.T) {
+	dsn := newTestDSN(t)
+	a := testOpenOrFail(t, dsn)
+	b := testOpenOrFail(t, dsn)
+	a.owner = "worker-a"
+	b.owner = "worker-b"
+
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	a.nowFn = func() time.Time { return t0 }
+	b.nowFn = func() time.Time { return t0 }
+
+	// The stale owner's row carries a high gauge (its last observation before it
+	// stopped flushing); the fresh owner observed the current lower backlog later.
+	a.RecordStats(Stats{EventsMatchedTotal: 10, PendingEntries: 500, OldestPendingAgeSeconds: 9999})
+	b.nowFn = func() time.Time { return t0.Add(5 * time.Second) }
+	b.RecordStats(Stats{EventsMatchedTotal: 25, PendingEntries: 2, OldestPendingAgeSeconds: 3})
+
+	s, ok := a.Stats()
+	if !ok {
+		t.Fatal("expected an aggregate stats snapshot")
+	}
+	if s.EventsMatchedTotal != 35 {
+		t.Fatalf("events = %d, want 35 (counters summed across owners)", s.EventsMatchedTotal)
+	}
+	if s.PendingEntries != 2 || s.OldestPendingAgeSeconds != 3 {
+		t.Fatalf("gauges = (%d, %d), want the freshest owner's (2, 3)", s.PendingEntries, s.OldestPendingAgeSeconds)
+	}
+
+	// Ownership tracks the freshest flush: when the other owner later flushes, the
+	// aggregate switches to ITS gauges (correct because the gauge really did drop),
+	// still never a maximum of stale rows.
+	a.nowFn = func() time.Time { return t0.Add(10 * time.Second) }
+	a.RecordStats(Stats{EventsMatchedTotal: 11, PendingEntries: 1, OldestPendingAgeSeconds: 1})
+	s, ok = a.Stats()
+	if !ok {
+		t.Fatal("expected an aggregate stats snapshot")
+	}
+	if s.PendingEntries != 1 || s.OldestPendingAgeSeconds != 1 {
+		t.Fatalf("gauges after the freshest owner changed = (%d, %d), want (1, 1)", s.PendingEntries, s.OldestPendingAgeSeconds)
+	}
+	if s.EventsMatchedTotal != 36 {
+		t.Fatalf("events = %d, want 36", s.EventsMatchedTotal)
+	}
+}
+
+// TestMergeStatsEqualUpdatedAtTieIsDeterministic pins the equal-updated_at tie
+// break in mergeStats directly: two snapshots of the SAME shared backlog with the
+// same updated_at (RFC3339 has second granularity) cannot be ordered by
+// freshness, so each gauge takes the larger value. Folding the two rows in either
+// order therefore yields the identical result, so the aggregate never depends on
+// the order the stats rows happen to be read in.
+func TestMergeStatsEqualUpdatedAtTieIsDeterministic(t *testing.T) {
+	const ts = "2026-01-01T00:00:00Z"
+	low := Stats{UpdatedAt: ts, PendingEntries: 2, OldestPendingAgeSeconds: 3}
+	high := Stats{UpdatedAt: ts, PendingEntries: 9, OldestPendingAgeSeconds: 5}
+
+	forward := low
+	mergeStats(&forward, high)
+	reverse := high
+	mergeStats(&reverse, low)
+
+	if forward != reverse {
+		t.Fatalf("tie merge is order-dependent: forward=%+v reverse=%+v", forward, reverse)
+	}
+	if forward.PendingEntries != 9 || forward.OldestPendingAgeSeconds != 5 {
+		t.Fatalf("tie gauges = (%d, %d), want the larger (9, 5)", forward.PendingEntries, forward.OldestPendingAgeSeconds)
+	}
+	if forward.UpdatedAt != ts {
+		t.Fatalf("tie updated_at = %q, want %q", forward.UpdatedAt, ts)
 	}
 }
 
@@ -203,15 +278,15 @@ func TestRemovalDeletesAppStats(t *testing.T) {
 // Schema init is idempotent: re-opening the same path succeeds and the stats
 // table is present alongside the apps table.
 func TestOpenWithStatsSchemaIsIdempotent(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "db.sqlite3")
-	c1, err := Open(path)
+	path := newTestDSN(t)
+	c1, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
 	c1.RecordStats(Stats{RetryTotal: 4})
 	_ = c1.Close()
 
-	c2, err := Open(path) // re-open, init (including new table) must be idempotent
+	c2, err := testOpen(t, path) // re-open, init (including new table) must be idempotent
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

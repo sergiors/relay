@@ -1,5 +1,5 @@
 // Package state persists a read-mostly operator snapshot of Relay's app
-// state in a local SQLite database.
+// state in a PostgreSQL database.
 //
 // The state database is a state VIEW, not the source of truth: /apps (the
 // filesystem root the loader reads) is authoritative. It is not immutable or
@@ -7,7 +7,7 @@
 // reconcile outcomes, the periodic stats flush) and `relay stats reset` writes
 // it — but it is read-mostly in that no read path mutates it and it never
 // drives matching, image building, or reconciliation decisions. The database is
-// rebuilt automatically when empty. It exists so operators can introspect what
+// initialized idempotently on open. It exists so operators can introspect what
 // Relay has loaded and how the last reconcile of each app went, independent
 // of Redis or Docker.
 //
@@ -48,7 +48,7 @@
 // In both cases a failure never reports "ready": degraded when a usable active
 // generation exists, unavailable otherwise. All timestamps are RFC3339 strings.
 //
-// SQLite-view boundary: this database is a VIEW, never the source of truth. It
+// View boundary: this database is a VIEW, never the source of truth. It
 // records what was loaded/prepared/served for operators, but it never drives
 // matching, image building, scheduling, or execution decisions — those are
 // rebuilt from /apps. An invalid app therefore stays out of the
@@ -58,12 +58,11 @@
 //
 // App storage model:
 //
-//   - apps(name TEXT PRIMARY KEY, data BLOB NOT NULL, updated_at TEXT NOT
-//     NULL) stores ONE whole per-app snapshot as a JSON object in data,
-//     written through SQLite's jsonb(?) (binary JSON / JSONB format) and read
-//     back with json(data). Only the stable name key and the write timestamp
-//     stay as columns. The nested configuration — the env names (each value is
-//     the fixed RedactedEnvValue marker, never the literal template value) and
+//   - apps(name TEXT PRIMARY KEY, data JSONB NOT NULL, updated_at TEXT NOT
+//     NULL) stores ONE whole per-app snapshot as a native JSONB object in data.
+//     Only the stable name key and the write timestamp stay as columns. The
+//     nested configuration — the env names (each value is the fixed
+//     RedactedEnvValue marker, never the literal template value) and
 //     the secret REFERENCE names (never a secret value), the event handlers (name
 //   - timeout), the schedules (handler/cron/timezone/timeout/retries), and the
 //     services (entrypoint/image/host/path/port/replicas) — is all part of
@@ -73,16 +72,18 @@
 //     parser's opaque matcher patterns: matching is rebuilt from template.yaml,
 //     never from this state view, and those matcher interfaces cannot be JSON
 //     round-tripped.
-//   - schedule_pending(id PRIMARY KEY, data BLOB NOT NULL, attempts,
-//     next_attempt_ms, lease_until_ms, expires_at_ms) is the durable
+//   - schedule_pending(id PRIMARY KEY, data JSONB NOT NULL, attempts,
+//     next_attempt_ms, lease_until_ms, expires_at_ms, claim_token) is the durable
 //     schedule-PUBLICATION retry outbox, not history and not an execution
 //     source. The row key is the derived occurrence ID, and the COMPLETE
 //     immutable occurrence intent (app/schedule/handler/scheduled_at) is the
-//     JSON object in data, written through jsonb(?) and read back with json(data)
-//     — the same BLOB-payload convention as apps.data, so the schema stays stable
-//     while the intent grows. It is written once (INSERT ... ON CONFLICT DO
-//     NOTHING, so it is unique and idempotent), leased per-row so concurrent
-//     retriers cannot both claim it, and deleted only after a publication call
+//     native JSONB object in data — the same JSONB-payload convention as
+//     apps.data, so the schema stays stable while the intent grows. It is
+//     written once (INSERT ... ON CONFLICT DO NOTHING, so it is unique and
+//     idempotent), leased per-row (a claim selects with FOR UPDATE SKIP LOCKED so
+//     concurrent retriers across processes cannot both claim it) and fenced by a
+//     monotonic claim_token so a superseded claimant's reschedule/delete can
+//     never clobber a newer claim; it is deleted only after a publication call
 //     resolves with a nil error (published or a clean duplicate) OR after its
 //     retention lapses. The intent (id/data) is never updated after insert; only
 //     attempts/next_attempt_ms advance. The scheduling columns are integer Unix
@@ -108,25 +109,43 @@
 // env-var name only, with a fixed redaction marker as the value.
 //
 // Design Constraint:
-//   - State errors are never fatal. Callers (main, reconciler) log them and
-//     continue; the state database degrades to "no state available" on failure.
+//   - State errors after a successful open are never fatal to the worker:
+//     callers (reconciler) log them and continue; the state view degrades to "no
+//     state available" on failure. Opening the database, however, IS fatal: the
+//     state view, the stats snapshots, and the durable schedule outbox all live
+//     in PostgreSQL, so the worker refuses to start without it (see Open).
 //
 // Stats persistence model:
 //
 // The stats and app_stats tables store the latest persisted ABSOLUTE
-// snapshot of Relay's operational counters — idempotent, no deltas. Only stable
-// relational metadata is kept as columns: stats.id and stats.updated_at, and
-// app_stats.app_name and app_stats.updated_at. The evolving
-// counter/gauge/execution-history payload is a JSON object — stored as binary
-// JSON (JSONB) in the data BLOB column — marshalled and unmarshalled ONLY
-// through stats_json.go; the worker, CLI, runtime, and metrics layers pass typed
-// Stats/AppStats values and never touch the JSON. This keeps the schema
-// stable as instrumentation grows: absent fields decode to zero. The typed
-// structs are the source of truth. There is no migration or backward
-// compatibility for payloads written by a different schema, and the internal
-// state schema as a whole — including schedule_pending — carries no
-// backward-compatibility guarantee across versions: it is local coordination
-// state, not a durable public contract.
+// snapshot of Relay's operational counters — idempotent, no deltas — PER WORKER.
+// Each row is keyed by the owning worker identity (the consumer name/hostname)
+// so two workers sharing one PostgreSQL database keep independent counter sets
+// instead of last-writer-wins overwriting a single global row. Only stable
+// relational metadata is kept as columns: stats.worker and stats.updated_at, and
+// app_stats.app_name, app_stats.worker, and app_stats.updated_at. The evolving
+// counter/gauge/execution-history payload is a native JSONB object in the data
+// column, marshalled and unmarshalled ONLY through stats_json.go; the worker,
+// CLI, runtime, and metrics layers pass typed Stats/AppStats values and never
+// touch the JSON. This keeps the schema stable as instrumentation grows: absent
+// fields decode to zero. The typed structs are the source of truth. There is no
+// migration or backward compatibility for payloads written by a different
+// schema, and the internal state schema as a whole — including schedule_pending —
+// carries no backward-compatibility guarantee across versions: it is
+// coordination/operator state, not a durable public contract.
+//
+// Reads: a worker restoring its own counters at startup reads ONLY its own rows
+// (OwnerStats/OwnerAppStats), so a restart of the same identity continues its
+// totals without double-counting a shared database. CLI and observability reads
+// AGGREGATE across every owner (Stats/AppStats/AllAppStats): cumulative counters
+// are summed, the execution-history timestamps take the maximum, and the
+// shared-backlog gauges come from the FRESHEST owner snapshot (the newest
+// updated_at), so a dead worker's stale gauge can never mask the live value.
+// `relay stats reset` zeroes every owner's rows in place. The
+// owner identity is the resolved hostname (ConsumerName); two workers that
+// resolve the same hostname would share a stats row — the documented limitation
+// of a hostname-based identity (distinct hosts, the normal case, are distinct
+// owners).
 //
 // In addition to the event/handler counters, app_stats carries the
 // CUMULATIVE warm-container pool counters (warm acquires, cold starts,
@@ -135,18 +154,18 @@
 // pool gauges (capacity, container counts by lease state) are deliberately NOT
 // persisted: a persisted live gauge would go stale between flushes. The worker
 // flushes the current in-memory metrics registry into them every 5 seconds
-// (fixed, non-configurable) via RecordStatsSnapshot, which writes the global
-// row and every per-app row in one short transaction. SQLite is never on
-// the event path: the runner and stream consumer update only the Prometheus
+// (fixed, non-configurable) via RecordStatsSnapshot, which writes the worker's
+// global row and every per-app row in one short transaction. PostgreSQL is never
+// on the event path: the runner and stream consumer update only the Prometheus
 // registry, and the flush merely mirrors that store. A failed flush is retried
 // next tick with the current values (absolute snapshots make this safe); a hard
 // crash may lose up to ~5s of telemetry. Graceful shutdown performs a final
-// bounded flush. At startup the worker restores the persisted counters into the
-// fresh registry (restorePersistedStats) so the first snapshot never resets
-// them. Redis event-processing correctness never depends on SQLite stats.
+// bounded flush. At startup the worker restores its own persisted counters into
+// the fresh registry (restorePersistedStats) so the first snapshot never resets
+// them. Redis event-processing correctness never depends on the stats tables.
 //
-// `relay stats reset` zeroes the cumulative fields IN PLACE: the global stats
-// row and every app_stats row survive, decoded from their typed JSON
+// `relay stats reset` zeroes the cumulative fields IN PLACE: every worker's
+// global row and every app_stats row survive, decoded from their typed JSON
 // payloads, while the live gauges and any known unrelated field are preserved.
 // A running worker performs the reset over its socket, under the same lock as
 // the flush, so its in-memory totals are reset too and no captured pre-reset
@@ -155,27 +174,28 @@
 // Relay-side reset baseline and subtracts it when snapshotting, so the persisted
 // totals continue from zero while the counters stay monotonic.
 //
-// The driver is modernc.org/sqlite (pure Go, CGO-free) so the binary stays
-// static under CGO_ENABLED=0 and the CLI needs no external database
-// dependencies.
+// The driver is github.com/jackc/pgx/v5's database/sql adapter (pgx), a
+// maintained pure-Go PostgreSQL driver (no CGO).
 //
 // Concurrency model:
 //
-//   - In-process access is serialized through a single pooled connection
-//     (SetMaxOpenConns(1) in Open). Relay's local state is a tiny,
-//     low-frequency, single-file workload — reconciler writes, a 5s stats flush,
-//     CLI reads — so a pool of 1 makes SQLITE_BUSY structurally impossible:
-//     database/sql queues callers on the single connection instead of letting
-//     SQLite reject concurrent writers. No write queue is needed because
-//     database/sql itself provides the queueing.
-//   - Cross-process access (a CLI process opening the same file while the
-//     worker runs) is covered by WAL + busy_timeout: WAL is persistent in the DB
-//     file and survives close, and each process sets its own busy_timeout on its
-//     own connection. One cross-process edge remains: Open always initializes
-//     the schema (CREATE TABLE IF NOT EXISTS — a brief write) even for read-only
-//     CLI commands, so a CLI may wait on the worker's in-flight flush for up to
-//     its busy_timeout; the worker's transactions are short (milliseconds), so
-//     this surfaces at worst as a brief startup pause, never a failure.
+//   - In-process access is a small bounded connection pool (a handful of
+//     connections). Relay's state workload is short and low-frequency —
+//     reconciler writes, a 5s stats flush, scheduler outbox writes, CLI reads —
+//     so a small pool serves it without a write queue; PostgreSQL handles the
+//     concurrency natively (MVCC, row locks).
+//   - Per-app writes are serialized by a transaction-scoped advisory lock keyed
+//     on the app NAME (lockAppTx/appWriteTx). The app snapshot is a single JSONB
+//     payload that each write path reads, changes a subset of fields, and writes
+//     whole, so MVCC alone does not protect it: two concurrent writers would
+//     each read the same snapshot and the second would clobber the first's
+//     fields. Keying on the name (not the row) also covers the app-row-ABSENT
+//     case, where a row lock would lock nothing.
+//   - Cross-process access is native: the database is shared, and the outbox's
+//     FOR UPDATE SKIP LOCKED claims and claim_token fencing coordinate retriers
+//     across processes without any process-global lock. Schema initialization is
+//     serialized by a transaction-scoped advisory lock so concurrent openers
+//     cannot race CREATE TABLE IF NOT EXISTS.
 //   - Transactions are short and hold no external I/O: fingerprints are computed
 //     before the transaction opens (see RebuildFromFS/RecordDiscovered), so a
 //     write transaction never blocks on the filesystem. Callers that already

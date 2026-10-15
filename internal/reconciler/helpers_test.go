@@ -3,13 +3,13 @@ package reconciler
 import (
 	"log/slog"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"relay/internal/app"
 	"relay/internal/runner"
 	"relay/internal/state"
+	"relay/internal/testutil"
 )
 
 // seedCurrent fingerprints fn as it currently exists on disk and seeds the
@@ -62,11 +62,7 @@ func newTestStateReconciler(
 	cfgHook func(*Config, *state.State),
 ) (*Reconciler, *runner.Registry, *state.State) {
 	t.Helper()
-	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
-	if err != nil {
-		t.Fatalf("open state: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st := testutil.NewState(t)
 	r, reg := newTestReconciler(t, root, builder, initial, func(cfg *Config) {
 		cfg.State = st
 		if cfgHook != nil {

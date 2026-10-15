@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"relay/internal/app"
 	"relay/internal/runner"
 	"relay/internal/runtime"
+	"relay/internal/state"
 	"relay/internal/worker"
 )
 
@@ -338,9 +340,10 @@ func TestAppHelpListsInvoke(t *testing.T) {
 // dependency of the invoke path.
 func TestAppInvokeDoesNotTouchStateDB(t *testing.T) {
 	deps := testDeps(t)
-	// Point StatePath at a directory: opening it as a SQLite DB would fail.
-	dir := t.TempDir()
-	deps.StatePath = dir
+	// Make opening the state database fail loudly: invoke must never call it.
+	deps.OpenState = func(context.Context) (*state.State, func(), error) {
+		return nil, nil, errors.New("state DB must not be opened by invoke")
+	}
 	startTestSocketWithInvoker(t, deps.SocketPath, &fakeInvoker{invoked: 1})
 
 	out, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "fn", "--event", `{}`)

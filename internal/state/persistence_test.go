@@ -29,8 +29,8 @@ func writeAppsDir(t *testing.T, root string) {
 // same DB (simulating a restart) and running the normal startup path must leave
 // every cumulative counter at its exact persisted value.
 func TestRestartPreservesGlobalStats(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "db.sqlite3")
-	c1, err := Open(path)
+	path := newTestDSN(t)
+	c1, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestRestartPreservesGlobalStats(t *testing.T) {
 
 	// Reopen the same path: this is the worker restart, including idempotent
 	// schema init.
-	c2, err := Open(path)
+	c2, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -77,8 +77,8 @@ func TestRestartPreservesGlobalStats(t *testing.T) {
 // restart bug: reopening the DB and rediscovering an already-known app must
 // not reset its persisted per-app counters.
 func TestRestartPreservesAppStats(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "db.sqlite3")
-	c1, err := Open(path)
+	path := newTestDSN(t)
+	c1, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestRestartPreservesAppStats(t *testing.T) {
 	c1.RecordAppStats(beta)
 	_ = c1.Close()
 
-	c2, err := Open(path)
+	c2, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -168,8 +168,8 @@ func TestRebuildFromFSOnNonEmptyDBKeepsAppStats(t *testing.T) {
 // restart), so the guard covers the persisted value, not just an in-memory
 // write.
 func TestRestartResetsBuildingStatusToPreparing(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "db.sqlite3")
-	c1, err := Open(path)
+	path := newTestDSN(t)
+	c1, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestRestartResetsBuildingStatusToPreparing(t *testing.T) {
 
 	// Reopen the same path (the worker restart) and run the normal startup
 	// discovery. The stale building marker must be reset to preparing.
-	c2, err := Open(path)
+	c2, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

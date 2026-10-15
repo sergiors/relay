@@ -97,7 +97,7 @@
 //     relay_runtime_container_acquire_duration_seconds{app}.
 //
 // The schedule-coordination counters are Prometheus-only: they are deliberately
-// NOT wired into the SQLite stats snapshot. The selective metrics added later —
+// NOT wired into the PostgreSQL stats snapshot. The selective metrics added later —
 // relay_app_status, relay_redis_read_errors_total, and the
 // relay_service_reconcile_* family — are likewise Prometheus-only: a
 // current-state gauge and failure/histogram series are scrape-time observations,
@@ -153,7 +153,7 @@
 // the runner, stream consumer, and runtime manager record against it directly,
 // and Prometheus /metrics reflects the current values immediately. There is no
 // second parallel counter store. The worker periodically snapshots this same
-// store into SQLite (a fixed 5-second cadence); SQLite stores snapshots, not
+// store into PostgreSQL (a fixed 5-second cadence); PostgreSQL stores snapshots, not
 // history. A hard crash loses at most the last unflushed interval of telemetry;
 // graceful shutdown performs a final bounded flush.
 //

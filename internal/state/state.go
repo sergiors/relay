@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -11,16 +12,65 @@ import (
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"relay/internal/app"
 )
 
-// DBPath is the fixed internal location of the local state database. It is an
-// application convention, not env-configurable: the compose file volume-mounts
-// /var/lib/relay so the file survives container restarts, and Open MkdirAll's
-// the parent so host-side runs (and tests) work without it existing first.
-const DBPath = "/var/lib/relay/db.sqlite3"
+// schemaLockKey is the PostgreSQL advisory-lock key that serializes concurrent
+// schema initialization across processes. Two Relay workers (or a worker and a
+// CLI) opening the same fresh database at once would otherwise race the
+// CREATE TABLE IF NOT EXISTS statements — a known PostgreSQL race that can
+// surface as a duplicate pg_type/relation error. The lock is transaction-scoped
+// so it is released the instant initSchema commits.
+const schemaLockKey int64 = 0x72656c6179 // "relay"
+
+// appLockNamespace is the high-order key of the per-app advisory locks (see
+// lockAppTx). It partitions them from schemaLockKey (which is the single-bigint
+// lock 0x72656c6179, i.e. the pair (0, 0x72656c6179)) and from any other
+// advisory lock Relay may take in the same database, so an app name can never
+// alias the schema-init lock. The pair (appLockNamespace, hash(app name)) is the
+// two-int form of pg_advisory_xact_lock.
+const appLockNamespace int32 = 1
+
+// appLockKey maps an app name to the low-order half of its advisory-lock key.
+// The mapping only needs to be stable within a run; a 32-bit hash collision
+// merely over-serializes two unrelated apps and never affects correctness.
+func appLockKey(name string) int32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(name))
+	return int32(h.Sum32())
+}
+
+// lockAppTx takes the transaction-scoped per-app advisory lock for name, so
+// every read-modify-write of one app's snapshot serializes against the other
+// writers of the SAME app — across goroutines, pooled connections, and Relay
+// processes. PostgreSQL's MVCC does not serialize two transactions that each
+// read the same snapshot and then write different fields: without this lock the
+// second writer would replace the first's whole apps.data snapshot, silently
+// losing the fields the first had merged in. The lock is keyed on the app NAME,
+// not on the row, so it also serializes the app-row-ABSENT case (a SELECT ...
+// FOR UPDATE locks nothing when the row does not exist, so it cannot guard a
+// create/upsert race). It is released when the enclosing transaction commits or
+// rolls back.
+func lockAppTx(ctx context.Context, tx *sql.Tx, name string) error {
+	if _, err := tx.ExecContext(ctx,
+		`SELECT pg_advisory_xact_lock($1, $2)`, appLockNamespace, appLockKey(name)); err != nil {
+		return fmt.Errorf("lock app %q: %w", name, err)
+	}
+	return nil
+}
+
+// Pool defaults used when Options leaves them unset. They mirror
+// config.DefaultDatabase* (a leaf package cannot import config, so the values
+// are duplicated here as internal defaults).
+const (
+	defaultMaxOpenConns    = 8
+	defaultMaxIdleConns    = 4
+	defaultConnMaxLifetime = 30 * time.Minute
+	defaultConnMaxIdleTime = 5 * time.Minute
+	defaultConnectTimeout  = 10 * time.Second
+)
 
 // Public persisted/CLI lifecycle statuses. The model is linear for a single
 // generation — preparing -> building -> reconciling -> ready — with degraded
@@ -93,7 +143,8 @@ type Detail struct {
 	// Env holds the app's env-var NAMES only: each value is the fixed
 	// RedactedEnvValue marker, never the literal template value. Literal env
 	// values live only in template.yaml and in the runtime injection path; the
-	// state snapshot (a local file an operator can read) must never carry them.
+	// state snapshot (readable by any operator with database access) must never
+	// carry them.
 	Env     map[string]string `json:"env,omitempty"`
 	Secrets map[string]string `json:"secrets,omitempty"`
 	// Resources is the app's EFFECTIVE per-container resource configuration
@@ -165,12 +216,20 @@ type Service struct {
 	Replicas   int    `json:"replicas"`
 }
 
-// State is a concrete SQLite-backed local state view. It is safe for use from
-// the reconciler goroutines; every operation uses a fresh connection context so
-// no state is shared.
+// State is a concrete PostgreSQL-backed local state view. It is safe for
+// concurrent use from the reconciler goroutines and the scheduler: the
+// underlying *sql.DB is a bounded connection pool and every operation uses a
+// fresh connection context so no state is shared between calls.
 type State struct {
 	db  *sql.DB
 	log *slog.Logger
+	// owner is this process's stable worker identity for the per-worker stats
+	// snapshots (the worker passes its ConsumerName/hostname). Stats rows are
+	// keyed by (worker, ...) so two workers sharing one database never
+	// overwrite each other's counters; reads used by the CLI aggregate across
+	// every owner while the worker's startup restore reads only its own rows.
+	// It is empty for standalone CLI/admin handles, which never write stats.
+	owner string
 	// nowFn is an injectable clock used to stamp updated_at/reconcile
 	// timestamps and the schedule_pending retention deadline. Production leaves
 	// it nil and falls back to time.Now, preserving behavior exactly; tests
@@ -193,69 +252,87 @@ type State struct {
 	statusObserver func(name, status string)
 }
 
+// Options configures Open. DSN is the PostgreSQL connection string (the
+// DATABASE_URL value); Owner is the stable worker identity used to scope stats
+// rows (empty for CLI/admin handles, which never write stats). The pool fields
+// are optional and fall back to the package defaults when zero.
+type Options struct {
+	DSN   string
+	Owner string
+	// Logger, when non-nil, is the logger Open installs. Otherwise the package
+	// fallback logger is used until SetLogger overrides it.
+	Logger *slog.Logger
+	// Pool tuning; zero values take the package defaults.
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxLifetime time.Duration
+	ConnMaxIdleTime time.Duration
+	ConnectTimeout  time.Duration
+}
+
 // fallbackLogger is the package-level default logger used when a State is
 // opened without SetLogger (e.g. the CLI admin commands and the worker's
 // early-open path before wiring). It runs at DEBUG so nothing is hidden; the
 // worker replaces it with the process's leveled logger via SetLogger.
 var fallbackLogger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-// Open creates (MkdirAll) the parent directory, opens (creating if absent) the
-// database, applies concurrency-friendly PRAGMAs, and initializes the schema
-// idempotently. It always returns a usable *State; schema errors surface via
-// method calls, keeping the local state non-fatal to Relay at startup.
-//
-// Concurrency model: the pool is capped at one connection (SetMaxOpenConns(1)),
-// so all in-process access is serialized by database/sql — callers queue on the
-// single connection rather than ever hitting SQLITE_BUSY. WAL + busy_timeout
-// cover cross-process access (a CLI process reading the same file while the
-// worker runs). See doc.go "Concurrency model" for the full rationale.
-func Open(path string) (*State, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("create state dir: %w", err)
+// Open connects to the PostgreSQL state database, applies bounded pool settings,
+// verifies connectivity with a bounded ping, and initializes the schema
+// idempotently. Unlike the former file-backed store, a failure here is FATAL to
+// the caller: PostgreSQL is a hard requirement (the operator state view, the
+// per-worker stats snapshots, and the durable schedule outbox), so Open returns a
+// clear, actionable error rather than a degraded handle. Schema initialization is
+// serialized by a transaction-scoped advisory lock so concurrent openers cannot
+// race the DDL.
+func Open(ctx context.Context, opts Options) (*State, error) {
+	if opts.DSN == "" {
+		return nil, fmt.Errorf("open state: no DATABASE_URL configured")
 	}
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("pgx", opts.DSN)
 	if err != nil {
-		return nil, fmt.Errorf("open state %s: %w", path, err)
+		return nil, fmt.Errorf("open state: %w", err)
 	}
-	st := &State{db: db, log: fallbackLogger}
+	st := &State{db: db, log: fallbackLogger, owner: opts.Owner}
+	if opts.Logger != nil {
+		st.log = opts.Logger
+	}
 
-	// Serialize all access through a single pooled connection. Relay's local
-	// state is a tiny, low-frequency, single-file workload (reconciler writes, a
-	// 5s stats flush, CLI reads): a pool of 1 makes SQLITE_BUSY structurally
-	// impossible — database/sql queues callers on the single connection instead
-	// of letting SQLite reject concurrent writers. WAL+busy_timeout remain as
-	// defense in depth (and for the CLI process opening the same file while the
-	// worker runs: cross-PROCESS access still relies on them).
-	db.SetMaxOpenConns(1)
-	// With MaxOpenConns(1) the default MaxIdleConns(2) already exceeds the pool
-	// size, so the single idle connection is retained automatically; no
-	// SetMaxIdleConns needed. SetConnMaxLifetime/SetConnMaxIdleTime are skipped
-	// too: there is no connection-rotation benefit for a single in-process
-	// connection, and modernc sqlite has no server-side connection lifetime.
+	// A small bounded pool: Relay's state workload is short and low-frequency,
+	// and several replicas plus CLI commands may share one database. The values
+	// are conservative per-process caps, never a host-wide quota.
+	db.SetMaxOpenConns(orDefault(opts.MaxOpenConns, defaultMaxOpenConns))
+	db.SetMaxIdleConns(orDefault(opts.MaxIdleConns, defaultMaxIdleConns))
+	db.SetConnMaxLifetime(orDuration(opts.ConnMaxLifetime, defaultConnMaxLifetime))
+	db.SetConnMaxIdleTime(orDuration(opts.ConnMaxIdleTime, defaultConnMaxIdleTime))
 
-	// PRAGMAs tune SQLite for concurrent single-writer access: a busy timeout
-	// bounds how long a writer waits for a lock, and WAL lets readers see the
-	// last committed state while a write is in flight (relay's readers and the
-	// single reconciler writer are distinct paths). Because MaxOpenConns(1) keeps
-	// exactly one connection open for the pool's lifetime, these ExecContext
-	// PRAGMAs run on that single connection and are effectively global for this
-	// handle. busy_timeout is per-connection, so it still matters cross-process
-	// (the CLI's own Open sets its own); journal_mode=WAL is persistent in the
-	// DB file and survives close, so a concurrently-opening CLI also gets WAL.
-	ctx := context.Background()
-	if _, err := db.ExecContext(ctx, "PRAGMA busy_timeout = 5000"); err != nil {
+	// Bounded connectivity check: a dead/unreachable database must surface as an
+	// actionable startup error, not a hang.
+	pingCtx, cancel := context.WithTimeout(ctx, orDuration(opts.ConnectTimeout, defaultConnectTimeout))
+	defer cancel()
+	if err := db.PingContext(pingCtx); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("set busy_timeout: %w", err)
+		return nil, fmt.Errorf("open state: connect to PostgreSQL failed: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, "PRAGMA journal_mode = WAL"); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("set WAL: %w", err)
-	}
-	if err := st.initSchema(ctx); err != nil {
+
+	if err := st.initSchema(pingCtx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return st, nil
+}
+
+func orDefault(v, def int) int {
+	if v > 0 {
+		return v
+	}
+	return def
+}
+
+func orDuration(v, def time.Duration) time.Duration {
+	if v > 0 {
+		return v
+	}
+	return def
 }
 
 // SetLogger redirects log output; used by tests and CLI wiring. A nil logger (or a
@@ -305,94 +382,123 @@ func (st *State) notifyStatus(name, status string) {
 func (st *State) Close() error { return st.db.Close() }
 
 // initSchema creates the current tables if they do not already exist, so a
-// fresh database is initialized with the current schema. Plain SQL: these
-// tables are internal local state and are (re)created on first open.
+// fresh database is initialized with the current schema. It runs inside a
+// transaction that first takes a transaction-scoped advisory lock, so
+// concurrent openers (two workers starting together, or a CLI racing the worker)
+// serialize their DDL instead of racing CREATE TABLE IF NOT EXISTS — a known
+// PostgreSQL race. The data columns are native JSONB: a typed Go struct is
+// marshalled to JSON text and stored with the jsonb type, and read back as JSON
+// text.
 //
-// apps stores a whole per-app snapshot as one JSON object in data
-// (SQLite's binary JSON/JSONB, written with jsonb(?) and read back with
-// json(data)), with only the stable name key and the write timestamp kept as
-// columns. There are deliberately no per-handler/per-schedule/per-service child
-// tables: the nested configuration is part of the snapshot, so a template change
-// replaces one row atomically. stats is the single-row global counter snapshot,
-// and app_stats the per-app counterpart; both keep their stable key
-// and updated_at relational while the evolving payload lives in data.
+// apps stores a whole per-app snapshot as one JSONB object in data, with only
+// the stable name key and the write timestamp kept as columns. There are
+// deliberately no per-handler/per-schedule/per-service child tables: the nested
+// configuration is part of the snapshot, so a template change replaces one row
+// atomically. stats is the per-worker global counter snapshot (keyed by worker
+// identity so shared-database workers never overwrite each other), app_stats the
+// per-app counterpart (keyed by app name + worker), and schedule_pending the
+// durable schedule-publication outbox.
 func (st *State) initSchema(ctx context.Context) error {
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("init schema: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, schemaLockKey); err != nil {
+		return fmt.Errorf("init schema: acquire lock: %w", err)
+	}
+
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS apps (
 			name TEXT PRIMARY KEY,
-			data BLOB NOT NULL,
+			data JSONB NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
-		// stats holds the single "current operational snapshot" consumed by
-		// Relay itself: monotonically increasing counters persisted across
-		// restarts plus gauge snapshots of the pending backlog, never a
-		// time-series. Only the stable relational metadata is a column — the
-		// fixed single-row id and the write timestamp updated_at — while the
-		// evolving counter/gauge payload is the JSON object in data (see Stats
-		// and stats_json.go). JSON, not a column per field: the payload grows
-		// as instrumentation is added without changing the schema, and absent
-		// fields decode to zero.
+		// stats holds each worker's "current operational snapshot". The row key
+		// is the OWNER worker identity, so N workers sharing this database keep N
+		// independent counter sets instead of last-writer-wins overwriting one
+		// another. Only stable relational metadata is a column — the worker key
+		// and the write timestamp updated_at — while the evolving counter/gauge
+		// payload is the JSONB object in data (see Stats and stats_json.go).
+		// JSONB, not a column per field: the payload grows as instrumentation is
+		// added without changing the schema, and absent fields decode to zero.
 		`CREATE TABLE IF NOT EXISTS stats (
-			id INTEGER PRIMARY KEY CHECK (id = 1),
-			data BLOB NOT NULL,
+			worker TEXT PRIMARY KEY,
+			data JSONB NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
 		// app_stats holds the per-app operational snapshot, keyed by
-		// app name. It mirrors the global stats table but attributes each
-		// payload to a single app (see AppStats for the semantics).
-		// The key app_name and the write timestamp updated_at stay
-		// relational; the payload — including the cumulative warm-container pool
-		// counters (warm_acquires_total, cold_starts_total, discarded_total) and
-		// the four last_*_at execution-history timestamps — lives in the JSONB
-		// data column (see stats_json.go). Backlog metrics
-		// (pending_entries/oldest_pending_age) stay global-only in stats: they
-		// describe the stream backlog, not any one app. The live pool
-		// gauges are deliberately never persisted.
+		// (app_name, worker). It mirrors the global stats table but attributes
+		// each payload to a single app AND a single owning worker, so two workers
+		// reporting the same app do not clobber each other. The key columns and
+		// the write timestamp updated_at stay relational; the payload —
+		// including the cumulative warm-container pool counters
+		// (warm_acquires_total, cold_starts_total, discarded_total) and the four
+		// last_*_at execution-history timestamps — lives in the JSONB data
+		// column (see stats_json.go). Backlog metrics
+		// (pending_entries/oldest_pending_age) stay global-only per worker: they
+		// describe the stream backlog, not any one app. The live pool gauges are
+		// deliberately never persisted.
 		`CREATE TABLE IF NOT EXISTS app_stats (
-			app_name TEXT PRIMARY KEY,
-			data BLOB NOT NULL,
-			updated_at TEXT NOT NULL
+			app_name TEXT NOT NULL,
+			worker TEXT NOT NULL,
+			data JSONB NOT NULL,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (app_name, worker)
 		)`,
 		// schedule_pending is the durable schedule-publication retry outbox: one
-		// row per logical occurrence, written BEFORE its Redis publish (intent-first
-		// durability) and deleted once publication resolves. The row
+		// row per logical occurrence, written BEFORE its Redis publish
+		// (intent-first durability) and deleted once publication resolves. The row
 		// key is the derived occurrence ID and the COMPLETE immutable occurrence
-		// intent (app/schedule/handler/scheduled_at) is the JSON object in data,
-		// written through jsonb(?) and read back with json(data), so the schema
-		// stays stable while the intent grows. It is NOT a history table and NOT an
-		// execution source: /apps stays authoritative, and the row exists only
-		// until a later publication resolves (published or a clean duplicate) or its
-		// retention expires and it is removed. The scheduling fields (attempts,
-		// next_attempt_ms, lease_until_ms) are integer Unix milliseconds used to
-		// coordinate retry observations: a row is claimable only while
-		// next_attempt_ms and lease_until_ms are both in the past, and a claim sets
-		// lease_until_ms atomically so concurrent retriers cannot both claim it.
-		// expires_at_ms is the durable retention deadline (integer Unix
-		// milliseconds), stamped at first insert as now + 7 days and never modified
-		// by reschedule; a record with expires_at_ms <= now is expired, is excluded
-		// from claims, and is deleted by the bounded cleanup instead of retried.
-		// The occurrence intent (id/data/expires_at_ms) is never updated after
-		// insert.
+		// intent (app/schedule/handler/scheduled_at) is the JSONB object in data,
+		// so the schema stays stable while the intent grows. It is NOT a history
+		// table and NOT an execution source: /apps stays authoritative, and the
+		// row exists only until a later publication resolves (published or a
+		// clean duplicate) or its retention expires and it is removed. The
+		// scheduling fields (attempts, next_attempt_ms, lease_until_ms) are
+		// integer Unix milliseconds used to coordinate retry observations: a row
+		// is claimable only while next_attempt_ms and lease_until_ms are both in
+		// the past, and a claim sets lease_until_ms atomically so concurrent
+		// retriers cannot both claim it. claim_token is a fencing generation: a
+		// claim increments it and returns the new value, and a claimant's
+		// reschedule/delete is conditioned on the token it observed, so a
+		// superseded claimant whose lease already expired can never clobber a
+		// newer claimant's lease or delete its row. expires_at_ms is the durable
+		// retention deadline (integer Unix milliseconds), stamped at first insert
+		// as now + 7 days and never modified by reschedule; a record with
+		// expires_at_ms <= now is expired, is excluded from claims, and is deleted
+		// by the bounded cleanup instead of retried. The occurrence intent
+		// (id/data/expires_at_ms) is never updated after insert.
 		`CREATE TABLE IF NOT EXISTS schedule_pending (
 			id TEXT PRIMARY KEY,
-			data BLOB NOT NULL,
-			attempts INTEGER NOT NULL DEFAULT 0,
-			next_attempt_ms INTEGER NOT NULL DEFAULT 0,
-			lease_until_ms INTEGER NOT NULL DEFAULT 0,
-			expires_at_ms INTEGER NOT NULL DEFAULT 0
+			data JSONB NOT NULL,
+			attempts BIGINT NOT NULL DEFAULT 0,
+			next_attempt_ms BIGINT NOT NULL DEFAULT 0,
+			lease_until_ms BIGINT NOT NULL DEFAULT 0,
+			expires_at_ms BIGINT NOT NULL DEFAULT 0,
+			claim_token BIGINT NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS schedule_pending_due
 			ON schedule_pending (next_attempt_ms, lease_until_ms)`,
 	}
 
 	for _, s := range stmts {
-		if _, err := st.db.ExecContext(ctx, s); err != nil {
+		if _, err := tx.ExecContext(ctx, s); err != nil {
 			return fmt.Errorf("init schema: %w", err)
 		}
 	}
 
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("init schema: commit: %w", err)
+	}
 	return nil
 }
+
+// Owner returns this handle's stats-owner identity (the worker ConsumerName in
+// production, empty for CLI/admin handles). It is exposed so the worker can log
+// the identity its persisted stats are scoped to.
+func (st *State) Owner() string { return st.owner }
 
 // nowString returns the current time as an RFC3339 UTC string, using the
 // injectable clock when set and the package default otherwise. It is the single
@@ -426,6 +532,26 @@ func (st *State) rebuildTx(ctx context.Context, fn func(tx *sql.Tx) error) error
 		return err
 	}
 	return tx.Commit()
+}
+
+// appWriteTx runs fn inside a short transaction that first takes the per-app
+// advisory lock for name (see lockAppTx), so every write to one app's snapshot
+// serializes with every other write to the SAME app. It is the transaction
+// helper for every apps-table writer: the read-modify-write paths (status
+// transitions, desired-generation refreshes, failure/invalid records) each read
+// the current snapshot, change a subset of fields, and write the whole payload
+// back, so two concurrent writers without this lock would lose each other's
+// fields; the full-snapshot writers (a successful reconcile) take the same lock
+// so they cannot interleave with a read-modify-write and be clobbered by it. It
+// holds no external I/O — fingerprints are computed by the caller before the
+// transaction opens.
+func (st *State) appWriteTx(ctx context.Context, name string, fn func(tx *sql.Tx) error) error {
+	return st.rebuildTx(ctx, func(tx *sql.Tx) error {
+		if err := lockAppTx(ctx, tx, name); err != nil {
+			return err
+		}
+		return fn(tx)
+	})
 }
 
 // empty reports whether the apps table has no rows. Only an empty state
@@ -497,9 +623,16 @@ func (st *State) RebuildFromApps(discovered []DiscoveredApp) error {
 // (or supplied) BEFORE this call: the transaction must hold no external I/O
 // (filesystem reads) while it is open, so the body only writes. On success every
 // seeded app's preparing status is published to the status observer.
+//
+// Each app's row is written under its per-app advisory lock (see lockAppTx), so
+// a seed never interleaves with a concurrent per-app write. The loader order is
+// stable, so the locks are always acquired in the same order.
 func (st *State) rebuildDiscoveredTx(ctx context.Context, discovered []DiscoveredApp) error {
 	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
 		for _, d := range discovered {
+			if err := lockAppTx(ctx, tx, d.App.Name); err != nil {
+				return err
+			}
 			detail := appSnapshot(d.App.Name, d.App.Template, StatusPreparing, "", "", d.Fingerprint, "", "", "", "")
 			detail.UpdatedAt = st.nowString()
 			if err := upsertAppTx(ctx, tx, detail); err != nil {
@@ -574,7 +707,7 @@ func (st *State) RecordDiscovered(fn app.App) {
 func (st *State) RecordDiscoveredWithFingerprint(fn app.App, fingerprint string) {
 	ctx := context.Background()
 	ts := st.nowString()
-	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+	err := st.appWriteTx(ctx, fn.Name, func(tx *sql.Tx) error {
 		return recordDesiredTx(ctx, tx, fn.Name, fn.Template, fingerprint, ts)
 	})
 	if err != nil {
@@ -600,7 +733,7 @@ func recordDesiredTx(
 	ts string,
 ) error {
 	detail, found, err := scanApp(name, tx.QueryRowContext(ctx,
-		`SELECT `+jsonPayloadExpr+`, updated_at FROM apps WHERE name = ?`, name))
+		`SELECT `+jsonPayloadExpr+`, updated_at FROM apps WHERE name = $1`, name))
 	if err != nil {
 		return err
 	}
@@ -636,7 +769,7 @@ func (st *State) RecordReconcileSuccess(
 	ctx := context.Background()
 	ts := st.nowString()
 	prepared := preparedAt.UTC().Format(time.RFC3339)
-	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		detail := appSnapshot(name, fn.Template, StatusReady, image, fingerprint, fingerprint, prepared, ts, ReconcileSuccess, "")
 		detail.UpdatedAt = ts
 		return upsertAppTx(ctx, tx, detail)
@@ -673,7 +806,7 @@ func (st *State) RecordPreparing(name string, fn app.App) {
 func (st *State) RecordPreparingWithFingerprint(name string, fn app.App, fingerprint string) {
 	ctx := context.Background()
 	ts := st.nowString()
-	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		return recordDesiredTx(ctx, tx, name, fn.Template, fingerprint, ts)
 	})
 	if err != nil {
@@ -708,9 +841,9 @@ func (st *State) recordStatus(name, status string) {
 	ctx := context.Background()
 	ts := st.nowString()
 	wrote := false
-	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		detail, found, err := scanApp(name, tx.QueryRowContext(ctx,
-			`SELECT `+jsonPayloadExpr+`, updated_at FROM apps WHERE name = ?`, name))
+			`SELECT `+jsonPayloadExpr+`, updated_at FROM apps WHERE name = $1`, name))
 		if err != nil || !found {
 			return err
 		}
@@ -719,7 +852,7 @@ func (st *State) recordStatus(name, status string) {
 		if err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE apps SET data = jsonb(?), updated_at = ? WHERE name = ?`, payload, ts, name); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE apps SET data = $1, updated_at = $2 WHERE name = $3`, payload, ts, name); err != nil {
 			return err
 		}
 		wrote = true
@@ -750,15 +883,15 @@ func (st *State) RecordReconcileFailure(name string, err2 error) {
 	ctx := context.Background()
 	ts := st.nowString()
 	status := ""
-	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		detail, found, err := scanApp(name, tx.QueryRowContext(ctx,
 			`SELECT `+jsonPayloadExpr+`, updated_at
-			 FROM apps WHERE name = ?`, name))
+			 FROM apps WHERE name = $1`, name))
 		if err != nil {
 			return err
 		}
 		if !found {
-			// The old UPDATE ... WHERE name = ? was a no-op on an absent row.
+			// The old UPDATE ... WHERE name = $1 was a no-op on an absent row.
 			return nil
 		}
 		detail.LastReconcileAt = ts
@@ -780,7 +913,7 @@ func (st *State) RecordReconcileFailure(name string, err2 error) {
 			return err
 		}
 		_, err = tx.ExecContext(ctx,
-			`UPDATE apps SET data = jsonb(?), updated_at = ? WHERE name = ?`,
+			`UPDATE apps SET data = $1, updated_at = $2 WHERE name = $3`,
 			payload, ts, name)
 		return err
 	})
@@ -823,10 +956,10 @@ func (st *State) RecordInvalidDesired(name string, err2 error) {
 	ctx := context.Background()
 	ts := st.nowString()
 	status := ""
-	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		detail, found, err := scanApp(name, tx.QueryRowContext(ctx,
 			`SELECT `+jsonPayloadExpr+`, updated_at
-			 FROM apps WHERE name = ?`, name))
+			 FROM apps WHERE name = $1`, name))
 		if err != nil {
 			return err
 		}
@@ -863,7 +996,7 @@ func (st *State) RecordInvalidDesired(name string, err2 error) {
 			return err
 		}
 		_, err = tx.ExecContext(ctx,
-			`INSERT INTO apps (name, data, updated_at) VALUES (?, jsonb(?), ?)
+			`INSERT INTO apps (name, data, updated_at) VALUES ($1, $2, $3)
 			 ON CONFLICT(name) DO UPDATE SET
 			   data       = excluded.data,
 			   updated_at = excluded.updated_at`,
@@ -926,10 +1059,10 @@ func (st *State) RecordServiceFailure(name string, err2 error) {
 	ctx := context.Background()
 	ts := st.nowString()
 	status := ""
-	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		detail, found, err := scanApp(name, tx.QueryRowContext(ctx,
 			`SELECT `+jsonPayloadExpr+`, updated_at
-			 FROM apps WHERE name = ?`, name))
+			 FROM apps WHERE name = $1`, name))
 		if err != nil || !found {
 			return err
 		}
@@ -948,7 +1081,7 @@ func (st *State) RecordServiceFailure(name string, err2 error) {
 			return err
 		}
 		_, err = tx.ExecContext(ctx,
-			`UPDATE apps SET data = jsonb(?), updated_at = ? WHERE name = ?`,
+			`UPDATE apps SET data = $1, updated_at = $2 WHERE name = $3`,
 			payload, ts, name)
 		return err
 	})
@@ -967,7 +1100,7 @@ func (st *State) RecordServiceFailure(name string, err2 error) {
 // delete the app's status series (a removed app has no lifecycle).
 func (st *State) RecordRemoved(name string) {
 	ctx := context.Background()
-	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		return removeTx(ctx, tx, name)
 	})
 	if err != nil {
@@ -1023,7 +1156,7 @@ func (st *State) PruneRemoved(dir string) {
 		// can be reserved (ValidName forbids a leading '.'), so this can never
 		// drop a real app.
 		if app.IsReservedDir(name) {
-			if rerr := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+			if rerr := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 				return removeTx(ctx, tx, name)
 			}); rerr != nil {
 				st.log.Warn("State: prune reserved row failed", "app", name, "error", rerr)
@@ -1035,7 +1168,7 @@ func (st *State) PruneRemoved(dir string) {
 		if _, err := os.Stat(filepath.Join(dir, name)); os.IsNotExist(err) {
 			// Reuse the same single-app removal path as RecordRemoved so the
 			// live reconciler and the startup sweep behave identically.
-			if rerr := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+			if rerr := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 				return removeTx(ctx, tx, name)
 			}); rerr != nil {
 				st.log.Warn("State: prune removed failed", "app", name, "error", rerr)
@@ -1058,10 +1191,10 @@ func (st *State) PruneRemoved(dir string) {
 // (RecordRemoved) and the startup sweep (PruneRemoved) so both are behaviorally
 // identical: a removed app never leaves a stale app_stats row behind.
 func removeTx(ctx context.Context, tx *sql.Tx, name string) error {
-	if _, err := tx.ExecContext(ctx, `DELETE FROM app_stats WHERE app_name = ?`, name); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM app_stats WHERE app_name = $1`, name); err != nil {
 		return err
 	}
-	_, err := tx.ExecContext(ctx, `DELETE FROM apps WHERE name = ?`, name)
+	_, err := tx.ExecContext(ctx, `DELETE FROM apps WHERE name = $1`, name)
 	return err
 }
 
@@ -1112,7 +1245,7 @@ func (st *State) GetApp(name string) (Detail, bool) {
 	ctx := context.Background()
 	detail, found, err := scanApp(name, st.db.QueryRowContext(ctx,
 		`SELECT `+jsonPayloadExpr+`, updated_at
-		 FROM apps WHERE name = ?`, name))
+		 FROM apps WHERE name = $1`, name))
 	if err != nil {
 		st.log.Warn("State: get failed", "app", name, "error", err)
 		return Detail{}, false
@@ -1123,7 +1256,7 @@ func (st *State) GetApp(name string) (Detail, bool) {
 	return detail, true
 }
 
-// scanApp decodes one apps row selected as (json(data), updated_at)
+// scanApp decodes one apps row selected as (data::text, updated_at)
 // into a Detail. name is relational metadata supplied by the caller (it is not
 // part of the payload). found is false for an absent row; a stored payload whose
 // JSON is invalid is returned as an error so the caller can log a clear decode
@@ -1157,7 +1290,7 @@ func upsertAppTx(ctx context.Context, tx *sql.Tx, detail Detail) error {
 		return err
 	}
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO apps (name, data, updated_at) VALUES (?, jsonb(?), ?)
+		`INSERT INTO apps (name, data, updated_at) VALUES ($1, $2, $3)
 		 ON CONFLICT(name) DO UPDATE SET
 		   data       = excluded.data,
 		   updated_at = excluded.updated_at`,
@@ -1222,11 +1355,11 @@ func snapshotResources(tmpl *app.Template) *Resources {
 }
 
 // RedactedEnvValue is the fixed marker stored as every env value in the
-// persisted snapshot. The state database is a local file an operator can read,
-// so it records env-var NAMES only (structural keys); the literal template
-// value is never written. Keeping the map shape (name -> marker), rather than
-// a bare key list, preserves the internal JSON shape and lets the CLI render
-// the configured names without any code-path branching.
+// persisted snapshot. The state database is shared and readable by any operator
+// with access, so it records env-var NAMES only (structural keys); the literal
+// template value is never written. Keeping the map shape (name -> marker),
+// rather than a bare key list, preserves the internal JSON shape and lets the
+// CLI render the configured names without any code-path branching.
 const RedactedEnvValue = "[redacted]"
 
 // snapshotConfig copies a template's env and secret MAPPINGS for the persisted

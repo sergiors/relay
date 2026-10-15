@@ -12,6 +12,8 @@ import (
 	"testing"
 
 	"relay/internal/processlock"
+	"relay/internal/state"
+	"relay/internal/testutil"
 )
 
 // testDeps returns CLI dependencies whose state DB, worker socket, and process
@@ -32,8 +34,15 @@ func testDeps(t *testing.T) Dependencies {
 		t.Fatalf("short temp dir: %v", err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+	dsn := testutil.NewStateDSN(t)
 	return Dependencies{
-		StatePath:  filepath.Join(dir, "db.sqlite3"),
+		OpenState: func(ctx context.Context) (*state.State, func(), error) {
+			st, err := state.Open(ctx, state.Options{DSN: dsn})
+			if err != nil {
+				return nil, nil, err
+			}
+			return st, func() { _ = st.Close() }, nil
+		},
 		SocketPath: filepath.Join(sockDir, "relay.sock"),
 		LockPath:   filepath.Join(dir, "relay.lock"),
 		Start:      func(*slog.Logger) error { return nil },
@@ -343,8 +352,8 @@ func TestNonStartCommandsDoNotAcquireLock(t *testing.T) {
 		t.Fatalf("stat held lock: %v", err)
 	}
 
-	// deps.StatePath is a fresh temp DB, so `app ls` never touches
-	// /var/lib/relay (the lock is the only path under test here).
+	// deps.OpenState opens a fresh isolated state database, so `app ls`
+	// never touches the real state (the lock is the only path under test here).
 	if _, _, err := runCLIWithDeps(t, deps, "", "app", "ls"); err != nil {
 		t.Fatalf("function ls err = %v, want nil (held lock must not matter)", err)
 	}

@@ -15,12 +15,11 @@ import (
 // stats to JSON: the worker, CLI, runtime, and metrics layers only ever pass
 // typed Stats / AppStats values.
 //
-// Storage format: the data column is a NOT NULL BLOB holding SQLite's binary
-// JSON (JSONB) format. Writes pass the marshalled JSON text through SQLite's
-// jsonb(?) constructor, which validates and converts it; reads render it back to
-// JSON text with json(data). A stored value that is not valid JSON (only
-// reachable by writing the column directly, since the typed marshallers always
-// emit valid JSON) is treated as a clear decode failure rather than silently
+// Storage format: the data column is a NOT NULL native JSONB value. Writes pass
+// the marshalled JSON text as a jsonb parameter; reads render it back to JSON
+// text with `data::text`. A JSONB value is always valid JSON, so a payload that
+// fails to decode into the typed struct (a well-formed value of the wrong shape,
+// or a bare scalar) is treated as a clear decode failure rather than silently
 // decoding to zero.
 //
 // Payload field names are stable and self-describing (events_matched_total,
@@ -29,15 +28,19 @@ import (
 // timestamps). There is no migration or backward compatibility for a payload
 // written by a different schema.
 
-// jsonPayloadExpr is the SELECT expression that renders a table's `data` column
-// back to JSON text, yielding NULL when the stored value is not valid JSON. The
-// json_valid flag 5 means "accept either JSON text (1) or JSONB (4)", so a row
-// written through jsonb(?) or seeded as raw JSON text both read back, while a
-// corrupt value renders NULL and surfaces as a decode error rather than a SQL
-// error from json(). It is embedded in every apps/stats/app_stats read
-// so the corrupt-payload handling is uniform. A NULL rendering is a decode
-// failure here because every writer stores a JSON object into a NOT NULL column.
-const jsonPayloadExpr = `CASE WHEN json_valid(data, 5) THEN json(data) END`
+// jsonPayloadExpr is the SELECT expression that renders a table's JSONB `data`
+// column to JSON text. The data columns are native PostgreSQL JSONB and are
+// always valid JSON (the column is NOT NULL and every writer stores the JSON
+// text of a typed struct), so no separate JSON-validity guard is needed; any
+// payload that does not decode into the typed struct is still surfaced as a
+// decode error by the unmarshal helpers. `data::text` renders the JSONB value
+// as canonical JSON text.
+//
+// The unmarshal helpers still treat an unexpected NULL/empty rendering as a
+// decode failure, because the NOT NULL column guarantees a value: a NULL
+// rendering can only mean the row was written by something other than this
+// package.
+const jsonPayloadExpr = `data::text`
 
 // marshalStats encodes s's payload for the stats.data column. UpdatedAt is
 // relational metadata (stats.updated_at) and is deliberately excluded by its
@@ -53,7 +56,7 @@ func marshalStats(s Stats) (string, error) {
 // unmarshalStats decodes a stats.data value rendered as JSON text by
 // jsonPayloadExpr. A NULL value is a corrupt payload: the column is NOT NULL and
 // every writer stores a JSON object, so a NULL rendering can only mean the
-// stored blob is not valid JSON. A valid payload that omits fields (including a
+// stored value is not valid JSON. A valid payload that omits fields (including a
 // bare JSON null) decodes to their zero values. The non-empty invalid case
 // returns the JSON error so the caller can log a useful message.
 func unmarshalStats(data sql.NullString) (Stats, error) {

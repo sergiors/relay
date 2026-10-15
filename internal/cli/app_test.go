@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -28,17 +29,17 @@ func normWS(s string) string {
 func openTempState(t *testing.T) (*state.State, Dependencies) {
 	t.Helper()
 	deps := testDeps(t)
-	st, err := state.Open(deps.StatePath)
+	st, cleanup, err := deps.OpenState(context.Background())
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	t.Cleanup(func() { _ = st.Close() })
+	t.Cleanup(cleanup)
 	return st, deps
 }
 
 // seedTestState creates a temp state DB under test dependencies and populates a
 // ready app and a pending one. It returns the opened state DB and the deps
-// whose StatePath points at it, so command tests run with runCLIWithDeps read
+// whose OpenState points at it, so command tests run with runCLIWithDeps read
 // exactly what the test seeded.
 func seedTestState(t *testing.T) (*state.State, Dependencies) {
 	t.Helper()

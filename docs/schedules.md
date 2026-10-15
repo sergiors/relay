@@ -138,7 +138,7 @@ A tick is not a single best-effort publish. Schedule publication **requires a
 usable durable store**: before a worker may fire a schedule it must have opened
 the local state database, because every due occurrence's exact intent is written
 to the outbox **before** it is published. The durable store is the scheduler's
-local SQLite outbox — the same state database Relay already uses — and, when it
+durable PostgreSQL outbox — the same state database Relay already uses — and, when it
 cannot be opened, the worker marks the scheduler **unavailable** (see
 [Storage availability](#storage-availability)) rather than firing schedules it
 could not recover.
@@ -172,7 +172,7 @@ A tick's publication has several layers:
   not an indefinite retry log: after 7 days an unresolved record **expires**. An
   expired record is **never published** (it is excluded from claims and the
   retrier re-checks the deadline immediately before publishing), is removed from
-  SQLite by a bounded cleanup, and is surfaced as an expiration
+  PostgreSQL by a bounded cleanup, and is surfaced as an expiration
   (`relay_schedule_pending_expired_total` plus a structured log) — it is
   deliberately counted as neither a publish success, a failure, nor a duplicate,
   because no publication is attempted. The Redis dedup key lives 14 days, so it
@@ -217,7 +217,7 @@ A tick's publication has several layers:
   retry of every due occurrence (persisted before publication); catch-up remains
   latest-only and time-bounded to 24h.
 
-The local state database therefore records a small, bounded outbox of occurrence
+The state database therefore records a small, bounded outbox of occurrence
 intents whose publication has not yet resolved — not execution history and never
 an execution source. `/apps` stays authoritative, and a row disappears as soon as
 publication resolves or its 7-day retention expires.
@@ -230,15 +230,16 @@ is deliberately not a global worker dependency. Consumers, functions, services,
 metrics, logging, and tracing stay fully operational when the store is
 unavailable, and worker readiness (`relay health`) deliberately excludes it.
 
-- **Startup.** If the state database cannot be opened at startup, the worker
-  does **not** fail, does not start gocron, and marks the scheduler
-  **unavailable** (logged and exposed as a one-hot `scheduler_state` gauge). A
-  scheduler-owned, cancellable bootstrap then retries opening the store on a
-  fixed cadence. Once it opens, the worker initializes the outbox, recovers
-  existing rows, runs the bounded latest-only catch-up, and enables live jobs.
-  The recovered handle is owned by the scheduler and closed only after all
-  scheduler work has stopped — the worker's shared state handle is never
-  disturbed.
+- **Startup.** The state database is opened before the scheduler is wired and a
+  failure is fatal to the whole worker (the state view, stats, and outbox share
+  it), so a worker never starts gocron against a store it could not open. The
+  scheduler-owned, cancellable bootstrap remains as a defensive seam: if the
+  shared handle were ever unavailable, the worker would mark the scheduler
+  **unavailable** and retry opening it on a fixed cadence, initializing the
+  outbox, recovering existing rows, running the bounded latest-only catch-up, and
+  enabling live jobs. A recovered handle is owned by the scheduler and closed
+  only after all scheduler work has stopped — the worker's shared state handle is
+  never disturbed.
 - **Runtime.** If an outbox operation fails while running, the scheduler
   transitions to **degraded**: callbacks arriving while degraded return before
   computing or publishing an occurrence, so no attempt is made against a store
@@ -247,8 +248,7 @@ unavailable, and worker readiness (`relay health`) deliberately excludes it.
 - **Metrics.** `scheduler_state{state=running|degraded|unavailable}` is a
   one-hot gauge, and `scheduler_degraded_total` /
   `scheduler_recoveries_total` count entries into degraded and recoveries back
-  to running. `/apps` remains the source of schedule configuration: SQLite is
-  only the scheduler's durable publication-coordination store.
+  to running.
 
 ## Live changes
 

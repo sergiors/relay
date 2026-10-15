@@ -2,7 +2,6 @@ package state
 
 import (
 	"context"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,17 +25,6 @@ func fnFor(t *testing.T, name string, tmpl *app.Template) app.App {
 	return app.App{Name: name, Dir: filepath.Join(t.TempDir(), name), Template: tmpl}
 }
 
-func openTestState(t *testing.T) *State {
-	t.Helper()
-	c, err := Open(filepath.Join(t.TempDir(), "db.sqlite3"))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	t.Cleanup(func() { _ = c.Close() })
-	c.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	return c
-}
-
 const twoHandlerTmpl = `runtime: python3.14
 events:
   - handler: events.created.handler
@@ -51,8 +39,8 @@ events:
 
 // init is idempotent and re-opening the same file yields a working state DB.
 func TestOpenIdempotentAndReopen(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "db.sqlite3")
-	c1, err := Open(path)
+	path := newTestDSN(t)
+	c1, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
@@ -60,7 +48,7 @@ func TestOpenIdempotentAndReopen(t *testing.T) {
 	c1.RecordDiscovered(fnFor(t, "alpha", tmpl))
 	_ = c1.Close()
 
-	c2, err := Open(path) // reopen, init must be idempotent
+	c2, err := testOpen(t, path) // reopen, init must be idempotent
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -917,7 +905,7 @@ func TestPruneRemovedNotResurrectedByDiscovery(t *testing.T) {
 // TestEnvSecretsMappingsPersisted verifies the env names and secret REFERENCE
 // names round-trip through the apps table, and that the env values are
 // REDACTED: the literal template env values must never appear in the persisted
-// snapshot (the DB is a local file an operator can read). Env-var keys are
+// snapshot (readable by any operator with database access). Env-var keys are
 // preserved so inspect can render them; values are the fixed marker.
 func TestEnvSecretsMappingsPersisted(t *testing.T) {
 	c := openTestState(t)
@@ -1004,23 +992,23 @@ func TestStatsRelationalMetadataColumns(t *testing.T) {
 	c := openTestState(t)
 
 	statsCols := tableColumnSet(t, c, "stats")
-	for _, want := range []string{"id", "data", "updated_at"} {
+	for _, want := range []string{"worker", "data", "updated_at"} {
 		if !statsCols[want] {
 			t.Errorf("stats missing metadata column %q: %v", want, statsCols)
 		}
 	}
 	if len(statsCols) != 3 {
-		t.Errorf("stats must have exactly id/data/updated_at, got %v", statsCols)
+		t.Errorf("stats must have exactly worker/data/updated_at, got %v", statsCols)
 	}
 
 	fnCols := tableColumnSet(t, c, "app_stats")
-	for _, want := range []string{"app_name", "data", "updated_at"} {
+	for _, want := range []string{"app_name", "worker", "data", "updated_at"} {
 		if !fnCols[want] {
 			t.Errorf("app_stats missing metadata column %q: %v", want, fnCols)
 		}
 	}
-	if len(fnCols) != 3 {
-		t.Errorf("app_stats must have exactly app_name/data/updated_at, got %v", fnCols)
+	if len(fnCols) != 4 {
+		t.Errorf("app_stats must have exactly app_name/worker/data/updated_at, got %v", fnCols)
 	}
 }
 
@@ -1071,12 +1059,12 @@ func TestFreshSchemaHasCurrentColumns(t *testing.T) {
 	}
 }
 
-// tableExists reports whether table is present in the database.
+// tableExists reports whether table is present in the current schema.
 func tableExists(t *testing.T, c *State, table string) bool {
 	t.Helper()
 	var n int
 	err := c.db.QueryRowContext(context.Background(),
-		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&n)
+		`SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = $1`, table).Scan(&n)
 	if err != nil {
 		t.Fatalf("check table %s: %v", table, err)
 	}

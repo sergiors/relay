@@ -57,7 +57,7 @@ func startStatsSocket(t *testing.T, path string, resetter worker.StatsResetter) 
 
 // seedStatsState creates a temp state DB under test dependencies and records a
 // known global stats snapshot. It returns the opened state DB and the deps
-// whose StatePath points at it, so command tests run with runCLIWithDeps read
+// whose OpenState points at it, so command tests run with runCLIWithDeps read
 // exactly what the test seeded.
 func seedStatsState(t *testing.T) (*state.State, Dependencies) {
 	t.Helper()

@@ -121,11 +121,7 @@ func TestActualDesiredChangeRecordsPreparingBeforePrepare(t *testing.T) {
 	tmpl := mustParse(servicesTemplate)
 	fn := app.App{Name: "svc-change", Dir: dir, Template: tmpl}
 
-	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
-	if err != nil {
-		t.Fatalf("open state: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st := testutil.NewState(t)
 	st.RecordReconcileSuccess(fn.Name, "img-v1", "fp-v1", time.Now(), fn)
 
 	pf := runner.NewPrepared(fn, &runtime.Prepared{Name: fn.Name, Image: "img-v1"}, &fakeBuilder{})
@@ -160,11 +156,7 @@ func TestReconcilingReadyOrderingOnChange(t *testing.T) {
 	tmpl := mustParse(servicesTemplate)
 	fn := app.App{Name: "svc-order", Dir: dir, Template: tmpl}
 
-	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
-	if err != nil {
-		t.Fatalf("open state: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st := testutil.NewState(t)
 	st.RecordReconcileSuccess(fn.Name, "img-v1", "fp-v1", time.Now(), fn)
 
 	pf := runner.NewPrepared(fn, &runtime.Prepared{Name: fn.Name, Image: "img-svc-order"}, &fakeBuilder{})
@@ -246,11 +238,7 @@ func TestServiceLifecycleNeverPublishesBuilding(t *testing.T) {
 	tmpl := mustParse(servicesTemplate)
 	fn := app.App{Name: "svc-nobuild", Dir: dir, Template: tmpl}
 
-	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
-	if err != nil {
-		t.Fatalf("open state: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st := testutil.NewState(t)
 	st.RecordReconcileSuccess(fn.Name, "img-v1", "fp-v1", time.Now(), fn)
 
 	pf := runner.NewPrepared(fn, &runtime.Prepared{Name: fn.Name, Image: "img-v2"}, &fakeBuilder{})

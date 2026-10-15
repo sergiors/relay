@@ -11,14 +11,16 @@ import (
 	"time"
 )
 
-// setRequiredEnv sets the three required REDIS_* variables to sentinel values.
-// It is a helper so individual Load tests only override the variable they are
-// exercising (and clear it where a missing-required-var case is under test).
+// setRequiredEnv sets the four required variables (the three REDIS_* plus
+// DATABASE_URL) to sentinel values. It is a helper so individual Load tests only
+// override the variable they are exercising (and clear it where a
+// missing-required-var case is under test).
 func setRequiredEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("REDIS_URI", "redis:6379")
 	t.Setenv("REDIS_STREAM", "stream")
 	t.Setenv("REDIS_GROUP", "group")
+	t.Setenv("DATABASE_URL", "postgres://relay:relay@localhost:5432/relay?sslmode=disable")
 }
 
 // testLogger returns a logger writing into an in-memory buffer so tests can
@@ -109,6 +111,9 @@ func TestLoadResolvesFields(t *testing.T) {
 	cfg := mustLoad(t)
 	if cfg.RedisURI != "redis:6379" || cfg.RedisStream != "stream" || cfg.RedisGroup != "group" {
 		t.Fatalf("redis fields = %+v, want address/stream/group sentinels", cfg)
+	}
+	if cfg.DatabaseURL != "postgres://relay:relay@localhost:5432/relay?sslmode=disable" {
+		t.Fatalf("DatabaseURL = %q, want the DATABASE_URL sentinel", cfg.DatabaseURL)
 	}
 	if cfg.StreamRetention != 6*time.Hour {
 		t.Fatalf("StreamRetention = %v, want 6h", cfg.StreamRetention)
@@ -422,12 +427,12 @@ func TestLoadRetentionErrorMentionsVariable(t *testing.T) {
 }
 
 // TestLoadReturnsErrorOnMissingVariable pins the required-variable contract:
-// Load RETURNS an error naming the missing REDIS_* variable (rather than exiting
+// Load RETURNS an error naming the missing required variable (rather than exiting
 // the process), the returned Config is zero, and nothing is logged — config
 // failures are surfaced once through the returned error at the process boundary,
 // not duplicated as a fatal slog line.
 func TestLoadReturnsErrorOnMissingVariable(t *testing.T) {
-	for _, missEnv := range []string{"REDIS_URI", "REDIS_STREAM", "REDIS_GROUP"} {
+	for _, missEnv := range []string{"REDIS_URI", "REDIS_STREAM", "REDIS_GROUP", "DATABASE_URL"} {
 		t.Run(missEnv, func(t *testing.T) {
 			setRequiredEnv(t)
 			t.Setenv(missEnv, "")
@@ -1141,6 +1146,54 @@ func TestLoadInvalidHotReloadReturnsError(t *testing.T) {
 			}
 			if buf.Len() != 0 {
 				t.Fatalf("Load logged %q for a returned config error; want no fatal log", buf.String())
+			}
+		})
+	}
+}
+
+// TestLoadDatabaseURL pins the narrow DB-only loader the administrative CLI
+// commands use: it returns DATABASE_URL's value and fails with a clear,
+// variable-naming error when it is missing (without requiring any REDIS_*).
+func TestLoadDatabaseURL(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://relay:relay@localhost:5432/relay?sslmode=disable")
+	dsn, err := LoadDatabaseURL()
+	if err != nil || dsn != "postgres://relay:relay@localhost:5432/relay?sslmode=disable" {
+		t.Fatalf("LoadDatabaseURL = (%q, %v), want the configured DSN", dsn, err)
+	}
+
+	t.Setenv("DATABASE_URL", "")
+	if _, err := LoadDatabaseURL(); err == nil || !strings.Contains(err.Error(), "DATABASE_URL") {
+		t.Fatalf("LoadDatabaseURL with no DATABASE_URL = %v, want an error naming DATABASE_URL", err)
+	}
+}
+
+// TestLoadRedisConfig pins the narrow Redis-only loader the `relay dlq` commands
+// use: it resolves the required REDIS_* variables with the same validation Load
+// applies, but works with NO DATABASE_URL (the DLQ is Redis-only), and still
+// returns a variable-naming error for each missing Redis variable.
+func TestLoadRedisConfig(t *testing.T) {
+	t.Setenv("REDIS_URI", "localhost:6379")
+	t.Setenv("REDIS_STREAM", "events")
+	t.Setenv("REDIS_GROUP", "relay")
+	// The whole point: no state database is configured.
+	t.Setenv("DATABASE_URL", "")
+
+	cfg, err := LoadRedisConfig()
+	if err != nil {
+		t.Fatalf("LoadRedisConfig without DATABASE_URL: %v", err)
+	}
+	if cfg.URI != "localhost:6379" || cfg.Stream != "events" || cfg.Group != "relay" {
+		t.Fatalf("LoadRedisConfig = %+v, want the configured Redis values", cfg)
+	}
+
+	for _, missing := range []string{"REDIS_URI", "REDIS_STREAM", "REDIS_GROUP"} {
+		t.Run("missing "+missing, func(t *testing.T) {
+			t.Setenv("REDIS_URI", "localhost:6379")
+			t.Setenv("REDIS_STREAM", "events")
+			t.Setenv("REDIS_GROUP", "relay")
+			t.Setenv(missing, "")
+			if _, err := LoadRedisConfig(); err == nil || !strings.Contains(err.Error(), missing) {
+				t.Fatalf("LoadRedisConfig with empty %s = %v, want an error naming %s", missing, err, missing)
 			}
 		})
 	}

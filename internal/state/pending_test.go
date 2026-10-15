@@ -3,13 +3,10 @@ package state
 import (
 	"context"
 	"log/slog"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-
-	"relay/internal/testutil"
 )
 
 // pendingOcc builds a deterministic pending record with the given id.
@@ -43,7 +40,7 @@ func TestPendingOccurrencePersistAndResolve(t *testing.T) {
 	}
 
 	// Progress written after the re-save must not have been rewound.
-	if err := c.ReschedulePendingOccurrence(ctx, "a", now.Add(2*time.Minute)); err != nil {
+	if err := c.ReschedulePendingOccurrence(ctx, "a", 0, now.Add(2*time.Minute)); err != nil {
 		t.Fatalf("reschedule: %v", err)
 	}
 	claimed, err := c.ClaimPendingOccurrences(ctx, now.Add(3*time.Minute), now.Add(4*time.Minute), 10)
@@ -166,7 +163,7 @@ func TestNextPendingDueReturnsExpiryWhenBackoffOutlivesRetention(t *testing.T) {
 	// it (a backoff that would outlive retention).
 	expiry := now.Add(2 * time.Minute)
 	if _, err := c.db.ExecContext(ctx,
-		`UPDATE schedule_pending SET expires_at_ms = ?, next_attempt_ms = ? WHERE id = 'a'`,
+		`UPDATE schedule_pending SET expires_at_ms = $1, next_attempt_ms = $2 WHERE id = 'a'`,
 		expiry.UnixMilli(), now.Add(30*time.Minute).UnixMilli()); err != nil {
 		t.Fatalf("stage row: %v", err)
 	}
@@ -200,7 +197,7 @@ func TestNextPendingDueReturnsExpiryWhenBackoffOutlivesRetention(t *testing.T) {
 
 // TestPendingOccurrenceConcurrentClaimsAreDisjoint hammers the claim path from
 // many goroutines and proves each record is claimed at most once (the DB lease,
-// not a process mutex, is the coordination) and no SQLite lock/busy error
+// not a process mutex, is the coordination) and no serialization error
 // surfaces.
 func TestPendingOccurrenceConcurrentClaimsAreDisjoint(t *testing.T) {
 	ctx := context.Background()
@@ -268,10 +265,10 @@ func TestPendingOccurrenceConcurrentClaimsAreDisjoint(t *testing.T) {
 // same file.
 func TestPendingOccurrenceSurvivesReopen(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "db.sqlite3")
+	path := newTestDSN(t)
 	now := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
 
-	c1, err := Open(path)
+	c1, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -282,7 +279,7 @@ func TestPendingOccurrenceSurvivesReopen(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	c2, err := Open(path)
+	c2, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -310,24 +307,24 @@ func TestPendingOccurrenceSchemaAndNoHistoryTable(t *testing.T) {
 		t.Fatal("schedule_pending table must exist")
 	}
 	cols := tableColumnSet(t, c, "schedule_pending")
-	for _, want := range []string{"id", "data", "attempts", "next_attempt_ms", "lease_until_ms", "expires_at_ms"} {
+	for _, want := range []string{"id", "data", "attempts", "next_attempt_ms", "lease_until_ms", "expires_at_ms", "claim_token"} {
 		if !cols[want] {
 			t.Errorf("schedule_pending missing column %q: %v", want, cols)
 		}
 	}
-	if len(cols) != 6 {
-		t.Errorf("schedule_pending must have exactly id/data/attempts/next_attempt_ms/lease_until_ms/expires_at_ms, got %v", cols)
+	if len(cols) != 7 {
+		t.Errorf("schedule_pending must have exactly id/data/attempts/next_attempt_ms/lease_until_ms/expires_at_ms/claim_token, got %v", cols)
 	}
-	// The occurrence intent is a BLOB payload, not dedicated columns.
+	// The occurrence intent is a JSONB payload, not dedicated columns.
 	for _, gone := range []string{"app", "schedule", "handler", "scheduled_at"} {
 		if cols[gone] {
 			t.Errorf("schedule_pending must not have per-intent column %q (intent lives in data)", gone)
 		}
 	}
-	// The due index lives in sqlite_master under type 'index' (not 'table').
+	// The due index lives in pg_indexes (not a table).
 	var idx int
 	if err := c.db.QueryRowContext(context.Background(),
-		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'schedule_pending_due'`).Scan(&idx); err != nil {
+		`SELECT COUNT(*) FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'schedule_pending_due'`).Scan(&idx); err != nil {
 		t.Fatalf("check index: %v", err)
 	}
 	if idx == 0 {
@@ -341,8 +338,8 @@ func TestPendingOccurrenceSchemaAndNoHistoryTable(t *testing.T) {
 }
 
 // TestPendingOccurrenceDataColumnHoldsIntent pins that the intent is actually
-// stored in the data BLOB as JSONB (not duplicated into columns) and that it is
-// valid JSON rendering back the exact occurrence.
+// stored as a native JSONB value in the data column (not duplicated into
+// columns) and that it is valid JSON rendering back the exact occurrence.
 func TestPendingOccurrenceDataColumnHoldsIntent(t *testing.T) {
 	ctx := context.Background()
 	c := openTestState(t)
@@ -355,17 +352,17 @@ func TestPendingOccurrenceDataColumnHoldsIntent(t *testing.T) {
 		typ     string
 	)
 	if err := c.db.QueryRowContext(ctx,
-		`SELECT json(data), typeof(data) FROM schedule_pending WHERE id = ?`, o.ID).Scan(&payload, &typ); err != nil {
+		`SELECT data::text, jsonb_typeof(data) FROM schedule_pending WHERE id = $1`, o.ID).Scan(&payload, &typ); err != nil {
 		t.Fatalf("read data: %v", err)
 	}
-	for _, want := range []string{`"app":"app-a"`, `"schedule":"sched-a"`, `"handler":"jobs.a"`, `"scheduled_at":"2026-07-01T08:00:00Z"`} {
+	for _, want := range []string{`"app": "app-a"`, `"schedule": "sched-a"`, `"handler": "jobs.a"`, `"scheduled_at": "2026-07-01T08:00:00Z"`} {
 		if !strings.Contains(payload, want) {
 			t.Errorf("data payload %s missing %s", payload, want)
 		}
 	}
 }
 
-// TestPendingOccurrenceCorruptPayloadRetained pins the safe corrupt-BLOB
+// TestPendingOccurrenceCorruptPayloadRetained pins the safe corrupt-payload
 // contract: a payload that is not valid JSON, and one that is valid JSON but
 // incomplete, are BOTH returned with DecodeErr set (empty intent, so the caller
 // cannot publish the wrong occurrence) and are RETAINED — never deleted. A valid
@@ -381,12 +378,12 @@ func TestPendingOccurrenceCorruptPayloadRetained(t *testing.T) {
 	}
 	if _, err := c.db.ExecContext(ctx,
 		`INSERT INTO schedule_pending (id, data, attempts, next_attempt_ms, lease_until_ms, expires_at_ms)
-		 VALUES ('garbage', ?, 0, 0, 0, ?)`, "not json", now.Add(PendingRetention).UnixMilli()); err != nil {
+		 VALUES ('garbage', $1, 0, 0, 0, $2)`, `"not-json"`, now.Add(PendingRetention).UnixMilli()); err != nil {
 		t.Fatalf("insert garbage: %v", err)
 	}
 	if _, err := c.db.ExecContext(ctx,
 		`INSERT INTO schedule_pending (id, data, attempts, next_attempt_ms, lease_until_ms, expires_at_ms)
-		 VALUES ('incomplete', jsonb('{"app":"x"}'), 0, 0, 0, ?)`, now.Add(PendingRetention).UnixMilli()); err != nil {
+		 VALUES ('incomplete', $1, 0, 0, 0, $2)`, `{"app":"x"}`, now.Add(PendingRetention).UnixMilli()); err != nil {
 		t.Fatalf("insert incomplete: %v", err)
 	}
 
@@ -438,7 +435,7 @@ func TestPendingOccurrenceCorruptPayloadNeverDeletedByReschedule(t *testing.T) {
 	now := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
 	if _, err := c.db.ExecContext(ctx,
 		`INSERT INTO schedule_pending (id, data, attempts, next_attempt_ms, lease_until_ms, expires_at_ms)
-		 VALUES ('bad', ?, 3, 0, 0, ?)`, "corrupt", now.Add(PendingRetention).UnixMilli()); err != nil {
+		 VALUES ('bad', $1, 3, 0, 0, $2)`, `"corrupt"`, now.Add(PendingRetention).UnixMilli()); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 	// A claim surfaces it with DecodeErr and does not reset its attempts.
@@ -450,7 +447,7 @@ func TestPendingOccurrenceCorruptPayloadNeverDeletedByReschedule(t *testing.T) {
 		t.Fatalf("claim = %+v, want one surfaced corrupt record", claimed)
 	}
 	// The caller's reschedule (the safe policy) advances it, retaining the row.
-	if err := c.ReschedulePendingOccurrence(ctx, "bad", now.Add(time.Minute)); err != nil {
+	if err := c.ReschedulePendingOccurrence(ctx, "bad", claimed[0].ClaimToken, now.Add(time.Minute)); err != nil {
 		t.Fatalf("reschedule: %v", err)
 	}
 	var attempts int
@@ -468,12 +465,12 @@ func TestPendingOccurrenceCorruptPayloadNeverDeletedByReschedule(t *testing.T) {
 // panicking, so the caller can log and continue.
 func TestPendingOccurrenceWriteErrorIsNonFatal(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "db.sqlite3")
-	c, err := Open(path)
+	path := newTestDSN(t)
+	c, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	c.SetLogger(slog.New(slog.NewTextHandler(&testutil.SyncBuffer{}, nil)))
+	c.SetLogger(slog.New(slog.NewTextHandler(&testSyncBuffer{}, nil)))
 	if err := c.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -503,28 +500,28 @@ func ids(ps []PendingOccurrence) string {
 //   - every SavePendingOccurrence returns no error;
 //   - exactly ONE call reports inserted=true;
 //   - exactly one row exists, carrying the complete immutable intent;
-//   - no SQLITE_BUSY / lock error surfaces.
+//   - no serialization/lock error surfaces.
 //
 // No sleeps: the writes are released by closing the barrier channel, and the
 // result is fully joined via a WaitGroup.
 func TestPendingOccurrenceConcurrentPersistIsUnique(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "db.sqlite3")
+	path := newTestDSN(t)
 	now := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
 
 	// Two independent handles to the SAME file, modeling two processes/retriers
 	// racing the same occurrence.
-	c1, err := Open(path)
+	c1, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("open c1: %v", err)
 	}
 	defer c1.Close()
-	c2, err := Open(path)
+	c2, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("open c2: %v", err)
 	}
 	defer c2.Close()
-	buf := &testutil.SyncBuffer{}
+	buf := &testSyncBuffer{}
 	c1.SetLogger(slog.New(slog.NewTextHandler(buf, nil)))
 	c2.SetLogger(slog.New(slog.NewTextHandler(buf, nil)))
 
@@ -575,7 +572,7 @@ func TestPendingOccurrenceConcurrentPersistIsUnique(t *testing.T) {
 	// Exactly one row exists and carries the complete, immutable intent.
 	var rows int
 	if err := c1.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM schedule_pending WHERE id = ?`, occ.ID).Scan(&rows); err != nil {
+		`SELECT COUNT(*) FROM schedule_pending WHERE id = $1`, occ.ID).Scan(&rows); err != nil {
 		t.Fatalf("count rows: %v", err)
 	}
 	if rows != 1 {
@@ -600,9 +597,9 @@ func TestPendingOccurrenceConcurrentPersistIsUnique(t *testing.T) {
 		t.Fatalf("attempts = %d, want 0 (a losing writer must not rewind/advance it)", got.Attempts)
 	}
 
-	// Cross-handle race: no SQLite lock/busy error may surface.
-	if s := buf.String(); strings.Contains(s, "locked") || strings.Contains(s, "SQLITE_BUSY") {
-		t.Fatalf("SQLite lock/busy error surfaced across concurrent handles:\n%s", s)
+	// Cross-handle race: no serialization/lock error may surface.
+	if s := buf.String(); strings.Contains(s, "could not serialize") || strings.Contains(s, "deadlock detected") {
+		t.Fatalf("serialization error surfaced across concurrent handles:\n%s", s)
 	}
 }
 
@@ -645,7 +642,7 @@ func TestPendingOccurrenceExpiryExactAndNotRefreshed(t *testing.T) {
 	}
 
 	// A reschedule (the failure path) advances attempts/next_attempt only.
-	if err := c.ReschedulePendingOccurrence(ctx, "a", now.Add(time.Minute)); err != nil {
+	if err := c.ReschedulePendingOccurrence(ctx, "a", 0, now.Add(time.Minute)); err != nil {
 		t.Fatalf("reschedule: %v", err)
 	}
 	if err := c.db.QueryRowContext(ctx,
@@ -721,7 +718,7 @@ func TestExpirePendingOccurrencesBoundedAndExcludesLive(t *testing.T) {
 	}
 	// Force the three to be already expired (the insert stamped +7d).
 	if _, err := c.db.ExecContext(ctx,
-		`UPDATE schedule_pending SET expires_at_ms = ? WHERE id IN ('e1','e2','e3')`,
+		`UPDATE schedule_pending SET expires_at_ms = $1 WHERE id IN ('e1','e2','e3')`,
 		now.Add(-time.Millisecond).UnixMilli()); err != nil {
 		t.Fatalf("expire rows: %v", err)
 	}
@@ -762,10 +759,10 @@ func TestExpirePendingOccurrencesBoundedAndExcludesLive(t *testing.T) {
 // process was down is excluded from claims and removed by cleanup after reopen.
 func TestPendingOccurrenceExpirySurvivesReopen(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "db.sqlite3")
+	path := newTestDSN(t)
 	now := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
 
-	c1, err := Open(path)
+	c1, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -779,7 +776,7 @@ func TestPendingOccurrenceExpirySurvivesReopen(t *testing.T) {
 	// "outside" expires just after the restart instant; "inside" stays live for
 	// the whole 7-day window.
 	if _, err := c1.db.ExecContext(ctx,
-		`UPDATE schedule_pending SET expires_at_ms = ? WHERE id = 'outside'`,
+		`UPDATE schedule_pending SET expires_at_ms = $1 WHERE id = 'outside'`,
 		now.Add(2*time.Hour).UnixMilli()); err != nil {
 		t.Fatalf("set outside expiry: %v", err)
 	}
@@ -787,7 +784,7 @@ func TestPendingOccurrenceExpirySurvivesReopen(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	c2, err := Open(path)
+	c2, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -882,8 +879,8 @@ func TestPendingOutboxStatsDepthAndOldestAge(t *testing.T) {
 func TestPendingOutboxStatsErrorIsNonFatalAndNonMutating(t *testing.T) {
 	ctx := context.Background()
 	base := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
-	path := filepath.Join(t.TempDir(), "db.sqlite3")
-	c, err := Open(path)
+	path := newTestDSN(t)
+	c, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -900,7 +897,7 @@ func TestPendingOutboxStatsErrorIsNonFatalAndNonMutating(t *testing.T) {
 
 	// Reopen: the row is intact, so the failed aggregate query never mutated the
 	// outbox.
-	c2, err := Open(path)
+	c2, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

@@ -16,7 +16,7 @@ type outboxStatsReader interface {
 	PendingOutboxStats(ctx context.Context) (state.OutboxStats, error)
 }
 
-// The production durable outbox (the SQLite state handle) must satisfy the
+// The production durable outbox (the PostgreSQL state handle) must satisfy the
 // read-only aggregate seam.
 var _ outboxStatsReader = (*state.State)(nil)
 

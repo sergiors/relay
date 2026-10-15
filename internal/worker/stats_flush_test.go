@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -10,10 +9,11 @@ import (
 
 	"relay/internal/observability/metrics"
 	"relay/internal/state"
+	"relay/internal/testutil"
 )
 
 // waitForStatsRow polls cond until it holds or a generous deadline passes. It
-// is the bounded-poll replacement for fixed sleeps that awaited the async SQLite
+// is the bounded-poll replacement for fixed sleeps that awaited the async PostgreSQL
 // statsLoop flush, so the first flush and the >1-tick tracking are observed
 // deterministically instead of timing out on slow CI.
 func waitForStatsRow(t *testing.T, what string, cond func() bool) {
@@ -32,7 +32,7 @@ func waitForStatsRow(t *testing.T, what string, cond func() bool) {
 // recordSnapshots sweeps the registry against the live app set (from the
 // state DB), deleting series for an app whose apps row is gone even
 // though its series still linger in the registry, while live apps' series
-// and global counters survive in BOTH SQLite and the registry.
+// and global counters survive in BOTH PostgreSQL and the registry.
 func TestRecordSnapshotsSweepsStaleAppSeries(t *testing.T) {
 	st := openTempState(t)
 	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
@@ -54,7 +54,7 @@ func TestRecordSnapshotsSweepsStaleAppSeries(t *testing.T) {
 
 	recordSnapshots(context.Background(), st, m, nil)
 
-	// Ghost's SQLite app_stats is absent (pre-existing orphan-prune/upsert
+	// Ghost's PostgreSQL app_stats is absent (pre-existing orphan-prune/upsert
 	// behavior).
 	if _, ok := st.AppStats("ghost"); ok {
 		t.Fatal("ghost app_stats must be absent after the sweep+flush")
@@ -67,7 +67,7 @@ func TestRecordSnapshotsSweepsStaleAppSeries(t *testing.T) {
 		t.Fatalf("ghost series must be swept from the registry:\n%s", m.Snapshot())
 	}
 
-	// Alpha's series survive in both SQLite and the registry. The flush persists
+	// Alpha's series survive in both PostgreSQL and the registry. The flush persists
 	// the registry's current absolute value (alpha was incremented twice), so
 	// its row is present with the live value — proving alpha was NOT swept.
 	a, ok := st.AppStats("alpha")
@@ -78,7 +78,7 @@ func TestRecordSnapshotsSweepsStaleAppSeries(t *testing.T) {
 		t.Fatalf("alpha must remain in AppStatsSnapshot:\n%+v", fs)
 	}
 
-	// Global counters unchanged (registry values persisted to SQLite).
+	// Global counters unchanged (registry values persisted to PostgreSQL).
 	gs, _ := st.Stats()
 	if gs.EventsMatchedTotal != 42 {
 		t.Fatalf("global events = %d, want 42", gs.EventsMatchedTotal)
@@ -91,7 +91,7 @@ func TestRecordSnapshotsSweepsStaleAppSeries(t *testing.T) {
 	}
 }
 
-// TestReaddedAppPersistsFreshSeries verifies SQLite consistency on re-add:
+// TestReaddedAppPersistsFreshSeries verifies PostgreSQL consistency on re-add:
 // after an app's series are removed, re-incrementing starts at 1 and the
 // flush persists that fresh small value (the row was recreated/upserted, not
 // held at a stale value).
@@ -129,11 +129,8 @@ func TestReaddedAppPersistsFreshSeries(t *testing.T) {
 // is idempotent), a subsequent flush sweeps ghost and keeps alpha — the
 // ghost/live behavior resumes.
 func TestSweepSkippedOnStateReadError(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "db.sqlite3")
-	st, err := state.Open(path)
-	if err != nil {
-		t.Fatalf("open state: %v", err)
-	}
+	dsn := testutil.NewStateDSN(t)
+	st := testutil.OpenState(t, dsn)
 	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
 	st.RecordDiscovered(stateApp("ghost", t.TempDir()))
 
@@ -166,11 +163,7 @@ func TestSweepSkippedOnStateReadError(t *testing.T) {
 
 	// Reopen on the same path (Open's schema init is idempotent) and flush; the
 	// ghost/live behavior resumes: ghost (now stale) is swept, alpha survives.
-	st2, err := state.Open(path)
-	if err != nil {
-		t.Fatalf("reopen state: %v", err)
-	}
-	defer st2.Close()
+	st2 := testutil.OpenState(t, dsn)
 	recordSnapshots(context.Background(), st2, m, nil)
 
 	if fs := m.AppStatsSnapshot(); !metricsStat(fs, "alpha") {
@@ -193,7 +186,7 @@ func metricsStat(fs []metrics.AppStat, name string) bool {
 
 // TestSnapshotStatsAndFuncSnapshotAreInMemoryOnly pins the hot-path contract:
 // updates go to the Prometheus registry only and the registry reflects them
-// immediately, while NO write reaches SQLite until recordSnapshots runs once.
+// immediately, while NO write reaches PostgreSQL until recordSnapshots runs once.
 func TestSnapshotStatsAndFuncSnapshotAreInMemoryOnly(t *testing.T) {
 	m := metrics.New()
 	// Give alpha/beta apps rows so their app_stats survive the flush's
@@ -221,12 +214,12 @@ func TestSnapshotStatsAndFuncSnapshotAreInMemoryOnly(t *testing.T) {
 		t.Fatal("expected no stats row before any flush (hot path is in memory only)")
 	}
 
-	// A further 1000 increments must STILL not write to SQLite.
+	// A further 1000 increments must STILL not write to PostgreSQL.
 	for i := 0; i < 1000; i++ {
 		m.Inc(metrics.MetricEventsMatched)
 	}
 	if _, ok := st.Stats(); ok {
-		t.Fatal("per-event activity must not write to SQLite")
+		t.Fatal("per-event activity must not write to PostgreSQL")
 	}
 
 	// Registry reflects the exact totals immediately.
@@ -263,7 +256,7 @@ func TestSnapshotStatsAndFuncSnapshotAreInMemoryOnly(t *testing.T) {
 }
 
 // TestStatsLoopFlushesEveryInterval proves the fixed-cadence flush mirrors the
-// in-memory absolute registry into SQLite repeatedly (not as deltas). The
+// in-memory absolute registry into PostgreSQL repeatedly (not as deltas). The
 // interval param exists solely for testability — production uses the
 // statsFlushInterval constant (5s, see TestStatsFlushIntervalConstant).
 func TestStatsLoopFlushesEveryInterval(t *testing.T) {

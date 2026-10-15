@@ -76,7 +76,7 @@ const (
 	// by MetricSchedulePublishFailures). MetricSchedulePublishExhausted counts
 	// occurrences whose BOUNDED IMMEDIATE retry loop was exhausted. It is NOT a
 	// terminal loss: when the failed publication attempt was persisted to the
-	// SQLite outbox, the durable retry worker keeps republishing that occurrence
+	// PostgreSQL outbox, the durable retry worker keeps republishing that occurrence
 	// (with the same identity), across restarts, until it resolves (published or
 	// a clean duplicate) or its 7-day retention expires. Only with no outbox
 	// configured does exhaustion here leave no durable copy. It is deliberately
@@ -119,7 +119,7 @@ const (
 	MetricSchedulePendingRetries   = metricNamespacePrefix + "schedule_pending_retries_total"
 	MetricSchedulePendingExpired   = metricNamespacePrefix + "schedule_pending_expired_total"
 	// Scheduler storage state. The schedule scheduler requires a usable durable
-	// publication store (the local SQLite outbox) before it may evaluate or
+	// publication store (the local PostgreSQL outbox) before it may evaluate or
 	// publish occurrences: publication must be persistable before it is
 	// attempted. The one-hot gauge exposes the current state, and the transition
 	// counters make a pause and its recovery observable without scraping the
@@ -308,7 +308,7 @@ var metricHelp = map[string]string{
 	MetricScheduleOccurrencesDuplicate: "Schedule occurrences skipped because another worker had already published them; the publish-if-new check is a clean no-op.",
 	MetricSchedulePublishFailures:      "Schedule occurrence publish attempts that failed, including envelope encoding errors and Redis script errors; a failed attempt is counted here before any bounded retry.",
 	MetricSchedulePublishRetries:       "Retries of a failed schedule occurrence publication within the bounded backoff budget; the initial failed attempt is counted by schedule_publish_failures_total and every subsequent re-attempt counts here.",
-	MetricSchedulePublishExhausted:     "Schedule occurrences whose BOUNDED IMMEDIATE publication retry loop was exhausted without a success or duplicate. This is not a terminal loss: the occurrence's exact intent was already written to the durable SQLite outbox BEFORE the publish (intent-first durability), so the retry worker keeps republishing it until it resolves (published or a clean duplicate) or its 7-day retention expires; only with no outbox configured does exhaustion leave no durable copy. It is not a handler exhaustion (see function_dlq_total).",
+	MetricSchedulePublishExhausted:     "Schedule occurrences whose BOUNDED IMMEDIATE publication retry loop was exhausted without a success or duplicate. This is not a terminal loss: the occurrence's exact intent was already written to the durable PostgreSQL outbox BEFORE the publish (intent-first durability), so the retry worker keeps republishing it until it resolves (published or a clean duplicate) or its 7-day retention expires; only with no outbox configured does exhaustion leave no durable copy. It is not a handler exhaustion (see function_dlq_total).",
 	MetricScheduleCatchUp:              "Schedule occurrences processed by the startup catch-up scan (the latest missed occurrence per schedule within the bounded horizon). Each is subject to the atomic publish-if-new, so the scan's published/duplicate split is counted by schedule_occurrences_published_total / schedule_occurrences_duplicate_total.",
 	MetricScheduleCatchupSkipped:       "Older missed schedule occurrences the bounded latest-only catch-up intentionally discarded: for each schedule, the occurrences inside the recovery horizon that are strictly older than the single latest one the scan republishes. Counted at the decision point on every scan (startup and each recovery scan), per process; occurrences outside the horizon, future occurrences, the published latest occurrence, schedules with no candidate, and publish outcomes are never counted. This is a local count of a deliberately bounded policy, not a cluster-wide measure of lost occurrences.",
 	MetricSchedulePendingPersisted:     "Schedule occurrences newly persisted to the durable local retry outbox. The exact occurrence intent is written BEFORE the tick is published (intent-first durability), so a crash between persistence and publication recovers it; a re-persist of an occurrence already present is not counted. The occurrence is retried until it publishes or is confirmed a clean duplicate, then the outbox row is deleted.",
@@ -457,7 +457,7 @@ type Registry struct {
 	restoredMu sync.RWMutex
 
 	// restoredDiscards maps an app name to the cumulative warm-container
-	// pool discard total recovered from SQLite at worker startup. Persisted
+	// pool discard total recovered from PostgreSQL at worker startup. Persisted
 	// discards are stored as one per-app aggregate across the real, finite
 	// teardown reasons, so the total cannot be reconstructed into causal
 	// per-reason series. Rather than invent a synthetic Prometheus reason (which
@@ -479,7 +479,7 @@ type Registry struct {
 	// appTimestamps maps an app name to its latest per-kind unix-seconds
 	// timestamps. It is the latest-known-value stage of the per-app stats
 	// pipeline: the runner overwrites entries as executions happen, and the
-	// worker's periodic SQLite snapshot (via AppStatsSnapshot) persists
+	// worker's periodic PostgreSQL snapshot (via AppStatsSnapshot) persists
 	// whatever it last read. Timestamps are RELAY-side state (when did this
 	// app's handler last run?), not scrape-time observations, so they are
 	// deliberately NOT Prometheus vecs — a gauge that flips forward on every
@@ -634,7 +634,7 @@ func New() *Registry {
 		MetricConcurrencyWaits,
 		// MetricScheduleOccurrences* are the cluster-wide schedule coordination
 		// counters (see internal/schedule). They are Prometheus-only: they are
-		// deliberately NOT wired into the SQLite stats snapshot.
+		// deliberately NOT wired into the PostgreSQL stats snapshot.
 		MetricScheduleOccurrencesPublished,
 		MetricScheduleOccurrencesDuplicate,
 		MetricSchedulePublishFailures,
@@ -1239,7 +1239,7 @@ type AppStat struct {
 	DiscardedTotal    int64
 
 	// Unix-seconds timestamps (0 = never observed), fed by SetAppTimestamp
-	// and seeded from SQLite at startup (see SeedAppStat). They mirror the
+	// and seeded from PostgreSQL at startup (see SeedAppStat). They mirror the
 	// runner's execution-history attribution:
 	//   - LastExecution: the last handler-execution attempt (retries included,
 	//     since every claimed attempt is an execution).
@@ -1266,7 +1266,7 @@ type AppStat struct {
 // series absence and Prometheus's zero-value lazy semantics make such an entry
 // inconsistent with the counters, and the state layer's case-guarded upsert
 // preserves persisted timestamps across empty incoming values anyway — so
-// dropping a timestamp-only read here never erases SQLite history.
+// dropping a timestamp-only read here never erases PostgreSQL history.
 // It is nil-safe and returns nil when no app has been attributed yet. The
 // app-labeled Relay-specific metrics are gathered here, so this Relay-specific
 // helper lives here rather than in the worker.
@@ -1469,7 +1469,7 @@ func (r *Registry) DeleteRuntimePool(name string) {
 // untouched. Nil-safe; unknown names are a no-op. It is the reconciliation-time
 // cleanup: when an app directory vanishes, the wired RemoveApp hook
 // (see internal/worker) calls this so its stale Prometheus series do not linger
-// on /metrics after SQLite state is dropped.
+// on /metrics after PostgreSQL state is dropped.
 //
 // MetricHandlerInvocations and MetricHandlerDuration carry a second
 // variable label alongside app (outcome/handler respectively), and

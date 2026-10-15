@@ -46,7 +46,7 @@ func TestSetupMetricsAlwaysBuildsRegistry(t *testing.T) {
 
 // TestStatsPersistWithMetricsDisabled is the regression for the reported bug:
 // with METRICS_ADDR unset the stats loop must still flush the registry into
-// SQLite. It wires the registry exactly as Run does (setupMetrics with an empty
+// PostgreSQL. It wires the registry exactly as Run does (setupMetrics with an empty
 // address), runs the unconditional statsLoop, and asserts the persisted totals.
 func TestStatsPersistWithMetricsDisabled(t *testing.T) {
 	reg, srv := setupMetrics(config.Config{}, lifecycleLogger())

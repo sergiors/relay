@@ -2293,7 +2293,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 							{Name: "app", Value: pf.fn.Name},
 							{Name: "handler", Value: rule.Handler},
 						})
-					// Unlabeled total for the SQLite snapshot; the labeled counter
+					// Unlabeled total for the PostgreSQL snapshot; the labeled counter
 					// above stays for Prometheus.
 					r.metrics.Inc(metrics.MetricHandlerFailure)
 					// Per-app failure attribution (per rule execution). A
@@ -3665,7 +3665,7 @@ func (r *Runner) recordHandlerSuccess(fnName, handler string, duration time.Dura
 			{Name: "app", Value: fnName},
 			{Name: "handler", Value: handler},
 		})
-	// Unlabeled total for the SQLite snapshot; the labeled counter above stays
+	// Unlabeled total for the PostgreSQL snapshot; the labeled counter above stays
 	// for Prometheus.
 	r.metrics.Inc(metrics.MetricHandlerSuccess)
 	// Per-app success attribution.

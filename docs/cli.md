@@ -40,8 +40,11 @@ those operations.
 | `secret ls` / `set` / `rm`  | no          | no           | no                     | local secret files                           |
 | `git *`                     | no          | no           | no                     | local git config/key/checkout + `/apps`      |
 
-Commands that need Redis call the same `config.Load` as `relay start`, so a
-missing `REDIS_*` variable is an error for them too.
+Commands that need Redis resolve the Redis configuration with the same required
+`REDIS_*` validation as `relay start`, so a missing `REDIS_URI`,
+`REDIS_STREAM`, or `REDIS_GROUP` is an error for them too. The `dlq` commands
+use `config.LoadRedisConfig` — a Redis-only loader — so they do **not** require
+`DATABASE_URL`: the DLQ lives entirely in Redis.
 
 ## relay start
 
@@ -74,7 +77,7 @@ healthcheck.
 - In steady state the worker answers from **live** dependency health: Redis
   consumer health, a bounded Docker ping, and `NETWORKS` verification. A
   dependency failing reports not-healthy, and recovery reports healthy again — no
-  restart required. `SQLite`, optional tracing, and asynchronous service
+  restart required. PostgreSQL (and therefore the scheduler state), optional tracing, and asynchronous service
   convergence/housekeeping are not blockers, and a per-app
   `degraded`/`unavailable`/`invalid` status does not change worker health.
 
@@ -119,8 +122,8 @@ not reset.
 
 ## relay app
 
-`ls` and `inspect` read the local state database only — no Redis, no Docker, no
-`/apps`.
+`ls` and `inspect` read the state database only — no Redis, no Docker, no
+`/apps` (they need `DATABASE_URL` and a reachable database).
 
 ```
 relay app ls

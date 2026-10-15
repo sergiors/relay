@@ -3,47 +3,47 @@ package state
 import (
 	"context"
 	"log/slog"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"relay/internal/app"
-	"relay/internal/testutil"
 )
 
 // captureLogger returns a *State whose logger writes into a mutex-protected
-// buffer, so a test can assert that no SQLITE_BUSY / "database is locked" error
-// surfaced during concurrent access. With SetMaxOpenConns(1) the pool serializes
-// all in-process access, so these errors must never appear.
-func captureLogger(t *testing.T) (*State, *testutil.SyncBuffer) {
+// buffer, so a test can assert that no serialization/lock error surfaced during
+// concurrent access.
+func captureLogger(t *testing.T) (*State, *testSyncBuffer) {
 	t.Helper()
-	c, err := Open(filepath.Join(t.TempDir(), "db.sqlite3"))
+	c, err := testOpen(t, newTestDSN(t))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { _ = c.Close() })
-	buf := &testutil.SyncBuffer{}
+	buf := &testSyncBuffer{}
 	c.SetLogger(slog.New(slog.NewTextHandler(buf, nil)))
 	return c, buf
 }
 
-// assertNoBusy fails the test if the captured log contains any SQLite lock/busy
-// error. The driver's error string is typically "database is locked (5)
-// (SQLITE_BUSY)"; we check for both "locked" and "SQLITE_BUSY".
-func assertNoBusy(t *testing.T, buf *testutil.SyncBuffer) {
+// assertNoBusy fails the test if the captured log contains any lock/serialize
+// error: PostgreSQL's "deadlock detected" or "could not serialize access due to
+// concurrent update" must never surface from Relay's short writes, which
+// serialize per app via a transaction-scoped advisory lock (see lockAppTx).
+func assertNoBusy(t *testing.T, buf *testSyncBuffer) {
 	t.Helper()
 	s := buf.String()
-	if strings.Contains(s, "locked") || strings.Contains(s, "SQLITE_BUSY") {
-		t.Fatalf("SQLite lock/busy error surfaced under concurrency:\n%s", s)
+	for _, bad := range []string{"could not serialize", "deadlock detected"} {
+		if strings.Contains(s, bad) {
+			t.Fatalf("lock/serialize error %q surfaced under concurrency:\n%s", bad, s)
+		}
 	}
 }
 
-// TestConcurrentGlobalStatsWrites hammers the single-row stats table from many
+// TestConcurrentGlobalStatsWrites hammers the worker's stats row from many
 // goroutines. Because RecordStats is an absolute-snapshot upsert, the final
 // Stats() must equal exactly one writer's value (never a mixture), and no
-// SQLITE_BUSY may surface.
+// serialization error may surface.
 func TestConcurrentGlobalStatsWrites(t *testing.T) {
 	c, buf := captureLogger(t)
 	const n = 50
@@ -240,12 +240,12 @@ func TestConcurrentReadsDuringWrites(t *testing.T) {
 // TestReopenUnderConcurrency runs concurrent writes, closes, reopens the same
 // path, and verifies the persisted values are correct.
 func TestReopenUnderConcurrency(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "db.sqlite3")
-	c1, err := Open(path)
+	path := newTestDSN(t)
+	c1, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	buf := &testutil.SyncBuffer{}
+	buf := &testSyncBuffer{}
 	c1.SetLogger(slog.New(slog.NewTextHandler(buf, nil)))
 
 	const n = 40
@@ -262,7 +262,7 @@ func TestReopenUnderConcurrency(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	c2, err := Open(path)
+	c2, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -281,12 +281,12 @@ func TestReopenUnderConcurrency(t *testing.T) {
 // app_stats rows written concurrently plus one final global RecordStats
 // must all be readable with exact values after Close+reopen.
 func TestPersistenceAfterConcurrency(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "db.sqlite3")
-	c1, err := Open(path)
+	path := newTestDSN(t)
+	c1, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	buf := &testutil.SyncBuffer{}
+	buf := &testSyncBuffer{}
 	c1.SetLogger(slog.New(slog.NewTextHandler(buf, nil)))
 
 	const k = 20
@@ -304,7 +304,7 @@ func TestPersistenceAfterConcurrency(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	c2, err := Open(path)
+	c2, err := testOpen(t, path)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

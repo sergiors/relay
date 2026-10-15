@@ -663,3 +663,32 @@ func TestDLQReplayWorkerUnavailableKeepsEntry(t *testing.T) {
 		t.Fatalf("an unavailable worker must keep the entry: %+v", store.entries)
 	}
 }
+
+// TestOpenRedisDLQStoreNeedsNoDatabaseURL pins that the production `relay dlq`
+// opener is Redis-only: with the Redis variables set and DATABASE_URL absent it
+// still resolves and constructs a store, and it still fails when a required
+// Redis variable is missing.
+func TestOpenRedisDLQStoreNeedsNoDatabaseURL(t *testing.T) {
+	t.Setenv("REDIS_URI", "localhost:6379")
+	t.Setenv("REDIS_STREAM", "events")
+	t.Setenv("REDIS_GROUP", "relay")
+	// No state database configured: the DLQ path must not require it.
+	t.Setenv("DATABASE_URL", "")
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store, cleanup, err := openRedisDLQStore(logger)
+	if err != nil {
+		t.Fatalf("openRedisDLQStore without DATABASE_URL: %v", err)
+	}
+	if store == nil {
+		t.Fatal("expected a non-nil store")
+	}
+	cleanup()
+
+	// Redis configuration validation is preserved: a missing required variable
+	// is still a clear error.
+	t.Setenv("REDIS_URI", "")
+	if _, _, err := openRedisDLQStore(logger); err == nil || !strings.Contains(err.Error(), "REDIS_URI") {
+		t.Fatalf("openRedisDLQStore without REDIS_URI = %v, want an error naming REDIS_URI", err)
+	}
+}

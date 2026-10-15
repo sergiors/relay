@@ -2,7 +2,7 @@
 
 // This file exercises the worker's graceful-shutdown path against real
 // external services: real Docker execution (an in-flight handler container)
-// and real Redis (PEL state, invocation keys, SQLite flush).
+// and real Redis (PEL state, invocation keys, PostgreSQL flush).
 //
 // This file is excluded from the default suite by the integration build tag.
 // Running it (`go test -tags=integration ./...`) REQUIRES both a reachable
@@ -41,7 +41,7 @@ import (
 )
 
 // workerConfig carries the test-controlled constants that replace the package
-// CONSTANTS (app.Dir, state.DBPath) and the env-derived values in Run().
+// CONSTANTS (app.Dir) and the env-derived values in Run().
 // The worker binary reads the literal "/apps" and "/var/lib/relay/...",
 // which are not writable on the host, so the test forks the wiring IN-PROCESS
 // with these values instead (the same pattern TestIntegrationMetricsEndpoint
@@ -53,7 +53,7 @@ type workerConfig struct {
 	group        string
 	consumerName string
 	fnRoot       string
-	statePath    string
+	stateDSN     string
 	metricsAddr  string
 }
 
@@ -121,7 +121,7 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 		t.Fatalf("load apps: %v", err)
 	}
 
-	st, err := state.Open(cfg.statePath)
+	st, err := state.Open(context.Background(), state.Options{DSN: cfg.stateDSN, Owner: cfg.consumerName, Logger: logger})
 	if err != nil {
 		t.Fatalf("state open: %v", err)
 	}
@@ -345,10 +345,10 @@ func writeTestFile(t *testing.T, dir, name, content string) {
 
 // TestIntegrationGracefulShutdownMidHandler is the end-to-end graceful-shutdown
 // test: a real worker (full wiring: real Consume loop, real Docker execution,
-// real Redis PEL, real SQLite flush) is cancelled mid-handler, and the test
+// real Redis PEL, real PostgreSQL flush) is cancelled mid-handler, and the test
 // asserts a clean bounded shutdown: the in-flight container is removed, the
 // message is left pending (not acked), the invocation is not marked complete,
-// the final SQLite flush runs within its bound, and the message is recoverable
+// the final PostgreSQL flush runs within its bound, and the message is recoverable
 // through the normal reclaim path by a second consumer.
 func TestIntegrationGracefulShutdownMidHandler(t *testing.T) {
 	testutil.RequireRedis(t)
@@ -371,7 +371,7 @@ func TestIntegrationGracefulShutdownMidHandler(t *testing.T) {
 	_ = l.Close()
 
 	fnRoot := t.TempDir()
-	statePath := filepath.Join(t.TempDir(), "db.sqlite3")
+	stateDSN := testutil.NewStateDSN(t)
 
 	// Derive a unique, length-capped app name from the test name + a
 	// nanosecond stamp so concurrent runs on one daemon cannot collide on the
@@ -405,7 +405,7 @@ export async function slow(event) {
 
 	env := startWorker(t, workerConfig{
 		redisURI: redisURI, stream: streamName, group: groupName,
-		consumerName: consumerName, fnRoot: fnRoot, statePath: statePath,
+		consumerName: consumerName, fnRoot: fnRoot, stateDSN: stateDSN,
 		metricsAddr: metricsAddr,
 	})
 

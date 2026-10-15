@@ -43,7 +43,7 @@ import (
 // persisted, because a persisted gauge would go stale between flushes. The reset
 // command carries no storage details: the worker resets its own in-memory source
 // and persisted rows behind its StatsResetter, so the socket never learns about
-// SQLite. Manual invocation likewise carries no broker details: it dispatches to
+// PostgreSQL. Manual invocation likewise carries no broker details: it dispatches to
 // the live runner, which executes the app's matching handlers but never
 // touches Redis streams, ACK/retry, invocation state, or the DLQ.
 //
