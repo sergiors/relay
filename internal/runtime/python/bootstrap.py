@@ -19,6 +19,14 @@ Process-model notes (intended semantics, not a bug):
   - A malformed request line is a fatal protocol failure: the process exits
     nonzero so Relay discards the container.
   - EOF on stdin means Relay is done with the container; exit 0 cleanly.
+  - The whole process owns ONE event loop, created once by asyncio.run() and
+    alive until the container exits. Requests are read and processed on that
+    loop, one at a time (see runtime_loop). Sync handlers are called inline on
+    the loop; an async handler (or any awaitable the handler returns) is awaited
+    on that SAME loop. Module-level asyncio resources (a lock, a queue, an HTTP
+    client session) therefore bind to one stable loop and stay usable across
+    invocations; relay never runs a per-invocation loop, so a warm resource is
+    not "attached to a different event loop" on its second use.
   - sys.modules caches imported modules, so module-level state (a cache dict,
     a client, a connection) persists across invocations. Per-request env is
     applied EXACTLY per invocation: a key absent from the new frame is restored
@@ -29,6 +37,11 @@ Process-model notes (intended semantics, not a bug):
     this invocation. It is extracted and attached ONLY around the one handler
     call and always detached afterwards, so one invocation's context never leaks
     into the next despite the warm interpreter (see invoke()).
+
+Lifetime caveat: reuse is a warm-process optimization, never a durability or
+lifetime guarantee. A container is discarded on a timeout, protocol error, or
+image change, and the process exits when Relay closes stdin; module state and
+any loop-bound resource created by a handler are released with it.
 
 Trace propagation:
   The runtime image installs the OpenTelemetry API (see the Python engine's
@@ -149,9 +162,14 @@ def _bound_error_frame(req_id, message):
     precisely, a multibyte character is never cut mid-byte, and the result always
     round-trips through json.dumps (the emitted frame is parseable).
     """
-    overhead = len(
-        (SENTINEL + json.dumps({"id": req_id, "ok": False, "error": ""})).encode("utf-8")
-    ) + 1  # +1 for the trailing newline respond writes
+    overhead = (
+        len(
+            (SENTINEL + json.dumps({"id": req_id, "ok": False, "error": ""})).encode(
+                "utf-8"
+            )
+        )
+        + 1
+    )  # +1 for the trailing newline respond writes
     budget = MAX_FRAME_BYTES - overhead
     if budget <= 0:
         return ""
@@ -186,7 +204,12 @@ def extract_context(trace):
     detach in a finally: this is the per-invocation boundary that keeps a warm
     container's ambient context from leaking across invocations, on success and
     on failure alike."""
-    if otel_context is None or otel_propagate is None or not isinstance(trace, dict) or not trace:
+    if (
+        otel_context is None
+        or otel_propagate is None
+        or not isinstance(trace, dict)
+        or not trace
+    ):
         return None
     # A dict carrier is exactly what the JSON "trace" object decodes to, so the
     # global W3C propagator (TraceContext + Baggage) reads it directly.
@@ -206,9 +229,15 @@ def detach_context(token):
         pass
 
 
-def invoke(handler, event, trace=None):
-    """Runs one handler. Raises SystemExit-free exceptions up to the caller for
-    protocol failure only; handler/user errors are converted here.
+async def invoke(handler, event, trace=None):
+    """Runs one handler on the process-lifetime loop. Raises SystemExit-free
+    exceptions up to the caller for protocol failure only; handler/user errors
+    are converted here.
+
+    The import, the handler lookup, a sync handler's call, and the await of an
+    async handler all happen on the SAME loop (the one runtime_loop runs on), so
+    a module-level asyncio resource reused by a later invocation is still bound
+    to a live loop.
 
     The invocation's trace context (if any) is attached for the single handler
     call and detached in a finally, so the warm interpreter's ambient context is
@@ -230,7 +259,7 @@ def invoke(handler, event, trace=None):
     try:
         result = func(event)
         if inspect.isawaitable(result):
-            asyncio.run(result)  # a fresh loop per invocation
+            await result  # on the process-lifetime loop, never a fresh one
     except SystemExit as exc:
         code = exc.code
         if code is None or code is True:
@@ -245,9 +274,16 @@ def invoke(handler, event, trace=None):
     return None
 
 
-def main():
+async def runtime_loop():
+    """The process's request loop, running on its one event loop. Reads one
+    request frame at a time, applies it, runs the handler, and responds before
+    reading again (Relay serializes warm-container use, so there is never more
+    than one in flight).
+
+    stdin is read in a worker thread (asyncio.to_thread) so the blocking read
+    never stalls the loop that owns the handlers' asyncio resources."""
     while True:
-        line = sys.stdin.buffer.readline()
+        line = await asyncio.to_thread(sys.stdin.buffer.readline)
         if not line:
             # Relay closed stdin (container discard or shutdown): exit cleanly.
             break
@@ -271,7 +307,7 @@ def main():
         os.environ["RELAY_HANDLER"] = str(handler)
 
         try:
-            error = invoke(handler, req.get("event"), req.get("trace"))
+            error = await invoke(handler, req.get("event"), req.get("trace"))
         except SystemExit as exc:
             sys.exit(1 if exc.code not in (None, 0, True) else 0)
 
@@ -279,6 +315,13 @@ def main():
             print(f"handler {handler!r} failed: {error}", file=sys.stderr)
 
         respond(req_id, error is None, error)
+
+
+def main():
+    # ONE loop for the whole process lifetime: module-level asyncio resources
+    # stay bound to it across invocations instead of being orphaned by a
+    # per-invocation loop.
+    asyncio.run(runtime_loop())
 
 
 if __name__ == "__main__":

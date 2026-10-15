@@ -292,6 +292,150 @@ def completed(event):
 	}
 }
 
+// TestPythonRuntimeAsyncHandlerKeepsOneProcessLifetimeLoop proves the warm
+// container's async semantics: one event loop lives for the whole process, a
+// sync handler and an async handler run on that SAME loop, and a module-level
+// asyncio resource (a Queue) created on first use stays usable across
+// invocations instead of being orphaned by a per-invocation loop. It also
+// proves an async failure fails only that invocation (a later await on the same
+// loop succeeds) and that the sync/async transitions and the import/lookup
+// distinctions are unchanged.
+func TestPythonRuntimeAsyncHandlerKeepsOneProcessLifetimeLoop(t *testing.T) {
+	skipIfNoPython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", `
+import asyncio
+
+_loop = None
+_queue = None
+
+def _remember():
+    # The loop this handler runs on must be the SAME live loop every
+    # invocation; the module-level Queue binds to it on first use.
+    global _loop, _queue
+    current = asyncio.get_running_loop()
+    if _loop is None:
+        _loop = current
+        _queue = asyncio.Queue()
+    assert current is _loop, "event loop changed between invocations"
+    assert not _loop.is_closed(), "event loop was closed between invocations"
+    return current
+
+def sync_count(event):
+    _remember()
+    print("sync=on-persistent-loop")
+
+async def async_touch(event):
+    _remember()
+    await _queue.put(event["msg"])
+    print("async=%s" % (await _queue.get()))
+
+async def async_boom(event):
+    _remember()
+    await asyncio.sleep(0)
+    raise RuntimeError("async-kaboom")
+`)
+	p := startPython(t, dir)
+
+	// sync -> async -> async -> async failure -> async recovery -> sync: every
+	// step must see the same process-lifetime loop, and the module Queue must
+	// survive between invocations.
+	r := p.invoke(t, "handler.sync_count", `{}`, nil)
+	if !r.OK || !strings.Contains(r.Out, "sync=on-persistent-loop") {
+		t.Fatalf("sync invoke = %+v, want success on the persistent loop", r)
+	}
+	for _, msg := range []string{"a", "b"} {
+		r := p.invoke(t, "handler.async_touch", fmt.Sprintf(`{"msg":%q}`, msg), nil)
+		if !r.OK || !strings.Contains(r.Out, "async="+msg) {
+			t.Fatalf("async invoke %q = %+v, want success on the same reused loop", msg, r)
+		}
+	}
+	fail := p.invoke(t, "handler.async_boom", `{}`, nil)
+	if fail.OK || !strings.Contains(fail.Err, "async-kaboom") {
+		t.Fatalf("async failure = %+v, want ok:false with the handler error", fail)
+	}
+	recover := p.invoke(t, "handler.async_touch", `{"msg":"c"}`, nil)
+	if !recover.OK || !strings.Contains(recover.Out, "async=c") {
+		t.Fatalf("post-failure async invoke = %+v, want recovery on the same live loop", recover)
+	}
+	again := p.invoke(t, "handler.sync_count", `{}`, nil)
+	if !again.OK || !strings.Contains(again.Out, "sync=on-persistent-loop") {
+		t.Fatalf("post-async sync invoke = %+v, want success", again)
+	}
+
+	// Import/lookup distinctions are unchanged: a missing function and an
+	// unimportable module both fail only the invocation.
+	missing := p.invoke(t, "handler.nope", `{}`, nil)
+	if missing.OK || !strings.Contains(missing.Err, "has no function") {
+		t.Fatalf("missing function = %+v, want a lookup failure", missing)
+	}
+	badimport := p.invoke(t, "no_such_module.nope", `{}`, nil)
+	if badimport.OK || !strings.Contains(badimport.Err, "failed to import module") {
+		t.Fatalf("bad import = %+v, want an import failure", badimport)
+	}
+}
+
+// TestPythonRuntimeAwaitableReturningHandler proves a sync handler that returns
+// an awaitable is awaited on the persistent loop: both a plain sync def
+// returning a coroutine and the common decorator shape (a sync wrapper around
+// an async body) complete, and the awaited body's output is still emitted before
+// the protocol response.
+func TestPythonRuntimeAwaitableReturningHandler(t *testing.T) {
+	skipIfNoPython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", `
+import asyncio
+
+def returns_coroutine(event):
+    async def inner():
+        await asyncio.sleep(0)
+        print("awaited %s" % event["msg"])
+    return inner()
+
+class Awaitable:
+    def __init__(self, msg):
+        self._msg = msg
+    def __await__(self):
+        async def run():
+            await asyncio.sleep(0)
+            print("object %s" % self._msg)
+        return run().__await__()
+
+def returns_awaitable_object(event):
+    return Awaitable(event["msg"])
+
+def decorate(fn):
+    def wrapper(event):
+        async def run():
+            await asyncio.sleep(0)
+            fn(event)
+        return run()
+    return wrapper
+
+@decorate
+def decorated(event):
+    print("decorated %s" % event["msg"])
+`)
+	p := startPython(t, dir)
+
+	for _, tc := range []struct {
+		handler string
+		want    string
+	}{
+		{"handler.returns_coroutine", "awaited hi"},
+		{"handler.returns_awaitable_object", "object hi"},
+		{"handler.decorated", "decorated hi"},
+	} {
+		r := p.invoke(t, tc.handler, `{"msg":"hi"}`, nil)
+		if !r.OK {
+			t.Fatalf("%s failed: %s", tc.handler, r.Err)
+		}
+		if !strings.Contains(r.Out, tc.want) {
+			t.Fatalf("%s out = %q, want %q (the returned awaitable must be awaited)", tc.handler, r.Out, tc.want)
+		}
+	}
+}
+
 func TestPythonRuntimeAsyncHandler(t *testing.T) {
 	skipIfNoPython(t)
 	dir := t.TempDir()
