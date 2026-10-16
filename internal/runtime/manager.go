@@ -129,12 +129,22 @@ type Manager struct {
 	// metrics is an optional observability registry. A nil registry disables
 	// all metric recording; every call is a no-op.
 	metrics *metrics.Registry
-	// hostname identifies this worker for container ownership. It is the same
-	// value as the Redis consumer identity (config.ConsumerName), so Relay's
-	// container-label hostname and its stream consumer identity are one and the
-	// same. The startup orphan sweep uses it to distinguish this worker's
+	// hostname identifies this worker for container ownership. It is the worker's
+	// stable identity (config.WorkerID), so the relay.hostname container label,
+	// the orphan/service cleanup scope, and the stream consumer identity are one
+	// and the same. The startup orphan sweep uses it to distinguish this worker's
 	// stalled containers from those of every other worker sharing the daemon.
 	hostname string
+	// selfHostname is the OS hostname of the container THIS process runs in,
+	// used ONLY to locate Relay's own container for HOT_RELOAD source-path
+	// mapping (see daemonSourcePath). It is deliberately separate from hostname:
+	// hostname is the worker's stable ownership identity (WORKER_ID) stamped on
+	// containers, while self-inspection must resolve the actual OCI hostname (the
+	// Docker-assigned container ID by default) to find this process's own
+	// container. It is resolved once at construction from os.Hostname; empty when
+	// unavailable, in which case self-inspection is skipped (it never falls back
+	// to hostname, which would risk inspecting a wrong container).
+	selfHostname string
 	// maxConcurrentInvocations is the worker-global concurrency cap (MAX_CONCURRENT_INVOCATIONS): the
 	// SAME value the runner uses for its global semaphore. It clips every
 	// app's effective per-app concurrency to
@@ -244,8 +254,8 @@ type Manager struct {
 	// zero value resolves on first use.
 	selfMounts containerMounts
 	// containerDetect overrides the container self-identification precondition
-	// used by daemonSourcePath. Nil uses the production default (the worker
-	// hostname is container-ID-like). Set only by tests.
+	// used by daemonSourcePath. Nil uses the production default (the resolved
+	// self-hostname is container-ID-like). Set only by tests.
 	containerDetect func() bool
 
 	// buildTempStore is the Manager's handle to Relay's private build-temp root
@@ -504,9 +514,11 @@ func withPing(ping pingFunc) ManagerOption {
 // (DOCKER_HOST / DOCKER_TLS_VERIFY / DOCKER_CERT_PATH) and negotiates the API
 // version automatically. registry is an optional observability registry; a nil registry
 // disables metric recording (every call is a no-op). hostname is this worker's
-// hostname-scoped container ownership identity (e.g. config.ConsumerName()); it
-// is stamped as the relay.hostname label on every execution container and gates
-// the startup orphan sweep.
+// stable container-ownership identity (config.WorkerID); it is stamped as the
+// relay.hostname label on every execution container and gates the startup orphan
+// sweep. Relay's own OCI hostname — used only to locate its container for
+// HOT_RELOAD source-path mapping — is resolved separately from os.Hostname (see
+// the Manager.selfHostname field).
 //
 // Options are variadic so the original three-argument call remains valid; the
 // worker passes WithWarmContainerIdleTimeout(cfg.WarmContainerIdleTimeout).
@@ -552,6 +564,7 @@ func NewManager(
 		cli:                      cli,
 		metrics:                  registry,
 		hostname:                 hostname,
+		selfHostname:             osHostname(),
 		maxConcurrentInvocations: resolved.maxConcurrentInvocations,
 		maxConcurrentBuilds:      resolved.maxConcurrentBuilds,
 		maxWarmContainers:        resolved.maxWarmContainers,

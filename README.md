@@ -1,6 +1,7 @@
 # Relay
 
-Relay is an event-driven runtime for declarative apps — with serverless functions, schedules, and persistent services. Run it on infrastructure you control.
+Relay is an event-driven runtime for declarative apps — with serverless functions,
+schedules, and persistent services. Run it on infrastructure you control.
 
 It executes short-lived functions in isolated runtimes, publishes scheduled
 occurrences to the same Redis Stream and consumer group as external events, and
@@ -12,7 +13,9 @@ and dead-letters exhausted invocations. Scheduled occurrences use a separate
 dispatch path that resolves the schedule's handler directly, without ordinary
 event classification or pattern matching.
 
-Persistent services use the same runtime, configuration, secrets, networking, resource controls, and container infrastructure without requiring them to participate in the event pipeline.
+Persistent services use the same runtime, configuration, secrets, networking,
+resource controls, and container infrastructure without requiring them to
+participate in the event pipeline.
 
 **An app is the unit of source, configuration, and deployment.** Within an
 app, event-driven **functions**, schedules, and optional persistent services
@@ -20,7 +23,8 @@ share one declarative model. A handler is the execution target for a one-shot
 function; an event pattern or schedule trigger determines when that function
 runs. Services are separate persistent workloads.
 
-Functions remain a first-class Relay workload. Start with a function. Add a service when you need one.
+Functions remain a first-class Relay workload. Start with a function.
+Add a service when you need one.
 
 Relay does not care where events originate:
 
@@ -28,7 +32,8 @@ Relay does not care where events originate:
 Producer → Redis Stream → Relay → App → Function (handler)
 ```
 
-Functions, schedules, and persistent services are declared within an app and share the same deployment model while keeping their execution semantics independent.
+Functions, schedules, and persistent services are declared within an app and share
+the same deployment model while keeping their execution semantics independent.
 
 ## What you get
 
@@ -197,11 +202,14 @@ Run it against your own Redis, PostgreSQL, and Docker Engine:
 REDIS_URI=localhost:6379 \
 REDIS_STREAM=events \
 REDIS_GROUP=relay \
+WORKER_ID=relay-1 \
 DATABASE_URL='postgres://relay:relay@localhost:5432/relay?sslmode=disable' \
 ./relay start
 ```
 
-Relay reads apps from the fixed `/apps` root. The `DATABASE_URL` database is a
+Relay reads apps from the fixed `/apps` root. `WORKER_ID` is the worker's
+required stable identity (Redis consumer name, `relay.hostname` label, and stats
+owner). The `DATABASE_URL` database is a
 required, shared state view (operator snapshot, per-worker stats, and the durable
 schedule outbox); see [docs/operations.md](docs/operations.md#state-database) and
 [docs/configuration.md](docs/configuration.md).

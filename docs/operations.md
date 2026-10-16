@@ -23,7 +23,7 @@ At startup Relay:
    warm-container maintenance loop is started;
 4. loads apps from `/apps` and computes each fingerprint once;
 5. runs a conservative orphan sweep (bounded to 30s) removing only stale
-   Relay containers owned by this worker hostname;
+   Relay containers owned by this worker identity (`WORKER_ID`);
 6. prepares each app's image and starts the reconciler, scheduler, and
    stream consumer.
 
@@ -99,12 +99,21 @@ write failures remain non-fatal to the event pipeline.
   `degraded` retains a usable previous image, `unavailable` has none. A failed
   reconcile never displaces a still-serving previous generation and never reports
   `ready`.
-- Stats are stored as latest absolute snapshots (no history), **keyed by worker
-  identity** (the resolved hostname). Two workers sharing one database keep
-  independent rows instead of overwriting each other; `relay stats` aggregates
-  across owners, a worker restores only its own rows, and `relay stats reset`
-  clears every owner's rows. A hard crash may lose up to ~5s of telemetry;
-  graceful shutdown flushes once. Prometheus is the time-series source.
+- Stats are stored as latest absolute snapshots (no history), **keyed by a stable
+  worker identity** (`WORKER_ID`, required — the same value as the Redis consumer
+  name and the `relay.hostname` label) plus a per-process `instance` fencing
+  token. Two workers sharing one database keep independent rows instead of
+  overwriting each other (each must set a distinct `WORKER_ID`; a second active
+  worker reusing an in-use `WORKER_ID` fails startup on the per-identity
+  PostgreSQL owner lock), same-host
+  workers never collide, a restarted worker resumes its own totals, and a stale
+  process incarnation cannot overwrite a
+  newer one. `relay stats` aggregates across owners, a worker restores only its
+  own row, and `relay stats reset` clears every owner's rows while advancing a
+  shared generation that fences delayed snapshots from every worker. A hard crash
+  may lose up to ~5s of telemetry; graceful shutdown flushes once. Prometheus is
+  the time-series source. Stale owner rows are compacted after `STATS_RETENTION`
+  (default 7d).
 - The scheduler's durable publication outbox (`schedule_pending`) lives here too;
   its per-row claims use `FOR UPDATE SKIP LOCKED` and a fencing token so
   concurrent retriers — in one process or several — never double-claim.

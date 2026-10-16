@@ -91,7 +91,7 @@ func TestDaemonSourcePathMapsSelfContainerBindMount(t *testing.T) {
 			fullID, hostname),
 		onMatch: func() { inspected++ },
 	})
-	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: hostname}
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), selfHostname: hostname}
 
 	if got := m.daemonSourcePath(context.Background(), "/apps/myapp"); got != "/host/apps/myapp" {
 		t.Fatalf("daemonSourcePath = %q, want /host/apps/myapp", got)
@@ -115,7 +115,7 @@ func TestDaemonSourcePathRejectsForeignContainer(t *testing.T) {
 			`{"Id":%q,"Config":{"Hostname":"some-other-container"},"Mounts":[{"Type":"bind","Source":"/host/apps","Destination":"/apps"}]}`,
 			hostname+strings.Repeat("f", 52)),
 	})
-	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: hostname}
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), selfHostname: hostname}
 	if got := m.daemonSourcePath(context.Background(), "/apps/myapp"); got != "/apps/myapp" {
 		t.Fatalf("a foreign container must not map; got %q", got)
 	}
@@ -131,7 +131,7 @@ func TestDaemonSourcePathIgnoresNonBindMounts(t *testing.T) {
 			`{"Id":%q,"Config":{"Hostname":%q},"Mounts":[{"Type":"volume","Source":"/var/lib/docker/volumes/v/_data","Destination":"/apps"}]}`,
 			hostname+strings.Repeat("f", 52), hostname),
 	})
-	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: hostname}
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), selfHostname: hostname}
 	if got := m.daemonSourcePath(context.Background(), "/apps/myapp"); got != "/apps/myapp" {
 		t.Fatalf("a volume mount must not map; got %q", got)
 	}
@@ -142,9 +142,36 @@ func TestDaemonSourcePathIgnoresNonBindMounts(t *testing.T) {
 // daemon has no routes, so any inspect would fail the test through the harness.
 func TestDaemonSourcePathNonContainerNoInspect(t *testing.T) {
 	cli := newScriptedDockerClient(t)
-	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "my-laptop"}
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), selfHostname: "my-laptop"}
 	if got := m.daemonSourcePath(context.Background(), "/apps/myapp"); got != "/apps/myapp" {
 		t.Fatalf("non-container hostname must keep appDir; got %q", got)
+	}
+}
+
+// TestDaemonSourcePathEmptySelfHostnameNoInspect pins that an empty
+// selfHostname skips self-inspection even when the worker ownership identity
+// (hostname/WORKER_ID) is itself ID-like and resolvable on the daemon. The
+// inspect route is scripted and counted, so a regression that fell back to the
+// ownership identity would both issue a request and remap the path; the empty
+// self hostname must do neither.
+func TestDaemonSourcePathEmptySelfHostnameNoInspect(t *testing.T) {
+	const hostname = "abcdef012345"
+	inspected := 0
+	cli := newScriptedDockerClient(t, dockerRoute{
+		method: http.MethodGet, path: "/containers/" + hostname + "/json",
+		body: fmt.Sprintf(
+			`{"Id":%q,"Config":{"Hostname":%q},"Mounts":[{"Type":"bind","Source":"/host/apps","Destination":"/apps"}]}`,
+			hostname+strings.Repeat("f", 52), hostname),
+		onMatch: func() { inspected++ },
+	})
+	// hostname is the worker's stable ownership identity; selfHostname is left
+	// empty, as when os.Hostname cannot be resolved.
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: hostname}
+	if got := m.daemonSourcePath(context.Background(), "/apps/myapp"); got != "/apps/myapp" {
+		t.Fatalf("empty selfHostname must keep appDir; got %q", got)
+	}
+	if inspected != 0 {
+		t.Fatalf("inspect calls = %d, want 0 (an empty selfHostname must not inspect the ownership identity)", inspected)
 	}
 }
 
@@ -159,7 +186,7 @@ func TestDaemonSourcePathInspectErrorNotCached(t *testing.T) {
 		status: http.StatusInternalServerError, body: `{"message":"daemon blip"}`,
 		onMatch: func() { attempts++ },
 	})
-	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: hostname}
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), selfHostname: hostname}
 	for i := 0; i < 2; i++ {
 		if got := m.daemonSourcePath(context.Background(), "/apps/x"); got != "/apps/x" {
 			t.Fatalf("attempt %d: got %q, want the appDir fallback", i, got)
@@ -255,7 +282,7 @@ func TestPrepareRecordsDaemonVisibleSourcePath(t *testing.T) {
 	)
 	m := newLifecycleManager(t, cli, context.Background())
 	m.sourceMount = true
-	m.hostname = hostname
+	m.selfHostname = hostname
 
 	if _, err := m.Prepare(context.Background(), fn); err != nil {
 		t.Fatalf("prepare: %v", err)

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
+	"os"
 	"path"
 	"strings"
 	"sync"
@@ -184,18 +185,32 @@ func (m *Manager) daemonSourcePath(ctx context.Context, appDir string) string {
 	return mapToDaemonPath(appDir, mounts)
 }
 
-// daemonMounts inspects Relay's own container (identified by the worker
-// hostname) and returns its mounts, or nil when Relay is not a container, is not
-// reliably identifiable, or the daemon cannot be consulted. It is conservative:
-// any uncertainty yields nil so the caller keeps fn.Dir. A successful resolution
-// is cached; a failure is not.
+// daemonMounts inspects Relay's own container (identified solely by the
+// process's OCI hostname) and returns its mounts, or nil when Relay is not a
+// container, is not reliably identifiable, or the daemon cannot be consulted. It
+// is conservative: any uncertainty yields nil so the caller keeps fn.Dir. A
+// successful resolution is cached; a failure is not.
+//
+// It deliberately does NOT fall back to hostname: hostname is the worker's
+// stable ownership identity (WORKER_ID), not an OCI hostname, and inspecting a
+// Docker object by an unrelated identity could inspect the WRONG container. An
+// empty selfHostname therefore simply skips self-inspection (the mapping is
+// unavailable), never a cross-identity inspect.
 func (m *Manager) daemonMounts(ctx context.Context) []container.MountPoint {
-	if m == nil || m.cli == nil || m.hostname == "" {
+	if m == nil || m.cli == nil {
+		return nil
+	}
+	// Locate Relay's own container by its OCI hostname (the Docker-assigned
+	// container ID by default), which is distinct from the worker ownership
+	// identity stamped in hostname. No self hostname means self-inspection is
+	// unavailable.
+	self := m.selfHostname
+	if self == "" {
 		return nil
 	}
 	detect := m.containerDetect
 	if detect == nil {
-		detect = func() bool { return isContainerIDLike(m.hostname) }
+		detect = func() bool { return isContainerIDLike(self) }
 	}
 	if !detect() {
 		return nil
@@ -205,7 +220,7 @@ func (m *Manager) daemonMounts(ctx context.Context) []container.MountPoint {
 	if m.selfMounts.resolved {
 		return m.selfMounts.mounts
 	}
-	insp, err := m.cli.ContainerInspect(ctx, m.hostname, client.ContainerInspectOptions{})
+	insp, err := m.cli.ContainerInspect(ctx, self, client.ContainerInspectOptions{})
 	if err != nil {
 		// Not a resolvable self container (e.g. the hostname is not a container
 		// ID/name) or a transient daemon failure. Fall back WITHOUT caching so a
@@ -214,7 +229,7 @@ func (m *Manager) daemonMounts(ctx context.Context) []container.MountPoint {
 			"error", err)
 		return nil
 	}
-	if !isSelfContainer(insp.Container, m.hostname) {
+	if !isSelfContainer(insp.Container, self) {
 		m.Logger().Debug("Runtime: inspected container does not match this Relay; using the app dir as the bind source")
 		return nil
 	}
@@ -227,12 +242,27 @@ func (m *Manager) daemonMounts(ctx context.Context) []container.MountPoint {
 	return m.selfMounts.mounts
 }
 
+// osHostname resolves this process's OCI hostname (os.Hostname) for HOT_RELOAD
+// self-container inspection. It is best-effort: a resolution failure yields "" so
+// self-inspection is skipped and the source-path mapping is simply unavailable
+// (never a startup failure, and never a fallback to the unrelated worker
+// ownership identity). It is isolated here so the Manager's construction can
+// populate selfHostname and direct-construction tests can set the field.
+func osHostname() string {
+	host, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return host
+}
+
 // isContainerIDLike reports whether s is the default Docker container hostname:
 // the short (12-character) or full hex container ID Docker assigns when no
-// explicit `hostname:` is configured. It is the reliable signal that Relay's OS
-// hostname (config.ConsumerName) is its own container ID, so inspecting by it
-// identifies THIS container. A normal hostname, or a custom `hostname:`, is not
-// ID-like and leaves the mapping off (falling back to fn.Dir).
+// explicit `hostname:` is configured. It is the reliable signal that Relay's OCI
+// hostname (the process's os.Hostname, resolved into Manager.selfHostname) is
+// its own container ID, so inspecting by it identifies THIS container. A normal
+// hostname, or a custom `hostname:`, is not ID-like and leaves the mapping off
+// (falling back to fn.Dir).
 func isContainerIDLike(s string) bool {
 	if len(s) < 12 || len(s) > 64 {
 		return false
@@ -246,12 +276,12 @@ func isContainerIDLike(s string) bool {
 }
 
 // isSelfContainer reports whether an inspected container is the Relay container
-// this process runs in. Relay's identity is its hostname (config.ConsumerName,
-// i.e. os.Hostname): the inspected container must declare that same hostname,
-// and — because Docker resolves a name or ID prefix — when the hostname is the
-// default container-ID form it must also prefix the inspected container's full
-// ID. Together these reject an unrelated container that merely happens to be
-// resolvable by the hostname string.
+// this process runs in. Relay's identity for this check is its OCI hostname (the
+// process's os.Hostname): the inspected container must declare that same
+// hostname, and — because Docker resolves a name or ID prefix — when the
+// hostname is the default container-ID form it must also prefix the inspected
+// container's full ID. Together these reject an unrelated container that merely
+// happens to be resolvable by the hostname string.
 func isSelfContainer(c container.InspectResponse, hostname string) bool {
 	if hostname == "" || c.Config == nil || c.Config.Hostname != hostname {
 		return false

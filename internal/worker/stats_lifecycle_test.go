@@ -125,7 +125,7 @@ func TestMetricsEnabledExposesSingleAccountingRegistry(t *testing.T) {
 	}
 
 	// The persisted snapshot reads the same registry value: one event, not two.
-	recordSnapshots(context.Background(), st, reg, nil)
+	newStatsFlusher(st, reg).flush(context.Background())
 	gs, ok := st.Stats()
 	if !ok || gs.EventsMatchedTotal != 1 {
 		t.Fatalf("persisted events = %+v, ok=%v; want exactly 1 (single accounting path)", gs, ok)

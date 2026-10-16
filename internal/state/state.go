@@ -42,6 +42,24 @@ func appLockKey(name string) int32 {
 	return int32(h.Sum32())
 }
 
+// workerLockNamespace tags the per-owner session advisory-lock key so it can
+// never alias the schema-init lock (schemaLockKey, whose high byte is 0) or any
+// other advisory lock Relay takes. The per-owner locks use the single-bigint
+// advisory form, which PostgreSQL keeps in a lock space of its own (distinct
+// from the two-int per-app locks, see appLockNamespace), so only the schema lock
+// needs the explicit tag.
+const workerLockNamespace int64 = 0x52 << 56 // 'R' for Relay owner
+
+// workerLockKey maps a stable worker identity to its session advisory-lock key.
+// A 56-bit FNV-1a hash makes an accidental collision between two DIFFERENT
+// owners — which would wrongly block the second Open — astronomically unlikely,
+// while the namespace tag keeps the key clear of the schema-init lock.
+func workerLockKey(owner string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(owner))
+	return workerLockNamespace | int64(h.Sum64()&0x00FFFFFFFFFFFFFF)
+}
+
 // lockAppTx takes the transaction-scoped per-app advisory lock for name, so
 // every read-modify-write of one app's snapshot serializes against the other
 // writers of the SAME app — across goroutines, pooled connections, and Relay
@@ -223,13 +241,26 @@ type Service struct {
 type State struct {
 	db  *sql.DB
 	log *slog.Logger
-	// owner is this process's stable worker identity for the per-worker stats
-	// snapshots (the worker passes its ConsumerName/hostname). Stats rows are
-	// keyed by (worker, ...) so two workers sharing one database never
-	// overwrite each other's counters; reads used by the CLI aggregate across
-	// every owner while the worker's startup restore reads only its own rows.
-	// It is empty for standalone CLI/admin handles, which never write stats.
+	// owner is this process's STABLE logical worker identity for the per-worker
+	// stats snapshots (the worker passes config.WorkerID). Stats rows are keyed
+	// by worker so two workers sharing one database never overwrite each other's
+	// counters; CLI reads aggregate across every owner while the worker's
+	// startup restore reads only its own row. It is empty for standalone
+	// CLI/admin handles, which never own stats rows.
 	owner string
+	// instance is this process incarnation's ALWAYS-FRESH fencing token
+	// (config.InstanceID). It is stored in the stats row and every flush is
+	// conditioned on it, so a stale process for the same owner cannot overwrite
+	// a newer incarnation's snapshots. It is set only when owner is set (see
+	// Open), and empty for CLI/admin handles.
+	instance string
+	// ownerConn is the dedicated connection that holds this handle's session
+	// advisory lock on the worker identity (see acquireWorkerLock). It is nil for
+	// an ownerless CLI/admin handle (which never takes the lock). The connection
+	// is pinned for the handle's whole lifetime so the lock is never silently
+	// returned to the pool mid-run; Close releases it, and PostgreSQL releases it
+	// if the process dies first.
+	ownerConn *sql.Conn
 	// nowFn is an injectable clock used to stamp updated_at/reconcile
 	// timestamps and the schedule_pending retention deadline. Production leaves
 	// it nil and falls back to time.Now, preserving behavior exactly; tests
@@ -253,12 +284,19 @@ type State struct {
 }
 
 // Options configures Open. DSN is the PostgreSQL connection string (the
-// DATABASE_URL value); Owner is the stable worker identity used to scope stats
-// rows (empty for CLI/admin handles, which never write stats). The pool fields
-// are optional and fall back to the package defaults when zero.
+// DATABASE_URL value); Owner is the stable logical worker identity used to scope
+// stats rows and Instance is this process incarnation's fencing token. Owner and
+// Instance are a PAIR: both set for a worker handle (which owns stats rows) or
+// both empty for a CLI/admin handle (which never does); setting exactly one is a
+// configuration error. The pool fields are optional and fall back to the package
+// defaults when zero.
 type Options struct {
 	DSN   string
 	Owner string
+	// Instance is the always-fresh per-process incarnation token paired with
+	// Owner. It fences stale incarnations of the same owner out of the stats
+	// row (see RecordStatsSnapshot).
+	Instance string
 	// Logger, when non-nil, is the logger Open installs. Otherwise the package
 	// fallback logger is used until SetLogger overrides it.
 	Logger *slog.Logger
@@ -284,15 +322,30 @@ var fallbackLogger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOption
 // clear, actionable error rather than a degraded handle. Schema initialization is
 // serialized by a transaction-scoped advisory lock so concurrent openers cannot
 // race the DDL.
+//
+// A handle with an Owner (a worker) additionally takes an EXCLUSIVE session
+// advisory lock on that stable worker identity, held for the handle's lifetime
+// and released by Close (or by PostgreSQL when the process/connection dies). A
+// second concurrent Open presenting the same WORKER_ID — on this host or any
+// other sharing the database — FAILS with a clear error naming the identity,
+// instead of silently sharing the identity and fighting over one stats row.
+// Ownerless CLI/admin handles never take the lock and are never blocked by a
+// running worker.
 func Open(ctx context.Context, opts Options) (*State, error) {
 	if opts.DSN == "" {
 		return nil, fmt.Errorf("open state: no DATABASE_URL configured")
+	}
+	// Owner and Instance are a pair: a handle either owns stats rows (both set)
+	// or does not (both empty). A half-configured identity would make stats
+	// ownership ambiguous, so it is rejected before touching the database.
+	if (opts.Owner == "") != (opts.Instance == "") {
+		return nil, fmt.Errorf("open state: Owner and Instance must be set together")
 	}
 	db, err := sql.Open("pgx", opts.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("open state: %w", err)
 	}
-	st := &State{db: db, log: fallbackLogger, owner: opts.Owner}
+	st := &State{db: db, log: fallbackLogger, owner: opts.Owner, instance: opts.Instance}
 	if opts.Logger != nil {
 		st.log = opts.Logger
 	}
@@ -315,6 +368,29 @@ func Open(ctx context.Context, opts Options) (*State, error) {
 	}
 
 	if err := st.initSchema(pingCtx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	// Take the per-owner EXCLUSIVE session lock (held for the handle's lifetime)
+	// BEFORE claiming the stats row: a second concurrent process presenting the
+	// same WORKER_ID — on this host or any other sharing the database — fails
+	// Open here, without re-stamping the live owner's stats row and thus fencing
+	// it. The lock is released by Close, or by PostgreSQL when the pinned
+	// connection dies.
+	ownerConn, err := st.acquireWorkerLock(pingCtx)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	st.ownerConn = ownerConn
+	// Claim ownership of this worker's stats row AFTER the schema exists and the
+	// worker lock is held, so a fresh owner gets a row and a restart re-stamps its
+	// (possibly next) incarnation without disturbing the prior totals (see
+	// claimStatsOwnership).
+	if err := st.claimStatsOwnership(pingCtx, ownerConn); err != nil {
+		if ownerConn != nil {
+			_ = ownerConn.Close()
+		}
 		_ = db.Close()
 		return nil, err
 	}
@@ -378,8 +454,59 @@ func (st *State) notifyStatus(name, status string) {
 	}
 }
 
-// Close releases the underlying connection pool. It is non-fatal on error.
-func (st *State) Close() error { return st.db.Close() }
+// Close releases the worker lock (if this handle holds one) and the underlying
+// connection pool. Closing the pinned lock connection releases its session
+// advisory lock, so a restart on the same WORKER_ID can reopen immediately;
+// PostgreSQL also releases the lock if the process dies without a clean Close.
+// It is non-fatal on error and safe on a nil receiver.
+func (st *State) Close() error {
+	if st == nil {
+		return nil
+	}
+	if st.ownerConn != nil {
+		_ = st.ownerConn.Close()
+		st.ownerConn = nil
+	}
+	return st.db.Close()
+}
+
+// acquireWorkerLock takes the EXCLUSIVE session advisory lock for this handle's
+// worker identity on a dedicated connection, pinned for the State handle's
+// lifetime (see Close). One pool connection is therefore reserved for the whole
+// run (the pool defaults leave ample headroom); the alternative — taking the
+// session lock on a pooled connection — would return the lock to the pool with
+// the connection and leak it. It returns (nil, nil) for an ownerless CLI/admin
+// handle, which must never be blocked by a running worker. A second process
+// presenting the same owner — on this host or any other sharing the database —
+// gets a clear error naming the identity, so two instances can never silently
+// share a WORKER_ID. The lock is non-blocking (pg_try_advisory_lock): a conflict
+// fails fast rather than hanging startup, and PostgreSQL releases a session
+// advisory lock automatically when its connection closes, so a crashed worker
+// never leaves a stale lock behind.
+func (st *State) acquireWorkerLock(ctx context.Context) (*sql.Conn, error) {
+	if st.owner == "" {
+		return nil, nil
+	}
+	conn, err := st.db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire worker lock: %w", err)
+	}
+	var locked bool
+	if err := conn.QueryRowContext(ctx,
+		`SELECT pg_try_advisory_lock($1)`, workerLockKey(st.owner)).Scan(&locked); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("acquire worker lock: %w", err)
+	}
+	if !locked {
+		// Release the borrowed connection before failing: the lock was not taken,
+		// so nothing would hold it, but the pool slot must not leak.
+		_ = conn.Close()
+		return nil, fmt.Errorf(
+			"open state: worker identity %q is already in use by another running instance; each concurrent worker must set a distinct WORKER_ID",
+			st.owner)
+	}
+	return conn, nil
+}
 
 // initSchema creates the current tables if they do not already exist, so a
 // fresh database is initialized with the current schema. It runs inside a
@@ -395,9 +522,10 @@ func (st *State) Close() error { return st.db.Close() }
 // deliberately no per-handler/per-schedule/per-service child tables: the nested
 // configuration is part of the snapshot, so a template change replaces one row
 // atomically. stats is the per-worker global counter snapshot (keyed by worker
-// identity so shared-database workers never overwrite each other), app_stats the
-// per-app counterpart (keyed by app name + worker), and schedule_pending the
-// durable schedule-publication outbox.
+// identity so shared-database workers never overwrite each other, with an
+// instance fencing column), app_stats the per-app counterpart (keyed by app name
+// + worker), stats_meta the single-row global reset generation, and
+// schedule_pending the durable schedule-publication outbox.
 func (st *State) initSchema(ctx context.Context) error {
 	tx, err := st.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -418,16 +546,34 @@ func (st *State) initSchema(ctx context.Context) error {
 		// stats holds each worker's "current operational snapshot". The row key
 		// is the OWNER worker identity, so N workers sharing this database keep N
 		// independent counter sets instead of last-writer-wins overwriting one
-		// another. Only stable relational metadata is a column — the worker key
-		// and the write timestamp updated_at — while the evolving counter/gauge
-		// payload is the JSONB object in data (see Stats and stats_json.go).
-		// JSONB, not a column per field: the payload grows as instrumentation is
-		// added without changing the schema, and absent fields decode to zero.
+		// another. instance is the current owning PROCESS incarnation (a fencing
+		// value): only the process whose instance matches the stored one may
+		// update the row, so a stale incarnation cannot overwrite a newer one.
+		// Only stable relational metadata is a column — the worker key, the
+		// incarnation, and the write timestamp updated_at — while the evolving
+		// counter/gauge payload is the JSONB object in data (see Stats and
+		// stats_json.go). JSONB, not a column per field: the payload grows as
+		// instrumentation is added without changing the schema, and absent fields
+		// decode to zero.
 		`CREATE TABLE IF NOT EXISTS stats (
 			worker TEXT PRIMARY KEY,
+			instance TEXT NOT NULL DEFAULT '',
 			data JSONB NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
+		// stats_meta is the single-row GLOBAL stats epoch (id is pinned to
+		// 'global'). generation is bumped by every `stats reset`; a flush reads
+		// it under a shared lock and rebases when it observes a bump, so a
+		// delayed pre-reset snapshot from ANY worker is fenced out — not only the
+		// socket-owning worker's. It carries no statistics; it is coordination
+		// state.
+		`CREATE TABLE IF NOT EXISTS stats_meta (
+			id TEXT PRIMARY KEY CHECK (id = 'global'),
+			generation BIGINT NOT NULL DEFAULT 0,
+			updated_at TEXT NOT NULL
+		)`,
+		`INSERT INTO stats_meta (id, generation, updated_at) VALUES ('global', 0, '')
+		 ON CONFLICT (id) DO NOTHING`,
 		// app_stats holds the per-app operational snapshot, keyed by
 		// (app_name, worker). It mirrors the global stats table but attributes
 		// each payload to a single app AND a single owning worker, so two workers
@@ -495,9 +641,55 @@ func (st *State) initSchema(ctx context.Context) error {
 	return nil
 }
 
-// Owner returns this handle's stats-owner identity (the worker ConsumerName in
-// production, empty for CLI/admin handles). It is exposed so the worker can log
-// the identity its persisted stats are scoped to.
+// execQuerier is the minimal execution surface claimStatsOwnership needs. It is
+// satisfied by both *sql.DB (ownerless/direct callers) and the pinned *sql.Conn
+// the worker lock holds, so the claim runs on the worker-lock connection when one
+// is held (see Open) without needing a second pool slot.
+type execQuerier interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// claimStatsOwnership records this handle's process incarnation as the current
+// owner of its stats row. It is a no-op for a handle with no owner (CLI/admin).
+//
+// The claim is an unconditional INSERT ... ON CONFLICT DO UPDATE of ONLY the
+// instance column. A fresh owner gets a zero row whose updated_at is ” — the
+// oldest possible value — so it can never win the freshest-owner backlog gauge
+// before its first real flush. An EXISTING row keeps its data and updated_at
+// untouched, so a restart's startup restore (OwnerStats) still reads the prior
+// cumulative totals before the first flush writes the resumed values back.
+//
+// Taking over unconditionally is what lets a newer incarnation fence out a stale
+// one: once this claim re-stamps the instance, the stale process's next flush
+// compares the stored instance and stops writing (see RecordStatsSnapshot). Two
+// workers deliberately configured with the SAME WorkerID can no longer coexist:
+// Open's per-owner exclusive lock refuses the second one before this claim runs,
+// so the takeover only happens on a restart after the prior handle closed (see
+// acquireWorkerLock). The instance fence remains as defense in depth for the
+// case where a handle's lock connection was lost while it kept running.
+func (st *State) claimStatsOwnership(ctx context.Context, q execQuerier) error {
+	if st.owner == "" {
+		return nil
+	}
+	payload, err := marshalStats(Stats{})
+	if err != nil {
+		return fmt.Errorf("claim stats ownership: %w", err)
+	}
+	// Run on the pinned worker-lock connection when one is held (see Open): the
+	// claim must be ordered AFTER the lock is taken, and reusing that connection
+	// needs no second pool slot.
+	if _, err := q.ExecContext(ctx,
+		`INSERT INTO stats (worker, instance, data, updated_at) VALUES ($1, $2, $3, '')
+		 ON CONFLICT(worker) DO UPDATE SET instance = excluded.instance`,
+		st.owner, st.instance, payload); err != nil {
+		return fmt.Errorf("claim stats ownership: %w", err)
+	}
+	return nil
+}
+
+// Owner returns this handle's stable stats-owner identity (the worker
+// config.WorkerID in production, empty for CLI/admin handles). It is exposed so
+// the worker can log the identity its persisted stats are scoped to.
 func (st *State) Owner() string { return st.owner }
 
 // nowString returns the current time as an RFC3339 UTC string, using the

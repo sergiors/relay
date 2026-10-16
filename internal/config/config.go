@@ -1,7 +1,8 @@
 package config
 
 import (
-	"errors"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -14,15 +15,16 @@ import (
 
 // Config holds the application settings Relay's runtime (see internal/worker)
 // and its supporting commands derive from the environment. Every field maps to
-// a single environment variable; there are no computed or invented settings.
-// Load() is the only constructor — application code should consume a Config
-// value instead of reading environment variables directly.
+// a single environment variable, except the always-generated per-process
+// InstanceID (see below). Load() is the only constructor — application code
+// should consume a Config value instead of reading environment variables
+// directly.
 //
 // The required fields name the Redis stream, group, and address the worker
-// consumes, plus the PostgreSQL state DSN (DATABASE_URL);
-// ConsumerName is the resolved hostname identity (see consumerNameFromHost);
-// and the address values (MetricsAddr, GitWebhookAddr) are empty when disabled,
-// so gating on non-empty keeps them opt-in.
+// consumes, the PostgreSQL state DSN (DATABASE_URL), and the worker's stable
+// identity (WORKER_ID, surfaced as WorkerID); the address values (MetricsAddr,
+// GitWebhookAddr) are empty when disabled, so gating on non-empty keeps them
+// opt-in.
 type Config struct {
 	RedisURI    string
 	RedisStream string
@@ -33,8 +35,24 @@ type Config struct {
 	// PostgreSQL, so the worker refuses to start without it. The value carries
 	// credentials and is never logged. It is consumed by internal/state as the
 	// sole connection identity.
-	DatabaseURL  string
-	ConsumerName string
+	DatabaseURL string
+	// WorkerID is the worker's REQUIRED, STABLE identity, resolved verbatim
+	// from WORKER_ID (trimmed) by ParseWorkerID. It is the SAME identity used as
+	// the Redis consumer name, the relay.hostname container-ownership label, and
+	// the stats-owner key, so a restart reuses one identity across all three and
+	// two workers sharing a group, database, or daemon never alias. There is no
+	// default or hostname fallback: a missing or malformed WORKER_ID fails
+	// startup. The value is a bounded token (maxWorkerIDLen; ASCII letters,
+	// digits, '.', '_', '-') because it becomes a stats row key, a Redis
+	// consumer name, and a container label.
+	WorkerID string
+	// InstanceID is the ALWAYS-FRESH process identity for this run
+	// ("instance-<hex>"). It is regenerated on every Load (never configurable)
+	// and stored alongside the owner in the stats row as a fencing value: a
+	// stale process incarnation for the same WorkerID cannot overwrite a newer
+	// one's snapshots. It is internal coordination state, not operator
+	// configuration.
+	InstanceID string
 	// StreamRetention is the source-stream retention window
 	// (REDIS_STREAM_RETENTION). Unset defaults to DefaultStreamRetention
 	// (24h); an explicitly empty, zero, or negative value disables main-stream
@@ -64,7 +82,18 @@ type Config struct {
 	// terminal/stale-transition guards are unchanged — only the expiry is
 	// omitted.
 	InvocationRetention time.Duration
-	MetricsAddr         string
+	// StatsRetention is the STALE-OWNER retention window for the per-worker
+	// statistics rows (STATS_RETENTION). Unset defaults to
+	// DefaultStatsRetention (7 days); an explicitly empty, zero, or negative
+	// value DISABLES stale-owner compaction (0), and a malformed value logs and
+	// disables it. It bounds the rows of DEAD workers: a stats/app_stats row
+	// whose owner is not this worker and whose updated_at is older than the
+	// window is periodically deleted. It is deliberately independent of the
+	// Redis retentions: those trim streams, this compacts operator state. A live
+	// worker's own row is never pruned (the owner is excluded), so disabling it
+	// only risks unbounded growth from many short-lived random WorkerIDs.
+	StatsRetention time.Duration
+	MetricsAddr    string
 	// GitWebhookAddr is the address for the GitHub webhook server
 	// (POST /github) that triggers an automatic git sync on matching pushes.
 	// Like MetricsAddr it is opt-in via the GIT_WEBHOOK_ADDR environment
@@ -236,6 +265,25 @@ const (
 	// Forty-eight hours is the historical terminal-bookkeeping window after
 	// this change (it replaced a hard-coded 7 days).
 	DefaultInvocationRetention = 48 * time.Hour
+	// DefaultStatsRetention is the stale-owner retention window applied when
+	// STATS_RETENTION is UNSET; an explicitly empty value disables compaction.
+	// Seven days matches the DLQ and schedule-outbox windows: a dead worker's
+	// stats row is retained long enough to cover a restart or a short outage,
+	// then compacted so an unbounded stream of short-lived random WorkerIDs
+	// cannot grow the tables forever. A live worker's row is never pruned.
+	DefaultStatsRetention = 7 * 24 * time.Hour
+)
+
+// Worker identity constants. WORKER_ID is REQUIRED and used verbatim (see
+// ParseWorkerID); the only generated identity is the per-process InstanceID, so
+// its form is prefixed to tell it apart from an operator-supplied value, and the
+// random suffix is 8 bytes of crypto/rand rendered as hex (collision-free for
+// any realistic deployment). maxWorkerIDLen bounds WORKER_ID so it can never be
+// used to smuggle unbounded data into a stats row key, a Redis consumer name, or
+// a container label.
+const (
+	instanceIDPrefix = "instance-"
+	maxWorkerIDLen   = 128
 )
 
 // State-database pool defaults. Relay's state workload is low-frequency and
@@ -268,21 +316,27 @@ const (
 //
 // Every failure path RETURNS a clear, variable-naming error rather than logging
 // and exiting, so Load never writes to a process boundary and never calls
-// os.Exit: a missing required REDIS_* variable, an unresolvable hostname, an
+// os.Exit: a missing required variable, an invalid WORKER_ID, an
 // invalid LOG_LEVEL, or an invalid positive integer/duration tuning knob is
 // returned for the caller (the CLI command or worker startup) to propagate. The
 // process boundary — printing the error exactly once and choosing the exit code
 // — stays in cmd/main.go.
 //
-// The required REDIS_* variables must be non-empty or Load returns an error (see
-// requiredEnv); the consumer name is hostname-resolved via consumerNameFromHost.
-// The optional variables are read with os.Getenv and stay zero/empty when
+// The required variables — the three REDIS_* values, DATABASE_URL, and WORKER_ID
+// — must be non-empty or Load returns an error (see requiredEnv); WORKER_ID is
+// additionally validated by ParseWorkerID. WorkerID is the worker's single
+// stable identity (the Redis consumer name, the relay.hostname
+// container-ownership label, and the stats owner); there is NO hostname or
+// generated fallback. InstanceID is always a fresh random "instance-<hex>" token
+// unique to this process. The optional variables are read with os.Getenv and
+// stay zero/empty when
 // unset: the metrics and git-webhook addresses (METRICS_ADDR, GIT_WEBHOOK_ADDR)
 // stay "" (no HTTP server), preserving their opt-in semantics through the
-// caller's non-empty guards. The three retention windows are the exception to
+// caller's non-empty guards. The retention windows are the exception to
 // the "zero when unset" rule: REDIS_STREAM_RETENTION defaults to
 // DefaultStreamRetention (24h), REDIS_DLQ_RETENTION to DefaultDLQRetention (7
-// days), and REDIS_INVOCATION_RETENTION to DefaultInvocationRetention (48h) when
+// days), REDIS_INVOCATION_RETENTION to DefaultInvocationRetention (48h), and
+// STATS_RETENTION to DefaultStatsRetention (7 days) when
 // UNSET, while an explicitly empty value disables the respective retention (0).
 // MAX_CONCURRENT_INVOCATIONS and MAX_CONCURRENT_BUILDS default to 8 and 2, and
 // MAX_BUFFERED_EVENTS to 16 (see ParsePositiveInt); MAX_EVENT_BYTES
@@ -322,11 +376,28 @@ func Load(logger *slog.Logger) (Config, error) {
 	}
 	cfg.DatabaseURL = databaseURL
 
-	consumer, err := consumerNameFromHost()
+	// WORKER_ID is REQUIRED: it is the worker's single stable identity — the
+	// Redis consumer name, the relay.hostname container-ownership label, and the
+	// per-worker stats owner. A missing value is a startup error naming the
+	// variable; a malformed one is rejected by ParseWorkerID. There is no
+	// hostname or generated fallback.
+	workerID, err := requiredEnv("WORKER_ID")
 	if err != nil {
 		return Config{}, err
 	}
-	cfg.ConsumerName = consumer
+	workerID, err = loadWorkerID(workerID)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.WorkerID = workerID
+
+	// InstanceID is ALWAYS fresh so a stale process incarnation of the same
+	// WorkerID can never overwrite a newer one's stats snapshots.
+	instanceID, err := newIdentityToken(instanceIDPrefix)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.InstanceID = instanceID
 
 	// Retention windows degrade rather than fail startup: a bad value logs and
 	// disables the respective retention. The unset-vs-empty distinction is
@@ -335,6 +406,7 @@ func Load(logger *slog.Logger) (Config, error) {
 	cfg.StreamRetention = retentionEnv(logger, "REDIS_STREAM_RETENTION", DefaultStreamRetention)
 	cfg.DLQRetention = retentionEnv(logger, "REDIS_DLQ_RETENTION", DefaultDLQRetention)
 	cfg.InvocationRetention = retentionEnv(logger, "REDIS_INVOCATION_RETENTION", DefaultInvocationRetention)
+	cfg.StatsRetention = retentionEnv(logger, "STATS_RETENTION", DefaultStatsRetention)
 	cfg.MetricsAddr = getEnv("METRICS_ADDR", "")
 	cfg.GitWebhookAddr = getEnv("GIT_WEBHOOK_ADDR", "")
 
@@ -621,6 +693,61 @@ func loadOptionalPositiveInt(name, value string) (*int, error) {
 	return ParseOptionalPositiveInt(name, value)
 }
 
+// ParseWorkerID validates a WORKER_ID value into the stable worker identity.
+// WORKER_ID is REQUIRED: callers resolve it with requiredEnv before validating,
+// so an empty (or whitespace-only) value is an error rather than a generated
+// fallback. The value is trimmed, must be at most maxWorkerIDLen bytes, and may
+// contain only ASCII letters, digits, '.', '_' and '-'. Any other value is an
+// error naming WORKER_ID (never silently coerced), so a missing or typo'd value
+// fails startup rather than producing an unexpected consumer name or stats owner.
+func ParseWorkerID(value string) (string, error) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return "", fmt.Errorf("invalid WORKER_ID %q: must not be empty", value)
+	}
+	if len(v) > maxWorkerIDLen {
+		return "", fmt.Errorf("invalid WORKER_ID %q: must be at most %d characters", value, maxWorkerIDLen)
+	}
+	for _, r := range v {
+		if !isWorkerIDChar(r) {
+			return "", fmt.Errorf("invalid WORKER_ID %q: only letters, digits, '.', '_' and '-' are allowed", value)
+		}
+	}
+	return v, nil
+}
+
+// isWorkerIDChar reports whether r is a permitted WORKER_ID character. The set
+// is deliberately conservative (ASCII letters, digits, '.', '_', '-'): the value
+// becomes a stats row key and appears in logs, so whitespace-bearing, ambiguous,
+// or non-ASCII values are rejected.
+func isWorkerIDChar(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return true
+	case r == '.', r == '_', r == '-':
+		return true
+	default:
+		return false
+	}
+}
+
+// loadWorkerID wraps ParseWorkerID with Load's returned-error style.
+func loadWorkerID(value string) (string, error) {
+	return ParseWorkerID(value)
+}
+
+// newIdentityToken returns prefix followed by 8 bytes of crypto/rand rendered as
+// lowercase hex (e.g. "instance-1f3a..."). A rand failure is returned rather than
+// falling back to a predictable value: an identity that silently repeats could
+// alias another process's stats row.
+func newIdentityToken(prefix string) (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("generate %s identity: %w", strings.TrimSuffix(prefix, "-"), err)
+	}
+	return prefix + hex.EncodeToString(b[:]), nil
+}
+
 // logLevelNames are the documented LOG_LEVEL values, in order of increasing
 // verbosity, used to render a helpful error message on an invalid value.
 var logLevelNames = []string{"DEBUG", "INFO", "WARN", "ERROR"}
@@ -687,38 +814,22 @@ func retentionEnv(logger *slog.Logger, name string, defaultWindow time.Duration)
 // variable must not take down the worker; the operator sees the log line and
 // the disabled behavior. The value carries no credentials, so echoing it in the
 // log line is safe. The same helper serves REDIS_STREAM_RETENTION,
-// REDIS_DLQ_RETENTION, and REDIS_INVOCATION_RETENTION; only the caller's unset
-// default differs.
+// REDIS_DLQ_RETENTION, REDIS_INVOCATION_RETENTION, and STATS_RETENTION; only the
+// caller's unset default differs.
 func parseRetention(logger *slog.Logger, name, value string) time.Duration {
 	if strings.TrimSpace(value) == "" {
 		return 0
 	}
 	d, err := time.ParseDuration(value)
 	if err != nil {
-		logger.Warn("Redis: invalid retention window; retention disabled", "variable", name, "value", value, "error", err)
+		logger.Warn("invalid retention window; retention disabled", "variable", name, "value", value, "error", err)
 		return 0
 	}
 	if d <= 0 {
-		logger.Warn("Redis: retention window must be positive; retention disabled", "variable", name, "value", value)
+		logger.Warn("retention window must be positive; retention disabled", "variable", name, "value", value)
 		return 0
 	}
 	return d
-}
-
-// consumerNameFromHost resolves the hostname into a consumer name. It returns a
-// clear error on both a hostname resolution failure and an empty hostname,
-// keeping the two failure paths distinct in their messages. os.Hostname is not
-// injectable, so the failure paths cannot be exercised in-process; they are
-// returned (not fatal) so Load's caller owns process exit.
-func consumerNameFromHost() (string, error) {
-	host, err := os.Hostname()
-	if err != nil {
-		return "", fmt.Errorf("resolve consumer name: hostname unavailable: %w", err)
-	}
-	if host == "" {
-		return "", errors.New("resolve consumer name: hostname is empty")
-	}
-	return host, nil
 }
 
 // requiredEnv returns the value of the environment variable key, or a clear

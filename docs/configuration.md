@@ -10,45 +10,53 @@ pinned libraries (see the last section) and are listed separately.
 
 ## Required
 
-| Variable       | Format                                                                  | Behavior                                                                                                                                                    |
-| -------------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `REDIS_URI`    | `host:port`, `redis://[user:password@]host:port`, or `rediss://…` (TLS) | Redis address or DSN. Missing/empty fails startup.                                                                                                          |
-| `REDIS_STREAM` | stream name                                                             | Stream Relay consumes. Missing/empty fails startup.                                                                                                         |
-| `REDIS_GROUP`  | group name                                                              | Consumer group. Missing/empty fails startup. Created with `MKSTREAM` at position `0` if absent, so a new group over an existing stream replays its backlog. |
-| `DATABASE_URL` | PostgreSQL DSN (`postgres://user:password@host:5432/db?sslmode=disable`) | The shared state database (operator state view, per-worker stats snapshots, and the durable schedule outbox). Missing/empty fails startup; an unreachable database fails startup. The value carries credentials and is never logged. |
+| Variable       | Format                                                                   | Behavior                                                                                                                                                                                                                                                                                                                                                                                              |
+| -------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `REDIS_URI`    | `host:port`, `redis://[user:password@]host:port`, or `rediss://…` (TLS)  | Redis address or DSN. Missing/empty fails startup.                                                                                                                                                                                                                                                                                                                                                    |
+| `REDIS_STREAM` | stream name                                                              | Stream Relay consumes. Missing/empty fails startup.                                                                                                                                                                                                                                                                                                                                                   |
+| `REDIS_GROUP`  | group name                                                               | Consumer group. Missing/empty fails startup. Created with `MKSTREAM` at position `0` if absent, so a new group over an existing stream replays its backlog.                                                                                                                                                                                                                                           |
+| `DATABASE_URL` | PostgreSQL DSN (`postgres://user:password@host:5432/db?sslmode=disable`) | The shared state database (operator state view, per-worker stats snapshots, and the durable schedule outbox). Missing/empty fails startup; an unreachable database fails startup. The value carries credentials and is never logged.                                                                                                                                                                  |
+| `WORKER_ID`    | stable token, ≤128 chars of ASCII letters/digits/`.`/`_`/`-`             | The worker's **stable identity**. Missing/empty fails startup; a malformed value fails startup. It is the Redis consumer name, the `relay.hostname` container-ownership label, and the persisted-stats owner key, so a restart reuses one identity across all three. It must be unique among concurrently running workers and stable across restarts: the PostgreSQL state owner lock (a per-identity session advisory lock) is held for the worker's lifetime, so a second active worker presenting the same `WORKER_ID` fails startup with a clear error rather than silently sharing one identity. There is **no** hostname or generated fallback. |
 
-The consumer name is **not** configurable: Relay uses the process hostname
-(container ID / pod name), so replicas sharing `REDIS_GROUP` are distinct
-automatically.
+The consumer name is **not** configurable: Relay uses the required, stable
+`WORKER_ID`, so replicas sharing `REDIS_GROUP` must each configure a unique
+`WORKER_ID`. The same identity is used for `relay.hostname` container labels
+and persisted `stats`/`app_stats` rows, while a fresh per-process `instance_id`
+provides fencing to prevent stale instances from overwriting statistics (see
+[operations.md](operations.md)).
 
 ## Optional
 
-| Variable                      | Default            | Format / accepted values                                                | Behavior when invalid                                                                                                                                                                                                       |
-| ----------------------------- | ------------------ | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `LOG_LEVEL`                   | `INFO`             | `DEBUG`, `INFO`, `WARN`, `ERROR` (case-insensitive, trimmed)            | Fails startup. `WARNING` is **not** an alias.                                                                                                                                                                               |
-| `MAX_CONCURRENT_INVOCATIONS`  | `8`                | positive integer                                                        | Fails startup. Bounds concurrent invocations **per worker**.                                                                                                                                                                |
-| `MAX_CONCURRENT_BUILDS`       | `2`                | positive integer                                                        | Fails startup. Bounds concurrent runtime-backed image-preparation pipelines **per worker**.                                                                                                                                  |
-| `MAX_WARM_CONTAINERS`         | `8`                | positive integer                                                        | Fails startup. Hard per-worker bound on warm **execution** containers across all apps (idle + busy); when saturated every idle container is LRU-evicted, and if all are busy the invocation stays pending. See below.        |
-| `MAX_BUFFERED_EVENTS`         | `16`               | positive integer                                                        | Fails startup. Per-worker bound on messages read from Redis and held locally, including deliveries waiting on execution capacity. It is **not** a bound on the Redis consumer-group PEL. See below.                          |
-| `MAX_EVENT_BYTES`             | `256KiB`           | human-readable binary size (`256B`, `256KiB`, `1MiB`; bare integer bytes accepted) | Fails startup on zero/negative/malformed/decimal-unit/above-1MiB. Byte length of a message's raw `event` value; over-limit messages are non-retryably dead-lettered with a bounded summary.                                |
-| `WARM_CONTAINER_IDLE_TIMEOUT` | `5m`               | positive Go duration (`90s`, `10m`, `1h30m`)                            | Fails startup.                                                                                                                                                                                                              |
-| `HOT_RELOAD`                  | `false`            | boolean (`1`, `t`, `true`, `0`, `f`, `false`; trimmed)                  | Fails startup on an unparseable value. `false` bakes the source into the immutable runtime image; `true` source-mounts the live app directory from `/apps` read-only into containers for runtimes with a mountable dependency layout (Python and Node), so a source-only edit reuses the app and dependency images, managed services restart in place, and pooled execution containers are recycled. See below. |
-| `METRICS_ADDR`                | unset              | listen address (`:9090`)                                                | Empty disables the Prometheus endpoint. A bind failure is fatal at startup.                                                                                                                                                 |
-| `GIT_WEBHOOK_ADDR`            | unset              | listen address (`:8081`)                                                | Empty disables the GitHub webhook. A bind failure is fatal. Starts only when the git source also names a webhook secret.                                                                                                    |
-| `NETWORKS`                    | unset              | comma-separated Docker network names                                    | Parsed at startup (trimmed, de-duplicated, declaration order kept). Every name is verified to exist; a missing network fails startup. Applied to execution containers and (as an order-independent set) service containers. |
-| `REDIS_STREAM_RETENTION`      | `24h`              | Go duration (`6h`, `90m`)                                               | The optional value that **logs and disables** instead of failing. See below.                                                                                                                                                |
-| `REDIS_DLQ_RETENTION`         | `7d` (`168h`)      | Go duration (`168h`, `90m`)                                             | The optional value that **logs and disables** instead of failing. Age-only DLQ trim. See below.                                                                                                                             |
-| `REDIS_INVOCATION_RETENTION`  | `48h`              | Go duration (`12h`, `90m`)                                             | The optional value that **logs and disables** instead of failing. Terminal invocation-state TTL only. See below.                                                                                                            |
-| `TRAEFIK_NETWORK`             | unset              | Docker network name                                                     | Required only when a service declares `host`; verified on every routed reconcile and joined in addition to `NETWORKS`.                                                                                                      |
-| `TRAEFIK_ENTRYPOINTS`         | unset              | comma-separated Traefik entrypoint names (`websecure`, `web,websecure`) | Passed through verbatim into the router label; no default.                                                                                                                                                                  |
-| `TRAEFIK_CERTRESOLVER`        | unset              | resolver name (`letsencrypt`)                                           | When set, adds both `tls=true` and `tls.certresolver`; unset adds neither.                                                                                                                                                  |
-| `TRAEFIK_PRIORITY`            | unset              | positive integer                                                        | Any provided value must be positive (a fatal error otherwise); unset omits the label.                                                                                                                                       |
-| `TRAEFIK_HOST_OVERRIDE`       | unset              | hostname suffix (`localhost`)                                           | Replaces the domain of each routed host, keeping its left-most label (`issuer.example.com` → `issuer.localhost`). Unset uses declared hosts verbatim.                                                                       |
+| Variable                      | Default       | Format / accepted values                                                           | Behavior when invalid                                                                                                                                                                                                                                                                                                                                                                                           |
+| ----------------------------- | ------------- | ---------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LOG_LEVEL`                   | `INFO`        | `DEBUG`, `INFO`, `WARN`, `ERROR` (case-insensitive, trimmed)                       | Fails startup. `WARNING` is **not** an alias.                                                                                                                                                                                                                                                                                                                                                                   |
+| `MAX_CONCURRENT_INVOCATIONS`  | `8`           | positive integer                                                                   | Fails startup. Bounds concurrent invocations **per worker**.                                                                                                                                                                                                                                                                                                                                                    |
+| `MAX_CONCURRENT_BUILDS`       | `2`           | positive integer                                                                   | Fails startup. Bounds concurrent runtime-backed image-preparation pipelines **per worker**.                                                                                                                                                                                                                                                                                                                     |
+| `MAX_WARM_CONTAINERS`         | `8`           | positive integer                                                                   | Fails startup. Hard per-worker bound on warm **execution** containers across all apps (idle + busy); when saturated every idle container is LRU-evicted, and if all are busy the invocation stays pending. See below.                                                                                                                                                                                           |
+| `MAX_BUFFERED_EVENTS`         | `16`          | positive integer                                                                   | Fails startup. Per-worker bound on messages read from Redis and held locally, including deliveries waiting on execution capacity. It is **not** a bound on the Redis consumer-group PEL. See below.                                                                                                                                                                                                             |
+| `MAX_EVENT_BYTES`             | `256KiB`      | human-readable binary size (`256B`, `256KiB`, `1MiB`; bare integer bytes accepted) | Fails startup on zero/negative/malformed/decimal-unit/above-1MiB. Byte length of a message's raw `event` value; over-limit messages are non-retryably dead-lettered with a bounded summary.                                                                                                                                                                                                                     |
+| `WARM_CONTAINER_IDLE_TIMEOUT` | `5m`          | positive Go duration (`90s`, `10m`, `1h30m`)                                       | Fails startup.                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `HOT_RELOAD`                  | `false`       | boolean (`1`, `t`, `true`, `0`, `f`, `false`; trimmed)                             | Fails startup on an unparseable value. `false` bakes the source into the immutable runtime image; `true` source-mounts the live app directory from `/apps` read-only into containers for runtimes with a mountable dependency layout (Python and Node), so a source-only edit reuses the app and dependency images, managed services restart in place, and pooled execution containers are recycled. See below. |
+| `METRICS_ADDR`                | unset         | listen address (`:9090`)                                                           | Empty disables the Prometheus endpoint. A bind failure is fatal at startup.                                                                                                                                                                                                                                                                                                                                     |
+| `GIT_WEBHOOK_ADDR`            | unset         | listen address (`:8081`)                                                           | Empty disables the GitHub webhook. A bind failure is fatal. Starts only when the git source also names a webhook secret.                                                                                                                                                                                                                                                                                        |
+| `NETWORKS`                    | unset         | comma-separated Docker network names                                               | Parsed at startup (trimmed, de-duplicated, declaration order kept). Every name is verified to exist; a missing network fails startup. Applied to execution containers and (as an order-independent set) service containers.                                                                                                                                                                                     |
+| `REDIS_STREAM_RETENTION`      | `24h`         | Go duration (`6h`, `90m`)                                                          | The optional value that **logs and disables** instead of failing. See below.                                                                                                                                                                                                                                                                                                                                    |
+| `REDIS_DLQ_RETENTION`         | `7d` (`168h`) | Go duration (`168h`, `90m`)                                                        | The optional value that **logs and disables** instead of failing. Age-only DLQ trim. See below.                                                                                                                                                                                                                                                                                                                 |
+| `REDIS_INVOCATION_RETENTION`  | `48h`         | Go duration (`12h`, `90m`)                                                         | The optional value that **logs and disables** instead of failing. Terminal invocation-state TTL only. See below.                                                                                                                                                                                                                                                                                                |
+| `STATS_RETENTION`             | `7d` (`168h`) | Go duration (`168h`, `90m`)                                                        | The optional value that **logs and disables** instead of failing. Bounds stale stats-owner rows: after a successful flush the worker deletes other workers' `stats`/`app_stats` rows older than this window. An explicitly empty value disables compaction. See below.                                                                                                                                          |
+| `TRAEFIK_NETWORK`             | unset         | Docker network name                                                                | Required only when a service declares `host`; verified on every routed reconcile and joined in addition to `NETWORKS`.                                                                                                                                                                                                                                                                                          |
+| `TRAEFIK_ENTRYPOINTS`         | unset         | comma-separated Traefik entrypoint names (`websecure`, `web,websecure`)            | Passed through verbatim into the router label; no default.                                                                                                                                                                                                                                                                                                                                                      |
+| `TRAEFIK_CERTRESOLVER`        | unset         | resolver name (`letsencrypt`)                                                      | When set, adds both `tls=true` and `tls.certresolver`; unset adds neither.                                                                                                                                                                                                                                                                                                                                      |
+| `TRAEFIK_PRIORITY`            | unset         | positive integer                                                                   | Any provided value must be positive (a fatal error otherwise); unset omits the label.                                                                                                                                                                                                                                                                                                                           |
+| `TRAEFIK_HOST_OVERRIDE`       | unset         | hostname suffix (`localhost`)                                                      | Replaces the domain of each routed host, keeping its left-most label (`issuer.example.com` → `issuer.localhost`). Unset uses declared hosts verbatim.                                                                                                                                                                                                                                                           |
 
 `METRICS_ADDR`, `GIT_WEBHOOK_ADDR`, and the `TRAEFIK_*` values are read only by
-the worker; the read-only admin commands that don't need Redis still call
-`config.Load`, so an invalid `LOG_LEVEL` or tuning value fails those commands
-too.
+the worker. The read-only admin commands resolve only what they need — the state
+DSN via `LoadDatabaseURL` (no `WORKER_ID`, `REDIS_*`, or tuning required) or the
+Redis/DLQ settings via `LoadRedisConfig` — but the process logger is bootstrapped
+from `LOG_LEVEL` before any command runs, so an invalid `LOG_LEVEL` fails every
+command too. `WORKER_ID` and the tuning variables are required only by
+`relay start`.
 
 `NETWORKS` and `TRAEFIK_NETWORK` name Docker networks Relay attaches containers
 to; Relay **never creates or removes** them (they are infrastructure owned
@@ -63,7 +71,7 @@ Three distinct quantities bound work, and they are not the same bound. Two are
 **per worker** and multiply across `N` replicas:
 
 - **Execution concurrency** — `MAX_CONCURRENT_INVOCATIONS` (default `8`) bounds
-  concurrently *executing* invocations in one worker. It is startup configuration
+  concurrently _executing_ invocations in one worker. It is startup configuration
   (restart to change); a template's per-app `concurrency` is clipped to it live
   and is documented in [apps.md](apps.md).
 - **Local processing slots** — `MAX_BUFFERED_EVENTS` (default `16`) bounds the
@@ -207,7 +215,7 @@ reaches its containers.
   takes effect by reloading or restarting the application process.
 
 Source mounting applies to every runtime with a mountable dependency layout —
-Python, whose dependencies install into the system site-packages *outside* the
+Python, whose dependencies install into the system site-packages _outside_ the
 app directory, and Node, whose `node_modules` and persisted esbuild live under
 `/app` while the source is mounted at the distinct `/app/src`. Python mounts at
 the engine work directory (`/app`); Node mounts at `/app/src` so the bind never
@@ -272,7 +280,7 @@ Consequences:
   app directory without mutating app data; the daemon's own source-existence
   validation remains the final authority. Native-host Relay and any container
   where no mapping can be established (for example a custom `hostname:`) keep the
-  plain app directory. A daemon on a *remote* host — not the daemon Relay itself
+  plain app directory. A daemon on a _remote_ host — not the daemon Relay itself
   runs on — still cannot see Relay's app tree and remains unsupported.
 
 Operational caveats:
@@ -282,8 +290,8 @@ Operational caveats:
   the container user.
 - The whole app directory is mounted, including `template.yaml`, any `.git`
   metadata, and files excluded from the build by `.gitignore` (for example a
-  local `.env`). `template.yaml` holds environment *values* and secret
-  *references* (never resolved secret values), which the baked image
+  local `.env`). `template.yaml` holds environment _values_ and secret
+  _references_ (never resolved secret values), which the baked image
   deliberately omits. Enable `HOT_RELOAD` only for app directories you are
   willing to expose to the handler process and its container.
 - `HOT_RELOAD` does not add anything to the application environment.
@@ -316,13 +324,14 @@ value requires a worker restart.
 raw transport forwarded verbatim at every level, independent of `LOG_LEVEL`.
 Fatal startup failures always log regardless of the configured level.
 
-### Stream and DLQ retention
+### Retention windows
 
 Three independent retention windows trim or bound three different things. All
 are **Go durations** parsed with `time.ParseDuration`; there is no day suffix
 (`7d` is **not** valid), so a 7-day override is written `168h`. All are startup
 configuration (restart to change) and none affects ACK, retry, DLQ routing, or
-the scheduler/outbox.
+the scheduler/outbox. (A fourth window, `STATS_RETENTION`, bounds stale
+PostgreSQL stats-owner rows; it is described after the three Redis windows.)
 
 `REDIS_STREAM_RETENTION` (default `24h`) drives the main stream trim. A single
 goroutine inside `relay start` periodically trims the configured source stream
@@ -391,6 +400,22 @@ that retention (`0`). A malformed value and an explicit `0` or negative value lo
 a line naming the variable and disable that behavior; **retention values never
 fail startup**.
 
+`STATS_RETENTION` (default `7d`, i.e. `168h`) is **not a Redis trim**: it bounds
+the persisted stats-owner rows in PostgreSQL. A `WORKER_ID` that is retired
+permanently leaves its `stats`/`app_stats` rows behind, so those would otherwise
+accumulate forever. After a successful
+flush the worker deletes rows owned by **other** workers whose `updated_at` is
+older than the window, throttled to one attempt per derived tick (`retention / 24`
+clamped to `[1m, 1h]`).
+
+- A worker never prunes its **own** row, however stale its timestamp looks, so a
+  temporarily quiet worker keeps the cumulative totals it will resume writing.
+- Because `WORKER_ID` is stable across restarts, a restarted worker reuses its
+  row; this window still bounds identities that were retired permanently.
+- `STATS_RETENTION` follows the same unset-vs-empty rule: unset applies `168h`,
+  and an explicit empty or `0`/negative value disables compaction (no rows are
+  ever deleted).
+
 For `REDIS_INVOCATION_RETENTION`, a disabled value (`0`) still writes the
 terminal marker atomically — every stale-transition guard is unchanged — but
 leaves the hash **persistent** (no expiry), so terminal bookkeeping survives
@@ -405,9 +430,11 @@ never silently replaced by the `48h` default.
 REDIS_STREAM_RETENTION=6h          # trim the source stream (ACKED)
 REDIS_DLQ_RETENTION=168h          # trim the DLQ after 7 days (age-only)
 REDIS_INVOCATION_RETENTION=12h    # expire terminal invocation state after 12h
+STATS_RETENTION=720h              # compact stale stats-owner rows after 30 days
 REDIS_STREAM_RETENTION=          # disable source retention
 REDIS_DLQ_RETENTION=             # disable DLQ retention
 REDIS_INVOCATION_RETENTION=       # keep terminal invocation state persistent (no TTL)
+STATS_RETENTION=                  # disable stats-owner compaction
 ```
 
 ## Environment owned by other libraries

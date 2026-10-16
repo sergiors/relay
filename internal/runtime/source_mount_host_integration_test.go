@@ -72,6 +72,10 @@ func TestIntegrationSourceMountDaemonPathMapsRelayContainerMount(t *testing.T) {
 		t.Fatalf("new manager: %v", err)
 	}
 	defer func() { _ = m.Close() }()
+	// NewManager resolves selfHostname from os.Hostname (the test runner, not the
+	// probe container); point self-inspection at the probe's short ID instead, as
+	// it would be inside the Relay container.
+	m.selfHostname = short
 
 	if got, want := m.daemonSourcePath(ctx, "/apps/myapp"), filepath.Join(hostRoot, "myapp"); got != want {
 		t.Fatalf("daemonSourcePath(/apps/myapp) = %q, want %q", got, want)

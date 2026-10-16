@@ -3,9 +3,10 @@
 // commands call it once at startup and pass the resulting Config value around,
 // so application code never reads environment variables directly.
 //
-// Every Config field maps 1:1 to an environment variable, with no computed or
-// invented settings. Required Redis variables (REDIS_URI, REDIS_STREAM,
-// REDIS_GROUP) and malformed tuning knobs are RETURNED as errors from Load, not
+// Every Config field maps 1:1 to an environment variable, except the
+// always-generated per-process InstanceID. The required variables (REDIS_URI,
+// REDIS_STREAM, REDIS_GROUP, DATABASE_URL, WORKER_ID) and malformed tuning knobs
+// are RETURNED as errors from Load, not
 // fatal: the caller propagates them to cmd/main.go, the sole process boundary
 // that prints the error and owns os.Exit. The optional knobs (stream, DLQ, and
 // invocation-state retention, metrics/webhook addresses, Traefik routing, and

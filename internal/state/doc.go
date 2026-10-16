@@ -119,13 +119,19 @@
 //
 // The stats and app_stats tables store the latest persisted ABSOLUTE
 // snapshot of Relay's operational counters — idempotent, no deltas — PER WORKER.
-// Each row is keyed by the owning worker identity (the consumer name/hostname)
-// so two workers sharing one PostgreSQL database keep independent counter sets
-// instead of last-writer-wins overwriting a single global row. Only stable
-// relational metadata is kept as columns: stats.worker and stats.updated_at, and
-// app_stats.app_name, app_stats.worker, and app_stats.updated_at. The evolving
-// counter/gauge/execution-history payload is a native JSONB object in the data
-// column, marshalled and unmarshalled ONLY through stats_json.go; the worker,
+// Each row is keyed by the owning worker's STABLE logical identity (config
+// WorkerID, resolved from the required WORKER_ID) so two
+// workers sharing one PostgreSQL database keep independent counter sets instead
+// of last-writer-wins overwriting a single global row, and so same-host workers
+// never collide (two processes must not share a WORKER_ID).
+// Only stable relational metadata is kept as columns: stats.worker,
+// stats.instance, and stats.updated_at, and app_stats.app_name,
+// app_stats.worker, and app_stats.updated_at. stats.instance is the owning
+// process incarnation (config InstanceID, an always-fresh per-process token):
+// every flush is conditioned on it, so a stale process for the same WorkerID can
+// never overwrite a newer incarnation's snapshot (see RecordStatsSnapshot). The
+// evolving counter/gauge/execution-history payload is a native JSONB object in the
+// data column, marshalled and unmarshalled ONLY through stats_json.go; the worker,
 // CLI, runtime, and metrics layers pass typed Stats/AppStats values and never
 // touch the JSON. This keeps the schema stable as instrumentation grows: absent
 // fields decode to zero. The typed structs are the source of truth. There is no
@@ -134,6 +140,13 @@
 // carries no backward-compatibility guarantee across versions: it is
 // coordination/operator state, not a durable public contract.
 //
+// stats_meta holds the single-row GLOBAL reset epoch (generation). Every flush
+// reads it FOR SHARE and every `stats reset` bumps it with an exclusive UPDATE in
+// the same transaction that zeroes the rows, so a delayed pre-reset snapshot from
+// ANY worker is fenced out of the reset — not only the socket-owning worker's. The
+// single lock ordering (stats_meta first, then stats/app_stats) makes a flush,
+// a reset, and a retention prune deadlock-free.
+//
 // Reads: a worker restoring its own counters at startup reads ONLY its own rows
 // (OwnerStats/OwnerAppStats), so a restart of the same identity continues its
 // totals without double-counting a shared database. CLI and observability reads
@@ -141,11 +154,12 @@
 // are summed, the execution-history timestamps take the maximum, and the
 // shared-backlog gauges come from the FRESHEST owner snapshot (the newest
 // updated_at), so a dead worker's stale gauge can never mask the live value.
-// `relay stats reset` zeroes every owner's rows in place. The
-// owner identity is the resolved hostname (ConsumerName); two workers that
-// resolve the same hostname would share a stats row — the documented limitation
-// of a hostname-based identity (distinct hosts, the normal case, are distinct
-// owners).
+// `relay stats reset` zeroes every owner's rows in place. Two workers
+// deliberately configured with the SAME WORKER_ID cannot coexist: Open takes an
+// exclusive per-owner session advisory lock held for the handle's lifetime, so
+// the second concurrent worker fails to start with a clear error instead of
+// silently fighting over one row (each concurrent worker must set a distinct
+// WORKER_ID).
 //
 // In addition to the event/handler counters, app_stats carries the
 // CUMULATIVE warm-container pool counters (warm acquires, cold starts,
@@ -155,7 +169,8 @@
 // persisted: a persisted live gauge would go stale between flushes. The worker
 // flushes the current in-memory metrics registry into them every 5 seconds
 // (fixed, non-configurable) via RecordStatsSnapshot, which writes the worker's
-// global row and every per-app row in one short transaction. PostgreSQL is never
+// global row and every per-app row in one short transaction, fenced by the
+// current reset epoch and the worker's process incarnation. PostgreSQL is never
 // on the event path: the runner and stream consumer update only the Prometheus
 // registry, and the flush merely mirrors that store. A failed flush is retried
 // next tick with the current values (absolute snapshots make this safe); a hard
@@ -164,15 +179,29 @@
 // the fresh registry (restorePersistedStats) so the first snapshot never resets
 // them. Redis event-processing correctness never depends on the stats tables.
 //
+// Stale-owner compaction: a retired WORKER_ID leaves its rows behind, so many
+// short-lived identities can accumulate rows. After a
+// successful flush the worker best-effort deletes stats/app_stats rows owned by
+// OTHER workers whose updated_at is older than STATS_RETENTION (default 7 days)
+// via PruneStaleStats, throttled to one attempt per retentionTickInterval. A
+// worker never prunes its OWN row, however stale it looks, and a zero/negative
+// retention disables compaction. See docs/configuration.md.
+//
 // `relay stats reset` zeroes the cumulative fields IN PLACE: every worker's
 // global row and every app_stats row survive, decoded from their typed JSON
 // payloads, while the live gauges and any known unrelated field are preserved.
-// A running worker performs the reset over its socket, under the same lock as
-// the flush, so its in-memory totals are reset too and no captured pre-reset
-// snapshot can be written afterwards; a stopped worker is reset directly through
-// state.ResetStats. Prometheus counters are never reset: the worker keeps a
-// Relay-side reset baseline and subtracts it when snapshotting, so the persisted
-// totals continue from zero while the counters stay monotonic.
+// The reset bumps the shared generation in the same transaction, so a delayed
+// snapshot from ANY worker (not just the socket-owning one) observes the advanced
+// epoch and refuses to write it. A running worker performs the reset over its
+// socket, under the same mutex as its flush, so its in-memory baseline is reset
+// too and no captured pre-reset snapshot can be written afterwards; a stopped
+// worker is reset directly through state.ResetStats. Prometheus counters are
+// never reset: the worker keeps a Relay-side reset baseline and subtracts it when
+// snapshotting, so the persisted totals continue from zero while the counters stay
+// monotonic. When a reset advances the epoch under a running worker that did not
+// issue it, the worker rebases its baseline to the current registry values and
+// retries once, so at most one flush interval (≤5s) of counters is dropped and
+// none are resurrected.
 //
 // The driver is github.com/jackc/pgx/v5's database/sql adapter (pgx), a
 // maintained pure-Go PostgreSQL driver (no CGO).
@@ -195,7 +224,11 @@
 //     FOR UPDATE SKIP LOCKED claims and claim_token fencing coordinate retriers
 //     across processes without any process-global lock. Schema initialization is
 //     serialized by a transaction-scoped advisory lock so concurrent openers
-//     cannot race CREATE TABLE IF NOT EXISTS.
+//     cannot race CREATE TABLE IF NOT EXISTS. A worker handle additionally holds
+//     a per-owner EXCLUSIVE session advisory lock on a dedicated pinned
+//     connection for its whole lifetime: a second process presenting the same
+//     WORKER_ID fails Open with a clear error rather than silently sharing the
+//     identity (see Open/Close); ownerless CLI/admin handles never take it.
 //   - Transactions are short and hold no external I/O: fingerprints are computed
 //     before the transaction opens (see RebuildFromFS/RecordDiscovered), so a
 //     write transaction never blocks on the filesystem. Callers that already

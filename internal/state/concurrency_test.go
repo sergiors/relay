@@ -162,7 +162,7 @@ func TestConcurrentReconcileAndStats(t *testing.T) {
 			for i := 0; i < m; i++ {
 				fns = append(fns, AppStats{App: "fn-" + string(rune('a'+i)), EventsMatchedTotal: int64(i + 1)})
 			}
-			_ = c.RecordStatsSnapshot(context.Background(), Stats{EventsMatchedTotal: 100}, fns)
+			_, _ = c.RecordStatsSnapshot(context.Background(), -1, Stats{EventsMatchedTotal: 100}, fns)
 		}
 	}()
 
@@ -207,7 +207,7 @@ func TestConcurrentReadsDuringWrites(t *testing.T) {
 				return
 			default:
 			}
-			_ = c.RecordStatsSnapshot(context.Background(),
+			_, _ = c.RecordStatsSnapshot(context.Background(), -1,
 				Stats{EventsMatchedTotal: 1},
 				[]AppStats{{App: "alpha", EventsMatchedTotal: 1}})
 		}

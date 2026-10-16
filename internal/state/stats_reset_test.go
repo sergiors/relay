@@ -76,7 +76,7 @@ func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 	c.RecordAppStats(AppStats{App: "beta", EventsMatchedTotal: 3})
 
 	c.nowFn = func() time.Time { return base.Add(time.Minute) }
-	if err := c.ResetStats(); err != nil {
+	if _, err := c.ResetStats(); err != nil {
 		t.Fatalf("ResetStats: %v", err)
 	}
 
@@ -162,7 +162,7 @@ func TestResetStatsPreservesUnrelatedGlobalJSONFields(t *testing.T) {
 		OldestPendingAgeSeconds: 3600,
 	})
 
-	if err := c.ResetStats(); err != nil {
+	if _, err := c.ResetStats(); err != nil {
 		t.Fatalf("ResetStats: %v", err)
 	}
 	// The payload is still valid JSON with exactly the known keys (no unrelated
@@ -200,7 +200,7 @@ func TestResetStatsZeroesPoolCountersAndTimestamps(t *testing.T) {
 		LastDLQAt:           exec,
 	})
 
-	if err := c.ResetStats(); err != nil {
+	if _, err := c.ResetStats(); err != nil {
 		t.Fatalf("ResetStats: %v", err)
 	}
 	fs, ok := c.AppStats("alpha")
@@ -225,7 +225,7 @@ func TestResetStatsMultipleAppRows(t *testing.T) {
 	c.RecordAppStats(AppStats{App: "beta", EventsMatchedTotal: 3})
 	c.RecordAppStats(AppStats{App: "gamma", WarmAcquiresTotal: 7, DiscardedTotal: 1})
 
-	if err := c.ResetStats(); err != nil {
+	if _, err := c.ResetStats(); err != nil {
 		t.Fatalf("ResetStats: %v", err)
 	}
 	all := c.AllAppStats()
@@ -247,7 +247,7 @@ func TestResetStatsThenAccumulate(t *testing.T) {
 	c.RecordStats(Stats{EventsMatchedTotal: 50, PendingEntries: 3})
 	c.RecordAppStats(AppStats{App: "alpha", EventsMatchedTotal: 5})
 
-	if err := c.ResetStats(); err != nil {
+	if _, err := c.ResetStats(); err != nil {
 		t.Fatalf("ResetStats: %v", err)
 	}
 
@@ -287,7 +287,7 @@ func TestResetStatsIdempotent(t *testing.T) {
 	c.RecordAppStats(AppStats{App: "alpha", EventsMatchedTotal: 1})
 
 	for i := 1; i <= 2; i++ {
-		if err := c.ResetStats(); err != nil {
+		if _, err := c.ResetStats(); err != nil {
 			t.Fatalf("ResetStats run %d: %v", i, err)
 		}
 	}
@@ -306,7 +306,7 @@ func TestResetStatsIdempotent(t *testing.T) {
 func TestResetStatsFreshDB(t *testing.T) {
 	c := openTestState(t)
 
-	if err := c.ResetStats(); err != nil {
+	if _, err := c.ResetStats(); err != nil {
 		t.Fatalf("ResetStats on fresh DB: %v", err)
 	}
 	if s, ok := c.Stats(); ok {
@@ -336,7 +336,7 @@ func TestResetStatsRollsBackOnCorruptGlobalPayload(t *testing.T) {
 		t.Fatalf("seed corrupt stats: %v", err)
 	}
 
-	if err := c.ResetStats(); err == nil {
+	if _, err := c.ResetStats(); err == nil {
 		t.Fatal("ResetStats with a corrupt payload: err = nil, want error")
 	}
 	if all := c.AllAppStats(); len(all) != 1 || all[0].EventsMatchedTotal != 5 {
@@ -358,7 +358,7 @@ func TestResetStatsRollsBackOnCorruptAppPayload(t *testing.T) {
 	}
 	c.RecordStats(Stats{EventsMatchedTotal: 9})
 
-	if err := c.ResetStats(); err == nil {
+	if _, err := c.ResetStats(); err == nil {
 		t.Fatal("ResetStats with a corrupt function payload: err = nil, want error")
 	}
 	// Nothing landed: the global counters and the good app row keep their

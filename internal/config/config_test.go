@@ -11,16 +11,17 @@ import (
 	"time"
 )
 
-// setRequiredEnv sets the four required variables (the three REDIS_* plus
-// DATABASE_URL) to sentinel values. It is a helper so individual Load tests only
-// override the variable they are exercising (and clear it where a
-// missing-required-var case is under test).
+// setRequiredEnv sets the required variables (the three REDIS_* plus
+// DATABASE_URL and WORKER_ID) to sentinel values. It is a helper so individual
+// Load tests only override the variable they are exercising (and clear it where
+// a missing-required-var case is under test).
 func setRequiredEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("REDIS_URI", "redis:6379")
 	t.Setenv("REDIS_STREAM", "stream")
 	t.Setenv("REDIS_GROUP", "group")
 	t.Setenv("DATABASE_URL", "postgres://relay:relay@localhost:5432/relay?sslmode=disable")
+	t.Setenv("WORKER_ID", "test-worker")
 }
 
 // testLogger returns a logger writing into an in-memory buffer so tests can
@@ -99,8 +100,8 @@ func TestLoadNetworks(t *testing.T) {
 }
 
 // TestLoadResolvesFields proves Load() resolves every Config field from the
-// environment: the required Redis settings pass through, the consumer name is
-// resolved to the hostname, the optional retention window parses, and the
+// environment: the required Redis settings pass through, the required WORKER_ID
+// becomes the worker identity, the optional retention window parses, and the
 // optional metrics address stays opt-in (empty when unset, passed through when
 // set).
 func TestLoadResolvesFields(t *testing.T) {
@@ -121,12 +122,8 @@ func TestLoadResolvesFields(t *testing.T) {
 	if cfg.MetricsAddr != ":9090" {
 		t.Fatalf("MetricsAddr = %q, want %q", cfg.MetricsAddr, ":9090")
 	}
-	host, hostErr := os.Hostname()
-	if hostErr != nil || host == "" {
-		t.Fatalf("os.Hostname unavailable on this host: %v", hostErr)
-	}
-	if cfg.ConsumerName != host {
-		t.Fatalf("ConsumerName = %q, want hostname %q", cfg.ConsumerName, host)
+	if cfg.WorkerID != "test-worker" {
+		t.Fatalf("WorkerID = %q, want the WORKER_ID sentinel", cfg.WorkerID)
 	}
 }
 
@@ -256,6 +253,8 @@ func TestLoadRetentionDefaults(t *testing.T) {
 	os.Unsetenv("REDIS_DLQ_RETENTION")
 	t.Setenv("REDIS_INVOCATION_RETENTION", "")
 	os.Unsetenv("REDIS_INVOCATION_RETENTION")
+	t.Setenv("STATS_RETENTION", "")
+	os.Unsetenv("STATS_RETENTION")
 
 	cfg := mustLoad(t)
 	if cfg.StreamRetention != 24*time.Hour {
@@ -267,6 +266,9 @@ func TestLoadRetentionDefaults(t *testing.T) {
 	if cfg.InvocationRetention != 48*time.Hour {
 		t.Fatalf("InvocationRetention = %v, want 48h default", cfg.InvocationRetention)
 	}
+	if cfg.StatsRetention != 7*24*time.Hour {
+		t.Fatalf("StatsRetention = %v, want 7d default", cfg.StatsRetention)
+	}
 	if DefaultStreamRetention != 24*time.Hour {
 		t.Fatalf("DefaultStreamRetention = %v, want 24h", DefaultStreamRetention)
 	}
@@ -275,6 +277,9 @@ func TestLoadRetentionDefaults(t *testing.T) {
 	}
 	if DefaultInvocationRetention != 48*time.Hour {
 		t.Fatalf("DefaultInvocationRetention = %v, want 48h", DefaultInvocationRetention)
+	}
+	if DefaultStatsRetention != 7*24*time.Hour {
+		t.Fatalf("DefaultStatsRetention = %v, want 7d", DefaultStatsRetention)
 	}
 }
 
@@ -432,7 +437,7 @@ func TestLoadRetentionErrorMentionsVariable(t *testing.T) {
 // failures are surfaced once through the returned error at the process boundary,
 // not duplicated as a fatal slog line.
 func TestLoadReturnsErrorOnMissingVariable(t *testing.T) {
-	for _, missEnv := range []string{"REDIS_URI", "REDIS_STREAM", "REDIS_GROUP", "DATABASE_URL"} {
+	for _, missEnv := range []string{"REDIS_URI", "REDIS_STREAM", "REDIS_GROUP", "DATABASE_URL", "WORKER_ID"} {
 		t.Run(missEnv, func(t *testing.T) {
 			setRequiredEnv(t)
 			t.Setenv(missEnv, "")
@@ -457,31 +462,6 @@ func TestLoadReturnsErrorOnMissingVariable(t *testing.T) {
 		})
 	}
 }
-
-// TestConsumerNameResolvesToHostname proves Load() resolves the consumer name to
-// the hostname on a normal test host. We compare against os.Hostname()
-// directly; the two may legitimately differ only in weird environments where
-// the hostname is empty, in which case the test fails rather than skips (an
-// empty hostname is a returned error in consumerNameFromHost, so a normal host
-// must resolve it).
-func TestConsumerNameResolvesToHostname(t *testing.T) {
-	host, hostErr := os.Hostname()
-	if hostErr != nil || host == "" {
-		t.Fatalf("os.Hostname unavailable on this host: %v", hostErr)
-	}
-	setRequiredEnv(t)
-	cfg := mustLoad(t)
-	if cfg.ConsumerName != host {
-		t.Fatalf("ConsumerName = %q, want hostname %q", cfg.ConsumerName, host)
-	}
-}
-
-// NOTE on consumerNameFromHost failure paths: consumerNameFromHost calls
-// os.Hostname internally and RETURNS an error on both a resolution failure and
-// an empty hostname. Those paths are not injectable (os.Hostname cannot be
-// stubbed), so they cannot be unit-tested in-process and are deliberately left
-// untested. The returned error is what makes them non-fatal, so the caller owns
-// the process exit.
 
 // TestLoadDefaultLogLevel pins that an unset LOG_LEVEL resolves to Info.
 func TestLoadDefaultLogLevel(t *testing.T) {

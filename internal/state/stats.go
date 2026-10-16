@@ -3,8 +3,24 @@ package state
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"sort"
+	"time"
 )
+
+// ErrStatsOwnershipLost reports that a flush did not own its stats row: another
+// process incarnation of the same worker has claimed it since this handle
+// opened, so the snapshot was deliberately NOT written. The caller should stop
+// writing under this incarnation rather than retry.
+var ErrStatsOwnershipLost = errors.New("stats ownership lost")
+
+// ErrStatsResetAdvanced reports that the global stats epoch advanced since the
+// caller's last observation — a `stats reset` happened, possibly in another
+// process. The snapshot was NOT written. The caller must rebase its cumulative
+// baseline to its current registry values, adopt the generation returned
+// alongside this error, and retry once.
+var ErrStatsResetAdvanced = errors.New("stats reset advanced")
 
 // Stats is the current operational snapshot of Relay's runtime, persisted as the
 // JSONB payload of a per-worker row in the stats table (keyed by worker
@@ -88,9 +104,31 @@ func (st *State) RecordStatsContext(ctx context.Context, stats Stats) {
 // conditional on the app still existing in the apps table, so a
 // removed app's row is not re-created even if the caller's snapshot still
 // reports its (now-stale) counters. This is the worker's flush path; it keeps
-// the whole snapshot atomic and idempotent (absolute values, no deltas). It
-// returns the error so the caller can bound the write with a context; the
-// error is also logged here, matching the package's non-fatal style.
+// the whole snapshot atomic and idempotent (absolute values, no deltas).
+//
+// FENCING. The snapshot is written only by the CURRENT ownership incarnation and
+// only under the caller's known reset epoch:
+//
+//   - generation is the caller's last-known global reset generation (see
+//     StatsGeneration). A NEGATIVE generation means "unknown, adopt current",
+//     which lets a process's very first flush avoid a spurious rebase. If
+//     generation is non-negative and differs from the stored one, the epoch
+//     advanced (a `stats reset` from ANY worker), and the call returns
+//     (currentGeneration, ErrStatsResetAdvanced) WITHOUT writing so the caller
+//     can rebase and retry.
+//   - The global row upsert is conditioned on stats.instance = this handle's
+//     instance, so a stale process incarnation whose row a newer one has claimed
+//     affects no rows; RowsAffected()==0 then returns ErrStatsOwnershipLost.
+//     Per-app rows are written only AFTER the global ownership check passes, so
+//     an incarnation that lost ownership writes nothing at all.
+//
+// Both checks are decided at the START of the transaction: it takes the
+// stats_meta row FOR SHARE, which serializes every flush against a reset's
+// exclusive bump and fixes a single lock order (meta first) so no deadlock is
+// possible against a concurrent reset or prune. Every path returns the stored
+// generation so the caller knows the epoch to adopt. Unexpected errors are
+// logged here (matching the package's non-fatal style); the two sentinel
+// outcomes are control flow and are left to the caller.
 //
 // Timestamp preservation: the four per-app Last*At fields are execution
 // history, so an empty incoming value PRESERVES the persisted one rather than
@@ -100,13 +138,25 @@ func (st *State) RecordStatsContext(ctx context.Context, stats Stats) {
 // once inside the transaction and merged before writing (see
 // mergeAppStatsTimestamps); counters are never merged — they are absolute
 // snapshots and always overwrite.
-func (st *State) RecordStatsSnapshot(ctx context.Context, stats Stats, fns []AppStats) error {
+func (st *State) RecordStatsSnapshot(ctx context.Context, generation int64, stats Stats, fns []AppStats) (int64, error) {
 	globalPayload, err := marshalStats(stats)
 	if err != nil {
 		st.log.Warn("State: flush stats snapshot failed", "error", err)
-		return err
+		return generation, err
 	}
+	// newGen carries the stored generation out of the transaction on every path;
+	// it defaults to the caller's value so a failure before the read leaves the
+	// caller's epoch unchanged.
+	newGen := generation
 	err = st.rebuildTx(ctx, func(tx *sql.Tx) error {
+		gen, err := readGenerationForWrite(ctx, tx)
+		if err != nil {
+			return err
+		}
+		newGen = gen
+		if generation >= 0 && generation != gen {
+			return ErrStatsResetAdvanced
+		}
 		// Prune orphaned app_stats rows first so a removed app's row
 		// is gone before the upserts below could re-create it. The apps table is
 		// shared and authoritative across workers, so an orphan is an orphan for
@@ -124,13 +174,24 @@ func (st *State) RecordStatsSnapshot(ctx context.Context, stats Stats, fns []App
 		// One timestamp for the whole snapshot, so this worker's global row and
 		// every per-app row share the same updated_at.
 		ts := st.nowString()
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO stats (worker, data, updated_at) VALUES ($1, $2, $3)
+		res, err := tx.ExecContext(ctx,
+			`INSERT INTO stats (worker, instance, data, updated_at) VALUES ($1, $2, $3, $4)
 			 ON CONFLICT(worker) DO UPDATE SET
 			   data       = excluded.data,
-			   updated_at = excluded.updated_at`,
-			st.owner, globalPayload, ts); err != nil {
+			   updated_at = excluded.updated_at
+			 WHERE stats.instance = excluded.instance`,
+			st.owner, st.instance, globalPayload, ts)
+		if err != nil {
 			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			// The row exists and is owned by a different incarnation; skip the
+			// per-app writes too so no partial snapshot lands.
+			return ErrStatsOwnershipLost
 		}
 		for _, fs := range fns {
 			// Counters are absolute and always replaced; an empty incoming
@@ -157,10 +218,37 @@ func (st *State) RecordStatsSnapshot(ctx context.Context, stats Stats, fns []App
 		}
 		return nil
 	})
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrStatsResetAdvanced) && !errors.Is(err, ErrStatsOwnershipLost) {
 		st.log.Warn("State: flush stats snapshot failed", "error", err)
 	}
-	return err
+	return newGen, err
+}
+
+// readGenerationForWrite reads the global reset generation inside tx under a
+// SHARED row lock. The shared lock serializes a flush with a reset's exclusive
+// bump; because both statements take the stats_meta row first, they can never
+// deadlock against each other. The stats_meta seed row is created by
+// initSchema, so it is always present.
+func readGenerationForWrite(ctx context.Context, tx *sql.Tx) (int64, error) {
+	var gen int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT generation FROM stats_meta WHERE id = 'global' FOR SHARE`).Scan(&gen); err != nil {
+		return 0, fmt.Errorf("read stats generation: %w", err)
+	}
+	return gen, nil
+}
+
+// StatsGeneration returns the current global reset generation, or an error if it
+// cannot be read. It is a direct read of the epoch for diagnostics/tests; the
+// flush path learns the epoch from RecordStatsSnapshot's return value instead.
+func (st *State) StatsGeneration() (int64, error) {
+	ctx := context.Background()
+	var gen int64
+	if err := st.db.QueryRowContext(ctx,
+		`SELECT generation FROM stats_meta WHERE id = 'global'`).Scan(&gen); err != nil {
+		return 0, fmt.Errorf("read stats generation: %w", err)
+	}
+	return gen, nil
 }
 
 // storedAppStatsPayloads reads THIS worker's app_stats row payloads, keyed by
@@ -252,16 +340,42 @@ func (st *State) storedAppStatsTx(ctx context.Context, tx *sql.Tx, name string) 
 // snapshot cannot be written after this reset (see worker's stats resetter);
 // this method is the complete reset for a stopped worker.
 //
+// FENCING. The transaction FIRST bumps the global reset generation (an
+// exclusive UPDATE of stats_meta, see bumpGeneration) and only then zeroes the
+// rows, so the epoch change and the row rewrite commit atomically. Every flush
+// takes the same stats_meta row FOR SHARE at the start of its own transaction,
+// so an in-flight flush either completes entirely before this reset (and is
+// then overwritten by the zeroing) or starts after it and observes the advanced
+// epoch (returning ErrStatsResetAdvanced instead of resurrecting the reset
+// history). This fences delayed snapshots from EVERY worker, not just the one
+// that issued the reset: the generation is global, and a worker that captured a
+// pre-reset snapshot refuses to write it under the new epoch. Bumping and
+// zeroing in one transaction is required: a separate bump would let a rebasing
+// worker write its fresh totals into rows this reset then zeroes, silently
+// losing the counters that grew across the reset.
+//
 // A corrupt payload — global or per-app — is fatal: it cannot be decoded
 // and rewritten to zero, so the decode error is returned and the transaction
-// rolls back, leaving every row exactly as it was. A partial reset is never
-// mistaken for a complete one.
+// rolls back, leaving every row and the generation exactly as they were. A
+// partial reset is never mistaken for a complete one.
 //
-// Returns the error so the CLI can surface it; the package's Warn log also
-// records the failure, matching RecordStats.
-func (st *State) ResetStats() error {
+// Returns the NEW global generation alongside the error; the generation is
+// meaningful only when err is nil, since a failed reset rolls back the bump and
+// leaves the stored epoch unchanged. The package's Warn log also records the
+// failure, matching RecordStats.
+func (st *State) ResetStats() (int64, error) {
 	ctx := context.Background()
+	var gen int64
 	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+		// Bump the epoch FIRST, taking the stats_meta row exclusively. Every
+		// flush takes this row FOR SHARE before touching stats/app_stats, so
+		// holding the exclusive lock for the whole reset orders the bump after
+		// every in-flight flush and before every later one.
+		var err error
+		gen, err = bumpGeneration(ctx, tx, st.nowString())
+		if err != nil {
+			return err
+		}
 		// One timestamp for every rewritten row, so every global row and all
 		// per-app rows share it (the flush snapshot does the same).
 		ts := st.nowString()
@@ -272,8 +386,78 @@ func (st *State) ResetStats() error {
 	})
 	if err != nil {
 		st.log.Warn("State: reset stats failed", "error", err)
+		return 0, err
 	}
-	return err
+	return gen, nil
+}
+
+// bumpGeneration increments the global reset generation inside tx and returns
+// the new value. The UPDATE takes the stats_meta row exclusively, which is what
+// serializes a reset against every flush (each flush takes the same row FOR
+// SHARE): the single lock ordering — stats_meta first, then stats/app_stats —
+// means a reset and a flush (or a prune) can never deadlock. The stats_meta
+// seed row is created by initSchema, so the update always matches one row.
+func bumpGeneration(ctx context.Context, tx *sql.Tx, ts string) (int64, error) {
+	var gen int64
+	if err := tx.QueryRowContext(ctx,
+		`UPDATE stats_meta SET generation = generation + 1, updated_at = $1
+		 WHERE id = 'global' RETURNING generation`, ts).Scan(&gen); err != nil {
+		return 0, fmt.Errorf("bump stats generation: %w", err)
+	}
+	return gen, nil
+}
+
+// PruneStaleStats deletes stats and app_stats rows owned by workers OTHER than
+// this handle (st.owner) whose updated_at is older than retention, bounding the
+// table growth from workers that no longer exist. It returns the total number of
+// rows removed across both tables.
+//
+// A worker keeps its OWN row unconditionally (it is the live owner), even if its
+// updated_at looks stale — a temporarily quiet worker must not lose the
+// cumulative totals it will resume writing. Rows are matched by their RFC3339
+// UTC updated_at, which is lexicographically ordered and expressed at second
+// granularity: a row is stale when updated_at < now-retention. The zero row a
+// fresh ownership claim creates (updated_at = ”) is therefore immediately stale
+// for any OTHER worker, which is intended — an abandoned claim must not linger.
+//
+// Retention <= 0 is a no-op (compaction disabled) and deletes nothing. The whole
+// prune runs in one transaction that takes the stats_meta row FOR SHARE first,
+// so it serializes with a concurrent reset under the same lock ordering the
+// flush path uses. This is a best-effort compaction, not part of the flush's
+// correctness: a failure leaves rows in place and is reported to the caller.
+func (st *State) PruneStaleStats(ctx context.Context, retention time.Duration) (int, error) {
+	if retention <= 0 {
+		return 0, nil
+	}
+	cutoff := st.nowTime().Add(-retention).UTC().Format(time.RFC3339)
+	var deleted int64
+	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+		// Take the meta row FOR SHARE first, matching the flush path's lock
+		// ordering (meta before stats/app_stats) so a prune cannot deadlock
+		// with a reset's exclusive bump.
+		var one int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT 1 FROM stats_meta WHERE id = 'global' FOR SHARE`).Scan(&one); err != nil {
+			return err
+		}
+		for _, table := range []string{"stats", "app_stats"} {
+			res, err := tx.ExecContext(ctx,
+				`DELETE FROM `+table+` WHERE worker <> $1 AND updated_at < $2`, st.owner, cutoff)
+			if err != nil {
+				return err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			deleted += n
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return int(deleted), nil
 }
 
 // resetGlobalStatsTx zeroes every worker's stats row cumulative counters in

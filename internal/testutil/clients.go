@@ -42,7 +42,7 @@ func RequireRedis(t *testing.T) *redis.Client {
 // t.Cleanup.
 func RequireDocker(t *testing.T) *client.Client {
 	t.Helper()
-	cli, err := client.NewClientWithOpts(client.FromEnv)
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		t.Fatalf("docker integration test requires a Docker daemon (client: %v)", err)
 	}

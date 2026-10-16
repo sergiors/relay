@@ -465,7 +465,7 @@ func TestRecordStatsSnapshotMergesTimestampsThroughJSON(t *testing.T) {
 
 	// A flush observing no timestamp must preserve the stored one, while the
 	// absolute counters replace.
-	if err := c.RecordStatsSnapshot(context.Background(), Stats{EventsMatchedTotal: 2},
+	if _, err := c.RecordStatsSnapshot(context.Background(), -1, Stats{EventsMatchedTotal: 2},
 		[]AppStats{{App: "alpha", EventsMatchedTotal: 2, WarmAcquiresTotal: 9}}); err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
@@ -495,7 +495,7 @@ func TestRecordStatsSnapshotSelfHealsInvalidJSON(t *testing.T) {
 	}
 
 	exec := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
-	if err := c.RecordStatsSnapshot(ctx, Stats{EventsMatchedTotal: 1},
+	if _, err := c.RecordStatsSnapshot(ctx, -1, Stats{EventsMatchedTotal: 1},
 		[]AppStats{{App: "alpha", EventsMatchedTotal: 3, LastExecutionAt: exec}}); err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}

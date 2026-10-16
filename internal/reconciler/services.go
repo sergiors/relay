@@ -1148,7 +1148,8 @@ func RemoveAll(ctx context.Context, docker Docker, fnName string, log *slog.Logg
 }
 
 // ShutdownCleanup stops and removes every persistent service container owned
-// by THIS worker: relay.hostname == hostname (the consumer identity). Graceful
+// by THIS worker: relay.hostname == hostname (the worker identity, config
+// WORKER_ID). Graceful
 // Relay shutdown removes this worker's persistent service containers; crash
 // recovery remains handled by startup reconciliation.
 //

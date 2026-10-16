@@ -121,7 +121,7 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 		t.Fatalf("load apps: %v", err)
 	}
 
-	st, err := state.Open(context.Background(), state.Options{DSN: cfg.stateDSN, Owner: cfg.consumerName, Logger: logger})
+	st, err := state.Open(context.Background(), state.Options{DSN: cfg.stateDSN, Owner: "shutdown-test-worker", Instance: "shutdown-test-instance", Logger: logger})
 	if err != nil {
 		t.Fatalf("state open: %v", err)
 	}

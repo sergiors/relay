@@ -50,7 +50,7 @@ func TestRecordStatsSnapshotPersistsPoolCounters(t *testing.T) {
 	fns := []AppStats{
 		{App: "alpha", EventsMatchedTotal: 10, WarmAcquiresTotal: 7, ColdStartsTotal: 3, DiscardedTotal: 2},
 	}
-	if err := c.RecordStatsSnapshot(context.Background(), Stats{EventsMatchedTotal: 10}, fns); err != nil {
+	if _, err := c.RecordStatsSnapshot(context.Background(), -1, Stats{EventsMatchedTotal: 10}, fns); err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
 	s, ok := c.AppStats("alpha")
@@ -59,7 +59,7 @@ func TestRecordStatsSnapshotPersistsPoolCounters(t *testing.T) {
 	}
 
 	// A repeat flush with identical values is idempotent (absolute, not delta).
-	if err := c.RecordStatsSnapshot(context.Background(), Stats{EventsMatchedTotal: 10}, fns); err != nil {
+	if _, err := c.RecordStatsSnapshot(context.Background(), -1, Stats{EventsMatchedTotal: 10}, fns); err != nil {
 		t.Fatalf("second snapshot: %v", err)
 	}
 	s, _ = c.AppStats("alpha")

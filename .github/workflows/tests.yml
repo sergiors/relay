@@ -16,6 +16,10 @@ jobs:
       # The state-backed unit suite runs for real against this service; without
       # TEST_DATABASE_URL it would silently skip every state test.
       TEST_DATABASE_URL: postgres://relay:relay@localhost:5432/relay?sslmode=disable
+      # WORKER_ID is required by config.Load with no hostname or generated
+      # fallback, so CI provides a stable non-empty identity. Tests that pin the
+      # missing-WORKER_ID failure clear it themselves.
+      WORKER_ID: relay-ci
     services:
       postgres:
         image: postgres:17-alpine
@@ -55,6 +59,10 @@ jobs:
     env:
       DOCKER_BUILDKIT: 1
       TEST_DATABASE_URL: postgres://relay:relay@localhost:5432/relay?sslmode=disable
+      # WORKER_ID is required by config.Load with no hostname or generated
+      # fallback, so CI provides a stable non-empty identity. Tests that pin the
+      # missing-WORKER_ID failure clear it themselves.
+      WORKER_ID: relay-ci
     services:
       redis:
         image: redis:8-alpine

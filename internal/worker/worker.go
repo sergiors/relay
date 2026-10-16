@@ -469,7 +469,8 @@ func Run(logger *slog.Logger) error {
 	stateSpanCtx, stateSpan := tracing.Start(startupCtx, "state.initialize")
 	st, err := state.Open(stateSpanCtx, state.Options{
 		DSN:             cfg.DatabaseURL,
-		Owner:           cfg.ConsumerName,
+		Owner:           cfg.WorkerID,
+		Instance:        cfg.InstanceID,
 		Logger:          logger,
 		MaxOpenConns:    config.DefaultDatabaseMaxOpenConns,
 		MaxIdleConns:    config.DefaultDatabaseMaxIdleConns,
@@ -531,7 +532,7 @@ func Run(logger *slog.Logger) error {
 			m, err := runtime.NewManager(
 				logger,
 				metricsInstance,
-				cfg.ConsumerName,
+				cfg.WorkerID,
 				runtime.WithWarmContainerIdleTimeout(cfg.WarmContainerIdleTimeout),
 				// The SAME MAX_CONCURRENT_INVOCATIONS the runner's global semaphore uses:
 				// the runtime clips each app's effective per-app
@@ -748,6 +749,8 @@ func Run(logger *slog.Logger) error {
 	// after it. Shared by statsLoop, finalStatsFlush, and the socket reset
 	// command.
 	statsFlusher := newStatsFlusher(st, metricsInstance)
+	statsFlusher.retention = cfg.StatsRetention
+	statsFlusher.log = logger
 	shutdown.register(shutdownStep{
 		name:    shutdownStepStatsFlush,
 		timeout: 2 * time.Second,
@@ -792,7 +795,7 @@ func Run(logger *slog.Logger) error {
 	// containers to its template (manager is the Docker seam; secretProvider is
 	// the shared secrets resolver). Service containers now stop on graceful
 	// shutdown: the shutdown tail runs ShutdownCleanup for this worker's
-	// hostname (cfg.ConsumerName). The coordinator runs the per-app Applys
+	// identity (cfg.WorkerID). The coordinator runs the per-app Applys
 	// asynchronously (bounded workers, latest-desired-state coalescing), so
 	// startup never blocks on service convergence (e.g. an external image pull);
 	// the startup orphan
@@ -829,19 +832,19 @@ func Run(logger *slog.Logger) error {
 		name:    shutdownStepServiceCleanup,
 		timeout: shutdownServiceTimeout,
 		run: func(stepCtx context.Context) error {
-			return shutdownServices(stepCtx, svcCtrl, cfg.ConsumerName)
+			return shutdownServices(stepCtx, svcCtrl, cfg.WorkerID)
 		},
 	})
 
 	// Conservative startup orphan sweep: before any app is prepared or any
 	// container created, remove execution containers a previous Relay process on
-	// THIS hostname left behind (a crash mid-invocation). It is label- and
-	// hostname-scoped, so other workers' and non-Relay containers are untouched.
+	// THIS worker identity left behind (a crash mid-invocation). It is label- and
+	// identity-scoped, so other workers' and non-Relay containers are untouched.
 	// Bounded so the sweep can never hang startup; on timeout/error we log and
 	// continue, leaving the orphans for a later restart.
 	orphanCtx, orphanSpan := tracing.Start(startupCtx, "orphan.sweep")
 	sweepCtx, sweepCancel := context.WithTimeout(orphanCtx, reconcileTimeout)
-	n, sweepErr := manager.SweepOrphanContainers(sweepCtx, cfg.ConsumerName)
+	n, sweepErr := manager.SweepOrphanContainers(sweepCtx, cfg.WorkerID)
 	sweepCancel()
 	if sweepErr != nil {
 		// A cancelled lifecycle is a normal shutdown, not a sweep failure.
@@ -905,7 +908,7 @@ func Run(logger *slog.Logger) error {
 	runWorker := runner.NewWithMetrics(prepared, logger, metricsInstance)
 	// Stamp the relay.hostname label (the worker/consumer identity) on every
 	// execution container, so all invocations carry it.
-	runWorker.SetHostname(cfg.ConsumerName)
+	runWorker.SetHostname(cfg.WorkerID)
 	// Wire the shared secrets provider; a missing secret surfaces per-invocation,
 	// never at startup.
 	runWorker.SetSecretProvider(secretProvider)
@@ -932,7 +935,7 @@ func Run(logger *slog.Logger) error {
 		Client:            client,
 		Stream:            cfg.RedisStream,
 		Group:             cfg.RedisGroup,
-		Consumer:          cfg.ConsumerName,
+		Consumer:          cfg.WorkerID,
 		Log:               logger,
 		Metrics:           metricsInstance,
 		MaxBufferedEvents: cfg.MaxBufferedEvents,
@@ -1109,7 +1112,7 @@ func Run(logger *slog.Logger) error {
 	// for scheduler correctness, but it is NOT a global worker dependency:
 	// consumers, functions, services, metrics, logging, and tracing stay
 	// operational either way, and worker readiness deliberately excludes it.
-	wireSchedulerStorage(ctx, sched, st, schedulerStorageOpener(cfg.DatabaseURL, cfg.ConsumerName, logger, metricsInstance))
+	wireSchedulerStorage(ctx, sched, st, schedulerStorageOpener(cfg.DatabaseURL, logger, metricsInstance))
 	for _, fn := range apps {
 		sched.ReplaceApp(fn.Name, fn.Template)
 	}
@@ -1138,7 +1141,7 @@ func Run(logger *slog.Logger) error {
 	// hands superseded images back to the runner so it can remove them once no
 	// in-flight execution uses them. On removal, RemoveApp first deletes the
 	// app's Prometheus series (after the registry entry is swapped to nil)
-	// and retires its images; the flush sweep in recordSnapshots re-deletes any
+	// and retires its images; the flush sweep (statsFlusher.flush) re-deletes any
 	// series an in-flight invocation may have recreated, so the "removed app
 	// => no exposed series" invariant holds even mid-invocation.
 	rec := reconciler.New(
@@ -1338,10 +1341,19 @@ func Run(logger *slog.Logger) error {
 	workerReady.startReady(consumer, manager, cfg.Networks)
 	logger.Info("Worker ready to consume")
 
+	// The persisted stats rows are keyed by this stable worker identity; the
+	// instance id fences a stale process incarnation of the same worker out of
+	// the row. Both are logged so an operator can correlate `relay stats` rows
+	// with the process that owns them.
+	logger.Info("Worker stats identity",
+		"worker_id", cfg.WorkerID,
+		"instance_id", cfg.InstanceID,
+	)
+
 	logger.Info("Consuming stream",
 		"stream", cfg.RedisStream,
 		"group", cfg.RedisGroup,
-		"consumer", cfg.ConsumerName,
+		"consumer", cfg.WorkerID,
 	)
 	var consumeErr error
 	if err := consumer.Consume(ctx, runWorker.Handle); err != nil {
@@ -1809,18 +1821,19 @@ func wireSchedulerStorage(
 // schedulerStorageOpener returns the cron.OutboxOpener the worker's
 // storage-unavailable bootstrap uses to retry opening the scheduler's durable
 // outbox (the PostgreSQL state database) when the shared handle could not be
-// opened at startup. dsn is cfg.DatabaseURL and owner the worker's ConsumerName
-// in production; they are parameters so the retry path is unit-testable without
-// a real database. The opened *state.State is a scheduler-OWNED handle: cron
-// closes it after all scheduler work has stopped, so the shared global handle is
-// never touched. It deliberately opens an independent handle on the same DSN —
-// the smallest clean equivalent — and wires the same status observer so a
-// recovered store's status writes still project onto the app_status gauge.
-func schedulerStorageOpener(dsn, owner string, logger *slog.Logger, metricsInstance *metrics.Registry) cron.OutboxOpener {
+// opened at startup. dsn is cfg.DatabaseURL; it is a parameter so the retry path
+// is unit-testable without a real database. The opened *state.State is a
+// scheduler-OWNED handle: cron closes it after all scheduler work has stopped,
+// so the shared global handle is never touched. It deliberately opens an
+// independent handle on the same DSN — the smallest clean equivalent — and wires
+// the same status observer so a recovered store's status writes still project
+// onto the app_status gauge. It opens with NO stats owner: the handle exists only
+// for the schedule outbox and never writes stats rows, and an owner without a
+// paired instance is rejected by state.Open.
+func schedulerStorageOpener(dsn string, logger *slog.Logger, metricsInstance *metrics.Registry) cron.OutboxOpener {
 	return func() (cron.Outbox, io.Closer, error) {
 		st, err := state.Open(context.Background(), state.Options{
 			DSN:             dsn,
-			Owner:           owner,
 			Logger:          logger,
 			MaxOpenConns:    config.DefaultDatabaseMaxOpenConns,
 			MaxIdleConns:    config.DefaultDatabaseMaxIdleConns,
@@ -2579,7 +2592,7 @@ func cleanupStartupDependencies(lifecycle context.Context, manager *runtime.Mana
 // THIS worker's cumulative counters persisted in the state database, so the
 // first snapshot never resets them. The registry only knows this process's
 // lifetime, while the PostgreSQL stats rows are cumulative history; seeding
-// bridges them. Only the worker's OWN rows (keyed by its ConsumerName identity)
+// bridges them. Only the worker's OWN rows (keyed by its WorkerID identity)
 // are read — never another worker's, so two workers sharing one database never
 // double-count. It is nil-safe on both the registry and the state handle. Gauges
 // are deliberately NOT restored: they are point-in-time backlog snapshots
@@ -2838,23 +2851,149 @@ type statsFlusher struct {
 	// read and replaced under mu, so a concurrent flush always sees a coherent
 	// baseline. Zero value = "no reset yet".
 	baseline relayBaseline
+
+	// generation is this worker's last-known global reset epoch (see
+	// state.StatsGeneration). It starts at statsGenerationUnknown so the first
+	// flush adopts whatever epoch the database holds instead of a spurious
+	// rebase, and tracks the epoch every flush returns thereafter.
+	generation int64
+
+	// ownershipLost records that another process incarnation of the same
+	// WorkerID has claimed this worker's stats row, so this (stale) process must
+	// stop writing. It is terminal for the process: the instance id is fixed at
+	// startup and a stale incarnation can never reclaim the row, so the warning
+	// is logged once and no further writes are attempted.
+	ownershipLost bool
+
+	// retention bounds stale-owner row growth (see state.PruneStaleStats); <=0
+	// disables compaction. lastPrune throttles pruning to one attempt per
+	// retentionTickInterval(retention) after a successful flush.
+	retention time.Duration
+	lastPrune time.Time
+
+	// log records the one-time ownership-loss warning; it defaults to
+	// slog.Default() and the worker installs the process logger.
+	log *slog.Logger
 }
 
-// newStatsFlusher builds a flusher over the state handle and registry.
+// statsGenerationUnknown is the sentinel for "this process has not yet observed
+// the global reset epoch". A negative generation tells RecordStatsSnapshot to
+// adopt the stored epoch rather than treat the first flush as a reset race.
+const statsGenerationUnknown = -1
+
+// newStatsFlusher builds a flusher over the state handle and registry. retention
+// and the process logger are installed by the worker after construction; tests
+// that only exercise the flush path leave the defaults (no compaction, default
+// logger).
 func newStatsFlusher(st *state.State, metricsInstance *metrics.Registry) *statsFlusher {
-	return &statsFlusher{st: st, metrics: metricsInstance}
+	return &statsFlusher{st: st, metrics: metricsInstance, generation: statsGenerationUnknown, log: slog.Default()}
 }
 
 // flush captures the current Relay-visible snapshot and writes it in one short
-// transaction (see recordSnapshots). Held under mu so a concurrent ResetStats
-// cannot land between capture and write. Nil-safe on the flusher.
+// transaction, then opportunistically compacts stale owner rows. Held under mu
+// so a concurrent ResetStats cannot land between capture and write. Nil-safe on
+// the flusher.
 func (flusher *statsFlusher) flush(ctx context.Context) {
 	if flusher == nil {
 		return
 	}
 	flusher.mu.Lock()
 	defer flusher.mu.Unlock()
-	recordSnapshots(ctx, flusher.st, flusher.metrics, &flusher.baseline)
+	flusher.flushLocked(ctx)
+}
+
+// flushLocked does the flush work with mu already held. The write is fenced two
+// ways (see state.RecordStatsSnapshot): the epoch must match the flusher's
+// known generation, and this process incarnation must still own the stats row.
+// A reset that advanced the epoch is handled by rebasing to the registry's
+// current values and retrying ONCE, so the reset's zero is not immediately
+// re-counted; a lost ownership stops all writes.
+func (flusher *statsFlusher) flushLocked(ctx context.Context) {
+	// Sweep the registry against the live app set before snapshotting, so an app
+	// removed (or swept) this interval cannot persist a stale app_stats row that
+	// the orphan-prune would have to reject anyway, and cannot linger on
+	// /metrics.
+	//
+	// Fail-open: if the live set cannot be read (st.AppNames returns ok=false),
+	// the sweep is skipped entirely rather than run against an empty map — an
+	// empty live set would delete every app-scoped series, including live apps'.
+	// Sweeping is best-effort and re-applied on the next successful flush.
+	if names, ok := flusher.st.AppNames(); ok {
+		active := make(map[string]bool, len(names))
+		for _, name := range names {
+			active[name] = true
+		}
+		flusher.metrics.SweepAppMetrics(active)
+	}
+
+	// A stale incarnation must not write at all: writing would either fail the
+	// ownership predicate or race a reclaim, and any per-app write would be
+	// rejected after the global one anyway.
+	if flusher.ownershipLost {
+		return
+	}
+
+	// At most two attempts: the first under the known epoch; if a reset (possibly
+	// from another worker) advanced the epoch in the meantime, rebase the
+	// in-memory baseline to the registry's current values and retry once under
+	// the new epoch. A second advance is left for the next tick rather than
+	// looped on.
+	for attempt := 0; attempt < 2; attempt++ {
+		gen, err := flusher.st.RecordStatsSnapshot(
+			ctx,
+			flusher.generation,
+			snapshotStats(flusher.metrics, &flusher.baseline),
+			snapshotAppStats(flusher.metrics, &flusher.baseline),
+		)
+		switch {
+		case err == nil:
+			flusher.generation = gen
+			flusher.prune(ctx)
+			return
+		case errors.Is(err, state.ErrStatsResetAdvanced):
+			// The persisted rows were just zeroed by a reset. Rebase so the
+			// snapshot restarts from the reset point instead of re-adding the
+			// pre-reset totals, and adopt the epoch it happened under.
+			flusher.generation = gen
+			flusher.baseline = captureRelayBaseline(flusher.metrics)
+		case errors.Is(err, state.ErrStatsOwnershipLost):
+			if !flusher.ownershipLost {
+				flusher.ownershipLost = true
+				flusher.log.Warn(
+					"Stats: ownership lost; another process claimed this worker's stats row; stopping stats writes",
+					"worker", flusher.st.Owner(),
+				)
+			}
+			return
+		default:
+			// An unexpected failure is already logged by the state package; the
+			// next tick retries with the current absolute values.
+			return
+		}
+	}
+}
+
+// prune runs best-effort compaction of stale owner rows at most once per
+// retentionTickInterval, after a successful flush. retention <=0 disables it.
+// The attempted instant is recorded before the call so a persistent prune
+// failure does not retry on every tick; a failure is logged and deferred.
+func (flusher *statsFlusher) prune(ctx context.Context) {
+	if flusher.retention <= 0 {
+		return
+	}
+	now := time.Now()
+	if !flusher.lastPrune.IsZero() && now.Sub(flusher.lastPrune) < retentionTickInterval(flusher.retention) {
+		return
+	}
+	flusher.lastPrune = now
+	n, err := flusher.st.PruneStaleStats(ctx, flusher.retention)
+	if err != nil {
+		flusher.log.Warn("Stats: prune stale owners failed; will retry next interval", "error", err)
+		return
+	}
+	if n > 0 {
+		flusher.log.Info("Stats: pruned stale owner rows", "removed", n, "retention", flusher.retention)
+	}
 }
 
 // dropAppBaseline drops an app's entry from the worker-owned reset
@@ -2878,8 +3017,10 @@ func (flusher *statsFlusher) dropAppBaseline(name string) {
 // uses, so no captured pre-reset snapshot can be written after the reset. It
 // implements StatsResetter for the socket's `reset stats` command and never
 // mutates Prometheus: the registry keeps accumulating monotonically, and the
-// flush subtracts the baseline when it snapshots. A missing state handle (state
-// open failed at startup) reports an error so the socket answers
+// flush subtracts the baseline when it snapshots. The state reset bumps the
+// global generation, which the flusher adopts so its next flush does not mistake
+// its OWN reset for a concurrent one and rebase a second time. A missing state
+// handle (state open failed at startup) reports an error so the socket answers
 // stats_reset_failed and the CLI surfaces it rather than masking a failed worker
 // reset; the baseline is still captured so the in-memory totals continue from
 // zero.
@@ -2893,7 +3034,12 @@ func (flusher *statsFlusher) ResetStats() error {
 	if flusher.st == nil {
 		return errors.New("state database unavailable")
 	}
-	return flusher.st.ResetStats()
+	gen, err := flusher.st.ResetStats()
+	if err != nil {
+		return err
+	}
+	flusher.generation = gen
+	return nil
 }
 
 // statsLoop is the flush loop: it mirrors the in-memory metrics registry into
@@ -2937,55 +3083,4 @@ func finalStatsFlush(ctx context.Context, flusher *statsFlusher) {
 		return
 	}
 	flusher.flush(ctx)
-}
-
-// recordSnapshots writes the whole stats snapshot — the global stats row and
-// one app_stats row per app with any attributed activity — in a
-// single short transaction (see state.RecordStatsSnapshot). base is the
-// worker-owned reset baseline subtracted from every cumulative counter (nil =
-// no reset yet), so an operator reset starts the persisted totals from zero
-// while Prometheus stays monotonic. Before the write it enforces the
-// metrics/PostgreSQL consistency invariant: it sweeps the registry with
-// SweepAppMetrics against state.AppNames, deleting any app-scoped
-// series whose app no longer has a apps row. This complements the
-// reconciler's RemoveApp hook (which deletes series at removal time) by
-// re-deleting series an in-flight invocation may have recreated after removal —
-// a removed app exposes NO series on /metrics, and globals are untouched.
-// The transaction first prunes orphaned app_stats rows (a removed
-// app's row is not re-created even though its registry counters are swept
-// just above). Per-app writes are bounded by the app count, so the 5s
-// cadence keeps them small. A failed flush is logged and retried next tick with
-// the current absolute values; no path resets counters on failure.
-func recordSnapshots(
-	ctx context.Context,
-	st *state.State,
-	metricsInstance *metrics.Registry,
-	base *relayBaseline,
-) {
-	// Sweep the registry against the live app set before snapshotting, so
-	// an app removed (or swept) this interval cannot persist a stale
-	// app_stats row that the orphan-prune would have to reject anyway, and
-	// cannot linger on /metrics.
-	//
-	// Fail-open: if the live set cannot be read (st.AppNames returns
-	// ok=false), the sweep is skipped entirely rather than run against an empty
-	// map — an empty live set would delete every app-scoped series,
-	// including live apps'. Sweeping is best-effort and re-applied on the
-	// next successful flush; RecordStatsSnapshot below already logs the DB
-	// issue, so no new logging is added here.
-	if names, ok := st.AppNames(); ok {
-		active := make(map[string]bool, len(names))
-		for _, name := range names {
-			active[name] = true
-		}
-		metricsInstance.SweepAppMetrics(active)
-	}
-	// RecordStatsSnapshot logs internally on error (matching the state package's
-	// non-fatal style); the returned error is only for the caller to bound the
-	// write with a context.
-	_ = st.RecordStatsSnapshot(
-		ctx,
-		snapshotStats(metricsInstance, base),
-		snapshotAppStats(metricsInstance, base),
-	)
 }

@@ -90,7 +90,7 @@ func statsResetCommand(deps Dependencies) *cli.Command {
 				return err
 			}
 			defer cleanup()
-			if err := st.ResetStats(); err != nil {
+			if _, err := st.ResetStats(); err != nil {
 				return fmt.Errorf("stats reset: %w", err)
 			}
 			fmt.Fprintln(cmd.Writer, "Stats reset")

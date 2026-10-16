@@ -28,12 +28,12 @@ func waitForStatsRow(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-// TestRecordSnapshotsSweepsStaleAppSeries pins the flush-path invariant:
-// recordSnapshots sweeps the registry against the live app set (from the
+// TestStatsFlushSweepsStaleAppSeries pins the flush-path invariant: the flush
+// sweeps the registry against the live app set (from the
 // state DB), deleting series for an app whose apps row is gone even
 // though its series still linger in the registry, while live apps' series
 // and global counters survive in BOTH PostgreSQL and the registry.
-func TestRecordSnapshotsSweepsStaleAppSeries(t *testing.T) {
+func TestStatsFlushSweepsStaleAppSeries(t *testing.T) {
 	st := openTempState(t)
 	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
 	st.RecordDiscovered(stateApp("ghost", t.TempDir()))
@@ -52,7 +52,7 @@ func TestRecordSnapshotsSweepsStaleAppSeries(t *testing.T) {
 	// them after removal. globals are untouched by removal.
 	st.RecordRemoved("ghost")
 
-	recordSnapshots(context.Background(), st, m, nil)
+	newStatsFlusher(st, m).flush(context.Background())
 
 	// Ghost's PostgreSQL app_stats is absent (pre-existing orphan-prune/upsert
 	// behavior).
@@ -104,7 +104,7 @@ func TestReaddedAppPersistsFreshSeries(t *testing.T) {
 	// would on removal.
 	m.IncLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}})
 	m.IncLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}})
-	recordSnapshots(context.Background(), st, m, nil)
+	newStatsFlusher(st, m).flush(context.Background())
 	m.RemoveApp("alpha")
 
 	// Re-add: a fresh series at count 1.
@@ -112,7 +112,7 @@ func TestReaddedAppPersistsFreshSeries(t *testing.T) {
 	if !strings.Contains(m.Snapshot(), "app_events_matched_total{app=alpha} count=1") {
 		t.Fatalf("re-added alpha must count 1:\n%s", m.Snapshot())
 	}
-	recordSnapshots(context.Background(), st, m, nil)
+	newStatsFlusher(st, m).flush(context.Background())
 	a, ok := st.AppStats("alpha")
 	if !ok || a.EventsMatchedTotal != 1 {
 		t.Fatalf("alpha persisted = %+v, ok=%v; want events 1", a, ok)
@@ -121,7 +121,7 @@ func TestReaddedAppPersistsFreshSeries(t *testing.T) {
 
 // TestSweepSkippedOnStateReadError pins the fail-open sweep: when the live set
 // cannot be read (AppNames errors, here by closing the DB so every read on
-// the single pooled connection fails), recordSnapshots must NOT sweep against an
+// the single pooled connection fails), the flush must NOT sweep against an
 // empty live map — that would delete live apps' series. The sweep is
 // skipped entirely, so alpha and ghost series both survive in the registry (and
 // the flush itself is a no-op on the closed handle, logging internally without
@@ -147,7 +147,7 @@ func TestSweepSkippedOnStateReadError(t *testing.T) {
 	}
 
 	// Must not panic.
-	recordSnapshots(context.Background(), st, m, nil)
+	newStatsFlusher(st, m).flush(context.Background())
 
 	// Fail-open: BOTH alpha and ghost series survive the failed flush.
 	if fs := m.AppStatsSnapshot(); !metricsStat(fs, "alpha") || !metricsStat(fs, "ghost") {
@@ -164,7 +164,7 @@ func TestSweepSkippedOnStateReadError(t *testing.T) {
 	// Reopen on the same path (Open's schema init is idempotent) and flush; the
 	// ghost/live behavior resumes: ghost (now stale) is swept, alpha survives.
 	st2 := testutil.OpenState(t, dsn)
-	recordSnapshots(context.Background(), st2, m, nil)
+	newStatsFlusher(st2, m).flush(context.Background())
 
 	if fs := m.AppStatsSnapshot(); !metricsStat(fs, "alpha") {
 		t.Fatalf("alpha must survive the resumed flush:\n%+v", fs)
@@ -186,7 +186,7 @@ func metricsStat(fs []metrics.AppStat, name string) bool {
 
 // TestSnapshotStatsAndFuncSnapshotAreInMemoryOnly pins the hot-path contract:
 // updates go to the Prometheus registry only and the registry reflects them
-// immediately, while NO write reaches PostgreSQL until recordSnapshots runs once.
+// immediately, while NO write reaches PostgreSQL until the flush runs once.
 func TestSnapshotStatsAndFuncSnapshotAreInMemoryOnly(t *testing.T) {
 	m := metrics.New()
 	// Give alpha/beta apps rows so their app_stats survive the flush's
@@ -231,11 +231,11 @@ func TestSnapshotStatsAndFuncSnapshotAreInMemoryOnly(t *testing.T) {
 		t.Fatalf("success = %d, want %d", got, loops)
 	}
 
-	// A single recordSnapshots writes the absolute snapshot.
-	recordSnapshots(context.Background(), st, m, nil)
+	// A single flush writes the absolute snapshot.
+	newStatsFlusher(st, m).flush(context.Background())
 	gs, ok := st.Stats()
 	if !ok {
-		t.Fatal("expected stats row after recordSnapshots")
+		t.Fatal("expected stats row after flush")
 	}
 	if gs.EventsMatchedTotal != wantEvents {
 		t.Fatalf("persisted events = %d, want %d", gs.EventsMatchedTotal, wantEvents)
@@ -360,10 +360,10 @@ func TestFinalStatsFlushPersistsOnShutdown(t *testing.T) {
 	finalStatsFlush(context.Background(), nil)
 }
 
-// TestRecordSnapshotsIdempotent verifies recordSnapshots is idempotent: identical
+// TestStatsFlushIdempotent verifies the flush is idempotent: identical
 // registry values produce identical DB totals (and refresh updated_at), and a
 // later bump persists the new absolute value without delta accumulation.
-func TestRecordSnapshotsIdempotent(t *testing.T) {
+func TestStatsFlushIdempotent(t *testing.T) {
 	st := openTempState(t)
 	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
 	m := metrics.New()
@@ -372,13 +372,13 @@ func TestRecordSnapshotsIdempotent(t *testing.T) {
 	m.IncLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}})
 
 	ctx := context.Background()
-	recordSnapshots(ctx, st, m, nil)
+	newStatsFlusher(st, m).flush(ctx)
 	first, ok := st.Stats()
 	if !ok {
 		t.Fatal("expected stats row after first snapshot")
 	}
 
-	recordSnapshots(ctx, st, m, nil)
+	newStatsFlusher(st, m).flush(ctx)
 	second, ok := st.Stats()
 	if !ok {
 		t.Fatal("expected stats row after second snapshot")
@@ -393,7 +393,7 @@ func TestRecordSnapshotsIdempotent(t *testing.T) {
 	// Bump the registry; a single flush persists the new absolute value.
 	m.Inc(metrics.MetricEventsMatched)
 	m.Inc(metrics.MetricEventsMatched)
-	recordSnapshots(ctx, st, m, nil)
+	newStatsFlusher(st, m).flush(ctx)
 	gs, ok := st.Stats()
 	if !ok {
 		t.Fatal("expected stats row after bump flush")
@@ -444,7 +444,7 @@ func TestConcurrentIncrementsAndFlushRaceSafe(t *testing.T) {
 		}()
 	}
 
-	// 2 flush goroutines call recordSnapshots in a loop until the writers finish.
+	// 2 flush goroutines call flush in a loop until the writers finish.
 	var flushWG sync.WaitGroup
 	flushWG.Add(2)
 	for i := 0; i < 2; i++ {
@@ -455,7 +455,7 @@ func TestConcurrentIncrementsAndFlushRaceSafe(t *testing.T) {
 				case <-stopFlushes:
 					return
 				default:
-					recordSnapshots(ctx, st, m, nil)
+					newStatsFlusher(st, m).flush(ctx)
 				}
 			}
 		}()
@@ -467,7 +467,7 @@ func TestConcurrentIncrementsAndFlushRaceSafe(t *testing.T) {
 	cancel()
 
 	// A final flush pins the exact totals.
-	recordSnapshots(context.Background(), st, m, nil)
+	newStatsFlusher(st, m).flush(context.Background())
 
 	const total = writers * iters // 1600
 	gs, ok := st.Stats()

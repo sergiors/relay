@@ -46,7 +46,7 @@ func TestRecordStatsSnapshotSingleTransaction(t *testing.T) {
 		{App: "gone", EventsMatchedTotal: 5, HandlerSuccessTotal: 5},
 	}
 
-	if err := c.RecordStatsSnapshot(context.Background(), s, fns); err != nil {
+	if _, err := c.RecordStatsSnapshot(context.Background(), -1, s, fns); err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
 
@@ -81,7 +81,7 @@ func TestRecordStatsSnapshotSingleTransaction(t *testing.T) {
 	// A repeated flush with identical values: totals unchanged, updated_at
 	// refreshed (never goes backwards).
 	prevUpdated := gs.UpdatedAt
-	if err := c.RecordStatsSnapshot(context.Background(), s, fns); err != nil {
+	if _, err := c.RecordStatsSnapshot(context.Background(), -1, s, fns); err != nil {
 		t.Fatalf("second snapshot: %v", err)
 	}
 	gs, ok = c.Stats()
@@ -109,7 +109,7 @@ func TestRecordStatsSnapshotConditionalUpsertGuardsRemovedApp(t *testing.T) {
 		{App: "alpha", EventsMatchedTotal: 10},
 		{App: "ghost", EventsMatchedTotal: 99}, // never discovered, no apps row
 	}
-	if err := c.RecordStatsSnapshot(context.Background(), Stats{EventsMatchedTotal: 10}, fns); err != nil {
+	if _, err := c.RecordStatsSnapshot(context.Background(), -1, Stats{EventsMatchedTotal: 10}, fns); err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
 
@@ -140,7 +140,7 @@ func TestRecordStatsSnapshotFailureRetriesNextFlush(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	fns := []AppStats{{App: "alpha", EventsMatchedTotal: 5}}
-	if err := c.RecordStatsSnapshot(ctx, Stats{EventsMatchedTotal: 500, HandlerSuccessTotal: 300}, fns); err == nil {
+	if _, err := c.RecordStatsSnapshot(ctx, -1, Stats{EventsMatchedTotal: 500, HandlerSuccessTotal: 300}, fns); err == nil {
 		t.Fatal("expected error on a cancelled-context snapshot")
 	}
 
@@ -162,7 +162,7 @@ func TestRecordStatsSnapshotFailureRetriesNextFlush(t *testing.T) {
 
 	// A later successful flush with a live ctx persists the accumulated values.
 	want := Stats{EventsMatchedTotal: 500, HandlerSuccessTotal: 300, HandlerFailureTotal: 150, RetryTotal: 4, DLQTotal: 1}
-	if err := c.RecordStatsSnapshot(context.Background(), want, fns); err != nil {
+	if _, err := c.RecordStatsSnapshot(context.Background(), -1, want, fns); err != nil {
 		t.Fatalf("recovery snapshot: %v", err)
 	}
 	gs, ok = c.Stats()
@@ -186,7 +186,7 @@ func TestRecordStatsSnapshotAbsoluteNotDelta(t *testing.T) {
 	c := openTestState(t)
 	ctx := context.Background()
 
-	if err := c.RecordStatsSnapshot(ctx, Stats{EventsMatchedTotal: 100}, nil); err != nil {
+	if _, err := c.RecordStatsSnapshot(ctx, -1, Stats{EventsMatchedTotal: 100}, nil); err != nil {
 		t.Fatalf("first snapshot: %v", err)
 	}
 	gs, ok := c.Stats()
@@ -195,7 +195,7 @@ func TestRecordStatsSnapshotAbsoluteNotDelta(t *testing.T) {
 	}
 
 	// No new activity, identical value: still 100, not 200.
-	if err := c.RecordStatsSnapshot(ctx, Stats{EventsMatchedTotal: 100}, nil); err != nil {
+	if _, err := c.RecordStatsSnapshot(ctx, -1, Stats{EventsMatchedTotal: 100}, nil); err != nil {
 		t.Fatalf("second snapshot: %v", err)
 	}
 	gs, _ = c.Stats()
@@ -204,7 +204,7 @@ func TestRecordStatsSnapshotAbsoluteNotDelta(t *testing.T) {
 	}
 
 	// New activity raises the absolute total to 150.
-	if err := c.RecordStatsSnapshot(ctx, Stats{EventsMatchedTotal: 150}, nil); err != nil {
+	if _, err := c.RecordStatsSnapshot(ctx, -1, Stats{EventsMatchedTotal: 150}, nil); err != nil {
 		t.Fatalf("third snapshot: %v", err)
 	}
 	gs, _ = c.Stats()

@@ -91,13 +91,13 @@ func TestRecordStatsSnapshotTimestampsPersist(t *testing.T) {
 	c.RecordDiscovered(fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl)))
 
 	exec := time.Now().Add(-time.Minute).UTC()
-	if err := c.RecordStatsSnapshot(context.Background(), Stats{EventsMatchedTotal: 1},
+	if _, err := c.RecordStatsSnapshot(context.Background(), -1, Stats{EventsMatchedTotal: 1},
 		[]AppStats{{App: "alpha", EventsMatchedTotal: 1, LastExecutionAt: exec.Format(time.RFC3339)}}); err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
 
 	// A follow-up flush carries NO timestamps: the stored one must survive.
-	if err := c.RecordStatsSnapshot(context.Background(), Stats{EventsMatchedTotal: 2},
+	if _, err := c.RecordStatsSnapshot(context.Background(), -1, Stats{EventsMatchedTotal: 2},
 		[]AppStats{{App: "alpha", EventsMatchedTotal: 2}}); err != nil {
 		t.Fatalf("second snapshot: %v", err)
 	}

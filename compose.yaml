@@ -14,6 +14,7 @@ services:
 
     ports:
       - 9090:9090
+      - 8081:8081
 
     environment:
       - DOCKER_HOST=tcp://socket-proxy:2375
@@ -22,16 +23,15 @@ services:
       - REDIS_STREAM=events
       - REDIS_GROUP=relay
 
-      # The shared state database (operator state view, per-worker stats
-      # snapshots, and the durable schedule outbox). Relay refuses to start
-      # without it.
+      - WORKER_ID=relay
+
       - DATABASE_URL=postgres://relay:relay@postgres:5432/relay?sslmode=disable
 
       - TRAEFIK_NETWORK=traefik
       - TRAEFIK_HOST_OVERRIDE=localhost
 
       - METRICS_ADDR=:9090
-      # - GIT_WEBHOOK_ADDR=:8081
+      - GIT_WEBHOOK_ADDR=:8081
 
       - LOG_LEVEL=DEBUG
 
@@ -86,16 +86,12 @@ services:
       start_period: 5s
 
 
-  # The shared PostgreSQL state database. It is internal-only by default (no
-  # published port): Relay reaches it over the compose network by service DNS
-  # (DATABASE_URL above). Enable the commented port mapping only for local
-  # inspection with a client.
   postgres:
     image: postgres:17-alpine
     container_name: postgres
 
-    # ports:
-    #   - 5432:5432
+    ports:
+      - 5432:5432
 
     environment:
       - POSTGRES_USER=relay

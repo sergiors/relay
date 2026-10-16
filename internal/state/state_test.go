@@ -987,18 +987,19 @@ func TestEnvSecretsMappingsNilWhenAbsent(t *testing.T) {
 
 // TestStatsRelationalMetadataColumns pins the schema shape: only the stable
 // metadata columns exist on stats/app_stats (plus data), so no counter is
-// duplicated as a column.
+// duplicated as a column. The stats table additionally carries the ownership
+// instance that fences stale process incarnations.
 func TestStatsRelationalMetadataColumns(t *testing.T) {
 	c := openTestState(t)
 
 	statsCols := tableColumnSet(t, c, "stats")
-	for _, want := range []string{"worker", "data", "updated_at"} {
+	for _, want := range []string{"worker", "instance", "data", "updated_at"} {
 		if !statsCols[want] {
 			t.Errorf("stats missing metadata column %q: %v", want, statsCols)
 		}
 	}
-	if len(statsCols) != 3 {
-		t.Errorf("stats must have exactly worker/data/updated_at, got %v", statsCols)
+	if len(statsCols) != 4 {
+		t.Errorf("stats must have exactly worker/instance/data/updated_at, got %v", statsCols)
 	}
 
 	fnCols := tableColumnSet(t, c, "app_stats")
