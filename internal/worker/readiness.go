@@ -73,6 +73,14 @@ var (
 type readiness struct {
 	ready atomic.Bool
 
+	// ownershipLost is set the moment the ownership monitor detects the pinned
+	// WORKER_ID lock is no longer held. It is deliberately separate from the
+	// ready flag: the monitor sets it immediately (and clears ready), before the
+	// deferred shutdown clear, and Ready reports it distinctly so an operator can
+	// tell an ownership loss from an ordinary shutdown. A lost identity is
+	// reported not-ready even if the flag were somehow set true again.
+	ownershipLost atomic.Bool
+
 	// lifecycle is the worker's signal/lifecycle context, cancelled the moment
 	// shutdown begins — on SIGINT/SIGTERM or by the deferred stop — which can
 	// precede Run's setNotReady. It is read directly (context is concurrency
@@ -108,6 +116,18 @@ func (r *readiness) setNotReady() {
 	if r == nil {
 		return
 	}
+	r.ready.Store(false)
+}
+
+// setOwnershipLost records that the ownership monitor detected the pinned worker
+// lock is no longer held and immediately clears the ready flag, so a `relay
+// health` query stops reporting ready the moment the loss is known — before the
+// deferred shutdown clear. It is nil-safe and idempotent.
+func (r *readiness) setOwnershipLost() {
+	if r == nil {
+		return
+	}
+	r.ownershipLost.Store(true)
 	r.ready.Store(false)
 }
 
@@ -148,7 +168,15 @@ func (r *readiness) Ready(ctx context.Context) (bool, string) {
 		// A false flag means the worker has not crossed the ready-to-consume
 		// boundary yet: it is still starting. The socket only exists once the
 		// worker is running, so there is no "not running" case here.
+		if r.ownershipLost.Load() {
+			// Distinguished from "worker starting": the flag is false BECAUSE
+			// ownership was lost, not because startup is incomplete.
+			return false, "worker ownership lost"
+		}
 		return false, "worker starting"
+	}
+	if r.ownershipLost.Load() {
+		return false, "worker ownership lost"
 	}
 	if r.lifecycle != nil && r.lifecycle.Err() != nil {
 		return false, "worker shutting down"

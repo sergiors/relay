@@ -666,6 +666,11 @@ func TestBarrierStepsStrictlyJoinViaTheirRealConstructors(t *testing.T) {
 			close(release)
 		}, entered)
 	})
+	t.Run("ownership", func(t *testing.T) {
+		done := make(chan struct{})
+		step := ownershipBarrierStep(done, ownershipProof{}, nil)
+		assertBarrierRunBlocksPastCancelledContext(t, step, func() { close(done) })
+	})
 }
 
 // assertBarrierRunBlocksPastCancelledContext drives step.run with an already
@@ -718,11 +723,14 @@ func TestBarrierStepConstructorsMarkBarriers(t *testing.T) {
 	close(reconcilerDone)
 	loopDone := make(chan struct{})
 	close(loopDone)
+	ownershipDone := make(chan struct{})
+	close(ownershipDone)
 
 	cases := []struct {
 		name string
 		step shutdownStep
 	}{
+		{shutdownStepOwnership, ownershipBarrierStep(ownershipDone, ownershipProof{}, nil)},
 		{shutdownStepReconciler, reconcilerBarrierStep(reconcilerDone)},
 		{shutdownStepLoops, loopsBarrierStep([]<-chan struct{}{loopDone})},
 		{shutdownStepServicesJoin, servicesJoinBarrierStep(func(context.Context) error { return nil })},

@@ -41,18 +41,59 @@ rebuild keeps the previous working version; a 30s periodic pass is the backstop
 for missed watch events. `/apps` is read-only to Relay; all builds happen in
 temporary contexts.
 
-Shutdown cancels the lifecycle first, then runs ordered teardown steps (socket,
-scheduler, reconciler, housekeeping, services join/cleanup, loops, stats flush,
-metrics, webhook, manager, state, tracing, Redis last). Best-effort cleanup
-steps are bounded by an aggregate shutdown budget; a step failure or timeout is
-logged and never aborts the sequence. Steps that gate a shared dependency (the
-scheduler, reconciler, startup housekeeping, the service coordinator, and the
-background loops) are quiescence barriers: on a missed bound they are logged,
-cancelled, and then joined for real before later steps tear that dependency
-down, so they may exceed the budget by design rather than close a resource an
-operation is still using. A graceful shutdown performs a final bounded stats
-flush. The process lock is held for the whole run and released last (the kernel
-releases it if the process dies).
+Shutdown cancels the lifecycle first, then runs ordered teardown steps (ownership
+join and final ownership verification, socket, scheduler, reconciler,
+housekeeping, services join/cleanup, loops,
+stats flush, metrics, webhook, manager, state, tracing, Redis last). Best-effort
+cleanup steps are bounded by an aggregate shutdown budget; a step failure or
+timeout is logged and never aborts the sequence. Steps that gate a shared
+dependency (the ownership monitor, the scheduler, reconciler, startup
+housekeeping, the service coordinator, and the background loops) are quiescence
+barriers: on a missed bound they are logged, cancelled, and then joined for real
+before later steps tear that dependency down, so they may exceed the budget by
+design rather than close a resource an operation is still using. The ownership
+step joins the monitor and then runs one final bounded ownership verification on
+a fresh background context, so a lock lost after the monitor's last poll (but
+before shutdown cancelled the lifecycle) is still detected before any
+identity-scoped cleanup runs. A graceful shutdown performs a final bounded stats
+flush (after re-proving the lock). The process lock is held for the whole run and
+released last (the kernel releases it if the process dies).
+
+### Ownership loss
+
+The exclusive per-`WORKER_ID` PostgreSQL owner lock is the cross-process guarantee
+that two workers never share an identity. The worker re-verifies that lock
+periodically (every 2s, each check bounded to 1s) **on the same pinned connection
+that holds it**; it never checks out a replacement connection or re-acquires the
+lock, either of which could mask a loss. If the lock connection is lost while the
+process keeps running — a terminated backend, a broken link — the pinned
+connection's backend PID changes or the lock disappears, and verification fails
+**closed**.
+
+Detection is interval-bounded, not instantaneous (normally within about 3s of the
+loss), so a side effect scoped to the identity can still occur in that window. On
+detection the worker cancels its lifecycle, clears readiness immediately (so
+`relay health` stops reporting ready), logs **one** warning with `worker_id` and
+`instance_id`, and skips identity-scoped cleanup on the way out: it does not run
+its final stats flush or remove its service containers, and it skips its
+identity-scoped startup orphan sweeps, because a replacement process may already
+own the identity. It then exits with a distinctive ownership-loss error so the
+supervisor treats the exit as abnormal termination rather than a clean signal
+shutdown. Existing per-instance stats fencing remains as defense in depth for the
+window before detection.
+
+Because detection is interval-bounded, shutdown does not rely on the monitor
+alone. After the monitor's quiescence barrier joins, one final bounded
+verification runs on a fresh background context (never the already-cancelled
+lifecycle), and each identity-scoped cleanup step — the service-container
+cleanup, the final stats flush, and the startup orphan and service-orphan
+sweeps — re-proves the lock on the pinned connection immediately before acting.
+If any proof fails, the worker fails **closed**: it latches the loss and skips
+that identity-scoped work rather than risk disturbing a replacement owner. A
+single verification that stalls to its bound is an ambiguous result and
+therefore also fails closed. A loss detected only by the final verification
+still produces the same once-only side effects (one warning, readiness cleared,
+lifecycle cancelled, cleanup skipped).
 
 ## State paths and persistence
 
@@ -141,7 +182,9 @@ cleared first on shutdown; it is bound to the worker lifecycle context, so a
 lifecycle cancellation that precedes the clear also reports not-ready. In steady
 state the answer reflects live Redis consumer health, a bounded Docker ping, and
 `NETWORKS` verification, so a dependency failing reports unhealthy and recovery
-reports healthy again. Per-app degraded/unavailable/invalid status, PostgreSQL
+reports healthy again. A detected ownership loss clears readiness immediately and
+is reported distinctly (`worker ownership lost`) from an ordinary shutdown. Per-app
+degraded/unavailable/invalid status, PostgreSQL
 (and therefore the scheduler's storage state), optional tracing, and asynchronous
 service convergence/housekeeping do not gate worker health.
 

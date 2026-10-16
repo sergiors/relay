@@ -261,6 +261,22 @@ type State struct {
 	// returned to the pool mid-run; Close releases it, and PostgreSQL releases it
 	// if the process dies first.
 	ownerConn *sql.Conn
+	// ownerPID is the PostgreSQL backend PID (pg_backend_pid) of ownerConn,
+	// captured immediately after the lock is acquired. VerifyOwnerLock compares
+	// it so a silently replaced connection (a different backend that happens to
+	// lack the lock) is detected as a loss rather than a held lock. Zero for an
+	// ownerless handle.
+	ownerPID int
+	// ownerMu serializes EVERY access to the pinned lock connection (ownerConn):
+	// VerifyOwnerLock reads and queries it, and Close closes and clears it.
+	// database/sql serializes individual driver calls on a *sql.Conn but NOT a
+	// whole check, so two concurrent checks would interleave their calls and pgx
+	// would fail the overlap with "conn busy" — a spurious ownership loss; the
+	// mutex also stops VerifyOwnerLock reading the field while Close nils it. It
+	// is deliberately NARROW: it guards ONLY ownerConn, so every other State
+	// operation (the pool, reconcile/stats/outbox writes, CLI reads) stays fully
+	// concurrent.
+	ownerMu sync.Mutex
 	// nowFn is an injectable clock used to stamp updated_at/reconcile
 	// timestamps and the schedule_pending retention deadline. Production leaves
 	// it nil and falls back to time.Now, preserving behavior exactly; tests
@@ -383,6 +399,19 @@ func Open(ctx context.Context, opts Options) (*State, error) {
 		return nil, err
 	}
 	st.ownerConn = ownerConn
+	// Record the pinned backend's PID so VerifyOwnerLock can tell the lock
+	// connection apart from any replacement: a silently dropped and re-dialed
+	// connection would land on a backend that does not hold the lock, and the
+	// PID mismatch makes that a detected loss.
+	if ownerConn != nil {
+		pid, pidErr := backendPID(pingCtx, ownerConn)
+		if pidErr != nil {
+			_ = ownerConn.Close()
+			_ = db.Close()
+			return nil, fmt.Errorf("open state: %w", pidErr)
+		}
+		st.ownerPID = pid
+	}
 	// Claim ownership of this worker's stats row AFTER the schema exists and the
 	// worker lock is held, so a fresh owner gets a row and a restart re-stamps its
 	// (possibly next) incarnation without disturbing the prior totals (see
@@ -459,14 +488,22 @@ func (st *State) notifyStatus(name, status string) {
 // advisory lock, so a restart on the same WORKER_ID can reopen immediately;
 // PostgreSQL also releases the lock if the process dies without a clean Close.
 // It is non-fatal on error and safe on a nil receiver.
+//
+// Close serializes with VerifyOwnerLock through ownerMu: the pinned lock
+// connection is never closed or cleared while a verification is querying it. A
+// verification queued behind Close observes the cleared connection and fails
+// closed. Only the pinned connection is guarded; the pool Close stays outside
+// the mutex so unrelated database work is not serialized.
 func (st *State) Close() error {
 	if st == nil {
 		return nil
 	}
+	st.ownerMu.Lock()
 	if st.ownerConn != nil {
 		_ = st.ownerConn.Close()
 		st.ownerConn = nil
 	}
+	st.ownerMu.Unlock()
 	return st.db.Close()
 }
 

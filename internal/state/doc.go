@@ -228,7 +228,19 @@
 //     a per-owner EXCLUSIVE session advisory lock on a dedicated pinned
 //     connection for its whole lifetime: a second process presenting the same
 //     WORKER_ID fails Open with a clear error rather than silently sharing the
-//     identity (see Open/Close); ownerless CLI/admin handles never take it.
+//     identity (see Open/Close); ownerless CLI/admin handles never take it. The
+//     worker periodically re-verifies that pinned lock with VerifyOwnerLock
+//     (recording the connection's backend PID at open): if the lock connection
+//     is lost while the process keeps running (a terminated backend, a broken
+//     link) or the lock is released, it fails closed with ErrOwnerLockLost so
+//     the worker can cancel its lifecycle and skip identity-scoped cleanup
+//     before a replacement owner is disturbed. Detection is interval-bounded,
+//     not instantaneous (see OwnerLockCheckInterval). Every access to that one
+//     pinned connection — each check and Close — is serialized by ownerMu,
+//     because database/sql does not make a whole check atomic on one connection
+//     and pgx fails the overlapping calls with "conn busy"; the monitor and the
+//     startup/shutdown ownership proofs all share it. The lock is narrow
+//     (ownerConn only), so unrelated state work remains fully concurrent.
 //   - Transactions are short and hold no external I/O: fingerprints are computed
 //     before the transaction opens (see RebuildFromFS/RecordDiscovered), so a
 //     write transaction never blocks on the filesystem. Callers that already

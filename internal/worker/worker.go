@@ -13,6 +13,16 @@
 // failure at any step short-circuits every later phase; a lifecycle cancellation
 // during the preflight is a graceful shutdown.
 //
+// After the state database is opened (which takes an exclusive per-WORKER_ID
+// PostgreSQL session advisory lock) the worker starts an ownership monitor that
+// re-verifies that lock on its pinned connection; if the lock is lost while the
+// process keeps running, the monitor cancels the lifecycle, clears readiness,
+// and the worker exits with an ownership-loss error after skipping
+// identity-scoped cleanup. The same pinned-connection proof is re-run once after
+// the monitor joins at shutdown and again immediately before each identity-scoped
+// cleanup, so a loss missed between polls still fails closed — see
+// internal/worker/ownership.go and internal/state/ownership.go.
+//
 // Its in-memory accounting registry is always created and
 // is the single source of truth for the operational counters; the Prometheus
 // /metrics HTTP endpoint (see internal/observability/metrics) is an optional
@@ -351,7 +361,12 @@ func runExternalPreflight(
 // converges through the SAME deferred cleanup as a normal shutdown, rather than
 // abandoning live servers, goroutines, containers, and the state DB to process
 // exit.
-func Run(logger *slog.Logger) error {
+//
+// Errors are returned through the named runErr so the ownership-loss override
+// (registered before the shutdown defer, and therefore run after it) can join
+// errOwnershipLost into whatever the deferred teardown path returned; see
+// internal/worker/ownership.go.
+func Run(logger *slog.Logger) (runErr error) {
 	cfg, err := config.Load(logger)
 	if err != nil {
 		// Pre-resource failure: nothing owns cleanup yet, so return the error for
@@ -414,6 +429,20 @@ func Run(logger *slog.Logger) error {
 	// timeout and then strictly joined before any later step runs, so the
 	// aggregate budget bounds cleanup work, not process exit.
 	shutdown := &shutdownRegistry{}
+	// The ownership-loss latch. It is set once by the ownership monitor (started
+	// after state.Open) when the pinned WORKER_ID lock is detected no longer
+	// held, and is read by readiness, the identity-scoped shutdown guards, and
+	// the override defer below.
+	ownership := &ownershipLoss{}
+	// Ownership-loss error override. It is registered BEFORE the deferred
+	// shutdown so it runs AFTER it (defers run LIFO): teardown must complete
+	// first, then a detected loss turns Run's result into a distinctive error so
+	// the supervisor sees abnormal termination rather than a clean signal
+	// shutdown. Reading the latch at defer time also reports a loss detected
+	// after the consume loop returns.
+	defer func() {
+		runErr = ownershipRunError(ownership, runErr)
+	}()
 	// The worker's readiness state. Its flag starts false and is set true only at
 	// the ready-to-consume boundary (just before Consume, once every listener and
 	// loop is wired) and cleared as the FIRST instruction of the shutdown defer.
@@ -496,6 +525,31 @@ func Run(logger *slog.Logger) error {
 	// Metrics stay decoupled from state (state imports nothing
 	// observability-related; the worker owns the closure).
 	wireStatusObserver(st, metricsInstance)
+	// Start the periodic ownership monitor now that the WORKER_ID lock is held
+	// (state.Open took it) and the handle is wired, so a lock lost DURING the
+	// rest of startup is detected and cancels the lifecycle even before Consume.
+	// Its quiescence barrier is registered in the same breath, so an early
+	// startup failure after this point still joins the monitor (which reads the
+	// pinned lock connection) before the state handle closes in a later step.
+	//
+	// The once-only loss side effects and the fail-closed shutdown proof share
+	// ONE action (ownershipLossAction) and ONE proof seam, so a loss detected by
+	// the monitor, the final barrier verification, or an identity-cleanup guard
+	// latches exactly once and skips identity-scoped work the same way.
+	onOwnershipLost := ownershipLossAction(
+		ownership, workerReady, logger, cfg.WorkerID, cfg.InstanceID, stop,
+	)
+	proof := ownershipProof{
+		loss:   ownership,
+		verify: st.VerifyOwnerLock,
+		onLost: onOwnershipLost,
+	}
+	ownershipDone := startOwnershipMonitor(ctx, onOwnershipLost, ownershipMonitorConfig{
+		verify:   st.VerifyOwnerLock,
+		interval: state.OwnerLockCheckInterval,
+		timeout:  state.OwnerLockCheckTimeout,
+	})
+	shutdown.register(ownershipBarrierStep(ownershipDone, proof, logger))
 	// Registered before any further startup work, so an early failure after this
 	// point (and a normal shutdown) always releases the pool. The scheduler
 	// barrier (registered later) joins all scheduler work before this step runs.
@@ -754,10 +808,18 @@ func Run(logger *slog.Logger) error {
 	shutdown.register(shutdownStep{
 		name:    shutdownStepStatsFlush,
 		timeout: 2 * time.Second,
-		run: func(stepCtx context.Context) error {
-			finalStatsFlush(stepCtx, statsFlusher)
-			return nil
-		},
+		// Final stats are IDENTITY-SCOPED (they write this worker's row), so the
+		// flush is skipped once ownership is lost: a replacement process may
+		// already own the row and this worker's stale totals must not overwrite
+		// it. The guard re-proves the lock on the pinned connection immediately
+		// before the flush (a loss since the final barrier verification still
+		// suppresses it). The per-instance fence in the flush is defense in
+		// depth.
+		run: guardIdentityCleanup(proof, logger, shutdownStepStatsFlush,
+			func(stepCtx context.Context) error {
+				finalStatsFlush(stepCtx, statsFlusher)
+				return nil
+			}),
 	})
 
 	// The live runtime-pool query socket (see internal/worker/socket.go). It is
@@ -831,9 +893,16 @@ func Run(logger *slog.Logger) error {
 	shutdown.register(shutdownStep{
 		name:    shutdownStepServiceCleanup,
 		timeout: shutdownServiceTimeout,
-		run: func(stepCtx context.Context) error {
-			return shutdownServices(stepCtx, svcCtrl, cfg.WorkerID)
-		},
+		// Service cleanup stops and removes THIS worker's service containers
+		// (scoped by WORKER_ID), so it is skipped once ownership is lost: a
+		// replacement process may already own the identity and its containers.
+		// The guard re-proves the lock on the pinned connection immediately
+		// before the cleanup, so a loss during the (potentially long) teardown
+		// still suppresses it.
+		run: guardIdentityCleanup(proof, logger, shutdownStepServiceCleanup,
+			func(stepCtx context.Context) error {
+				return shutdownServices(stepCtx, svcCtrl, cfg.WorkerID)
+			}),
 	})
 
 	// Conservative startup orphan sweep: before any app is prepared or any
@@ -843,15 +912,24 @@ func Run(logger *slog.Logger) error {
 	// Bounded so the sweep can never hang startup; on timeout/error we log and
 	// continue, leaving the orphans for a later restart.
 	orphanCtx, orphanSpan := tracing.Start(startupCtx, "orphan.sweep")
-	sweepCtx, sweepCancel := context.WithTimeout(orphanCtx, reconcileTimeout)
-	n, sweepErr := manager.SweepOrphanContainers(sweepCtx, cfg.WorkerID)
-	sweepCancel()
-	if sweepErr != nil {
-		// A cancelled lifecycle is a normal shutdown, not a sweep failure.
-		orphanSpan.RecordError(sweepErr)
-		logStartupCleanupFailure(ctx, logger, "Startup: orphan container sweep failed", sweepErr)
-	} else if n > 0 {
-		logger.Info("Startup: removed orphan containers from a previous relay process", "count", n)
+	// A loss latched by the monitor (isLost short-circuits the proof) OR detected
+	// by a fresh bounded proof here skips the identity-scoped sweep: a
+	// replacement process may already own WORKER_ID and its containers. One
+	// check before the operation, not one per Docker object; the documented
+	// interval race DURING the sweep is retained.
+	if ownership.isLost() || proof.prove(0) != nil {
+		logger.Debug("Startup: skipping orphan container sweep after ownership loss")
+	} else {
+		sweepCtx, sweepCancel := context.WithTimeout(orphanCtx, reconcileTimeout)
+		n, sweepErr := manager.SweepOrphanContainers(sweepCtx, cfg.WorkerID)
+		sweepCancel()
+		if sweepErr != nil {
+			// A cancelled lifecycle is a normal shutdown, not a sweep failure.
+			orphanSpan.RecordError(sweepErr)
+			logStartupCleanupFailure(ctx, logger, "Startup: orphan container sweep failed", sweepErr)
+		} else if n > 0 {
+			logger.Info("Startup: removed orphan containers from a previous relay process", "count", n)
+		}
 	}
 	orphanSpan.End()
 
@@ -893,9 +971,20 @@ func Run(logger *slog.Logger) error {
 	}
 	housekeepingDone := startStartupHousekeeping(ctx, logger, startupHousekeeper{
 		exclusive: services.RunExclusive,
-		sweep:     func(hctx context.Context) { sweepStartupServiceOrphans(hctx, svcCtrl, liveNames) },
-		images:    func(hctx context.Context) { sweepStartupImages(hctx, manager, prepared, st, logger) },
-		deps:      func(hctx context.Context) { cleanupStartupDependencies(hctx, manager, logger) },
+		sweep: func(hctx context.Context) {
+			// The service-orphan sweep is identity-scoped (it lists and stops
+			// stale containers for THIS worker's services), so it is skipped
+			// once ownership is lost to avoid disturbing a replacement owner. A
+			// detail container made by a previous process on this identity is
+			// left for that replacement; a fresh bounded proof here also catches
+			// a loss since the monitor's previous poll.
+			if ownership.isLost() || proof.prove(0) != nil {
+				return
+			}
+			sweepStartupServiceOrphans(hctx, svcCtrl, liveNames)
+		},
+		images: func(hctx context.Context) { sweepStartupImages(hctx, manager, prepared, st, logger) },
+		deps:   func(hctx context.Context) { cleanupStartupDependencies(hctx, manager, logger) },
 	})
 	// barrier: the startup sweeps use the runtime manager and the state DB, so
 	// the manager/state teardown must wait for the pass to actually exit (not
@@ -1379,6 +1468,7 @@ func Run(logger *slog.Logger) error {
 // NOT teardown order (Redis is acquired first and released last) — so the order
 // is declared here rather than inherited from registration/LIFO.
 const (
+	shutdownStepOwnership      = "ownership"
 	shutdownStepSocket         = "socket"
 	shutdownStepScheduler      = "scheduler"
 	shutdownStepReconciler     = "reconciler"
@@ -1409,6 +1499,8 @@ const (
 //     logged, the context is cancelled, and the step is then strictly joined
 //     before the registry advances, so it may exceed both its own bound and the
 //     aggregate budget. Barriers:
+//     ownership (joins the lock monitor and runs the final fail-closed
+//     ownership verification before the state handle closes),
 //     scheduler (joins publisher callbacks before Redis closes), reconciler
 //     (writes state, drives the manager), housekeeping (startup sweeps use the
 //     manager and state DB), services-join (coordinator workers use manager and
@@ -1423,6 +1515,7 @@ const (
 // ignores its context is surfaced as a timeout and left running by design; none
 // of them is a join of a resource-holding operation.
 var shutdownStepOrder = []string{
+	shutdownStepOwnership,
 	shutdownStepSocket,
 	shutdownStepScheduler,
 	shutdownStepReconciler,
