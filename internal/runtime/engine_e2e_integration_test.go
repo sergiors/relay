@@ -129,6 +129,63 @@ async def completed(event):
 	}
 }
 
+// TestIntegrationPythonWarmLoopReuse drives two invocations through the SAME
+// warm Python container (the manager reuses the pooled process) and asserts the
+// handler sees one stable event loop: the first invocation records the running
+// loop and creates a module-level asyncio.Queue, the second must observe the
+// same live loop and reuse that Queue. The handler fails the invocation when the
+// loop changed or was closed, so a regression to a per-invocation loop fails
+// Execute rather than silently passing.
+func TestIntegrationPythonWarmLoopReuse(t *testing.T) {
+	testutil.RequireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: python3.14
+events:
+  - handler: handler.touch
+    pattern:
+      status: [COMPLETED]
+`)
+	writeFile(t, dir, "handler.py", `
+import asyncio
+
+_loop = None
+_queue = None
+_calls = 0
+
+async def touch(event):
+    global _loop, _queue, _calls
+    _calls += 1
+    current = asyncio.get_running_loop()
+    if _loop is None:
+        _loop = current
+        _queue = asyncio.Queue()
+    assert current is _loop, "event loop changed between invocations"
+    assert not _loop.is_closed(), "event loop was closed between invocations"
+    await _queue.put(event["event_id"])
+    reused = _queue._get_loop() is _loop
+    print("touch %s call=%d reused=%s" % (await _queue.get(), _calls, reused))
+`)
+
+	fn := app.App{Name: "py-warm-loop", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
+	m, _ := newManager(t)
+	out := newAppOutputSink(t)
+
+	prepared, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	for _, id := range []string{"1757-0", "1757-1"} {
+		if err := m.Execute(ctx, prepared, "handler.touch", []byte(`{"event_id":"`+id+`","status":"COMPLETED"}`), nil); err != nil {
+			t.Fatalf("execute %s: %v", id, err)
+		}
+	}
+	awaitAppOutput(t, ctx, out, "touch 1757-0 call=1 reused=True", "touch 1757-1 call=2 reused=True")
+}
+
 func TestIntegrationNodeEndToEnd(t *testing.T) {
 	testutil.RequireDocker(t)
 

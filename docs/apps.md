@@ -316,6 +316,22 @@ invocations. Per-invocation env values are applied exactly per request: a key a
 new request no longer carries is restored to its pre-Relay value (or removed), so
 a rotated or removed secret never leaks into a later invocation.
 
+For Python, the warm process also owns **one event loop for its whole lifetime**.
+Synchronous handlers are called inline on that loop while it is running, and an
+async handler (or any handler that returns an awaitable) is awaited on it.
+Because that loop is already running, a synchronous handler must not call
+`asyncio.run()` or `run_until_complete()` — both are errors on an
+already-running loop. This constrains only a handler that itself needs to drive
+a coroutine; a plain synchronous handler is unaffected, and a handler that needs
+asynchronous work should be written as an async handler (or return an
+awaitable), which Relay awaits on the same loop. A module-level asyncio
+resource — a lock, a queue, an HTTP client session — therefore binds to one
+stable loop and stays usable across invocations, instead of being orphaned when a
+per-invocation loop would have been created and closed. This is a **reuse
+optimization, not a durability or lifetime guarantee**: a container is discarded
+on a timeout, a protocol error, or an image change, and the process — with its
+module state and any loop-bound resource — ends when Relay stops the container.
+
 A container is pooled only while healthy; timeouts, process exits, protocol
 errors, image changes, and shutdown invalidate it. A healthy idle container is
 evicted after `WARM_CONTAINER_IDLE_TIMEOUT` (default `5m`). A container's
