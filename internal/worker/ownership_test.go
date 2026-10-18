@@ -470,6 +470,163 @@ func TestOwnershipRunError(t *testing.T) {
 	}
 }
 
+// TestGuardIdentitySnapshotCleanupSnapshotsProofsThenRemoves pins the security
+// ordering the guard exists for: discovery runs FIRST, the fresh bounded proof
+// SECOND, and removal LAST with exactly the captured candidates — never a
+// discovery after the proof.
+func TestGuardIdentitySnapshotCleanupSnapshotsProofsThenRemoves(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []string
+	)
+	record := func(s string) {
+		mu.Lock()
+		events = append(events, s)
+		mu.Unlock()
+	}
+
+	loss := &ownershipLoss{}
+	proof := ownershipProof{
+		loss: loss,
+		verify: func(context.Context) error {
+			record("proof")
+			return nil
+		},
+	}
+	candidates := []string{"a", "b"}
+	guarded := guardIdentitySnapshotCleanup(proof, nil, shutdownStepServiceCleanup,
+		func(context.Context) ([]string, error) {
+			record("discover")
+			return candidates, nil
+		},
+		func(_ context.Context, got []string) error {
+			record("remove")
+			if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+				t.Errorf("remove got %v, want exactly the captured candidates", got)
+			}
+			return nil
+		},
+	)
+	if err := guarded(context.Background()); err != nil {
+		t.Fatalf("guarded = %v, want nil", err)
+	}
+
+	mu.Lock()
+	got := append([]string(nil), events...)
+	mu.Unlock()
+	want := []string{"discover", "proof", "remove"}
+	if len(got) != len(want) {
+		t.Fatalf("event order = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("event order = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestGuardIdentitySnapshotCleanupLatchedLossSkipsEverything pins the
+// short-circuit: a latched loss runs neither discovery, the proof, nor removal
+// (no Docker round trip, no removal of a replacement owner's containers).
+func TestGuardIdentitySnapshotCleanupLatchedLossSkipsEverything(t *testing.T) {
+	var (
+		discoverCalls atomic.Int32
+		proofCalls    atomic.Int32
+		removeCalls   atomic.Int32
+	)
+	loss := &ownershipLoss{}
+	loss.lose()
+	proof := ownershipProof{
+		loss:   loss,
+		verify: func(context.Context) error { proofCalls.Add(1); return nil },
+	}
+	guarded := guardIdentitySnapshotCleanup(proof, nil, shutdownStepServiceCleanup,
+		func(context.Context) ([]string, error) { discoverCalls.Add(1); return []string{"a"}, nil },
+		func(context.Context, []string) error { removeCalls.Add(1); return nil },
+	)
+	if err := guarded(context.Background()); err != nil {
+		t.Fatalf("guarded = %v, want nil", err)
+	}
+	if discoverCalls.Load() != 0 || proofCalls.Load() != 0 || removeCalls.Load() != 0 {
+		t.Fatalf("calls after latched loss = discover:%d proof:%d remove:%d, want all 0",
+			discoverCalls.Load(), proofCalls.Load(), removeCalls.Load())
+	}
+}
+
+// TestGuardIdentitySnapshotCleanupFailedProofSkipsRemovalAndLatches pins the
+// fail-closed path: the snapshot happens, the fresh proof fails (the lock was
+// lost since the last poll), the shared loss action runs once, and the captured
+// containers are NOT removed.
+func TestGuardIdentitySnapshotCleanupFailedProofSkipsRemovalAndLatches(t *testing.T) {
+	var removeCalls atomic.Int32
+	loss := &ownershipLoss{}
+	var cancels atomic.Int32
+	proof := ownershipProof{
+		loss:   loss,
+		verify: func(context.Context) error { return errors.New("lock lost during cleanup") },
+		onLost: ownershipLossAction(loss, nil, nil, "worker-x", "inst-1", func() { cancels.Add(1) }),
+	}
+	guarded := guardIdentitySnapshotCleanup(proof, nil, shutdownStepServiceCleanup,
+		func(context.Context) ([]string, error) { return []string{"a"}, nil },
+		func(context.Context, []string) error { removeCalls.Add(1); return nil },
+	)
+	if err := guarded(context.Background()); err != nil {
+		t.Fatalf("guarded = %v, want nil (skipped)", err)
+	}
+	if removeCalls.Load() != 0 {
+		t.Fatalf("removal ran %d times after a failed proof, want 0", removeCalls.Load())
+	}
+	if !loss.isLost() {
+		t.Fatal("a failed fresh proof must latch the ownership loss")
+	}
+	if cancels.Load() != 1 {
+		t.Fatalf("loss action ran %d times, want exactly 1", cancels.Load())
+	}
+}
+
+// TestGuardIdentitySnapshotCleanupNoCandidatesSkipsProofAndRemoval pins that an
+// empty snapshot skips both the proof and the removal.
+func TestGuardIdentitySnapshotCleanupNoCandidatesSkipsProofAndRemoval(t *testing.T) {
+	var (
+		proofCalls  atomic.Int32
+		removeCalls atomic.Int32
+	)
+	proof := ownershipProof{
+		loss:   &ownershipLoss{},
+		verify: func(context.Context) error { proofCalls.Add(1); return nil },
+	}
+	guarded := guardIdentitySnapshotCleanup(proof, nil, shutdownStepServiceCleanup,
+		func(context.Context) ([]string, error) { return nil, nil },
+		func(context.Context, []string) error { removeCalls.Add(1); return nil },
+	)
+	if err := guarded(context.Background()); err != nil {
+		t.Fatalf("guarded = %v, want nil", err)
+	}
+	if proofCalls.Load() != 0 {
+		t.Fatalf("proof ran %d times with no candidates, want 0", proofCalls.Load())
+	}
+	if removeCalls.Load() != 0 {
+		t.Fatalf("removal ran %d times with no candidates, want 0", removeCalls.Load())
+	}
+}
+
+// TestGuardIdentitySnapshotCleanupPropagatesDiscoveryError pins that a discovery
+// failure is returned (so the shutdown registry surfaces it with its step name)
+// and removal never runs.
+func TestGuardIdentitySnapshotCleanupPropagatesDiscoveryError(t *testing.T) {
+	sentinel := errors.New("list containers: daemon down")
+	guarded := guardIdentitySnapshotCleanup(ownershipProof{loss: &ownershipLoss{}}, nil, shutdownStepServiceCleanup,
+		func(context.Context) ([]string, error) { return nil, sentinel },
+		func(context.Context, []string) error {
+			t.Fatal("removal must not run after a discovery error")
+			return nil
+		},
+	)
+	if err := guarded(context.Background()); !errors.Is(err, sentinel) {
+		t.Fatalf("guarded = %v, want the discovery error", err)
+	}
+}
+
 // waitClosed fails the test unless done closes within d (a deadlock guard, never
 // a sequencing wait).
 func waitClosed(t *testing.T, done <-chan struct{}, d time.Duration) {

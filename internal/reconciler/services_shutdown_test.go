@@ -156,3 +156,85 @@ func TestShutdownCleanupStopFailureDoesNotBlock(t *testing.T) {
 		t.Fatal("the failing container must remain (it could not be stopped)")
 	}
 }
+
+// TestDiscoverShutdownContainersSelectsOwnHostname pins the split discovery half:
+// it returns exactly the containers whose relay.hostname equals the argument
+// (hostname-scoped, empty hostname selects nothing) and stops nothing — the
+// caller decides removal.
+func TestDiscoverShutdownContainersSelectsOwnHostname(t *testing.T) {
+	f := newFakeDocker()
+	seed := func(id, hostname string) {
+		f.ctrs[id] = &fakeContainer{
+			id: id, appName: "fn", entrypoint: "svc.js", image: "img-1",
+			port: 80, replica: 0, state: container.StateRunning, hostname: hostname,
+		}
+	}
+	seed("w1-b", "w1")
+	seed("w1-a", "w1")
+	seed("w2-a", "w2")
+	seed("none-a", "")
+
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	own, err := c.DiscoverShutdownContainers(context.Background(), "w1")
+	if err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	if len(own) != 2 || own[0].ID != "w1-a" || own[1].ID != "w1-b" {
+		t.Fatalf("discovered %+v, want [w1-a w1-b] (own hostname only)", own)
+	}
+	if len(f.stops) != 0 {
+		t.Fatalf("discovery stopped %v, want none (discovery must not remove)", f.stops)
+	}
+
+	none, err := c.DiscoverShutdownContainers(context.Background(), "")
+	if err != nil {
+		t.Fatalf("discover empty hostname: %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("empty hostname discovered %+v, want none", none)
+	}
+}
+
+// TestRemoveShutdownContainersRemovesCapturedOnlyAndPreservesReplacement pins the
+// property the snapshot-before-proof ordering relies on: removal stops exactly
+// the captured containers and a container created AFTER the snapshot (a
+// replacement owner's fresh container, with a new immutable id) survives
+// untouched because removal never re-lists the daemon.
+func TestRemoveShutdownContainersRemovesCapturedOnlyAndPreservesReplacement(t *testing.T) {
+	f := newFakeDocker()
+	for _, id := range []string{"w1-a", "w1-b"} {
+		f.ctrs[id] = &fakeContainer{
+			id: id, appName: "fn", entrypoint: "svc.js", image: "img-1",
+			port: 80, replica: 0, state: container.StateRunning, hostname: "w1",
+		}
+	}
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+
+	own, err := c.DiscoverShutdownContainers(context.Background(), "w1")
+	if err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	if len(own) != 2 {
+		t.Fatalf("discovered %+v, want 2", own)
+	}
+
+	// A replacement owner reusing WORKER_ID starts a NEW service container after
+	// the snapshot. It must survive the removal of the captured set.
+	f.ctrs["replacement"] = &fakeContainer{
+		id: "replacement", appName: "fn", entrypoint: "svc.js", image: "img-1",
+		port: 80, replica: 0, state: container.StateRunning, hostname: "w1",
+	}
+
+	if err := c.RemoveShutdownContainers(context.Background(), own); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if got := len(f.stops); got != 2 {
+		t.Fatalf("stops = %v, want exactly the two captured containers", f.stops)
+	}
+	f.mu.Lock()
+	_, alive := f.ctrs["replacement"]
+	f.mu.Unlock()
+	if !alive {
+		t.Fatal("a container created after the snapshot must survive (removal must not re-list)")
+	}
+}

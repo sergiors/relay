@@ -1161,33 +1161,68 @@ func RemoveAll(ctx context.Context, docker Docker, fnName string, log *slog.Logg
 // A container with an empty Hostname is NOT claimed by any worker: the hostname
 // is unmatchable, so ownership is unknowable — startup reconciliation handles
 // such strays. As a defensive guard, an empty hostname argument selects nothing.
+//
+// It is the convenience form of the split cleanup (DiscoverShutdownContainers
+// then RemoveShutdownContainers) under ONE lock hold, preserving the historical
+// list-and-stop atomicity. Callers that must prove ownership BETWEEN discovery
+// and removal (the worker's shutdown step) call the two halves directly, so the
+// ownership proof runs after the snapshot and before any removal.
 func (c *ServiceReconciler) ShutdownCleanup(ctx context.Context, hostname string) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if hostname == "" {
+	own, err := c.discoverShutdownLocked(ctx, hostname)
+	if err != nil {
+		return 0, err
+	}
+	if len(own) == 0 {
 		return 0, nil
+	}
+	return len(own), c.removeShutdownLocked(ctx, own)
+}
+
+// discoverShutdownLocked selects THIS worker's persistent service containers:
+// every discovered service container whose relay.hostname label equals hostname.
+// It is the DISCOVERY half of ShutdownCleanup, split out so the caller can prove
+// ownership before any removal, and it must be called with c.mu held (see the
+// locked wrappers DiscoverShutdownContainers and ShutdownCleanup).
+//
+// Strict equality: a container without a hostname label is not claimed by any
+// worker's shutdown (ownership unknowable; startup reconciliation handles
+// strays). An empty hostname is unmatchable, so nothing is selected — a
+// defensive guard for a caller that somehow has no worker identity.
+func (c *ServiceReconciler) discoverShutdownLocked(ctx context.Context, hostname string) ([]runtime.ServiceContainer, error) {
+	if hostname == "" {
+		return nil, nil
 	}
 	containers, err := c.docker.ServiceContainerList(ctx)
 	if err != nil {
 		logErr := fmt.Errorf("service: list containers: %w", err)
 		c.log.Warn("Service: shutdown cleanup failed", "error", logErr)
-		return 0, logErr
+		return nil, logErr
 	}
 	var own []runtime.ServiceContainer
 	for _, ct := range containers {
-		// Strict equality: a container without a hostname label is not claimed
-		// by any worker's shutdown (ownership unknowable; startup reconciliation
-		// handles strays).
 		if ct.Hostname == hostname {
 			own = append(own, ct)
 		}
 	}
 	if len(own) == 0 {
 		c.log.Debug("Service: shutdown cleanup: nothing to clean", "hostname", hostname)
-		return 0, nil
 	}
-	err = c.docker.StopServiceContainers(ctx, own)
+	return own, nil
+}
+
+// removeShutdownLocked stops and removes exactly the given service containers.
+// It is the REMOVAL half of ShutdownCleanup and must be called with c.mu held.
+// It never re-lists the daemon: the caller passes the containers captured by
+// discoverShutdownLocked, so a replacement container created AFTER that snapshot
+// is never stopped (its id is not in the captured set).
+func (c *ServiceReconciler) removeShutdownLocked(ctx context.Context, own []runtime.ServiceContainer) error {
+	if len(own) == 0 {
+		return nil
+	}
+	err := c.docker.StopServiceContainers(ctx, own)
 	if err != nil {
 		// StopServiceContainers keeps the partial progress (everything it
 		// could stop/remove is gone); the error is still returned to the
@@ -1196,7 +1231,29 @@ func (c *ServiceReconciler) ShutdownCleanup(ctx context.Context, hostname string
 	} else {
 		c.log.Info("Service: shutdown cleanup complete", "containers", len(own))
 	}
-	return len(own), err
+	return err
+}
+
+// DiscoverShutdownContainers returns THIS worker's persistent service containers
+// (relay.hostname == hostname) for graceful-shutdown removal. It is the
+// discovery half of ShutdownCleanup, exported so the worker can snapshot the
+// candidates, prove ownership on its pinned lock, and only then remove the
+// captured containers (RemoveShutdownContainers) — never re-listing after the
+// proof, which is what keeps a replacement owner's containers safe.
+func (c *ServiceReconciler) DiscoverShutdownContainers(ctx context.Context, hostname string) ([]runtime.ServiceContainer, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.discoverShutdownLocked(ctx, hostname)
+}
+
+// RemoveShutdownContainers stops and removes exactly the given containers. It is
+// the removal half of ShutdownCleanup, exported for the worker's snapshot →
+// ownership-proof → remove ordering, and by construction only ever touches the
+// containers it is given (immutable IDs captured before the proof).
+func (c *ServiceReconciler) RemoveShutdownContainers(ctx context.Context, containers []runtime.ServiceContainer) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.removeShutdownLocked(ctx, containers)
 }
 
 // ServiceReconciler ties Reconcile, RemoveAll, SweepOrphans, and ShutdownCleanup
@@ -1409,14 +1466,57 @@ func (c *ServiceReconciler) Remove(ctx context.Context, fnName string) {
 // from a previous boot on this host). hostname is deliberately NOT part of the
 // predicate, matching the runtime's documented same-host-restart limitation.
 // Called once at startup after the per-app Applys.
+//
+// It is the convenience form of the split cleanup (DiscoverOrphanContainers
+// then RemoveOrphanContainers) under ONE lock hold, preserving the historical
+// list-and-stop atomicity. Callers that must prove ownership BETWEEN discovery
+// and removal (the worker's startup housekeeping) call the two halves directly,
+// so the ownership proof runs after the candidate snapshot and before any
+// removal.
 func (c *ServiceReconciler) SweepOrphans(ctx context.Context, liveApps map[string]bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	stale, err := c.discoverOrphansLocked(ctx, liveApps)
+	if err != nil {
+		// discoverOrphansLocked already logged the failure.
+		return
+	}
+	if len(stale) == 0 {
+		return
+	}
+	// removeOrphansLocked already logged the outcome (failure or success).
+	_ = c.removeOrphansLocked(ctx, stale)
+}
+
+// DiscoverOrphanContainers returns every discovered service container whose app
+// is not in liveApps (an app removed while Relay was down, or a stale container
+// from a previous boot on this host). It is the DISCOVERY half of SweepOrphans,
+// split out so the caller can snapshot the candidates, prove ownership on its
+// pinned lock, and only then remove the captured containers
+// (RemoveOrphanContainers) — never re-listing after the proof, which is what
+// keeps a replacement owner's containers safe. It stops nothing.
+//
+// The app-live predicate is the same one SweepOrphans has always used; hostname
+// is deliberately NOT part of it, matching the runtime's documented
+// same-host-restart limitation. A list failure is returned unchanged (and logged)
+// so the caller can surface it with its own context.
+func (c *ServiceReconciler) DiscoverOrphanContainers(ctx context.Context, liveApps map[string]bool) ([]runtime.ServiceContainer, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.discoverOrphansLocked(ctx, liveApps)
+}
+
+// discoverOrphansLocked selects the containers SweepOrphans would remove: every
+// discovered service container whose app is not in liveApps. It must be called
+// with c.mu held (see the locked wrappers DiscoverOrphanContainers and
+// SweepOrphans). A list failure is logged ("Service: orphan sweep list failed")
+// and returned unchanged.
+func (c *ServiceReconciler) discoverOrphansLocked(ctx context.Context, liveApps map[string]bool) ([]runtime.ServiceContainer, error) {
 	containers, err := c.docker.ServiceContainerList(ctx)
 	if err != nil {
 		c.log.Warn("Service: orphan sweep list failed", "error", err)
-		return
+		return nil, err
 	}
 	var stale []runtime.ServiceContainer
 	for _, ct := range containers {
@@ -1424,14 +1524,37 @@ func (c *ServiceReconciler) SweepOrphans(ctx context.Context, liveApps map[strin
 			stale = append(stale, ct)
 		}
 	}
+	return stale, nil
+}
+
+// RemoveOrphanContainers stops and removes exactly the given service containers.
+// It is the REMOVAL half of SweepOrphans, exported for the worker's snapshot →
+// ownership-proof → remove ordering, and by construction only ever touches the
+// containers it is given (the IDs captured before the proof).
+func (c *ServiceReconciler) RemoveOrphanContainers(ctx context.Context, stale []runtime.ServiceContainer) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.removeOrphansLocked(ctx, stale)
+}
+
+// removeOrphansLocked stops and removes exactly the given containers and must be
+// called with c.mu held (see RemoveOrphanContainers and SweepOrphans). It never
+// re-lists the daemon: the caller passes the containers captured by
+// discoverOrphansLocked, so a replacement container created AFTER that snapshot
+// is never stopped (its id is not in the captured set). A stop failure is logged
+// ("Service: orphan sweep stop failed") and returned unchanged; a success is
+// logged ("Service: swept orphan containers") with the removed count. An empty
+// set is a no-op.
+func (c *ServiceReconciler) removeOrphansLocked(ctx context.Context, stale []runtime.ServiceContainer) error {
 	if len(stale) == 0 {
-		return
+		return nil
 	}
 	if err := c.docker.StopServiceContainers(ctx, stale); err != nil {
 		c.log.Warn("Service: orphan sweep stop failed", "count", len(stale), "error", err)
-		return
+		return err
 	}
 	c.log.Info("Service: swept orphan containers",
 		"count", len(stale),
 	)
+	return nil
 }

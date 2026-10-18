@@ -99,9 +99,11 @@ func TestStartupHousekeepingSweepBoundReleasesExclusive(t *testing.T) {
 	resumeObserved := make(chan struct{})
 	done := startStartupHousekeeping(housekeeping, logger, startupHousekeeper{
 		exclusive: coordinator.RunExclusive,
-		sweep:     func(hctx context.Context) { sweepStartupServiceOrphans(hctx, svcCtrl, map[string]bool{"alpha": true}) },
-		images:    func(context.Context) {},
-		deps:      func(context.Context) { close(resumeObserved) },
+		sweep: func(hctx context.Context) {
+			sweepStartupServiceOrphans(hctx, svcCtrl, map[string]bool{"alpha": true}, ownershipProof{}, logger)
+		},
+		images: func(context.Context) {},
+		deps:   func(context.Context) { close(resumeObserved) },
 	})
 
 	select {

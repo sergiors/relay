@@ -769,6 +769,87 @@ func TestSweepOrphans(t *testing.T) {
 	}
 }
 
+// TestDiscoverOrphanContainersFiltersLiveAppsAndStopsNothing pins the split
+// discovery half: it returns exactly the containers whose app is NOT live (the
+// historical app-live predicate) and stops nothing — the caller decides removal
+// after its ownership proof.
+func TestDiscoverOrphanContainersFiltersLiveAppsAndStopsNothing(t *testing.T) {
+	f := newFakeDocker()
+	seed := func(id, appName string) {
+		f.ctrs[id] = &fakeContainer{
+			id: id, appName: appName, entrypoint: "svc.js", image: "img-1",
+			port: 80, state: container.StateRunning,
+		}
+	}
+	seed("live-1", "live")
+	seed("ghost-b", "ghost")
+	seed("ghost-a", "ghost")
+
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	stale, err := c.DiscoverOrphanContainers(context.Background(), map[string]bool{"live": true})
+	if err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	ids := make([]string, 0, len(stale))
+	for _, sc := range stale {
+		ids = append(ids, sc.ID)
+	}
+	sort.Strings(ids)
+	if len(ids) != 2 || ids[0] != "ghost-a" || ids[1] != "ghost-b" {
+		t.Fatalf("discovered %v, want the two ghost containers only", ids)
+	}
+	if len(f.stops) != 0 {
+		t.Fatalf("discovery stopped %v, want none (discovery must not remove)", f.stops)
+	}
+	if got := f.countForApp("live"); got != 1 {
+		t.Fatalf("live count = %d, want 1 (untouched)", got)
+	}
+}
+
+// TestRemoveOrphanContainersRemovesCapturedOnlyAndPreservesReplacement pins the
+// property the snapshot-before-proof ordering relies on: removal stops exactly
+// the captured containers and a container created AFTER the snapshot (a
+// replacement owner's container, or one a concurrent reconcile left) survives
+// untouched because removal never re-lists the daemon.
+func TestRemoveOrphanContainersRemovesCapturedOnlyAndPreservesReplacement(t *testing.T) {
+	f := newFakeDocker()
+	for _, id := range []string{"ghost-a", "ghost-b"} {
+		f.ctrs[id] = &fakeContainer{
+			id: id, appName: "ghost", entrypoint: "svc.js", image: "img-1",
+			port: 80, state: container.StateRunning,
+		}
+	}
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+
+	stale, err := c.DiscoverOrphanContainers(context.Background(), map[string]bool{"live": true})
+	if err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	if len(stale) != 2 {
+		t.Fatalf("discovered %+v, want 2", stale)
+	}
+
+	// A NEW orphan appears after the snapshot. Removal must not touch it: it was
+	// not in the captured set, and removal must not re-list.
+	f.ctrs["late"] = &fakeContainer{
+		id: "late", appName: "ghost", entrypoint: "svc.js", image: "img-1",
+		port: 80, state: container.StateRunning,
+	}
+
+	if err := c.RemoveOrphanContainers(context.Background(), stale); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if got := len(f.stops); got != 2 {
+		t.Fatalf("stops = %v, want exactly the two captured containers", f.stops)
+	}
+	f.mu.Lock()
+	_, alive := f.ctrs["late"]
+	f.mu.Unlock()
+	if !alive {
+		t.Fatal("a container created after the snapshot must survive (removal must not re-list)")
+	}
+}
+
 func TestBuildEnvOrdering(t *testing.T) {
 	tmpl := &app.Template{
 		Runtime: "node24",
@@ -1142,6 +1223,48 @@ func TestReconcileUnchangedIsNoOp(t *testing.T) {
 	}
 	if got := f.runningCount("fn", "service.js"); got != 1 {
 		t.Fatalf("running = %d, want 1 (untouched)", got)
+	}
+}
+
+// TestServiceReconcilerAdoptsConvergedContainerSameID pins the captured
+// service-container audit finding: the service reconciler is label-derived and
+// deliberately NOT process- or hostname-scoped, so a FRESH reconciler standing
+// in for a replacement incarnation that reuses WORKER_ID ADOPTS a running,
+// label-converged service container in place — the SAME physical Docker id, with
+// no new start and no stop. This is why the shutdown service cleanup cannot rely
+// on "a replacement only ever creates NEW ids" and instead gates removal on the
+// fail-closed ownership proof (see guardIdentitySnapshotCleanup).
+func TestServiceReconcilerAdoptsConvergedContainerSameID(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	logger := testutil.DiscardLogger()
+
+	// Incarnation A converges one replica onto an empty daemon: id-1.
+	a := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
+	if err := a.Apply(context.Background(), "fn", tmpl, "img-1", nil); err != nil {
+		t.Fatalf("incarnation A apply: %v", err)
+	}
+	if _, ok := f.containerByID("id-1"); !ok {
+		t.Fatal("incarnation A must have created id-1")
+	}
+
+	// Incarnation B reuses the same WORKER_ID with a FRESH reconciler (empty
+	// source-apply tracker). It must retain the converged, running id-1 in place.
+	b := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
+	if err := b.Apply(context.Background(), "fn", tmpl, "img-1", nil); err != nil {
+		t.Fatalf("incarnation B apply: %v", err)
+	}
+	if _, ok := f.containerByID("id-1"); !ok {
+		t.Fatal("incarnation B must retain id-1 (adopted in place, not recreated)")
+	}
+	if _, ok := f.containerByID("id-2"); ok {
+		t.Fatal("incarnation B started a NEW container (id-2); it must adopt id-1 in place")
+	}
+	if got := len(f.stops); got != 0 {
+		t.Fatalf("stops = %v, want none (the adopted container is not replaced)", f.stops)
+	}
+	if got := f.runningCount("fn", "service.js"); got != 1 {
+		t.Fatalf("running = %d, want 1", got)
 	}
 }
 

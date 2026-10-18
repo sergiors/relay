@@ -279,6 +279,91 @@ func guardIdentityCleanup(
 	}
 }
 
+// guardIdentitySnapshotCleanup wraps an identity-scoped cleanup that REMOVES
+// discovered Docker objects (this worker's orphan execution containers, its
+// service containers) in the single-proof ordering that shrinks the takeover
+// race as far as a non-atomic cross-system check can: SNAPSHOT the candidates
+// first, run ONE fresh bounded ownership proof second, and remove exactly the
+// captured objects third. It never discovers after the proof. Other orderings
+// (for example a proof followed by a re-listing) are not equivalent and can
+// remove a replacement owner's objects; this is the ordering every caller that
+// takes a SINGLE proof must use.
+//
+// The ordering removes one specific race. If discovery ran AFTER a successful
+// proof, ownership could be lost in the proof→discovery gap and a replacement
+// that took over WORKER_ID would have its objects listed and removed. With
+// discovery first, a captured candidate was observed while the lock was still
+// ours, so a replacement that had taken over BEFORE the snapshot cannot have its
+// objects in the set.
+//
+// The callers differ in whether a captured ID can later become
+// replacement-owned:
+//
+//   - Orphan EXECUTION containers (startup sweep): a replacement cannot adopt
+//     them. The runtime execution container cache is in-process, so a
+//     replacement process starts with an empty pool and any execution container
+//     it creates has a NEW immutable Docker ID. A captured ID therefore can
+//     never name a container the replacement made.
+//   - SERVICE containers (shutdown cleanup, and the startup service-orphan
+//     sweep): a replacement CAN retain/adopt the SAME physical id. The service
+//     reconciler is deliberately label-derived and NOT process- or
+//     hostname-scoped (services must be reconcilable across worker restarts, see
+//     reconciler.Reconcile), so on startup a replacement converges the
+//     daemon-listed containers and keeps a running, label-converged one in place
+//     instead of recreating it. For services the id-freshness argument above does
+//     NOT hold.
+//
+// For service containers the safety therefore rests on the FAIL-CLOSED ownership
+// proof, not on id freshness: the WORKER_ID advisory lock is exclusive, so while
+// the proof succeeds no replacement holds the identity and none can be
+// converging/adopting; and if the proof fails or is ambiguous the guard removes
+// nothing and latches the loss. This is NOT atomic fencing: the lock can still
+// be lost in the residual proof→removal gap (a terminated backend, a stalled
+// removal), after which a replacement could adopt a captured id before its
+// removal lands. That window is bounded by the proof plus the removal and is
+// accepted, not eliminated — do not read this guard as making the removal
+// atomic.
+//
+// The latch check short-circuits before discovery (a loss already known needs no
+// Docker round trip); a latched loss or a failed/ambiguous proof (which latches
+// and runs the shared once-only side effects) suppresses the removal entirely.
+// The discovery error is returned unchanged so the caller's registry surfaces it
+// with its step name; a discovery that finds nothing skips the proof.
+func guardIdentitySnapshotCleanup[C any](
+	proof ownershipProof,
+	logger *slog.Logger,
+	name string,
+	discover func(context.Context) ([]C, error),
+	remove func(context.Context, []C) error,
+) func(context.Context) error {
+	return func(ctx context.Context) error {
+		if proof.loss.isLost() {
+			if logger != nil {
+				logger.Debug("Skipping identity-scoped cleanup after ownership loss",
+					"step", name)
+			}
+			return nil
+		}
+		candidates, err := discover(ctx)
+		if err != nil {
+			return err
+		}
+		if len(candidates) == 0 {
+			return nil
+		}
+		if err := proof.prove(0); err != nil {
+			// prove already latched the loss and ran the once-only side effects.
+			if logger != nil {
+				logger.Debug("Skipping identity-scoped cleanup after failed ownership verification",
+					"step", name,
+					"error", err)
+			}
+			return nil
+		}
+		return remove(ctx, candidates)
+	}
+}
+
 // ownershipBarrierStep joins the ownership monitor goroutine and then runs ONE
 // final fail-closed ownership verification before any later teardown step runs
 // (the state handle, and the pinned lock connection the verification reads, are

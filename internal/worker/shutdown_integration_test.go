@@ -52,9 +52,19 @@ type workerConfig struct {
 	stream       string
 	group        string
 	consumerName string
-	fnRoot       string
-	stateDSN     string
-	metricsAddr  string
+	// instanceID is this process's per-incarnation fencing token (state.Options
+	// .Instance). It is deliberately NOT the worker identity — that is
+	// consumerName, standing in for the production WORKER_ID — so a replacement
+	// incarnation can reuse consumerName with a different instanceID.
+	instanceID  string
+	fnRoot      string
+	stateDSN    string
+	metricsAddr string
+	// docker is the test's raw Docker client (testutil.RequireDocker). It is used
+	// AFTER the manager closes, when the manager's own client is gone, to remove
+	// exactly the app images this run built so the shared daemon does not
+	// accumulate one managed image per test run. Nil disables that cleanup.
+	docker *client.Client
 }
 
 // workerEnv is the running worker wiring plus the handles the test needs to
@@ -70,9 +80,24 @@ type workerEnv struct {
 	stream       string
 	group        string
 	consumerName string
-	metricsDone  chan error
-	statsDone    chan struct{}
-} // startWorker replicates the ordering of Run() (internal/worker/worker.go) with
+	// workerID is the worker identity (the production WORKER_ID): the state
+	// handle's owner, the relay.hostname label, and the Redis consumer. It
+	// equals consumerName; it is named separately so a test reads the identity it
+	// asserts against (a replacement incarnation reuses it).
+	workerID string
+	// stateDSN is the isolated schema DSN the harness opened, so a test can open
+	// a replacement incarnation of the SAME worker identity.
+	stateDSN string
+	// ready and loss are the readiness state and the once-only ownership-loss
+	// latch the monitor drives; monitorDone closes when the monitor exits.
+	ready       *readiness
+	loss        *ownershipLoss
+	monitorDone <-chan struct{}
+	metricsDone chan error
+	statsDone   chan struct{}
+}
+
+// startWorker replicates the ordering of Run() (internal/worker/worker.go) with
 // test-controlled constants, but WITHOUT signal.NotifyContext: the test owns
 // ctx/cancel, and cancel() is the exact runtime effect of SIGTERM (NotifyContext
 // cancels its ctx when the signal arrives). Sending the real signal to the test
@@ -81,19 +106,50 @@ type workerEnv struct {
 // group bootstrap) but not the whole preflight: the test needs concrete handles
 // (manager, state, consumer) to drive and assert the shutdown path.
 //
+// It also installs the real ownership monitor over the state handle's pinned
+// WORKER_ID lock (startOwnershipMonitor + ownershipLossAction), so both the
+// graceful-shutdown and ownership-loss tests exercise the same detection path
+// production does; the monitor is joined before the state handle closes.
+//
 // Consume runs in a goroutine writing to consumeDone so the test can observe
 // when it returns after cancel, exactly as Run()'s blocking Consume would return
 // on SIGTERM.
 func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	t.Helper()
+	if cfg.instanceID == "" {
+		cfg.instanceID = fmt.Sprintf("inst-%d", time.Now().UnixNano())
+	}
 	buf := &testutil.SyncBuffer{}
 	// DEBUG level: the mid-handler shutdown path logs its cancellation line at
 	// Debug (expected shutdown coordination detail), and the assertions below
 	// match it.
 	logger := slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	client := redis.NewClient(&redis.Options{Addr: cfg.redisURI})
-	t.Cleanup(func() { _ = client.Close() })
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.redisURI})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	// Remove this run's built app images. The cleanup is registered EARLY so
+	// cleanup LIFO runs it LAST: by then the manager has closed (tearing down the
+	// warm execution containers and closing the manager's own Docker client), the
+	// lifecycle is cancelled (so the reconciler/consumer goroutines have stopped),
+	// and the state handle is closed — nothing Relay started can still reference
+	// the image when it is removed. Only the EXACT references this run built
+	// (populated after Prepare below; the app names are unique per run) are
+	// removed via the test's raw Docker client (the manager's own client is gone),
+	// so shared dependency images and other runs' managed images are never
+	// touched — no listing, no prune. Best-effort: a failure is logged, not fatal.
+	var runImages []string
+	if cfg.docker != nil {
+		t.Cleanup(func() {
+			rmCtx, rmCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer rmCancel()
+			for _, img := range runImages {
+				if _, err := cfg.docker.ImageRemove(rmCtx, img, client.ImageRemoveOptions{Force: true}); err != nil {
+					t.Logf("integration cleanup: remove test image %s: %v", img, err)
+				}
+			}
+		})
+	}
 
 	m := metrics.New()
 
@@ -111,7 +167,7 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	// consumer method delegates to it), so this exercises the same path. The
 	// remaining wiring below is bespoke to this shutdown test (it needs concrete
 	// handles for its assertions), not a line-for-line copy of Run.
-	if err := stream.EnsureGroup(ctx, client, cfg.stream, cfg.group); err != nil {
+	if err := stream.EnsureGroup(ctx, rdb, cfg.stream, cfg.group); err != nil {
 		t.Fatalf("ensure group: %v", err)
 	}
 
@@ -121,11 +177,38 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 		t.Fatalf("load apps: %v", err)
 	}
 
-	st, err := state.Open(context.Background(), state.Options{DSN: cfg.stateDSN, Owner: "shutdown-test-worker", Instance: "shutdown-test-instance", Logger: logger})
+	st, err := state.Open(context.Background(), state.Options{DSN: cfg.stateDSN, Owner: cfg.consumerName, Instance: cfg.instanceID, Logger: logger})
 	if err != nil {
 		t.Fatalf("state open: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
+
+	// The ownership monitor mirrors the worker: it re-verifies the pinned
+	// WORKER_ID lock through the real State.VerifyOwnerLock and, on a detected
+	// loss, runs the shared once-only action (clear readiness, cancel the
+	// lifecycle) exactly as production does. Readiness is marked ready at the
+	// ready-to-consume boundary below with the SAME live dependency probe
+	// production installs (startReady), so the flag the loss action clears is
+	// backed by a real probe rather than a bare bool.
+	ready := newReadiness(ctx)
+	loss := &ownershipLoss{}
+	monitorDone := startOwnershipMonitor(ctx,
+		ownershipLossAction(loss, ready, logger, cfg.consumerName, cfg.instanceID, cancel),
+		ownershipMonitorConfig{
+			verify:   st.VerifyOwnerLock,
+			interval: 100 * time.Millisecond,
+			timeout:  time.Second,
+		})
+	// Join the monitor BEFORE the state handle closes: the monitor reads the
+	// pinned lock connection, so the state handle must not close beneath it.
+	// Cleanups run LIFO and this is registered after st.Close, so it runs first.
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-monitorDone:
+		case <-time.After(10 * time.Second):
+		}
+	})
 	if err := st.RebuildFromFS(cfg.fnRoot); err != nil {
 		t.Fatalf("state rebuild: %v", err)
 	}
@@ -156,11 +239,15 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 		}
 		fingerprints[fn.Name] = p.Fingerprint
 		st.RecordReconcileSuccess(fn.Name, p.Image, p.Fingerprint, time.Now(), fn)
+		// Record the exact image ref this run built for post-close cleanup.
+		if p.Image != "" {
+			runImages = append(runImages, p.Image)
+		}
 		prepared = append(prepared, runner.NewPrepared(fn, p, manager))
 	}
 
 	consumer := stream.NewConsumer(stream.ConsumerConfig{
-		Client:   client,
+		Client:   rdb,
 		Stream:   cfg.stream,
 		Group:    cfg.group,
 		Consumer: cfg.consumerName,
@@ -229,6 +316,15 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	}
 	go rec.Start(ctx)
 
+	// Cross the ready-to-consume boundary exactly as Run does — install the SAME
+	// live dependency probe (Redis consumer health, a bounded Docker ping, and
+	// NETWORKS verification) and mark ready — immediately before Consume. The
+	// harness configures no NETWORKS, so the probe verifies none. This is what
+	// makes the pre-loss readiness observable and the ownership-loss clear
+	// meaningful; a bare setReady would leave Ready reporting "dependency probe
+	// not wired".
+	ready.startReady(consumer, manager, nil)
+
 	consumeDone := make(chan error, 1)
 	go func() {
 		consumeDone <- consumer.Consume(ctx, runWorker.Handle)
@@ -236,8 +332,10 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 
 	return &workerEnv{
 		ctx: ctx, cancel: cancel, consumeDone: consumeDone,
-		buf: buf, m: m, st: st, client: client,
+		buf: buf, m: m, st: st, client: rdb,
 		stream: cfg.stream, group: cfg.group, consumerName: cfg.consumerName,
+		workerID: cfg.consumerName, stateDSN: cfg.stateDSN,
+		ready: ready, loss: loss, monitorDone: monitorDone,
 		metricsDone: metricsDone, statsDone: statsDone,
 	}
 }
@@ -406,7 +504,7 @@ export async function slow(event) {
 	env := startWorker(t, workerConfig{
 		redisURI: redisURI, stream: streamName, group: groupName,
 		consumerName: consumerName, fnRoot: fnRoot, stateDSN: stateDSN,
-		metricsAddr: metricsAddr,
+		metricsAddr: metricsAddr, docker: dcli,
 	})
 
 	// XADD an event matching the rule.

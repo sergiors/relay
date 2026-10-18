@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -398,6 +399,7 @@ type svcShutdownDocker struct {
 	containers map[string]runtime.ServiceContainer
 	stopped    []string
 	stopErr    error
+	listCalls  int
 }
 
 func newSvcShutdownDocker() *svcShutdownDocker {
@@ -429,6 +431,7 @@ func (f *svcShutdownDocker) RemoveAppServiceContainers(_ context.Context, _ stri
 func (f *svcShutdownDocker) ServiceContainerList(context.Context) ([]runtime.ServiceContainer, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.listCalls++
 	out := make([]runtime.ServiceContainer, 0, len(f.containers))
 	for _, c := range f.containers {
 		out = append(out, c)
@@ -448,15 +451,29 @@ func (f *svcShutdownDocker) StopServiceContainers(_ context.Context, containers 
 
 // addService inserts one service container for the given worker hostname.
 func (f *svcShutdownDocker) addService(id, hostname string) {
+	f.addServiceForApp(id, "fn", hostname)
+}
+
+// addServiceForApp inserts one service container for the given app and worker
+// hostname, so the app-live orphan-sweep predicate is exercisable.
+func (f *svcShutdownDocker) addServiceForApp(id, appName, hostname string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.nextID++
 	f.containers[id] = runtime.ServiceContainer{
 		ID:       id,
-		App:      "fn",
+		App:      appName,
 		Hostname: hostname,
 		Image:    "img-1",
 	}
+}
+
+// listCount returns the number of ServiceContainerList calls (one per
+// discovery), so a test can prove removal never re-lists.
+func (f *svcShutdownDocker) listCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.listCalls
 }
 
 func (f *svcShutdownDocker) stoppedIDs() []string {
@@ -488,7 +505,7 @@ func TestWorkerShutdownServicesHostnameScopedAndBounded(t *testing.T) {
 	// The shutdown registry owns the step's bound; apply the same 30s bound
 	// here so the bounded cleanup path is exercised as production runs it.
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), shutdownServiceTimeout)
-	shutdownServices(cleanupCtx, svcCtrl, "relay-worker-a")
+	shutdownServices(svcCtrl, "relay-worker-a", ownershipProof{}, logger)(cleanupCtx)
 	cleanupCancel()
 
 	consoleFake := fake // the same fake: shutdownServices already ran the cleanup
@@ -544,9 +561,7 @@ func TestWorkerShutdownServiceCleanupStepFailureReachesRegistry(t *testing.T) {
 	reg.register(shutdownStep{
 		name:    shutdownStepServiceCleanup,
 		timeout: shutdownServiceTimeout,
-		run: func(stepCtx context.Context) error {
-			return shutdownServices(stepCtx, svcCtrl, "relay-worker-a")
-		},
+		run:     shutdownServices(svcCtrl, "relay-worker-a", ownershipProof{}, logger),
 	})
 	reg.run(logger)
 
@@ -570,5 +585,177 @@ func TestWorkerShutdownServiceCleanupStepFailureReachesRegistry(t *testing.T) {
 	}
 	if !strings.Contains(out, "Shutdown complete") {
 		t.Errorf("a failing step must not abort the sequence; missing completion marker:\n%s", out)
+	}
+}
+
+// TestWorkerShutdownServicesSkipsAdoptedContainerAfterOwnershipLoss pins the
+// captured service-container adoption safety property: the service reconciler
+// can ADOPT the SAME physical container id across worker incarnations (it is
+// label-derived, not process-scoped), so the shutdown service cleanup must not
+// remove a container once THIS worker's ownership is lost — the container may
+// already have become the replacement's. The step SNAPSHOTS the container, then
+// either the fresh ownership proof fails or a loss is already latched, so the
+// removal is skipped and the (possibly replacement-owned) container survives.
+// It is the service-container counterpart to the guard's fail-closed unit tests:
+// removal is gated on the ownership proof, never on id freshness.
+func TestWorkerShutdownServicesSkipsAdoptedContainerAfterOwnershipLoss(t *testing.T) {
+	latched := &ownershipLoss{}
+	latched.lose()
+	tests := []struct {
+		name  string
+		proof ownershipProof
+	}{
+		{
+			name: "fresh proof fails (ownership lost since the last poll)",
+			proof: ownershipProof{
+				loss:   &ownershipLoss{},
+				verify: func(context.Context) error { return errors.New("worker ownership lost") },
+			},
+		},
+		{
+			name:  "loss already latched by the monitor",
+			proof: ownershipProof{loss: latched},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newSvcShutdownDocker()
+			// The container carries THIS worker's hostname, so discovery captures
+			// it; a replacement reusing WORKER_ID would adopt the SAME physical id.
+			fake.addService("adopted-1", "relay-worker-a")
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+
+			step := shutdownServices(svcCtrl, "relay-worker-a", tc.proof, logger)
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), shutdownServiceTimeout)
+			defer cancel()
+			if err := step(cleanupCtx); err != nil {
+				t.Fatalf("shutdown service cleanup = %v, want nil (removal skipped on ownership loss)", err)
+			}
+			if got := fake.stoppedIDs(); len(got) != 0 {
+				t.Fatalf("stopped = %v, want none (must not remove a possibly replacement-owned container)", got)
+			}
+			if got := fake.remainingCount(); got != 1 {
+				t.Fatalf("remaining containers = %d, want 1 (the adopted container must survive)", got)
+			}
+		})
+	}
+}
+
+// TestSweepStartupServiceOrphansSnapshotsProofsThenRemoves pins the startup
+// service-orphan sweep's ownership ordering: DISCOVERY (app-live filter) runs
+// first, the fresh bounded proof second, and removal last with exactly the
+// captured candidates. It also pins that removal never re-lists: a container
+// that appears AFTER the snapshot (simulated from inside the proof — a
+// replacement owner's or a concurrent one) is left untouched.
+func TestSweepStartupServiceOrphansSnapshotsProofsThenRemoves(t *testing.T) {
+	fake := newSvcShutdownDocker()
+	fake.addServiceForApp("ghost-a", "ghost", "relay-worker-a")
+	fake.addServiceForApp("ghost-b", "ghost", "relay-worker-a")
+	fake.addServiceForApp("live-1", "live", "relay-worker-a")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+
+	var (
+		sawListAtProof  int
+		stopsAtProof    int
+		proofRan        bool
+		replacementDone bool
+	)
+	proof := ownershipProof{
+		loss: &ownershipLoss{},
+		verify: func(context.Context) error {
+			// The proof must run AFTER discovery (one list) and BEFORE any stop.
+			sawListAtProof = fake.listCount()
+			stopsAtProof = len(fake.stoppedIDs())
+			proofRan = true
+			if !replacementDone {
+				replacementDone = true
+				// A NEW orphan appears after the snapshot; removal must not re-list.
+				fake.addServiceForApp("late", "ghost", "relay-worker-a")
+			}
+			return nil
+		},
+	}
+
+	sweepStartupServiceOrphans(context.Background(), svcCtrl, map[string]bool{"live": true}, proof, logger)
+
+	if !proofRan {
+		t.Fatal("the ownership proof must run before removal")
+	}
+	if sawListAtProof != 1 {
+		t.Fatalf("lists seen at proof = %d, want exactly 1 (snapshot before proof)", sawListAtProof)
+	}
+	if stopsAtProof != 0 {
+		t.Fatalf("stops seen at proof = %d, want 0 (proof before removal)", stopsAtProof)
+	}
+	stopped := fake.stoppedIDs()
+	sort.Strings(stopped)
+	if len(stopped) != 2 || stopped[0] != "ghost-a" || stopped[1] != "ghost-b" {
+		t.Fatalf("stopped = %v, want exactly the two captured ghost containers", stopped)
+	}
+	if got := fake.listCount(); got != 1 {
+		t.Fatalf("lists = %d, want 1 (removal must not re-list)", got)
+	}
+	if got := fake.remainingCount(); got != 2 {
+		t.Fatalf("remaining containers = %d, want 2 (live-1 and the post-snapshot late orphan survive)", got)
+	}
+	fake.mu.Lock()
+	_, liveAlive := fake.containers["live-1"]
+	_, lateAlive := fake.containers["late"]
+	fake.mu.Unlock()
+	if !liveAlive {
+		t.Fatal("the app-live container must be preserved by the orphan filter")
+	}
+	if !lateAlive {
+		t.Fatal("a container created after the snapshot must survive (removal must not re-list)")
+	}
+}
+
+// TestSweepStartupServiceOrphansSkipsRemovalOnOwnershipLoss pins fail-closed
+// behavior for the startup service-orphan sweep: a latched loss skips discovery
+// entirely (no Docker round trip), and a failed fresh proof still skips the
+// removal, so a replacement owner's containers are never disturbed.
+func TestSweepStartupServiceOrphansSkipsRemovalOnOwnershipLoss(t *testing.T) {
+	latched := &ownershipLoss{}
+	latched.lose()
+	tests := []struct {
+		name          string
+		proof         ownershipProof
+		wantListCalls int
+	}{
+		{
+			name:          "loss already latched skips discovery",
+			proof:         ownershipProof{loss: latched},
+			wantListCalls: 0,
+		},
+		{
+			name: "fresh proof fails after discovery",
+			proof: ownershipProof{
+				loss:   &ownershipLoss{},
+				verify: func(context.Context) error { return errors.New("worker ownership lost") },
+			},
+			wantListCalls: 1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newSvcShutdownDocker()
+			fake.addServiceForApp("ghost-a", "ghost", "relay-worker-a")
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+
+			sweepStartupServiceOrphans(context.Background(), svcCtrl, map[string]bool{"live": true}, tc.proof, logger)
+
+			if got := fake.listCount(); got != tc.wantListCalls {
+				t.Fatalf("list calls = %d, want %d", got, tc.wantListCalls)
+			}
+			if got := fake.stoppedIDs(); len(got) != 0 {
+				t.Fatalf("stopped = %v, want none after an ownership loss", got)
+			}
+			if got := fake.remainingCount(); got != 1 {
+				t.Fatalf("remaining containers = %d, want 1 (the container must survive)", got)
+			}
+		})
 	}
 }

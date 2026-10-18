@@ -896,13 +896,18 @@ func Run(logger *slog.Logger) (runErr error) {
 		// Service cleanup stops and removes THIS worker's service containers
 		// (scoped by WORKER_ID), so it is skipped once ownership is lost: a
 		// replacement process may already own the identity and its containers.
-		// The guard re-proves the lock on the pinned connection immediately
-		// before the cleanup, so a loss during the (potentially long) teardown
-		// still suppresses it.
-		run: guardIdentityCleanup(proof, logger, shutdownStepServiceCleanup,
-			func(stepCtx context.Context) error {
-				return shutdownServices(stepCtx, svcCtrl, cfg.WorkerID)
-			}),
+		// Unlike execution containers, a replacement CAN adopt the SAME physical
+		// service container id (the service reconciler is label-derived and not
+		// process/hostname-scoped), so the safety here rests on the fail-closed
+		// ownership proof rather than on id freshness. It snapshots the
+		// candidates FIRST, re-proves the lock on the pinned connection SECOND,
+		// and removes exactly the captured containers THIRD
+		// (guardIdentitySnapshotCleanup): discovery before the proof means a
+		// candidate was observed while the lock was ours, the proof gates the
+		// whole removal, and a latched or failed proof removes nothing. This is
+		// not atomic fencing; see guardIdentitySnapshotCleanup for the bounded
+		// residual.
+		run: shutdownServices(svcCtrl, cfg.WorkerID, proof, logger),
 	})
 
 	// Conservative startup orphan sweep: before any app is prepared or any
@@ -912,24 +917,37 @@ func Run(logger *slog.Logger) (runErr error) {
 	// Bounded so the sweep can never hang startup; on timeout/error we log and
 	// continue, leaving the orphans for a later restart.
 	orphanCtx, orphanSpan := tracing.Start(startupCtx, "orphan.sweep")
-	// A loss latched by the monitor (isLost short-circuits the proof) OR detected
-	// by a fresh bounded proof here skips the identity-scoped sweep: a
-	// replacement process may already own WORKER_ID and its containers. One
-	// check before the operation, not one per Docker object; the documented
-	// interval race DURING the sweep is retained.
-	if ownership.isLost() || proof.prove(0) != nil {
-		logger.Debug("Startup: skipping orphan container sweep after ownership loss")
-	} else {
-		sweepCtx, sweepCancel := context.WithTimeout(orphanCtx, reconcileTimeout)
-		n, sweepErr := manager.SweepOrphanContainers(sweepCtx, cfg.WorkerID)
-		sweepCancel()
-		if sweepErr != nil {
-			// A cancelled lifecycle is a normal shutdown, not a sweep failure.
-			orphanSpan.RecordError(sweepErr)
-			logStartupCleanupFailure(ctx, logger, "Startup: orphan container sweep failed", sweepErr)
-		} else if n > 0 {
-			logger.Info("Startup: removed orphan containers from a previous relay process", "count", n)
-		}
+	// Ownership ordering: SNAPSHOT this identity's orphan candidates FIRST, then
+	// run ONE fresh bounded proof, then force-remove exactly the captured IDs.
+	// A latched loss (isLost short-circuits) or a failed/ambiguous proof skips
+	// the removal: a replacement process may already own WORKER_ID and its
+	// containers must not be disturbed. Discovering before the proof is what
+	// shrinks the takeover race — a candidate captured while the lock was still
+	// ours predates any replacement takeover, and because these are EXECUTION
+	// containers (which a replacement cannot adopt — the runtime pool is
+	// in-process, so it always creates NEW ids) a captured id can never name a
+	// replacement's container. The bounded residual race between the passing
+	// proof and the removal of the already-captured IDs is documented on
+	// guardIdentitySnapshotCleanup and is not claimed to be eliminated.
+	sweepCtx, sweepCancel := context.WithTimeout(orphanCtx, reconcileTimeout)
+	removed := 0
+	sweepErr := guardIdentitySnapshotCleanup(proof, logger, "orphan-sweep",
+		func(stepCtx context.Context) ([]runtime.OrphanContainer, error) {
+			return manager.DiscoverOrphanContainers(stepCtx, cfg.WorkerID)
+		},
+		func(stepCtx context.Context, orphans []runtime.OrphanContainer) error {
+			n, rerr := manager.RemoveOrphanContainers(stepCtx, orphans)
+			removed = n
+			return rerr
+		},
+	)(sweepCtx)
+	sweepCancel()
+	if sweepErr != nil {
+		// A cancelled lifecycle is a normal shutdown, not a sweep failure.
+		orphanSpan.RecordError(sweepErr)
+		logStartupCleanupFailure(ctx, logger, "Startup: orphan container sweep failed", sweepErr)
+	} else if removed > 0 {
+		logger.Info("Startup: removed orphan containers from a previous relay process", "count", removed)
 	}
 	orphanSpan.End()
 
@@ -972,16 +990,17 @@ func Run(logger *slog.Logger) (runErr error) {
 	housekeepingDone := startStartupHousekeeping(ctx, logger, startupHousekeeper{
 		exclusive: services.RunExclusive,
 		sweep: func(hctx context.Context) {
-			// The service-orphan sweep is identity-scoped (it lists and stops
-			// stale containers for THIS worker's services), so it is skipped
-			// once ownership is lost to avoid disturbing a replacement owner. A
-			// detail container made by a previous process on this identity is
-			// left for that replacement; a fresh bounded proof here also catches
-			// a loss since the monitor's previous poll.
-			if ownership.isLost() || proof.prove(0) != nil {
-				return
-			}
-			sweepStartupServiceOrphans(hctx, svcCtrl, liveNames)
+			// The service-orphan sweep is identity-scoped: it lists and stops
+			// stale service containers for THIS worker's identity on the shared
+			// daemon. Like the orphan execution sweep it must run in the
+			// snapshot-first, proof-second, remove-third order
+			// (guardIdentitySnapshotCleanup) so discovery never follows the
+			// proof: SNAPSHOT the stale candidates (app-live filtered), re-prove
+			// the pinned lock, then remove exactly the captured containers. A
+			// latched or failed proof removes nothing, so a replacement owner's
+			// containers are not disturbed. This sweep is app-scoped but runs
+			// under the worker identity startup, so the same invariant applies.
+			sweepStartupServiceOrphans(hctx, svcCtrl, liveNames, proof, logger)
 		},
 		images: func(hctx context.Context) { sweepStartupImages(hctx, manager, prepared, st, logger) },
 		deps:   func(hctx context.Context) { cleanupStartupDependencies(hctx, manager, logger) },
@@ -1855,19 +1874,35 @@ func (r *shutdownRegistry) run(logger *slog.Logger) {
 	logger.Info("Shutdown complete", "duration", time.Since(started))
 }
 
-// shutdownServices stops and removes THIS worker's persistent service
-// containers during graceful shutdown. ctx is the shutdown step's fresh,
-// bounded context (the registry derives it from context.Background), so a
-// Docker problem or timeout must never fail the process (no os.Exit anywhere on
-// this path). It returns ShutdownCleanup's error so the shutdown registry can
-// surface it with the structured step name; callers may discard it. The
-// detailed per-operation logs live in ShutdownCleanup, so no duplicate logging
-// happens here.
+// shutdownServices builds the shutdown step that stops and removes THIS worker's
+// persistent service containers during graceful shutdown. It is the
+// snapshot-first, proof-second, remove-third sequence (see
+// guardIdentitySnapshotCleanup): the step SNAPSHOTS the worker's service
+// containers, re-proves the pinned ownership lock, and stops/removes exactly the
+// captured containers — never re-listing after the proof. Because the service
+// reconciler can retain/adopt the SAME physical id across worker incarnations
+// (it is label-derived, not process-scoped), the protection is the fail-closed
+// ownership proof, not id freshness: a latched loss or a failed/ambiguous proof
+// removes nothing. The step's context (the registry's fresh bounded one) is
+// handed to discovery and removal; the ownership proof uses its own background
+// context (proof.prove), so it still detects a loss once the lifecycle is
+// cancelled. A discovery error is returned so the shutdown registry surfaces it
+// with the structured step name. The detailed per-operation logs live in the
+// reconciler, so no duplicate logging happens here.
 func shutdownServices(
-	ctx context.Context, svcCtrl *reconciler.ServiceReconciler, hostname string,
-) error {
-	_, err := svcCtrl.ShutdownCleanup(ctx, hostname)
-	return err
+	svcCtrl *reconciler.ServiceReconciler,
+	hostname string,
+	proof ownershipProof,
+	logger *slog.Logger,
+) func(context.Context) error {
+	return guardIdentitySnapshotCleanup(proof, logger, shutdownStepServiceCleanup,
+		func(stepCtx context.Context) ([]runtime.ServiceContainer, error) {
+			return svcCtrl.DiscoverShutdownContainers(stepCtx, hostname)
+		},
+		func(stepCtx context.Context, own []runtime.ServiceContainer) error {
+			return svcCtrl.RemoveShutdownContainers(stepCtx, own)
+		},
+	)
 }
 
 // schedulerStorage is the narrow scheduler view the worker's storage wiring
@@ -2575,18 +2610,42 @@ func sweepStartupImages(
 	}
 }
 
-// sweepStartupServiceOrphans runs the startup service-orphan sweep each under
-// its own fresh reconcileTimeout rooted in the housekeeping lifecycle, so a slow
-// daemon cannot make the exclusive housekeeping window (and every service update
+// sweepStartupServiceOrphans runs the startup service-orphan sweep under its own
+// fresh reconcileTimeout rooted in the housekeeping lifecycle, so a slow daemon
+// cannot make the exclusive housekeeping window (and every service update
 // coalesced behind it) wait unbounded. It preserves the ServiceReconciler's
-// existing behavior (list then stop stale containers); the only change is the
-// bound, matching the per-app Applys.
+// behavior (app-live-filtered stale containers, list-then-stop) but changes the
+// ORDER to the snapshot-first, proof-second, remove-third sequence
+// (guardIdentitySnapshotCleanup): it SNAPSHOTS the stale candidates, re-proves
+// the pinned ownership lock, then stops/removes exactly the captured
+// containers — never re-listing after the proof. A loss latched by the monitor
+// (or a failed/ambiguous fresh proof) skips the removal entirely, so a
+// replacement owner's containers are never disturbed. The bound matches the
+// per-app Applys; the reconciler logs a list/stop failure itself, and any error
+// returned by the guard is surfaced here with the startup cleanup convention.
 func sweepStartupServiceOrphans(
 	hctx context.Context, svcCtrl *reconciler.ServiceReconciler, liveNames map[string]bool,
+	proof ownershipProof, logger *slog.Logger,
 ) {
 	sweepCtx, cancel := context.WithTimeout(hctx, reconcileTimeout)
 	defer cancel()
-	svcCtrl.SweepOrphans(sweepCtx, liveNames)
+	err := guardIdentitySnapshotCleanup(proof, logger, "startup-service-orphan-sweep",
+		func(stepCtx context.Context) ([]runtime.ServiceContainer, error) {
+			return svcCtrl.DiscoverOrphanContainers(stepCtx, liveNames)
+		},
+		func(stepCtx context.Context, stale []runtime.ServiceContainer) error {
+			return svcCtrl.RemoveOrphanContainers(stepCtx, stale)
+		},
+	)(sweepCtx)
+	if err != nil {
+		// The reconciler already emitted its existing Warn for the underlying
+		// list/stop failure. This worker-level classification only downgrades a
+		// cancellation-driven error to Debug, matching the sibling startup
+		// sweeps, so shutdown does not gain a second warning; it does not imply
+		// that cancellation logging is Debug everywhere (the reconciler's Warn
+		// above is unconditional).
+		logStartupCleanupFailure(hctx, logger, "Startup: service orphan sweep failed", err)
+	}
 }
 
 // networkVerifier is the narrow view of the runtime Manager that the startup
