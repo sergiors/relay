@@ -884,14 +884,19 @@ func (m *Manager) Close() error {
 //  3. PHASE 1 (normal): closes normal admission atomically (ops.closeNormal),
 //     cancelling every normal operation's context, then DRAINS every normal
 //     operation (ops.drainNormal). After this point no ordinary Manager-owned
-//     Docker operation may begin — a synchronous method, a runner async cleanup,
-//     a service pass, an execution-container create, or an execution-container
-//     discard/watcher all receive ErrManagerShuttingDown — and no ordinary
-//     operation (including a pool discard reserved before close) is still in
-//     flight when the cache is torn down. A pool discard that races this
-//     transition is refused and leaves its container in the pool, owned by cache
-//     teardown. The specialized image-retirement gate is closed here too
-//     (beginShutdown);
+//     Docker operation may begin — a synchronous method, a runner async
+//     cleanup, a service pass, an execution-container create, or an
+//     execution-container discard/watcher all receive ErrManagerShuttingDown
+//     — and no ordinary operation (including a pool discard reserved before
+//     close) is still in flight when the cache is torn down. The drain also
+//     joins every shutdown-only cleanup operation admitted through
+//     beginShutdownCleanupOp (the worker's hostname-scoped service-container
+//     removal, admitted after the lifecycle was cancelled but before this
+//     call), even when its shutdown step already timed out and the registry
+//     moved on, so the client can never close beneath one. A pool discard that
+//     races this transition is refused and leaves its container in the pool,
+//     owned by cache teardown. The specialized image-retirement gate is closed
+//     here too (beginShutdown);
 //  4. PHASE 2 (teardown): opens the teardown phase (ops.openTeardown), which
 //     ONLY Manager cache teardown may use, then tears down every cached
 //     execution container through a bounded parallel worker pool
@@ -2034,6 +2039,14 @@ func (m *Manager) Execute(
 	eventJSON []byte,
 	extraEnv []string,
 ) (retErr error) {
+	// A warm-cache acquire can complete WITHOUT issuing a Docker call, so it is
+	// not covered by the per-operation admission inside startContainer. Refuse
+	// lifecycle-cancelled work here, before any pooled container is handed back
+	// or any operation context is derived, exactly as an explicit Docker entry
+	// point would.
+	if err := m.ordinaryRefused(); err != nil {
+		return fmt.Errorf("execute %s: %w", prepared.Name, err)
+	}
 	// The top-level execution span. It is a child of the invocation's context
 	// (which the runner already instrumented with function.invoke), so the
 	// runtime's acquire/invoke children nest under it. Payload and env values

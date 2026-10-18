@@ -334,13 +334,22 @@ func assertServiceCounts(t *testing.T, m *runtime.Manager, name string, want int
 }
 
 // TestIntegrationShutdownCleanupHostnameScoped proves graceful-shutdown cleanup
-// is hostname-scoped against a real daemon: two managers with distinct worker
-// identities each start a persistent service container; ShutdownCleanup of w1
-// removes only w1's container while w2's remains (and the container list
-// structurally contains ONLY relay service containers, so no unrelated
-// container could ever be touched by this path).
+// is hostname-scoped against a real daemon AND that it survives the production
+// shutdown ordering (the worker cancels its lifecycle before running the ordered
+// teardown steps, so ordinary admission is refused and only the shutdown-only
+// gate is left): two managers with distinct worker identities each start a
+// persistent service container; w1's lifecycle is cancelled, then ShutdownCleanup
+// of w1 removes only w1's container while w2's remains (and the container list
+// structurally contains ONLY relay service containers, so no unrelated container
+// could ever be touched by this path).
 func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 	testutil.RequireDocker(t)
+
+	dcli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		t.Fatalf("raw docker client: %v", err)
+	}
+	t.Cleanup(func() { _ = dcli.Close() })
 
 	var buf strings.Builder
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
@@ -348,7 +357,12 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 	// one daemon cannot collide on the hostname-scoped container set.
 	stamp := time.Now().UnixNano()
 	w1host, w2host := fmt.Sprintf("relay-it-w1-%d", stamp), fmt.Sprintf("relay-it-w2-%d", stamp)
-	m1, err := runtime.NewManager(logger, nil, w1host)
+	// The worker cancels its lifecycle BEFORE running its ordered shutdown
+	// steps, so only the shutdown-only admission remains when the cleanup runs.
+	// w1's lifecycle is cancelled below; w2's stays live.
+	lifecycle1, cancelLifecycle1 := context.WithCancel(context.Background())
+	defer cancelLifecycle1()
+	m1, err := runtime.NewManager(logger, nil, w1host, runtime.WithLifecycleContext(lifecycle1))
 	if err != nil {
 		t.Fatalf("new manager w1: %v", err)
 	}
@@ -372,14 +386,13 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 	// container is still long-lived and the hostname-scoping assertion is
 	// unchanged.
 	stopResponsive := []string{"node", "-e", "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000);"}
-	id1, err := m1.StartService(context.Background(), runtime.ServiceSpec{
+	if _, err := m1.StartService(context.Background(), runtime.ServiceSpec{
 		App:  fn1,
 		Name: "svc.js", SourceRef: "svc.js",
 		Port:  80,
 		Image: "node:24-alpine",
 		Entry: stopResponsive,
-	}, 0)
-	if err != nil {
+	}, 0); err != nil {
 		t.Fatalf("start w1 service: %v", err)
 	}
 	id2, err := m2.StartService(context.Background(), runtime.ServiceSpec{
@@ -393,23 +406,28 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 		t.Fatalf("start w2 service: %v", err)
 	}
 
-	// Cleanup: stop whatever this test left running on either manager, scoped to
-	// this run's derived app names.
+	// Cleanup via the raw client: the managers' clients are closed by their
+	// deferred Close before t.Cleanup runs, and m1's ordinary listing is refused
+	// once its lifecycle is cancelled. Scope strictly to this run's two hostname
+	// identities.
 	t.Cleanup(func() {
 		cc, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		for _, m := range []*runtime.Manager{m1, m2} {
-			if list, err := m.ServiceContainerList(cc); err == nil {
-				keep := list[:0]
-				for _, c := range list {
-					if c.App == fn1 || c.App == fn2 {
-						keep = append(keep, c)
-					}
-				}
-				_ = m.StopServiceContainers(cc, keep)
+		list, err := dcli.ContainerList(cc, client.ContainerListOptions{All: true})
+		if err != nil {
+			return
+		}
+		for _, c := range list.Items {
+			if c.Labels["relay.hostname"] == w1host || c.Labels["relay.hostname"] == w2host {
+				_, _ = dcli.ContainerRemove(cc, c.ID, client.ContainerRemoveOptions{Force: true})
 			}
 		}
 	})
+
+	// Graceful shutdown of w1: cancel its lifecycle first (ordinary admission is
+	// then refused), exactly as the worker's shutdown defer does before running
+	// the ordered teardown steps.
+	cancelLifecycle1()
 
 	svcW1 := NewServiceReconciler(m1, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
 	n, err := svcW1.ShutdownCleanup(context.Background(), w1host)
@@ -420,26 +438,28 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 		t.Fatalf("removed count = %d, want 1", n)
 	}
 
-	list, err := m1.ServiceContainerList(context.Background())
-	if err != nil {
-		t.Fatalf("list after cleanup: %v", err)
-	}
-	for _, c := range list {
-		if c.ID == id1 {
-			t.Fatal("w1's container survived ShutdownCleanup of w1")
+	// Assert against the daemon directly: m1's own listing is refused once its
+	// lifecycle is cancelled.
+	findByHostname := func(host string) []string {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		list, err := dcli.ContainerList(ctx, client.ContainerListOptions{All: true})
+		if err != nil {
+			t.Fatalf("list containers: %v", err)
 		}
-	}
-	list2, err := m2.ServiceContainerList(context.Background())
-	if err != nil {
-		t.Fatalf("list w2: %v", err)
-	}
-	found := false
-	for _, c := range list2 {
-		if c.ID == id2 {
-			found = true
+		var ids []string
+		for _, c := range list.Items {
+			if c.Labels["relay.hostname"] == host {
+				ids = append(ids, c.ID)
+			}
 		}
+		return ids
 	}
-	if !found {
-		t.Fatal("w2's container must survive ShutdownCleanup of w1")
+	testutil.WaitFor(t, 10*time.Second, "w1 container removed by shutdown cleanup", func() bool {
+		return len(findByHostname(w1host)) == 0
+	})
+	if got := findByHostname(w2host); len(got) != 1 || got[0] != id2 {
+		t.Fatalf("w2's container must survive ShutdownCleanup of w1, got %v", got)
 	}
 }

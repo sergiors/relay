@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 )
@@ -30,6 +31,24 @@ import (
 // admission could be admitted after drainNormal observed zero and race the
 // cache teardown. Normal work is therefore never admitted through the teardown
 // phase; only Manager cache teardown is.
+//
+// Ordinary admission is closed in TWO senses, and both are checked under this
+// coordinator's lock so the decision is atomic with the registration:
+//
+//   - once CloseContext has begun (normalClosed), and
+//   - once the normal shutdown context is cancelled — i.e. as soon as the
+//     manager lifecycle is cancelled (the worker's signal context, or Close).
+//     An operation admitted after that point would receive an already-cancelled
+//     operation context, so it is refused terminally instead: cancelled work
+//     must not be admitted and must issue no Docker call.
+//
+// The one narrow exception is beginShutdownCleanup: a shutdown-only
+// authorization available ONLY while the manager is already shutting down and
+// CloseContext has NOT begun. It is what lets the worker's hostname-scoped
+// service-container cleanup run after the lifecycle is cancelled (the worker
+// cancels it before running the ordered teardown steps, so ordinary admission
+// is already refused by then) while remaining tracked by the ordinary count,
+// so CloseContext still joins every such operation before the client closes.
 type managerOps struct {
 	mu sync.Mutex
 
@@ -129,20 +148,93 @@ func closeIfOpen(ch chan struct{}) {
 	}
 }
 
+// errOrdinaryRefused is the terminal admission refusal for ordinary Manager
+// work: either CloseContext has begun or the manager is already shutting down.
+func errOrdinaryRefused() error {
+	return fmt.Errorf("manager docker operation: %w", ErrManagerShuttingDown)
+}
+
+// errShutdownCleanupUnavailable is returned when the shutdown-only cleanup
+// authorization is requested while the manager is NOT shutting down: the
+// ordinary gate is the correct path there, so this path can never be used to
+// bypass lifecycle cancellation in steady state.
+var errShutdownCleanupUnavailable = errors.New(
+	"runtime: shutdown cleanup refused: manager is not shutting down")
+
+// ordinaryRefused returns the terminal refusal for ordinary Manager work when
+// the manager is shutting down, or nil when ordinary work may proceed. It is
+// the single predicate behind the ordinary admission gate, exposed so a Manager
+// entry point that can complete WITHOUT issuing a Docker call — a warm-cache
+// execution acquire — still refuses lifecycle-cancelled work rather than
+// handing back a pooled container. o.mu must be held by the caller.
+func (o *managerOps) ordinaryRefusedLocked() error {
+	if o.normalClosed || o.normalCtx.Err() != nil {
+		return errOrdinaryRefused()
+	}
+	return nil
+}
+
 // begin admits one NORMAL Manager-owned operation. It returns the operation's
 // context and a release that MUST be called exactly once when the operation
 // concludes. It refuses with ErrManagerShuttingDown once closeNormal has closed
-// admission, and never starts an operation whose caller context is already
-// cancelled (it returns that context error and holds no registration).
+// admission OR once the normal shutdown context is already cancelled (a
+// lifecycle-cancelled worker), so ordinary work is never admitted onto an
+// already-cancelled operation context. It never starts an operation whose
+// caller context is already cancelled (it returns that context error and holds
+// no registration).
 func (o *managerOps) begin(ctx context.Context) (context.Context, func(), error) {
+	return o.admitOrdinary(ctx, false)
+}
+
+// beginShutdownCleanup admits one shutdown-only Manager-owned cleanup operation
+// (the worker's hostname-scoped service-container removal during graceful
+// shutdown), returning its context and a release that MUST be called exactly
+// once.
+//
+// It exists because the worker cancels its lifecycle BEFORE it runs the ordered
+// shutdown steps, so by the time the service-cleanup step runs ordinary
+// admission is already refused. The authorization is deliberately narrow:
+//
+//   - it is refused once CloseContext has begun (normalClosed), so no cleanup
+//     operation can be admitted once the drains and the client close are under
+//     way; and
+//   - it is refused unless the normal shutdown context is ALREADY cancelled, so
+//     it is available only during shutdown and never bypasses lifecycle
+//     cancellation in steady state.
+//
+// The operation is registered in the SAME ordinary count, so CloseContext's
+// drainNormal joins it (and any in-flight Docker call it owns) before the
+// Docker client closes, even when the caller's shutdown step has already timed
+// out and moved on. Its context is derived from the caller's ctx ALONE: the
+// normal shutdown context is already cancelled, so merging it would abort
+// immediately the very cleanup this path exists to perform. The caller still
+// owns the bound (the shutdown registry's fresh, bounded step context).
+func (o *managerOps) beginShutdownCleanup(ctx context.Context) (context.Context, func(), error) {
+	return o.admitOrdinary(ctx, true)
+}
+
+// admitOrdinary implements begin and beginShutdownCleanup. shutdownCleanup
+// selects the narrow shutdown-only authorization described on
+// beginShutdownCleanup; the ordinary path additionally cancels the operation
+// when the normal shutdown context is cancelled.
+func (o *managerOps) admitOrdinary(ctx context.Context, shutdownCleanup bool) (context.Context, func(), error) {
 	o.mu.Lock()
 	o.lazyInitLocked()
 	if o.normalClosed {
 		o.mu.Unlock()
-		return nil, nil, fmt.Errorf("manager docker operation: %w", ErrManagerShuttingDown)
+		return nil, nil, errOrdinaryRefused()
+	}
+	shutdown := o.normalCtx
+	if shutdownCleanup {
+		if shutdown.Err() == nil {
+			o.mu.Unlock()
+			return nil, nil, errShutdownCleanupUnavailable
+		}
+	} else if err := o.ordinaryRefusedLocked(); err != nil {
+		o.mu.Unlock()
+		return nil, nil, err
 	}
 	o.enterNormalLocked()
-	shutdown := o.normalCtx
 	o.mu.Unlock()
 
 	if ctx == nil {
@@ -156,7 +248,11 @@ func (o *managerOps) begin(ctx context.Context) (context.Context, func(), error)
 		o.mu.Unlock()
 		return nil, nil, ctx.Err()
 	}
-	opCtx, cancel := deriveOpContext(ctx, shutdown)
+	var extra context.Context
+	if !shutdownCleanup {
+		extra = shutdown
+	}
+	opCtx, cancel := deriveOpContext(ctx, extra)
 	once := &sync.Once{}
 	release := func() {
 		once.Do(func() {
@@ -376,6 +472,30 @@ func (m *Manager) opsCoord() *managerOps {
 // drains).
 func (m *Manager) beginDockerOp(ctx context.Context) (context.Context, func(), error) {
 	return m.opsCoord().begin(ctx)
+}
+
+// beginShutdownCleanupOp admits one shutdown-only Manager-owned cleanup
+// operation through the manager's single operation gate (see
+// managerOps.beginShutdownCleanup). It is the ONLY way a Manager-owned Docker
+// operation may be admitted after the manager lifecycle has been cancelled, and
+// only while CloseContext has not begun. It is reserved for the worker's
+// graceful-shutdown service-container cleanup; every other entry point must use
+// beginDockerOp and is therefore refused once shutdown starts.
+func (m *Manager) beginShutdownCleanupOp(ctx context.Context) (context.Context, func(), error) {
+	return m.opsCoord().beginShutdownCleanup(ctx)
+}
+
+// ordinaryRefused returns the terminal refusal for ordinary Manager work when
+// the manager is shutting down, or nil when ordinary work may proceed. A
+// Manager entry point that can complete WITHOUT a Docker call (a warm-cache
+// execution acquire) uses it so lifecycle-cancelled work is refused rather than
+// admitted with an already-cancelled operation context.
+func (m *Manager) ordinaryRefused() error {
+	o := m.opsCoord()
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.lazyInitLocked()
+	return o.ordinaryRefusedLocked()
 }
 
 // classifyDockerErr converts a Docker error that raced Manager shutdown into

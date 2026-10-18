@@ -3,6 +3,7 @@ services:
     build: .
     # image: ghcr.io/sergiors/relay:latest
     container_name: relay
+    stop_grace_period: 3m
 
     depends_on:
       redis:

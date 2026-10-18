@@ -120,6 +120,41 @@ type ServiceRestarter interface {
 	RestartServiceContainer(ctx context.Context, containerID string) error
 }
 
+// ShutdownDocker is the optional shutdown-scoped Docker capability of a Docker
+// implementation. The production runtime Manager implements it; the reconciler
+// type-asserts the configured Docker for it in the graceful-shutdown cleanup
+// path only, so a minimal fake (or an implementation without the capability)
+// keeps using the ordinary methods.
+//
+// It exists because the worker cancels its lifecycle BEFORE it runs the ordered
+// shutdown steps: every ordinary runtime admission is already refused by the
+// time the service cleanup runs. These methods are the same list/remove
+// operations admitted through the Manager's narrow shutdown-only gate, so the
+// work runs on the fresh shutdown step context (never the cancelled lifecycle)
+// while still being tracked and joined by Manager.CloseContext.
+type ShutdownDocker interface {
+	// ShutdownServiceContainerList is the shutdown-only form of
+	// ServiceContainerList.
+	ShutdownServiceContainerList(ctx context.Context) ([]runtime.ServiceContainer, error)
+	// ShutdownStopServiceContainers is the shutdown-only form of
+	// StopServiceContainers, applied to the containers the shutdown discovery
+	// captured.
+	ShutdownStopServiceContainers(ctx context.Context, containers []runtime.ServiceContainer) error
+}
+
+// shutdownDockerOps selects the shutdown-scoped list/remove pair for d,
+// falling back to the ordinary Docker methods when d does not implement
+// ShutdownDocker (a minimal fake). Production always takes the shutdown pair.
+func shutdownDockerOps(d Docker) (
+	list func(context.Context) ([]runtime.ServiceContainer, error),
+	remove func(context.Context, []runtime.ServiceContainer) error,
+) {
+	if sd, ok := d.(ShutdownDocker); ok {
+		return sd.ShutdownServiceContainerList, sd.ShutdownStopServiceContainers
+	}
+	return d.ServiceContainerList, d.StopServiceContainers
+}
+
 // SecretResolver resolves a secret reference to its value. It is a structural
 // alias for secrets.Provider so the Worker can pass its shared provider without
 // a new concrete type.
@@ -1195,7 +1230,13 @@ func (c *ServiceReconciler) discoverShutdownLocked(ctx context.Context, hostname
 	if hostname == "" {
 		return nil, nil
 	}
-	containers, err := c.docker.ServiceContainerList(ctx)
+	// The shutdown-scoped listener runs the lookup on the fresh shutdown step
+	// context through the Manager's narrow shutdown-only gate: the worker
+	// lifecycle is already cancelled when this step runs, so the ordinary method
+	// would be refused. A Docker without the capability falls back to the
+	// ordinary method.
+	listContainers, _ := shutdownDockerOps(c.docker)
+	containers, err := listContainers(ctx)
 	if err != nil {
 		logErr := fmt.Errorf("service: list containers: %w", err)
 		c.log.Warn("Service: shutdown cleanup failed", "error", logErr)
@@ -1222,7 +1263,13 @@ func (c *ServiceReconciler) removeShutdownLocked(ctx context.Context, own []runt
 	if len(own) == 0 {
 		return nil
 	}
-	err := c.docker.StopServiceContainers(ctx, own)
+	// The shutdown-scoped removal runs on the fresh shutdown step context through
+	// the Manager's narrow shutdown-only gate (the ordinary method is refused once
+	// the worker lifecycle is cancelled). The order is preserved: discovery, the
+	// caller's fail-closed ownership proof, then this removal of exactly the
+	// captured IDs.
+	_, removeContainers := shutdownDockerOps(c.docker)
+	err := removeContainers(ctx, own)
 	if err != nil {
 		// StopServiceContainers keeps the partial progress (everything it
 		// could stop/remove is gone); the error is still returned to the
@@ -1240,6 +1287,10 @@ func (c *ServiceReconciler) removeShutdownLocked(ctx context.Context, own []runt
 // candidates, prove ownership on its pinned lock, and only then remove the
 // captured containers (RemoveShutdownContainers) — never re-listing after the
 // proof, which is what keeps a replacement owner's containers safe.
+//
+// When the configured Docker implements ShutdownDocker (the production runtime
+// Manager), discovery is admitted through the shutdown-only gate on the
+// caller's fresh step context; otherwise the ordinary method is used.
 func (c *ServiceReconciler) DiscoverShutdownContainers(ctx context.Context, hostname string) ([]runtime.ServiceContainer, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1250,6 +1301,10 @@ func (c *ServiceReconciler) DiscoverShutdownContainers(ctx context.Context, host
 // the removal half of ShutdownCleanup, exported for the worker's snapshot →
 // ownership-proof → remove ordering, and by construction only ever touches the
 // containers it is given (immutable IDs captured before the proof).
+//
+// When the configured Docker implements ShutdownDocker (the production runtime
+// Manager), the removal is admitted through the shutdown-only gate on the
+// caller's fresh step context; otherwise the ordinary method is used.
 func (c *ServiceReconciler) RemoveShutdownContainers(ctx context.Context, containers []runtime.ServiceContainer) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

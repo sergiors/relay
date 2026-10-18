@@ -1919,6 +1919,14 @@ type schedulerStorage interface {
 
 var _ schedulerStorage = (*cron.Scheduler)(nil)
 
+// *runtime.Manager must always implement the reconciler's optional
+// shutdown-scoped Docker capability. The reconciler type-asserts the
+// configured Docker for it and otherwise silently falls back to the ordinary
+// (lifecycle-refused) methods, so this compile-time assertion keeps a
+// production regression from degrading graceful service cleanup without
+// failing the build. It is always compiled, unlike the capability tests.
+var _ reconciler.ShutdownDocker = (*runtime.Manager)(nil)
+
 // wireSchedulerStorage connects the scheduler to its durable outbox. A non-nil
 // shared state handle is installed and its durable retry worker started, which
 // enables schedule publication. A nil shared handle means the global

@@ -643,6 +643,13 @@ func (m *Manager) RestartServiceContainer(ctx context.Context, containerID strin
 	return nil
 }
 
+// dockerOpAdmitter admits one Manager-owned Docker operation and returns the
+// operation context plus the release the caller must invoke exactly once, or
+// the terminal admission error. Manager methods that exist in both an ordinary
+// and a shutdown-only form share one body and select the gate through it, so
+// the two forms cannot drift apart.
+type dockerOpAdmitter func(ctx context.Context) (context.Context, func(), error)
+
 // ServiceContainerList discovers every service container on the daemon. The
 // filter is a strict relay.type=service match (isServiceContainer) — deliberately
 // NOT combined with a non-empty relay.app check: stale containers (a
@@ -653,12 +660,28 @@ func (m *Manager) RestartServiceContainer(ctx context.Context, containerID strin
 // logging. Replica is parsed from labelReplica, defaulting to -1 when
 // missing/invalid.
 func (m *Manager) ServiceContainerList(ctx context.Context) ([]ServiceContainer, error) {
-	opCtx, release, err := m.beginDockerOp(ctx)
+	return m.serviceContainerList(ctx, m.beginDockerOp)
+}
+
+// ShutdownServiceContainerList is the shutdown-only form of
+// ServiceContainerList used by the worker's graceful-shutdown service cleanup.
+// It is identical except for its admission: the lookup is admitted through the
+// narrow beginShutdownCleanupOp gate rather than the ordinary one, so it can
+// run after the worker lifecycle has been cancelled (which is what refuses
+// ordinary work) while remaining tracked and joined by Manager.CloseContext.
+// It is refused before CloseContext begins and after it, and is the ONLY
+// discovery the shutdown cleanup may use.
+func (m *Manager) ShutdownServiceContainerList(ctx context.Context) ([]ServiceContainer, error) {
+	return m.serviceContainerList(ctx, m.beginShutdownCleanupOp)
+}
+
+func (m *Manager) serviceContainerList(ctx context.Context, admit dockerOpAdmitter) ([]ServiceContainer, error) {
+	callerCtx := ctx
+	opCtx, release, err := admit(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer release()
-	callerCtx := ctx
 	ctx = opCtx
 	list, err := m.cli.ContainerList(ctx, client.ContainerListOptions{All: true})
 	if err != nil {
@@ -779,8 +802,30 @@ func (m *Manager) VerifyNetworks(ctx context.Context, networks []string) (string
 // round trip. The first context error is returned (via the removal/stop error)
 // like any other failure.
 func (m *Manager) StopServiceContainers(ctx context.Context, containers []ServiceContainer) error {
+	return m.stopServiceContainers(ctx, containers, m.beginDockerOp)
+}
+
+// ShutdownStopServiceContainers is the shutdown-only form of
+// StopServiceContainers used by the worker's graceful-shutdown service cleanup
+// to stop/remove exactly the containers captured by
+// ShutdownServiceContainerList. It is identical except for its admission: the
+// removal is admitted through the narrow beginShutdownCleanupOp gate rather
+// than the ordinary one, so it can run after the worker lifecycle has been
+// cancelled while remaining tracked and joined by Manager.CloseContext. It
+// preserves the ordinary per-container best-effort semantics and the caller's
+// cancellation checks, so a shutdown step that exceeded its bound still unwinds
+// promptly.
+func (m *Manager) ShutdownStopServiceContainers(ctx context.Context, containers []ServiceContainer) error {
+	return m.stopServiceContainers(ctx, containers, m.beginShutdownCleanupOp)
+}
+
+func (m *Manager) stopServiceContainers(
+	ctx context.Context,
+	containers []ServiceContainer,
+	admit dockerOpAdmitter,
+) error {
 	callerCtx := ctx
-	opCtx, release, err := m.beginDockerOp(ctx)
+	opCtx, release, err := admit(ctx)
 	if err != nil {
 		return err
 	}
