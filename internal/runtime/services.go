@@ -91,9 +91,12 @@ type ServiceSpec struct {
 }
 
 // ServiceContainer is one discovered service container, as stamped on its
-// labels. Hostname is included for logging only — it is NOT part of the
-// ownership predicate, because services must be reconcilable across worker
-// restarts on the same host.
+// labels. Hostname is the worker identity that created it (relay.hostname).
+// Discovery is deliberately unscoped, but a worker-wired ServiceReconciler
+// compares it to the worker's stable WORKER_ID so it only converges, adopts,
+// and removes its OWN containers: a restart of the same WORKER_ID still
+// reconciles them, while another worker's service containers on a shared daemon
+// are left untouched.
 type ServiceContainer struct {
 	ID  string
 	App string
@@ -655,9 +658,10 @@ type dockerOpAdmitter func(ctx context.Context) (context.Context, func(), error)
 // NOT combined with a non-empty relay.app check: stale containers (a
 // app removed while Relay was down) must still be discovered and returned so
 // the reconciler's cross-app orphan sweep can identify and remove them.
-// Hostname is deliberately NOT part of discovery — services must be reconcilable
-// across worker restarts on the same host — but it IS included in the result for
-// logging. Replica is parsed from labelReplica, defaulting to -1 when
+// Hostname is deliberately NOT part of discovery (services stay reconcilable
+// across worker restarts; the worker-wired reconciler applies its own
+// stable-WORKER_ID scope, see ServiceContainer), but it IS included in the
+// result. Replica is parsed from labelReplica, defaulting to -1 when
 // missing/invalid.
 func (m *Manager) ServiceContainerList(ctx context.Context) ([]ServiceContainer, error) {
 	return m.serviceContainerList(ctx, m.beginDockerOp)

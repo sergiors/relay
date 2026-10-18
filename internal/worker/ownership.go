@@ -305,13 +305,14 @@ func guardIdentityCleanup(
 //     it creates has a NEW immutable Docker ID. A captured ID therefore can
 //     never name a container the replacement made.
 //   - SERVICE containers (shutdown cleanup, and the startup service-orphan
-//     sweep): a replacement CAN retain/adopt the SAME physical id. The service
-//     reconciler is deliberately label-derived and NOT process- or
-//     hostname-scoped (services must be reconcilable across worker restarts, see
-//     reconciler.Reconcile), so on startup a replacement converges the
-//     daemon-listed containers and keeps a running, label-converged one in place
-//     instead of recreating it. For services the id-freshness argument above does
-//     NOT hold.
+//     sweep): a replacement with the SAME WORKER_ID CAN retain/adopt the SAME
+//     physical id. The worker wires reconciler.WithWorkerID, so adoption
+//     requires a matching relay.hostname: the replacement incarnation of this
+//     identity converges the daemon-listed containers and keeps a running,
+//     label-converged one in place instead of recreating it, while another
+//     worker's containers are filtered out (the exported direct Reconcile API
+//     stays unscoped). For services the id-freshness argument above does NOT
+//     hold.
 //
 // For service containers the safety therefore rests on the FAIL-CLOSED ownership
 // proof, not on id freshness: the WORKER_ID advisory lock is exclusive, so while
@@ -362,6 +363,122 @@ func guardIdentitySnapshotCleanup[C any](
 		}
 		return remove(ctx, candidates)
 	}
+}
+
+const (
+	// startupSweepAttempts bounds how many times a startup identity-scoped
+	// orphan sweep is driven. A transient list/stop error (a daemon hiccup, a
+	// container being removed concurrently) is otherwise logged and abandoned,
+	// leaving this worker's stale containers behind for a whole process
+	// lifetime. The retry is finite on purpose: startup cleanup stays a
+	// best-effort pass, never an unbounded heal loop.
+	startupSweepAttempts = 3
+	// startupSweepRetryDelay is the bounded pause between attempts. It only
+	// spaces the retries; every attempt is still bounded by the caller's
+	// existing startup sweep context, so a stuck daemon cannot extend startup.
+	startupSweepRetryDelay = time.Second
+)
+
+// sweepDriveResult aggregates one startup identity-scoped sweep's bounded
+// re-drive for the worker's structured startup log: how many attempts ran, how
+// many candidates discovery captured across them, and how many objects the
+// removals reported removing. discovered/removed are deliberately aggregate
+// counters, never per-container logs.
+type sweepDriveResult struct {
+	attempts   int
+	discovered int
+	removed    int
+}
+
+// retryIdentitySnapshotCleanup re-drives guardIdentitySnapshotCleanup a bounded
+// number of times for a STARTUP sweep. It exists because a transient list/stop
+// error used to be logged and abandoned, so this worker's containers could
+// remain while the new worker stayed up.
+//
+// Every attempt runs the WHOLE snapshot-first, proof-second, remove-third
+// sequence: it rediscovers a FRESH candidate snapshot, re-proves PostgreSQL
+// ownership on the pinned lock, and removes exactly the IDs that attempt
+// captured. Nothing is carried between attempts, so a retry can never remove a
+// container a replacement owner created after an earlier snapshot.
+//
+// Retrying stops immediately, and never re-discovers, once the caller's context
+// is done or ownership is known lost: after a loss the identity may already
+// belong to a replacement process, whose containers a fresh discovery could
+// capture. A latched loss or a failed/ambiguous proof therefore still fails
+// closed, exactly as the single-pass guard does. All attempts share the
+// caller's startup bound; the inter-attempt pause is small and context-aware,
+// so the retries add no unbounded wait.
+func retryIdentitySnapshotCleanup[C any](
+	ctx context.Context,
+	proof ownershipProof,
+	logger *slog.Logger,
+	name string,
+	discover func(context.Context) ([]C, error),
+	remove func(context.Context, []C) (int, error),
+) (sweepDriveResult, error) {
+	var result sweepDriveResult
+	for attempt := 1; attempt <= startupSweepAttempts; attempt++ {
+		result.attempts = attempt
+		err := guardIdentitySnapshotCleanup(proof, logger, name,
+			func(stepCtx context.Context) ([]C, error) {
+				candidates, derr := discover(stepCtx)
+				if derr == nil {
+					result.discovered += len(candidates)
+				}
+				return candidates, derr
+			},
+			func(stepCtx context.Context, candidates []C) error {
+				n, rerr := remove(stepCtx, candidates)
+				if rerr == nil {
+					result.removed += n
+				}
+				return rerr
+			},
+		)(ctx)
+		if proof.loss.isLost() {
+			// The shared loss action already emitted the one structured loss
+			// warning; this records that the sweep stopped with its aggregate.
+			if logger != nil {
+				logger.Debug("Startup: identity-scoped sweep skipped after ownership loss",
+					"sweep", name,
+					"attempts", result.attempts,
+					"discovered", result.discovered,
+					"removed", result.removed,
+				)
+			}
+			return result, err
+		}
+		if err == nil {
+			return result, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			// Keep the operation error for diagnosis while still classifying
+			// the sweep as interrupted by shutdown.
+			if errors.Is(err, ctxErr) {
+				return result, err
+			}
+			return result, errors.Join(err, ctxErr)
+		}
+		if attempt == startupSweepAttempts {
+			return result, err
+		}
+		if logger != nil {
+			logger.Debug("Startup: retrying identity-scoped sweep",
+				"sweep", name,
+				"attempt", attempt,
+				"max_attempts", startupSweepAttempts,
+				"error", err,
+			)
+		}
+		timer := time.NewTimer(startupSweepRetryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return result, errors.Join(err, ctx.Err())
+		case <-timer.C:
+		}
+	}
+	return result, nil
 }
 
 // ownershipBarrierStep joins the ownership monitor goroutine and then runs ONE

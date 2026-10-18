@@ -206,9 +206,10 @@ func (l *Loader) LoadWithDiagnostics() ([]App, []LoadIssue, error) {
 // directories, loads each through LoadSingle, and classifies the outcome. It
 // returns the loaded apps plus the present-but-invalid entries as issues;
 // Relay-owned transient staging directories (IsReservedDir) are skipped
-// entirely, vanished entries (fs.ErrNotExist) and entries without a template yet
-// (ErrNotReady) are neither apps nor issues. Callers own the logging and
-// the error semantics.
+// entirely, vanished entries (fs.ErrNotExist) are neither apps nor issues, and
+// entries without a template yet (ErrNotReady) are reported as issues so a
+// caller can observe the present-but-not-ready state. Callers own the logging
+// and the error semantics.
 func (l *Loader) load() ([]App, []LoadIssue, error) {
 	entries, err := os.ReadDir(l.dir)
 	if err != nil {

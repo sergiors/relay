@@ -16,10 +16,18 @@
 // what decides when to invoke it. Containers owned by OTHER apps are never
 // touched here: each app's reconcile owns only its own containers, and
 // SweepOrphans is the single cross-app pass (called once at startup with
-// the set of live app names) that removes containers whose app no
+// the set of present app names) that removes containers whose app no
 // longer exists. ShutdownCleanup is the graceful-shutdown counterpart: it
 // removes service containers owned by this worker only; startup convergence
 // remains the crash-recovery path when shutdown cleanup did not execute.
+//
+// Worker identity: the production worker wires WithWorkerID, which scopes every
+// operation to containers whose relay.hostname equals its stable WORKER_ID. A
+// ServiceReconciler built without it (and the exported direct Reconcile API)
+// keeps the historical unscoped, same-host behavior. The worker scope is what
+// keeps two Relay workers sharing one Docker daemon from changing each other's
+// service containers, while a restart of the SAME WORKER_ID still adopts the
+// previous process's running, converged containers instead of recreating them.
 //
 // Identity is the service's stable template name (app.Service.Name) and the
 // replica slot is relay.replica; both are label-derived and are the only
@@ -376,8 +384,12 @@ func (t *sourceApplyTracker) forgetApp(app string) {
 //
 // Container ownership is always label-derived. A container belongs to fnName
 // when its App == fnName; containers of other apps are never touched.
-// The ownership predicate is NOT hostname-scoped — services must be
-// reconcilable across worker restarts on the same host (same as the runtime).
+// This exported entry point is deliberately NOT hostname-scoped, so a direct
+// caller keeps the historical same-host behavior. The worker-wired
+// ServiceReconciler adds its stable WORKER_ID as a second predicate (see
+// WithWorkerID): containers stamped with another worker's relay.hostname are
+// untouched, while a restart of the SAME WORKER_ID still adopts and reconciles
+// the previous process's service containers.
 func Reconcile(
 	ctx context.Context,
 	reconcileTimeout time.Duration,
@@ -393,7 +405,7 @@ func Reconcile(
 ) (bool, error) {
 	return reconcileWithObserver(
 		ctx, reconcileTimeout, docker, fnName, tmpl, appImage, preparedEnv,
-		serviceNetworks, secrets, traefik, log, nil, nil,
+		serviceNetworks, secrets, traefik, log, "", nil, nil,
 	)
 }
 
@@ -409,6 +421,7 @@ func reconcileWithObserver(
 	secrets SecretResolver,
 	traefik routing.TraefikConfig,
 	log *slog.Logger,
+	workerID string,
 	reconcileStarted func(),
 	apply *sourceApplyTracker,
 ) (bool, error) {
@@ -428,6 +441,21 @@ func reconcileWithObserver(
 		return false, fmt.Errorf("service: list containers: %w", err)
 	}
 
+	// owned reports whether a discovered container belongs to this pass: the
+	// same app, and — when the reconciler is worker-wired — this worker's own
+	// stable identity. A container another worker created (a different
+	// relay.hostname on the shared daemon) is never converged, adopted, or
+	// stopped here; the unscoped direct API (workerID == "") keeps the
+	// historical app-only predicate. Because WORKER_ID is stable across
+	// restarts, a replacement process still matches the containers its previous
+	// incarnation created and adopts a converged one in place.
+	owned := func(ctr runtime.ServiceContainer) bool {
+		if ctr.App != fnName {
+			return false
+		}
+		return workerID == "" || ctr.Hostname == workerID
+	}
+
 	// restarter is the optional in-place restart capability. When the configured
 	// Docker implements it AND a source-apply tracker is present (the worker's
 	// ServiceReconciler always supplies one), a source-only change restarts the
@@ -443,7 +471,7 @@ func reconcileWithObserver(
 	if apply != nil {
 		live := make(map[string]bool, len(containers))
 		for _, ctr := range containers {
-			if ctr.App == fnName {
+			if owned(ctr) {
 				live[ctr.ID] = true
 			}
 		}
@@ -534,8 +562,9 @@ func reconcileWithObserver(
 	var removed []runtime.ServiceContainer
 	byService := make(map[string][]runtime.ServiceContainer)
 	for _, ctr := range containers {
-		if ctr.App != fnName {
-			// Another app owns this container; its reconcile handles it.
+		if !owned(ctr) {
+			// Another app, or another worker's service container, owns this
+			// container; this pass never touches it.
 			continue
 		}
 		if _, ok := desired[ctr.Name]; !ok {
@@ -1188,9 +1217,11 @@ func RemoveAll(ctx context.Context, docker Docker, fnName string, log *slog.Logg
 // Relay shutdown removes this worker's persistent service containers; crash
 // recovery remains handled by startup reconciliation.
 //
-// It exists as its own smallest operation because RemoveAll is app-scoped
-// and SweepOrphans is cross-app (neither is hostname-scoped by design);
-// here ownership is hostname-scoped only. The returned count is the number of
+// It exists as its own smallest operation because RemoveAll is app-scoped and
+// SweepOrphans is cross-app (the latter is hostname-scoped only when the
+// reconciler is wired with WithWorkerID; the exported direct API stays
+// unscoped); here ownership is hostname-scoped only. The returned count is the
+// number of
 // this worker's containers selected for removal.
 //
 // A container with an empty Hostname is NOT claimed by any worker: the hostname
@@ -1315,7 +1346,10 @@ func (c *ServiceReconciler) RemoveShutdownContainers(ctx context.Context, contai
 // to a single
 // Docker implementation, secret resolver, and logger. App-scoped Apply
 // calls are serialized by ServiceCoordinator in the worker; the mutex remains
-// around cross-app cleanup operations.
+// around cross-app cleanup operations. A reconciler constructed with
+// WithWorkerID scopes Reconcile, app removal, and the orphan sweep to its
+// stable relay.hostname (see that option); without it the operations keep the
+// historical unscoped, same-host behavior.
 type ServiceReconciler struct {
 	docker  Docker
 	secrets SecretResolver
@@ -1341,6 +1375,16 @@ type ServiceReconciler struct {
 	// is a no-op; it is set through NewServiceReconciler's options (the worker
 	// passes WithMetrics). It is never used to gate behavior.
 	metrics *metrics.Registry
+
+	// workerID, when non-empty, is this worker's stable identity (WORKER_ID,
+	// stamped as relay.hostname on every service container) and SCOPES every
+	// container operation: Reconcile converges/adopts, Remove removes, and the
+	// orphan sweep selects only containers carrying it. The worker wires
+	// WithWorkerID so workers sharing a Docker daemon cannot change each
+	// other's services; because WORKER_ID is stable, a restart still adopts its
+	// own converged containers. Empty (a directly-constructed reconciler or the
+	// exported Reconcile) keeps the historical unscoped, same-host behavior.
+	workerID string
 
 	// sourceApply tracks source-only in-place restarts (HOT_RELOAD). It is
 	// constructed by NewServiceReconciler and shared across this reconciler's
@@ -1372,6 +1416,18 @@ func WithMetrics(reg *metrics.Registry) ServiceReconcilerOption {
 // startup configuration: changing it requires a worker restart.
 func WithNetworks(networks []string) ServiceReconcilerOption {
 	return func(c *ServiceReconciler) { c.networks = append([]string(nil), networks...) }
+}
+
+// WithWorkerID scopes every service-container operation of this reconciler to
+// one stable worker identity: only containers whose relay.hostname label equals
+// workerID are reconciled, adopted, removed, or swept. The worker wires its
+// WORKER_ID (the same value Manager stamps on service containers), so two
+// workers sharing a Docker daemon never change each other's services while a
+// restart of the SAME identity still adopts the previous process's running,
+// converged containers. Omitting the option (or passing "") leaves the
+// historical unscoped, same-host behavior for direct reconciler use.
+func WithWorkerID(workerID string) ServiceReconcilerOption {
+	return func(c *ServiceReconciler) { c.workerID = workerID }
 }
 
 // NewServiceReconciler builds a ServiceReconciler. traefik is the worker-level
@@ -1452,7 +1508,8 @@ func (c *ServiceReconciler) apply(
 	start := time.Now()
 	changed, err := reconcileWithObserver(
 		ctx, c.reconcileTimeout, c.docker, fnName, tmpl, image, preparedEnv,
-		c.networks, c.secrets, c.traefik, c.log, reconcileStarted, c.sourceApply,
+		c.networks, c.secrets, c.traefik, c.log, c.workerID, reconcileStarted,
+		c.sourceApply,
 	)
 	c.observeReconcile(fnName, changed, err, time.Since(start))
 	if err != nil {
@@ -1506,20 +1563,62 @@ func (c *ServiceReconciler) observeReconcile(
 	}, d)
 }
 
-// Remove stops and removes every service container belonging to fnName. Called
-// by the reconciler's RemoveServices hook BEFORE the app's images are
-// retired.
+// Remove stops and removes every service container belonging to fnName that
+// THIS reconciler owns. Called by the reconciler's RemoveServices hook BEFORE
+// the app's images are retired. An unscoped reconciler (no WithWorkerID)
+// delegates to RemoveAll and therefore removes every container of the app on
+// the daemon, preserving the historical behavior; a worker-wired reconciler
+// additionally requires relay.hostname == its WORKER_ID, so removing an app
+// never takes another worker's service containers down.
 func (c *ServiceReconciler) Remove(ctx context.Context, fnName string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.sourceApply.forgetApp(fnName)
-	RemoveAll(ctx, c.docker, fnName, c.log)
+	if c.workerID == "" {
+		RemoveAll(ctx, c.docker, fnName, c.log)
+		return
+	}
+	c.removeAppForWorkerLocked(ctx, fnName)
+}
+
+// removeAppForWorkerLocked removes this worker's service containers for fnName.
+// It is the worker-identity-scoped counterpart of RemoveAll and must be called
+// with c.mu held. It uses the same two Docker operations
+// (ServiceContainerList then StopServiceContainers) RemoveAppServiceContainers
+// uses, adding the relay.hostname scope. It never touches another worker's
+// containers for the same app: those are that worker's to converge or remove.
+func (c *ServiceReconciler) removeAppForWorkerLocked(
+	ctx context.Context, fnName string,
+) {
+	containers, err := c.docker.ServiceContainerList(ctx)
+	if err != nil {
+		c.log.Warn("Service: remove app containers failed",
+			"app", fnName, "error", err)
+		return
+	}
+	var own []runtime.ServiceContainer
+	for _, ctr := range containers {
+		if ctr.App == fnName && ctr.Hostname == c.workerID {
+			own = append(own, ctr)
+		}
+	}
+	if len(own) == 0 {
+		return
+	}
+	if err := c.docker.StopServiceContainers(ctx, own); err != nil {
+		c.log.Warn("Service: remove app containers failed",
+			"app", fnName, "count", len(own), "error", err)
+		return
+	}
+	c.log.Info("Service: removed app containers", "app", fnName, "count", len(own))
 }
 
 // SweepOrphans stops and removes every service container whose app is not
 // in liveApps (an app removed while Relay was down, or stale containers
-// from a previous boot on this host). hostname is deliberately NOT part of the
-// predicate, matching the runtime's documented same-host-restart limitation.
+// from a previous boot on this host). A worker-wired reconciler additionally
+// requires relay.hostname == its WORKER_ID, so it never sweeps another worker's
+// service containers; an unscoped reconciler keeps the historical app-only
+// predicate (the runtime's documented same-host-restart limitation).
 // Called once at startup after the per-app Applys.
 //
 // It is the convenience form of the split cleanup (DiscoverOrphanContainers
@@ -1552,10 +1651,13 @@ func (c *ServiceReconciler) SweepOrphans(ctx context.Context, liveApps map[strin
 // (RemoveOrphanContainers) — never re-listing after the proof, which is what
 // keeps a replacement owner's containers safe. It stops nothing.
 //
-// The app-live predicate is the same one SweepOrphans has always used; hostname
-// is deliberately NOT part of it, matching the runtime's documented
-// same-host-restart limitation. A list failure is returned unchanged (and logged)
-// so the caller can surface it with its own context.
+// The app-live predicate is the same one SweepOrphans has always used. A
+// worker-wired reconciler additionally requires relay.hostname == its
+// WORKER_ID, so the startup sweep never captures another worker's service
+// containers; an unscoped reconciler keeps the historical app-only predicate
+// (the runtime's documented same-host-restart limitation). A list failure is
+// returned unchanged (and logged) so the caller can surface it with its own
+// context.
 func (c *ServiceReconciler) DiscoverOrphanContainers(ctx context.Context, liveApps map[string]bool) ([]runtime.ServiceContainer, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1563,7 +1665,8 @@ func (c *ServiceReconciler) DiscoverOrphanContainers(ctx context.Context, liveAp
 }
 
 // discoverOrphansLocked selects the containers SweepOrphans would remove: every
-// discovered service container whose app is not in liveApps. It must be called
+// discovered service container whose app is not in liveApps, restricted to this
+// worker's identity when the reconciler is worker-wired. It must be called
 // with c.mu held (see the locked wrappers DiscoverOrphanContainers and
 // SweepOrphans). A list failure is logged ("Service: orphan sweep list failed")
 // and returned unchanged.
@@ -1575,6 +1678,11 @@ func (c *ServiceReconciler) discoverOrphansLocked(ctx context.Context, liveApps 
 	}
 	var stale []runtime.ServiceContainer
 	for _, ct := range containers {
+		if c.workerID != "" && ct.Hostname != c.workerID {
+			// Another worker's service container: another identity's property,
+			// never swept here.
+			continue
+		}
 		if !liveApps[ct.App] {
 			stale = append(stale, ct)
 		}

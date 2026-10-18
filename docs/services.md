@@ -153,13 +153,15 @@ to the template.
 - A replica whose process exits (a crash) is recreated on the next reconcile, so
   a service self-heals within the periodic cadence — no event-style
   retry/DLQ semantics.
-- Removing a service, or its whole app, stops and removes its containers.
+- Removing a service, or its whole app, stops and removes that worker's
+  containers for it (scoped by `relay.hostname`).
   Relay then retires obsolete `relay-app-<name>` images, but only after no active
   container references them, and ordered after service convergence. Image
   removal is never forced.
 - On graceful shutdown, Relay stops and removes the service containers owned by
   that worker (scoped by `relay.hostname`); containers left by a crashed process
-  are swept at the next startup.
+  of the **same** `WORKER_ID` are swept at the next startup, while a different
+  worker's service containers are never adopted, converged, or removed.
 
 Changes to an app's services are serialized per app and only the latest
 desired state is applied. A pass that a newer desired state superseded (a live
