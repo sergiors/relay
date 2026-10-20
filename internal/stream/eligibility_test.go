@@ -32,7 +32,8 @@ func activeToken(v string) string {
 }
 
 // fakeInvocationStore is an in-memory invocationStateStore that models the
-// documented value grammar of the Redis-backed invocationStore (invocation.go).
+// documented value grammar of the Redis-backed invocationStore
+// (invocation_store.go).
 // It exists so the consumer's invocation-state seam (newConsumer) and the
 // InvocationState wrapper can be exercised without Redis; the Redis-backed store
 // itself is covered by the integration suite. It models the per-claim
