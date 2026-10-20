@@ -3,25 +3,26 @@
 // the Redis stream, blocking until signalled. Configuration comes entirely
 // from the environment.
 //
-// Startup begins with an explicit external-dependency preflight (see
-// runExternalPreflight) that runs BEFORE any app is loaded or fingerprinted,
-// before the state database is opened, and before the runtime socket, services,
+// Startup opens the required PostgreSQL state database first (which takes an
+// exclusive per-WORKER_ID PostgreSQL session advisory lock), then runs an
+// explicit external-dependency preflight (see runExternalPreflight) BEFORE any
+// app is loaded or fingerprinted, and before the runtime socket, services,
 // sweeps, preparation, listener starts, background loops, scheduler, and
-// reconciler. The fixed order is: Redis stream/consumer-group readiness, then
-// Docker runtime-manager readiness, then verification of the configured NETWORKS
-// set, then the runtime manager's own background maintenance loop is started. A
-// failure at any step short-circuits every later phase; a lifecycle cancellation
-// during the preflight is a graceful shutdown.
+// reconciler. The fixed preflight order is: Redis stream/consumer-group
+// readiness, then Docker runtime-manager readiness, then verification of the
+// configured NETWORKS set, then the runtime manager's own background
+// maintenance loop is started. A failure at any step short-circuits every later
+// phase; a lifecycle cancellation during the preflight is a graceful shutdown.
 //
-// After the state database is opened (which takes an exclusive per-WORKER_ID
-// PostgreSQL session advisory lock) the worker starts an ownership monitor that
-// re-verifies that lock on its pinned connection; if the lock is lost while the
-// process keeps running, the monitor cancels the lifecycle, clears readiness,
-// and the worker exits with an ownership-loss error after skipping
-// identity-scoped cleanup. The same pinned-connection proof is re-run once after
-// the monitor joins at shutdown and again immediately before each identity-scoped
-// cleanup, so a loss missed between polls still fails closed — see
-// internal/worker/ownership.go and internal/state/ownership.go.
+// Immediately after the state database is opened (and before the preflight) the
+// worker starts an ownership monitor that re-verifies that lock on its pinned
+// connection; if the lock is lost while the process keeps running, the monitor
+// cancels the lifecycle, clears readiness, and the worker exits with an
+// ownership-loss error after skipping identity-scoped cleanup. The same
+// pinned-connection proof is re-run once after the monitor joins at shutdown
+// and again immediately before each identity-scoped cleanup, so a loss missed
+// between polls still fails closed — see internal/worker/ownership.go and
+// internal/state/ownership.go.
 //
 // Its in-memory accounting registry is always created and
 // is the single source of truth for the operational counters; the Prometheus
@@ -64,10 +65,8 @@ import (
 	"relay/internal/observability/metrics"
 	"relay/internal/observability/tracing"
 	"relay/internal/reconciler"
-	"relay/internal/routing"
 	"relay/internal/runner"
 	"relay/internal/runtime"
-	"relay/internal/schedule"
 	"relay/internal/secrets"
 	"relay/internal/source"
 	"relay/internal/state"
@@ -269,11 +268,12 @@ type preflightDeps struct {
 
 // runExternalPreflight runs the worker's external-dependency preflight in the
 // fixed order Redis stream/group readiness -> Docker runtime-manager readiness
-// -> configured NETWORKS verification -> manager maintenance start, BEFORE any
-// app is loaded or fingerprinted, before state.Open, and before the runtime
-// socket, services, sweeps, preparation, listener starts, background loops,
-// scheduler, and reconciler are touched. A failure at any step short-circuits
-// every later step and is returned so Run unwinds through its deferred shutdown;
+// -> configured NETWORKS verification -> manager maintenance start. It runs
+// after the required state database is opened, and BEFORE any app is loaded or
+// fingerprinted and before the runtime socket, services, sweeps, preparation,
+// listener starts, background loops, scheduler, and reconciler are touched. A
+// failure at any step short-circuits every later step and is returned so Run
+// unwinds through its deferred shutdown;
 // a failure that only reflects the lifecycle being cancelled is classified as
 // errStartupInterrupted for a graceful nil return, and a genuine failure is
 // wrapped with its step's context.
@@ -369,115 +369,70 @@ func runExternalPreflight(
 func Run(logger *slog.Logger) (runErr error) {
 	cfg, err := config.Load(logger)
 	if err != nil {
-		// Pre-resource failure: nothing owns cleanup yet, so return the error for
-		// the CLI to print and exit on.
+		// Pre-resource failures: nothing owns cleanup yet, so return for the CLI.
 		return fmt.Errorf("invalid configuration: %w", err)
 	}
 	redisOpts, err := config.RedisOptions(cfg.RedisURI)
 	if err != nil {
-		// Pre-resource failure: nothing owns cleanup yet, so return the error for
-		// the CLI to print and exit on.
 		return fmt.Errorf("redis config invalid: %w", err)
 	}
 	client := redis.NewClient(redisOpts)
 
-	// The worker's lifecycle context: cancelled on SIGINT/SIGTERM (or by the
-	// deferred shutdown when Run returns). It is created here,
-	// before the runtime Manager, so the manager can root Dockerfile builds in
-	// it (see runtime.WithLifecycleContext): a long build is bounded by the
-	// runtime's 10m buildTimeout but is still cancelled when Relay shuts down.
-	// Every bounded startup daemon operation and the reconciler hooks are
-	// likewise rooted here (rather than context.Background), so shutdown cancels
-	// them too. It replaces the signal context that used to be created later.
+	// The worker lifecycle owns every bounded startup operation, Dockerfile
+	// builds, and reconciler hook. Created before the runtime manager so builds
+	// are cancelled on SIGINT/SIGTERM or when Run returns.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
-	// Tracing is initialized before the root startup span and rooted in the
-	// worker lifecycle. It is disabled by default (no endpoint => no exporter, no
-	// collector connection); Setup always returns a usable provider, and a setup
-	// error is non-fatal observability (the worker runs untraced).
+	// Tracing is optional observability: setup always returns a usable provider,
+	// and a setup failure leaves the worker running untraced.
 	tracerProvider, tracerErr := tracing.Setup(ctx, logger)
 	if tracerErr != nil {
 		logger.Warn("Tracing: setup failed; continuing without tracing", "error", tracerErr)
 	}
 
-	// The startup trace root. Its children cover each startup phase; it ends at
-	// the ready-to-consume boundary immediately before consumer.Consume. The
-	// deferred End below is a no-op after the explicit one and guarantees the
-	// span closes on every early-return path (before the provider shutdown step
-	// flushes it).
+	// Startup trace root. The deferred End below covers every early return; the
+	// explicit End at the ready boundary closes it before consumption starts.
 	startupCtx, startupSpan := tracing.Start(ctx, "relay.startup")
 
-	// The accounting registry is ALWAYS created; only the /metrics HTTP
-	// exposition (and its periodic snapshot logger) is opt-in, gated on
-	// METRICS_ADDR. Setup only CREATES them here (server nil when disabled);
-	// STARTING the server happens later, once the startup wiring is complete.
-	// Because the registry exists even with exposition disabled, the persistent
-	// PostgreSQL stats flush is independent of the HTTP listener.
+	// The accounting registry always exists for the persistent PostgreSQL stats
+	// flush; only the /metrics HTTP exposition is opt-in (server nil when
+	// METRICS_ADDR is unset). The server starts later, after wiring completes.
 	metricsInstance, metricsServer := setupMetrics(cfg, logger)
 
-	// The graceful shutdown registry converges here on every return path —
-	// normal shutdown, a startup failure after resources exist, or a Consume
-	// error. Steps are registered as each resource is successfully
-	// acquired/started (below), but run in the explicit shutdownStepOrder, so a
-	// resource acquired early (Redis) is released last and ordering never
-	// depends on registration/LIFO. The defer is registered BEFORE the first
-	// fallible resource-owning step, so even a secrets-provider failure releases
-	// the Redis client. Best-effort cleanup steps are bounded by min(their own
-	// cap, the remaining aggregate budget); their failure or timeout is logged
-	// with the step name and never stops the sequence. Quiescence barriers
-	// (scheduler, reconciler, housekeeping, services-join, loops) are logged on
-	// timeout and then strictly joined before any later step runs, so the
-	// aggregate budget bounds cleanup work, not process exit.
+	// Every return path converges through this ordered teardown. Steps register
+	// as resources are acquired but run in shutdownStepOrder (Redis FIRST in,
+	// LAST out), and the defer is installed before the first fallible resource
+	// so an early failure still releases everything acquired. Barriers
+	// (scheduler, reconciler, housekeeping, services-join, loops) are strictly
+	// joined before a later step closes the dependency they use.
 	shutdown := &shutdownRegistry{}
-	// The ownership-loss latch. It is set once by the ownership monitor (started
-	// after state.Open) when the pinned WORKER_ID lock is detected no longer
-	// held, and is read by readiness, the identity-scoped shutdown guards, and
-	// the override defer below.
+	// Latched by the ownership monitor and read by readiness, identity-scoped
+	// shutdown guards, and the override below.
 	ownership := &ownershipLoss{}
-	// Ownership-loss error override. It is registered BEFORE the deferred
-	// shutdown so it runs AFTER it (defers run LIFO): teardown must complete
-	// first, then a detected loss turns Run's result into a distinctive error so
-	// the supervisor sees abnormal termination rather than a clean signal
-	// shutdown. Reading the latch at defer time also reports a loss detected
-	// after the consume loop returns.
+	// Registered BEFORE the shutdown defer so it runs AFTER teardown (LIFO):
+	// a detected loss turns the final result into a distinctive error.
 	defer func() {
 		runErr = ownershipRunError(ownership, runErr)
 	}()
-	// The worker's readiness state. Its flag starts false and is set true only at
-	// the ready-to-consume boundary (just before Consume, once every listener and
-	// loop is wired) and cleared as the FIRST instruction of the shutdown defer.
-	// It is bound to the worker lifecycle context so a lifecycle cancellation
-	// that precedes the deferred clear (a signal during the final startup wiring,
-	// or just before Consume returns) already reports not-ready.
-	// It backs the `relay health` socket query; see internal/worker/readiness.go.
+	// Starts false; set only at the ready-to-consume boundary and cleared as the
+	// first shutdown instruction. Bound to the lifecycle so a cancellation that
+	// precedes that clear still reports not-ready.
 	workerReady := newReadiness(ctx)
-	// Redis is acquired first and released last; a wedged client close must not
-	// hang teardown.
+	// Redis is acquired first and released last.
 	shutdown.register(shutdownStep{
 		name:    shutdownStepRedis,
 		timeout: 5 * time.Second,
 		run:     func(context.Context) error { return client.Close() },
 	})
-	// Tracing is released LAST, after every other resource has stopped producing
-	// spans, under a bounded provider shutdown that flushes the batch processor.
-	// A disabled provider's Shutdown is a no-op.
+	// Tracing stops last, after every span producer has stopped.
 	shutdown.register(shutdownStep{
 		name:    shutdownStepTracing,
 		timeout: 5 * time.Second,
 		run:     tracerProvider.Shutdown,
 	})
 
-	// Cancel the lifecycle FIRST: a startup failure returns without a signal
-	// having arrived, so background loops, the coordinator, and the manager
-	// builds observe cancellation before teardown joins them. The root span is
-	// ended BEFORE the registry (and its tracing shutdown step) runs, so an
-	// early-return startup failure still flushes its trace.
-	//
-	// Readiness is cleared as the VERY FIRST instruction, before the lifecycle
-	// is cancelled: a `relay health` that races shutdown must observe not-ready
-	// rather than a stale true. Everything after that (lifecycle cancellation,
-	// span end, ordered graceful teardown with strict dependency barriers) is
-	// the normal shutdown sequence.
+	// Shutdown order is load-bearing: readiness clears FIRST, then the lifecycle
+	// is cancelled, the root span ends, and only then does ordered teardown run.
 	defer func() {
 		workerReady.setNotReady()
 		stop()
@@ -485,197 +440,58 @@ func Run(logger *slog.Logger) (runErr error) {
 		shutdown.run(logger)
 	}()
 
-	// The state database is a REQUIRED PostgreSQL dependency: the operator state
-	// view, the per-worker stats snapshots, and the durable schedule-publication
-	// outbox all live in it. It is opened FIRST — before the Redis/Docker
-	// preflight, before any app is loaded or fingerprinted, and before the
-	// runtime socket, services, sweeps, preparation, listeners, loops, scheduler,
-	// and reconciler — so no partially initialized runtime exists while a
-	// required dependency is unavailable. A failure is fatal: the deferred
-	// shutdown releases everything acquired so far. The handle's teardown step is
-	// registered here (before any other resource work) so every startup failure
-	// and normal shutdown releases the pool.
-	stateSpanCtx, stateSpan := tracing.Start(startupCtx, "state.initialize")
-	st, err := state.Open(stateSpanCtx, state.Options{
-		DSN:             cfg.DatabaseURL,
-		Owner:           cfg.WorkerID,
-		Instance:        cfg.InstanceID,
-		Logger:          logger,
-		MaxOpenConns:    config.DefaultDatabaseMaxOpenConns,
-		MaxIdleConns:    config.DefaultDatabaseMaxIdleConns,
-		ConnMaxLifetime: config.DefaultDatabaseConnMaxLifetime,
-		ConnMaxIdleTime: config.DefaultDatabaseConnMaxIdleTime,
-		ConnectTimeout:  config.DefaultDatabaseConnectTimeout,
-	})
+	// The state DB is a REQUIRED dependency (operator view, stats snapshots,
+	// schedule outbox) and is opened before preflight or any app work. A failure
+	// is fatal; the deferred shutdown releases everything acquired so far.
+	st, err := openWorkerState(startupCtx, logger, cfg, metricsInstance)
 	if err != nil {
-		stateSpan.RecordError(err)
-		stateSpan.SetStatus(codes.Error, err.Error())
-		stateSpan.End()
-		if startupInterrupted(startupCtx, err) {
-			logger.Info("Startup: state database initialization interrupted by shutdown", "error", err)
-			return startupResult(errStartupInterrupted)
-		}
-		return fmt.Errorf("state: open failed: %w", err)
+		return startupResult(err)
 	}
-	stateSpan.End()
-	// Keep the one-hot app_status gauge in sync with every persisted status
-	// transition, centrally, so startup discovery, the reconciler, and the
-	// service callbacks all flow through one seam. Installed immediately after
-	// open, before any discovery/status write, so no transition is missed.
-	// Metrics stay decoupled from state (state imports nothing
-	// observability-related; the worker owns the closure).
-	wireStatusObserver(st, metricsInstance)
-	// Start the periodic ownership monitor now that the WORKER_ID lock is held
-	// (state.Open took it) and the handle is wired, so a lock lost DURING the
-	// rest of startup is detected and cancels the lifecycle even before Consume.
-	// Its quiescence barrier is registered in the same breath, so an early
-	// startup failure after this point still joins the monitor (which reads the
-	// pinned lock connection) before the state handle closes in a later step.
+	// Track ownership immediately after open so a lock lost during startup still
+	// cancels the lifecycle; its barrier is registered here so an early failure
+	// joins the monitor before the state handle closes.
 	//
-	// The once-only loss side effects and the fail-closed shutdown proof share
-	// ONE action (ownershipLossAction) and ONE proof seam, so a loss detected by
-	// the monitor, the final barrier verification, or an identity-cleanup guard
-	// latches exactly once and skips identity-scoped work the same way.
+	// The once-only loss action and the fail-closed proof are ONE seam, so a
+	// loss detected by the monitor, the final barrier check, or an
+	// identity-cleanup guard latches and skips identity-scoped work identically.
 	onOwnershipLost := ownershipLossAction(
 		ownership, workerReady, logger, cfg.WorkerID, cfg.InstanceID, stop,
 	)
-	proof := ownershipProof{
-		loss:   ownership,
-		verify: st.VerifyOwnerLock,
-		onLost: onOwnershipLost,
-	}
-	ownershipDone := startOwnershipMonitor(ctx, onOwnershipLost, ownershipMonitorConfig{
-		verify:   st.VerifyOwnerLock,
-		interval: state.OwnerLockCheckInterval,
-		timeout:  state.OwnerLockCheckTimeout,
-	})
-	shutdown.register(ownershipBarrierStep(ownershipDone, proof, logger))
-	// Registered before any further startup work, so an early failure after this
-	// point (and a normal shutdown) always releases the pool. The scheduler
-	// barrier (registered later) joins all scheduler work before this step runs.
+	proof := startOwnershipTracking(
+		ctx, st, ownership, onOwnershipLost, logger, shutdown,
+	)
+	// Registered before further startup gives an early failure and a normal
+	// shutdown the same state release; scheduler work is joined before it.
 	shutdown.register(shutdownStep{
 		name:    shutdownStepState,
 		timeout: 10 * time.Second,
 		run:     func(context.Context) error { return st.Close() },
 	})
 
-	// External-dependency preflight, in one explicit fixed order: Redis
-	// stream/consumer-group readiness -> Docker runtime-manager readiness ->
-	// configured NETWORKS verification. It runs BEFORE any app is loaded or
-	// fingerprinted, before state.Open, and before the runtime socket, services,
-	// sweeps, preparation, listener starts, background loops, scheduler, and
-	// reconciler. A failure at any step short-circuits every later step: Redis
-	// or the Docker daemon being unavailable is an operator condition that must
-	// surface before the worker touches anything else, and a lifecycle
-	// cancellation during the preflight is still a graceful shutdown (the
-	// deferred cleanup above released the Redis client and tracing, and the
-	// manager is closed by its registered shutdown step when it was opened).
-	// The manager's own teardown step is registered by OpenManager only on a
-	// successful open, so an early failure never registers a step for a manager
-	// that does not exist.
+	// Fixed external-dependency order: Redis/group, Docker manager, NETWORKS,
+	// then the manager's deferred maintenance loop. Any failure short-circuits
+	// every later phase; a cancellation here is a graceful shutdown.
 	manager, err := runExternalPreflight(startupCtx, logger, preflightDeps{
 		EnsureGroup: func(ctx context.Context) error {
 			return stream.EnsureGroup(ctx, client, cfg.RedisStream, cfg.RedisGroup)
 		},
-		// The closure deliberately ignores the preflight-step context and roots
-		// the manager in Run's worker lifecycle `ctx` (the signal context), the
-		// same lifecycle the manager owned before this refactor: builds and the
-		// startup ping must be cancelled by SIGTERM/SIGINT, and the startup-span
-		// context is used only for the phase span in runExternalPreflight.
+		// Root the manager in the worker lifecycle, not the preflight span, so
+		// builds and the startup ping observe SIGTERM/SIGINT.
 		OpenManager: func(_ context.Context) (*runtime.Manager, error) {
-			m, err := runtime.NewManager(
-				logger,
-				metricsInstance,
-				cfg.WorkerID,
-				runtime.WithWarmContainerIdleTimeout(cfg.WarmContainerIdleTimeout),
-				// The SAME MAX_CONCURRENT_INVOCATIONS the runner's global semaphore uses:
-				// the runtime clips each app's effective per-app
-				// concurrency to it, so a template asking for more than the
-				// worker-global cap (e.g. 15 with MAX_CONCURRENT_INVOCATIONS=8) warms,
-				// reports, and admits only the cap's worth. It is startup
-				// configuration; a global change requires a worker restart.
-				runtime.WithMaxConcurrentInvocations(cfg.MaxConcurrentInvocations),
-				// The per-worker cap (MAX_CONCURRENT_BUILDS) on runtime-backed
-				// image-preparation pipelines running concurrently. It bounds the
-				// whole preparation (source selection/snapshot, dependency
-				// snapshot, reuse probes, dependency and app image builds), so it
-				// is independent of invocation concurrency and of the local event
-				// buffer. It is startup configuration; a change requires a worker
-				// restart.
-				runtime.WithMaxConcurrentBuilds(cfg.MaxConcurrentBuilds),
-				// The worker-global hard bound (MAX_WARM_CONTAINERS) on warm
-				// EXECUTION containers this worker keeps across all apps. It
-				// bounds the pooled execution-container population (idle + busy),
-				// independent of invocation concurrency; persistent service
-				// containers are outside it. It is startup configuration; a
-				// change requires a worker restart.
-				runtime.WithMaxWarmContainers(cfg.MaxWarmContainers),
-				// The worker-global Docker networks (NETWORKS) every execution
-				// container joins at create time. They are verified by the next
-				// preflight step before any app is prepared or any container
-				// created.
-				runtime.WithNetworks(cfg.Networks),
-				// HOT_RELOAD: bind-mount the live app source read-only for a
-				// runtime whose dependency layout permits it (Python and Node),
-				// instead of baking it into the image, so a source-only edit
-				// takes effect without rebuilding. It is the public trigger for
-				// the runtime's internal source-mount mechanism. Startup
-				// configuration; a change requires a worker restart.
-				runtime.WithSourceMount(cfg.HotReload),
-				// Root Dockerfile builds in the WORKER LIFECYCLE (ctx), not the
-				// startup-span context: they get an independent 10m bound
-				// (runtime.buildTimeout) but are still cancelled when Relay shuts
-				// down. Builds must NOT inherit the short 30s reconcile budget
-				// the worker uses for normal service operations.
-				runtime.WithLifecycleContext(ctx),
-				// Do NOT start the warm-container maintenance loop in the
-				// constructor: the manager is opened before NETWORKS is
-				// verified, and the request is that all configured networks
-				// validate before ANY background loop starts. The loop is
-				// started by the final preflight step (StartMaintenance) only
-				// after verification succeeds; if it fails, the manager (and its
-				// Docker client) is still torn down by the registered shutdown
-				// step with no loop ever started.
-				runtime.WithDeferredMaintenance(),
-			)
-			if err != nil {
-				return nil, err
-			}
-			// Manager cleanup is context-aware, so the Docker client is only
-			// closed after every worker-owned goroutine has stopped and every
-			// warm container has been torn down (in parallel, bounded) or the
-			// step's finite bound expires. Registered BEFORE the preflight
-			// returns so a later preflight-step failure (NETWORKS verification)
-			// still converges through the deferred shutdown.
-			shutdown.register(shutdownStep{
-				name:    shutdownStepManager,
-				timeout: 30 * time.Second,
-				run:     m.CloseContext,
-			})
-			return m, nil
+			return openRuntimeManager(ctx, logger, metricsInstance, cfg, shutdown)
 		},
 		VerifyNetworks: func(ctx context.Context, m *runtime.Manager) error {
-			// Verify every configured NETWORKS network exists BEFORE any
-			// app is prepared or any container created. The networks are
-			// infrastructure owned OUTSIDE Relay — Relay never creates them —
-			// so a missing one is an operator condition that must fail startup
-			// rather than silently produce containers on the wrong (or no)
-			// network. A verify error (a broken daemon) is likewise fatal. The
-			// check is skipped entirely when NETWORKS is unset.
+			// Relay never creates networks, so a missing one must fail startup
+			// before any container exists. Unset NETWORKS skips the check.
 			return verifyConfiguredNetworks(ctx, m, cfg.Networks)
 		},
-		// The manager was opened with deferred maintenance, so this is the
-		// single place the warm-container eviction loop starts — only after
-		// NETWORKS verification succeeded. For a manager that did not defer,
-		// the call is a no-op (the loop is already running).
+		// Last: start the deferred warm-container eviction loop only after
+		// NETWORKS succeeds. Infallible and idempotent.
 		StartMaintenance: func(m *runtime.Manager) {
 			m.StartMaintenance()
 		},
 	})
 	if err != nil {
-		// startupResult converts a lifecycle-cancelled preflight into a
-		// graceful nil return (the process is already shutting down) and leaves
-		// a genuine prerequisite failure for the CLI to print and exit on.
 		return startupResult(err)
 	}
 	logger.Info("Startup: external dependencies ready",
@@ -684,137 +500,58 @@ func Run(logger *slog.Logger) (runErr error) {
 		"networks", len(cfg.Networks),
 	)
 
-	// Reclaim build-temp sessions a previous Relay process abandoned (a crash
-	// mid-preparation leaves its private source/dependency roots behind). This
-	// runs AFTER the preflight opened the manager — so this process's own session
-	// exists and its OS advisory owner lock protects it — and BEFORE any app is
-	// loaded, fingerprinted, or prepared, so no source preparation can begin
-	// before the reclaim. A session is removed only when its owner lock is
-	// acquirable (proving no live process owns it), and the shared coordination
-	// lock makes the scan race-free against another Relay creating a session. It
-	// is best-effort: on a coordination timeout or error we log and continue,
-	// leaving the residue for a later restart. Legacy os.TempDir roots from an
-	// older Relay are never touched (see runtime.Manager.ScavengeBuildRoots).
+	// Best-effort reclaim of private build-temp sessions a previous process
+	// abandoned. Runs after the manager session exists and before any app work;
+	// a session is removed only when its owner lock is acquirable.
 	scavengeCtx, scavengeCancel := context.WithTimeout(startupCtx, reconcileTimeout)
 	scavenged, scavengeErr := manager.ScavengeBuildRoots(scavengeCtx)
 	scavengeCancel()
 	if scavengeErr != nil {
-		logStartupCleanupFailure(ctx, logger, "Startup: build temp scavenge failed", scavengeErr)
+		logStartupCleanupFailure(
+			ctx, logger, "Startup: build temp scavenge failed", scavengeErr,
+		)
 	} else if scavenged > 0 {
-		logger.Info("Startup: removed abandoned build temp sessions from a previous relay process", "count", scavenged)
+		logger.Info(
+			"Startup: removed abandoned build temp sessions from a previous relay process",
+			"count", scavenged,
+		)
 	}
 
-	// A single shared secrets provider, used by both the webhook (below) and the
-	// runner (later). Construction is infallible (the dir is created lazily on
-	// Set, never Resolve); a missing secret surfaces as a per-invocation Resolve
-	// error, and startup does not validate that referenced secrets exist. A
-	// construction failure here is fatal — the provider is core to invocation
-	// and the webhook.
+	// One shared secrets provider for the webhook and runner. A missing secret
+	// surfaces per invocation; construction failure is fatal.
 	secretProvider, err := secrets.NewLocalProvider(secrets.SecretsDir)
 	if err != nil {
 		return fmt.Errorf("secrets: new local provider failed: %w", err)
 	}
 
-	// The Git webhook server (internal/git/webhook) is opt-in, gated on
-	// GIT_WEBHOOK_ADDR. NewServer owns all assembly (git source config, secret
-	// reference checks, the coalescing sync scheduler, provider handlers) and
-	// returns nil when disabled. The worker only orchestrates: construct, start
-	// (bind failure is fatal, matching metrics), and stop on shutdown. Its
-	// teardown step is registered only once it has actually started.
+	// Optional Git webhook, gated on GIT_WEBHOOK_ADDR. NewServer owns assembly
+	// and returns nil when disabled; Run only constructs, starts, and registers
+	// its teardown.
 	var gitWebhookServer *gitwh.Server
 	if cfg.GitWebhookAddr != "" {
 		gitWebhookServer = gitwh.NewServer(cfg.GitWebhookAddr, logger, gitwh.Config{Secrets: secretProvider})
 	}
 
-	_, loaderSpan := tracing.Start(startupCtx, "apps.load")
-	loader := app.NewLoader(app.Dir, logger)
-	apps, loadIssues, err := loader.LoadWithDiagnostics()
+	startupSet, err := loadStartupApps(startupCtx, logger, st, metricsInstance)
 	if err != nil {
-		loaderSpan.RecordError(err)
-		loaderSpan.SetStatus(codes.Error, err.Error())
-		loaderSpan.End()
-		// The worker cannot run without its app set. The deferred cleanup
-		// releases the Redis client and stops the servers; the error is returned
-		// for the CLI boundary to print and exit on.
-		return fmt.Errorf("load apps failed: %w", err)
+		return err
 	}
-	loaderSpan.End()
-	logger.Info("Loaded apps", "count", len(apps), "invalid", len(loadIssues), "root", app.Dir)
+	apps := startupSet.loaded
+	fingerprints := startupSet.fingerprints
 
-	// Compute every loaded app's content fingerprint — and, for a
-	// runtime-backed app, the source selection it was computed from — ONCE
-	// for the whole startup, carrying both forward as the immutable startup
-	// records. The fingerprint feeds the state phase (rebuild + discovery
-	// upserts); the selection feeds Manager.Prepare, which captures it into one
-	// immutable snapshot and derives the built image's tag, staged context, and
-	// returned identity from that single read — no startup stage re-reads
-	// /apps to build. The identity actually built is what the state phase
-	// records and the reconciler is seeded with, not this pre-prepare scan. The
-	// state DB is a persisted, read-mostly local state view (see internal/state),
-	// NOT the source of truth and NOT a snapshot the worker only reads: the worker
-	// also writes it (this discovery phase, reconcile outcomes, the 5s stats
-	// flush). It never drives matching or building; it is opened after the
-	// fingerprints so even a broken DB still yields fingerprints for Prepare and
-	// the reconciler.
-	_, fingerprintSpan := tracing.Start(startupCtx, "apps.fingerprint")
-	fingerprintStart := time.Now()
-	startup := selectAndFingerprintApps(apps, logger)
-	fingerprints := make(map[string]string, len(startup))
-	for _, s := range startup {
-		fingerprints[s.App.Name] = s.Fingerprint
-	}
-	// The state package consumes the narrow (app, fingerprint) pair; the
-	// selection stays worker-local because it is a filesystem concern the state
-	// layer must not own.
-	discovered := discoveredFromStartup(startup)
-	fingerprintSpan.End()
-	logger.Debug("Startup: fingerprints computed",
-		"count", len(startup),
-		"duration", time.Since(fingerprintStart),
-	)
-
-	// The already-computed fingerprint pairs feed both the fresh-database
-	// rebuild and the per-app discovery upserts; /apps is never
-	// re-read for state and each app's source is hashed exactly once.
-	// Present-but-invalid desired definitions are persisted alongside the
-	// valid discovery; they stay out of the loaded set, so they never reach
-	// the runtime registry, matching, the scheduler, or preparation. A write
-	// failure is logged (non-fatal): the app set is already loaded and serving.
-	_, discoverySpan := tracing.Start(startupCtx, "state.discovery")
-	if rerr := persistStartupDiscovery(st, app.Dir, discovered, loadIssues, logger); rerr != nil {
-		discoverySpan.RecordError(rerr)
-	}
-	discoverySpan.End()
-
-	// Seed the fresh registry with THIS worker's persisted cumulative totals so
-	// the first snapshot writes them back instead of zeroing PostgreSQL. Each
-	// worker restores only its own rows (stats are keyed by worker identity), so
-	// two workers sharing the database never double-count. Gauges are NOT
-	// restored (they are point-in-time snapshots refreshed each interval).
-	_, statsRestoreSpan := tracing.Start(startupCtx, "state.restore_stats")
-	restorePersistedStats(metricsInstance, st)
-	statsRestoreSpan.End()
-
-	// The stats flusher is the single owner of every write of the registry's
-	// Relay-visible totals into PostgreSQL. It holds a mutex across BOTH the
-	// capture of the current snapshot and the write, so an operator reset over
-	// the socket (flusher.ResetStats) can never race a flush into resurrecting
-	// pre-reset values: a flush either completes before the reset or captures
-	// after it. Shared by statsLoop, finalStatsFlush, and the socket reset
-	// command.
+	// Single owner of registry-to-PostgreSQL stats writes. Its mutex spans
+	// snapshot capture and write, so a socket reset can never be overwritten by
+	// a flush holding pre-reset values; shared by the loop, final flush, and
+	// socket reset command.
 	statsFlusher := newStatsFlusher(st, metricsInstance)
 	statsFlusher.retention = cfg.StatsRetention
 	statsFlusher.log = logger
 	shutdown.register(shutdownStep{
 		name:    shutdownStepStatsFlush,
 		timeout: 2 * time.Second,
-		// Final stats are IDENTITY-SCOPED (they write this worker's row), so the
-		// flush is skipped once ownership is lost: a replacement process may
-		// already own the row and this worker's stale totals must not overwrite
-		// it. The guard re-proves the lock on the pinned connection immediately
-		// before the flush (a loss since the final barrier verification still
-		// suppresses it). The per-instance fence in the flush is defense in
-		// depth.
+		// Identity-scoped: skip once ownership is lost so this worker's stale
+		// totals cannot overwrite a replacement's row. The guard re-proves the
+		// lock immediately before the flush.
 		run: guardIdentityCleanup(proof, logger, shutdownStepStatsFlush,
 			func(stepCtx context.Context) error {
 				finalStatsFlush(stepCtx, statsFlusher)
@@ -822,667 +559,96 @@ func Run(logger *slog.Logger) (runErr error) {
 			}),
 	})
 
-	// The live runtime-pool query socket (see internal/worker/socket.go). It is
-	// started now that the manager exists: the CLI's `app inspect` dials it
-	// for the LIVE gauges, which are worker-local and never persisted; the
-	// cumulative counters stay in /var/lib/relay. The
-	// process lock acquired by `relay start` is already held, so removing a stale
-	// socket here can never delete an active worker's socket. A bind failure is
-	// fatal, matching the metrics and webhook servers: a local bind error is a
-	// host/config problem that must surface at startup, not heal invisibly.
-	_, socketSpan := tracing.Start(startupCtx, "runtime.socket")
-	rtSocket, err := NewSocketServer(SocketPath, manager, statsFlusher, logger)
+	// The live runtime-pool query socket; its readiness checker stays not-ready
+	// until the ready-to-consume boundary installs the live probe.
+	rtSocket, err := startRuntimeSocket(
+		startupCtx, logger, manager, statsFlusher, workerReady, shutdown,
+	)
 	if err != nil {
-		socketSpan.RecordError(err)
-		socketSpan.SetStatus(codes.Error, err.Error())
-		socketSpan.End()
-		return fmt.Errorf("runtime state socket: start failed: %w", err)
+		return err
 	}
-	socketSpan.End()
-	// The readiness query (`relay health`) answers from the worker's readiness
-	// state. It is wired now, before the socket serves a request, so the socket
-	// always has a checker; the checker's live dependency probe is installed at
-	// the ready-to-consume boundary below, and until then its flag is false and
-	// it reports not-ready.
-	rtSocket.SetReadiness(workerReady)
-	// rtSocket.Close takes no context; the shutdown registry bounds its wait.
-	shutdown.register(shutdownStep{
-		name:    shutdownStepSocket,
-		timeout: 5 * time.Second,
-		run:     func(context.Context) error { return rtSocket.Close() },
-	})
-	logger.Info("Runtime state socket listening", "path", SocketPath)
 
-	// The service controller converges each app's persistent service
-	// containers to its template (manager is the Docker seam; secretProvider is
-	// the shared secrets resolver). It is wired with THIS worker's stable
-	// identity (WithWorkerID), so every service pass, app removal, and orphan
-	// sweep only ever converges, adopts, or removes containers stamped with this
-	// worker's relay.hostname: another worker's services on the shared Docker
-	// daemon are never touched. Because WORKER_ID is stable across restarts, a
-	// replacement process still ADOPTS the previous process's converged service
-	// containers instead of recreating them. Service containers stop on graceful
-	// shutdown: the shutdown tail runs ShutdownCleanup for this worker's
-	// identity (cfg.WorkerID). The coordinator runs the per-app Applys
-	// asynchronously (bounded workers, latest-desired-state coalescing), so
-	// startup never blocks on service convergence (e.g. an external image pull);
-	// the startup orphan
-	// sweep + image GC run inside the coordinator's exclusive housekeeping window
-	// in the background pass. Startup reconciliation remains the crash-recovery
-	// path when shutdown cleanup did not execute. The service reconciler itself
-	// decides whether routing applies (only services declaring a host are routed)
-	// and validates TRAEFIK_NETWORK per routed service; wiring only forwards the
-	// configured value. The same worker-global NETWORKS set applied to execution
-	// containers is forwarded too, so every service container joins it.
-	svcCtrl := reconciler.NewServiceReconciler(
-		manager,
-		secretProvider,
-		routing.TraefikConfig{
-			Network:      cfg.TraefikNetwork,
-			EntryPoints:  cfg.TraefikEntryPoints,
-			CertResolver: cfg.TraefikCertResolver,
-			Priority:     cfg.TraefikPriority,
-			HostOverride: cfg.TraefikHostOverride,
-		},
-		logger,
-		reconcileTimeout,
-		reconciler.WithMetrics(metricsInstance),
-		reconciler.WithNetworks(cfg.Networks),
-		// Scope every service-container operation to this worker's stable
-		// identity (relay.hostname). A same-WORKER_ID restart still adopts its
-		// own running services; a different worker's containers are untouched.
-		reconciler.WithWorkerID(cfg.WorkerID),
+	// Persistent service controller/coordinator; see startServiceConvergence.
+	svcCtrl, services := startServiceConvergence(
+		ctx, logger, cfg, manager, secretProvider, proof, metricsInstance, shutdown,
 	)
-	services := reconciler.NewServiceCoordinator(svcCtrl)
-	services.Start(ctx)
-	// Joining the coordinator releases its workers and waiters and drains
-	// in-flight Applys; the join is a strict barrier whose per-step bound is only
-	// the wait-before-diagnostic threshold, while the hostname-scoped container
-	// cleanup that runs right after is a separate bounded best-effort step.
-	shutdown.register(servicesJoinBarrierStep(services.Join))
-	shutdown.register(shutdownStep{
-		name:    shutdownStepServiceCleanup,
-		timeout: shutdownServiceTimeout,
-		// Service cleanup stops and removes THIS worker's service containers
-		// (scoped by WORKER_ID), so it is skipped once ownership is lost: a
-		// replacement process may already own the identity and its containers.
-		// Unlike execution containers, a replacement presenting the SAME
-		// WORKER_ID CAN adopt the SAME physical service container id (the
-		// reconciler is label-derived and the worker scopes it by relay.hostname,
-		// not by process), so the safety here rests on the fail-closed
-		// ownership proof rather than on id freshness. It snapshots the
-		// candidates FIRST, re-proves the lock on the pinned connection SECOND,
-		// and removes exactly the captured containers THIRD
-		// (guardIdentitySnapshotCleanup): discovery before the proof means a
-		// candidate was observed while the lock was ours, the proof gates the
-		// whole removal, and a latched or failed proof removes nothing. This is
-		// not atomic fencing; see guardIdentitySnapshotCleanup for the bounded
-		// residual.
-		run: shutdownServices(svcCtrl, cfg.WorkerID, proof, logger),
-	})
 
-	// Conservative startup orphan sweep: before any app is prepared or any
-	// container created, remove execution containers a previous Relay process on
-	// THIS worker identity left behind (a crash mid-invocation). It is label- and
-	// identity-scoped, so other workers' and non-Relay containers are untouched.
-	// The sweep is bounded so it can never hang startup and re-driven a bounded
-	// number of times (retryIdentitySnapshotCleanup) so a transient list/remove
-	// error does not leave this identity's orphans behind for the whole process
-	// lifetime; when the bound is exhausted we log and continue, leaving the
-	// orphans for a later restart.
-	orphanCtx, orphanSpan := tracing.Start(startupCtx, "orphan.sweep")
-	// Ownership ordering: SNAPSHOT this identity's orphan candidates FIRST, then
-	// run ONE fresh bounded proof, then force-remove exactly the captured IDs.
-	// A latched loss (isLost short-circuits) or a failed/ambiguous proof skips
-	// the removal: a replacement process may already own WORKER_ID and its
-	// containers must not be disturbed. Discovering before the proof is what
-	// shrinks the takeover race — a candidate captured while the lock was still
-	// ours predates any replacement takeover, and because these are EXECUTION
-	// containers (which a replacement cannot adopt — the runtime pool is
-	// in-process, so it always creates NEW ids) a captured id can never name a
-	// replacement's container. The bounded residual race between the passing
-	// proof and the removal of the already-captured IDs is documented on
-	// guardIdentitySnapshotCleanup and is not claimed to be eliminated. Every
-	// retry repeats the whole sequence, so it never removes a container captured
-	// by an earlier attempt.
-	sweepCtx, sweepCancel := context.WithTimeout(orphanCtx, reconcileTimeout)
-	sweepResult, sweepErr := retryIdentitySnapshotCleanup(
-		sweepCtx, proof, logger, "orphan-sweep",
-		func(stepCtx context.Context) ([]runtime.OrphanContainer, error) {
-			return manager.DiscoverOrphanContainers(stepCtx, cfg.WorkerID)
-		},
-		func(stepCtx context.Context, orphans []runtime.OrphanContainer) (int, error) {
-			return manager.RemoveOrphanContainers(stepCtx, orphans)
-		},
+	// Remove execution containers a previous process on this worker identity
+	// left behind before preparing any app.
+	sweepStartupExecutionOrphans(
+		ctx, startupCtx, logger, manager, cfg.WorkerID, proof,
 	)
-	sweepCancel()
-	if sweepErr != nil {
-		// A cancelled lifecycle is a normal shutdown, not a sweep failure.
-		orphanSpan.RecordError(sweepErr)
-		logStartupCleanupFailure(ctx, logger, "Startup: orphan container sweep failed", sweepErr)
-	} else if sweepResult.removed > 0 {
-		logger.Info("Startup: removed orphan containers from a previous relay process",
-			"removed", sweepResult.removed,
-			"discovered", sweepResult.discovered,
-			"attempts", sweepResult.attempts,
-		)
-	} else {
-		logger.Debug("Startup: orphan container sweep complete",
-			"discovered", sweepResult.discovered,
-			"attempts", sweepResult.attempts,
-		)
+
+	prepared := prepareAndStartApps(
+		ctx, startupCtx, logger, manager, st, startupSet,
+		services, svcCtrl, proof, shutdown,
+	)
+
+	// Runner before consumer: the consumer wires it as its ScheduleRunner seam.
+	runWorker := newWorkerRunner(
+		prepared, logger, cfg, metricsInstance, secretProvider, rtSocket,
+	)
+
+	consumer := newStreamConsumer(client, logger, cfg, metricsInstance, runWorker)
+
+	// Optional metrics and webhook servers bind synchronously; a bind failure is
+	// fatal and each teardown step registers only after a successful Start.
+	metricsLoggerDone, err := startMetricsServer(
+		ctx, logger, cfg, metricsInstance, metricsServer, shutdown,
+	)
+	if err != nil {
+		return err
 	}
-	orphanSpan.End()
-
-	// Build every app's image. An app whose image cannot be built is
-	// marked unavailable so the runner skips it; the rest continue. The startup
-	// selections are supplied to Prepare (which captures each into one immutable
-	// snapshot) so no startup build re-reads an app's source to derive an
-	// identity it already has, nor re-derives the selection policy. The state
-	// record and the reconciler seed use the identity each image was ACTUALLY
-	// built from, so a source edit during the build is detected by the next audit
-	// rather than recorded as current.
-	prepareCtx, prepareSpan := tracing.Start(startupCtx, "apps.prepare")
-	prepareStart := time.Now()
-	prepared := prepareApps(prepareCtx, manager, startup, st, logger)
-	logger.Debug("Startup: prepared apps", "count", len(prepared), "duration", time.Since(prepareStart))
-	prepareSpan.End()
-
-	// Publish each app's initial desired service state and return
-	// immediately. The coordinator's bounded workers converge the states in the
-	// background, so startup never blocks on service convergence (e.g. an
-	// external image pull) — nor on the unavailable/no-services removals, which
-	// are published the same nonblocking way (the coordinator derives their own
-	// fresh bound).
-	_, enqueueSpan := tracing.Start(startupCtx, "services.enqueue")
-	enqueueStartupServicesWithState(prepared, services, st, logger)
-	enqueueSpan.End()
-
-	// Lifecycle-aware background housekeeping. It waits behind the coordinator's
-	// barrier for the initial service attempts to settle, then runs the startup
-	// cleanup passes in their safe order: orphan container sweep, image sweep
-	// (whose keep-set must observe the settled service containers), then
-	// dependency GC (which prunes dependency images the image sweep orphaned).
-	// Run does NOT call image GC synchronously; housekeepingDone is joined in the
-	// shutdown tail so no sweep overlaps shutdown cleanup or the closing state DB
-	// and Docker client.
-	// The service-orphan sweep's present-app set: every VALID loaded app plus
-	// every PRESENT directory the loader diagnosed as invalid or not-ready. A
-	// directory that is present but unloadable (an invalid template, or a
-	// template.yaml not yet copied) is still an app on disk, so its service
-	// containers must never be treated as belonging to an app that was removed
-	// while Relay was down. The loader's diagnostics — not PostgreSQL state — are
-	// the source of truth for what is present. A directory that VANISHED is not
-	// in either set, so its containers are (correctly) swept as orphans.
-	liveNames := liveAppNames(apps, loadIssues)
-	housekeepingDone := startStartupHousekeeping(ctx, logger, startupHousekeeper{
-		exclusive: services.RunExclusive,
-		sweep: func(hctx context.Context) {
-			// The service-orphan sweep is identity-scoped: it lists and stops
-			// stale service containers for THIS worker's identity on the shared
-			// daemon (the ServiceReconciler is wired with WithWorkerID, so
-			// another worker's service containers are never captured). Like the
-			// orphan execution sweep it must run in the snapshot-first,
-			// proof-second, remove-third order (guardIdentitySnapshotCleanup) so
-			// discovery never follows the proof: SNAPSHOT the stale candidates
-			// (absent-app filtered with the loader's present set), re-prove the
-			// pinned lock, then remove exactly the captured containers. A
-			// latched or failed proof removes nothing, so a replacement owner's
-			// containers are not disturbed. The sweep is re-driven a bounded
-			// number of times so a transient list/stop error is not abandoned.
-			sweepStartupServiceOrphans(hctx, svcCtrl, liveNames, proof, logger)
-		},
-		images: func(hctx context.Context) { sweepStartupImages(hctx, manager, prepared, st, logger) },
-		deps:   func(hctx context.Context) { cleanupStartupDependencies(hctx, manager, logger) },
-	})
-	// barrier: the startup sweeps use the runtime manager and the state DB, so
-	// the manager/state teardown must wait for the pass to actually exit (not
-	// merely for this step's bound) before closing either.
-	shutdown.register(housekeepingBarrierStep(housekeepingDone))
-
-	// The runner executes invocations. It is constructed before the stream
-	// consumer so its InvokeHandler can be wired as the consumer's ScheduleRunner
-	// seam (schedule-occurrence messages route directly to it, bypassing matching).
-	runWorker := runner.NewWithMetrics(prepared, logger, metricsInstance)
-	// Stamp the relay.hostname label (the worker/consumer identity) on every
-	// execution container, so all invocations carry it.
-	runWorker.SetHostname(cfg.WorkerID)
-	// Wire the shared secrets provider; a missing secret surfaces per-invocation,
-	// never at startup.
-	runWorker.SetSecretProvider(secretProvider)
-	// Cap every rule's handler timeout at the value template validation enforces
-	// (app.MaxTimeout). Defense in depth: a misconfigured or hot-swapped
-	// template can never run a handler past the cap.
-	runWorker.SetMaxHandlerTimeout(stream.MaxRuleTimeout)
-	// Bound the number of invocations executing concurrently (MAX_CONCURRENT_INVOCATIONS);
-	// a value < 1 falls back to the runner's default.
-	runWorker.SetMaxConcurrentInvocations(cfg.MaxConcurrentInvocations)
-
-	// Expose the live runner to the manual-invocation socket command. It was
-	// wired after the socket was created (the runner is built later, once images
-	// and services are prepared), so a `relay app invoke` that races the
-	// wiring answers invoke_unavailable rather than a torn value. This is what
-	// lets the CLI run handlers against the live runtime pool without ever
-	// instantiating Docker/runtime in the CLI process. The same runner also
-	// serves the `relay dlq replay` semantic command, which re-executes one DLQ
-	// entry's exact recorded app/handler once against the current registry.
-	rtSocket.SetInvoker(runWorker)
-	rtSocket.SetReplayer(runWorker)
-
-	consumer := stream.NewConsumer(stream.ConsumerConfig{
-		Client:            client,
-		Stream:            cfg.RedisStream,
-		Group:             cfg.RedisGroup,
-		Consumer:          cfg.WorkerID,
-		Log:               logger,
-		Metrics:           metricsInstance,
-		MaxBufferedEvents: cfg.MaxBufferedEvents,
-		MaxEventBytes:     cfg.MaxEventBytes,
-		// Terminal invocation-state retention (cfg.InvocationRetention from
-		// REDIS_INVOCATION_RETENTION, default 48h; unset/empty/zero/negative
-		// behavior is resolved by config.Load). Passed as an explicit pointer so
-		// an operator's disable (0) is honored verbatim and never defaulted back
-		// to 48h by the stream package. It is the TTL the consumer applies to a
-		// message's invocation-state hash only AFTER it leaves the PEL; while
-		// recoverable the hash stays persistent.
-		InvocationRetention: &cfg.InvocationRetention,
-		// Schedule occurrences route directly to the runner, bypassing event
-		// matching; the runner validates the occurrence against the current
-		// template and resolves the handler timeout from it, and stamps the
-		// message's real Redis stream ID.
-		ScheduleRunner: runWorker.InvokeOccurrence,
-	})
-
-	// Start the metrics components created earlier. The snapshot logger and the
-	// /metrics HTTP server are BOTH opt-in (gated on METRICS_ADDR): the registry
-	// always exists for the persistent stats flush, but with exposition disabled
-	// there is no server to bind (and the periodic logger would only duplicate
-	// the stats it already persists). metricsServer is nil exactly when
-	// METRICS_ADDR is unset. The logger runs in its own goroutine (exits on ctx);
-	// the server binds synchronously — a bind failure (a taken metrics port) is
-	// a config error that must surface now, and is FATAL. metricsLoggerDone is
-	// joined by the loops shutdown step before the state DB and Redis close, so
-	// no logger tick can touch a closed resource.
-	var metricsLoggerDone <-chan struct{}
-	if metricsServer != nil {
-		metricsLogger := metrics.NewMetricsLogger(
-			metricsInstance,
-			metrics.DefaultLogInterval,
-			func(format string, args ...any) {
-				logger.Debug(fmt.Sprintf(format, args...))
-			},
-		)
-		done := make(chan struct{})
-		metricsLoggerDone = done
-		go func() {
-			defer close(done)
-			metricsLogger.Start(ctx)
-		}()
-
-		if err := metricsServer.Start(); err != nil {
-			// A bind failure (taken metrics port) is a config error that must
-			// surface at startup, not retry invisibly. The deferred cleanup stops
-			// the metrics logger goroutine via the cancelled lifecycle.
-			return fmt.Errorf("metrics server: start failed: %w", err)
-		}
-		shutdown.register(shutdownStep{
-			name:    shutdownStepMetrics,
-			timeout: shutdownStepTimeout,
-			run:     metricsServer.Stop,
-		})
-		logger.Info("Metrics http server listening", "addr", cfg.MetricsAddr)
+	if err := startWebhookServer(
+		logger, cfg, gitWebhookServer, shutdown,
+	); err != nil {
+		return err
 	}
 
-	// Start the webhook server (created above) right after metrics. It binds
-	// synchronously and fails fast on a taken/unparseable GIT_WEBHOOK_ADDR,
-	// matching metrics: a webhook port conflict must surface at startup. A nil
-	// server means the webhook was disabled, so there is nothing to start.
-	if gitWebhookServer != nil {
-		if err := gitWebhookServer.Start(); err != nil {
-			return fmt.Errorf("git webhook server: start failed: %w", err)
-		}
-		shutdown.register(shutdownStep{
-			name:    shutdownStepWebhook,
-			timeout: shutdownStepTimeout,
-			run:     gitWebhookServer.Stop,
-		})
-		logger.Info("Webhook http server listening", "addr", cfg.GitWebhookAddr)
-	}
+	startBackgroundLoops(
+		ctx, logger, cfg, client, statsFlusher, metricsLoggerDone, shutdown,
+	)
 
-	// Worker-owned background loops. Every loop is tracked by a done channel so
-	// the loops shutdown step can join it before the state DB, runtime manager,
-	// and Redis client close — a loop must never touch a closed resource.
-	var loopDones []<-chan struct{}
-	if metricsLoggerDone != nil {
-		loopDones = append(loopDones, metricsLoggerDone)
-	}
-
-	// Flush the registry into the state database on the fixed cadence. The
-	// registry always exists, so the loop runs unconditionally: persistent stats
-	// must keep flushing when METRICS_ADDR is unset (there is simply no HTTP
-	// exposition alongside them). A nil state handle parks the loop until
-	// shutdown (nothing to snapshot), keeping shutdown ordering uniform.
-	statsDone := make(chan struct{})
-	loopDones = append(loopDones, statsDone)
-	go func() {
-		defer close(statsDone)
-		statsLoop(ctx, statsFlusher, statsFlushInterval)
-	}()
-
-	// Optional internal stream retention (cfg.StreamRetention from
-	// REDIS_STREAM_RETENTION, default 24h; unset/empty/zero/negative behavior is
-	// resolved by config.Load): a single goroutine periodically trims the
-	// configured stream with XTRIM MINID ~ ... ACKED so entries older than the
-	// window are removed only once every consumer group has acknowledged them.
-	// Completely separate from ACK/retry/DLQ semantics. On a server that does not
-	// support ACKED (pre-8.2) the loop logs and disables itself rather than
-	// trimming unsafely.
-	if cfg.StreamRetention > 0 {
-		retentionDone := make(chan struct{})
-		loopDones = append(loopDones, retentionDone)
-		go func() {
-			defer close(retentionDone)
-			retentionLoop(ctx, client, cfg.RedisStream, cfg.StreamRetention, logger)
-		}()
-	}
-
-	// Optional DLQ retention (cfg.DLQRetention from REDIS_DLQ_RETENTION, default
-	// 7 days; unset/empty/zero/negative behavior is resolved by config.Load): a
-	// separate goroutine age-trims ONLY the Relay-owned DLQ stream derived from
-	// the configured source (stream.DLQStreamFor) with a mode-less
-	// XTRIM MINID ~. The DLQ has no consumer group, PEL, or XACK, so it needs no
-	// ACKED mode and is independent of the main stream's capability. This never
-	// touches the source stream and never affects ACK-before-DLQ ordering.
-	if cfg.DLQRetention > 0 {
-		dlqRetentionDone := make(chan struct{})
-		loopDones = append(loopDones, dlqRetentionDone)
-		go func() {
-			defer close(dlqRetentionDone)
-			dlqRetentionLoop(ctx, client, stream.DLQStreamFor(cfg.RedisStream), cfg.DLQRetention, logger)
-		}()
-	}
-
-	// Join every worker-owned background loop before the resources they use
-	// (state DB, runtime manager, Redis client) are closed. A barrier step: once
-	// its bound expires it is cancelled and then joined for real, so a loop
-	// cannot touch a closed resource even if it ignores cancellation promptly.
-	shutdown.register(loopsBarrierStep(loopDones))
-
-	// The schedule publisher atomically publishes one stream entry per logical
-	// occurrence cluster-wide (publish-if-new Lua script) into the same stream the
-	// consumer reads, and wires into the scheduler below.
-	publisher := schedule.NewPublisher(client, cfg.RedisStream, logger, metricsInstance)
-
-	// The cron scheduler maps each app template's schedules into jobs that
-	// publish schedule occurrences through the publisher, seeded from the loaded
-	// app set before Start, then converges live via the reconciler's
-	// UpdateSchedules/RemoveApp hooks.
-	sched := cron.NewWithMetrics(publisher, logger, metricsInstance)
-	// Register the scheduler shutdown barrier IMMEDIATELY after constructing the
-	// scheduler and BEFORE starting anything that can touch Redis or the state
-	// DB (the durable retry worker, catch-up, jobs). gocron's Shutdown is bounded
-	// by WithStopTimeout (and its executor can return ErrStopJobsTimedOut while a
-	// task goroutine is still running), so a Relay publisher callback — or the
-	// durable retry worker — can outlive g.Shutdown and still touch Redis. This
-	// barrier strictly joins both the gocron shutdown, every admitted publisher
-	// callback, the durable retry worker, AND (when storage was unavailable at
-	// startup) the scheduler-owned storage-bootstrap loop, before closing any
-	// scheduler-owned state handle. Redis is released in a later step, so this
-	// guarantees no scheduler work can touch Redis or PostgreSQL after the step
-	// returns. Registering it here means an early startup failure after this
-	// point still joins them. Stop is idempotent and also guards against a
-	// scheduler that was never Started, so an early-return shutdown is safe.
-	shutdown.register(schedulerBarrierStep(sched.Stop))
-	// The scheduler is a metrics.GaugeSource: register it with the consumer's
-	// single periodic gauge refresher so its durable-outbox depth/age gauges are
-	// sampled on the existing ~15s pass, with no separate ticker or goroutine.
-	// This is safe before Consume starts the refresher; the source reads the
-	// scheduler's CURRENT outbox at each tick, so a bootstrap-recovered
-	// scheduler-owned handle is observed too.
-	consumer.AddGaugeSource(sched)
-	// Schedule firing REQUIRES a usable durable outbox: every due occurrence is
-	// persisted to it BEFORE it is published (intent-first durability), so a tick
-	// that cannot be persisted must not fire. The outbox is the
-	// PostgreSQL state database. The shared handle opened at startup (st) is
-	// always available here (its open is fatal), so it is wired directly; the
-	// scheduler-owned bootstrap opener remains as a defensive recovery seam for a
-	// future where the shared handle could be unavailable. PostgreSQL is required
-	// for scheduler correctness, but it is NOT a global worker dependency:
-	// consumers, functions, services, metrics, logging, and tracing stay
-	// operational either way, and worker readiness deliberately excludes it.
-	wireSchedulerStorage(ctx, sched, st, schedulerStorageOpener(cfg.DatabaseURL, logger, metricsInstance))
-	for _, fn := range apps {
-		sched.ReplaceApp(fn.Name, fn.Template)
-	}
-	logger.Info("Scheduler: schedule jobs registered", "count", sched.JobCount())
-
-	// Bounded startup catch-up: republish the latest missed occurrence per
-	// schedule (within the 24h horizon) that this worker may have missed while
-	// it was down. It runs once, on the initial loaded schedule set, BEFORE the
-	// reconciler can converge live changes and before Start; the existing atomic
-	// publish-if-new makes a catch-up that another worker already published a
-	// harmless duplicate. Older misses are intentionally dropped (bounded
-	// recovery, not backlog replay). When storage is unavailable this is a no-op
-	// and does NOT consume the once-only flag: the storage-bootstrap recovery
-	// re-runs the same bounded scan once the outbox is usable.
-	catchUpCtx, catchUpSpan := tracing.Start(startupCtx, "schedule.catchup")
-	if n := sched.CatchUp(catchUpCtx); n > 0 {
-		logger.Info("Scheduler: startup catch-up published missed occurrences", "count", n)
-	}
-	catchUpSpan.End()
-
+	sched := newWorkerScheduler(
+		ctx, startupCtx, logger, cfg, client, st, metricsInstance,
+		consumer, apps, shutdown,
+	)
+	// Emitted after the scheduler's own startup lines to preserve log order.
 	logConcurrencyLimits(logger, cfg)
 
-	// Watch /apps and reconcile apps live: rebuild changed images,
-	// discover new ones, drop removed ones. The runner's registry is swapped
-	// atomically behind the snapshots the consumer already uses. The retire hook
-	// hands superseded images back to the runner so it can remove them once no
-	// in-flight execution uses them. On removal, RemoveApp first deletes the
-	// app's Prometheus series (after the registry entry is swapped to nil)
-	// and retires its images; the flush sweep (statsFlusher.flush) re-deletes any
-	// series an in-flight invocation may have recreated, so the "removed app
-	// => no exposed series" invariant holds even mid-invocation.
+	// Watch /apps and reconcile live. Callback wiring lives in
+	// appReconcilerConfig; startAppReconciler owns watch/seed/start ordering.
 	rec := reconciler.New(
-		reconciler.Config{
-			Root:   app.Dir,
-			State:  st,
-			Retire: func(_ string, oldImage string) { runWorker.RetireImage(oldImage) },
-			// The periodic audit re-drives deferred image cleanup: an image
-			// whose bounded removal retries were exhausted while a service
-			// container still referenced it (or whose removal failed) is retried
-			// here once the reference state may have changed, so it is not left
-			// behind when the initial retry window elapsed. Coalesced and
-			// idempotent, and a no-op when nothing is deferred.
-			Audit: func() { runWorker.RetryDeferredImageRemovals() },
-			RemoveApp: func(name string) {
-				metricsInstance.RemoveApp(name)
-				// Drop the app's reset baseline too, so a re-added app
-				// is not offset by a stale pre-removal total.
-				statsFlusher.dropAppBaseline(name)
-				// Drop the app's warm container state first: no new acquire
-				// may warm a removed app, idle containers are discarded now,
-				// and busy ones are discarded on release. Then retire every image
-				// version once idle (the runner's reference guard keeps an image
-				// an in-flight execution still needs).
-				manager.RemoveApp(name)
-				runWorker.RemoveAppSemaphore(name)
-				runWorker.RemoveAppImages(name)
-				sched.RemoveApp(name) // a removed app never keeps firing
-			},
-			UpdateSchedules: func(name string, tmpl *app.Template) {
-				sched.ReplaceApp(name, tmpl)
-			},
-			// Converge the app's persistent service containers whenever its
-			// new version is swapped in (and on the skip path when it declares
-			// services, so crashed replicas self-heal on the periodic tick). The
-			// hook runs synchronously in the reconciler pump goroutine.
-			//
-			// Apply receives the LIFECYCLE context, NOT a 30s budget wrapped
-			// around the whole pass: the ServiceReconciler injects the worker's
-			// reconcileTimeout into Reconcile, which derives a fresh bound for
-			// each normal Docker operation itself. Shutdown still
-			// cancels the operation promptly because ctx is the signal context.
-			//
-			// The prepared env comes from the current registry entry (the runtime
-			// plan env); a nil Prepared (unavailable) falls back to no plan env,
-			// mirroring the runner's nil-safe behavior.
-			UpdateServices: func(name string, tmpl *app.Template, image string) {
-				enqueueLiveServices(
-					services,
-					manager,
-					runWorker.Registry(),
-					name,
-					tmpl,
-					image,
-				)
-			},
-			UpdateServicesWithStatus: func(
-				name string,
-				tmpl *app.Template,
-				image string,
-				onReconcileStart func(),
-				onComplete func(error),
-			) {
-				enqueueLiveServicesWithStatus(
-					services,
-					manager,
-					runWorker.Registry(),
-					name,
-					tmpl,
-					image,
-					onReconcileStart,
-					// A service convergence completing is exactly the lifecycle
-					// moment an old image's last service container may have been
-					// replaced, so it is the precise re-drive point for a
-					// deferred image retirement. It runs after the caller's own
-					// completion bookkeeping and only admits async cleanup, so it
-					// never blocks or changes the completion outcome.
-					func(err error) {
-						if onComplete != nil {
-							onComplete(err)
-						}
-						runWorker.RetryDeferredImageRemovals()
-					},
-				)
-			},
-			UpdateServicesObservationWithStatus: func(
-				name string,
-				tmpl *app.Template,
-				image string,
-				onReconcileStart func(),
-				onComplete func(error),
-			) {
-				enqueueLiveServiceObservationWithStatus(
-					services,
-					manager,
-					runWorker.Registry(),
-					name,
-					tmpl,
-					image,
-					onReconcileStart,
-					// See UpdateServicesWithStatus: a converged service pass is
-					// the re-drive point for a deferred image retirement. The
-					// periodic audit path converges services too, so a deferred
-					// image is retried on that cadence as well.
-					func(err error) {
-						if onComplete != nil {
-							onComplete(err)
-						}
-						runWorker.RetryDeferredImageRemovals()
-					},
-				)
-			},
-			// On removal, stop the app's service containers BEFORE the images
-			// are retired (reconciler calls RemoveServices before RemoveApp):
-			// running service containers reference those images. RemoveAndWait
-			// waits DETERMINISTICALLY for the queued removal to complete; the
-			// coordinator derives the operation's own fresh 30s bound rooted in
-			// the lifecycle context, and shutdown releases the wait via the
-			// lifecycle, so the hook can never let image retirement race the
-			// removal. The hook runs in the single pump goroutine, so it never
-			// blocks a reconcile of another app.
-			RemoveServices: func(name string) {
-				services.RemoveAndWait(name)
-			},
-		},
+		appReconcilerConfig(
+			app.Dir, st, runWorker, metricsInstance,
+			statsFlusher, manager, sched, services,
+		),
 		runWorker.Registry(),
 		manager,
 		logger,
 	)
-	// Establish change detection BEFORE seeding the startup fingerprints. The
-	// supplied fingerprints are the ones computed once above; a change that
-	// lands after the watch is installed is observed as an fsnotify event, and a
-	// change between the fingerprint scan and the watch installation is still
-	// caught because the seeded value is the OLDER one, so the first reconcile
-	// observes it as a rebuild. If the watcher cannot be created, the supplied
-	// fingerprints must NOT be trusted: Seed is skipped entirely and Start logs
-	// the error and does not run the loops, so no stale seed can suppress a
-	// rebuild.
 	_, reconcilerSpan := tracing.Start(startupCtx, "reconciler.start")
-	if err := rec.PrepareWatch(ctx); err != nil {
-		logger.Error("Reconciler: fsnotify error; not seeding startup fingerprints", "error", err)
-		reconcilerSpan.RecordError(err)
-	} else {
-		seedStart := time.Now()
-		// Seed the identity each app's image was ACTUALLY built from
-		// (Prepared.Fingerprint), not the pre-prepare scan. A source edit between
-		// the scan and the build's snapshot changes the built identity, and seeding
-		// the built value makes the first reconcile compare against what is really
-		// baked: it observes the edit as a rebuild instead of treating the mutated
-		// tree as already prepared. The rule lives in the pure startupSeedFingerprints
-		// helper so it is pinned by a deterministic unit test.
-		seeds := startupSeedFingerprints(apps, fingerprints, prepared)
-		for _, fn := range apps {
-			rec.Seed(fn, seeds[fn.Name])
-		}
-		logger.Debug("Startup: seeded startup fingerprints",
-			"count", len(apps),
-			"duration", time.Since(seedStart),
-		)
-	}
-	logger.Info("Watching apps for changes", "root", app.Dir)
+	startAppReconciler(
+		ctx, logger, reconcilerSpan, rec, apps, fingerprints, prepared, shutdown,
+	)
 
-	// Runs in its own goroutine and stops when ctx is cancelled. Start reuses the
-	// watcher PrepareWatch already established, and now JOINS its pump/ticker/
-	// eventLoop before returning; reconcilerDone is the shutdown barrier that
-	// guarantees no reconcile can still be pumped into the runtime manager or
-	// state DB when those are closed.
-	reconcilerDone := make(chan struct{})
-	go func() {
-		defer close(reconcilerDone)
-		rec.Start(ctx)
-	}()
-	shutdown.register(reconcilerBarrierStep(reconcilerDone))
-
-	// Start the cron scheduler right after the reconciler, so jobs added here
-	// (seeded before Start) fire from their first cron tick and jobs the
-	// reconciler later converges schedule immediately.
+	// Start the scheduler only after the reconciler watches and joins, so seeded
+	// jobs fire on their first tick and live changes converge immediately. Its
+	// shutdown barrier was registered at construction.
 	sched.Start()
-	// The scheduler shutdown barrier was registered when the scheduler was
-	// constructed (before its durable retry worker and any publish could start),
-	// so an early startup failure already joins it; nothing is registered here.
 	reconcilerSpan.End()
 
-	// The startup root ends here, at the ready-to-consume boundary immediately
-	// before Consume. Everything before it is a child of the root; consumption
-	// then establishes its own per-message spans.
+	// The startup root ends here; consumption establishes its own spans.
 	startupSpan.End()
 
-	// Ready-to-consume boundary: install the live dependency probe (Redis
-	// consumer health + a bounded Docker ping + NETWORKS verification) and mark
-	// the worker ready. This is the LAST step before Consume, and it is reached
-	// only after the external preflight, app load/prepare, the socket,
-	// required listeners and loops, and the consumer/schedule/reconciler/
-	// scheduler wiring are all complete. It deliberately does not wait on
-	// asynchronous service convergence/housekeeping, optional tracing, PostgreSQL,
-	// or per-app success.
+	// Ready-to-consume boundary: the LAST step before Consume. It deliberately
+	// does not wait on asynchronous services/housekeeping, optional tracing,
+	// PostgreSQL, or per-app success.
 	workerReady.startReady(consumer, manager, cfg.Networks)
 	logger.Info("Worker ready to consume")
 
-	// The persisted stats rows are keyed by this stable worker identity; the
-	// instance id fences a stale process incarnation of the same worker out of
-	// the row. Both are logged so an operator can correlate `relay stats` rows
-	// with the process that owns them.
+	// Stats rows are keyed by worker identity; the instance id fences a stale
+	// incarnation of the same worker out of the row.
 	logger.Info("Worker stats identity",
 		"worker_id", cfg.WorkerID,
 		"instance_id", cfg.InstanceID,
@@ -1495,19 +661,13 @@ func Run(logger *slog.Logger) (runErr error) {
 	)
 	var consumeErr error
 	if err := consumer.Consume(ctx, runWorker.Handle); err != nil {
-		// The consumer is the worker's raison d'être; a Consume error means the
-		// consumption loop has stopped. The deferred cleanup still drains
-		// everything in order, and the error is returned after shutdown rather
-		// than exiting mid-teardown. (Shutdown via a cancelled ctx returns nil, so
-		// a non-nil error here is a genuine failure.)
+		// A Consume error means the loop stopped. A cancelled lifecycle returns
+		// nil here, so this is a genuine failure; teardown still runs in order.
 		logger.Error("Consume failed", "error", err)
 		consumeErr = fmt.Errorf("consume failed: %w", err)
 	}
 
-	// The graceful shutdown (socket, scheduler, reconciler, housekeeping,
-	// services, loops, stats, servers, manager, state, tracing, Redis) is owned
-	// by the deferred shutdown registry registered at the top, so a startup
-	// failure and a normal shutdown converge on the exact same explicit order.
+	// All teardown is owned by the registry registered at the top.
 	return consumeErr
 }
 
@@ -1960,12 +1120,17 @@ var _ reconciler.ShutdownDocker = (*runtime.Manager)(nil)
 
 // wireSchedulerStorage connects the scheduler to its durable outbox. A non-nil
 // shared state handle is installed and its durable retry worker started, which
-// enables schedule publication. A nil shared handle means the global
-// state.Open failed: the scheduler is marked unavailable (so it never fires a
-// schedule without a durable store) and a scheduler-owned, cancellable bootstrap
-// retries opening the store; on success the bootstrap installs it, recovers
-// existing rows, runs the bounded latest-only catch-up, and enables publication.
-// It never fails and never gates the event consumer or services.
+// enables schedule publication. Current Run ALWAYS takes this path: state.Open
+// is fatal, so the shared handle is non-nil by the time this runs.
+//
+// A nil shared handle is therefore a DEFENSIVE fallback, unreachable via the
+// current Run, retained as a seam for an embedding host (or a future where the
+// shared open could be non-fatal): the scheduler is marked unavailable (so it
+// never fires a schedule without a durable store) and a scheduler-owned,
+// cancellable bootstrap retries opening the store; on success the bootstrap
+// installs it, recovers existing rows, runs the bounded latest-only catch-up,
+// and enables publication. It never fails and never gates the event consumer or
+// services.
 func wireSchedulerStorage(
 	ctx context.Context,
 	sched schedulerStorage,
@@ -1985,18 +1150,21 @@ func wireSchedulerStorage(
 	sched.StartStorageBootstrap(ctx, open)
 }
 
-// schedulerStorageOpener returns the cron.OutboxOpener the worker's
+// schedulerStorageOpener returns the cron.OutboxOpener the worker's DEFENSIVE
 // storage-unavailable bootstrap uses to retry opening the scheduler's durable
-// outbox (the PostgreSQL state database) when the shared handle could not be
-// opened at startup. dsn is cfg.DatabaseURL; it is a parameter so the retry path
-// is unit-testable without a real database. The opened *state.State is a
-// scheduler-OWNED handle: cron closes it after all scheduler work has stopped,
-// so the shared global handle is never touched. It deliberately opens an
-// independent handle on the same DSN — the smallest clean equivalent — and wires
-// the same status observer so a recovered store's status writes still project
-// onto the app_status gauge. It opens with NO stats owner: the handle exists only
-// for the schedule outbox and never writes stats rows, and an owner without a
-// paired instance is rejected by state.Open.
+// outbox (the PostgreSQL state database) when a nil shared handle was supplied.
+// Current Run never supplies one because its state.Open is fatal; the opener
+// exists so the nil-shared fallback stays a complete, testable seam for an
+// embedding host or a future non-fatal open. dsn is cfg.DatabaseURL; it is a
+// parameter so the retry path is unit-testable without a real database. The
+// opened *state.State is a scheduler-OWNED handle: cron closes it after all
+// scheduler work has stopped, so the shared global handle is never touched. It
+// deliberately opens an independent handle on the same DSN — the smallest
+// clean equivalent — and wires the same status observer so a recovered
+// store's status writes still project onto the app_status gauge. It opens with
+// NO stats owner: the handle exists only for the schedule outbox and never
+// writes stats rows, and an owner without a paired instance is rejected by
+// state.Open.
 func schedulerStorageOpener(dsn string, logger *slog.Logger, metricsInstance *metrics.Registry) cron.OutboxOpener {
 	return func() (cron.Outbox, io.Closer, error) {
 		st, err := state.Open(context.Background(), state.Options{
