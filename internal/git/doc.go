@@ -31,18 +31,30 @@
 // checked only for copy completeness and template.yaml presence; template
 // contents are not validated, so malformed templates are still committed and
 // handled by the reconciler. A staging/copy failure leaves the previous /apps
-// tree intact. Each existing app is then replaced with an atomic directory
-// exchange — renameat2(RENAME_EXCHANGE) on Linux, renamex_np(RENAME_SWAP) on
-// macOS — so an updated app name is never absent and never partially copied.
-// New apps are an atomic rename into an absent name. Removed apps are atomically
-// renamed into the reserved namespace before deletion. /apps is a fixed bind
-// mount and is never renamed as a root; the commit boundary is per app, not a
-// whole-revision snapshot, so a concurrent observer may see a mixture across
-// different apps. An app name always resolves to a complete tree, never a
-// partially copied directory; a reader whose walk spans a swap can still see
-// files from both generations. If an existing app must be replaced and the
-// filesystem cannot exchange directories, sync fails closed before mutating a
-// live app rather than using a remove-then-rename fallback.
+// tree intact.
+//
+// After every candidate is staged, each existing app's staged tree is compared
+// with its live tree by content (entries, directory/file permission bits, file
+// bytes, and therefore empty directories). An unchanged app is left exactly as
+// it is: no exchange, no inode change, and no watch churn. Only added or actually
+// changed apps are then installed by atomic rename or replaced with an atomic
+// directory exchange — renameat2(RENAME_EXCHANGE) on Linux,
+// renamex_np(RENAME_SWAP) on macOS — so an updated app name is never absent and
+// never partially copied. The exchange-support probe is required only when a
+// changed existing app must be replaced. Removed apps are atomically renamed into
+// the reserved namespace before deletion; normal removals remain part of the
+// deterministic source-of-truth rule. No comparison fingerprint is persisted.
+//
+// /apps is a fixed bind mount and is never renamed as a root; the commit boundary
+// is per app, not a whole-revision snapshot, so a concurrent observer may see a
+// mixture across different apps. An app name always resolves to a complete tree,
+// never a partially copied directory; a reader whose walk spans a swap can still
+// see files from both generations. The reconciler's recursive watch is refreshed
+// when a directory path is replaced, so nested edits under the newly installed
+// tree are observed; an unchanged app's live tree and watches are not disturbed.
+// If an existing app must be replaced and the filesystem cannot exchange
+// directories, sync fails closed before mutating a live app rather than using a
+// remove-then-rename fallback.
 //
 // Sync serializes writers sharing the managed checkout with an advisory flock
 // on a sibling of the checkout. Stale .sync-* directories from an interrupted

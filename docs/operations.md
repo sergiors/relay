@@ -355,17 +355,32 @@ a staging/copy failure leaves the previous `/apps` tree intact. These checks do
 not parse or schema-validate the template: that remains the reconciler's
 responsibility. A template-present but invalid config is still committed to
 `/apps` as desired state for the reconciler to handle; invalid template contents
-do not make Git sync fail. Existing apps are then replaced with an atomic
-directory exchange (`renameat2(RENAME_EXCHANGE)` on Linux,
-`renamex_np(RENAME_SWAP)` on macOS):
-an updated app name is never absent and never partially copied. New apps are
-atomically renamed into an absent name, and removed apps are atomically renamed
-into the reserved namespace before deletion. `/apps` itself is a fixed bind
-mount and is never renamed as a root. The commit boundary is per app rather than
-a whole-revision snapshot, so a concurrent reader can briefly observe a mixture
-of old and new apps. An app name always resolves to a complete tree, never a
-partially copied directory; a reader whose walk spans a swap can still see files
-from both generations. If an existing app must be replaced and the filesystem
+do not make Git sync fail.
+
+After staging, each existing app's staged tree is compared with its live tree by
+actual content — entry names, directory and file permission bits, file bytes, and
+therefore empty directories too. An unchanged app is left exactly as it is: its
+live directory and inode are preserved, it is not reported as materialized, and
+no atomic exchange is attempted. Changed existing apps are replaced with an atomic directory exchange
+(`renameat2(RENAME_EXCHANGE)` on Linux, `renamex_np(RENAME_SWAP)` on macOS), so
+an updated app name is never absent and never partially copied; the
+exchange-capability check runs only when a changed existing app must be replaced.
+New apps are atomically renamed into an absent name, and removed apps are
+atomically renamed into the reserved namespace before deletion. A sync with an identical revision therefore replaces nothing
+(repeating a sync is a no-op apart from the recorded sync metadata). Comparison
+errors fail the sync rather than treating an app as unchanged, and no comparison
+fingerprint is persisted.
+
+Because unchanged live directories are not exchanged, their inode and recursive
+watch remain valid. When a directory is replaced, the reconciler releases the
+watches that pointed at the detached old tree and registers the currently
+installed tree, so later nested edits are still observed. `/apps` itself is a
+fixed bind mount and is never renamed as a root. The commit boundary is per app
+rather than a whole-revision snapshot, so a concurrent reader can briefly observe
+a mixture of old and new apps; per-app atomicity is not whole-revision atomicity.
+An app name always resolves to a complete tree, never a partially copied
+directory; a reader whose walk spans a swap can still see files from both
+generations. If a changed existing app must be replaced and the filesystem
 cannot exchange directories, the sync fails before changing a live app rather
 than falling back to remove-then-rename.
 

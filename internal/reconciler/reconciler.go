@@ -448,7 +448,11 @@ func (r *Reconciler) ticker() {
 }
 
 // eventLoop forwards fsnotify events into the debounce queue, mapping their paths
-// to app names and maintaining watches on newly created/removed directories.
+// to app names and maintaining watches on created/removed directories. Watch
+// maintenance releases a removed/renamed path's old tree before registering the
+// currently installed tree at that path, so an atomic per-app directory exchange
+// (which can emit duplicate or reordered Rename/Create events) converges on the
+// new inode rather than leaving only the detached old tree watched.
 func (r *Reconciler) eventLoop() {
 	defer r.loops.Done()
 	for {
@@ -467,25 +471,34 @@ func (r *Reconciler) eventLoop() {
 			if name, affected := r.appForPath(ev.Name); affected && r.shouldEnqueue(name) {
 				r.Enqueue(name)
 			}
-			// Maintain watches on created/renamed directories (recursive watch).
-			// A Relay-owned reserved directory (git's ".sync-*") is never
+			// Release watches for a removed or renamed (moved-away) directory
+			// FIRST. fsnotify watches inodes, so after an atomic per-app exchange
+			// the path-keyed watches still refer to the DETACHED old tree; they
+			// must be dropped before the current tree at the same path can be
+			// registered. Doing this first also makes a Rename+Create notification
+			// pair idempotent instead of leaving only the old inode watched.
+			if ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+				r.removeWatchRecursive(ev.Name)
+			}
+			// Maintain watches on created/removed/renamed directories (recursive
+			// watch). A Relay-owned reserved directory (git's ".sync-*") is never
 			// watched, and neither will addWatchRecursive descend into it, so a
 			// dynamic Create for a stage dir spends no handle; addWatchRecursive
 			// itself also prunes reserved subtrees defensively.
-			if ev.Op&(fsnotify.Create|fsnotify.Rename) != 0 && !r.isReservedDirPath(ev.Name) {
+			//
+			// A Create (or a Remove for a path that is already occupied again) can
+			// describe the NEW inode installed at a path that is already watched:
+			// that is one half of an atomic exchange (possibly duplicated), not
+			// necessarily a brand-new directory. Re-register from the currently
+			// installed tree, removing first so a stale detached-inode watch (and
+			// any of its old descendants) cannot survive and duplicates cannot leak
+			// handles. The removal above may already have done this; repeating it
+			// is a no-op. A genuinely removed path fails the stat and is not added.
+			if ev.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 && !r.isReservedDirPath(ev.Name) {
 				if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {
+					r.removeWatchRecursive(ev.Name)
 					r.addWatchRecursive(ev.Name)
 				}
-			}
-			// A removed or renamed (to elsewhere) directory leaves stale watch
-			// handles that leak file descriptors over time. Clear the watch for
-			// the path (and, for a parent-dir removal, every descendant watch
-			// below it). Only directories are ever in the watches map, so a file
-			// event here simply matches nothing. Rename is treated like remove:
-			// the old path is gone even if it reappears elsewhere, and a recreated
-			// directory is re-watched on its Create event via the branch above.
-			if ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
-				r.removeWatchRecursive(ev.Name)
 			}
 		case err, ok := <-r.w.Errors:
 			if !ok {
@@ -577,9 +590,20 @@ func (r *Reconciler) isReservedDirPath(p string) bool {
 // cannot make this unbounded — this is why we use the DirEntry (not os.Stat)
 // form of the walk. A symlinked dir is simply never watched, which is
 // acceptable.
+//
+// A failed watch registration is logged with its path. It is not reported as a
+// completed refresh: the periodic reconciliation remains the backstop until the
+// path is registered successfully (for example on a later Create/Rename).
 func (r *Reconciler) addWatchRecursive(path string) {
 	_ = filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
+			// A concurrent rename/removal can make a path vanish between the
+			// event and this walk. There is nothing to watch in that case; any
+			// other traversal error means part of the live tree may be unwatched
+			// and must be surfaced.
+			if !errors.Is(err, fs.ErrNotExist) {
+				r.warnWatch("Reconciler: watch refresh failed", "path", p, "error", err)
+			}
 			return nil
 		}
 		if !d.IsDir() {
@@ -595,11 +619,23 @@ func (r *Reconciler) addWatchRecursive(path string) {
 		if _, ok := r.watches.Load(p); ok {
 			return nil
 		}
-		if err := r.w.Add(p); err == nil {
-			r.watches.Store(p, struct{}{})
+		if err := r.w.Add(p); err != nil {
+			// Do not silently claim a complete recursive refresh: without this
+			// watch, nested edits below p are invisible until the periodic audit.
+			r.warnWatch("Reconciler: watch registration failed", "path", p, "error", err)
+			return nil
 		}
+		r.watches.Store(p, struct{}{})
 		return nil
 	})
+}
+
+// warnWatch logs a watch-maintenance failure. It is nil-safe because a few
+// tests construct a Reconciler with only the watcher fields.
+func (r *Reconciler) warnWatch(msg string, args ...any) {
+	if r.log != nil {
+		r.log.Warn(msg, args...)
+	}
 }
 
 // removeWatchRecursive drops the watch for path and for every descendant watch

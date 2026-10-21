@@ -2,7 +2,9 @@
 //
 // This package drives live reload while a Builder (satisfied by the runtime
 // Manager) does the image build:
-//   - Watch: recursive fsnotify on the apps root; symlinks are not followed
+//   - Watch: recursive fsnotify on the apps root; an atomically replaced app
+//     directory is re-registered on its current tree (old detached-inode watches
+//     are released first), and symlinks are not followed
 //   - Debounce: per-app timers coalesce edit storms into one reconcile
 //   - Rebuild: a changed fingerprint gates a per-app rebuild, committed to
 //     the runner's registry as an atomic swap

@@ -1,6 +1,7 @@
 package git
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -67,7 +68,33 @@ func discoverApps(selection *source.Selection) ([]string, error) {
 	return names, nil
 }
 
-// materialize rewrites dstDir (the /apps root) so that it contains exactly
+// materialize is the package-internal compatibility entry point for
+// materializeApps that returns only the added/updated and removed app names.
+// The returned slices are sorted and nil on failure.
+func materialize(selection *source.Selection, dstDir string) (materialized, removed []string, err error) {
+	result, err := materializeApps(selection, dstDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	return result.materialized, result.removed, nil
+}
+
+// materializeResult is one materialization pass's outcome.
+type materializeResult struct {
+	// desired is the number of app directories discovered in the source. It is
+	// independent of how many needed replacement, so a no-op sync can still
+	// report whether the source itself was empty.
+	desired int
+	// materialized lists the apps that were newly added or whose live tree
+	// differed from the staged candidate and were therefore atomically installed
+	// or replaced. Unchanged apps are deliberately absent. Sorted.
+	materialized []string
+	// removed lists live directories removed because the source no longer
+	// contains them. Sorted.
+	removed []string
+}
+
+// materializeApps rewrites dstDir (the /apps root) so that it contains exactly
 // the app directories discovered under selection, recursively and
 // deterministically:
 //
@@ -77,19 +104,28 @@ func discoverApps(selection *source.Selection) ([]string, error) {
 //     succeeded, so a staging/copy failure leaves the previous /apps tree
 //     intact. This checks template.yaml presence, not template validity; the
 //     reconciler handles template parsing and schema validation after commit.
-//   - Only then is each live app replaced by an atomic directory exchange
-//     (renameat2(RENAME_EXCHANGE) on Linux, renamex_np(RENAME_SWAP) on macOS).
-//     An updated app name is therefore never absent and never partially copied.
-//     A newly added app is an atomic rename into an absent name. If an existing
-//     app must be replaced and the filesystem cannot exchange directories,
-//     materialize fails closed BEFORE any live mutation; there is deliberately
-//     no remove-then-rename fallback.
+//   - After all candidates are staged, each existing app's staged tree is
+//     compared with its live tree (entries, directory modes, file modes, file
+//     bytes, and therefore empty directories). An unchanged app is NOT replaced:
+//     its live directory, inode, and watches stay exactly as they are. The
+//     duplicate stage is discarded. Comparison errors fail the sync; they are
+//     never treated as "unchanged". Only added/changed apps are reported as
+//     materialized.
+//   - Only then is each changed live app replaced by an atomic directory
+//     exchange (renameat2(RENAME_EXCHANGE) on Linux, renamex_np(RENAME_SWAP) on
+//     macOS). An updated app name is therefore never absent and never partially
+//     copied. A newly added app is an atomic rename into an absent name. If a
+//     changed existing app must be replaced and the filesystem cannot exchange
+//     directories, materialize fails closed BEFORE any live mutation; there is
+//     deliberately no remove-then-rename fallback. The exchange-support probe is
+//     skipped entirely when no changed app already exists.
 //   - The commit boundary is PER APP, not a whole-revision snapshot. /apps is a
 //     fixed bind mount and is never renamed as a root, so a concurrent observer
 //     may see a mixture of old and new apps while the per-app swaps proceed. An
 //     app name always resolves to a complete tree, never a partially copied
 //     directory; a reader whose walk spans a swap can still see files from both
-//     generations, which the next reconcile's fingerprint handles.
+//     generations, which the next reconcile's fingerprint handles. Per-app
+//     atomicity is not whole-revision atomicity.
 //   - Files excluded by the source-selection policy (the .gitignore rules
 //     anchored at the checkout root) are NOT copied. The applicable .gitignore
 //     files themselves ARE copied: they are the selection policy, so they must
@@ -116,22 +152,23 @@ func discoverApps(selection *source.Selection) ([]string, error) {
 // and the next locked sync converges from the checkout. Stale .sync-* leftovers
 // are removed by that next sync under the writer lock (see clearStaleStages).
 //
-// The caller must serialize writers (Sync does so with a process lock). The
-// returned values are the names materialized (sorted) and removed (sorted) for
-// the sync summary.
+// The caller must serialize writers (Sync does so with a process lock). No
+// fingerprints are derived or persisted here: comparison is against the actual
+// staged representation of this sync.
 //
 // Ownership note: once a git source is configured and synced, /apps is
 // managed by git. Operator-placed app directories are subject to the same
 // deterministic rule: a sync removes any directory not in the source. This is
 // documented in docs/operations.md "Git" and in Sync's doc comment.
-func materialize(selection *source.Selection, dstDir string) (materialized, removed []string, err error) {
+func materializeApps(selection *source.Selection, dstDir string) (materializeResult, error) {
+	var result materializeResult
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
-		return nil, nil, fmt.Errorf("git: create apps dir %q: %w", dstDir, err)
+		return materializeResult{}, fmt.Errorf("git: create apps dir %q: %w", dstDir, err)
 	}
 
 	newSet, err := discoverApps(selection)
 	if err != nil {
-		return nil, nil, err
+		return materializeResult{}, err
 	}
 	want := make(map[string]bool, len(newSet))
 	for _, n := range newSet {
@@ -141,7 +178,7 @@ func materialize(selection *source.Selection, dstDir string) (materialized, remo
 	// Stage every desired app before mutating any live app. Each stagePath is
 	// owned by this call; after a successful exchange it holds the previous live
 	// tree, so the deferred cleanup doubles as old-tree disposal and crash-safe
-	// failure cleanup.
+	// failure cleanup. Unchanged apps keep their stage until this cleanup too.
 	staged := make([]*stagedApp, 0, len(newSet))
 	defer func() {
 		for _, s := range staged {
@@ -153,18 +190,40 @@ func materialize(selection *source.Selection, dstDir string) (materialized, remo
 	for _, name := range newSet {
 		fnSelection, err := selection.Sub(filepath.Join(selection.Dir(), name))
 		if err != nil {
-			return nil, nil, err
+			return materializeResult{}, err
 		}
 		stagePath, err := stageAppDir(fnSelection, dstDir, name)
 		if err != nil {
-			return nil, nil, err
+			return materializeResult{}, err
 		}
 		existed, err := pathExists(filepath.Join(dstDir, name))
 		if err != nil {
 			_ = os.RemoveAll(stagePath)
-			return nil, nil, fmt.Errorf("git: inspect app dir %q: %w", name, err)
+			return materializeResult{}, fmt.Errorf("git: inspect app dir %q: %w", name, err)
 		}
 		staged = append(staged, &stagedApp{name: name, stagePath: stagePath, existed: existed})
+	}
+	result.desired = len(staged)
+
+	// Compare AFTER every candidate is staged and BEFORE any live mutation.
+	// Unchanged live apps are left completely alone; only added/changed apps
+	// proceed to the commit phase. A comparison error aborts the sync rather than
+	// guessing "unchanged", because a wrong guess would silently leave stale
+	// content live.
+	changed := make([]*stagedApp, 0, len(staged))
+	for _, s := range staged {
+		if !s.existed {
+			changed = append(changed, s)
+			continue
+		}
+		equal, err := sameStagedTree(s.stagePath, filepath.Join(dstDir, s.name))
+		if err != nil {
+			return materializeResult{}, fmt.Errorf("git: compare staged app dir %q with live tree: %w", s.name, err)
+		}
+		if equal {
+			continue
+		}
+		changed = append(changed, s)
 	}
 
 	// Determine the removal set BEFORE any live mutation, so a listing failure
@@ -172,31 +231,32 @@ func materialize(selection *source.Selection, dstDir string) (materialized, remo
 	// never removal candidates.
 	stale, err := staleAppNames(dstDir, want)
 	if err != nil {
-		return nil, nil, err
+		return materializeResult{}, err
 	}
 
 	// Replacement of an existing directory requires an atomic exchange. Probe
 	// the capability now, while every live app is still untouched, so an
 	// unsupported filesystem fails closed instead of exposing a removal window.
-	for _, s := range staged {
+	// An all-new or all-unchanged desired set needs no exchange probe.
+	for _, s := range changed {
 		if s.existed {
 			if err := checkExchangeSupport(dstDir); err != nil {
-				return nil, nil, err
+				return materializeResult{}, err
 			}
 			break
 		}
 	}
 
-	// Commit phase: per-app atomic exchange/rename. The old tree of an updated
-	// app remains at stagePath until the deferred cleanup, which is what makes
-	// rollback possible without ever unlinking the live name.
-	committed := make([]*stagedApp, 0, len(staged))
-	for _, s := range staged {
+	// Commit phase: per-app atomic exchange/rename for changed apps only. The old
+	// tree of an updated app remains at stagePath until the deferred cleanup,
+	// which is what makes rollback possible without ever unlinking the live name.
+	committed := make([]*stagedApp, 0, len(changed))
+	for _, s := range changed {
 		target := filepath.Join(dstDir, s.name)
 		if s.existed {
 			if err := exchangeDirs(s.stagePath, target); err != nil {
 				rbErr := rollbackApps(committed, dstDir)
-				return nil, nil, withRollback(fmt.Errorf("git: commit app dir %q: %w", s.name, err), rbErr)
+				return materializeResult{}, withRollback(fmt.Errorf("git: commit app dir %q: %w", s.name, err), rbErr)
 			}
 		} else {
 			// The name was absent when staged. A plain rename is an atomic
@@ -205,12 +265,12 @@ func materialize(selection *source.Selection, dstDir string) (materialized, remo
 			// transaction rolls back rather than exposing a partial tree.
 			if err := os.Rename(s.stagePath, target); err != nil {
 				rbErr := rollbackApps(committed, dstDir)
-				return nil, nil, withRollback(fmt.Errorf("git: commit app dir %q: %w", s.name, err), rbErr)
+				return materializeResult{}, withRollback(fmt.Errorf("git: commit app dir %q: %w", s.name, err), rbErr)
 			}
 			s.stagePath = "" // renamed into place: no old tree to clean up
 		}
 		committed = append(committed, s)
-		materialized = append(materialized, s.name)
+		result.materialized = append(result.materialized, s.name)
 	}
 
 	// Removal phase: first rename each stale directory into the reserved
@@ -222,12 +282,12 @@ func materialize(selection *source.Selection, dstDir string) (materialized, remo
 		removal, err := detachStaleApp(dstDir, name)
 		if err != nil {
 			rbErr := errors.Join(rollbackRemovals(removals, dstDir), rollbackApps(committed, dstDir))
-			return nil, nil, withRollback(fmt.Errorf("git: remove stale app dir %q: %w", name, err), rbErr)
+			return materializeResult{}, withRollback(fmt.Errorf("git: remove stale app dir %q: %w", name, err), rbErr)
 		}
 		removals = append(removals, removal)
-		removed = append(removed, name)
+		result.removed = append(result.removed, name)
 	}
-	sort.Strings(removed)
+	sort.Strings(result.removed)
 
 	// Deleting the detached trees is cleanup, not a visibility step: their live
 	// names are already gone. A failure leaves only reserved .sync-* leftovers,
@@ -235,7 +295,7 @@ func materialize(selection *source.Selection, dstDir string) (materialized, remo
 	for _, r := range removals {
 		_ = os.RemoveAll(r.trashPath)
 	}
-	return materialized, removed, nil
+	return result, nil
 }
 
 // stagedApp is one desired app's staged replacement. stagePath is its staging
@@ -290,6 +350,142 @@ func stageAppDir(selection *source.Selection, dst, name string) (string, error) 
 	}
 	ok = true
 	return tmp, nil
+}
+
+// sameStagedTree reports whether the live directory already has exactly the
+// staged candidate's materialized representation. It compares the actual trees
+// (not mtimes or a build fingerprint): every entry name and type, directory
+// permissions, file permissions, and file bytes. Empty directories therefore
+// participate naturally, and an extra/missing entry makes the trees differ.
+//
+// The staged tree is produced by copyTree, which dereferences nothing: it skips
+// symlinks and special files. A live entry of such a type (or any type the stage
+// does not contain) can never match the staged representation, so it is reported
+// as changed and replaced by the atomic exchange. Any read/stat error is returned
+// to the caller: comparison must fail the sync, never claim equality.
+func sameStagedTree(staged, live string) (bool, error) {
+	stagedInfo, err := os.Lstat(staged)
+	if err != nil {
+		return false, fmt.Errorf("stat staged tree %q: %w", staged, err)
+	}
+	liveInfo, err := os.Lstat(live)
+	if err != nil {
+		return false, fmt.Errorf("stat live tree %q: %w", live, err)
+	}
+	if !stagedInfo.IsDir() || !liveInfo.IsDir() {
+		return false, nil
+	}
+	if stagedInfo.Mode().Perm() != liveInfo.Mode().Perm() {
+		return false, nil
+	}
+	return sameDirContents(staged, live)
+}
+
+// sameDirContents compares two directories entry by entry. os.ReadDir returns
+// entries sorted by name, so walking both in lockstep is deterministic and a
+// differing name at the same index means the trees are not equal. It does not
+// follow symlinks: entry metadata comes from the directory entry itself.
+func sameDirContents(stagedDir, liveDir string) (bool, error) {
+	stagedEntries, err := os.ReadDir(stagedDir)
+	if err != nil {
+		return false, fmt.Errorf("read staged dir %q: %w", stagedDir, err)
+	}
+	liveEntries, err := os.ReadDir(liveDir)
+	if err != nil {
+		return false, fmt.Errorf("read live dir %q: %w", liveDir, err)
+	}
+	if len(stagedEntries) != len(liveEntries) {
+		return false, nil
+	}
+	for i, stagedEntry := range stagedEntries {
+		liveEntry := liveEntries[i]
+		if stagedEntry.Name() != liveEntry.Name() {
+			return false, nil
+		}
+		equal, err := sameTreeEntry(
+			filepath.Join(stagedDir, stagedEntry.Name()),
+			filepath.Join(liveDir, liveEntry.Name()),
+			stagedEntry,
+			liveEntry,
+		)
+		if err != nil {
+			return false, err
+		}
+		if !equal {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// sameTreeEntry compares one staged entry with the live entry of the same name.
+// Directory modes and file modes are the permission bits copyTree/copyFile
+// preserve; special mode bits are not part of the materialized representation.
+func sameTreeEntry(stagedPath, livePath string, stagedEntry, liveEntry fs.DirEntry) (bool, error) {
+	stagedInfo, err := stagedEntry.Info()
+	if err != nil {
+		return false, fmt.Errorf("stat staged entry %q: %w", stagedPath, err)
+	}
+	liveInfo, err := liveEntry.Info()
+	if err != nil {
+		return false, fmt.Errorf("stat live entry %q: %w", livePath, err)
+	}
+	switch {
+	case stagedInfo.IsDir():
+		if !liveInfo.IsDir() || stagedInfo.Mode().Perm() != liveInfo.Mode().Perm() {
+			return false, nil
+		}
+		return sameDirContents(stagedPath, livePath)
+	case stagedInfo.Mode().IsRegular():
+		if !liveInfo.Mode().IsRegular() ||
+			stagedInfo.Mode().Perm() != liveInfo.Mode().Perm() ||
+			stagedInfo.Size() != liveInfo.Size() {
+			return false, nil
+		}
+		return sameFileContents(stagedPath, livePath)
+	default:
+		// stageAppDir only creates directories and regular files (symlinks and
+		// special files are skipped on copy), so no live entry can match this.
+		return false, nil
+	}
+}
+
+// sameFileContents streams two regular files and compares their bytes. Sizes are
+// checked before the open, so a mismatch in length is already known; the stream
+// comparison avoids loading whole app files into memory.
+func sameFileContents(stagedPath, livePath string) (bool, error) {
+	stagedFile, err := os.Open(stagedPath)
+	if err != nil {
+		return false, fmt.Errorf("open staged file %q: %w", stagedPath, err)
+	}
+	defer stagedFile.Close()
+	liveFile, err := os.Open(livePath)
+	if err != nil {
+		return false, fmt.Errorf("open live file %q: %w", livePath, err)
+	}
+	defer liveFile.Close()
+
+	stagedBuf := make([]byte, 64*1024)
+	liveBuf := make([]byte, 64*1024)
+	for {
+		stagedN, stagedErr := io.ReadFull(stagedFile, stagedBuf)
+		if stagedErr != nil && !errors.Is(stagedErr, io.EOF) && !errors.Is(stagedErr, io.ErrUnexpectedEOF) {
+			return false, fmt.Errorf("read staged file %q: %w", stagedPath, stagedErr)
+		}
+		liveN, liveErr := io.ReadFull(liveFile, liveBuf)
+		if liveErr != nil && !errors.Is(liveErr, io.EOF) && !errors.Is(liveErr, io.ErrUnexpectedEOF) {
+			return false, fmt.Errorf("read live file %q: %w", livePath, liveErr)
+		}
+		if stagedN != liveN || !bytes.Equal(stagedBuf[:stagedN], liveBuf[:liveN]) {
+			return false, nil
+		}
+		if errors.Is(stagedErr, io.EOF) || errors.Is(stagedErr, io.ErrUnexpectedEOF) {
+			// Both reads returned the same number of bytes, so the live file is
+			// at the same end position; the size check already proved no trailing
+			// bytes.
+			return true, nil
+		}
+	}
 }
 
 // staleAppNames returns the sorted names of real directories under dst that are
@@ -510,9 +706,9 @@ func preserveAncestorIgnoreFiles(selection *source.Selection, dst string) error 
 
 // copyTree recursively copies the selected source tree at selection into dst
 // (which must already exist), preserving file permissions. Excluded files (the
-// .gitignore rules) and ".git" are skipped by the selection itself. Symlinks are
-// dereferenced and copied as regular files/dirs by walking the target, mirroring
-// a naive cp -r.
+// .gitignore rules) and ".git" are skipped by the selection itself. Symlinks and
+// other non-regular entries are skipped: WalkDir does not follow links, so the
+// staged representation contains only directories and regular files.
 func copyTree(selection *source.Selection, dst string) error {
 	return selection.WalkDir(func(path string, d fs.DirEntry, err error) error {
 		if err != nil {

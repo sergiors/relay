@@ -271,10 +271,13 @@ relay git remove [-y|--yes]
 - `sync` checks out the configured ref and deterministically rewrites
   `/apps` to match the repository/path (removing directories not in the
   source). This is the only command that writes `/apps`. All app trees are
-  staged before any live change; existing apps are replaced by an atomic
-  per-app directory exchange, so an updated app name is never absent or
-  partially copied. Sync fails before changing a live app if the filesystem
-  cannot provide that exchange.
+  staged before any live change; each staged tree is then compared with its
+  live tree. Changed existing apps are replaced by an atomic per-app directory
+  exchange; new apps are atomically renamed into place. An unchanged app keeps
+  its live directory and is not reported as materialized, so an identical
+  revision replaces nothing. An updated app name is never absent or partially
+  copied. Sync fails before changing a live app if a needed exchange is
+  unsupported.
 - `status` shows the configured source, key/checkout existence, resolved commit,
   and last sync time. Nothing configured prints a message and exits `0`.
 - `remove` deletes the persisted config and checkout, leaving `/apps` and

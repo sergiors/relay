@@ -65,12 +65,15 @@ type gitRepo interface {
 //     resolves the shared source-selection policy (.gitignore rules anchored at
 //     the checkout root; see internal/source).
 //  6. Stages every desired app (skipping files excluded by the selection
-//     policy) before touching /apps, then atomically exchanges each per-app
-//     directory into place and removes any directory not in the source (see
-//     materialize). /apps itself is a fixed bind mount and is never replaced as
-//     a root.
+//     policy) before touching /apps, compares each staged candidate with its
+//     live tree, and atomically exchanges ONLY per-app trees that were added or
+//     actually changed. Unchanged apps keep their existing live directory (and
+//     inode) untouched, so their watcher handles stay valid. Any directory not
+//     in the source is removed (see materializeApps). /apps itself is a fixed
+//     bind mount and is never replaced as a root.
 //  7. Records LastSyncedCommit/LastSyncedAt/Synced in the persisted config,
-//     atomically, after materialization succeeds.
+//     atomically, after materialization succeeds. No content comparison
+//     fingerprint is persisted; each sync compares its actual staged output.
 //
 // Writers are serialized with an advisory flock (internal/processlock) on a
 // sibling of the managed checkout, so a manual CLI sync, a webhook-triggered
@@ -89,8 +92,9 @@ type gitRepo interface {
 // owned by git. Sync rewrites it to reflect exactly the repository/path — a
 // directory present in /apps but absent from the source is removed,
 // including operator-placed ones. This is the documented behavior. Filesystem
-// support for atomic directory exchange is required to replace any existing app;
-// when it is unavailable Sync fails before mutating a live app rather than
+// support for atomic directory exchange is required to replace any CHANGED
+// existing app; unchanged apps are not replaced or probed. When an exchange is
+// required but unavailable, Sync fails before mutating a live app rather than
 // falling back to remove-then-rename.
 func Sync(ctx context.Context, opts SyncOptions) error {
 	cfg, err := LoadConfig(opts.ConfigPath)
@@ -323,23 +327,30 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 	}
 	debug("Cleared stale git staging entries", "apps_dir", opts.AppsDir)
 
-	// Materialize /apps deterministically.
-	materialized, removed, err := materialize(selection, opts.AppsDir)
+	// Materialize /apps deterministically. Only added/changed apps are reported
+	// as materialized; an identical revision performs no live replacement.
+	result, err := materializeApps(selection, opts.AppsDir)
 	if err != nil {
 		return err
 	}
-	if len(materialized) == 0 {
-		// materialize already hard-errors on a missing source dir, so an empty
-		// result here means the source existed but held no app dirs. The
-		// deterministic-removal pass still ran and cleared stale dirs.
+	switch {
+	case result.desired == 0:
+		// materializeApps already hard-errors on a missing source dir, so an
+		// empty desired set here means the source existed but held no app dirs.
+		// The deterministic-removal pass still ran and cleared stale dirs.
 		writeLine("Source contained no app directories; /apps is now empty")
-	} else {
-		writeLine("Materialized %d app(s): %s", len(materialized), joinNames(materialized))
+	case len(result.materialized) == 0 && len(result.removed) == 0:
+		writeLine("No app changes: %d app(s) already up to date", result.desired)
+	default:
+		writeLine("Materialized %d app(s): %s", len(result.materialized), joinNames(result.materialized))
 	}
-	if len(removed) > 0 {
-		writeLine("Removed %d app(s): %s", len(removed), joinNames(removed))
+	if len(result.removed) > 0 {
+		writeLine("Removed %d app(s): %s", len(result.removed), joinNames(result.removed))
 	}
-	debug("Materialized apps", "source", srcDir, "materialized", len(materialized), "removed", len(removed))
+	debug("Materialized apps", "source", srcDir,
+		"desired", result.desired,
+		"materialized", len(result.materialized),
+		"removed", len(result.removed))
 
 	// Record the sync bookkeeping atomically, only after materialization.
 	cfg.LastSyncedCommit = headHash.String()
