@@ -31,7 +31,8 @@ func TestReconcileInvalidDesiredWritesFailureAndKeepsRegistry(t *testing.T) {
 	// Seed a usable active generation (the registry already serves img-guarded;
 	// the skip path deliberately records no outcome, so record it explicitly as
 	// startup/reconcile would after a real success).
-	st.RecordReconcileSuccess("guarded", "img-guarded", "fp-guarded", time.Now(), fn.App())
+	token := recordSuccess(t, st, "guarded", "img-guarded", "fp-guarded", time.Now(), fn.App())
+	r.SeedStateToken("guarded", token)
 	before, ok := st.GetApp("guarded")
 	if !ok || before.Status != state.StatusReady {
 		t.Fatalf("precondition: %+v ok=%v, want ready", before, ok)
@@ -83,7 +84,8 @@ func TestReconcileOverDeepPatternInvalidRetainsActive(t *testing.T) {
 	b := &fakeBuilder{}
 	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
-	st.RecordReconcileSuccess("deep", "img-deep", "fp-deep", time.Now(), fn.App())
+	token := recordSuccess(t, st, "deep", "img-deep", "fp-deep", time.Now(), fn.App())
+	r.SeedStateToken("deep", token)
 	before, ok := st.GetApp("deep")
 	if !ok || before.Status != state.StatusReady {
 		t.Fatalf("precondition: %+v ok=%v, want ready", before, ok)
@@ -146,7 +148,8 @@ func TestReconcileMissingTemplateRecordsInvalidButRetains(t *testing.T) {
 	b := &fakeBuilder{}
 	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
-	st.RecordReconcileSuccess("midcopy", "img-midcopy", "fp-midcopy", time.Now(), fn.App())
+	token := recordSuccess(t, st, "midcopy", "img-midcopy", "fp-midcopy", time.Now(), fn.App())
+	r.SeedStateToken("midcopy", token)
 	if err := os.Remove(filepath.Join(dir, "template.yaml")); err != nil {
 		t.Fatalf("remove template: %v", err)
 	}
@@ -186,7 +189,8 @@ func TestReconcileFingerprintFailureRecordsInvalidAndKeepsRegistry(t *testing.T)
 	})
 
 	// Seed an active generation so the retained view is observable.
-	st.RecordReconcileSuccess("unreadable", "img-active", "fp-active", time.Now(), fn.App())
+	token := recordSuccess(t, st, "unreadable", "img-active", "fp-active", time.Now(), fn.App())
+	r.SeedStateToken("unreadable", token)
 	before, _ := st.GetApp("unreadable")
 
 	r.reconcileApp("unreadable")
@@ -251,7 +255,8 @@ func TestReconcileInvalidThenRestoredIdenticalContentRecovers(t *testing.T) {
 	b := &fakeBuilder{}
 	r, _, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
-	st.RecordReconcileSuccess("restored", "img-v1", "fp-v1", time.Now(), fn.App())
+	token := recordSuccess(t, st, "restored", "img-v1", "fp-v1", time.Now(), fn.App())
+	r.SeedStateToken("restored", token)
 	original, err := os.ReadFile(filepath.Join(dir, "template.yaml"))
 	if err != nil {
 		t.Fatalf("read template: %v", err)
@@ -295,7 +300,8 @@ func TestReconcileValidReplacementOverwritesInvalidGeneration(t *testing.T) {
 	b := &fakeBuilder{}
 	r, _, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
-	st.RecordReconcileSuccess("recovers", "img-v1", "fp-v1", time.Now(), fn.App())
+	token := recordSuccess(t, st, "recovers", "img-v1", "fp-v1", time.Now(), fn.App())
+	r.SeedStateToken("recovers", token)
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("runtime: python9.9\n"), 0o644); err != nil {
 		t.Fatalf("write broken template: %v", err)
 	}

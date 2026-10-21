@@ -42,18 +42,18 @@ func TestStatusObserverTransitions(t *testing.T) {
 	fn := app.App{Name: "demo", Dir: t.TempDir(), Template: tmpl}
 
 	// Discovery -> preparing.
-	st.RecordDiscoveredWithFingerprint(fn, "fp-1")
+	token := seedTokenWithFingerprint(t, st, fn, "fp-1")
 	// Building / reconciling transient stages.
-	st.RecordReconcileBuilding("demo")
-	st.RecordReconciling("demo")
+	st.RecordReconcileBuilding("demo", token)
+	st.RecordReconciling("demo", token)
 	// Success -> ready.
-	st.RecordReconcileSuccess("demo", "img-1", "fp-1", time.Now(), fn)
+	st.RecordReconcileSuccess("demo", "img-1", "fp-1", time.Now(), fn, token)
 	// Failure with a usable generation -> degraded.
-	st.RecordReconcileFailure("demo", errors.New("boom"))
+	st.RecordReconcileFailure("demo", errors.New("boom"), token)
 	// Service failure with a usable generation -> degraded.
-	st.RecordServiceFailure("demo", errors.New("svc boom"))
+	st.RecordServiceFailure("demo", errors.New("svc boom"), token)
 	// Removal -> empty status.
-	st.RecordRemoved("demo")
+	st.RecordRemoved("demo", token)
 
 	want := []statusEvent{
 		{"demo", StatusPreparing},
@@ -89,8 +89,8 @@ func TestStatusObserverFailureWithoutGenerationUnavailable(t *testing.T) {
 
 	tmpl := &app.Template{Runtime: "python3.14"}
 	fn := app.App{Name: "fresh", Dir: t.TempDir(), Template: tmpl}
-	st.RecordDiscoveredWithFingerprint(fn, "fp")
-	st.RecordReconcileFailure("fresh", errors.New("first build failed"))
+	token := seedTokenWithFingerprint(t, st, fn, "fp")
+	st.RecordReconcileFailure("fresh", errors.New("first build failed"), token)
 
 	last := (*events)[len(*events)-1]
 	if last.status != StatusUnavailable {
@@ -118,8 +118,10 @@ func TestStatusObserverNotNotifiedForMissingRow(t *testing.T) {
 	observer, events := recordingObserver()
 	st.SetStatusObserver(observer)
 
-	st.RecordReconcileBuilding("ghost")
-	st.RecordReconciling("ghost")
+	st.RecordReconcileBuilding("ghost", absentToken())
+	st.RecordReconciling("ghost", absentToken())
+	st.RecordReconcileFailure("ghost", errors.New("boom"), absentToken())
+	st.RecordServiceFailure("ghost", errors.New("boom"), absentToken())
 	if len(*events) != 0 {
 		t.Fatalf("missing-row status writes must not notify: %+v", *events)
 	}
@@ -174,8 +176,8 @@ func TestStatusObserverNilSafe(t *testing.T) {
 
 	tmpl := &app.Template{Runtime: "python3.14"}
 	fn := app.App{Name: "quiet", Dir: t.TempDir(), Template: tmpl}
-	st.RecordDiscoveredWithFingerprint(fn, "fp")
-	st.RecordReconcileSuccess("quiet", "img", "fp", time.Now(), fn)
+	token := seedTokenWithFingerprint(t, st, fn, "fp")
+	st.RecordReconcileSuccess("quiet", "img", "fp", time.Now(), fn, token)
 	if len(*events) != 0 {
 		t.Fatalf("cleared observer must not be notified: %+v", *events)
 	}

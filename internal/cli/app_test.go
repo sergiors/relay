@@ -22,6 +22,37 @@ func normWS(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
+// seedToken persists fn's desired generation and returns the exact transition
+// token the write stored. Generation-specific writes must carry it; zero is a
+// failed write and never persists.
+func seedToken(t *testing.T, st *state.State, fn app.App) state.Token {
+	t.Helper()
+	token := st.RecordDiscovered(fn)
+	if token <= 0 {
+		t.Fatalf("RecordDiscovered(%q) returned token %d, want positive", fn.Name, token)
+	}
+	return token
+}
+
+// recordSuccess gives name a usable persisted generation without reading the
+// token back from apps.generation: the desired write returns the exact token and
+// the success is conditioned on it.
+func recordSuccess(
+	t *testing.T,
+	st *state.State,
+	name, image, fingerprint string,
+	preparedAt time.Time,
+	fn app.App,
+) state.Token {
+	t.Helper()
+	token := seedToken(t, st, fn)
+	if !st.RecordReconcileSuccess(name, image, fingerprint, preparedAt, fn, token) {
+		t.Fatalf("RecordReconcileSuccess(%q) did not persist with token %d",
+			name, token)
+	}
+	return token
+}
+
 // openTempState opens a fresh temp state DB under per-test dependencies and
 // returns it with those deps. It replaces the former package-level statePath
 // global: each test owns its explicit temp locations, so no shared filesystem
@@ -61,7 +92,8 @@ events:
     timeout: 20s
 `))
 	readyFn := app.App{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl}
-	st.RecordReconcileSuccess("user-events-python", "relay-app-user-events-python", "abc123hash", time.Now(), readyFn)
+	recordSuccess(t, st, "user-events-python", "relay-app-user-events-python",
+		"abc123hash", time.Now(), readyFn)
 
 	nodeTmpl, _ := app.ParseTemplate([]byte(`runtime: node24
 events:
@@ -129,18 +161,18 @@ func TestAppListStatusesConsistentWithInspect(t *testing.T) {
 	// Seed each status through its production write path.
 	st.RecordDiscovered(fn("st-preparing")) // preparing
 	prepFn := fn("st-building")
-	st.RecordDiscovered(prepFn)
-	st.RecordReconcileBuilding("st-building")
+	prepToken := seedToken(t, st, prepFn)
+	st.RecordReconcileBuilding("st-building", prepToken)
 	reconFn := fn("st-reconciling")
-	st.RecordDiscovered(reconFn)
-	st.RecordReconciling("st-reconciling")
-	st.RecordReconcileSuccess("st-ready", "img", "fp", time.Now(), fn("st-ready"))
+	reconToken := seedToken(t, st, reconFn)
+	st.RecordReconciling("st-reconciling", reconToken)
+	recordSuccess(t, st, "st-ready", "img", "fp", time.Now(), fn("st-ready"))
 	degFn := fn("st-degraded")
-	st.RecordReconcileSuccess("st-degraded", "img", "fp", time.Now(), degFn)
-	st.RecordServiceFailure("st-degraded", errors.New("service failed"))
+	degToken := recordSuccess(t, st, "st-degraded", "img", "fp", time.Now(), degFn)
+	st.RecordServiceFailure("st-degraded", errors.New("service failed"), degToken)
 	unavFn := fn("st-unavailable")
-	st.RecordDiscovered(unavFn)
-	st.RecordReconcileFailure("st-unavailable", errors.New("build failed"))
+	unavToken := seedToken(t, st, unavFn)
+	st.RecordReconcileFailure("st-unavailable", errors.New("build failed"), unavToken)
 
 	want := map[string]string{
 		"st-preparing":   state.StatusPreparing,
@@ -308,7 +340,7 @@ events:
     pattern:
       event_name: [INSERT]
 `))
-	st.RecordReconcileSuccess("user-events-python", "img", "fp", time.Now(),
+	recordSuccess(t, st, "user-events-python", "img", "fp", time.Now(),
 		app.App{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
 
 	detail, ok := st.GetApp("user-events-python")
@@ -357,7 +389,7 @@ schedules:
     timezone: Europe/Rome
     timeout: 20s
 `))
-	st.RecordReconcileSuccess("user-events-python", "img", "fp", time.Now(),
+	recordSuccess(t, st, "user-events-python", "img", "fp", time.Now(),
 		app.App{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
 
 	detail, ok := st.GetApp("user-events-python")
@@ -400,7 +432,7 @@ schedules:
 	if err != nil {
 		t.Fatalf("parse template: %v", err)
 	}
-	st.RecordReconcileSuccess("user-events-python", "img", "fp", time.Now(),
+	recordSuccess(t, st, "user-events-python", "img", "fp", time.Now(),
 		app.App{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
 
 	detail, ok := st.GetApp("user-events-python")
@@ -582,7 +614,7 @@ services:
 	if err != nil {
 		t.Fatalf("parse template: %v", err)
 	}
-	st.RecordReconcileSuccess("user-events-python", "img", "fp", time.Now(),
+	recordSuccess(t, st, "user-events-python", "img", "fp", time.Now(),
 		app.App{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
 
 	detail, ok := st.GetApp("user-events-python")
@@ -638,7 +670,7 @@ events:
 	if err != nil {
 		t.Fatalf("parse template: %v", err)
 	}
-	st.RecordReconcileSuccess("user-events-python", "img", "fp", time.Now(),
+	recordSuccess(t, st, "user-events-python", "img", "fp", time.Now(),
 		app.App{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
 
 	detail, ok := st.GetApp("user-events-python")
@@ -877,8 +909,9 @@ events:
 	if err != nil {
 		t.Fatalf("parse runtime template: %v", err)
 	}
-	st.RecordDiscovered(app.App{Name: "runtime-building", Dir: filepath.Join(t.TempDir(), "rb"), Template: runtimeTmpl})
-	st.RecordReconcileBuilding("runtime-building")
+	runtimeBuilding := app.App{Name: "runtime-building", Dir: filepath.Join(t.TempDir(), "rb"), Template: runtimeTmpl}
+	runtimeToken := seedToken(t, st, runtimeBuilding)
+	st.RecordReconcileBuilding("runtime-building", runtimeToken)
 
 	// A template whose only workload is an image-backed service: the runtime may
 	// be omitted entirely, so the persisted Runtime is empty.
@@ -958,7 +991,7 @@ services:
 	if err != nil {
 		t.Fatalf("parse template: %v", err)
 	}
-	st.RecordReconcileSuccess("src-kinds", "img", "fp", time.Now(),
+	recordSuccess(t, st, "src-kinds", "img", "fp", time.Now(),
 		app.App{Name: "src-kinds", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
 	detail, ok := st.GetApp("src-kinds")
 	if !ok {

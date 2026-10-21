@@ -155,7 +155,7 @@ func TestPrepareAppsHandsStartupIdentityToPrepare(t *testing.T) {
 	}
 
 	spy := &startupSpyPreparer{}
-	prepared := prepareApps(context.Background(), spy, startup, nil, discardLogger())
+	prepared := prepareApps(context.Background(), spy, startup, nil, nil, discardLogger())
 
 	if spy.calls != len(startup) {
 		t.Fatalf("selection-aware Prepare calls = %d, want exactly %d (one per startup record)", spy.calls, len(startup))

@@ -43,7 +43,7 @@ events:
 	}
 	preparedAt := time.Now().Add(-2 * time.Hour)
 	for _, name := range []string{"zeta-app", "alpha-app", "mid-app", "beta-app"} {
-		st.RecordReconcileSuccess(name, "img-"+name, "fp-"+name, preparedAt,
+		recordSuccess(t, st, name, "img-"+name, "fp-"+name, preparedAt,
 			app.App{Name: name, Dir: filepath.Join(t.TempDir(), name), Template: tmpl})
 	}
 	return deps

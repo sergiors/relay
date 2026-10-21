@@ -12,7 +12,7 @@ import (
 func TestRecordInvalidDesiredFreshRowIsUnavailable(t *testing.T) {
 	c := openTestState(t)
 
-	c.RecordInvalidDesired("broken", &boomErr{})
+	requireToken(t, "broken", c.RecordInvalidDesired("broken", &boomErr{}))
 
 	detail, ok := c.GetApp("broken")
 	if !ok {
@@ -50,9 +50,10 @@ func TestRecordInvalidDesiredPreservesActiveGeneration(t *testing.T) {
 	fn := fnFor(t, "fn", tmpl)
 	prepared := time.Now().Add(-time.Hour)
 
-	c.RecordReconcileSuccess("fn", "img-active", "fp-active", prepared, fn)
+	token := seedToken(t, c, fn)
+	c.RecordReconcileSuccess("fn", "img-active", "fp-active", prepared, fn, token)
 
-	c.RecordInvalidDesired("fn", &boomErr{})
+	requireToken(t, "fn", c.RecordInvalidDesired("fn", &boomErr{}))
 
 	detail, ok := c.GetApp("fn")
 	if !ok {
@@ -90,7 +91,9 @@ func TestRecordInvalidDesiredObserverNotified(t *testing.T) {
 	c.SetStatusObserver(observer)
 
 	tmpl := mustTemplate(t, twoHandlerTmpl)
-	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fnFor(t, "fn", tmpl))
+	fn := fnFor(t, "fn", tmpl)
+	token := seedToken(t, c, fn)
+	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fn, token)
 	*events = nil
 
 	c.RecordInvalidDesired("fn", &boomErr{})
@@ -112,7 +115,9 @@ func TestActiveImagesListsRecordedImages(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 
-	c.RecordReconcileSuccess("with-img", "img-with", "fp", time.Now(), fnFor(t, "with-img", tmpl))
+	withImg := fnFor(t, "with-img", tmpl)
+	withImgToken := seedToken(t, c, withImg)
+	c.RecordReconcileSuccess("with-img", "img-with", "fp", time.Now(), withImg, withImgToken)
 	c.RecordDiscovered(fnFor(t, "no-img", tmpl))
 
 	got := c.ActiveImages()

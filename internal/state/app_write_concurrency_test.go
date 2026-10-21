@@ -47,8 +47,8 @@ func TestConcurrentAppSnapshotWritesPreserveFields(t *testing.T) {
 	for r := 0; r < rounds; r++ {
 		// Seed a converged snapshot: config/runtime A, desired fp-A, and a usable
 		// active generation.
-		c.RecordDiscoveredWithFingerprint(fnA, "fp-A")
-		c.RecordReconcileSuccess(name, "img-A", "fp-A", time.Now(), fnA)
+		tokenA := seedTokenWithFingerprint(t, c, fnA, "fp-A")
+		c.RecordReconcileSuccess(name, "img-A", "fp-A", time.Now(), fnA, tokenA)
 
 		start := make(chan struct{})
 		var wg sync.WaitGroup
@@ -61,9 +61,9 @@ func TestConcurrentAppSnapshotWritesPreserveFields(t *testing.T) {
 				case i < 2: // desired-generation writers change config + desired fingerprint
 					c.RecordPreparingWithFingerprint(name, fnB, "fp-B")
 				case i%2 == 0:
-					c.RecordReconcileBuilding(name)
+					c.RecordReconcileBuilding(name, tokenA)
 				default:
-					c.RecordReconciling(name)
+					c.RecordReconciling(name, tokenA)
 				}
 			}(i)
 		}
@@ -103,7 +103,7 @@ func TestAppWriteTakesPerAppAdvisoryLock(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	const name = "locked"
-	c.RecordDiscoveredWithFingerprint(fnFor(t, name, tmpl), "fp")
+	token := seedTokenWithFingerprint(t, c, fnFor(t, name, tmpl), "fp")
 
 	ctx := context.Background()
 	tx, err := c.db.BeginTx(ctx, nil)
@@ -118,7 +118,7 @@ func TestAppWriteTakesPerAppAdvisoryLock(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		c.RecordReconcileBuilding(name)
+		c.RecordReconcileBuilding(name, token)
 		close(done)
 	}()
 

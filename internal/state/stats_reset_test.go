@@ -44,7 +44,9 @@ func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 	c.nowFn = func() time.Time { return base }
 
 	tmpl := mustTemplate(t, resetSeedTmpl)
-	c.RecordReconcileSuccess("alpha", "img", "fp", base, fnFor(t, "alpha", tmpl))
+	alpha := fnFor(t, "alpha", tmpl)
+	token := seedToken(t, c, alpha)
+	c.RecordReconcileSuccess("alpha", "img", "fp", base, alpha, token)
 
 	c.RecordStats(Stats{
 		EventsReceivedTotal:     110,

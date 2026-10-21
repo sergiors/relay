@@ -501,7 +501,7 @@ func TestStartupSweepPrunesBeforeSeeding(t *testing.T) {
 
 	// Seed the DB as if a prior process had run: "stale" succeeded (no dir on
 	// disk now) and both apps have per-app counters.
-	st.RecordReconcileSuccess("stale", "img", "fp", time.Now(), stateApp("stale", keptDir))
+	recordSuccess(t, st, stateApp("stale", keptDir), "img", "fp", time.Now())
 	st.RecordAppStats(state.AppStats{App: "stale", EventsMatchedTotal: 5})
 	st.RecordAppStats(state.AppStats{App: "kept", EventsMatchedTotal: 7})
 	// A cumulative global row, so restorePersistedStats seeds the registry's

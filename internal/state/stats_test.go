@@ -266,9 +266,11 @@ func TestAppStatsAbsent(t *testing.T) {
 // RecordRemoved deletes the app_stats row alongside the apps row.
 func TestRemovalDeletesAppStats(t *testing.T) {
 	c := openTestState(t)
+	tmpl := mustTemplate(t, twoHandlerTmpl)
+	token := seedToken(t, c, fnFor(t, "alpha", tmpl))
 	c.RecordAppStats(AppStats{App: "alpha", EventsMatchedTotal: 3})
 
-	c.RecordRemoved("alpha")
+	c.RecordRemoved("alpha", token)
 
 	if _, ok := c.AppStats("alpha"); ok {
 		t.Fatal("expected function stats row to be removed")

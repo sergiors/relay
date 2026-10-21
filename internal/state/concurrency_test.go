@@ -117,9 +117,10 @@ func TestConcurrentReconcileAndStats(t *testing.T) {
 	// Precompute the app values up front: fnFor calls t.TempDir(), which is
 	// not safe to call from goroutines.
 	fns := make([]app.App, m)
+	tokens := make([]Token, m)
 	for i := 0; i < m; i++ {
 		fns[i] = fnFor(t, "fn-"+string(rune('a'+i)), tmpl)
-		c.RecordDiscovered(fns[i])
+		tokens[i] = seedToken(t, c, fns[i])
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -141,9 +142,9 @@ func TestConcurrentReconcileAndStats(t *testing.T) {
 			for i := 0; i < m; i++ {
 				name := "fn-" + string(rune('a'+i))
 				if i%2 == 0 {
-					c.RecordReconcileSuccess(name, "img", "fp", time.Now(), fns[i])
+					c.RecordReconcileSuccess(name, "img", "fp", time.Now(), fns[i], tokens[i])
 				} else {
-					c.RecordReconcileSuccess(name, "img-else", "fp", time.Now(), fns[i])
+					c.RecordReconcileSuccess(name, "img-else", "fp", time.Now(), fns[i], tokens[i])
 				}
 			}
 		}

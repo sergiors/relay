@@ -175,8 +175,8 @@ func TestRestartResetsBuildingStatusToPreparing(t *testing.T) {
 	}
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "demo", tmpl)
-	c1.RecordDiscovered(fn)
-	c1.RecordReconcileBuilding("demo")
+	token := seedToken(t, c1, fn)
+	c1.RecordReconcileBuilding("demo", token)
 	if got, _ := c1.GetApp("demo"); got.Status != StatusBuilding {
 		t.Fatalf("pre-restart status = %q, want building", got.Status)
 	}

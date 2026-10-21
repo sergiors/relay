@@ -23,7 +23,9 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	c.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
+	fn := fnFor(t, "demo", tmpl)
+	token := seedToken(t, c, fn)
+	c.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
 
 	detail, ok := c.GetApp("demo")
 	if !ok {
@@ -37,12 +39,14 @@ events:
 	}
 
 	// Omitted resources persist the effective defaults.
-	c.RecordReconcileSuccess("defaulted", "img", "fp", time.Now(), fnFor(t, "defaulted", mustTemplate(t, `runtime: node24
+	defaulted := fnFor(t, "defaulted", mustTemplate(t, `runtime: node24
 events:
   - handler: index.run
     pattern:
       event_name: [INSERT]
-`)))
+`))
+	defaultedToken := seedToken(t, c, defaulted)
+	c.RecordReconcileSuccess("defaulted", "img", "fp", time.Now(), defaulted, defaultedToken)
 	d2, ok := c.GetApp("defaulted")
 	if !ok {
 		t.Fatal("expected defaulted")

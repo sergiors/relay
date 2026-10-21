@@ -53,7 +53,7 @@ func newTestStateReconcilerLogging(
 	r := New(cfg, reg, builder, slog.New(slog.NewTextHandler(logs, nil)))
 	for _, pf := range initial {
 		seedCurrent(r, pf.App())
-		st.RecordDiscovered(pf.App())
+		r.SeedStateToken(pf.App().Name, st.RecordDiscovered(pf.App()))
 	}
 	return r, reg, st
 }

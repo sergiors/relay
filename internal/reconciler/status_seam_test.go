@@ -147,7 +147,7 @@ func TestReconcileServiceStatusPersistedPreparingReconcilingReady(t *testing.T) 
 	baseFn := app.App{Name: "svc-persist", Dir: dir, Template: tmpl}
 
 	st := testutil.NewState(t)
-	st.RecordReconcileSuccess(baseFn.Name, "img-svc-persist", "fp", time.Now(), baseFn)
+	token := recordSuccess(t, st, baseFn.Name, "img-svc-persist", "fp", time.Now(), baseFn)
 
 	// Seed an active generation so the reconcile is an update (the skip path is
 	// bypassed by changing content below).
@@ -172,6 +172,7 @@ func TestReconcileServiceStatusPersistedPreparingReconcilingReady(t *testing.T) 
 		},
 	}, reg, &fakeBuilder{}, testutil.DiscardLogger())
 	seedCurrent(r, baseFn)
+	r.SeedStateToken(baseFn.Name, token)
 
 	// Change content so the rebuild path runs and the update-services hook fires.
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
@@ -199,7 +200,7 @@ func TestReconcileServiceFailureStatusRetainsGeneration(t *testing.T) {
 	baseFn := app.App{Name: "svc-fail", Dir: dir, Template: tmpl}
 
 	st := testutil.NewState(t)
-	st.RecordReconcileSuccess(baseFn.Name, "img-svc-fail", "fp", time.Now(), baseFn)
+	token := recordSuccess(t, st, baseFn.Name, "img-svc-fail", "fp", time.Now(), baseFn)
 
 	pf := runner.NewPrepared(baseFn, &runtime.Prepared{Name: baseFn.Name, Image: "img-svc-fail"}, &fakeBuilder{})
 	reg := &runner.Registry{}
@@ -213,6 +214,7 @@ func TestReconcileServiceFailureStatusRetainsGeneration(t *testing.T) {
 		},
 	}, reg, &fakeBuilder{}, testutil.DiscardLogger())
 	seedCurrent(r, baseFn)
+	r.SeedStateToken(baseFn.Name, token)
 
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
@@ -252,7 +254,7 @@ func TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus(t *testing
 	baseFn := app.App{Name: "svc-gen", Dir: dir, Template: tmpl}
 
 	st := testutil.NewState(t)
-	st.RecordReconcileSuccess(baseFn.Name, "img-gen", "fp", time.Now(), baseFn)
+	token := recordSuccess(t, st, baseFn.Name, "img-gen", "fp", time.Now(), baseFn)
 
 	pf := runner.NewPrepared(baseFn, &runtime.Prepared{Name: baseFn.Name, Image: "img-gen"}, &fakeBuilder{})
 	reg := &runner.Registry{}
@@ -270,6 +272,7 @@ func TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus(t *testing
 		},
 	}, reg, &fakeBuilder{}, testutil.DiscardLogger())
 	seedCurrent(r, baseFn)
+	r.SeedStateToken(baseFn.Name, token)
 
 	// Generation 1: content change triggers an update; capture its callbacks.
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
@@ -305,7 +308,7 @@ func TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus(t *testing
 	// the ready status either.
 	t.Run("stale failure after current success is ignored", func(t *testing.T) {
 		st2 := testutil.NewState(t)
-		st2.RecordReconcileSuccess(baseFn.Name, "img-gen", "fp", time.Now(), baseFn)
+		token2 := recordSuccess(t, st2, baseFn.Name, "img-gen", "fp", time.Now(), baseFn)
 
 		var cs []completion
 		reg2 := &runner.Registry{}
@@ -317,6 +320,7 @@ func TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus(t *testing
 			},
 		}, reg2, &fakeBuilder{}, testutil.DiscardLogger())
 		seedCurrent(r2, baseFn)
+		r2.SeedStateToken(baseFn.Name, token2)
 
 		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v4'); }\n"), 0o644); err != nil {
 			t.Fatalf("write v4: %v", err)

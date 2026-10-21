@@ -15,6 +15,8 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"relay/internal/app"
 )
 
 // The state tests run against a real PostgreSQL instance (the suite is a
@@ -158,6 +160,37 @@ func openUnlockedState(t *testing.T, dsn, worker, instance string) *State {
 	}
 	return st
 }
+
+// seedToken persists fn's desired generation and returns the exact transition
+// token that write stored. Generation-specific writes (success, failure, status,
+// removal) must carry this token: zero is a failed desired write and never
+// persists.
+func seedToken(t *testing.T, c *State, fn app.App) Token {
+	t.Helper()
+	return requireToken(t, fn.Name, c.RecordDiscovered(fn))
+}
+
+// seedTokenWithFingerprint is seedToken with a caller-supplied desired
+// fingerprint.
+func seedTokenWithFingerprint(t *testing.T, c *State, fn app.App, fingerprint string) Token {
+	t.Helper()
+	return requireToken(t, fn.Name, c.RecordDiscoveredWithFingerprint(fn, fingerprint))
+}
+
+func requireToken(t *testing.T, name string, token Token) Token {
+	t.Helper()
+	if token <= 0 {
+		t.Fatalf("desired-generation write for %q returned token %d, want positive",
+			name, token)
+	}
+	return token
+}
+
+// absentToken is a positive token for writes that must not affect a row. It is
+// far beyond any value the test schema's sequence allocates, so it bypasses the
+// zero-token short-circuit and exercises the generation guard's stale/absent-row
+// path without colliding with a real generation.
+func absentToken() Token { return Token(1 << 62) }
 
 // testSyncBuffer is a mutex-protected log buffer for tests whose logger is
 // written by background goroutines while the test goroutine asserts on it. It

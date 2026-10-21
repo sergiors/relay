@@ -36,7 +36,8 @@ func waitForStatsRow(t *testing.T, what string, cond func() bool) {
 func TestStatsFlushSweepsStaleAppSeries(t *testing.T) {
 	st := openTempState(t)
 	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
-	st.RecordDiscovered(stateApp("ghost", t.TempDir()))
+	ghost := stateApp("ghost", t.TempDir())
+	ghostToken := seedToken(t, st, ghost)
 	st.RecordAppStats(state.AppStats{App: "alpha", EventsMatchedTotal: 10})
 	st.RecordAppStats(state.AppStats{App: "ghost", EventsMatchedTotal: 5})
 
@@ -50,7 +51,7 @@ func TestStatsFlushSweepsStaleAppSeries(t *testing.T) {
 	// Remove ghost's apps row (the reconciler's RecordRemoved) but KEEP its
 	// series in the registry, simulating an in-flight invocation that recreated
 	// them after removal. globals are untouched by removal.
-	st.RecordRemoved("ghost")
+	st.RecordRemoved("ghost", ghostToken)
 
 	newStatsFlusher(st, m).flush(context.Background())
 

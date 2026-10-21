@@ -27,7 +27,9 @@ schedules:
 func TestScheduleRoundTrip(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, schedulesTmpl)
-	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
+	fn := fnFor(t, "demo", tmpl)
+	token := seedToken(t, st, fn)
+	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
 
 	detail, ok := st.GetApp("demo")
 	if !ok {
@@ -57,7 +59,9 @@ func TestScheduleRoundTrip(t *testing.T) {
 func TestScheduleReplacementUpdatesRows(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, schedulesTmpl)
-	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
+	fn := fnFor(t, "demo", tmpl)
+	token := seedToken(t, st, fn)
+	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
 
 	// Change: drop one schedule, change the other's cron/timezone/timeout.
 	changed := mustTemplate(t, `runtime: python3.14
@@ -71,7 +75,7 @@ schedules:
     cron: "0 4 * * *"
     timezone: America/New_York
 `)
-	st.RecordReconcileSuccess("demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed))
+	st.RecordReconcileSuccess("demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed), token)
 
 	detail, ok := st.GetApp("demo")
 	if !ok {
@@ -93,9 +97,11 @@ schedules:
 func TestScheduleRemovalClearsRows(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, schedulesTmpl)
-	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
+	fn := fnFor(t, "demo", tmpl)
+	token := seedToken(t, st, fn)
+	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
 
-	st.RecordRemoved("demo")
+	st.RecordRemoved("demo", token)
 	if _, ok := st.GetApp("demo"); ok {
 		t.Fatal("function row should be gone after removal")
 	}
@@ -106,7 +112,9 @@ func TestScheduleRemovalClearsRows(t *testing.T) {
 func TestScheduleEmptyStored(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl) // no schedules key
-	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
+	fn := fnFor(t, "demo", tmpl)
+	token := seedToken(t, st, fn)
+	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
 
 	detail, ok := st.GetApp("demo")
 	if !ok {

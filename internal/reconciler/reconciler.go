@@ -185,7 +185,14 @@ type Reconciler struct {
 	mu           sync.Mutex
 	fingerprints map[string]string // name -> last-reconciled fingerprint
 	generations  map[string]uint64
-	timers       map[string]*time.Timer
+	// stateTokens carries the PostgreSQL-authoritative transition token returned
+	// by the desired-generation write that started each app's current
+	// generation. It is deliberately SEPARATE from generations: generations is a
+	// process-local counter used only to short-circuit this Reconciler's own
+	// stale callbacks, while stateTokens is the cross-worker fence persisted in
+	// apps.generation. A zero token means no generation-specific write may land.
+	stateTokens map[string]state.Token
+	timers      map[string]*time.Timer
 
 	incoming chan string   // debounced, per-app trigger queue
 	done     chan struct{} // closed on shutdown to unblock pump/timer sends
@@ -239,6 +246,7 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 		removeServices:                      cfg.RemoveServices,
 		fingerprints:                        map[string]string{},
 		generations:                         map[string]uint64{},
+		stateTokens:                         map[string]state.Token{},
 		timers:                              map[string]*time.Timer{},
 		incoming:                            make(chan string, DefaultQueueSize),
 		done:                                make(chan struct{}),
@@ -265,6 +273,23 @@ func (r *Reconciler) Seed(fn app.App, fingerprint string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.fingerprints[fn.Name] = fingerprint
+}
+
+// SeedStateToken records the PostgreSQL transition token returned by the exact
+// startup discovery write for name. It seeds the cross-worker generation fence
+// for the first live pass (notably the unchanged-service observation path) and
+// must come from the caller's own discovery/persisting result — never from a
+// later read of apps.generation, which could claim another worker's generation.
+// A zero token clears any seeded value, so generation-specific writes stay
+// suppressed rather than guessing.
+func (r *Reconciler) SeedStateToken(name string, token state.Token) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if token > 0 {
+		r.stateTokens[name] = token
+		return
+	}
+	delete(r.stateTokens, name)
 }
 
 // PrepareWatch creates the fsnotify watcher and installs the recursive watches
@@ -817,8 +842,10 @@ func (r *Reconciler) reconcileApp(name string) {
 			} else {
 				// This is an observation of the current source generation, not a
 				// new desired generation. Its status callbacks must not invalidate
-				// meaningful source work that is still completing.
-				generation := r.currentGenerationNumber(name)
+				// meaningful source work that is still completing. They reuse the
+				// token from that generation's desired-state write: no new token is
+				// allocated, and a newer worker's token makes them stale.
+				generation, token := r.generationSnapshot(name)
 				// This is a periodic VERIFICATION of an unchanged, already-
 				// available app: it must not claim that a new generation is
 				// being prepared. No RecordPreparing here — the public status is
@@ -841,14 +868,14 @@ func (r *Reconciler) reconcileApp(name string) {
 					func() {
 						worked = true
 						if r.st != nil && r.currentGeneration(name, generation) {
-							r.st.RecordReconciling(name)
+							r.st.RecordReconciling(name, token)
 						}
 					}, func(err error) {
 						if r.st == nil || !r.currentGeneration(name, generation) {
 							return
 						}
 						if err != nil {
-							r.st.RecordServiceFailure(name, err)
+							r.st.RecordServiceFailure(name, err, token)
 							return
 						}
 						if !worked {
@@ -857,7 +884,7 @@ func (r *Reconciler) reconcileApp(name string) {
 							// touch updated_at.
 							return
 						}
-						r.st.RecordReconcileSuccess(name, cur.Prepared().Image, known, time.Now(), fn)
+						r.st.RecordReconcileSuccess(name, cur.Prepared().Image, known, time.Now(), fn, token)
 					})
 			}
 		}
@@ -872,15 +899,19 @@ func (r *Reconciler) reconcileApp(name string) {
 	r.generations[name]++
 	generation := r.generations[name]
 	r.mu.Unlock()
+	var token state.Token
 	if r.st != nil {
 		// Reuse the fingerprint computed above for this desired generation: it is
 		// recorded as DesiredFingerprint without a second filesystem scan, so the
-		// state write transaction holds no external I/O.
-		r.st.RecordPreparingWithFingerprint(name, fn, fp)
+		// state write transaction holds no external I/O. The returned token is
+		// the PostgreSQL-authoritative identity of this generation; every
+		// callback below carries it so another worker's newer generation wins.
+		token = r.st.RecordPreparingWithFingerprint(name, fn, fp)
+		r.setStateToken(name, token)
 	}
 
 	start := time.Now()
-	built, err := r.prepareImage(r.prepareContext(name, generation), fn, fp, selection)
+	built, err := r.prepareImage(r.prepareContext(name, generation, token), fn, fp, selection)
 	if err != nil {
 		r.log.Error(
 			"App: reload failed; retaining previous version",
@@ -894,7 +925,7 @@ func (r *Reconciler) reconcileApp(name string) {
 		if r.st != nil {
 			// The prior active version is retained in the state database; only
 			// the failure outcome is recorded.
-			r.st.RecordReconcileFailure(name, err)
+			r.st.RecordReconcileFailure(name, err, token)
 		}
 		return
 	}
@@ -930,11 +961,11 @@ func (r *Reconciler) reconcileApp(name string) {
 		if r.st == nil || !r.currentGeneration(name, generation) {
 			return
 		}
-		r.st.RecordReconcileSuccess(name, built.Image, builtFP, time.Now(), fn)
+		r.st.RecordReconcileSuccess(name, built.Image, builtFP, time.Now(), fn, token)
 	}
 	failServices := func(serviceErr error) {
 		if serviceErr != nil && r.st != nil && r.currentGeneration(name, generation) {
-			r.st.RecordServiceFailure(name, serviceErr)
+			r.st.RecordServiceFailure(name, serviceErr, token)
 		}
 	}
 	if len(fn.Template.Services) == 0 || r.updateServicesWithStatus == nil {
@@ -960,7 +991,7 @@ func (r *Reconciler) reconcileApp(name string) {
 		r.updateServicesWithStatus(name, fn.Template, built.Image,
 			func() {
 				if r.st != nil && r.currentGeneration(name, generation) {
-					r.st.RecordReconciling(name)
+					r.st.RecordReconciling(name, token)
 				}
 			}, func(err error) {
 				if err != nil {
@@ -1007,10 +1038,26 @@ func (r *Reconciler) currentGeneration(name string, generation uint64) bool {
 	return r.generations[name] == generation
 }
 
-func (r *Reconciler) currentGenerationNumber(name string) uint64 {
+// generationSnapshot returns the current local generation plus the PostgreSQL
+// token for name under one lock, so a periodic observation cannot pair one
+// generation's local counter with another's token.
+func (r *Reconciler) generationSnapshot(name string) (uint64, state.Token) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.generations[name]
+	return r.generations[name], r.stateTokens[name]
+}
+
+// setStateToken records the token returned by the desired-state write that
+// started the current generation. A failed write (zero) clears it so the
+// generation's callbacks fail closed rather than reusing an older fence.
+func (r *Reconciler) setStateToken(name string, token state.Token) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if token > 0 {
+		r.stateTokens[name] = token
+		return
+	}
+	delete(r.stateTokens, name)
 }
 
 // prepareImage builds the app's image, passing the fingerprint the
@@ -1041,17 +1088,22 @@ func (r *Reconciler) prepareImage(
 // prepareContext roots a Prepare call in the reconciler context and installs the
 // app-image build observer that publishes status=building at the ACTUAL
 // managed-runtime image build boundary (runtime.WithAppBuildObserver). The
-// callback is generation-guarded, so a stale in-flight completion cannot
-// overwrite a newer generation's status. When no state sink is wired, the plain
-// reconciler context is returned.
-func (r *Reconciler) prepareContext(name string, generation uint64) context.Context {
+// callback is local-generation-guarded, and the state write itself validates the
+// PostgreSQL token, so a stale in-flight build cannot overwrite a newer
+// generation's status. When no state sink is wired, the plain reconciler context
+// is returned.
+func (r *Reconciler) prepareContext(
+	name string,
+	generation uint64,
+	token state.Token,
+) context.Context {
 	ctx := r.rctx()
 	if r.st == nil {
 		return ctx
 	}
 	return runtime.WithAppBuildObserver(ctx, func() {
 		if r.currentGeneration(name, generation) {
-			r.st.RecordReconcileBuilding(name)
+			r.st.RecordReconcileBuilding(name, token)
 		}
 	})
 }
@@ -1066,32 +1118,49 @@ func (r *Reconciler) prepareContext(name string, generation uint64) context.Cont
 // failed desired state instead of a stale ready row. When no state sink is wired
 // it is a no-op.
 //
-// It also FORGETS the stored fingerprint for name. That stored value is the
-// reconciler's skip key: if it were left in place, a definition later restored
-// byte-identically would compare equal and take the unchanged skip path, leaving
-// the recorded failure visible forever (the skip path deliberately writes
-// nothing). Forgetting it forces the next reconcile to re-resolve the identity,
-// so a restored definition is re-verified and a real success replaces the
-// failure — the same "retry even when the fingerprint is stable" behavior an
-// unavailable app already has. It never writes a success itself.
+// It also FORGETS the stored fingerprint for name and invalidates this
+// Reconciler's local generation plus the persisted token. That stored
+// fingerprint is the reconciler's skip key: if it were left in place, a
+// definition later restored byte-identically would compare equal and take the
+// unchanged skip path, leaving the recorded failure visible forever (the skip
+// path deliberately writes nothing). Forgetting it forces the next reconcile to
+// re-resolve the identity, so a restored definition is re-verified and a real
+// success replaces the failure — the same "retry even when the fingerprint is
+// stable" behavior an unavailable app already has. Advancing the generation
+// prevents a callback captured for the previous desired state from writing after
+// the invalid state is recorded. It never writes a success itself.
 func (r *Reconciler) recordInvalidDesired(name string, err error) {
 	r.mu.Lock()
 	delete(r.fingerprints, name)
+	r.generations[name]++
+	delete(r.stateTokens, name)
 	r.mu.Unlock()
 	if r.st == nil {
 		return
 	}
-	r.st.RecordInvalidDesired(name, err)
+	// The invalid desired write advances the persisted token, invalidating older
+	// completions from any worker. Keep the returned token as this Reconciler's
+	// current state identity; zero (write failure) leaves it cleared, so later
+	// callbacks fail closed.
+	r.setStateToken(name, r.st.RecordInvalidDesired(name, err))
 }
 
-// remove drops an app from the registry and forgets its fingerprint.
+// remove drops an app from the registry and forgets its fingerprint. It
+// invalidates the app's local generation and persisted token before deleting, so
+// a captured service completion from the removed generation can neither write a
+// status nor recreate the row. Local services and images are still retired even
+// when the state delete is suppressed by a newer generation: the directory is
+// gone from THIS worker's point of view.
 func (r *Reconciler) remove(name string) {
 	r.reg.Replace(name, nil)
 	r.mu.Lock()
 	delete(r.fingerprints, name)
+	r.generations[name]++
+	token := r.stateTokens[name]
+	delete(r.stateTokens, name)
 	r.mu.Unlock()
 	if r.st != nil {
-		r.st.RecordRemoved(name)
+		r.st.RecordRemoved(name, token)
 	}
 	// The directory is gone, so every version of this app's images is now
 	// garbage. Let the runner retire all of them (once idle) when wired. The

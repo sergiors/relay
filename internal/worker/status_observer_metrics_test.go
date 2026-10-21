@@ -17,7 +17,7 @@ func TestWireStatusObserverProjectsTransitions(t *testing.T) {
 	wireStatusObserver(st, reg)
 
 	fn := stateApp("alpha", t.TempDir())
-	st.RecordDiscoveredWithFingerprint(fn, "fp")
+	token := seedToken(t, st, fn)
 
 	// Discovery -> preparing (one-hot: preparing 1, others 0).
 	if got := reg.GaugeLabels(metrics.MetricAppStatus, []metrics.Label{{Name: "app", Value: "alpha"}, {Name: "status", Value: state.StatusPreparing}}); got != 1 {
@@ -28,14 +28,14 @@ func TestWireStatusObserverProjectsTransitions(t *testing.T) {
 	}
 
 	// Success -> ready.
-	st.RecordReconcileSuccess("alpha", "img", "fp", time.Now(), fn)
+	st.RecordReconcileSuccess("alpha", "img", "fp", time.Now(), fn, token)
 	if got := reg.GaugeLabels(metrics.MetricAppStatus, []metrics.Label{{Name: "app", Value: "alpha"}, {Name: "status", Value: state.StatusReady}}); got != 1 {
 		t.Fatalf("ready after success = %v, want 1", got)
 	}
 
 	// Removal -> all status series deleted. Check the snapshot BEFORE any
 	// GaugeLabels read: the read-back creates a series as a side effect.
-	st.RecordRemoved("alpha")
+	st.RecordRemoved("alpha", token)
 	series := reg.Snapshot()
 	for _, s := range []string{"preparing", "building", "reconciling", "ready", "degraded", "unavailable"} {
 		if containsLabel(series, "app_status{app=alpha,status="+s+"}") {
@@ -64,8 +64,8 @@ func TestStatsResetDoesNotTouchAppStatus(t *testing.T) {
 	reg := metrics.New()
 	wireStatusObserver(st, reg)
 	fn := stateApp("alpha", t.TempDir())
-	st.RecordDiscoveredWithFingerprint(fn, "fp")
-	st.RecordReconcileSuccess("alpha", "img", "fp", time.Now(), fn)
+	token := seedToken(t, st, fn)
+	st.RecordReconcileSuccess("alpha", "img", "fp", time.Now(), fn, token)
 
 	reg.Add(metrics.MetricEventsMatched, 100)
 	f := newStatsFlusher(st, reg)

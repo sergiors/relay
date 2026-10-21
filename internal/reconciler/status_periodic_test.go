@@ -19,7 +19,7 @@ import (
 // state row recorded as ready — the state of an unchanged, already-converged
 // app that the periodic tick verifies. It returns the reconciler, the
 // app, and the state handle.
-func readyServicesReconciler(t *testing.T, root, name string) (*Reconciler, app.App, *state.State) {
+func readyServicesReconciler(t *testing.T, root, name string) (*Reconciler, app.App, *state.State, state.Token) {
 	t.Helper()
 	dir := writeServicesDir(t, root, name)
 	tmpl := mustParse(servicesTemplate)
@@ -33,8 +33,9 @@ func readyServicesReconciler(t *testing.T, root, name string) (*Reconciler, app.
 	if err != nil {
 		t.Fatalf("fingerprint: %v", err)
 	}
-	st.RecordReconcileSuccess(name, "img-"+name, fp, time.Now(), fn)
-	return r, fn, st
+	token := recordSuccess(t, st, name, "img-"+name, fp, time.Now(), fn)
+	r.SeedStateToken(name, token)
+	return r, fn, st, token
 }
 
 // TestUnchangedPeriodicPathDoesNotRecordPreparing pins the focused fix: the
@@ -44,7 +45,7 @@ func readyServicesReconciler(t *testing.T, root, name string) (*Reconciler, app.
 // without corrective work), status and every reconcile timestamp stay ready.
 func TestUnchangedPeriodicPathDoesNotRecordPreparing(t *testing.T) {
 	root := t.TempDir()
-	r, fn, st := readyServicesReconciler(t, root, "svc-unchanged")
+	r, fn, st, _ := readyServicesReconciler(t, root, "svc-unchanged")
 
 	// A converged pass: the hook completes without firing reconcile-start,
 	// exactly as the coordinator does for a no-op verification.
@@ -77,7 +78,7 @@ func TestUnchangedPeriodicPathDoesNotRecordPreparing(t *testing.T) {
 // only for actual corrective work, so a no-op verification leaves ready intact.
 func TestNoOpPeriodicPassStaysReadyWithoutReconciling(t *testing.T) {
 	root := t.TempDir()
-	r, fn, st := readyServicesReconciler(t, root, "svc-noop")
+	r, fn, st, _ := readyServicesReconciler(t, root, "svc-noop")
 
 	r.updateServicesWithStatus = func(name string, _ *app.Template, image string, onReconcileStart func(), onComplete func(error)) {
 		// A converged pass performs no corrective work: no onReconcileStart.
@@ -122,7 +123,7 @@ func TestActualDesiredChangeRecordsPreparingBeforePrepare(t *testing.T) {
 	fn := app.App{Name: "svc-change", Dir: dir, Template: tmpl}
 
 	st := testutil.NewState(t)
-	st.RecordReconcileSuccess(fn.Name, "img-v1", "fp-v1", time.Now(), fn)
+	token := recordSuccess(t, st, fn.Name, "img-v1", "fp-v1", time.Now(), fn)
 
 	pf := runner.NewPrepared(fn, &runtime.Prepared{Name: fn.Name, Image: "img-v1"}, &fakeBuilder{})
 	reg := &runner.Registry{}
@@ -134,6 +135,7 @@ func TestActualDesiredChangeRecordsPreparingBeforePrepare(t *testing.T) {
 		UpdateServices: func(string, *app.Template, string) {},
 	}, reg, probe, testutil.DiscardLogger())
 	seedCurrent(r, fn)
+	r.SeedStateToken(fn.Name, token)
 
 	// Change content so the fingerprint changes and a rebuild is warranted.
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
@@ -157,7 +159,7 @@ func TestReconcilingReadyOrderingOnChange(t *testing.T) {
 	fn := app.App{Name: "svc-order", Dir: dir, Template: tmpl}
 
 	st := testutil.NewState(t)
-	st.RecordReconcileSuccess(fn.Name, "img-v1", "fp-v1", time.Now(), fn)
+	token := recordSuccess(t, st, fn.Name, "img-v1", "fp-v1", time.Now(), fn)
 
 	pf := runner.NewPrepared(fn, &runtime.Prepared{Name: fn.Name, Image: "img-svc-order"}, &fakeBuilder{})
 	reg := &runner.Registry{}
@@ -178,6 +180,7 @@ func TestReconcilingReadyOrderingOnChange(t *testing.T) {
 		},
 	}, reg, &fakeBuilder{}, testutil.DiscardLogger())
 	seedCurrent(r, fn)
+	r.SeedStateToken(fn.Name, token)
 
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
@@ -201,7 +204,7 @@ func TestReconcilingReadyOrderingOnChange(t *testing.T) {
 // retaining the active image.
 func TestCorrectivePeriodicPassCanReconcile(t *testing.T) {
 	root := t.TempDir()
-	r, fn, st := readyServicesReconciler(t, root, "svc-heal")
+	r, fn, st, _ := readyServicesReconciler(t, root, "svc-heal")
 
 	var seen []string
 	r.updateServicesWithStatus = func(name string, _ *app.Template, image string, onReconcileStart func(), onComplete func(error)) {
@@ -239,7 +242,7 @@ func TestServiceLifecycleNeverPublishesBuilding(t *testing.T) {
 	fn := app.App{Name: "svc-nobuild", Dir: dir, Template: tmpl}
 
 	st := testutil.NewState(t)
-	st.RecordReconcileSuccess(fn.Name, "img-v1", "fp-v1", time.Now(), fn)
+	token := recordSuccess(t, st, fn.Name, "img-v1", "fp-v1", time.Now(), fn)
 
 	pf := runner.NewPrepared(fn, &runtime.Prepared{Name: fn.Name, Image: "img-v2"}, &fakeBuilder{})
 	reg := &runner.Registry{}
@@ -262,6 +265,7 @@ func TestServiceLifecycleNeverPublishesBuilding(t *testing.T) {
 		},
 	}, reg, &fakeBuilder{}, testutil.DiscardLogger())
 	seedCurrent(r, fn)
+	r.SeedStateToken(fn.Name, token)
 
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
@@ -284,10 +288,10 @@ func TestServiceLifecycleNeverPublishesBuilding(t *testing.T) {
 // verification writes nothing.
 func TestActiveBuildPlusPeriodicTickDoesNotBecomePreparing(t *testing.T) {
 	root := t.TempDir()
-	r, fn, st := readyServicesReconciler(t, root, "svc-building")
+	r, fn, st, token := readyServicesReconciler(t, root, "svc-building")
 
 	// An active build's status stands in the store.
-	st.RecordReconcileBuilding(fn.Name)
+	st.RecordReconcileBuilding(fn.Name, token)
 	before, _ := st.GetApp(fn.Name)
 	if before.Status != state.StatusBuilding {
 		t.Fatalf("precondition: status = %q, want building", before.Status)
@@ -310,12 +314,12 @@ func TestActiveBuildPlusPeriodicTickDoesNotBecomePreparing(t *testing.T) {
 }
 
 // TestPeriodicSkipPathStaleCallbacksRemainGuarded pins the generation guard on
-// the unchanged periodic path: callbacks captured for an older generation must
-// be a no-op once a newer periodic generation is current, so a slow stale
-// convergence can never resurrect an outdated ready/reconciling status.
+// an unchanged periodic pass: its captured callbacks must be a no-op once a
+// newer desired generation has completed, so a slow stale convergence can never
+// resurrect an outdated ready/reconciling status.
 func TestPeriodicSkipPathStaleCallbacksRemainGuarded(t *testing.T) {
 	root := t.TempDir()
-	r, fn, st := readyServicesReconciler(t, root, "svc-skipgen")
+	r, fn, st, _ := readyServicesReconciler(t, root, "svc-skipgen")
 
 	type callbacks struct {
 		onReconcile func()
@@ -326,15 +330,31 @@ func TestPeriodicSkipPathStaleCallbacksRemainGuarded(t *testing.T) {
 		captured = append(captured, callbacks{onReconcile: onReconcileStart, onComplete: onComplete})
 	}
 
-	r.reconcileApp(fn.Name) // generation 1 (skip)
-	r.reconcileApp(fn.Name) // generation 2 (skip), now current
+	// An unchanged pass captures callbacks for the current desired generation;
+	// leave them pending.
+	r.reconcileApp(fn.Name)
+	if len(captured) != 1 {
+		t.Fatalf("captured %d callback sets, want 1", len(captured))
+	}
 
+	// A newer desired generation starts (content changes) and completes before
+	// the pending callbacks run.
+	if err := os.WriteFile(filepath.Join(fn.Dir, "index.js"),
+		[]byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+		t.Fatalf("write v2: %v", err)
+	}
+	r.reconcileApp(fn.Name)
 	if len(captured) != 2 {
 		t.Fatalf("captured %d callback sets, want 2", len(captured))
 	}
+	captured[1].onReconcile()
+	captured[1].onComplete(nil)
 	before, _ := st.GetApp(fn.Name)
+	if before.Status != state.StatusReady {
+		t.Fatalf("precondition: status = %q, want ready", before.Status)
+	}
 
-	// The stale generation 1 begins and completes: both must be ignored.
+	// The older generation's callbacks must not land.
 	captured[0].onReconcile()
 	captured[0].onComplete(nil)
 

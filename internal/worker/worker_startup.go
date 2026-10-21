@@ -24,6 +24,11 @@ type startupAppSet struct {
 	issues       []app.LoadIssue
 	records      []startupApp
 	fingerprints map[string]string
+	// tokens carries the PostgreSQL transition token persisted for each app's
+	// startup desired generation, keyed by app name. Startup preparation, its
+	// build observer, the startup service callbacks, and the reconciler seed all
+	// reuse these exact values instead of reading apps.generation back.
+	tokens map[string]state.Token
 }
 
 // loadStartupApps loads /apps, resolves each app's fingerprint and source
@@ -92,9 +97,10 @@ func loadStartupApps(
 	// runtime registry, matching, the scheduler, or preparation. A write failure
 	// is logged (non-fatal): the app set is already loaded and serving.
 	_, discoverySpan := tracing.Start(startupCtx, "state.discovery")
-	if rerr := persistStartupDiscovery(
+	tokens, rerr := persistStartupDiscovery(
 		st, app.Dir, discovered, loadIssues, logger,
-	); rerr != nil {
+	)
+	if rerr != nil {
 		discoverySpan.RecordError(rerr)
 	}
 	discoverySpan.End()
@@ -113,5 +119,6 @@ func loadStartupApps(
 		issues:       loadIssues,
 		records:      startup,
 		fingerprints: fingerprints,
+		tokens:       tokens,
 	}, nil
 }

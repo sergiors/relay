@@ -63,7 +63,8 @@ func TestDiscoveredThenSuccessReplacesActiveFields(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 
-	c.RecordDiscovered(fnFor(t, "fn", tmpl))
+	fn := fnFor(t, "fn", tmpl)
+	token := seedToken(t, c, fn)
 
 	detail, ok := c.GetApp("fn")
 	if !ok {
@@ -76,7 +77,7 @@ func TestDiscoveredThenSuccessReplacesActiveFields(t *testing.T) {
 		t.Fatalf("handler count = %d, want 2", len(detail.Handlers))
 	}
 
-	c.RecordReconcileSuccess("fn", "img-fn", "fp-new", time.Now(), fnFor(t, "fn", tmpl))
+	c.RecordReconcileSuccess("fn", "img-fn", "fp-new", time.Now(), fn, token)
 
 	detail, ok = c.GetApp("fn")
 	if !ok {
@@ -114,8 +115,9 @@ func TestDiscoveryPreservesActiveGenerationAndOutcome(t *testing.T) {
 	fn := fnFor(t, "fn", tmpl)
 	prepared := time.Now().Add(-time.Hour)
 
-	c.RecordReconcileSuccess("fn", "img-active", "fp-active", prepared, fn)
-	c.RecordReconcileFailure("fn", &boomErr{}) // degraded, last reconciliation failed
+	token := seedToken(t, c, fn)
+	c.RecordReconcileSuccess("fn", "img-active", "fp-active", prepared, fn, token)
+	c.RecordReconcileFailure("fn", &boomErr{}, token) // degraded, last reconciliation failed
 
 	c.RecordDiscoveredWithFingerprint(fn, "fp-desired-next")
 
@@ -181,10 +183,10 @@ func TestSuccessReplacesActiveAndConvergesDesiredGeneration(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "fn", tmpl)
 
-	c.RecordDiscoveredWithFingerprint(fn, "fp-v1")
-	c.RecordReconcileFailure("fn", &boomErr{}) // unavailable: no prior image
+	token := seedTokenWithFingerprint(t, c, fn, "fp-v1")
+	c.RecordReconcileFailure("fn", &boomErr{}, token) // unavailable: no prior image
 
-	c.RecordReconcileSuccess("fn", "img-v1", "fp-v1", time.Now(), fn)
+	c.RecordReconcileSuccess("fn", "img-v1", "fp-v1", time.Now(), fn, token)
 
 	detail, ok := c.GetApp("fn")
 	if !ok {
@@ -212,8 +214,10 @@ func TestPreparingRecordsDesiredFingerprintAndRetainsActive(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "fn", tmpl)
 
-	c.RecordReconcileSuccess("fn", "img-v1", "fp-v1", time.Now(), fn)
-	c.RecordPreparingWithFingerprint("fn", fn, "fp-v2")
+	token := seedToken(t, c, fn)
+	c.RecordReconcileSuccess("fn", "img-v1", "fp-v1", time.Now(), fn, token)
+	next := c.RecordPreparingWithFingerprint("fn", fn, "fp-v2")
+	requireToken(t, fn.Name, next)
 
 	detail, _ := c.GetApp("fn")
 	if detail.Status != StatusPreparing {
@@ -226,7 +230,7 @@ func TestPreparingRecordsDesiredFingerprintAndRetainsActive(t *testing.T) {
 		t.Fatalf("active generation = %q/%q, want preserved img-v1/fp-v1", detail.Image, detail.Fingerprint)
 	}
 
-	c.RecordReconcileFailure("fn", &boomErr{})
+	c.RecordReconcileFailure("fn", &boomErr{}, next)
 
 	detail, _ = c.GetApp("fn")
 	if detail.Status != StatusDegraded {
@@ -242,20 +246,21 @@ func TestReconcileStatusTransitionsRetainHealthyGeneration(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "fn", tmpl)
-	c.RecordReconcileSuccess("fn", "img-v1", "fp-v1", time.Now(), fn)
-	c.RecordPreparing("fn", fn)
+	token := seedToken(t, c, fn)
+	c.RecordReconcileSuccess("fn", "img-v1", "fp-v1", time.Now(), fn, token)
+	token = requireToken(t, fn.Name, c.RecordPreparing("fn", fn))
 	if got, _ := c.GetApp("fn"); got.Status != StatusPreparing || got.Image != "img-v1" {
 		t.Fatalf("preparing status/image = %q/%q, want preparing/img-v1", got.Status, got.Image)
 	}
-	c.RecordReconcileBuilding("fn")
+	c.RecordReconcileBuilding("fn", token)
 	if got, _ := c.GetApp("fn"); got.Status != StatusBuilding {
 		t.Fatalf("building status = %q, want building", got.Status)
 	}
-	c.RecordReconciling("fn")
+	c.RecordReconciling("fn", token)
 	if got, _ := c.GetApp("fn"); got.Status != StatusReconciling {
 		t.Fatalf("reconciling status = %q, want reconciling", got.Status)
 	}
-	c.RecordServiceFailure("fn", &boomErr{})
+	c.RecordServiceFailure("fn", &boomErr{}, token)
 	got, _ := c.GetApp("fn")
 	if got.Status != StatusDegraded || got.Image != "img-v1" {
 		t.Fatalf("service failed status/image = %q/%q, want degraded/img-v1", got.Status, got.Image)
@@ -266,14 +271,14 @@ func TestReconcileFailuresWithoutActiveImageAreUnavailable(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "fn", tmpl)
-	c.RecordDiscovered(fn)
-	c.RecordReconcileFailure("fn", &boomErr{})
+	token := seedToken(t, c, fn)
+	c.RecordReconcileFailure("fn", &boomErr{}, token)
 	got, _ := c.GetApp("fn")
 	if got.Status != StatusUnavailable {
 		t.Fatalf("image failure status = %q, want unavailable", got.Status)
 	}
-	c.RecordPreparing("fn", fn)
-	c.RecordServiceFailure("fn", &boomErr{})
+	token = requireToken(t, fn.Name, c.RecordPreparing("fn", fn))
+	c.RecordServiceFailure("fn", &boomErr{}, token)
 	got, _ = c.GetApp("fn")
 	if got.Status != StatusUnavailable {
 		t.Fatalf("service failure status = %q, want unavailable", got.Status)
@@ -303,13 +308,14 @@ func TestImageLessPreparedAppTransitionsToDegradedOnFailure(t *testing.T) {
 		fn := fnFor(t, "svc", tmpl)
 
 		// Successful no-runtime prepare: no app image, but prepared.
-		c.RecordReconcileSuccess("svc", "", "fp-svc", time.Now(), fn)
+		token := seedToken(t, c, fn)
+		c.RecordReconcileSuccess("svc", "", "fp-svc", time.Now(), fn, token)
 		if got, _ := c.GetApp("svc"); got.Image != "" || got.PreparedAt == "" {
 			t.Fatalf("precondition: image=%q prepared_at=%q, want empty image with prepared_at set",
 				got.Image, got.PreparedAt)
 		}
 
-		c.RecordReconcileFailure("svc", &boomErr{})
+		c.RecordReconcileFailure("svc", &boomErr{}, token)
 		got, _ := c.GetApp("svc")
 		if got.Status != StatusDegraded {
 			t.Fatalf("status = %q, want degraded (image-less but prepared generation is usable)", got.Status)
@@ -324,8 +330,9 @@ func TestImageLessPreparedAppTransitionsToDegradedOnFailure(t *testing.T) {
 		tmpl := mustTemplate(t, noRuntimeServiceTmpl)
 		fn := fnFor(t, "svc", tmpl)
 
-		c.RecordReconcileSuccess("svc", "", "fp-svc", time.Now(), fn)
-		c.RecordServiceFailure("svc", &boomErr{})
+		token := seedToken(t, c, fn)
+		c.RecordReconcileSuccess("svc", "", "fp-svc", time.Now(), fn, token)
+		c.RecordServiceFailure("svc", &boomErr{}, token)
 		got, _ := c.GetApp("svc")
 		if got.Status != StatusDegraded {
 			t.Fatalf("status = %q, want degraded (image-less but prepared generation is usable)", got.Status)
@@ -338,19 +345,19 @@ func TestImageLessPreparedAppTransitionsToDegradedOnFailure(t *testing.T) {
 		fn := fnFor(t, "svc", tmpl)
 
 		// Discovered but never prepared: no image and no prepared_at.
-		c.RecordDiscovered(fn)
+		token := seedToken(t, c, fn)
 		if got, _ := c.GetApp("svc"); got.Image != "" || got.PreparedAt != "" {
 			t.Fatalf("precondition: image=%q prepared_at=%q, want both empty", got.Image, got.PreparedAt)
 		}
 
-		c.RecordReconcileFailure("svc", &boomErr{})
+		c.RecordReconcileFailure("svc", &boomErr{}, token)
 		got, _ := c.GetApp("svc")
 		if got.Status != StatusUnavailable {
 			t.Fatalf("status = %q, want unavailable (no successful generation ever)", got.Status)
 		}
 
-		c.RecordPreparing("svc", fn)
-		c.RecordServiceFailure("svc", &boomErr{})
+		token = requireToken(t, fn.Name, c.RecordPreparing("svc", fn))
+		c.RecordServiceFailure("svc", &boomErr{}, token)
 		got, _ = c.GetApp("svc")
 		if got.Status != StatusUnavailable {
 			t.Fatalf("status = %q, want unavailable (no successful generation ever)", got.Status)
@@ -365,10 +372,12 @@ func TestReconcileFailureKeepsPriorActiveAndMarksFailed(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	prepared := time.Now().Add(-time.Hour)
+	fn := fnFor(t, "fn", tmpl)
 
-	c.RecordReconcileSuccess("fn", "img-active", "fp-active", prepared, fnFor(t, "fn", tmpl))
+	token := seedToken(t, c, fn)
+	c.RecordReconcileSuccess("fn", "img-active", "fp-active", prepared, fn, token)
 
-	c.RecordReconcileFailure("fn", &boomErr{})
+	c.RecordReconcileFailure("fn", &boomErr{}, token)
 
 	detail, ok := c.GetApp("fn")
 	if !ok {
@@ -411,11 +420,11 @@ func TestRecordReconcileSuccessAdvancesLastReconcileAt(t *testing.T) {
 	c.nowFn = func() time.Time { return clock }
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "fn", tmpl)
-	c.RecordDiscovered(fn) // existing row, empty reconcile fields
+	token := seedToken(t, c, fn) // existing row, empty reconcile fields
 
 	img1, fp1 := "img-v1", "fp-v1"
 	t1 := clock
-	c.RecordReconcileSuccess("fn", img1, fp1, t1, fn)
+	c.RecordReconcileSuccess("fn", img1, fp1, t1, fn, token)
 
 	d1, ok := c.GetApp("fn")
 	if !ok {
@@ -433,7 +442,7 @@ func TestRecordReconcileSuccessAdvancesLastReconcileAt(t *testing.T) {
 	// second success; the persisted timestamp must advance.
 	clock = clock.Add(2 * time.Second)
 	t2 := clock
-	c.RecordReconcileSuccess("fn", img1, fp1, t2, fn)
+	c.RecordReconcileSuccess("fn", img1, fp1, t2, fn, token)
 
 	d2, ok := c.GetApp("fn")
 	if !ok {
@@ -462,10 +471,10 @@ func TestLastReconcileSurvivesDiscoveredUpsert(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "fn", tmpl)
-	c.RecordDiscovered(fn)
+	token := seedToken(t, c, fn)
 
 	// (i) success on the existing row persists status + timestamp.
-	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fn)
+	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fn, token)
 	detail, ok := c.GetApp("fn")
 	if !ok {
 		t.Fatal("expected row after success")
@@ -502,9 +511,11 @@ func TestLastReconcileSurvivesDiscoveredUpsert(t *testing.T) {
 func TestRemovalDeletesRowAndHandlers(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
-	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fnFor(t, "fn", tmpl))
+	fn := fnFor(t, "fn", tmpl)
+	token := seedToken(t, c, fn)
+	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fn, token)
 
-	c.RecordRemoved("fn")
+	c.RecordRemoved("fn", token)
 
 	if _, ok := c.GetApp("fn"); ok {
 		t.Fatal("expected fn to be removed")
@@ -520,9 +531,13 @@ func TestRemovalDeletesRowAndHandlers(t *testing.T) {
 func TestListAppsShapeAndSort(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
-	c.RecordReconcileSuccess("zeta", "i-z", "f-z", time.Now(), fnFor(t, "zeta", tmpl))
+	zeta := fnFor(t, "zeta", tmpl)
+	zetaToken := seedToken(t, c, zeta)
+	c.RecordReconcileSuccess("zeta", "i-z", "f-z", time.Now(), zeta, zetaToken)
 	c.RecordDiscovered(fnFor(t, "alpha", tmpl))
-	c.RecordReconcileSuccess("mid", "i-m", "f-m", time.Now(), fnFor(t, "mid", tmpl))
+	mid := fnFor(t, "mid", tmpl)
+	midToken := seedToken(t, c, mid)
+	c.RecordReconcileSuccess("mid", "i-m", "f-m", time.Now(), mid, midToken)
 
 	rows := c.ListApps()
 	if len(rows) != 3 {
@@ -693,7 +708,9 @@ func TestRecordReconcileSuccessRoundTripsFingerprintedImage(t *testing.T) {
 
 	img := "relay-app-user-events:3f8a2c1d9b6e4a17"
 	fp := "3f8a2c1d9b6e4a1700aa11bb22cc33dd44ee55ff66778899aabbccddeeff0011"
-	c.RecordReconcileSuccess("user-events", img, fp, time.Now(), fnFor(t, "user-events", tmpl))
+	fn := fnFor(t, "user-events", tmpl)
+	token := seedToken(t, c, fn)
+	c.RecordReconcileSuccess("user-events", img, fp, time.Now(), fn, token)
 
 	detail, ok := c.GetApp("user-events")
 	if !ok {
@@ -746,10 +763,14 @@ func TestPruneRemovedSweepsReservedStagingRow(t *testing.T) {
 
 	// A reserved name that (from a previous bad discovery) has a state row and
 	// app_stats, plus a transient stage directory on disk.
-	c.RecordReconcileSuccess(".sync-old", "img-stage", "fp-stage", time.Now(), fnFor(t, ".sync-old", tmpl))
+	stage := fnFor(t, ".sync-old", tmpl)
+	stageToken := seedToken(t, c, stage)
+	c.RecordReconcileSuccess(".sync-old", "img-stage", "fp-stage", time.Now(), stage, stageToken)
 	c.RecordAppStats(AppStats{App: ".sync-old", EventsMatchedTotal: 3})
 	// A normal app that must survive.
-	c.RecordReconcileSuccess("kept", "img-kept", "fp-kept", time.Now(), fnFor(t, "kept", tmpl))
+	kept := fnFor(t, "kept", tmpl)
+	keptToken := seedToken(t, c, kept)
+	c.RecordReconcileSuccess("kept", "img-kept", "fp-kept", time.Now(), kept, keptToken)
 
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, ".sync-old"), 0o755); err != nil {
@@ -803,9 +824,13 @@ func TestPruneRemovedSweepsStaleApps(t *testing.T) {
 
 	// "gone" exists only in the DB; "kept" exists on disk too. Give both state
 	// rows (snapshot + app_stats) so the sweep must clean them inclusively.
-	c.RecordReconcileSuccess("gone", "img", "fp", time.Now(), fnFor(t, "gone", tmpl))
+	gone := fnFor(t, "gone", tmpl)
+	goneToken := seedToken(t, c, gone)
+	c.RecordReconcileSuccess("gone", "img", "fp", time.Now(), gone, goneToken)
 	c.RecordAppStats(AppStats{App: "gone", EventsMatchedTotal: 5})
-	c.RecordReconcileSuccess("kept", "img", "fp", time.Now(), fnFor(t, "kept", tmpl))
+	kept := fnFor(t, "kept", tmpl)
+	keptToken := seedToken(t, c, kept)
+	c.RecordReconcileSuccess("kept", "img", "fp", time.Now(), kept, keptToken)
 	c.RecordAppStats(AppStats{App: "kept", EventsMatchedTotal: 9})
 	// The global stats row must never be touched by pruning.
 	want := Stats{EventsMatchedTotal: 55}
@@ -878,8 +903,12 @@ func TestPruneRemovedNotResurrectedByDiscovery(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 
 	// Both have active state; only "kept" still exists on disk.
-	c.RecordReconcileSuccess("gone", "img-gone", "fp-gone", time.Now(), fnFor(t, "gone", tmpl))
-	c.RecordReconcileSuccess("kept", "img-kept", "fp-kept", time.Now(), fnFor(t, "kept", tmpl))
+	gone := fnFor(t, "gone", tmpl)
+	goneToken := seedToken(t, c, gone)
+	c.RecordReconcileSuccess("gone", "img-gone", "fp-gone", time.Now(), gone, goneToken)
+	kept := fnFor(t, "kept", tmpl)
+	keptToken := seedToken(t, c, kept)
+	c.RecordReconcileSuccess("kept", "img-kept", "fp-kept", time.Now(), kept, keptToken)
 
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "kept"), 0o755); err != nil {
@@ -920,7 +949,9 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fnFor(t, "fn", tmpl))
+	fn := fnFor(t, "fn", tmpl)
+	token := seedToken(t, c, fn)
+	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fn, token)
 
 	detail, ok := c.GetApp("fn")
 	if !ok {
@@ -959,7 +990,9 @@ events:
 func TestEnvSecretsMappingsNilWhenAbsent(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
-	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fnFor(t, "fn", tmpl))
+	fn := fnFor(t, "fn", tmpl)
+	token := seedToken(t, c, fn)
+	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fn, token)
 
 	detail, ok := c.GetApp("fn")
 	if !ok {
@@ -975,7 +1008,9 @@ func TestEnvSecretsMappingsNilWhenAbsent(t *testing.T) {
 	// A directly-constructed Template (nil Env/Secrets maps) must not panic and
 	// must also persist nil maps.
 	direct := &app.Template{Runtime: "node24"}
-	c.RecordReconcileSuccess("direct", "img", "fp", time.Now(), fnFor(t, "direct", direct))
+	directFn := fnFor(t, "direct", direct)
+	directToken := seedToken(t, c, directFn)
+	c.RecordReconcileSuccess("direct", "img", "fp", time.Now(), directFn, directToken)
 	d, ok := c.GetApp("direct")
 	if !ok {
 		t.Fatal("expected direct row")
@@ -1035,22 +1070,35 @@ func tableColumnSet(t *testing.T, c *State, table string) map[string]bool {
 }
 
 // TestFreshSchemaHasCurrentColumns checks the current schema shape directly:
-// initSchema must create the apps table with exactly name/data/updated_at,
-// and must NOT create any of the removed child tables. The whole nested
-// app configuration (handlers, schedules, services, env/secrets)
-// lives inside apps.data, so there are no per-handler/schedule/service
-// tables.
+// initSchema must create the apps table with exactly name/data/updated_at plus
+// the internal generation token, and must NOT create any of the removed child
+// tables. The whole nested app configuration (handlers, schedules, services,
+// env/secrets) lives inside apps.data, so there are no
+// per-handler/schedule/service tables. The global generation sequence backs the
+// token.
 func TestFreshSchemaHasCurrentColumns(t *testing.T) {
 	c := openTestState(t)
 
 	fnCols := tableColumnSet(t, c, "apps")
-	for _, want := range []string{"name", "data", "updated_at"} {
+	for _, want := range []string{"name", "data", "updated_at", "generation"} {
 		if !fnCols[want] {
 			t.Errorf("apps missing current column %q: %v", want, fnCols)
 		}
 	}
-	if len(fnCols) != 3 {
-		t.Errorf("apps must have exactly name/data/updated_at, got %v", fnCols)
+	if len(fnCols) != 4 {
+		t.Errorf("apps must have exactly name/data/updated_at/generation, got %v", fnCols)
+	}
+
+	var hasSequence bool
+	if err := c.db.QueryRowContext(context.Background(),
+		`SELECT EXISTS (SELECT 1 FROM information_schema.sequences
+		                WHERE sequence_schema = current_schema()
+		                  AND sequence_name = 'apps_generation_seq')`,
+	).Scan(&hasSequence); err != nil {
+		t.Fatalf("check apps_generation_seq: %v", err)
+	}
+	if !hasSequence {
+		t.Error("apps_generation_seq sequence must exist")
 	}
 
 	for _, table := range []string{"handlers", "schedules", "services"} {

@@ -35,7 +35,9 @@ func TestPersistStartupDiscoveryIgnoresStagingDir(t *testing.T) {
 		t.Fatalf("mkdir stage: %v", err)
 	}
 	// A stale reserved row from a previous bad discovery.
-	st.RecordReconcileSuccess(".sync-old", "img-stage", "fp-stage", time.Now(), stateApp(".sync-old", filepath.Join(root, ".sync-old")))
+	stage := stateApp(".sync-old", filepath.Join(root, ".sync-old"))
+	stageToken := seedToken(t, st, stage)
+	st.RecordReconcileSuccess(".sync-old", "img-stage", "fp-stage", time.Now(), stage, stageToken)
 
 	good := stateApp("good", filepath.Join(root, "good"))
 	discovered := []state.DiscoveredApp{{App: good, Fingerprint: "fp-good"}}
@@ -45,7 +47,7 @@ func TestPersistStartupDiscoveryIgnoresStagingDir(t *testing.T) {
 		{Name: ".sync-abc", Err: errors.New(`function ".sync-abc": read template: no such file`)},
 	}
 
-	if err := persistStartupDiscovery(st, root, discovered, issues, discardLogger()); err != nil {
+	if _, err := persistStartupDiscovery(st, root, discovered, issues, discardLogger()); err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
 
@@ -108,8 +110,8 @@ func TestPersistStartupDiscoveryRecordsInvalidPresent(t *testing.T) {
 	// (whose desired definition is about to be reported invalid).
 	prior := stateApp("prior", filepath.Join(root, "prior"))
 	invalid := stateApp("now-invalid", filepath.Join(root, "now-invalid"))
-	st.RecordReconcileSuccess(prior.Name, "img-prior", "fp-prior", time.Now(), prior)
-	st.RecordReconcileSuccess(invalid.Name, "img-invalid", "fp-invalid", time.Time{}.Add(time.Hour), invalid)
+	recordSuccess(t, st, prior, "img-prior", "fp-prior", time.Now())
+	recordSuccess(t, st, invalid, "img-invalid", "fp-invalid", time.Time{}.Add(time.Hour))
 
 	discovered := []state.DiscoveredApp{{App: prior, Fingerprint: "fp-prior-next"}}
 	issues := []app.LoadIssue{
@@ -117,7 +119,7 @@ func TestPersistStartupDiscoveryRecordsInvalidPresent(t *testing.T) {
 		{Name: "brand-new-bad", Err: errors.New("function \"brand-new-bad\": read template: no such file")},
 	}
 
-	if err := persistStartupDiscovery(st, root, discovered, issues, discardLogger()); err != nil {
+	if _, err := persistStartupDiscovery(st, root, discovered, issues, discardLogger()); err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
 
@@ -191,7 +193,7 @@ func TestPersistStartupDiscoveryInvalidAbsentFromRegistrySet(t *testing.T) {
 	st := openTempState(t)
 	startup := selectAndFingerprintApps(fns, discardLogger())
 	discovered := discoveredFromStartup(startup)
-	if err := persistStartupDiscovery(st, root, discovered, issues, discardLogger()); err != nil {
+	if _, err := persistStartupDiscovery(st, root, discovered, issues, discardLogger()); err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
 
@@ -220,10 +222,10 @@ func TestPersistStartupDiscoveryInvalidImageRetainedInKeepSet(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	invalid := stateApp("now-invalid", filepath.Join(root, "now-invalid"))
-	st.RecordReconcileSuccess(invalid.Name, "relay-app-now-invalid:deadbeef", "fp", time.Time{}.Add(time.Hour), invalid)
+	recordSuccess(t, st, invalid, "relay-app-now-invalid:deadbeef", "fp", time.Time{}.Add(time.Hour))
 
 	issues := []app.LoadIssue{{Name: "now-invalid", Err: errors.New("function \"now-invalid\": invalid template")}}
-	if err := persistStartupDiscovery(st, root, nil, issues, discardLogger()); err != nil {
+	if _, err := persistStartupDiscovery(st, root, nil, issues, discardLogger()); err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
 
@@ -243,8 +245,8 @@ func TestPersistStartupDiscoveryPrunesRemovedNotInvalid(t *testing.T) {
 	root := t.TempDir()
 	removed := stateApp("removed", filepath.Join(root, "removed"))
 	present := stateApp("present", filepath.Join(root, "present"))
-	st.RecordReconcileSuccess(removed.Name, "img-removed", "fp", time.Now(), removed)
-	st.RecordReconcileSuccess(present.Name, "img-present", "fp", time.Now(), present)
+	recordSuccess(t, st, removed, "img-removed", "fp", time.Now())
+	recordSuccess(t, st, present, "img-present", "fp", time.Now())
 
 	// Create only the present directory on disk.
 	if err := os.MkdirAll(filepath.Join(root, "present"), 0o755); err != nil {
@@ -252,7 +254,7 @@ func TestPersistStartupDiscoveryPrunesRemovedNotInvalid(t *testing.T) {
 	}
 
 	issues := []app.LoadIssue{{Name: "present", Err: errors.New("present invalid")}}
-	if err := persistStartupDiscovery(st, root, nil, issues, discardLogger()); err != nil {
+	if _, err := persistStartupDiscovery(st, root, nil, issues, discardLogger()); err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
 
@@ -276,7 +278,7 @@ func TestPersistStartupDiscoveryPruneDropsVanishedInvalid(t *testing.T) {
 	// The loader reported "vanished" as present-invalid, but by the time the
 	// state phase runs its directory is gone (no directory is created here).
 	issues := []app.LoadIssue{{Name: "vanished", Err: errors.New("transient")}}
-	if err := persistStartupDiscovery(st, root, nil, issues, discardLogger()); err != nil {
+	if _, err := persistStartupDiscovery(st, root, nil, issues, discardLogger()); err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
 

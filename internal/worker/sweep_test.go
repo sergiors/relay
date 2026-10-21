@@ -80,7 +80,8 @@ func TestStartupImageKeepSetRetainsRecordedImageAfterRediscovery(t *testing.T) {
 
 	// A prior process recorded an active generation; startup rediscovery then
 	// refreshes the desired fingerprint but must preserve the active image.
-	st.RecordReconcileSuccess(fn.Name, "recorded-active-img", "fp-active", time.Now(), fn)
+	token := seedToken(t, st, fn)
+	st.RecordReconcileSuccess(fn.Name, "recorded-active-img", "fp-active", time.Now(), fn, token)
 	st.RecordDiscovered(fn)
 
 	detail, ok := st.GetApp(fn.Name)

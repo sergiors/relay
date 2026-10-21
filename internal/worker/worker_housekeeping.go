@@ -99,7 +99,7 @@ func prepareAndStartApps(
 ) []*runner.PreparedApp {
 	prepareCtx, prepareSpan := tracing.Start(startupCtx, "apps.prepare")
 	prepareStart := time.Now()
-	prepared := prepareApps(prepareCtx, manager, startup.records, st, logger)
+	prepared := prepareApps(prepareCtx, manager, startup.records, st, startup.tokens, logger)
 	logger.Debug("Startup: prepared apps",
 		"count", len(prepared),
 		"duration", time.Since(prepareStart),
@@ -112,7 +112,7 @@ func prepareAndStartApps(
 	// pull) — nor on the unavailable/no-services removals, which are published
 	// the same nonblocking way (the coordinator derives their own fresh bound).
 	_, enqueueSpan := tracing.Start(startupCtx, "services.enqueue")
-	enqueueStartupServicesWithState(prepared, services, st, logger)
+	enqueueStartupServicesWithState(prepared, services, st, startup.tokens, logger)
 	enqueueSpan.End()
 
 	// Lifecycle-aware background housekeeping. It waits behind the coordinator's

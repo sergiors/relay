@@ -213,8 +213,9 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 		t.Fatalf("state rebuild: %v", err)
 	}
 	st.PruneRemoved(cfg.fnRoot)
+	tokens := make(map[string]state.Token, len(functions))
 	for _, fn := range functions {
-		st.RecordDiscovered(fn)
+		tokens[fn.Name] = st.RecordDiscovered(fn)
 	}
 	restorePersistedStats(m, st)
 
@@ -238,7 +239,7 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 			t.Fatalf("prepare %s: %v", fn.Name, err)
 		}
 		fingerprints[fn.Name] = p.Fingerprint
-		st.RecordReconcileSuccess(fn.Name, p.Image, p.Fingerprint, time.Now(), fn)
+		st.RecordReconcileSuccess(fn.Name, p.Image, p.Fingerprint, time.Now(), fn, tokens[fn.Name])
 		// Record the exact image ref this run built for post-close cleanup.
 		if p.Image != "" {
 			runImages = append(runImages, p.Image)

@@ -9,6 +9,7 @@ import (
 	"relay/internal/app"
 	"relay/internal/runner"
 	"relay/internal/runtime"
+	"relay/internal/state"
 	"relay/internal/testutil"
 )
 
@@ -206,9 +207,9 @@ func TestStartupBuiltFingerprintIsReturnedIdentity(t *testing.T) {
 	}
 
 	st := testutil.NewState(t)
-	st.RecordDiscovered(startup[0].App)
+	tokens := map[string]state.Token{startup[0].App.Name: seedToken(t, st, startup[0].App)}
 
-	prepareApps(context.Background(), spy, startup, st, discardLogger())
+	prepareApps(context.Background(), spy, startup, st, tokens, discardLogger())
 
 	detail, ok := st.GetApp("runtime-fn")
 	if !ok {

@@ -46,10 +46,38 @@ func newTestReconciler(
 	for _, pf := range initial {
 		seedCurrent(r, pf.App())
 		if cfg.State != nil {
-			cfg.State.RecordDiscovered(pf.App())
+			// Seed the cross-worker fence from the SAME discovery write, never a
+			// later read of apps.generation (which could claim another writer's
+			// generation).
+			r.SeedStateToken(pf.App().Name, cfg.State.RecordDiscovered(pf.App()))
 		}
 	}
 	return r, reg
+}
+
+// recordSuccess gives name a usable persisted generation without reading the
+// token back from the database: the desired write returns the exact token and
+// the success is conditioned on it. A test that then drives the reconciler
+// through a generation-specific callback seeds this token with
+// Reconciler.SeedStateToken so the local fence matches the persisted row.
+func recordSuccess(
+	t *testing.T,
+	st *state.State,
+	name, image, fingerprint string,
+	preparedAt time.Time,
+	fn app.App,
+) state.Token {
+	t.Helper()
+	token := st.RecordDiscoveredWithFingerprint(fn, fingerprint)
+	if token <= 0 {
+		t.Fatalf("RecordDiscoveredWithFingerprint(%q) returned token %d, want positive",
+			name, token)
+	}
+	if !st.RecordReconcileSuccess(name, image, fingerprint, preparedAt, fn, token) {
+		t.Fatalf("RecordReconcileSuccess(%q) did not persist with token %d",
+			name, token)
+	}
+	return token
 }
 
 // newTestStateReconciler is newTestReconciler with a temp state DB wired, and

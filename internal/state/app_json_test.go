@@ -70,7 +70,9 @@ func TestAppSnapshotIsJSONB(t *testing.T) {
 	tmpl := mustTemplate(t, fullSnapshotTmpl)
 	base := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
 	c.nowFn = func() time.Time { return base }
-	c.RecordReconcileSuccess("demo", "img", "fp", base, fnFor(t, "demo", tmpl))
+	fn := fnFor(t, "demo", tmpl)
+	token := seedToken(t, c, fn)
+	c.RecordReconcileSuccess("demo", "img", "fp", base, fn, token)
 
 	data, updatedAt, jsonbType := rawAppData(t, c, "demo")
 	if jsonbType != "object" {
@@ -127,7 +129,9 @@ func TestAppSnapshotRoundTrip(t *testing.T) {
 	tmpl := mustTemplate(t, fullSnapshotTmpl)
 	base := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
 	c.nowFn = func() time.Time { return base }
-	c.RecordReconcileSuccess("demo", "img", "fp", base, fnFor(t, "demo", tmpl))
+	fn := fnFor(t, "demo", tmpl)
+	token := seedToken(t, c, fn)
+	c.RecordReconcileSuccess("demo", "img", "fp", base, fn, token)
 
 	detail, ok := c.GetApp("demo")
 	if !ok {
@@ -194,7 +198,9 @@ func TestAppSnapshotRoundTrip(t *testing.T) {
 func TestAppSnapshotAtomicReplacement(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, fullSnapshotTmpl)
-	c.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
+	fn := fnFor(t, "demo", tmpl)
+	token := seedToken(t, c, fn)
+	c.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
 
 	// Replace with a leaner template: one handler (new timeout), no schedules,
 	// one service (new source/port), no secrets.
@@ -210,7 +216,7 @@ services:
     port: 7000
     replicas: 4
 `)
-	c.RecordReconcileSuccess("demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed))
+	c.RecordReconcileSuccess("demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed), token)
 
 	detail, ok := c.GetApp("demo")
 	if !ok {
@@ -247,10 +253,12 @@ services:
 func TestAppRemovalDeletesSnapshotAndStats(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, fullSnapshotTmpl)
-	c.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
+	fn := fnFor(t, "demo", tmpl)
+	token := seedToken(t, c, fn)
+	c.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
 	c.RecordAppStats(AppStats{App: "demo", EventsMatchedTotal: 5})
 
-	c.RecordRemoved("demo")
+	c.RecordRemoved("demo", token)
 
 	if _, ok := c.GetApp("demo"); ok {
 		t.Fatal("apps row must be removed")
@@ -287,7 +295,9 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	c.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
+	fn := fnFor(t, "demo", tmpl)
+	token := seedToken(t, c, fn)
+	c.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
 
 	data, _, _ := rawAppData(t, c, "demo")
 	if strings.Contains(data, envCanary) || strings.Contains(data, "another-literal") {
@@ -356,7 +366,7 @@ func TestCorruptAppSnapshotFailsClearly(t *testing.T) {
 // UPDATE ... WHERE name = ? semantics.
 func TestReconcileFailurePreservesSnapshotOnAbsentRow(t *testing.T) {
 	c := openTestState(t)
-	c.RecordReconcileFailure("ghost", &boomErr{})
+	c.RecordReconcileFailure("ghost", &boomErr{}, absentToken())
 	if _, ok := c.GetApp("ghost"); ok {
 		t.Fatal("failure for an unknown function must not create a row")
 	}
@@ -368,10 +378,12 @@ func TestReconcileFailurePreservesSnapshotOnAbsentRow(t *testing.T) {
 func TestReconcileFailurePreservesNestedSnapshot(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, fullSnapshotTmpl)
-	c.RecordReconcileSuccess("demo", "img-active", "fp-active", time.Now(), fnFor(t, "demo", tmpl))
+	fn := fnFor(t, "demo", tmpl)
+	token := seedToken(t, c, fn)
+	c.RecordReconcileSuccess("demo", "img-active", "fp-active", time.Now(), fn, token)
 
 	before, _ := c.GetApp("demo")
-	c.RecordReconcileFailure("demo", &boomErr{})
+	c.RecordReconcileFailure("demo", &boomErr{}, token)
 	after, ok := c.GetApp("demo")
 	if !ok {
 		t.Fatal("row must survive a failed reconcile")

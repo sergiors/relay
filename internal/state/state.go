@@ -111,6 +111,30 @@ const (
 	ReconcileFailed  = "failed"
 )
 
+// Token is an opaque, PostgreSQL-authoritative transition token for one app's
+// current desired generation. Zero is never allocated: every positive token is
+// drawn from the global apps_generation_seq sequence while the per-app advisory
+// lock is held, so it is unique across all Relay processes sharing the database.
+// Generation-specific writes are conditioned on the token the caller observed, so
+// a stale completion updates no row instead of overwriting a newer generation or
+// resurrecting a removed app. It is deliberately not part of Detail or the
+// persisted JSONB snapshot: it is internal coordination state, never a
+// CLI/JSON field.
+type Token int64
+
+// nextGenerationTx allocates the next positive transition token. nextval is
+// intentionally non-transactional: a rolled-back write merely skips a value, and
+// tokens only need to be unique and increasing, never gapless. Callers invoke it
+// while holding lockAppTx for the app whose desired state is advancing.
+func nextGenerationTx(ctx context.Context, tx *sql.Tx) (Token, error) {
+	var generation int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT nextval('apps_generation_seq')`).Scan(&generation); err != nil {
+		return 0, fmt.Errorf("allocate app generation: %w", err)
+	}
+	return Token(generation), nil
+}
+
 // Row is the per-app summary returned by ListApps. Its fields are part
 // of the apps.data snapshot except the relational Name/UpdatedAt (columns)
 // and the derived HandlerCount; it is embedded in Detail, so the JSON tags below
@@ -555,8 +579,9 @@ func (st *State) acquireWorkerLock(ctx context.Context) (*sql.Conn, error) {
 // text.
 //
 // apps stores a whole per-app snapshot as one JSONB object in data, with only
-// the stable name key and the write timestamp kept as columns. There are
-// deliberately no per-handler/per-schedule/per-service child tables: the nested
+// the stable name key, the write timestamp, and the internal transition token
+// (generation) kept as columns. There are deliberately no
+// per-handler/per-schedule/per-service child tables: the nested
 // configuration is part of the snapshot, so a template change replaces one row
 // atomically. stats is the per-worker global counter snapshot (keyed by worker
 // identity so shared-database workers never overwrite each other, with an
@@ -578,8 +603,14 @@ func (st *State) initSchema(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS apps (
 			name TEXT PRIMARY KEY,
 			data JSONB NOT NULL,
-			updated_at TEXT NOT NULL
+			updated_at TEXT NOT NULL,
+			generation BIGINT NOT NULL DEFAULT 0
 		)`,
+		// generation is the internal per-app transition token (see Token). It is
+		// a column, never part of apps.data. The global sequence is CACHE 1 so
+		// concurrent allocators never hand out the same value; gaps from
+		// rolled-back transactions are harmless.
+		`CREATE SEQUENCE IF NOT EXISTS apps_generation_seq AS BIGINT CACHE 1 START WITH 1`,
 		// stats holds each worker's "current operational snapshot". The row key
 		// is the OWNER worker identity, so N workers sharing this database keep N
 		// independent counter sets instead of last-writer-wins overwriting one
@@ -862,9 +893,13 @@ func (st *State) rebuildDiscoveredTx(ctx context.Context, discovered []Discovere
 			if err := lockAppTx(ctx, tx, d.App.Name); err != nil {
 				return err
 			}
+			generation, err := nextGenerationTx(ctx, tx)
+			if err != nil {
+				return err
+			}
 			detail := appSnapshot(d.App.Name, d.App.Template, StatusPreparing, "", "", d.Fingerprint, "", "", "", "")
 			detail.UpdatedAt = st.nowString()
-			if err := upsertAppTx(ctx, tx, detail); err != nil {
+			if err := upsertAppTx(ctx, tx, detail, generation); err != nil {
 				return err
 			}
 		}
@@ -914,8 +949,12 @@ func (st *State) fingerprint(fn app.App) string {
 // is reset to preparing rather than persisting forever, without erasing a
 // still-serving image or a recent failure outcome. It computes the fingerprint
 // itself; callers that already hold one use RecordDiscoveredWithFingerprint.
-func (st *State) RecordDiscovered(fn app.App) {
-	st.RecordDiscoveredWithFingerprint(fn, st.fingerprint(fn))
+//
+// It returns the new transition token to carry through this generation's
+// build/service callbacks, or zero when the write failed (in which case those
+// callbacks must not persist anything).
+func (st *State) RecordDiscovered(fn app.App) Token {
+	return st.RecordDiscoveredWithFingerprint(fn, st.fingerprint(fn))
 }
 
 // RecordDiscoveredWithFingerprint records a discovered app using a
@@ -932,27 +971,35 @@ func (st *State) RecordDiscovered(fn app.App) {
 // fingerprint is recorded.
 //
 // The write transaction holds no external I/O: the fingerprint is passed in, not
-// computed inside the closure.
-func (st *State) RecordDiscoveredWithFingerprint(fn app.App, fingerprint string) {
+// computed inside the closure. The returned token is the exact generation the
+// write persisted; callers must not read it back later.
+func (st *State) RecordDiscoveredWithFingerprint(fn app.App, fingerprint string) Token {
 	ctx := context.Background()
 	ts := st.nowString()
+	var generation Token
 	err := st.appWriteTx(ctx, fn.Name, func(tx *sql.Tx) error {
-		return recordDesiredTx(ctx, tx, fn.Name, fn.Template, fingerprint, ts)
+		var err error
+		generation, err = recordDesiredTx(ctx, tx, fn.Name, fn.Template, fingerprint, ts)
+		return err
 	})
 	if err != nil {
 		st.log.Warn("State: record discovered failed", "app", fn.Name, "error", err)
-		return
+		return 0
 	}
 	st.notifyStatus(fn.Name, StatusPreparing)
+	return generation
 }
 
 // recordDesiredTx is the shared body of the desired-generation writes (startup
-// discovery and live desired-change detection): it refreshes the whole
-// configuration snapshot and the desired fingerprint and sets status=preparing
-// while preserving the last usable active generation
+// discovery and live desired-change detection): it allocates a fresh transition
+// token, refreshes the whole configuration snapshot and the desired fingerprint,
+// and sets status=preparing while preserving the last usable active generation
 // (image/fingerprint/prepared_at) and the previous last-reconcile outcome. Only
 // a successful full reconcile replaces the active generation. An absent row is
 // created with no active generation and the supplied desired fingerprint.
+//
+// Advancing the token is what invalidates older completions across workers: a
+// callback carrying a previous generation updates no row.
 func recordDesiredTx(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -960,11 +1007,15 @@ func recordDesiredTx(
 	tmpl *app.Template,
 	fingerprint,
 	ts string,
-) error {
+) (Token, error) {
+	generation, err := nextGenerationTx(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
 	detail, found, err := scanApp(name, tx.QueryRowContext(ctx,
 		`SELECT `+jsonPayloadExpr+`, updated_at FROM apps WHERE name = $1`, name))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if !found {
 		detail = appSnapshot(name, tmpl, StatusPreparing, "", "", fingerprint, "", "", "", "")
@@ -975,7 +1026,10 @@ func recordDesiredTx(
 			active.PreparedAt, active.LastReconcileAt, active.LastReconcileStatus, active.LastError)
 	}
 	detail.UpdatedAt = ts
-	return upsertAppTx(ctx, tx, detail)
+	if err := upsertAppTx(ctx, tx, detail, generation); err != nil {
+		return 0, err
+	}
+	return generation, nil
 }
 
 // RecordReconcileSuccess records that an app built and serves an active
@@ -985,29 +1039,43 @@ func recordDesiredTx(
 // the successful generation IS the desired generation, both the active
 // Fingerprint and DesiredFingerprint are set to the successful final
 // fingerprint, so the next discovery/desired-change starts from a converged
-// desired value. On conflict (existing row) the upsert replaces the whole
-// snapshot, so a success on a previously-discovered row records its own outcome
-// and timestamp.
+// desired value.
+//
+// It is a generation-guarded UPDATE, never an upsert: a completion carrying a
+// stale token (another worker advanced the app, or the app was removed) affects
+// no row and is not published to the status observer. A success can only ever
+// describe the generation that already owns the row. It returns whether the
+// write landed.
 func (st *State) RecordReconcileSuccess(
 	name,
 	image,
 	fingerprint string,
 	preparedAt time.Time,
 	fn app.App,
-) {
+	generation Token,
+) bool {
 	ctx := context.Background()
+	if generation <= 0 {
+		return false
+	}
 	ts := st.nowString()
 	prepared := preparedAt.UTC().Format(time.RFC3339)
+	wrote := false
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		detail := appSnapshot(name, fn.Template, StatusReady, image, fingerprint, fingerprint, prepared, ts, ReconcileSuccess, "")
 		detail.UpdatedAt = ts
-		return upsertAppTx(ctx, tx, detail)
+		var err error
+		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, generation)
+		return err
 	})
 	if err != nil {
 		st.log.Warn("State: record success failed", "app", name, "error", err)
-		return
+		return false
 	}
-	st.notifyStatus(name, StatusReady)
+	if wrote {
+		st.notifyStatus(name, StatusReady)
+	}
+	return wrote
 }
 
 // RecordPreparing marks the desired configuration as in progress while retaining
@@ -1021,8 +1089,8 @@ func (st *State) RecordReconcileSuccess(
 // fingerprint; the fingerprint is computed BEFORE the write transaction opens so
 // the transaction holds no filesystem I/O. Callers that already computed it (the
 // reconciler's rebuild path) use RecordPreparingWithFingerprint.
-func (st *State) RecordPreparing(name string, fn app.App) {
-	st.RecordPreparingWithFingerprint(name, fn, st.fingerprint(fn))
+func (st *State) RecordPreparing(name string, fn app.App) Token {
+	return st.RecordPreparingWithFingerprint(name, fn, st.fingerprint(fn))
 }
 
 // RecordPreparingWithFingerprint records a live desired-generation change using a
@@ -1032,28 +1100,36 @@ func (st *State) RecordPreparing(name string, fn app.App) {
 // desired-generation write: it refreshes the configuration snapshot and the
 // desired fingerprint and sets status=preparing while preserving the last usable
 // active generation and the previous last-reconcile outcome.
-func (st *State) RecordPreparingWithFingerprint(name string, fn app.App, fingerprint string) {
+//
+// It returns the new transition token to carry through this generation's
+// callbacks, or zero when the write failed (fail closed: those callbacks must
+// not persist anything).
+func (st *State) RecordPreparingWithFingerprint(name string, fn app.App, fingerprint string) Token {
 	ctx := context.Background()
 	ts := st.nowString()
+	var generation Token
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
-		return recordDesiredTx(ctx, tx, name, fn.Template, fingerprint, ts)
+		var err error
+		generation, err = recordDesiredTx(ctx, tx, name, fn.Template, fingerprint, ts)
+		return err
 	})
 	if err != nil {
 		st.log.Warn("State: record preparing failed", "app", name, "error", err)
-		return
+		return 0
 	}
 	// recordDesiredTx writes StatusPreparing through the same desired-generation
 	// path as discovery, so the observer is notified with preparing here too.
 	st.notifyStatus(name, StatusPreparing)
+	return generation
 }
 
 // RecordReconcileBuilding changes only the lifecycle status to building. It is
 // called at the actual managed-runtime image build boundary (an app or
 // dependency image build), not when a build is merely queued. Persistent
 // services have no separate image build, so the service path never publishes
-// building.
-func (st *State) RecordReconcileBuilding(name string) {
-	st.recordStatus(name, StatusBuilding)
+// building. It is generation-guarded: a stale build callback affects no row.
+func (st *State) RecordReconcileBuilding(name string, generation Token) bool {
+	return st.recordStatus(name, StatusBuilding, generation)
 }
 
 // RecordReconciling changes only the lifecycle status to reconciling. It is
@@ -1061,39 +1137,38 @@ func (st *State) RecordReconcileBuilding(name string) {
 // work to perform (entrypoint/image services), so the status never claims
 // convergence work that has not started. A fully-converged no-op verification
 // pass never calls it: an unchanged app stays ready rather than flashing
-// reconciling.
-func (st *State) RecordReconciling(name string) {
-	st.recordStatus(name, StatusReconciling)
+// reconciling. It is generation-guarded: a stale convergence callback affects
+// no row.
+func (st *State) RecordReconciling(name string, generation Token) bool {
+	return st.recordStatus(name, StatusReconciling, generation)
 }
 
-func (st *State) recordStatus(name, status string) {
+func (st *State) recordStatus(name, status string, generation Token) bool {
+	if generation <= 0 {
+		return false
+	}
 	ctx := context.Background()
 	ts := st.nowString()
 	wrote := false
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		detail, found, err := scanApp(name, tx.QueryRowContext(ctx,
-			`SELECT `+jsonPayloadExpr+`, updated_at FROM apps WHERE name = $1`, name))
+			`SELECT `+jsonPayloadExpr+`, updated_at
+			 FROM apps WHERE name = $1 AND generation = $2`, name, int64(generation)))
 		if err != nil || !found {
 			return err
 		}
 		detail.Status, detail.UpdatedAt = status, ts
-		payload, err := marshalApp(detail)
-		if err != nil {
-			return err
-		}
-		if _, err = tx.ExecContext(ctx, `UPDATE apps SET data = $1, updated_at = $2 WHERE name = $3`, payload, ts, name); err != nil {
-			return err
-		}
-		wrote = true
-		return nil
+		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, generation)
+		return err
 	})
 	if err != nil {
 		st.log.Warn("State: record status failed", "app", name, "status", status, "error", err)
-		return
+		return false
 	}
 	if wrote {
 		st.notifyStatus(name, status)
 	}
+	return wrote
 }
 
 // RecordReconcileFailure records that a reconcile build failed.
@@ -1107,20 +1182,26 @@ func (st *State) recordStatus(name, status string) {
 // inside the transaction. Status is degraded when a prior usable active
 // generation exists — the app still serves but the desired generation did
 // not converge — and unavailable otherwise; a failure never claims ready, so the
-// failed outcome is always visible to an operator.
-func (st *State) RecordReconcileFailure(name string, err2 error) {
+// failed outcome is always visible to an operator. It is generation-guarded: a
+// stale failure affects no row and is not published. It returns whether the
+// write landed.
+func (st *State) RecordReconcileFailure(name string, err2 error, generation Token) bool {
+	if generation <= 0 {
+		return false
+	}
 	ctx := context.Background()
 	ts := st.nowString()
 	status := ""
+	wrote := false
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		detail, found, err := scanApp(name, tx.QueryRowContext(ctx,
 			`SELECT `+jsonPayloadExpr+`, updated_at
-			 FROM apps WHERE name = $1`, name))
+			 FROM apps WHERE name = $1 AND generation = $2`, name, int64(generation)))
 		if err != nil {
 			return err
 		}
 		if !found {
-			// The old UPDATE ... WHERE name = $1 was a no-op on an absent row.
+			// A stale generation no longer owns the row; do not resurrect it.
 			return nil
 		}
 		detail.LastReconcileAt = ts
@@ -1137,22 +1218,17 @@ func (st *State) RecordReconcileFailure(name string, err2 error) {
 		}
 		status = detail.Status
 		detail.UpdatedAt = ts
-		payload, err := marshalApp(detail)
-		if err != nil {
-			return err
-		}
-		_, err = tx.ExecContext(ctx,
-			`UPDATE apps SET data = $1, updated_at = $2 WHERE name = $3`,
-			payload, ts, name)
+		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, generation)
 		return err
 	})
 	if err != nil {
 		st.log.Warn("State: record failure failed", "app", name, "error", err)
-		return
+		return false
 	}
-	if status != "" {
+	if wrote {
 		st.notifyStatus(name, status)
 	}
+	return wrote
 }
 
 // RecordInvalidDesired records that an app's desired definition is present
@@ -1179,13 +1255,20 @@ func (st *State) RecordReconcileFailure(name string, err2 error) {
 //
 // It is an UPSERT: an invalid app never seen before (no prior row) is
 // inserted, so a fresh invalid desired state is visible to operators instead of
-// being silently absent. The status observer is notified with the resulting
-// status, keeping the one-hot app_status gauge consistent.
-func (st *State) RecordInvalidDesired(name string, err2 error) {
+// being silently absent. It advances the transition token, invalidating older
+// completions across workers, and returns that token (zero on a failed write).
+// The status observer is notified with the resulting status, keeping the one-hot
+// app_status gauge consistent.
+func (st *State) RecordInvalidDesired(name string, err2 error) Token {
 	ctx := context.Background()
 	ts := st.nowString()
+	var generation Token
 	status := ""
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
+		gen, err := nextGenerationTx(ctx, tx)
+		if err != nil {
+			return err
+		}
 		detail, found, err := scanApp(name, tx.QueryRowContext(ctx,
 			`SELECT `+jsonPayloadExpr+`, updated_at
 			 FROM apps WHERE name = $1`, name))
@@ -1220,25 +1303,20 @@ func (st *State) RecordInvalidDesired(name string, err2 error) {
 		}
 		status = detail.Status
 		detail.UpdatedAt = ts
-		payload, err := marshalApp(detail)
-		if err != nil {
+		if err := upsertAppTx(ctx, tx, detail, gen); err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx,
-			`INSERT INTO apps (name, data, updated_at) VALUES ($1, $2, $3)
-			 ON CONFLICT(name) DO UPDATE SET
-			   data       = excluded.data,
-			   updated_at = excluded.updated_at`,
-			name, payload, ts)
-		return err
+		generation = gen
+		return nil
 	})
 	if err != nil {
 		st.log.Warn("State: record invalid desired failed", "app", name, "error", err)
-		return
+		return 0
 	}
 	if status != "" {
 		st.notifyStatus(name, status)
 	}
+	return generation
 }
 
 // ActiveImages returns the currently recorded active image reference for every
@@ -1283,17 +1361,25 @@ func (st *State) ActiveImages() map[string]string {
 // healthy app image. An app with a usable active generation is
 // degraded; one without an active generation is unavailable. A no-runtime
 // external-image service-only app has no app image but a
-// successfully-prepared generation, so it is degraded, not unavailable.
-func (st *State) RecordServiceFailure(name string, err2 error) {
+// successfully-prepared generation, so it is degraded, not unavailable. It is
+// generation-guarded and returns whether the write landed.
+func (st *State) RecordServiceFailure(name string, err2 error, generation Token) bool {
+	if generation <= 0 {
+		return false
+	}
 	ctx := context.Background()
 	ts := st.nowString()
 	status := ""
+	wrote := false
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		detail, found, err := scanApp(name, tx.QueryRowContext(ctx,
 			`SELECT `+jsonPayloadExpr+`, updated_at
-			 FROM apps WHERE name = $1`, name))
-		if err != nil || !found {
+			 FROM apps WHERE name = $1 AND generation = $2`, name, int64(generation)))
+		if err != nil {
 			return err
+		}
+		if !found {
+			return nil
 		}
 		detail.LastReconcileAt = ts
 		detail.LastReconcileStatus = ReconcileFailed
@@ -1305,38 +1391,64 @@ func (st *State) RecordServiceFailure(name string, err2 error) {
 		}
 		status = detail.Status
 		detail.UpdatedAt = ts
-		payload, err := marshalApp(detail)
-		if err != nil {
-			return err
-		}
-		_, err = tx.ExecContext(ctx,
-			`UPDATE apps SET data = $1, updated_at = $2 WHERE name = $3`,
-			payload, ts, name)
+		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, generation)
 		return err
 	})
 	if err != nil {
 		st.log.Warn("State: record service failure failed", "app", name, "error", err)
-		return
+		return false
 	}
-	if status != "" {
+	if wrote {
 		st.notifyStatus(name, status)
 	}
+	return wrote
 }
 
 // RecordRemoved deletes an app and its per-app stats from the state
-// database, so a removed app never leaves a stale stats row behind. On
-// success the status observer is notified with an EMPTY status, the signal to
-// delete the app's status series (a removed app has no lifecycle).
-func (st *State) RecordRemoved(name string) {
+// database, so a removed app never leaves a stale stats row behind. The delete
+// is generation-guarded: it removes the row only while the caller's token still
+// owns it, so a removal observed by an older worker cannot delete a newer
+// generation. app_stats is deleted only when the matching apps row was actually
+// removed; both happen in one transaction. On a landed delete the status
+// observer is notified with an EMPTY status, the signal to delete the app's
+// status series (a removed app has no lifecycle). It returns whether the row was
+// deleted.
+func (st *State) RecordRemoved(name string, generation Token) bool {
+	if generation <= 0 {
+		return false
+	}
 	ctx := context.Background()
+	deleted := false
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
-		return removeTx(ctx, tx, name)
+		result, err := tx.ExecContext(ctx,
+			`DELETE FROM apps WHERE name = $1 AND generation = $2`,
+			name, int64(generation))
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			// A newer generation (or a re-added app) owns the row; leave it.
+			return nil
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM app_stats WHERE app_name = $1`, name); err != nil {
+			return err
+		}
+		deleted = true
+		return nil
 	})
 	if err != nil {
 		st.log.Warn("State: record removed failed", "app", name, "error", err)
-		return
+		return false
 	}
-	st.notifyStatus(name, "")
+	if deleted {
+		st.notifyStatus(name, "")
+	}
+	return deleted
 }
 
 // PruneRemoved removes state rows for every app recorded in the database
@@ -1395,8 +1507,9 @@ func (st *State) PruneRemoved(dir string) {
 			continue
 		}
 		if _, err := os.Stat(filepath.Join(dir, name)); os.IsNotExist(err) {
-			// Reuse the same single-app removal path as RecordRemoved so the
-			// live reconciler and the startup sweep behave identically.
+			// Startup pruning is filesystem-authoritative and therefore
+			// unconditional: no generation token can own a directory that is
+			// genuinely gone at startup.
 			if rerr := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 				return removeTx(ctx, tx, name)
 			}); rerr != nil {
@@ -1416,9 +1529,10 @@ func (st *State) PruneRemoved(dir string) {
 // removeTx deletes an app and its per-app stats row — the apps
 // row itself and the matching app_stats row — inside tx. The nested
 // handler/schedule/service configuration lives inside apps.data, so no
-// child-table delete is needed. It is shared by the live reconciler removal
-// (RecordRemoved) and the startup sweep (PruneRemoved) so both are behaviorally
-// identical: a removed app never leaves a stale app_stats row behind.
+// child-table delete is needed. It is the UNCONDITIONAL removal used by the
+// startup sweep (PruneRemoved), where the filesystem — not a generation — is the
+// source of truth. Live removal uses the generation-guarded DELETE in
+// RecordRemoved instead.
 func removeTx(ctx context.Context, tx *sql.Tx, name string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM app_stats WHERE app_name = $1`, name); err != nil {
 		return err
@@ -1510,21 +1624,58 @@ func scanApp(name string, row *sql.Row) (Detail, bool, error) {
 }
 
 // upsertAppTx writes the whole Detail snapshot as one JSONB value in
-// apps.data, upserting on the name key. The snapshot replaces the previous
-// one atomically, so a template change never leaves a mixture of old and new
-// handler/schedule/service configuration.
-func upsertAppTx(ctx context.Context, tx *sql.Tx, detail Detail) error {
+// apps.data, upserting on the name key and stamping generation. It is reserved
+// for desired-state writes (discovery, preparing, invalid), which are the only
+// operations allowed to CREATE a row or advance its generation. The snapshot
+// replaces the previous one atomically, so a template change never leaves a
+// mixture of old and new handler/schedule/service configuration.
+func upsertAppTx(ctx context.Context, tx *sql.Tx, detail Detail, generation Token) error {
 	payload, err := marshalApp(detail)
 	if err != nil {
 		return err
 	}
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO apps (name, data, updated_at) VALUES ($1, $2, $3)
+		`INSERT INTO apps (name, data, updated_at, generation)
+		 VALUES ($1, $2, $3, $4)
 		 ON CONFLICT(name) DO UPDATE SET
 		   data       = excluded.data,
-		   updated_at = excluded.updated_at`,
-		detail.Name, payload, detail.UpdatedAt)
+		   updated_at = excluded.updated_at,
+		   generation = excluded.generation`,
+		detail.Name, payload, detail.UpdatedAt, int64(generation))
 	return err
+}
+
+// updateAppIfCurrentTx rewrites one app snapshot only while the row still
+// carries generation, returning false when the token is stale or the row is
+// gone. Every generation-specific outcome (status, success, failure,
+// service failure) goes through this guarded UPDATE so a delayed completion
+// from another worker — or from before a removal — can never overwrite a newer
+// generation, create a row, or publish a status.
+func updateAppIfCurrentTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	detail Detail,
+	generation Token,
+) (bool, error) {
+	if generation <= 0 {
+		return false, nil
+	}
+	payload, err := marshalApp(detail)
+	if err != nil {
+		return false, err
+	}
+	result, err := tx.ExecContext(ctx,
+		`UPDATE apps SET data = $1, updated_at = $2
+		 WHERE name = $3 AND generation = $4`,
+		payload, detail.UpdatedAt, detail.Name, int64(generation))
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
 }
 
 // appSnapshot builds the persisted snapshot for an app template: the

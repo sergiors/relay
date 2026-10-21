@@ -28,7 +28,9 @@ services:
 func TestServiceRoundTrip(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, servicesTmpl)
-	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
+	fn := fnFor(t, "demo", tmpl)
+	token := seedToken(t, st, fn)
+	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
 
 	detail, ok := st.GetApp("demo")
 	if !ok {
@@ -52,7 +54,9 @@ func TestServiceRoundTrip(t *testing.T) {
 func TestServiceReplacementUpdatesRows(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, servicesTmpl)
-	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
+	fn := fnFor(t, "demo", tmpl)
+	token := seedToken(t, st, fn)
+	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
 
 	// Change: drop one service, change the other's port/replicas/path.
 	changed := mustTemplate(t, `runtime: python3.14
@@ -68,7 +72,7 @@ services:
     port: 8080
     replicas: 5
 `)
-	st.RecordReconcileSuccess("demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed))
+	st.RecordReconcileSuccess("demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed), token)
 
 	detail, ok := st.GetApp("demo")
 	if !ok {
@@ -87,9 +91,11 @@ services:
 func TestServiceRemovalClearsRows(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, servicesTmpl)
-	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
+	fn := fnFor(t, "demo", tmpl)
+	token := seedToken(t, st, fn)
+	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
 
-	st.RecordRemoved("demo")
+	st.RecordRemoved("demo", token)
 	if _, ok := st.GetApp("demo"); ok {
 		t.Fatal("function row should be gone after removal")
 	}
@@ -99,7 +105,9 @@ func TestServiceRemovalClearsRows(t *testing.T) {
 func TestServiceEmptyStored(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl) // no services key
-	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
+	fn := fnFor(t, "demo", tmpl)
+	token := seedToken(t, st, fn)
+	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
 
 	detail, ok := st.GetApp("demo")
 	if !ok {
@@ -129,7 +137,9 @@ func stateServiceName(s Service) string { return s.Name }
 func TestServiceSourceKindsRoundTrip(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, sourceServicesTmpl)
-	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
+	fn := fnFor(t, "demo", tmpl)
+	token := seedToken(t, st, fn)
+	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
 
 	detail, ok := st.GetApp("demo")
 	if !ok {
