@@ -1360,10 +1360,13 @@ func startupSeedFingerprints(
 
 // persistStartupDiscovery writes the startup state phase: it seeds a fresh
 // database from the already-loaded (app, fingerprint) pairs, records each
-// PRESENT-but-invalid desired definition from the loader diagnostics as invalid
+// PRESENT-but-invalid app candidate from the loader diagnostics as invalid
 // (preserving any active generation while clearing the untrustworthy desired
-// snapshot), prunes rows for apps genuinely absent from dir, and records
-// each valid app as discovered (preserving its active generation).
+// snapshot), prunes rows for names that are no longer app candidates in dir
+// (directory absent OR template.yaml absent), and records each valid app as
+// discovered (preserving its active generation). A directory without
+// template.yaml is not an app candidate and is never an issue, so a fresh
+// template-less directory leaves no row, warning, or token behind.
 //
 // Ordering matters. The invalid writes happen BEFORE the prune so a directory
 // the loader observed as present but which vanished before the sweep is still
@@ -1897,14 +1900,15 @@ func sweepStartupImages(
 }
 
 // liveAppNames builds the startup service-orphan sweep's present-app set from
-// the loader's output: every valid app plus every PRESENT entry reported as a
-// LoadIssue (an invalid path/template, or a not-ready directory whose
-// template.yaml is missing). A present-but-invalid or not-ready directory is
-// still an app on disk, so its service containers must be preserved rather than
-// treated as an absent app's leftovers. Relay's staging directories and
-// directories that vanished mid-load are never issues, so they stay absent and
-// their containers remain sweepable. Loader diagnostics are the only input: the
-// persisted state view must not decide container cleanup.
+// the loader's output: every valid app plus every PRESENT app candidate reported
+// as a LoadIssue (an invalid path or an invalid/unreadable template). A
+// present-but-invalid candidate is still an app on disk, so its service
+// containers must be preserved rather than treated as an absent app's
+// leftovers. A directory without template.yaml is not an app candidate and is
+// never an issue, so its containers are swept like a removed app's. Relay's
+// staging directories and directories that vanished mid-load are never issues
+// either. Loader diagnostics are the only input: the persisted state view must
+// not decide container cleanup.
 func liveAppNames(apps []app.App, issues []app.LoadIssue) map[string]bool {
 	live := make(map[string]bool, len(apps)+len(issues))
 	for _, fn := range apps {

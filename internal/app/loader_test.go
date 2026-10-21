@@ -51,6 +51,10 @@ events:
 	}
 }
 
+// TestLoadIgnoresDirWithoutTemplate pins the candidate contract: a direct
+// child directory without template.yaml is not an app. It yields no app, no
+// LoadIssue, and no warning in either loader variant, so startup never records
+// an invalid desired state for plain filesystem clutter.
 func TestLoadIgnoresDirWithoutTemplate(t *testing.T) {
 	dir := t.TempDir()
 	writeTemplate(t, dir, "valid", `
@@ -60,21 +64,87 @@ events:
     pattern:
       event_name: [MODIFY]
 `)
-	// A directory without template.yaml.
-	if err := os.MkdirAll(filepath.Join(dir, "no-template"), 0o755); err != nil {
+	// A directory without template.yaml holding unrelated files only.
+	unrelated := filepath.Join(dir, "no-template")
+	if err := os.MkdirAll(unrelated, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(unrelated, "README.md"), []byte("notes"), 0o644); err != nil {
+		t.Fatalf("write unrelated file: %v", err)
+	}
 
-	loader := NewLoader(dir, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	var logs bytes.Buffer
+	loader := NewLoader(dir, slog.New(slog.NewTextHandler(&logs, nil)))
+
 	fns, err := loader.Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if len(fns) != 1 {
-		t.Fatalf("expected 1 app, got %d", len(fns))
+	if len(fns) != 1 || fns[0].Name != "valid" {
+		t.Fatalf("Load = %+v, want only 'valid'", fns)
 	}
-	if fns[0].Name != "valid" {
-		t.Errorf("expected 'valid', got %q", fns[0].Name)
+
+	diag, issues, err := loader.LoadWithDiagnostics()
+	if err != nil {
+		t.Fatalf("load with diagnostics: %v", err)
+	}
+	if len(diag) != 1 || diag[0].Name != "valid" {
+		t.Fatalf("LoadWithDiagnostics = %+v, want only 'valid'", diag)
+	}
+	if len(issues) != 0 {
+		t.Fatalf("issues = %+v, want none for a template-less directory", issues)
+	}
+	if got := logs.String(); strings.Contains(got, "no-template") {
+		t.Fatalf("template-less directory must not be logged, logs = %q", got)
+	}
+}
+
+// TestLoadTemplatePresenceDecidesCandidacy pins that template.yaml presence,
+// not the directory name, decides whether a child is an app candidate: a
+// directory with an invalid name and no template is ignored entirely, while the
+// same invalid name WITH a template is reported as an invalid desired
+// definition.
+func TestLoadTemplatePresenceDecidesCandidacy(t *testing.T) {
+	dir := t.TempDir()
+	// Invalid name, no template: not a candidate, so no issue.
+	if err := os.MkdirAll(filepath.Join(dir, "Invalid Name"), 0o755); err != nil {
+		t.Fatalf("mkdir invalid name: %v", err)
+	}
+	// Invalid name, present template: still a candidate with an invalid name.
+	writeTemplate(t, dir, "Also Invalid", "runtime: python3.14\n")
+	writeTemplate(t, dir, "valid", `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      event_name: [MODIFY]
+`)
+
+	var logs bytes.Buffer
+	loader := NewLoader(dir, slog.New(slog.NewTextHandler(&logs, nil)))
+	fns, issues, err := loader.LoadWithDiagnostics()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(fns) != 1 || fns[0].Name != "valid" {
+		t.Fatalf("valid apps = %+v, want only 'valid'", fns)
+	}
+
+	byName := make(map[string]error, len(issues))
+	for _, issue := range issues {
+		byName[issue.Name] = issue.Err
+	}
+	if _, ok := byName["Invalid Name"]; ok {
+		t.Fatalf("template-less invalid-name directory must not be an issue: %+v", issues)
+	}
+	if err, ok := byName["Also Invalid"]; !ok || !errors.Is(err, ErrInvalidPath) {
+		t.Fatalf("issue for template-present invalid name = %v, want ErrInvalidPath", err)
+	}
+	if len(issues) != 1 {
+		t.Fatalf("issues = %+v, want only the template-present invalid name", issues)
+	}
+	if got := logs.String(); strings.Contains(got, "Invalid Name") {
+		t.Fatalf("template-less directory must not be logged, logs = %q", got)
 	}
 }
 
@@ -359,10 +429,11 @@ events:
 }
 
 // TestLoadWithDiagnosticsReportsPresentInvalidEntries pins the loader diagnostic
-// seam: each PRESENT entry that cannot be loaded is reported exactly once as a
-// LoadIssue (invalid template, missing template, invalid name), valid apps
-// are still returned, and a directory that vanished between the read and the
-// load is NOT reported (a removal, not an invalid desired definition).
+// seam: each PRESENT app candidate that cannot be loaded is reported exactly
+// once as a LoadIssue (invalid template, invalid name), valid apps are still
+// returned, a template-less directory is not a candidate (no issue), and a
+// directory that vanished between the read and the load is NOT reported (a
+// removal, not an invalid desired definition).
 func TestLoadWithDiagnosticsReportsPresentInvalidEntries(t *testing.T) {
 	dir := t.TempDir()
 	writeTemplate(t, dir, "good", `
@@ -381,11 +452,12 @@ events:
       event_name: [MODIFY]
 `)
 	writeTemplate(t, dir, "bad-name", "runtime: python3.14\n")
-	// A directory with no template.yaml: present, but not an invalid definition
-	// (it may be mid-copy), so it is reported as an issue without being treated
-	// as loadable.
-	if err := os.MkdirAll(filepath.Join(dir, "no-template"), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
+	// Directories without template.yaml: not app candidates, so no issue even
+	// when the name itself would be invalid.
+	for _, name := range []string{"no-template", "Invalid No Template"} {
+		if err := os.MkdirAll(filepath.Join(dir, name), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", name, err)
+		}
 	}
 
 	loader := NewLoader(dir, slog.New(slog.NewTextHandler(os.Stderr, nil)))
@@ -404,13 +476,18 @@ events:
 		}
 		byName[issue.Name] = issue.Err
 	}
-	for _, name := range []string{"bad-yaml", "bad-runtime", "bad-name", "no-template"} {
+	for _, name := range []string{"bad-yaml", "bad-runtime", "bad-name"} {
 		if _, ok := byName[name]; !ok {
 			t.Errorf("missing issue for present entry %q (issues: %v)", name, byName)
 		}
 	}
-	if len(issues) != 4 {
-		t.Fatalf("issues = %d, want 4 (one per present invalid/incomplete entry)", len(issues))
+	for _, name := range []string{"no-template", "Invalid No Template"} {
+		if _, ok := byName[name]; ok {
+			t.Errorf("template-less directory %q must not be reported as an issue", name)
+		}
+	}
+	if len(issues) != 3 {
+		t.Fatalf("issues = %d, want 3 (one per present app candidate)", len(issues))
 	}
 }
 
@@ -429,14 +506,13 @@ func TestLoadWithDiagnosticsRootReadErrorIsFatal(t *testing.T) {
 }
 
 // TestLoadWithDiagnosticsLogsInvalidEntries pins that the diagnostic variant
-// logs exactly like Load always has: a present-but-invalid entry is warned
-// about, while an entry without a template.yaml (ErrNotReady) stays silent
-// because it is not invalid, merely mid-copy. Without this, swapping the worker
-// to LoadWithDiagnostics would silently drop startup diagnostics.
+// logs exactly like Load always has: a present-but-invalid app candidate is
+// warned about, while a directory without template.yaml is not a candidate and
+// is neither reported nor logged.
 func TestLoadWithDiagnosticsLogsInvalidEntries(t *testing.T) {
 	dir := t.TempDir()
 	writeTemplate(t, dir, "bad-yaml", "events: [unclosed")
-	// Present but not ready: must be reported as an issue yet never logged.
+	// Present but not an app candidate: no issue and no log.
 	if err := os.MkdirAll(filepath.Join(dir, "no-template"), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -447,8 +523,8 @@ func TestLoadWithDiagnosticsLogsInvalidEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if len(issues) != 2 {
-		t.Fatalf("issues = %+v, want one invalid and one not-ready", issues)
+	if len(issues) != 1 || issues[0].Name != "bad-yaml" {
+		t.Fatalf("issues = %+v, want only the invalid template", issues)
 	}
 
 	logs := buf.String()
@@ -456,7 +532,7 @@ func TestLoadWithDiagnosticsLogsInvalidEntries(t *testing.T) {
 		t.Fatalf("invalid entry must be logged, logs = %q", logs)
 	}
 	if strings.Contains(logs, "no-template") {
-		t.Fatalf("ErrNotReady must stay silent, logs = %q", logs)
+		t.Fatalf("template-less directory must stay silent, logs = %q", logs)
 	}
 }
 
@@ -532,6 +608,32 @@ events:
 	}
 	if fns[0].Name != "good" {
 		t.Errorf("expected 'good', got %q", fns[0].Name)
+	}
+}
+
+// TestHasTemplateReportsPresence pins the candidacy predicate used by the
+// reconciler and startup prune: only entry presence matters, never parseability,
+// so a malformed template is still a present candidate and an empty directory
+// is not.
+func TestHasTemplateReportsPresence(t *testing.T) {
+	dir := t.TempDir()
+
+	present, err := HasTemplate(dir)
+	if err != nil || present {
+		t.Fatalf("HasTemplate(empty dir) = (%v, %v), want (false, nil)", present, err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, TemplateFile), []byte("not: [valid: yaml"), 0o644); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+	present, err = HasTemplate(dir)
+	if err != nil || !present {
+		t.Fatalf("HasTemplate(malformed template) = (%v, %v), want (true, nil)", present, err)
+	}
+
+	present, err = HasTemplate(filepath.Join(dir, "absent"))
+	if err != nil || present {
+		t.Fatalf("HasTemplate(absent dir) = (%v, %v), want (false, nil)", present, err)
 	}
 }
 

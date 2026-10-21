@@ -91,6 +91,69 @@ func TestLoaderIgnoresStagingDirAtStartup(t *testing.T) {
 	}
 }
 
+// TestPersistStartupDiscoveryTemplateLessDirLeavesNoState pins that a fresh
+// directory without template.yaml is not an app candidate: the startup phase
+// writes no apps row, no app_stats, and no transition token for it.
+func TestPersistStartupDiscoveryTemplateLessDirLeavesNoState(t *testing.T) {
+	st := openTempState(t)
+	root := t.TempDir()
+	draftDir := filepath.Join(root, "draft")
+	if err := os.MkdirAll(draftDir, 0o755); err != nil {
+		t.Fatalf("mkdir draft: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(draftDir, "README.md"), []byte("notes"), 0o644); err != nil {
+		t.Fatalf("write unrelated file: %v", err)
+	}
+
+	tokens, err := persistStartupDiscovery(context.Background(), st, root, nil, nil, discardLogger())
+	if err != nil {
+		t.Fatalf("persistStartupDiscovery: %v", err)
+	}
+
+	if len(tokens) != 0 {
+		t.Fatalf("tokens = %v, want none for a template-less directory", tokens)
+	}
+	if _, ok := st.GetApp("draft"); ok {
+		t.Fatal("a template-less directory must not create an apps row")
+	}
+	if _, ok := st.AppStats("draft"); ok {
+		t.Fatal("a template-less directory must not create app_stats")
+	}
+}
+
+// TestPersistStartupDiscoveryPrunesTemplateLessKnownApp pins the startup prune
+// boundary: a persisted app whose directory still exists but no longer has
+// template.yaml is removed from apps and app_stats, and its stale transition
+// token is never returned to the caller.
+func TestPersistStartupDiscoveryPrunesTemplateLessKnownApp(t *testing.T) {
+	st := openTempState(t)
+	root := t.TempDir()
+
+	appDir := filepath.Join(root, "draft")
+	known := stateApp("draft", appDir)
+	recordSuccess(t, st, known, "img-draft", "fp-draft", time.Now())
+	st.RecordAppStats(state.AppStats{App: "draft", EventsMatchedTotal: 4})
+
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatalf("mkdir draft: %v", err)
+	}
+
+	tokens, err := persistStartupDiscovery(context.Background(), st, root, nil, nil, discardLogger())
+	if err != nil {
+		t.Fatalf("persistStartupDiscovery: %v", err)
+	}
+
+	if _, ok := st.GetApp("draft"); ok {
+		t.Fatal("an app directory without template.yaml must be pruned at startup")
+	}
+	if _, ok := st.AppStats("draft"); ok {
+		t.Fatal("a template-less app's app_stats must be pruned at startup")
+	}
+	if _, ok := tokens["draft"]; ok {
+		t.Fatal("a pruned app must not surface a transition token")
+	}
+}
+
 // TestPersistStartupDiscoveryRecordsInvalidPresent pins the worker startup state
 // phase: valid discovery persists as before, and each PRESENT-but-invalid desired
 // definition from the loader diagnostics is persisted as an invalid view
@@ -100,12 +163,17 @@ func TestPersistStartupDiscoveryRecordsInvalidPresent(t *testing.T) {
 	st := openTempState(t)
 	root := t.TempDir()
 
-	// Both apps (and their directories) are present on disk, so prune must
-	// not remove them; only their desired definitions differ in validity, and a
-	// fresh invalid name is present but has no prior row.
-	for _, name := range []string{"prior", "now-invalid", "brand-new-bad"} {
-		if err := os.MkdirAll(filepath.Join(root, name), 0o755); err != nil {
+	// Both invalid apps (and their directories) are present on disk with a
+	// malformed template.yaml, so prune must not remove them; only their desired
+	// definitions are invalid, and a fresh invalid name has no prior row.
+	writeWorkerApp(t, root, "prior", "def handler(e): return 1\n")
+	for _, name := range []string{"now-invalid", "brand-new-bad"} {
+		dir := filepath.Join(root, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("runtime: python9.9\n"), 0o644); err != nil {
+			t.Fatalf("write %s template: %v", name, err)
 		}
 	}
 
@@ -118,8 +186,8 @@ func TestPersistStartupDiscoveryRecordsInvalidPresent(t *testing.T) {
 
 	discovered := []state.DiscoveredApp{{App: prior, Fingerprint: "fp-prior-next"}}
 	issues := []app.LoadIssue{
-		{Name: "now-invalid", Err: errors.New("function \"now-invalid\": template must contain at least one event rule or one service")},
-		{Name: "brand-new-bad", Err: errors.New("function \"brand-new-bad\": read template: no such file")},
+		{Name: "now-invalid", Err: errors.New(`function "now-invalid": unknown runtime "python9.9"`)},
+		{Name: "brand-new-bad", Err: errors.New(`function "brand-new-bad": unknown runtime "python9.9"`)},
 	}
 
 	if _, err := persistStartupDiscovery(context.Background(), st, root, discovered, issues, discardLogger()); err != nil {
@@ -219,12 +287,16 @@ func TestPersistStartupDiscoveryInvalidAbsentFromRegistrySet(t *testing.T) {
 func TestPersistStartupDiscoveryInvalidImageRetainedInKeepSet(t *testing.T) {
 	st := openTempState(t)
 	root := t.TempDir()
-	// The app is PRESENT on disk (just invalid), so prune keeps its row and
-	// its recorded active image.
-	if err := os.MkdirAll(filepath.Join(root, "now-invalid"), 0o755); err != nil {
+	// The app is PRESENT on disk with a malformed template, so prune keeps its
+	// row and its recorded active image.
+	invalidDir := filepath.Join(root, "now-invalid")
+	if err := os.MkdirAll(invalidDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	invalid := stateApp("now-invalid", filepath.Join(root, "now-invalid"))
+	if err := os.WriteFile(filepath.Join(invalidDir, "template.yaml"), []byte("runtime: python9.9\n"), 0o644); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+	invalid := stateApp("now-invalid", invalidDir)
 	recordSuccess(t, st, invalid, "relay-app-now-invalid:deadbeef", "fp", time.Time{}.Add(time.Hour))
 
 	issues := []app.LoadIssue{{Name: "now-invalid", Err: errors.New("function \"now-invalid\": invalid template")}}
@@ -251,9 +323,13 @@ func TestPersistStartupDiscoveryPrunesRemovedNotInvalid(t *testing.T) {
 	recordSuccess(t, st, removed, "img-removed", "fp", time.Now())
 	recordSuccess(t, st, present, "img-present", "fp", time.Now())
 
-	// Create only the present directory on disk.
+	// Create only the present directory on disk, with a malformed template so it
+	// remains a candidate (and therefore an invalid desired definition).
 	if err := os.MkdirAll(filepath.Join(root, "present"), 0o755); err != nil {
 		t.Fatalf("mkdir present: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "present", "template.yaml"), []byte("runtime: python9.9\n"), 0o644); err != nil {
+		t.Fatalf("write present template: %v", err)
 	}
 
 	issues := []app.LoadIssue{{Name: "present", Err: errors.New("present invalid")}}

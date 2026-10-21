@@ -169,40 +169,39 @@ func TestReconcileInvalidTemplateKeepsOld(t *testing.T) {
 	}
 }
 
-// A dir gone entirely is removed, but a dir that only lacks a template
-// (mid-copy) is left alone.
-func TestReconcileMissingDirsRetainsActive(t *testing.T) {
+// TestReconcileMissingCandidatePathsRemoveKnownApps pins removal semantics for
+// both ways an app stops being a candidate: the directory is gone entirely, or
+// the directory remains but template.yaml was removed (or renamed away). A
+// known app follows the normal removal path instead of invalid-desired
+// retention.
+func TestReconcileMissingCandidatePathsRemoveKnownApps(t *testing.T) {
 	root := t.TempDir()
-	dir := writeFnDir(t, root, "tobe-removed")
+	goneDir := writeFnDir(t, root, "tobe-removed")
+	emptyDir := writeFnDir(t, root, "template-gone")
 
-	fn := initialFn("tobe-removed", dir)
+	gone := initialFn("tobe-removed", goneDir)
+	empty := initialFn("template-gone", emptyDir)
 	b := &fakeBuilder{}
-	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
+	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{gone, empty}, nil)
 
-	// Remove the whole directory -> app dropped.
-	if err := os.RemoveAll(dir); err != nil {
+	if err := os.RemoveAll(goneDir); err != nil {
 		t.Fatalf("removeall: %v", err)
 	}
+	if err := os.Remove(filepath.Join(emptyDir, "template.yaml")); err != nil {
+		t.Fatalf("remove template: %v", err)
+	}
+
 	r.reconcileApp("tobe-removed")
+	r.reconcileApp("template-gone")
+
 	if reg.GetByName("tobe-removed") != nil {
-		t.Fatal("removed dir should drop the function from the registry")
+		t.Fatal("a vanished directory must remove the app from the registry")
 	}
-
-	// "midcopy" dir exists without template -> must not be dropped nor removed.
-	mid := filepath.Join(root, "midcopy")
-	if err := os.MkdirAll(mid, 0o755); err != nil {
-		t.Fatalf("mkdir midcopy: %v", err)
-	}
-	midFn := initialFn("midcopy", mid)
-	reg.Set([]*runner.PreparedApp{midFn})
-	seedCurrent(r, midFn.App())
-
-	r.reconcileApp("midcopy")
-	if reg.GetByName("midcopy") == nil {
-		t.Fatal("dir without template must not be removed")
+	if reg.GetByName("template-gone") != nil {
+		t.Fatal("a directory without template.yaml must remove the known app")
 	}
 	if b.prepares() != 0 {
-		t.Fatalf("expected no rebuild for dir without template, got %d", b.prepares())
+		t.Fatalf("prepare calls = %d, want 0 (removal never builds)", b.prepares())
 	}
 }
 

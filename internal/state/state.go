@@ -1301,8 +1301,8 @@ func (st *State) RecordReconcileFailure(
 }
 
 // RecordInvalidDesired records that an app's desired definition is present
-// on disk but cannot be loaded or validated (an invalid path, a missing
-// template.yaml, or an invalid/unreadable template). It is the state view of an
+// on disk but cannot be loaded or validated (an invalid path or an
+// invalid/unreadable template). It is the state view of an
 // INVALID desired state, distinct from RecordReconcileFailure, which records a
 // valid desired generation that failed to prepare:
 //
@@ -1538,17 +1538,19 @@ func (st *State) RecordRemoved(
 }
 
 // PruneRemoved removes state rows for every app recorded in the database
-// that no longer exists in dir (the authoritative /apps root), including
-// its app_stats. The filesystem is the source of truth; this only removes
-// rows for apps genuinely absent from disk. Transient stat errors
-// (permissions/I/O) are skipped — a flaky read must not drop an app that is
-// still on disk, mirroring the reconciler's removal tolerance. A row for a
-// Relay-owned staging name (app.IsReservedDir, e.g. git's ".sync-*") is
-// stale debris from a buggy discovery and is removed unconditionally, even if a
-// transient directory of that name happens to exist; no legitimate app name
-// can be reserved. The global single-row stats table is deliberately untouched.
-// It is intended to run at
-// startup, before the fresh registry's counters are seeded from the persisted
+// that is no longer an app candidate in dir (the authoritative /apps root),
+// including its app_stats. A direct child is an app candidate only when it
+// contains template.yaml, so a row is removed when its directory is gone OR the
+// directory exists but has no template.yaml. The filesystem is the source of
+// truth; this only removes rows for names that are no longer app candidates.
+// Transient stat errors (permissions/I/O) are skipped — a flaky read must not
+// drop an app whose template may still be present, mirroring the reconciler's
+// removal tolerance. A row for a Relay-owned staging name (app.IsReservedDir,
+// e.g. git's ".sync-*") is stale debris from a buggy discovery and is removed
+// unconditionally, even if a transient directory of that name happens to exist;
+// no legitimate app name can be reserved. The global single-row stats table is
+// deliberately untouched. It is intended to run at startup, before the fresh
+// registry's counters are seeded from the persisted
 // app_stats (restorePersistedStats), so an app removed while the worker
 // was down is pruned before its stale app_stats row could be re-seeded into
 // metrics.
@@ -1599,10 +1601,15 @@ func (st *State) PruneRemoved(ctx context.Context, dir string) error {
 		// drop a real app.
 		reserved := app.IsReservedDir(name)
 		if !reserved {
-			if _, statErr := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(statErr) {
-				// Any other stat error (permissions/I/O) is skipped: only a
-				// genuine os.IsNotExist means the app was removed from the
-				// filesystem.
+			present, statErr := app.HasTemplate(filepath.Join(dir, name))
+			if statErr != nil {
+				// Any ambiguous stat error (permissions/I/O, or a non-directory
+				// path) is skipped: only a definite "no template.yaml" means the
+				// app is no longer a candidate. A flaky read must never drop a
+				// row whose definition may still be present.
+				continue
+			}
+			if present {
 				continue
 			}
 		}

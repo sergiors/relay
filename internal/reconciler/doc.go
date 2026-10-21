@@ -28,17 +28,26 @@
 //     no-build path, and an unavailable-placeholder reconcile all clear pending
 //     so no removed rule keeps gating events.
 //   - Live/periodic reload applies the SAME discovery path policy as startup
-//     (app.LoadSingle): a legal single-element name and a real direct-child
-//     directory of the root, never a symlink. An invalid path (bad name, symlink
-//     — even to an in-root or outside target, non-directory) RETAINS the
-//     previously-loaded app rather than removing or replacing it; only a
-//     truly missing directory is a removal.
+//     (app.LoadSingle): a legal single-element name, a real direct-child
+//     directory of the root, never a symlink, and a template.yaml present. An
+//     invalid path (bad name, symlink — even to an in-root or outside target,
+//     non-directory) RETAINS the previously-loaded app rather than removing or
+//     replacing it. A truly missing directory is a removal, and so is a known
+//     app whose directory remains but no longer contains template.yaml: a
+//     template-less directory is not an app candidate, so it follows the single
+//     remove lifecycle. An unknown template-less directory (one that was never
+//     an app) is ignored with no warning and no state write.
 //   - Relay-owned transient staging directories (app.IsReservedDir, e.g.
 //     git's ".sync-*" created directly under the apps root during
 //     materialization) are never apps: their events and periodic entries
 //     are filtered before a debounce/reconcile is armed, so a live sync cannot
 //     surface a warning, a state write, or a degraded/unavailable transition for
 //     a directory that is merely mid-copy.
+//   - The watcher arms a per-app debounce only for a directory that currently
+//     has a template.yaml or for a name this worker already knows (registry,
+//     pending rules, or a startup transition token). Unrelated writes in a
+//     never-app directory therefore cause no reconcile churn, while template
+//     creation, deletion, and rename stay responsive.
 //
 // Usage: New, then PrepareWatch (establish change detection synchronously),
 // then Seed each startup app with its already-computed fingerprint, then
@@ -51,10 +60,12 @@
 // state database (a persisted, read-mostly state view) — success, failure
 // (retaining the prior active version), unchanged-skip, removal, and invalid
 // desired definitions. A present-but-invalid desired definition (an invalid
-// path, a missing template, or an invalid template) records a failed view via
+// path or an invalid/unreadable template) records a failed view via
 // State.RecordInvalidDesired while preserving the previous active generation and
 // leaving the runtime registry untouched; it is never treated as a removal. A
-// genuinely missing directory instead removes the entry. The database is never
+// genuinely missing directory, or a known app whose template.yaml disappeared,
+// instead removes the entry through the same lifecycle. A directory that never
+// had a template is not an app and is ignored entirely. The database is never
 // the source of truth: the worker also writes it (startup discovery, the
 // periodic stats flush), and state writes never drive reconcile decisions and
 // never fail the reconcile loop; errors are only logged.

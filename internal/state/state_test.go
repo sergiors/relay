@@ -862,8 +862,12 @@ func TestPruneRemovedSweepsReservedStagingRow(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, ".sync-old"), 0o755); err != nil {
 		t.Fatalf("mkdir stage: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Join(root, "kept"), 0o755); err != nil {
+	keptDir := filepath.Join(root, "kept")
+	if err := os.MkdirAll(keptDir, 0o755); err != nil {
 		t.Fatalf("mkdir kept: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(keptDir, "template.yaml"), []byte(twoHandlerTmpl), 0o644); err != nil {
+		t.Fatalf("write kept template: %v", err)
 	}
 
 	if err := c.PruneRemoved(context.Background(), root); err != nil {
@@ -884,8 +888,9 @@ func TestPruneRemovedSweepsReservedStagingRow(t *testing.T) {
 // TestPruneRemovedDoesNotDropRealHiddenInvalidDir pins that the reservation is
 // narrow: a persisted row for a genuinely invalid user directory (a hidden name
 // that merely looks similar) is NOT unconditionally pruned by the reserved
-// branch; it is pruned only by the normal filesystem rule (dir absent). Here the
-// directory exists, so the row survives.
+// branch. It is kept while template.yaml is PRESENT (an invalid desired
+// definition still exists on disk) and pruned by the normal candidate rule once
+// the template disappears.
 func TestPruneRemovedDoesNotDropRealHiddenInvalidDir(t *testing.T) {
 	c := openTestState(t)
 
@@ -894,8 +899,12 @@ func TestPruneRemovedDoesNotDropRealHiddenInvalidDir(t *testing.T) {
 	}
 
 	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, ".hidden"), 0o755); err != nil {
+	hiddenDir := filepath.Join(root, ".hidden")
+	if err := os.MkdirAll(hiddenDir, 0o755); err != nil {
 		t.Fatalf("mkdir hidden: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(hiddenDir, "template.yaml"), []byte("runtime: python9.9\n"), 0o644); err != nil {
+		t.Fatalf("write hidden template: %v", err)
 	}
 
 	if err := c.PruneRemoved(context.Background(), root); err != nil {
@@ -903,7 +912,19 @@ func TestPruneRemovedDoesNotDropRealHiddenInvalidDir(t *testing.T) {
 	}
 
 	if _, ok := c.GetApp(".hidden"); !ok {
-		t.Fatal("a non-reserved hidden directory present on disk must not be pruned as reserved")
+		t.Fatal("a non-reserved hidden directory with a present template must not be pruned as reserved")
+	}
+
+	// The candidate contract decides removal: without template.yaml the row is
+	// no longer backed by an app definition, even for an invalid name.
+	if err := os.Remove(filepath.Join(hiddenDir, "template.yaml")); err != nil {
+		t.Fatalf("remove hidden template: %v", err)
+	}
+	if err := c.PruneRemoved(context.Background(), root); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
+	if _, ok := c.GetApp(".hidden"); ok {
+		t.Fatal("a template-less directory must be pruned by the normal candidate rule")
 	}
 }
 
@@ -932,11 +953,15 @@ func TestPruneRemovedSweepsStaleApps(t *testing.T) {
 	want := Stats{EventsMatchedTotal: 55}
 	c.RecordStats(want)
 
-	// Real roots: create "kept", leave "gone" out, plus a stray non-app
-	// file to confirm only dirs matter.
+	// Real roots: create "kept" with a template, leave "gone" out, plus a stray
+	// non-app file to confirm only candidates matter.
 	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "kept"), 0o755); err != nil {
+	keptDir := filepath.Join(root, "kept")
+	if err := os.MkdirAll(keptDir, 0o755); err != nil {
 		t.Fatalf("mkdir kept: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(keptDir, "template.yaml"), []byte(twoHandlerTmpl), 0o644); err != nil {
+		t.Fatalf("write kept template: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "notes.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatalf("write stray: %v", err)
@@ -973,6 +998,70 @@ func TestPruneRemovedSweepsStaleApps(t *testing.T) {
 	}
 }
 
+// TestPruneRemovedSweepsTemplateLessDirectory pins the candidate-based startup
+// prune: a recorded app whose directory still exists but has no template.yaml is
+// no longer an app, so its apps row and app_stats are removed even though the
+// path itself was not deleted.
+func TestPruneRemovedSweepsTemplateLessDirectory(t *testing.T) {
+	c := openTestState(t)
+	tmpl := mustTemplate(t, twoHandlerTmpl)
+
+	draft := fnFor(t, "draft", tmpl)
+	draftToken := seedToken(t, c, draft)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "draft", "img-draft", "fp-draft", time.Now(), draft, draftToken); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
+	c.RecordAppStats(AppStats{App: "draft", EventsMatchedTotal: 4})
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "draft"), 0o755); err != nil {
+		t.Fatalf("mkdir draft: %v", err)
+	}
+
+	if err := c.PruneRemoved(context.Background(), root); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
+
+	if _, ok := c.GetApp("draft"); ok {
+		t.Fatal("an app directory without template.yaml must be pruned")
+	}
+	if _, ok := c.AppStats("draft"); ok {
+		t.Fatal("a template-less app's app_stats must be pruned too")
+	}
+}
+
+// TestPruneRemovedKeepsTemplatePresentInvalidRow pins that invalidity is not
+// absence: a directory whose template.yaml is PRESENT but malformed remains a
+// desired app candidate, so its persisted invalid view survives the startup
+// prune.
+func TestPruneRemovedKeepsTemplatePresentInvalidRow(t *testing.T) {
+	c := openTestState(t)
+	if _, err := c.RecordInvalidDesired(context.Background(), "broken", &boomErr{}); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
+
+	root := t.TempDir()
+	brokenDir := filepath.Join(root, "broken")
+	if err := os.MkdirAll(brokenDir, 0o755); err != nil {
+		t.Fatalf("mkdir broken: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(brokenDir, "template.yaml"), []byte("not: [valid: yaml"), 0o644); err != nil {
+		t.Fatalf("write broken template: %v", err)
+	}
+
+	if err := c.PruneRemoved(context.Background(), root); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
+
+	got, ok := c.GetApp("broken")
+	if !ok {
+		t.Fatal("a present malformed template must keep its invalid desired row")
+	}
+	if got.Status != StatusUnavailable || got.LastError == "" {
+		t.Fatalf("broken = %+v, want unavailable with an error", got)
+	}
+}
+
 // PruneRemoved is a no-op when the DB is empty and never drops an app that
 // still exists on disk even if its state row predates the disk contents.
 func TestPruneRemovedEmptyDBAndMissingDirName(t *testing.T) {
@@ -986,8 +1075,12 @@ func TestPruneRemovedEmptyDBAndMissingDirName(t *testing.T) {
 	if _, err := c.RecordDiscovered(context.Background(), fnFor(t, "demo", tmpl)); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Join(root, "demo"), 0o755); err != nil {
+	demoDir := filepath.Join(root, "demo")
+	if err := os.MkdirAll(demoDir, 0o755); err != nil {
 		t.Fatalf("mkdir demo: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(demoDir, "template.yaml"), []byte(twoHandlerTmpl), 0o644); err != nil {
+		t.Fatalf("write demo template: %v", err)
 	}
 	if err := c.PruneRemoved(context.Background(), root); err != nil {
 		t.Errorf("state write error: %v", err)
@@ -1019,8 +1112,12 @@ func TestPruneRemovedNotResurrectedByDiscovery(t *testing.T) {
 	}
 
 	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "kept"), 0o755); err != nil {
+	keptDir := filepath.Join(root, "kept")
+	if err := os.MkdirAll(keptDir, 0o755); err != nil {
 		t.Fatalf("mkdir kept: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(keptDir, "template.yaml"), []byte(twoHandlerTmpl), 0o644); err != nil {
+		t.Fatalf("write kept template: %v", err)
 	}
 
 	// Worker startup order: prune, then discover the loaded (on-disk) set.

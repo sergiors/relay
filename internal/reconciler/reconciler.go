@@ -464,7 +464,7 @@ func (r *Reconciler) eventLoop() {
 			if ev.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename|fsnotify.Write) == 0 {
 				continue
 			}
-			if name, affected := r.appForPath(ev.Name); affected {
+			if name, affected := r.appForPath(ev.Name); affected && r.shouldEnqueue(name) {
 				r.Enqueue(name)
 			}
 			// Maintain watches on created/renamed directories (recursive watch).
@@ -506,6 +506,33 @@ func (r *Reconciler) appForPath(path string) (string, bool) {
 		return "", false
 	}
 	return name, true
+}
+
+// shouldEnqueue reports whether an event for name is worth a debounced reconcile:
+// the directory currently has a template.yaml (a creation or edit), or the name
+// is already known locally (so a template deletion/rename is observed as a
+// removal). A directory that has never been an app and still has no template
+// never arms a timer, so writes to unrelated files there (a README, say) cannot
+// cause reconcile churn.
+func (r *Reconciler) shouldEnqueue(name string) bool {
+	if present, err := app.HasTemplate(filepath.Join(r.root, name)); err == nil && present {
+		return true
+	}
+	return r.knownLocally(name)
+}
+
+// knownLocally reports whether this Reconciler already holds state for name: an
+// active or pending registry entry, or a transition token from startup
+// discovery/invalid persistence. It deliberately consults no database:
+// PostgreSQL is a view and must never decide whether an app is removed.
+func (r *Reconciler) knownLocally(name string) bool {
+	if r.reg != nil && (r.reg.GetByName(name) != nil || r.reg.HasPending(name)) {
+		return true
+	}
+	r.mu.Lock()
+	_, ok := r.stateTokens[name]
+	r.mu.Unlock()
+	return ok
 }
 
 // rootChildName returns the first path segment of p relative to the apps
@@ -597,10 +624,13 @@ func (r *Reconciler) removeWatchRecursive(path string) {
 	}
 }
 
-// reconcileAll discovers current child dirs and reconciles each, so periodic
-// checks also handle removal (a dir present in the registry but gone from disk)
-// and retry previously failed builds. Each discovered app is dispatched
-// through the same single pump so reconciles stay serialized per app.
+// reconcileAll discovers current app candidates and reconciles each, so periodic
+// checks also handle removal (a name present in the registry/state tokens but no
+// longer an app candidate on disk) and retry previously failed builds. A direct
+// child directory is a candidate only when template.yaml is present; a
+// template-less directory is not an app and is handled by the missing-name sweep
+// when it was previously known. Each candidate is dispatched through the same
+// single pump so reconciles stay serialized per app.
 func (r *Reconciler) reconcileAll() {
 	seen := map[string]bool{}
 	entries, err := os.ReadDir(r.root)
@@ -616,30 +646,51 @@ func (r *Reconciler) reconcileAll() {
 		if !e.IsDir() {
 			continue
 		}
-		if app.IsReservedDir(e.Name()) {
+		name := e.Name()
+		if app.IsReservedDir(name) {
 			// A Relay-owned transient staging directory (git's ".sync-*") is
 			// never an app and never a desired definition: it is neither
 			// dispatched for reconcile nor recorded as seen, so it cannot
 			// produce a warning or an invalid state row while it briefly exists.
 			continue
 		}
-		seen[e.Name()] = true
-		r.dispatch(e.Name())
+		present, statErr := app.HasTemplate(filepath.Join(r.root, name))
+		if statErr != nil {
+			// An ambiguous template stat is not proof of removal. Keep the name
+			// seen and let the normal load classify it (a flaky read is recorded
+			// as an invalid desired state and retains the active generation)
+			// instead of dispatching it through the removal sweep.
+			seen[name] = true
+			r.dispatch(name)
+			continue
+		}
+		if !present {
+			// No template.yaml: not an app candidate. A previously-known name is
+			// dispatched by missingNames as a removal.
+			continue
+		}
+		seen[name] = true
+		r.dispatch(name)
 	}
-	// Apps still registered but no longer on disk were removed. A brand-new app
-	// whose first preparation has not yet completed exists ONLY as a pending
-	// desired entry (nothing is published as active until the build succeeds),
-	// so PendingNames must be swept too: otherwise a directory that vanishes
-	// during preparation would leave a stale pending entry gating events
-	// forever.
+	// Apps still registered, pending, or carrying a transition token but no
+	// longer candidates on disk were removed. A brand-new app whose first
+	// preparation has not yet completed exists ONLY as a pending desired entry
+	// (nothing is published as active until the build succeeds), so PendingNames
+	// must be swept too: otherwise a directory that vanishes during preparation
+	// would leave a stale pending entry gating events forever. State tokens cover
+	// a name that only ever had a startup invalid-desired row and therefore never
+	// entered the registry.
 	for _, name := range r.missingNames(seen) {
 		r.dispatch(name)
 	}
 }
 
-// missingNames returns the registered names (active and pending-only) that are
-// NOT present on disk, so reconcileAll dispatches them for removal. An app that
-// is BOTH active and pending (an available generation being rebuilt) is returned
+// missingNames returns the locally-known names (active, pending-only, or
+// carrying a startup transition token) that are NOT app candidates on disk, so
+// reconcileAll dispatches them for removal. State tokens are included so a name
+// that only ever had a startup invalid-desired row — and therefore never entered
+// the registry — is still removed once its definition disappears. An app that is
+// BOTH active and pending (an available generation being rebuilt) is returned
 // once.
 func (r *Reconciler) missingNames(seen map[string]bool) []string {
 	var out []string
@@ -655,6 +706,15 @@ func (r *Reconciler) missingNames(seen map[string]bool) []string {
 		add(name)
 	}
 	for _, name := range r.reg.PendingNames() {
+		add(name)
+	}
+	r.mu.Lock()
+	tokenNames := make([]string, 0, len(r.stateTokens))
+	for name := range r.stateTokens {
+		tokenNames = append(tokenNames, name)
+	}
+	r.mu.Unlock()
+	for _, name := range tokenNames {
 		add(name)
 	}
 	return out
@@ -677,9 +737,9 @@ func (r *Reconciler) reconcileApp(name string) {
 	// single-element name, a real direct child of the root, never a symlink), so
 	// a reload can never read, fingerprint, or build a path the startup loader
 	// would have rejected. A missing directory wraps fs.ErrNotExist (a removal);
-	// an invalid path is ErrInvalidPath and RETAINS the previously-loaded
-	// version rather than letting an invalid path remove or replace a healthy
-	// app.
+	// a directory without template.yaml is ErrNotReady (not an app candidate); an
+	// invalid path is ErrInvalidPath and RETAINS the previously-loaded version
+	// rather than letting an invalid path remove or replace a healthy app.
 	fn, err := app.LoadSingle(r.root, name)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -688,24 +748,25 @@ func (r *Reconciler) reconcileApp(name string) {
 			r.remove(name)
 			return
 		}
-		// Every other load failure (not-ready/mid-copy, invalid path, flaky read,
-		// unreadable/invalid template) means the desired definition is not a
-		// valid generation to prepare, so no desired pending rules are
-		// manufactured. Any stale pending entry from a previous, now-invalid
-		// desired state is cleared so removed rules cannot keep gating events;
-		// the previously-active generation (if any) is retained exactly as
-		// today.
-		r.reg.ClearPending(name)
 		if errors.Is(err, app.ErrNotReady) {
-			// Directory exists but template isn't there yet (mid-copy); wait for
-			// more events rather than dropping a previously-active app. The
-			// desired definition is present but not yet loadable, so record the
-			// invalid/failed view (retaining any active generation) while the
-			// runtime registry is untouched: a mid-copy never removes a healthy
-			// app.
-			r.recordInvalidDesired(name, err)
+			// The directory has no template.yaml, so it is not an app candidate.
+			// If this Reconciler already knows the name (an active/pending
+			// registry entry, or a startup transition token for an invalid row),
+			// losing its template is a normal removal. A never-app directory
+			// holding only unrelated files is a no-op: no warning, no invalid
+			// state write, no generation churn.
+			if r.knownLocally(name) {
+				r.remove(name)
+			}
 			return
 		}
+		// Every other load failure (invalid path, flaky read, unreadable/invalid
+		// template) means the desired definition is not a valid generation to
+		// prepare, so no desired pending rules are manufactured. Any stale
+		// pending entry from a previous, now-invalid desired state is cleared so
+		// removed rules cannot keep gating events; the previously-active
+		// generation (if any) is retained exactly as today.
+		r.reg.ClearPending(name)
 		if errors.Is(err, app.ErrInvalidPath) {
 			// An invalid path (bad name, symlink, non-directory, not a direct
 			// child) can never be an app; retain any previously-loaded
@@ -1112,8 +1173,9 @@ func (r *Reconciler) prepareContext(
 // the state view (degraded with a retained active generation, or unavailable
 // without one) while leaving the runtime registry untouched. It is the shared
 // seam for every reconcileApp failure that is NOT a removal and NOT a valid
-// desired generation that failed to build: ErrNotReady (mid-copy),
-// ErrInvalidPath, a flaky read/stat, and a fingerprint error. State is a view
+// desired generation that failed to build: ErrInvalidPath, a flaky read/stat,
+// and a fingerprint error. A directory without template.yaml is not an app
+// candidate and follows the removal/no-op path instead. State is a view
 // only — the previously-loaded version stays served — so an operator sees the
 // failed desired state instead of a stale ready row. When no state sink is wired
 // it is a no-op.

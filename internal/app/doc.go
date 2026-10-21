@@ -1,19 +1,22 @@
 // Package app is the pure decision layer for Relay apps.
 //
 // This package reads the /apps root and models what the runtime needs:
-//   - Discovery: each direct subdirectory is an app with a template.yaml.
-//     Relay-owned transient staging directories (IsReservedDir, git's ".sync-"
-//     created directly under the root during materialization) are ignored
-//     entirely: never an app, never an invalid desired definition, never
-//     logged — so a live sync cannot surface a spurious invalid/unavailable
-//     state.
+//   - Discovery: a direct subdirectory is an app candidate only when it
+//     contains template.yaml (TemplateFile). A directory without it is not an
+//     app — even if it holds unrelated files — so discovery skips it, and live
+//     reload treats a name that previously was an app as removed. Relay-owned
+//     transient staging directories (IsReservedDir, git's ".sync-" created
+//     directly under the root during materialization) are ignored entirely:
+//     never an app, never an invalid desired definition, never logged — so a
+//     live sync cannot surface a spurious invalid/unavailable state.
 //   - Validation: templates are parsed and validated, including per-rule
 //     timeout resolution and handler form. Loader.LoadWithDiagnostics surfaces
-//     each PRESENT entry that cannot be loaded (invalid path, missing/invalid
-//     template) so a caller can record the invalid desired state instead of
-//     silently leaving a stale view; Load keeps its historical skip-and-log
-//     behavior. A directory that vanished is a removal, never an invalid
-//     definition.
+//     each PRESENT app candidate that cannot be loaded (invalid path,
+//     invalid/unreadable template) so a caller can record the invalid desired
+//     state instead of silently leaving a stale view; Load keeps its historical
+//     skip-and-log behavior. A directory without template.yaml is not a
+//     candidate and is never reported, and a directory that vanished is a
+//     removal, never an invalid definition.
 //   - Model: rules pair handlers with patterns. This package owns the
 //     declarative model (Template/EventRule/Pattern and the parser that
 //     produces them); the matching behavior that evaluates events against a

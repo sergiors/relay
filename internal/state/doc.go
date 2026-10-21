@@ -37,13 +37,15 @@
 //     failure while PRESERVING both the active generation and the desired
 //     fingerprint (the failed generation is still the desired one, so a later
 //     pass retries it).
-//   - An INVALID desired definition (RecordInvalidDesired: an invalid path, a
-//     missing template.yaml, an invalid/unreadable template) records a failure
-//     while preserving only the active generation: the definition cannot be
-//     parsed, so there is no trustworthy desired fingerprint or template-derived
-//     configuration, and those fields are cleared. This applies equally to
-//     startup discovery (the loader reports present-but-invalid entries) and the
-//     live reconciler.
+//   - An INVALID desired definition (RecordInvalidDesired: an invalid path, an
+//     invalid/unreadable template) records a failure while preserving only the
+//     active generation: the definition cannot be parsed, so there is no
+//     trustworthy desired fingerprint or template-derived configuration, and
+//     those fields are cleared. This applies equally to startup discovery (the
+//     loader reports present-but-invalid entries) and the live reconciler. A
+//     directory without template.yaml is not an app candidate at all: it is
+//     never recorded as invalid, and a known app that loses its template is
+//     removed (startup pruning and live removal share that rule).
 //
 // In both cases a failure never reports "ready": degraded when a usable active
 // generation exists, unavailable otherwise. All timestamps are RFC3339 strings.

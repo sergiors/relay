@@ -5,43 +5,59 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"relay/internal/app"
 )
 
-// TestLiveAppNamesProtectsPresentInvalidAndNotReady pins the startup
-// service-orphan sweep's present-app set: an app that loaded, an app whose
-// template the loader rejected, and an app whose directory is present but not
-// ready (missing template.yaml) are all apps on disk, so their service
-// containers must be preserved. A name in neither the loaded set nor the
-// diagnostics is a directory that vanished while Relay was down, so its
-// containers are the ones the sweep may remove.
-func TestLiveAppNamesProtectsPresentInvalidAndNotReady(t *testing.T) {
-	apps := []app.App{{Name: "valid-a"}, {Name: "valid-b"}}
-	issues := []app.LoadIssue{
-		{Name: "invalid-template", Err: errors.New("parse template: unknown runtime")},
-		{Name: "not-ready", Err: app.ErrNotReady},
+// TestLiveAppNamesProtectsLoadedAndInvalidCandidates pins the startup
+// service-orphan sweep's present-app set: an app that loaded and an app whose
+// PRESENT template the loader rejected are both apps on disk, so their service
+// containers must be preserved. A directory without template.yaml is not an app
+// candidate and is never a loader issue, so it is sweepable like an app removed
+// while Relay was down.
+func TestLiveAppNamesProtectsLoadedAndInvalidCandidates(t *testing.T) {
+	root := t.TempDir()
+	writeWorkerApp(t, root, "valid", "def handler(e): return 1\n")
+	writeWorkerApp(t, root, "invalid-template", "def handler(e): return 1\n")
+	if err := os.WriteFile(filepath.Join(root, "invalid-template", "template.yaml"), []byte("runtime: python9.9\n"), 0o644); err != nil {
+		t.Fatalf("write invalid template: %v", err)
+	}
+	// Present but never an app candidate.
+	if err := os.MkdirAll(filepath.Join(root, "no-template"), 0o755); err != nil {
+		t.Fatalf("mkdir no-template: %v", err)
+	}
+
+	loader := app.NewLoader(root, discardLogger())
+	apps, issues, err := loader.LoadWithDiagnostics()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(apps) != 1 || apps[0].Name != "valid" {
+		t.Fatalf("loaded apps = %+v, want only valid", apps)
+	}
+	if len(issues) != 1 || issues[0].Name != "invalid-template" {
+		t.Fatalf("issues = %+v, want only invalid-template", issues)
 	}
 
 	got := liveAppNames(apps, issues)
 
-	for _, name := range []string{
-		"valid-a",
-		"valid-b",
-		"invalid-template",
-		"not-ready",
-	} {
+	for _, name := range []string{"valid", "invalid-template"} {
 		if !got[name] {
 			t.Errorf("liveAppNames() omitted present app %q; a present app must be protected from the orphan sweep", name)
 		}
 	}
+	if got["no-template"] {
+		t.Error("liveAppNames() protected a template-less directory; it is not an app")
+	}
 	if got["removed-while-down"] {
 		t.Error("liveAppNames() protected an absent app; a genuinely removed directory must be sweepable")
 	}
-	if len(got) != 4 {
-		t.Fatalf("liveAppNames() = %v, want exactly the four present names", got)
+	if len(got) != 2 {
+		t.Fatalf("liveAppNames() = %v, want exactly valid and invalid-template", got)
 	}
 }
 

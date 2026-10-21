@@ -22,8 +22,9 @@ pattern matching. Services do not use that one-shot message lifecycle.
 Names must match `[a-z0-9][a-z0-9._-]*`, be at most 63 characters, and not end
 in a dot. Validation happens at load time — names are never sanitized — so valid
 names are already safe as image tags. A directory without a `template.yaml` is
-ignored; an invalid name or invalid template is logged and skipped without
-stopping the worker.
+not an app: discovery ignores it (it may hold unrelated files), and if a known
+app loses its template it is removed like any other removed app. An invalid name
+or invalid template is logged and skipped without stopping the worker.
 
 ## Template schema
 

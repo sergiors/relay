@@ -115,6 +115,60 @@ func TestAppForPath(t *testing.T) {
 	}
 }
 
+// TestShouldEnqueueUsesTemplateCandidacy pins the watcher's debounce filter:
+// edits under a directory that has never had template.yaml arm no timer, while
+// creating template.yaml does, and a known app remains responsive to losing its
+// template so the removal is observed. A token-only startup-invalid app is also
+// responsive. Reserved staging paths stay filtered before candidacy is checked.
+func TestShouldEnqueueUsesTemplateCandidacy(t *testing.T) {
+	root := t.TempDir()
+
+	// Never-app directory: unrelated edits are not worth a reconcile.
+	draftDir := filepath.Join(root, "draft")
+	if err := os.MkdirAll(draftDir, 0o755); err != nil {
+		t.Fatalf("mkdir draft: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(draftDir, "README.md"), []byte("notes"), 0o644); err != nil {
+		t.Fatalf("write unrelated file: %v", err)
+	}
+	r := New(Config{Root: root}, nil, nil, testutil.DiscardLogger())
+	if r.shouldEnqueue("draft") {
+		t.Fatal("an unrelated edit under a never-app directory must not enqueue")
+	}
+
+	// Creating the template makes the same name a candidate.
+	if err := os.WriteFile(filepath.Join(draftDir, "template.yaml"), []byte(template), 0o644); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+	if !r.shouldEnqueue("draft") {
+		t.Fatal("creating template.yaml must enqueue the new app")
+	}
+
+	// A known app losing its template still enqueues, so removal is observed.
+	knownDir := writeFnDir(t, root, "known")
+	known := initialFn("known", knownDir)
+	rKnown, _ := newTestReconciler(t, root, &fakeBuilder{}, []*runner.PreparedApp{known}, nil)
+	if err := os.Remove(filepath.Join(knownDir, "template.yaml")); err != nil {
+		t.Fatalf("remove known template: %v", err)
+	}
+	if !rKnown.shouldEnqueue("known") {
+		t.Fatal("a known app's template removal must enqueue its removal")
+	}
+
+	// A token-only known name (startup invalid desired, no registry entry) also
+	// stays responsive.
+	rToken := New(Config{Root: root}, nil, nil, testutil.DiscardLogger())
+	rToken.SeedStateToken("startup-bad", 1)
+	if !rToken.shouldEnqueue("startup-bad") {
+		t.Fatal("a token-only known app must remain responsive to template removal")
+	}
+
+	// Reserved staging paths are filtered before candidacy.
+	if name, ok := r.appForPath(filepath.Join(root, ".sync-1", "template.yaml")); ok {
+		t.Fatalf("reserved staging path mapped to app %q, want filtered", name)
+	}
+}
+
 // TestWatcherAddsNestedDirWatch uses a real fsnotify watcher on a temp dir to
 // verify that creating a nested directory results in a watch that surfaces an
 // event for a file written there later (proving recursive watch maintenance).

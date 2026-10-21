@@ -184,8 +184,11 @@ func copyAppDir(selection *source.Selection, dst, name string) error {
 	}
 
 	target := filepath.Join(dst, name)
-	// A brief absence is acceptable: the reconciler tolerates a missing
-	// template (ErrNotReady) and retried loads.
+	// The old tree is removed before the replacement is renamed into place. The
+	// rename is what keeps that window short, but a reconcile observing it sees
+	// a directory without template.yaml — not an app candidate — and treats a
+	// known app as removed; the renamed tree is then discovered as a new
+	// generation.
 	if _, err := os.Stat(target); err == nil {
 		if err := os.RemoveAll(target); err != nil {
 			return fmt.Errorf("git: remove existing app dir %q: %w", name, err)

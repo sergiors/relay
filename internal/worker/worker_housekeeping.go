@@ -125,13 +125,14 @@ func prepareAndStartApps(
 	// closing state DB and Docker client.
 	//
 	// The service-orphan sweep's present-app set: every VALID loaded app plus
-	// every PRESENT directory the loader diagnosed as invalid or not-ready. A
-	// directory that is present but unloadable (an invalid template, or a
-	// template.yaml not yet copied) is still an app on disk, so its service
-	// containers must never be treated as belonging to an app that was removed
-	// while Relay was down. The loader's diagnostics — not PostgreSQL state —
-	// are the source of truth for what is present. A directory that VANISHED is
-	// not in either set, so its containers are (correctly) swept as orphans.
+	// every PRESENT app candidate the loader diagnosed as invalid. A directory
+	// that is present but unloadable (an invalid/unreadable template) is still an
+	// app on disk, so its service containers must never be treated as belonging
+	// to an app that was removed while Relay was down. A directory without
+	// template.yaml is not an app candidate and is never an issue, so its stale
+	// containers are swept. The loader's diagnostics — not PostgreSQL state — are
+	// the source of truth for what is present. A directory that VANISHED is not
+	// in either set, so its containers are (correctly) swept as orphans.
 	liveNames := liveAppNames(startup.loaded, startup.issues)
 	housekeepingDone := startStartupHousekeeping(
 		lifecycle, logger, startupHousekeeper{

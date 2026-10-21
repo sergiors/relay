@@ -1,6 +1,7 @@
 package reconciler
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -135,38 +136,160 @@ func overDeepPatternTemplate() string {
 	return b.String()
 }
 
-// TestReconcileMissingTemplateRecordsInvalidButRetains pins the mid-copy case: a
-// directory that exists but currently lacks template.yaml is a PRESENT but not
-// yet loadable desired definition. It must not be treated as a removal (the
-// registry entry survives), and its failed view is recorded with the retained
-// active generation.
-func TestReconcileMissingTemplateRecordsInvalidButRetains(t *testing.T) {
+// TestReconcileTemplateRemovalRemovesKnownApp pins that losing template.yaml —
+// whether deleted or renamed away — means a previously-known app is no longer a
+// candidate and follows the normal removal path: active and pending registry
+// entries are dropped, the generation-fenced state row and app_stats are
+// deleted, and the service/schedule hooks converge like any removal.
+func TestReconcileTemplateRemovalRemovesKnownApp(t *testing.T) {
 	root := t.TempDir()
-	dir := writeFnDir(t, root, "midcopy")
+	dir := writeFnDir(t, root, "known")
 
-	fn := initialFn("midcopy", dir)
+	fn := initialFn("known", dir)
+	var events []string
 	b := &fakeBuilder{}
-	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
+	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, func(cfg *Config, _ *state.State) {
+		cfg.RemoveServices = func(name string) {
+			events = append(events, "remove-services "+name)
+		}
+		cfg.RemoveApp = func(name string) {
+			events = append(events, "remove-app "+name)
+		}
+		cfg.UpdateSchedules = func(name string, _ *app.Template) {
+			events = append(events, "update-schedules "+name)
+		}
+	})
 
-	token := recordSuccess(t, st, "midcopy", "img-midcopy", "fp-midcopy", time.Now(), fn.App())
-	r.SeedStateToken("midcopy", token)
-	if err := os.Remove(filepath.Join(dir, "template.yaml")); err != nil {
+	// An in-preparation desired generation and prior activity must be cleaned up
+	// by the same removal.
+	reg.SetPending("known", fn.App())
+	st.RecordAppStats(state.AppStats{App: "known", EventsMatchedTotal: 3})
+
+	if err := os.Rename(filepath.Join(dir, "template.yaml"), filepath.Join(dir, "template.yaml.old")); err != nil {
+		t.Fatalf("rename template: %v", err)
+	}
+	r.reconcileApp("known")
+
+	if pf := reg.GetByName("known"); pf != nil {
+		t.Fatal("an app that lost its template must leave the active registry")
+	}
+	if reg.HasPending("known") {
+		t.Fatal("an app that lost its template must clear its pending desired entry")
+	}
+	if _, ok := st.GetApp("known"); ok {
+		t.Fatal("a removed app's state row must be deleted")
+	}
+	if _, ok := st.AppStats("known"); ok {
+		t.Fatal("a removed app's app_stats must be deleted")
+	}
+	want := []string{"remove-services known", "remove-app known"}
+	if len(events) != len(want) {
+		t.Fatalf("removal hooks = %v, want %v", events, want)
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Fatalf("removal hooks = %v, want %v", events, want)
+		}
+	}
+	if b.prepares() != 0 {
+		t.Fatalf("prepare calls = %d, want 0 (removal never builds)", b.prepares())
+	}
+	r.mu.Lock()
+	_, tokenHeld := r.stateTokens["known"]
+	r.mu.Unlock()
+	if tokenHeld {
+		t.Fatal("removal must forget the app's transition token")
+	}
+}
+
+// TestReconcileUnknownTemplateLessDirIsNoOp pins that a directory that was
+// never an app cannot cause state or registry churn: reconciling it writes no
+// state row, allocates no transition token, and performs no build.
+func TestReconcileUnknownTemplateLessDirIsNoOp(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "unrelated")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir unrelated: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("notes"), 0o644); err != nil {
+		t.Fatalf("write unrelated file: %v", err)
+	}
+
+	b := &fakeBuilder{}
+	r, reg, st := newTestStateReconciler(t, root, b, nil, nil)
+
+	r.reconcileApp("unrelated")
+
+	if pf := reg.GetByName("unrelated"); pf != nil {
+		t.Fatal("a never-app directory must not enter the registry")
+	}
+	if _, ok := st.GetApp("unrelated"); ok {
+		t.Fatal("a never-app directory must not create a state row")
+	}
+	if _, ok := st.AppStats("unrelated"); ok {
+		t.Fatal("a never-app directory must not create app_stats")
+	}
+	if b.prepares() != 0 {
+		t.Fatalf("prepare calls = %d, want 0", b.prepares())
+	}
+	r.mu.Lock()
+	_, tokenHeld := r.stateTokens["unrelated"]
+	r.mu.Unlock()
+	if tokenHeld {
+		t.Fatal("a never-app directory must not allocate a transition token")
+	}
+}
+
+// TestReconcileAllRemovesTokenOnlyTemplateLessApp pins the startup-only case:
+// an app that only ever persisted an invalid desired row (a transition token but
+// no registry entry) is still swept once its directory loses template.yaml, so
+// its stale state cannot outlive the definition.
+func TestReconcileAllRemovesTokenOnlyTemplateLessApp(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "startup-bad")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir startup-bad: %v", err)
+	}
+
+	b := &fakeBuilder{}
+	r, reg, st := newTestStateReconciler(t, root, b, nil, nil)
+	templatePath := filepath.Join(dir, "template.yaml")
+	if err := os.WriteFile(templatePath, []byte("runtime: python9.9\n"), 0o644); err != nil {
+		t.Fatalf("write invalid template: %v", err)
+	}
+	token, err := st.RecordInvalidDesired(context.Background(), "startup-bad", errBoom)
+	if err != nil {
+		t.Fatalf("record invalid desired: %v", err)
+	}
+	if token <= 0 {
+		t.Fatalf("record invalid desired token = %d, want positive", token)
+	}
+	r.SeedStateToken("startup-bad", token)
+	if err := os.Remove(templatePath); err != nil {
 		t.Fatalf("remove template: %v", err)
 	}
-	r.reconcileApp("midcopy")
 
-	if pf := reg.GetByName("midcopy"); pf == nil || pf.Prepared() == nil {
-		t.Fatal("a missing template (mid-copy) must retain the loaded function")
+	go r.pump()
+	r.reconcileAll()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := st.GetApp("startup-bad"); !ok {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	after, ok := st.GetApp("midcopy")
-	if !ok {
-		t.Fatal("midcopy row must survive")
+	if _, ok := st.GetApp("startup-bad"); ok {
+		t.Fatal("a token-only app must be removed when its template is absent")
 	}
-	if after.Status != state.StatusDegraded {
-		t.Fatalf("status = %q, want degraded (retained active generation)", after.Status)
+	if reg.GetByName("startup-bad") != nil {
+		t.Fatal("a token-only app must not remain in the registry")
 	}
-	if after.LastReconcileStatus != state.ReconcileFailed {
-		t.Fatalf("last_reconcile_status = %q, want failed", after.LastReconcileStatus)
+	r.mu.Lock()
+	_, tokenHeld := r.stateTokens["startup-bad"]
+	r.mu.Unlock()
+	if tokenHeld {
+		t.Fatal("removal must forget the token-only app's transition token")
 	}
 }
 
