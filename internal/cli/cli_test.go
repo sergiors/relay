@@ -79,16 +79,17 @@ func runCLIWithLogger(t *testing.T, logger *slog.Logger, stdin string, args ...s
 
 // runCLIWithLoggerAndDeps is the shared implementation behind the runCLI
 // variants: it builds the tree with New (the injected logger, an output buffer,
-// and the supplied deps) and runs it against args. Errors flow into the returned
-// error, never onto the ErrWriter (printing happens in cmd/main.go).
+// and the supplied deps) and runs it against args. The Reader is always an
+// injected strings.Reader, even for empty stdin, so a command never observes
+// the test process's inherited stdin. Terminal behavior is exercised through
+// direct helper calls that provide their own reader. Errors flow into the
+// returned error, never onto the ErrWriter (printing happens in cmd/main.go).
 func runCLIWithLoggerAndDeps(t *testing.T, logger *slog.Logger, deps Dependencies, stdin string, args ...string) (
 	stdout, stderr string, err error) {
 	t.Helper()
 	var out, errOut bytes.Buffer
 	cmd := New(logger, &out, deps)
-	if stdin != "" {
-		cmd.Reader = strings.NewReader(stdin)
-	}
+	cmd.Reader = strings.NewReader(stdin)
 	cmd.ErrWriter = &errOut
 	err = cmd.Run(t.Context(), append([]string{"relay"}, args...))
 	return out.String(), errOut.String(), err

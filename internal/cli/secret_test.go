@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -226,11 +227,10 @@ func TestSecretSetInvalidName(t *testing.T) {
 const pemValue = "-----BEGIN PRIVATE KEY-----\nMIIB\nline2\n\nindented:  value\n-----END PRIVATE KEY-----"
 
 // TestSecretSetMultilineStdin pins that `secret set` reads a whole multiline
-// (PEM-shaped) stdin value, strips exactly one trailing newline and one
-// trailing \r (the terminal-input convention), preserves every internal
-// newline, writes the result atomically with 0600 perms, and never echoes it.
-// readSecretValue's trailing trimming only ever removes ONE trailing \n and ONE
-// trailing \r after it; nothing else is normalized.
+// (PEM-shaped) stdin value, removes exactly one trailing line ending — one CRLF,
+// or else one LF — and preserves every other byte, including leading
+// whitespace, internal newlines, lone CRs, and trailing spaces. The stored
+// result is written atomically with 0600 perms and is never echoed.
 func TestSecretSetMultilineStdin(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -241,11 +241,21 @@ func TestSecretSetMultilineStdin(t *testing.T) {
 		{"pem fixture one trailing newline", pemValue + "\n", pemValue},
 		{"no trailing newline verbatim", "v1\nv2", "v1\nv2"},
 		// Internal \r\n line endings are preserved verbatim; only a trailing
-		// "\r\n" is adjusted (strip one "\n" then one "\r").
+		// CRLF is adjusted.
 		{"internal CRLF preserved", "-----BEGIN-----\r\na\r\n-----END-----", "-----BEGIN-----\r\na\r\n-----END-----"},
+		{"trailing LF stripped", "a\n", "a"},
 		{"trailing CRLF stripped", "a\r\n", "a"},
+		{"lone trailing CR preserved", "a\r", "a\r"},
+		{"only one trailing LF stripped", "a\n\n", "a\n"},
+		{"only one trailing CRLF stripped", "a\r\n\r\n", "a\r\n"},
+		{"leading whitespace preserved", "  abc\n", "  abc"},
+		{"intentional trailing spaces preserved", "abc  \n", "abc  "},
+		{"trailing spaces without newline preserved", "abc  ", "abc  "},
+		{"internal newlines preserved", "v1\nv2\nv3\n", "v1\nv2\nv3"},
 		{"empty value accepted", "", ""},
-		{"only newline becomes empty", "\n", ""},
+		{"only LF becomes empty", "\n", ""},
+		{"only CRLF becomes empty", "\r\n", ""},
+		{"only CR preserved", "\r", "\r"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -277,6 +287,108 @@ func TestSecretSetMultilineStdin(t *testing.T) {
 				t.Fatalf("file mode = %o, want 0600", info.Mode().Perm())
 			}
 		})
+	}
+}
+
+// errReader returns data together with a read error, so the read-failure path
+// can be checked for secret leakage.
+type errReader struct{ data string }
+
+func (r errReader) Read(p []byte) (int, error) {
+	n := copy(p, r.data)
+	return n, errors.New("boom")
+}
+
+// TestSecretSetNeverLeaksValueOnError verifies neither the success output nor a
+// returned error ever contains the secret value, on invalid-name, read-failure,
+// and store-write-failure paths.
+func TestSecretSetNeverLeaksValueOnError(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("invalid name", func(t *testing.T) {
+		store := seedSecretStore(t)
+		const value = "invalid-name-super-secret"
+		var out bytes.Buffer
+		err := secretSetValue(ctx, store, "../etc", strings.NewReader(value+"\n"), &out)
+		if err == nil || !strings.Contains(err.Error(), "invalid secret name") {
+			t.Fatalf("err = %v, want invalid-name error", err)
+		}
+		if out.Len() != 0 {
+			t.Fatalf("output = %q, want empty", out.String())
+		}
+		if strings.Contains(err.Error(), value) {
+			t.Fatal("error leaked the secret value")
+		}
+	})
+
+	t.Run("read failure", func(t *testing.T) {
+		store := seedSecretStore(t)
+		const value = "read-failure-super-secret"
+		var out bytes.Buffer
+		err := secretSetValue(ctx, store, "db", errReader{data: value}, &out)
+		if err == nil || !strings.Contains(err.Error(), "read secret from stdin") {
+			t.Fatalf("err = %v, want read error", err)
+		}
+		if out.Len() != 0 {
+			t.Fatalf("output = %q, want empty", out.String())
+		}
+		if strings.Contains(err.Error(), value) {
+			t.Fatal("error leaked the secret value")
+		}
+	})
+
+	t.Run("store write failure", func(t *testing.T) {
+		// Make the secrets path a regular file, so creating the directory for
+		// the write fails after the value has been read.
+		prev := secretsPath
+		secretsPath = filepath.Join(t.TempDir(), "secrets")
+		t.Cleanup(func() { secretsPath = prev })
+		if err := os.WriteFile(secretsPath, []byte("blocker"), 0o600); err != nil {
+			t.Fatalf("write blocker: %v", err)
+		}
+		store, err := secrets.NewLocal(secretsPath)
+		if err != nil {
+			t.Fatalf("new store: %v", err)
+		}
+
+		const value = "store-failure-super-secret"
+		var out bytes.Buffer
+		err = secretSetValue(ctx, store, "db", strings.NewReader(value+"\n"), &out)
+		if err == nil || !strings.Contains(err.Error(), "create dir") {
+			t.Fatalf("err = %v, want store write error", err)
+		}
+		if out.Len() != 0 {
+			t.Fatalf("output = %q, want empty", out.String())
+		}
+		if strings.Contains(err.Error(), value) {
+			t.Fatal("error leaked the secret value")
+		}
+	})
+}
+
+// TestSecretSetRejectsPositionalValue pins argument safety: a value passed as a
+// positional argument is rejected, never read from stdin, never stored, and
+// never echoed in the output or error.
+func TestSecretSetRejectsPositionalValue(t *testing.T) {
+	store := seedSecretStore(t)
+	const (
+		positional = "positional-super-secret"
+		piped      = "piped-super-secret"
+	)
+	out, _, err := runCLI(t, piped+"\n", "secret", "set", "db", positional)
+	if err == nil || !strings.Contains(err.Error(), "secret set: too many arguments") {
+		t.Fatalf("err = %v, want too-many-arguments error", err)
+	}
+	if out != "" {
+		t.Fatalf("stdout = %q, want empty", out)
+	}
+	for _, value := range []string{positional, piped} {
+		if strings.Contains(err.Error(), value) {
+			t.Fatalf("error leaked %q: %v", value, err)
+		}
+	}
+	if got, err := store.Resolve(context.Background(), "db"); err == nil {
+		t.Fatalf("secret was stored as %q despite the argument error", got)
 	}
 }
 

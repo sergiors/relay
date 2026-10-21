@@ -138,8 +138,8 @@ func secretSetValue(ctx context.Context, store *secrets.LocalStore, name string,
 // readSecretValue reads a secret value from in. When in is a terminal, it
 // prompts and reads a single line with echo disabled (so the value is never
 // shown); otherwise it reads ALL of stdin (the safe non-interactive path, e.g.
-// `printf 'value' | relay secret set foo`). In both cases a single trailing
-// newline is stripped; the stored bytes are otherwise authoritative.
+// `printf 'value' | relay secret set foo`). The stored bytes are authoritative
+// apart from exactly one trailing line ending (see trimSecretLineEnding).
 func readSecretValue(in io.Reader) (string, error) {
 	if f, ok := in.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
 		fmt.Fprint(os.Stderr, "Enter value: ")
@@ -154,12 +154,18 @@ func readSecretValue(in io.Reader) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read secret from stdin: %w", err)
 	}
-	// Strip a single trailing newline (the terminal-input convention), so a
-	// piped `printf 'value\n'` stores "value" exactly like terminal input.
-	s := string(data)
-	s = strings.TrimSuffix(s, "\n")
-	s = strings.TrimSuffix(s, "\r")
-	return s, nil
+	return trimSecretLineEnding(string(data)), nil
+}
+
+// trimSecretLineEnding removes exactly one trailing line ending from a piped
+// secret value: one CRLF, or else one LF. Every other byte is preserved —
+// trailing CR or spaces, leading whitespace, and internal newlines included —
+// so a value that legitimately ends in CR is not silently rewritten.
+func trimSecretLineEnding(s string) string {
+	if trimmed, ok := strings.CutSuffix(s, "\r\n"); ok {
+		return trimmed
+	}
+	return strings.TrimSuffix(s, "\n")
 }
 
 // secretRm removes a secret. A missing secret is an error (exit 1 via main).

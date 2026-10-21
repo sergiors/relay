@@ -412,6 +412,26 @@ relay dlq replay <id>
 relay dlq rm <id>
 ```
 
+Manual invocation takes an inline event or stdin (never an interactive terminal);
+an explicit `--event` takes precedence and stdin is not read. Secrets are read
+from a hidden prompt or stdin, never arguments:
+
+```sh
+relay app invoke user-events-python --event '{"event_name":"INSERT"}'
+relay app invoke user-events-python < event.json
+echo '{"event_name":"INSERT"}' | relay app invoke user-events-python
+
+# -T keeps stdin a pipe instead of an allocated pseudo-TTY.
+docker compose exec -T relay app invoke user-events-python < event.json
+
+echo -n 'value' | relay secret set API_KEY    # bash/zsh
+printf '%s' 'value' | relay secret set API_KEY     # POSIX-portable
+docker compose exec -T relay secret set API_KEY < value.txt
+```
+
+Piped secrets are stored byte-for-byte except for exactly one trailing line
+ending (one `CRLF`, or else one `LF`).
+
 Use:
 
 ```sh

@@ -164,22 +164,34 @@ labels `Message reclaims` and `DLQ entries` mean different things; see
 ### relay app invoke
 
 Runs an app's matching event handlers **synchronously on the running
-worker's live runtime pool**, without publishing to the stream:
+worker's live runtime pool**, without publishing to the stream. Supply the event
+as `--event JSON` or on stdin:
 
 ```sh
 relay app invoke user-events-python --event '{"event_name":"INSERT"}'
-relay app invoke user-events-python --file event.json
+relay app invoke user-events-python < event.json
 echo '{"event_name":"INSERT"}' | relay app invoke user-events-python
 ```
 
-`--event` and `--file` are mutually exclusive; with neither, the event is read
-from stdin when stdin is not an interactive terminal. The payload must be a JSON
-**object** (arrays, scalars, and `null` are rejected). Output is one of:
+`--event` takes precedence: when it is set, stdin is never read, so an explicit
+event cannot block on (or fail because of) an open stdin stream. Stdin is only
+read when `--event` is absent and stdin is not an interactive terminal, so a bare
+`relay app invoke NAME` is a usage error instead of blocking for a typed line.
+The payload must be a JSON **object** (arrays, scalars, and `null` are rejected),
+and malformed JSON is reported as `app invoke: invalid event JSON: ...`. Output
+is one of:
 
 ```
 No matching handlers
 Invoked 1 handler
 Invoked N handlers
+```
+
+Inside Docker, pass `-T` so stdin stays a pipe (the default allocates a
+pseudo-TTY and an interactive terminal is never read):
+
+```sh
+docker compose exec -T relay app invoke user-events-python < event.json
 ```
 
 Unlike stream consumption, a manual invocation is **not** part of the
@@ -223,11 +235,19 @@ relay secret rm database-url         # a missing secret is an error
 ```
 
 `secret set NAME` never accepts a value as a positional argument and never
-prints it. When stdin is not a terminal it reads all of stdin:
+prints it. When stdin is not a terminal it reads all of stdin. Use the portable
+`printf` form (or `echo -n` in bash/zsh) so no newline is added:
 
 ```sh
-printf 'value' | relay secret set database-url
+echo -n 'value' | relay secret set API_KEY    # bash/zsh
+printf '%s' 'value' | relay secret set API_KEY     # POSIX-portable
+docker compose exec -T relay secret set API_KEY < value.txt
 ```
+
+Piped values are stored byte-for-byte except for exactly one trailing line
+ending: one `CRLF`, or else one `LF`, is removed. Everything else is preserved,
+including leading whitespace, trailing spaces, internal newlines, and a sole
+trailing `CR`.
 
 Values are stored as files under `/var/lib/relay/secrets` and are only ever
 referenced by name from `template.yaml`.
