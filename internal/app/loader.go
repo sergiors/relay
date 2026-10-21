@@ -16,9 +16,12 @@ const Dir = "/apps"
 // StagingPrefix prefixes Relay's own transient staging directories created
 // directly under the apps root by git materialization
 // (internal/git/materialize.go: os.MkdirTemp(dst, StagingPrefix+"*")). Such a
-// directory holds an app tree only while it is being copied into place and
-// is renamed to the app's real name before materialization returns, so it
-// is never an app and never a desired definition. The constant lives here,
+// directory holds an app tree only while it is being copied into place and is
+// then moved into the app's real name (an atomic rename for a new app, an
+// atomic directory exchange for a replacement) before materialization returns,
+// so it is never an app and never a desired definition. A staging directory can
+// also hold a replaced app's old tree briefly before disposal and any crash
+// leftovers are reclaimed by the next serialized sync. The constant lives here,
 // at the discovery boundary, so the creator (internal/git) and every
 // discovery/reload path (internal/app, internal/reconciler, internal/state)
 // share one definition and cannot drift apart.

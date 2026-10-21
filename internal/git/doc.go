@@ -22,8 +22,31 @@
 // selection honors .gitignore rules via the shared internal/source policy: an
 // ignored app directory is not materialized and an ignored file inside a
 // app is not copied, while the applicable .gitignore files themselves are
-// copied (they are the policy). See Sync's documentation and README.md "Git" for
-// the precise contract.
+// copied (they are the policy). See Sync's documentation and docs/operations.md
+// "Git" for the precise contract.
+//
+// Materialization is staged before it is committed. Every desired app tree is
+// copied into a reserved .sync-* directory directly under /apps (which the
+// loader, watcher, reconciler, and state view all ignore). Candidate trees are
+// checked only for copy completeness and template.yaml presence; template
+// contents are not validated, so malformed templates are still committed and
+// handled by the reconciler. A staging/copy failure leaves the previous /apps
+// tree intact. Each existing app is then replaced with an atomic directory
+// exchange — renameat2(RENAME_EXCHANGE) on Linux, renamex_np(RENAME_SWAP) on
+// macOS — so an updated app name is never absent and never partially copied.
+// New apps are an atomic rename into an absent name. Removed apps are atomically
+// renamed into the reserved namespace before deletion. /apps is a fixed bind
+// mount and is never renamed as a root; the commit boundary is per app, not a
+// whole-revision snapshot, so a concurrent observer may see a mixture across
+// different apps. An app name always resolves to a complete tree, never a
+// partially copied directory; a reader whose walk spans a swap can still see
+// files from both generations. If an existing app must be replaced and the
+// filesystem cannot exchange directories, sync fails closed before mutating a
+// live app rather than using a remove-then-rename fallback.
+//
+// Sync serializes writers sharing the managed checkout with an advisory flock
+// on a sibling of the checkout. Stale .sync-* directories from an interrupted
+// sync are reclaimed only by that locked path.
 //
 // Transport model: production sync authenticates over SSH only, using a local
 // ed25519 deploy key whose host verification uses Trust On First Use (TOFU)

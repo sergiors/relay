@@ -321,7 +321,10 @@ func matchRepository(configured string, payload *pushPayload) bool {
 // converges to the latest commit; no unbounded queue; bounded goroutines). No
 // wake channel is needed: since the run loop re-checks pending under the mutex
 // after each sync and continues on its own when it is set, a push arriving
-// mid-run is picked up automatically without any external signal.
+// mid-run is picked up automatically without any external signal. This
+// serialization is per scheduler instance only; cross-process writers (a manual
+// CLI sync or another worker sharing the checkout) are serialized by git.Sync's
+// own checkout-scoped lock.
 //
 // It implements SyncTrigger. The HTTP handler is NEVER blocked: Trigger only
 // takes a mutex and spawns (or coalesces into) the scheduler goroutine, which

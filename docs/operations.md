@@ -103,7 +103,9 @@ Two path roots:
   - `secrets/` — the local secret files (`0700` dir, `0600` files, atomic
     writes);
   - `ssh/id_ed25519`, `ssh/known_hosts` — deploy key and TOFU host-key pins;
-  - `git/source.json`, `git/checkout` — git sync config and managed checkout.
+  - `git/source.json`, `git/checkout` — git sync config and managed checkout;
+  - `git/relay-<checkout-base>.sync.lock` — persistent checkout-sibling flock
+    file; the lock releases on process exit, but the inert file is retained.
 - **PostgreSQL** — the shared state database (operator state view, per-worker
   stats snapshots, and the durable schedule outbox), addressed by
   `DATABASE_URL`. It is **not** a file under a path root; see below.
@@ -345,6 +347,31 @@ options `--ref` (default `main`), `--path` (monorepo subdir), and
 `--webhook-secret NAME`. While a source is configured and synced, `/apps`
 is owned by git: a sync rewrites it to reflect exactly the repository/path,
 removing directories not in the source.
+
+Materialization is staged before it is committed. Relay copies every desired
+app tree into a reserved `.sync-*` directory under `/apps` and checks that each
+copy is complete and contains `template.yaml` before touching any live app, so
+a staging/copy failure leaves the previous `/apps` tree intact. These checks do
+not parse or schema-validate the template: that remains the reconciler's
+responsibility. A template-present but invalid config is still committed to
+`/apps` as desired state for the reconciler to handle; invalid template contents
+do not make Git sync fail. Existing apps are then replaced with an atomic
+directory exchange (`renameat2(RENAME_EXCHANGE)` on Linux,
+`renamex_np(RENAME_SWAP)` on macOS):
+an updated app name is never absent and never partially copied. New apps are
+atomically renamed into an absent name, and removed apps are atomically renamed
+into the reserved namespace before deletion. `/apps` itself is a fixed bind
+mount and is never renamed as a root. The commit boundary is per app rather than
+a whole-revision snapshot, so a concurrent reader can briefly observe a mixture
+of old and new apps. An app name always resolves to a complete tree, never a
+partially copied directory; a reader whose walk spans a swap can still see files
+from both generations. If an existing app must be replaced and the filesystem
+cannot exchange directories, the sync fails before changing a live app rather
+than falling back to remove-then-rename.
+
+Syncs that share the managed checkout serialize on an advisory lock, so a manual
+`relay git sync` and a webhook-triggered sync cannot interleave. Stale `.sync-*`
+directories left by an interrupted sync are removed by the next locked sync.
 
 Host-key verification is never disabled; Relay maintains its own
 `known_hosts` with TOFU. A changed host key fails the sync loudly and is never

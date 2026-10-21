@@ -1,6 +1,7 @@
 package git
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -13,14 +14,20 @@ import (
 	"relay/internal/source"
 )
 
-// discoverApps returns the sorted set of valid app names under the
-// selected source: each DIRECT subdirectory that has a template.yaml and is not
-// excluded by the source-selection policy. Subdirectories without a
-// template.yaml, files, and directories failing app.ValidName are ignored —
-// the same discovery rules as internal/app/loader.go, so the set we
-// materialize is exactly what the reconciler would load. An ignored directory is
-// skipped just as the loader would (git never descends into it), so an app
-// directory excluded by .gitignore is not materialized.
+// exchangeDirs atomically swaps two directory entries on the same filesystem.
+// It is a variable only so tests can exercise the unsupported-exchange and
+// commit-failure paths; production always resolves to platformExchange (see the
+// exchange_<platform>.go files).
+var exchangeDirs = platformExchange
+
+// discoverApps returns the sorted set of app directories under the selected
+// source: each direct subdirectory with an app.ValidName name, an included
+// template.yaml path, and a stat-able template.yaml. It selects by presence,
+// not template contents; parsing and schema validation belong to the
+// reconciler. Subdirectories without a template.yaml, files, and directories
+// failing app.ValidName are ignored. An ignored directory is skipped just as
+// the loader would (git never descends into it), so an app directory excluded
+// by .gitignore is not materialized.
 func discoverApps(selection *source.Selection) ([]string, error) {
 	entries, err := os.ReadDir(selection.Dir())
 	if err != nil {
@@ -64,12 +71,25 @@ func discoverApps(selection *source.Selection) ([]string, error) {
 // the app directories discovered under selection, recursively and
 // deterministically:
 //
-//   - Each app in the discovered set is copied/refreshed from selection into
-//     dstDir. The copy is made "atomic-ish" per app: the tree is copied
-//     into a temp directory beside dstDir, then the existing target is removed
-//     and the temp renamed over it. A reader (the reconciler's watcher) sees at
-//     worst the target absent for an instant — which the reconciler tolerates —
-//     and never a half-copied app.
+//   - Every desired app is first copied into a Relay-owned staging directory
+//     beside dstDir (app.StagingPrefix, e.g. ".sync-*", which discovery ignores).
+//     No live app is touched until every copy and completeness check has
+//     succeeded, so a staging/copy failure leaves the previous /apps tree
+//     intact. This checks template.yaml presence, not template validity; the
+//     reconciler handles template parsing and schema validation after commit.
+//   - Only then is each live app replaced by an atomic directory exchange
+//     (renameat2(RENAME_EXCHANGE) on Linux, renamex_np(RENAME_SWAP) on macOS).
+//     An updated app name is therefore never absent and never partially copied.
+//     A newly added app is an atomic rename into an absent name. If an existing
+//     app must be replaced and the filesystem cannot exchange directories,
+//     materialize fails closed BEFORE any live mutation; there is deliberately
+//     no remove-then-rename fallback.
+//   - The commit boundary is PER APP, not a whole-revision snapshot. /apps is a
+//     fixed bind mount and is never renamed as a root, so a concurrent observer
+//     may see a mixture of old and new apps while the per-app swaps proceed. An
+//     app name always resolves to a complete tree, never a partially copied
+//     directory; a reader whose walk spans a swap can still see files from both
+//     generations, which the next reconcile's fingerprint handles.
 //   - Files excluded by the source-selection policy (the .gitignore rules
 //     anchored at the checkout root) are NOT copied. The applicable .gitignore
 //     files themselves ARE copied: they are the selection policy, so they must
@@ -77,19 +97,33 @@ func discoverApps(selection *source.Selection) ([]string, error) {
 //     applying the same rules against /apps.
 //   - Any pre-existing DIRECTORY in dstDir whose name is not in the new set is
 //     removed, so /apps reflects exactly the configured source (the
-//     deterministic-replace rule). Only directories are removed, never files,
-//     and nothing outside dstDir is ever touched. A Relay-owned transient
-//     staging directory (app.IsReservedDir) is not governed by this rule:
-//     the creator owns its lifecycle, so it is never reported as removed nor
-//     deleted here.
+//     deterministic-replace rule). Removal first renames the directory into the
+//     reserved staging namespace, so its live name disappears atomically and a
+//     crash during deletion cannot expose a partially deleted candidate. Only
+//     directories are removed, never files, and nothing outside dstDir is ever
+//     touched. A Relay-owned staging directory (app.IsReservedDir) is not
+//     governed by this rule: the creator owns its lifecycle, so it is never
+//     reported as removed nor deleted here.
 //
-// REMOVED are treated by removal of the directory. The returned values are the
-// names materialized (sorted) and removed (sorted) for the sync summary.
+// If a commit or removal fails after some live apps were already replaced,
+// materialize rolls the replacements and removals back in reverse order from the
+// still-staged old trees. A rollback failure is reported. An updated app's live
+// name still holds a complete tree (the old or the new one), never a partial one;
+// a removal whose restoration fails stays detached in the reserved namespace,
+// never partially deleted under its live name. Crash behavior: a crash during
+// staging leaves only ignored .sync-* directories;
+// a crash during the per-app commit leaves each live app complete (old or new)
+// and the next locked sync converges from the checkout. Stale .sync-* leftovers
+// are removed by that next sync under the writer lock (see clearStaleStages).
+//
+// The caller must serialize writers (Sync does so with a process lock). The
+// returned values are the names materialized (sorted) and removed (sorted) for
+// the sync summary.
 //
 // Ownership note: once a git source is configured and synced, /apps is
 // managed by git. Operator-placed app directories are subject to the same
 // deterministic rule: a sync removes any directory not in the source. This is
-// documented in README.md "Git" and in Sync's doc comment.
+// documented in docs/operations.md "Git" and in Sync's doc comment.
 func materialize(selection *source.Selection, dstDir string) (materialized, removed []string, err error) {
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return nil, nil, fmt.Errorf("git: create apps dir %q: %w", dstDir, err)
@@ -104,100 +138,341 @@ func materialize(selection *source.Selection, dstDir string) (materialized, remo
 		want[n] = true
 	}
 
-	// Copy/refresh each wanted app atomically-ish: temp dir beside dst,
-	// remove old target, rename temp into place.
+	// Stage every desired app before mutating any live app. Each stagePath is
+	// owned by this call; after a successful exchange it holds the previous live
+	// tree, so the deferred cleanup doubles as old-tree disposal and crash-safe
+	// failure cleanup.
+	staged := make([]*stagedApp, 0, len(newSet))
+	defer func() {
+		for _, s := range staged {
+			if s.stagePath != "" && !s.preserveStage {
+				_ = os.RemoveAll(s.stagePath)
+			}
+		}
+	}()
 	for _, name := range newSet {
 		fnSelection, err := selection.Sub(filepath.Join(selection.Dir(), name))
 		if err != nil {
 			return nil, nil, err
 		}
-		if err := copyAppDir(fnSelection, dstDir, name); err != nil {
+		stagePath, err := stageAppDir(fnSelection, dstDir, name)
+		if err != nil {
 			return nil, nil, err
 		}
-		materialized = append(materialized, name)
+		existed, err := pathExists(filepath.Join(dstDir, name))
+		if err != nil {
+			_ = os.RemoveAll(stagePath)
+			return nil, nil, fmt.Errorf("git: inspect app dir %q: %w", name, err)
+		}
+		staged = append(staged, &stagedApp{name: name, stagePath: stagePath, existed: existed})
 	}
 
-	// Remove directories in dstDir that are not in the new set. Only DIRECTORY
-	// entries are considered; files and unreadable entries are left alone.
-	//
-	// Note on the variable name: dstEntries is deliberately distinct from the
-	// newSet/entries naming above. Both reads must succeed independently and a
-	// ReadDir error here must NOT be conflated with the discovery result that
-	// drives the copy loop — an empty dstDir (nil dstEntries) is normal (first
-	// sync, or /apps already empty) and is NOT the same as a read failure.
+	// Determine the removal set BEFORE any live mutation, so a listing failure
+	// cannot strand a half-applied revision. Reserved staging directories are
+	// never removal candidates.
+	stale, err := staleAppNames(dstDir, want)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Replacement of an existing directory requires an atomic exchange. Probe
+	// the capability now, while every live app is still untouched, so an
+	// unsupported filesystem fails closed instead of exposing a removal window.
+	for _, s := range staged {
+		if s.existed {
+			if err := checkExchangeSupport(dstDir); err != nil {
+				return nil, nil, err
+			}
+			break
+		}
+	}
+
+	// Commit phase: per-app atomic exchange/rename. The old tree of an updated
+	// app remains at stagePath until the deferred cleanup, which is what makes
+	// rollback possible without ever unlinking the live name.
+	committed := make([]*stagedApp, 0, len(staged))
+	for _, s := range staged {
+		target := filepath.Join(dstDir, s.name)
+		if s.existed {
+			if err := exchangeDirs(s.stagePath, target); err != nil {
+				rbErr := rollbackApps(committed, dstDir)
+				return nil, nil, withRollback(fmt.Errorf("git: commit app dir %q: %w", s.name, err), rbErr)
+			}
+		} else {
+			// The name was absent when staged. A plain rename is an atomic
+			// creation; if a foreign writer created the name meanwhile, rename
+			// fails (it never replaces a non-empty directory) and the
+			// transaction rolls back rather than exposing a partial tree.
+			if err := os.Rename(s.stagePath, target); err != nil {
+				rbErr := rollbackApps(committed, dstDir)
+				return nil, nil, withRollback(fmt.Errorf("git: commit app dir %q: %w", s.name, err), rbErr)
+			}
+			s.stagePath = "" // renamed into place: no old tree to clean up
+		}
+		committed = append(committed, s)
+		materialized = append(materialized, s.name)
+	}
+
+	// Removal phase: first rename each stale directory into the reserved
+	// namespace (an atomic disappearance of the live name), then delete the
+	// detached trees. If a rename fails, restore every detached directory and
+	// every committed app so /apps stays on the previous revision.
+	removals := make([]stagedRemoval, 0, len(stale))
+	for _, name := range stale {
+		removal, err := detachStaleApp(dstDir, name)
+		if err != nil {
+			rbErr := errors.Join(rollbackRemovals(removals, dstDir), rollbackApps(committed, dstDir))
+			return nil, nil, withRollback(fmt.Errorf("git: remove stale app dir %q: %w", name, err), rbErr)
+		}
+		removals = append(removals, removal)
+		removed = append(removed, name)
+	}
+	sort.Strings(removed)
+
+	// Deleting the detached trees is cleanup, not a visibility step: their live
+	// names are already gone. A failure leaves only reserved .sync-* leftovers,
+	// which the next locked sync reclaims (clearStaleStages).
+	for _, r := range removals {
+		_ = os.RemoveAll(r.trashPath)
+	}
+	return materialized, removed, nil
+}
+
+// stagedApp is one desired app's staged replacement. stagePath is its staging
+// directory before commit; after an atomic exchange it holds the previous live
+// tree (the rollback source). existed records whether a live directory was
+// present before commit.
+type stagedApp struct {
+	name          string
+	stagePath     string
+	existed       bool
+	preserveStage bool
+}
+
+// stagedRemoval is a stale app directory atomically renamed into the reserved
+// staging namespace, awaiting deletion.
+type stagedRemoval struct {
+	name      string
+	trashPath string
+}
+
+// stageAppDir copies the whole tree at selection into a new reserved staging
+// directory directly under dst, validates that the staged candidate is
+// complete, and returns its path. Nothing live is touched. Files the
+// source-selection policy excludes are not copied; the applicable .gitignore
+// files are (they are the policy and must travel with the app). File modes are
+// preserved.
+func stageAppDir(selection *source.Selection, dst, name string) (string, error) {
+	tmp, err := os.MkdirTemp(dst, app.StagingPrefix+"*")
+	if err != nil {
+		return "", fmt.Errorf("git: create temp dir: %w", err)
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = os.RemoveAll(tmp)
+		}
+	}()
+
+	if err := copyTree(selection, tmp); err != nil {
+		return "", err
+	}
+	if err := preserveAncestorIgnoreFiles(selection, tmp); err != nil {
+		return "", err
+	}
+	// A staged app must be a complete candidate: the same template.yaml
+	// presence that made discovery accept it in the checkout. This catches a
+	// partial copy before commit; template CONTENTS are still the reconciler's
+	// concern (a present-but-invalid template follows its normal invalid-desired
+	// path), so only presence is checked here.
+	if _, err := os.Stat(filepath.Join(tmp, app.TemplateFile)); err != nil {
+		return "", fmt.Errorf("git: staged app dir %q is incomplete: %w", name, err)
+	}
+	ok = true
+	return tmp, nil
+}
+
+// staleAppNames returns the sorted names of real directories under dst that are
+// not in want and are not Relay-owned staging directories. Only directory
+// entries are considered; files and symlinks are left alone.
+func staleAppNames(dstDir string, want map[string]bool) ([]string, error) {
 	dstEntries, err := os.ReadDir(dstDir)
 	if err != nil {
-		return nil, nil, fmt.Errorf("git: list apps dir %q: %w", dstDir, err)
+		return nil, fmt.Errorf("git: list apps dir %q: %w", dstDir, err)
 	}
+	var stale []string
 	for _, e := range dstEntries {
 		if !e.IsDir() {
 			continue
 		}
 		if app.IsReservedDir(e.Name()) {
-			// A Relay-owned transient staging directory (git's ".sync-*") is
-			// not a materialized app and is not governed by the
-			// deterministic-removal rule: the creator owns its lifecycle (it is
-			// renamed away on success and cleaned up on failure). Skipping it
-			// here avoids reporting a transient stage as a removed app and
-			// avoids deleting a stage a concurrent sync is still filling.
+			// Relay-owned staging (git's ".sync-*"): the creator owns its
+			// lifecycle. It is never reported as removed nor deleted here.
 			continue
 		}
 		if want[e.Name()] {
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(dstDir, e.Name())); err != nil {
-			return nil, nil, fmt.Errorf("git: remove stale app dir %q: %w", e.Name(), err)
-		}
-		removed = append(removed, e.Name())
+		stale = append(stale, e.Name())
 	}
-	sort.Strings(removed)
-	return materialized, removed, nil
+	sort.Strings(stale)
+	return stale, nil
 }
 
-// copyAppDir copies the whole tree at selection into dst/name
-// atomically-ish: the tree is first copied to a temp directory (named with
-// app.StagingPrefix, Relay's reserved staging prefix that discovery
-// ignores) created beside dst, then the existing dst/name is removed and the
-// temp renamed into place, so the reconciler never observes a partially-written
-// app directory. Files the
-// source-selection policy excludes are not copied; the applicable .gitignore
-// files are (they are the policy and must travel with the app). File modes
-// are preserved.
-func copyAppDir(selection *source.Selection, dst, name string) error {
-	tmp, err := os.MkdirTemp(dst, app.StagingPrefix+"*")
+// checkExchangeSupport proves, before any live app is touched, that dstDir's
+// filesystem supports the atomic two-directory exchange materialize needs to
+// replace an existing app. The probe uses reserved staging names, which
+// discovery ignores.
+func checkExchangeSupport(dstDir string) error {
+	a, err := os.MkdirTemp(dstDir, app.StagingPrefix+"probe-a-")
 	if err != nil {
-		return fmt.Errorf("git: create temp dir: %w", err)
+		return fmt.Errorf("git: create exchange probe: %w", err)
 	}
-	tmpPath := tmp
-	defer func() {
-		// Clean up the temp dir unless it was renamed away.
-		if tmpPath != "" {
-			_ = os.RemoveAll(tmpPath)
-		}
-	}()
+	defer os.RemoveAll(a)
+	b, err := os.MkdirTemp(dstDir, app.StagingPrefix+"probe-b-")
+	if err != nil {
+		return fmt.Errorf("git: create exchange probe: %w", err)
+	}
+	defer os.RemoveAll(b)
+	if err := exchangeDirs(a, b); err != nil {
+		return fmt.Errorf("git: /apps filesystem %q does not support atomic directory exchange: %w; "+
+			"refusing to replace live apps non-atomically (Linux requires "+
+			"renameat2(RENAME_EXCHANGE), macOS requires renamex_np(RENAME_SWAP))", dstDir, err)
+	}
+	return nil
+}
 
-	if err := copyTree(selection, tmpPath); err != nil {
-		return err
+// detachStaleApp atomically renames dst/name into a reserved staging path, so
+// the live app name disappears in one step and no partial candidate is ever
+// visible under it. The returned trashPath is then deleted by the caller.
+func detachStaleApp(dstDir, name string) (stagedRemoval, error) {
+	trashPath, err := newStagingPath(dstDir, "removed-")
+	if err != nil {
+		return stagedRemoval{}, err
 	}
-	if err := preserveAncestorIgnoreFiles(selection, tmpPath); err != nil {
-		return err
+	if err := os.Rename(filepath.Join(dstDir, name), trashPath); err != nil {
+		return stagedRemoval{}, err
 	}
+	return stagedRemoval{name: name, trashPath: trashPath}, nil
+}
 
-	target := filepath.Join(dst, name)
-	// The old tree is removed before the replacement is renamed into place. The
-	// rename is what keeps that window short, but a reconcile observing it sees
-	// a directory without template.yaml — not an app candidate — and treats a
-	// known app as removed; the renamed tree is then discovered as a new
-	// generation.
-	if _, err := os.Stat(target); err == nil {
-		if err := os.RemoveAll(target); err != nil {
-			return fmt.Errorf("git: remove existing app dir %q: %w", name, err)
+// newStagingPath reserves a unique path in the reserved staging namespace
+// without leaving a directory there. The caller immediately renames something
+// onto it, so the path is absent between the reservation and the rename.
+func newStagingPath(dstDir, role string) (string, error) {
+	dir, err := os.MkdirTemp(dstDir, app.StagingPrefix+role)
+	if err != nil {
+		return "", fmt.Errorf("git: create staging path: %w", err)
+	}
+	if err := os.Remove(dir); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("git: prepare staging path: %w", err)
+	}
+	return dir, nil
+}
+
+// pathExists reports whether path exists as any filesystem entry (including a
+// symlink). Lstat is deliberate: the commit decision must not follow a link.
+func pathExists(path string) (bool, error) {
+	_, err := os.Lstat(path)
+	switch {
+	case err == nil:
+		return true, nil
+	case os.IsNotExist(err):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+// rollbackApps restores the apps committed so far, newest first. An updated app
+// is swapped back with the same atomic exchange, leaving its new tree in the
+// staging path for deferred cleanup; a newly created app is atomically renamed
+// back out of the live namespace. A failed rollback is reported but never
+// unlinks the live name.
+func rollbackApps(committed []*stagedApp, dstDir string) error {
+	var errs []error
+	for i := len(committed) - 1; i >= 0; i-- {
+		s := committed[i]
+		target := filepath.Join(dstDir, s.name)
+		if s.existed {
+			if err := exchangeDirs(s.stagePath, target); err != nil {
+				// stagePath still contains the previous app tree. Preserve it for
+				// inspection/recovery rather than letting materialize's cleanup
+				// destroy the only remaining snapshot.
+				s.preserveStage = true
+				errs = append(errs, fmt.Errorf("restore app %q: %w", s.name, err))
+			}
+			continue
+		}
+		// The app did not exist before this sync: move its new tree back into the
+		// reserved namespace so cleanup deletes it and the live name is absent
+		// again (its pre-sync state).
+		stagePath, err := newStagingPath(dstDir, "rollback-")
+		if err != nil {
+			errs = append(errs, fmt.Errorf("restore app %q: %w", s.name, err))
+			continue
+		}
+		if err := os.Rename(target, stagePath); err != nil {
+			errs = append(errs, fmt.Errorf("restore app %q: %w", s.name, err))
+			continue
+		}
+		s.stagePath = stagePath
+	}
+	return errors.Join(errs...)
+}
+
+// rollbackRemovals restores detached stale directories, newest first. The
+// original live name must be free; a concurrent occupancy is reported rather
+// than overwritten.
+func rollbackRemovals(removals []stagedRemoval, dstDir string) error {
+	var errs []error
+	for i := len(removals) - 1; i >= 0; i-- {
+		r := removals[i]
+		target := filepath.Join(dstDir, r.name)
+		if exists, err := pathExists(target); err != nil {
+			errs = append(errs, fmt.Errorf("restore removed app %q: %w", r.name, err))
+			continue
+		} else if exists {
+			errs = append(errs, fmt.Errorf("restore removed app %q: target already exists", r.name))
+			continue
+		}
+		if err := os.Rename(r.trashPath, target); err != nil {
+			errs = append(errs, fmt.Errorf("restore removed app %q: %w", r.name, err))
 		}
 	}
-	if err := os.Rename(tmpPath, target); err != nil {
-		return fmt.Errorf("git: rename app dir %q: %w", name, err)
+	return errors.Join(errs...)
+}
+
+// withRollback joins a materialization failure with any rollback failure. Both
+// causes remain discoverable with errors.Is.
+func withRollback(cause, rollback error) error {
+	if rollback == nil {
+		return cause
 	}
-	tmpPath = "" // renamed away; skip deferred cleanup
+	return errors.Join(cause, fmt.Errorf("git: materialization rollback: %w", rollback))
+}
+
+// clearStaleStages removes every Relay-owned staging entry from dstDir. It may
+// only be called by a serialized writer (Sync holds the process lock), because
+// otherwise it could delete a stage another sync is still filling. A missing
+// dstDir is normal (nothing to clean).
+func clearStaleStages(dstDir string) error {
+	entries, err := os.ReadDir(dstDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("git: list apps dir %q: %w", dstDir, err)
+	}
+	for _, e := range entries {
+		if !app.IsReservedDir(e.Name()) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(dstDir, e.Name())); err != nil {
+			return fmt.Errorf("git: clean stale staging entry %q: %w", e.Name(), err)
+		}
+	}
 	return nil
 }
 

@@ -11,6 +11,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 
+	"relay/internal/processlock"
 	"relay/internal/source"
 )
 
@@ -63,20 +64,34 @@ type gitRepo interface {
 //  5. Locates the apps source (repo root or validated monorepo Path) and
 //     resolves the shared source-selection policy (.gitignore rules anchored at
 //     the checkout root; see internal/source).
-//  6. Materializes /apps deterministically: copy/refresh each app
-//     directory, skipping files excluded by the selection policy, and remove any
-//     directory not in the source (see materialize).
+//  6. Stages every desired app (skipping files excluded by the selection
+//     policy) before touching /apps, then atomically exchanges each per-app
+//     directory into place and removes any directory not in the source (see
+//     materialize). /apps itself is a fixed bind mount and is never replaced as
+//     a root.
 //  7. Records LastSyncedCommit/LastSyncedAt/Synced in the persisted config,
 //     atomically, after materialization succeeds.
 //
-// Sync never holds a lock (the CLI process exits when done); it bounds the whole
-// network operation with a fixed syncTimeout context. Progress output is a tidy
-// per-step line, never raw go-git sideband.
+// Writers are serialized with an advisory flock (internal/processlock) on a
+// sibling of the managed checkout, so a manual CLI sync, a webhook-triggered
+// sync, or another process using the same checkout cannot interleave their
+// fetch/checkout/materialization. The lock is held from before the checkout work
+// through the metadata write. It is NOT a whole-revision transaction: the
+// materialization commit boundary is per app, so a concurrent reader can observe
+// a mixture of old and new apps while the swaps proceed; any individual app it
+// observes is complete, and an updated app's name is never absent.
+//
+// Sync bounds the whole network operation (including waiting for the writer
+// lock) with a fixed syncTimeout context. Progress output is a tidy per-step
+// line, never raw go-git sideband.
 //
 // Determinism contract: with a git source configured AND synced, /apps is
 // owned by git. Sync rewrites it to reflect exactly the repository/path — a
 // directory present in /apps but absent from the source is removed,
-// including operator-placed ones. This is the documented behavior.
+// including operator-placed ones. This is the documented behavior. Filesystem
+// support for atomic directory exchange is required to replace any existing app;
+// when it is unavailable Sync fails before mutating a live app rather than
+// falling back to remove-then-rename.
 func Sync(ctx context.Context, opts SyncOptions) error {
 	cfg, err := LoadConfig(opts.ConfigPath)
 	if err != nil {
@@ -223,6 +238,20 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 
 	writeLine("Syncing...")
 
+	// Serialize writers before touching the checkout or /apps. The lock file is
+	// a sibling of the checkout, never inside it: ensureCheckout may remove and
+	// re-clone the checkout, which would delete an in-checkout lock file while
+	// it is held and let a second process lock a fresh file independently.
+	// Waiting is bounded by the sync context (and therefore by syncTimeout).
+	if lockPath := syncLockPath(opts.CheckoutDir); lockPath != "" {
+		lock, err := processlock.AcquireBlocking(ctx, lockPath)
+		if err != nil {
+			return fmt.Errorf("git: acquire sync lock %s: %w", lockPath, err)
+		}
+		defer lock.Close()
+		debug("Sync writer lock acquired", "path", lockPath)
+	}
+
 	// Ensure the checkout: re-clone when the origin URL changed, else clone/open.
 	repo, fresh, err := ensureCheckout(ctx, ops, opts.CheckoutDir, cloneURL, am)
 	if err != nil {
@@ -286,6 +315,14 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 		return err
 	}
 
+	// We hold the writer lock, so every reserved staging entry under /apps is a
+	// leftover from an interrupted earlier sync (never an active stage of a
+	// concurrent writer). Reclaim them before staging this revision.
+	if err := clearStaleStages(opts.AppsDir); err != nil {
+		return err
+	}
+	debug("Cleared stale git staging entries", "apps_dir", opts.AppsDir)
+
 	// Materialize /apps deterministically.
 	materialized, removed, err := materialize(selection, opts.AppsDir)
 	if err != nil {
@@ -316,6 +353,23 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 
 	writeLine("Sync complete")
 	return nil
+}
+
+// syncLockPath is the advisory lock serializing writers that share a managed
+// checkout. It is a SIBLING of the checkout, in the same git data directory as
+// the config and checkout: a re-clone removes the checkout directory, so a lock
+// file inside it would be deleted while held. An empty CheckoutDir yields no
+// lock path (defensive; production and tests always provide one, and
+// ensureCheckout would fail anyway).
+func syncLockPath(checkoutDir string) string {
+	if checkoutDir == "" {
+		return ""
+	}
+	clean := filepath.Clean(checkoutDir)
+	// The "relay-" prefix keeps the lock name out of the reserved ".sync-*"
+	// namespace even for an unusual checkout name, so staging cleanup can never
+	// mistake the held lock file for a stage.
+	return filepath.Join(filepath.Dir(clean), "relay-"+filepath.Base(clean)+".sync.lock")
 }
 
 // builder produces the transport auth.
