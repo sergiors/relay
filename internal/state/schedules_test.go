@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -29,7 +30,9 @@ func TestScheduleRoundTrip(t *testing.T) {
 	tmpl := mustTemplate(t, schedulesTmpl)
 	fn := fnFor(t, "demo", tmpl)
 	token := seedToken(t, st, fn)
-	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	detail, ok := st.GetApp("demo")
 	if !ok {
@@ -61,7 +64,9 @@ func TestScheduleReplacementUpdatesRows(t *testing.T) {
 	tmpl := mustTemplate(t, schedulesTmpl)
 	fn := fnFor(t, "demo", tmpl)
 	token := seedToken(t, st, fn)
-	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	// Change: drop one schedule, change the other's cron/timezone/timeout.
 	changed := mustTemplate(t, `runtime: python3.14
@@ -75,7 +80,9 @@ schedules:
     cron: "0 4 * * *"
     timezone: America/New_York
 `)
-	st.RecordReconcileSuccess("demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed), token)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed), token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	detail, ok := st.GetApp("demo")
 	if !ok {
@@ -99,9 +106,13 @@ func TestScheduleRemovalClearsRows(t *testing.T) {
 	tmpl := mustTemplate(t, schedulesTmpl)
 	fn := fnFor(t, "demo", tmpl)
 	token := seedToken(t, st, fn)
-	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
-	st.RecordRemoved("demo", token)
+	if _, err := st.RecordRemoved(context.Background(), "demo", token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	if _, ok := st.GetApp("demo"); ok {
 		t.Fatal("function row should be gone after removal")
 	}
@@ -114,7 +125,9 @@ func TestScheduleEmptyStored(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl) // no schedules key
 	fn := fnFor(t, "demo", tmpl)
 	token := seedToken(t, st, fn)
-	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	detail, ok := st.GetApp("demo")
 	if !ok {

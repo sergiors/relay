@@ -19,9 +19,15 @@ func TestRecordStatsSnapshotSingleTransaction(t *testing.T) {
 	// Seed apps rows for "alpha" and "beta". Record "gone" and its
 	// app_stats, then delete ONLY its apps row directly via the
 	// unexported db handle, leaving a genuine orphaned app_stats row behind.
-	c.RecordDiscovered(fnFor(t, "alpha", tmpl))
-	c.RecordDiscovered(fnFor(t, "beta", tmpl))
-	c.RecordDiscovered(fnFor(t, "gone", tmpl))
+	if _, err := c.RecordDiscovered(context.Background(), fnFor(t, "alpha", tmpl)); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
+	if _, err := c.RecordDiscovered(context.Background(), fnFor(t, "beta", tmpl)); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
+	if _, err := c.RecordDiscovered(context.Background(), fnFor(t, "gone", tmpl)); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	c.RecordAppStats(AppStats{App: "gone", EventsMatchedTotal: 5})
 	if _, err := c.db.ExecContext(context.Background(), `DELETE FROM apps WHERE name = 'gone'`); err != nil {
 		t.Fatalf("delete gone apps row: %v", err)
@@ -103,7 +109,9 @@ func TestRecordStatsSnapshotSingleTransaction(t *testing.T) {
 // all (never discovered): the flush must not create its app_stats row.
 func TestRecordStatsSnapshotConditionalUpsertGuardsRemovedApp(t *testing.T) {
 	c := openTestState(t)
-	c.RecordDiscovered(fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl)))
+	if _, err := c.RecordDiscovered(context.Background(), fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl))); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	fns := []AppStats{
 		{App: "alpha", EventsMatchedTotal: 10},
@@ -130,7 +138,9 @@ func TestRecordStatsSnapshotConditionalUpsertGuardsRemovedApp(t *testing.T) {
 // later successful flush must persist the accumulated (absolute) values.
 func TestRecordStatsSnapshotFailureRetriesNextFlush(t *testing.T) {
 	c := openTestState(t)
-	c.RecordDiscovered(fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl)))
+	if _, err := c.RecordDiscovered(context.Background(), fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl))); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	prev := Stats{EventsMatchedTotal: 50, HandlerSuccessTotal: 40, HandlerFailureTotal: 10, RetryTotal: 2, DLQTotal: 1}
 	c.RecordStats(prev)

@@ -95,13 +95,20 @@ func loadStartupApps(
 	// Present-but-invalid desired definitions are persisted alongside the valid
 	// discovery; they stay out of the loaded set, so they never reach the
 	// runtime registry, matching, the scheduler, or preparation. A write failure
-	// is logged (non-fatal): the app set is already loaded and serving.
+	// is logged (non-fatal): the app set is already loaded and serving. A
+	// cancellation, however, stops startup promptly: it is reported as a
+	// graceful interruption so Run converges on the normal teardown path.
 	_, discoverySpan := tracing.Start(startupCtx, "state.discovery")
 	tokens, rerr := persistStartupDiscovery(
-		st, app.Dir, discovered, loadIssues, logger,
+		startupCtx, st, app.Dir, discovered, loadIssues, logger,
 	)
 	if rerr != nil {
 		discoverySpan.RecordError(rerr)
+		if startupInterrupted(startupCtx, rerr) {
+			discoverySpan.End()
+			logger.Debug("Startup: state discovery interrupted by shutdown", "error", rerr)
+			return startupAppSet{}, errStartupInterrupted
+		}
 	}
 	discoverySpan.End()
 

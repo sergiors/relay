@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -12,7 +13,9 @@ import (
 func TestRecordInvalidDesiredFreshRowIsUnavailable(t *testing.T) {
 	c := openTestState(t)
 
-	requireToken(t, "broken", c.RecordInvalidDesired("broken", &boomErr{}))
+	requireDesired(t, "broken", func() (Token, error) {
+		return c.RecordInvalidDesired(context.Background(), "broken", &boomErr{})
+	})
 
 	detail, ok := c.GetApp("broken")
 	if !ok {
@@ -51,9 +54,13 @@ func TestRecordInvalidDesiredPreservesActiveGeneration(t *testing.T) {
 	prepared := time.Now().Add(-time.Hour)
 
 	token := seedToken(t, c, fn)
-	c.RecordReconcileSuccess("fn", "img-active", "fp-active", prepared, fn, token)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img-active", "fp-active", prepared, fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
-	requireToken(t, "fn", c.RecordInvalidDesired("fn", &boomErr{}))
+	requireDesired(t, "fn", func() (Token, error) {
+		return c.RecordInvalidDesired(context.Background(), "fn", &boomErr{})
+	})
 
 	detail, ok := c.GetApp("fn")
 	if !ok {
@@ -93,15 +100,21 @@ func TestRecordInvalidDesiredObserverNotified(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "fn", tmpl)
 	token := seedToken(t, c, fn)
-	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fn, token)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img", "fp", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	*events = nil
 
-	c.RecordInvalidDesired("fn", &boomErr{})
+	if _, err := c.RecordInvalidDesired(context.Background(), "fn", &boomErr{}); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	if len(*events) != 1 || (*events)[0].name != "fn" || (*events)[0].status != StatusDegraded {
 		t.Fatalf("events = %+v, want one degraded notification for fn", *events)
 	}
 
-	c.RecordInvalidDesired("fresh", &boomErr{})
+	if _, err := c.RecordInvalidDesired(context.Background(), "fresh", &boomErr{}); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	last := (*events)[len(*events)-1]
 	if last.name != "fresh" || last.status != StatusUnavailable {
 		t.Fatalf("last event = %+v, want unavailable for fresh", last)
@@ -117,8 +130,12 @@ func TestActiveImagesListsRecordedImages(t *testing.T) {
 
 	withImg := fnFor(t, "with-img", tmpl)
 	withImgToken := seedToken(t, c, withImg)
-	c.RecordReconcileSuccess("with-img", "img-with", "fp", time.Now(), withImg, withImgToken)
-	c.RecordDiscovered(fnFor(t, "no-img", tmpl))
+	if _, err := c.RecordReconcileSuccess(context.Background(), "with-img", "img-with", "fp", time.Now(), withImg, withImgToken); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
+	if _, err := c.RecordDiscovered(context.Background(), fnFor(t, "no-img", tmpl)); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	got := c.ActiveImages()
 	if got["with-img"] != "img-with" {

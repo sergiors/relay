@@ -868,14 +868,14 @@ func (r *Reconciler) reconcileApp(name string) {
 					func() {
 						worked = true
 						if r.st != nil && r.currentGeneration(name, generation) {
-							r.st.RecordReconciling(name, token)
+							r.st.RecordReconciling(r.rctx(), name, token)
 						}
 					}, func(err error) {
 						if r.st == nil || !r.currentGeneration(name, generation) {
 							return
 						}
 						if err != nil {
-							r.st.RecordServiceFailure(name, err, token)
+							r.st.RecordServiceFailure(r.rctx(), name, err, token)
 							return
 						}
 						if !worked {
@@ -884,7 +884,7 @@ func (r *Reconciler) reconcileApp(name string) {
 							// touch updated_at.
 							return
 						}
-						r.st.RecordReconcileSuccess(name, cur.Prepared().Image, known, time.Now(), fn, token)
+						r.st.RecordReconcileSuccess(r.rctx(), name, cur.Prepared().Image, known, time.Now(), fn, token)
 					})
 			}
 		}
@@ -906,7 +906,7 @@ func (r *Reconciler) reconcileApp(name string) {
 		// state write transaction holds no external I/O. The returned token is
 		// the PostgreSQL-authoritative identity of this generation; every
 		// callback below carries it so another worker's newer generation wins.
-		token = r.st.RecordPreparingWithFingerprint(name, fn, fp)
+		token, _ = r.st.RecordPreparingWithFingerprint(r.rctx(), name, fn, fp)
 		r.setStateToken(name, token)
 	}
 
@@ -925,7 +925,7 @@ func (r *Reconciler) reconcileApp(name string) {
 		if r.st != nil {
 			// The prior active version is retained in the state database; only
 			// the failure outcome is recorded.
-			r.st.RecordReconcileFailure(name, err, token)
+			r.st.RecordReconcileFailure(r.rctx(), name, err, token)
 		}
 		return
 	}
@@ -961,11 +961,11 @@ func (r *Reconciler) reconcileApp(name string) {
 		if r.st == nil || !r.currentGeneration(name, generation) {
 			return
 		}
-		r.st.RecordReconcileSuccess(name, built.Image, builtFP, time.Now(), fn, token)
+		r.st.RecordReconcileSuccess(r.rctx(), name, built.Image, builtFP, time.Now(), fn, token)
 	}
 	failServices := func(serviceErr error) {
 		if serviceErr != nil && r.st != nil && r.currentGeneration(name, generation) {
-			r.st.RecordServiceFailure(name, serviceErr, token)
+			r.st.RecordServiceFailure(r.rctx(), name, serviceErr, token)
 		}
 	}
 	if len(fn.Template.Services) == 0 || r.updateServicesWithStatus == nil {
@@ -991,7 +991,7 @@ func (r *Reconciler) reconcileApp(name string) {
 		r.updateServicesWithStatus(name, fn.Template, built.Image,
 			func() {
 				if r.st != nil && r.currentGeneration(name, generation) {
-					r.st.RecordReconciling(name, token)
+					r.st.RecordReconciling(r.rctx(), name, token)
 				}
 			}, func(err error) {
 				if err != nil {
@@ -1103,7 +1103,7 @@ func (r *Reconciler) prepareContext(
 	}
 	return runtime.WithAppBuildObserver(ctx, func() {
 		if r.currentGeneration(name, generation) {
-			r.st.RecordReconcileBuilding(name, token)
+			r.st.RecordReconcileBuilding(ctx, name, token)
 		}
 	})
 }
@@ -1142,7 +1142,8 @@ func (r *Reconciler) recordInvalidDesired(name string, err error) {
 	// completions from any worker. Keep the returned token as this Reconciler's
 	// current state identity; zero (write failure) leaves it cleared, so later
 	// callbacks fail closed.
-	r.setStateToken(name, r.st.RecordInvalidDesired(name, err))
+	token, _ := r.st.RecordInvalidDesired(r.rctx(), name, err)
+	r.setStateToken(name, token)
 }
 
 // remove drops an app from the registry and forgets its fingerprint. It
@@ -1160,7 +1161,7 @@ func (r *Reconciler) remove(name string) {
 	delete(r.stateTokens, name)
 	r.mu.Unlock()
 	if r.st != nil {
-		r.st.RecordRemoved(name, token)
+		r.st.RecordRemoved(r.rctx(), name, token)
 	}
 	// The directory is gone, so every version of this app's images is now
 	// garbage. Let the runner retire all of them (once idle) when wired. The

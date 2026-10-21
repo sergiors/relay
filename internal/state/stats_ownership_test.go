@@ -25,7 +25,9 @@ func openWithIdentity(t *testing.T, dsn, worker, instance string) *State {
 // the EXISTS guard.
 func seedDiscoveredAlpha(t *testing.T, st *State) {
 	t.Helper()
-	st.RecordDiscovered(fnFor(t, "alpha", mustTemplate(t, resetSeedTmpl)))
+	if _, err := st.RecordDiscovered(context.Background(), fnFor(t, "alpha", mustTemplate(t, resetSeedTmpl))); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 }
 
 // TestOpenRejectsUnpairedOwnerInstance pins the identity invariant: a handle

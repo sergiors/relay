@@ -209,13 +209,22 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 		case <-time.After(10 * time.Second):
 		}
 	})
-	if err := st.RebuildFromFS(cfg.fnRoot); err != nil {
+	if err := st.RebuildFromFS(context.Background(), cfg.fnRoot); err != nil {
 		t.Fatalf("state rebuild: %v", err)
 	}
-	st.PruneRemoved(cfg.fnRoot)
+	if err := st.PruneRemoved(context.Background(), cfg.fnRoot); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	tokens := make(map[string]state.Token, len(functions))
 	for _, fn := range functions {
-		tokens[fn.Name] = st.RecordDiscovered(fn)
+		token, err := st.RecordDiscovered(context.Background(), fn)
+		if err != nil {
+			t.Fatalf("record discovered %s: %v", fn.Name, err)
+		}
+		if token <= 0 {
+			t.Fatalf("record discovered %s returned invalid token %d", fn.Name, token)
+		}
+		tokens[fn.Name] = token
 	}
 	restorePersistedStats(m, st)
 
@@ -239,7 +248,9 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 			t.Fatalf("prepare %s: %v", fn.Name, err)
 		}
 		fingerprints[fn.Name] = p.Fingerprint
-		st.RecordReconcileSuccess(fn.Name, p.Image, p.Fingerprint, time.Now(), fn, tokens[fn.Name])
+		if _, err := st.RecordReconcileSuccess(context.Background(), fn.Name, p.Image, p.Fingerprint, time.Now(), fn, tokens[fn.Name]); err != nil {
+			t.Errorf("state write error: %v", err)
+		}
 		// Record the exact image ref this run built for post-close cleanup.
 		if p.Image != "" {
 			runImages = append(runImages, p.Image)

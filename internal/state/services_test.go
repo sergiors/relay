@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -30,7 +31,9 @@ func TestServiceRoundTrip(t *testing.T) {
 	tmpl := mustTemplate(t, servicesTmpl)
 	fn := fnFor(t, "demo", tmpl)
 	token := seedToken(t, st, fn)
-	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	detail, ok := st.GetApp("demo")
 	if !ok {
@@ -56,7 +59,9 @@ func TestServiceReplacementUpdatesRows(t *testing.T) {
 	tmpl := mustTemplate(t, servicesTmpl)
 	fn := fnFor(t, "demo", tmpl)
 	token := seedToken(t, st, fn)
-	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	// Change: drop one service, change the other's port/replicas/path.
 	changed := mustTemplate(t, `runtime: python3.14
@@ -72,7 +77,9 @@ services:
     port: 8080
     replicas: 5
 `)
-	st.RecordReconcileSuccess("demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed), token)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed), token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	detail, ok := st.GetApp("demo")
 	if !ok {
@@ -93,9 +100,13 @@ func TestServiceRemovalClearsRows(t *testing.T) {
 	tmpl := mustTemplate(t, servicesTmpl)
 	fn := fnFor(t, "demo", tmpl)
 	token := seedToken(t, st, fn)
-	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
-	st.RecordRemoved("demo", token)
+	if _, err := st.RecordRemoved(context.Background(), "demo", token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	if _, ok := st.GetApp("demo"); ok {
 		t.Fatal("function row should be gone after removal")
 	}
@@ -107,7 +118,9 @@ func TestServiceEmptyStored(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl) // no services key
 	fn := fnFor(t, "demo", tmpl)
 	token := seedToken(t, st, fn)
-	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	detail, ok := st.GetApp("demo")
 	if !ok {
@@ -139,7 +152,9 @@ func TestServiceSourceKindsRoundTrip(t *testing.T) {
 	tmpl := mustTemplate(t, sourceServicesTmpl)
 	fn := fnFor(t, "demo", tmpl)
 	token := seedToken(t, st, fn)
-	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	detail, ok := st.GetApp("demo")
 	if !ok {

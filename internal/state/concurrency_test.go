@@ -142,9 +142,13 @@ func TestConcurrentReconcileAndStats(t *testing.T) {
 			for i := 0; i < m; i++ {
 				name := "fn-" + string(rune('a'+i))
 				if i%2 == 0 {
-					c.RecordReconcileSuccess(name, "img", "fp", time.Now(), fns[i], tokens[i])
+					if _, err := c.RecordReconcileSuccess(context.Background(), name, "img", "fp", time.Now(), fns[i], tokens[i]); err != nil {
+						t.Errorf("state write error: %v", err)
+					}
 				} else {
-					c.RecordReconcileSuccess(name, "img-else", "fp", time.Now(), fns[i], tokens[i])
+					if _, err := c.RecordReconcileSuccess(context.Background(), name, "img-else", "fp", time.Now(), fns[i], tokens[i]); err != nil {
+						t.Errorf("state write error: %v", err)
+					}
 				}
 			}
 		}
@@ -191,7 +195,9 @@ func TestConcurrentReconcileAndStats(t *testing.T) {
 func TestConcurrentReadsDuringWrites(t *testing.T) {
 	c, buf := captureLogger(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
-	c.RecordDiscovered(fnFor(t, "alpha", tmpl))
+	if _, err := c.RecordDiscovered(context.Background(), fnFor(t, "alpha", tmpl)); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

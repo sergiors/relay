@@ -46,7 +46,9 @@ func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 	tmpl := mustTemplate(t, resetSeedTmpl)
 	alpha := fnFor(t, "alpha", tmpl)
 	token := seedToken(t, c, alpha)
-	c.RecordReconcileSuccess("alpha", "img", "fp", base, alpha, token)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "alpha", "img", "fp", base, alpha, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	c.RecordStats(Stats{
 		EventsReceivedTotal:     110,

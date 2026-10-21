@@ -81,7 +81,9 @@ func TestRestoreToleratesCorruptGlobalJSON(t *testing.T) {
 func TestRestoreToleratesCorruptAppJSON(t *testing.T) {
 	dsn := testutil.NewStateDSN(t)
 	st := testutil.OpenState(t, dsn)
-	st.RecordDiscovered(stateApp("broken", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("broken", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	seedCorruptAppRow(t, dsn, st.Owner(), "broken")
 
 	m := metrics.New()
@@ -101,7 +103,9 @@ func TestWorkerFlushReopenRestoreRoundTrip(t *testing.T) {
 	dsn := testutil.NewStateDSN(t)
 
 	c1 := testutil.OpenState(t, dsn)
-	c1.RecordDiscovered(stateApp("alpha", t.TempDir()))
+	if _, err := c1.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	exec := time.Now().Add(-time.Minute).UTC()
 	m1 := metrics.New()
@@ -306,7 +310,9 @@ func TestRestorePersistedStatsSeedsRegistry(t *testing.T) {
 func TestRestorePersistedStatsSeedsPoolCounters(t *testing.T) {
 	m := metrics.New()
 	st := openTempState(t)
-	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	st.RecordAppStats(state.AppStats{
 		App:                "alpha",
 		EventsMatchedTotal: 1,
@@ -366,7 +372,9 @@ func TestFuncSnapshotStatsPoolCountersMapping(t *testing.T) {
 // the decoded row.
 func TestFlushPersistsCountersNotLiveGauges(t *testing.T) {
 	st := openTempState(t)
-	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	m := metrics.New()
 	m.AddLabels(metrics.MetricRuntimeContainerAcquires, []metrics.Label{{Name: "app", Value: "alpha"}, {Name: "outcome", Value: metrics.RuntimeOutcomeWarm}}, 7)
@@ -509,14 +517,18 @@ func TestStartupSweepPrunesBeforeSeeding(t *testing.T) {
 	st.RecordStats(state.Stats{EventsMatchedTotal: 7})
 
 	// Simulate the worker startup order: rebuild, prune, then seed the registry.
-	if err := st.RebuildFromFS(root); err != nil {
+	if err := st.RebuildFromFS(context.Background(), root); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
-	st.PruneRemoved(root)
+	if err := st.PruneRemoved(context.Background(), root); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	// The real startup path records each loaded app (RecordDiscovered),
 	// giving "kept" a apps row so its app_stats survives the flush's
 	// orphan pruning.
-	st.RecordDiscovered(stateApp("kept", keptDir))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("kept", keptDir)); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	m := metrics.New()
 	restorePersistedStats(m, st)
 
@@ -579,7 +591,9 @@ func stateApp(name, dir string) app.App {
 // flush's case-guarded upsert.
 func TestRestoreSeedsAndFlushesTimestamps(t *testing.T) {
 	st := openTempState(t)
-	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	exec := time.Now().Add(-time.Minute).UTC()
 	dlq := exec.Add(-time.Minute)
@@ -641,7 +655,9 @@ func TestRestoreSeedsAndFlushesTimestamps(t *testing.T) {
 // worker never errors the startup path over a corrupt timestamp column.
 func TestRestoreSkipsInvalidAndEmptyTimestamps(t *testing.T) {
 	st := openTempState(t)
-	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	st.RecordAppStats(state.AppStats{
 		App:                "alpha",
 		EventsMatchedTotal: 1,

@@ -27,7 +27,10 @@ func normWS(s string) string {
 // failed write and never persists.
 func seedToken(t *testing.T, st *state.State, fn app.App) state.Token {
 	t.Helper()
-	token := st.RecordDiscovered(fn)
+	token, err := st.RecordDiscovered(context.Background(), fn)
+	if err != nil {
+		t.Fatalf("RecordDiscovered(%q): %v", fn.Name, err)
+	}
 	if token <= 0 {
 		t.Fatalf("RecordDiscovered(%q) returned token %d, want positive", fn.Name, token)
 	}
@@ -46,7 +49,11 @@ func recordSuccess(
 ) state.Token {
 	t.Helper()
 	token := seedToken(t, st, fn)
-	if !st.RecordReconcileSuccess(name, image, fingerprint, preparedAt, fn, token) {
+	landed, err := st.RecordReconcileSuccess(context.Background(), name, image, fingerprint, preparedAt, fn, token)
+	if err != nil {
+		t.Fatalf("RecordReconcileSuccess(%q): %v", name, err)
+	}
+	if !landed {
 		t.Fatalf("RecordReconcileSuccess(%q) did not persist with token %d",
 			name, token)
 	}
@@ -102,7 +109,9 @@ events:
       event_name: [INSERT]
 `))
 	nodeFn := app.App{Name: "welcome-email-node", Dir: filepath.Join(t.TempDir(), "y"), Template: nodeTmpl}
-	st.RecordDiscovered(nodeFn)
+	if _, err := st.RecordDiscovered(context.Background(), nodeFn); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	return st, deps
 }
@@ -159,20 +168,30 @@ func TestAppListStatusesConsistentWithInspect(t *testing.T) {
 	}
 
 	// Seed each status through its production write path.
-	st.RecordDiscovered(fn("st-preparing")) // preparing
+	if _, err := st.RecordDiscovered(context.Background(), fn("st-preparing")); err != nil {
+		t.Errorf("state write error: %v", err)
+	} // preparing
 	prepFn := fn("st-building")
 	prepToken := seedToken(t, st, prepFn)
-	st.RecordReconcileBuilding("st-building", prepToken)
+	if _, err := st.RecordReconcileBuilding(context.Background(), "st-building", prepToken); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	reconFn := fn("st-reconciling")
 	reconToken := seedToken(t, st, reconFn)
-	st.RecordReconciling("st-reconciling", reconToken)
+	if _, err := st.RecordReconciling(context.Background(), "st-reconciling", reconToken); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	recordSuccess(t, st, "st-ready", "img", "fp", time.Now(), fn("st-ready"))
 	degFn := fn("st-degraded")
 	degToken := recordSuccess(t, st, "st-degraded", "img", "fp", time.Now(), degFn)
-	st.RecordServiceFailure("st-degraded", errors.New("service failed"), degToken)
+	if _, err := st.RecordServiceFailure(context.Background(), "st-degraded", errors.New("service failed"), degToken); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	unavFn := fn("st-unavailable")
 	unavToken := seedToken(t, st, unavFn)
-	st.RecordReconcileFailure("st-unavailable", errors.New("build failed"), unavToken)
+	if _, err := st.RecordReconcileFailure(context.Background(), "st-unavailable", errors.New("build failed"), unavToken); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	want := map[string]string{
 		"st-preparing":   state.StatusPreparing,
@@ -911,7 +930,9 @@ events:
 	}
 	runtimeBuilding := app.App{Name: "runtime-building", Dir: filepath.Join(t.TempDir(), "rb"), Template: runtimeTmpl}
 	runtimeToken := seedToken(t, st, runtimeBuilding)
-	st.RecordReconcileBuilding("runtime-building", runtimeToken)
+	if _, err := st.RecordReconcileBuilding(context.Background(), "runtime-building", runtimeToken); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	// A template whose only workload is an image-backed service: the runtime may
 	// be omitted entirely, so the persisted Runtime is empty.
@@ -924,7 +945,9 @@ events:
 		t.Fatalf("parse template: %v", err)
 	}
 	fn := app.App{Name: "svc-only", Dir: filepath.Join(t.TempDir(), "svc"), Template: tmpl}
-	st.RecordDiscovered(fn)
+	if _, err := st.RecordDiscovered(context.Background(), fn); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	// ls: the building row carries the building status; the service-only row
 	// carries the "-" runtime placeholder (columns are NAME RUNTIME STATUS

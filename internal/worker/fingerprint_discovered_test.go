@@ -68,11 +68,13 @@ func TestFingerprintDiscoveredReusedAcrossStatePhase(t *testing.T) {
 	// upsert the discovery pair. Both must persist the pre-change fingerprint.
 	st := testutil.NewState(t)
 
-	if err := st.RebuildFromApps(discovered); err != nil {
+	if err := st.RebuildFromApps(context.Background(), discovered); err != nil {
 		t.Fatalf("rebuild from apps: %v", err)
 	}
 	for _, d := range discovered {
-		st.RecordDiscoveredWithFingerprint(d.App, d.Fingerprint)
+		if _, err := st.RecordDiscoveredWithFingerprint(context.Background(), d.App, d.Fingerprint); err != nil {
+			t.Errorf("state write error: %v", err)
+		}
 	}
 
 	detail, ok := st.GetApp("demo")

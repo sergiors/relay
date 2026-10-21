@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -57,10 +58,12 @@ func TestRestartPreservesGlobalStats(t *testing.T) {
 	// Run the normal startup path pieces that touch the DB.
 	root := t.TempDir()
 	writeAppsDir(t, root)
-	if err := c2.RebuildFromFS(root); err != nil {
+	if err := c2.RebuildFromFS(context.Background(), root); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
-	c2.RecordDiscovered(fnFor(t, "demo", mustTemplate(t, twoHandlerTmpl)))
+	if _, err := c2.RecordDiscovered(context.Background(), fnFor(t, "demo", mustTemplate(t, twoHandlerTmpl))); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	got, ok := c2.Stats()
 	if !ok {
@@ -96,11 +99,13 @@ func TestRestartPreservesAppStats(t *testing.T) {
 
 	root := t.TempDir()
 	writeAppsDir(t, root)
-	if err := c2.RebuildFromFS(root); err != nil {
+	if err := c2.RebuildFromFS(context.Background(), root); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
 	// Rediscover an already-known app; must not touch its stats row.
-	c2.RecordDiscovered(fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl)))
+	if _, err := c2.RecordDiscovered(context.Background(), fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl))); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	a, ok := c2.AppStats("alpha")
 	if !ok {
@@ -140,12 +145,14 @@ func TestRestartPreservesAppStats(t *testing.T) {
 func TestRebuildFromFSOnNonEmptyDBKeepsAppStats(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
-	c.RecordDiscovered(fnFor(t, "demo", tmpl)) // populate the apps table
+	if _, err := c.RecordDiscovered(context.Background(), fnFor(t, "demo", tmpl)); err != nil {
+		t.Errorf("state write error: %v", err)
+	} // populate the apps table
 	c.RecordAppStats(AppStats{App: "demo", EventsMatchedTotal: 7, HandlerSuccessTotal: 5})
 
 	root := t.TempDir()
 	writeAppsDir(t, root)
-	if err := c.RebuildFromFS(root); err != nil {
+	if err := c.RebuildFromFS(context.Background(), root); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
 
@@ -176,7 +183,9 @@ func TestRestartResetsBuildingStatusToPreparing(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "demo", tmpl)
 	token := seedToken(t, c1, fn)
-	c1.RecordReconcileBuilding("demo", token)
+	if _, err := c1.RecordReconcileBuilding(context.Background(), "demo", token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	if got, _ := c1.GetApp("demo"); got.Status != StatusBuilding {
 		t.Fatalf("pre-restart status = %q, want building", got.Status)
 	}
@@ -193,7 +202,9 @@ func TestRestartResetsBuildingStatusToPreparing(t *testing.T) {
 	if got, _ := c2.GetApp("demo"); got.Status != StatusBuilding {
 		t.Fatalf("status after reopen = %q, want the persisted building status", got.Status)
 	}
-	c2.RecordDiscovered(fn)
+	if _, err := c2.RecordDiscovered(context.Background(), fn); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	got, ok := c2.GetApp("demo")
 	if !ok {
 		t.Fatal("expected demo function after restart discovery")
@@ -216,7 +227,9 @@ func TestRecordDiscoveredDoesNotResetAppStats(t *testing.T) {
 		t.Fatal("expected alpha stats before discovery")
 	}
 
-	c.RecordDiscovered(fnFor(t, "alpha", tmpl))
+	if _, err := c.RecordDiscovered(context.Background(), fnFor(t, "alpha", tmpl)); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	after, ok := c.AppStats("alpha")
 	if !ok {

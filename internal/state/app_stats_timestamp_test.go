@@ -88,7 +88,9 @@ func TestRecordAppStatsEmptyTimestampPreservesExisting(t *testing.T) {
 // CASE guards.
 func TestRecordStatsSnapshotTimestampsPersist(t *testing.T) {
 	c := openTestState(t)
-	c.RecordDiscovered(fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl)))
+	if _, err := c.RecordDiscovered(context.Background(), fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl))); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	exec := time.Now().Add(-time.Minute).UTC()
 	if _, err := c.RecordStatsSnapshot(context.Background(), -1, Stats{EventsMatchedTotal: 1},

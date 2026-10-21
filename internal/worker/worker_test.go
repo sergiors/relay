@@ -19,7 +19,10 @@ import (
 // is a failed write and never persists.
 func seedToken(t *testing.T, st *state.State, fn app.App) state.Token {
 	t.Helper()
-	token := st.RecordDiscovered(fn)
+	token, err := st.RecordDiscovered(context.Background(), fn)
+	if err != nil {
+		t.Fatalf("RecordDiscovered(%q): %v", fn.Name, err)
+	}
 	if token <= 0 {
 		t.Fatalf("RecordDiscovered(%q) returned token %d, want positive", fn.Name, token)
 	}
@@ -38,7 +41,11 @@ func recordSuccess(
 ) state.Token {
 	t.Helper()
 	token := seedToken(t, st, fn)
-	if !st.RecordReconcileSuccess(fn.Name, image, fingerprint, preparedAt, fn, token) {
+	landed, err := st.RecordReconcileSuccess(context.Background(), fn.Name, image, fingerprint, preparedAt, fn, token)
+	if err != nil {
+		t.Fatalf("RecordReconcileSuccess(%q): %v", fn.Name, err)
+	}
+	if !landed {
 		t.Fatalf("RecordReconcileSuccess(%q) did not persist with token %d",
 			fn.Name, token)
 	}
@@ -120,7 +127,11 @@ func TestManagedRuntimeBuildObserverPublishesBuildingOnlyOnActualBuild(t *testin
 	}
 
 	// A successful no-service preparation reaches ready, clearing building.
-	if !st.RecordReconcileSuccess(runtimeFn.Name, "img", "fp", time.Now(), runtimeFn, runtimeToken) {
+	landed, err := st.RecordReconcileSuccess(context.Background(), runtimeFn.Name, "img", "fp", time.Now(), runtimeFn, runtimeToken)
+	if err != nil {
+		t.Fatalf("success write: %v", err)
+	}
+	if !landed {
 		t.Fatal("success did not persist with the current token")
 	}
 	if got, _ := st.GetApp(runtimeFn.Name); got.Status != state.StatusReady {
@@ -134,7 +145,11 @@ func TestManagedRuntimeBuildObserverPublishesBuildingOnlyOnActualBuild(t *testin
 	runtime.AppBuildObserverFromContext(
 		managedRuntimeBuildContext(context.Background(), st, failFn, failToken),
 	)()
-	if !st.RecordReconcileFailure(failFn.Name, errors.New("build failed"), failToken) {
+	landed, err = st.RecordReconcileFailure(context.Background(), failFn.Name, errors.New("build failed"), failToken)
+	if err != nil {
+		t.Fatalf("failure write: %v", err)
+	}
+	if !landed {
 		t.Fatal("failure did not persist with the current token")
 	}
 	if got, _ := st.GetApp(failFn.Name); got.Status != state.StatusUnavailable {

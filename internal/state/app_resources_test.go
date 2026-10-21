@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -25,7 +26,9 @@ events:
 `)
 	fn := fnFor(t, "demo", tmpl)
 	token := seedToken(t, c, fn)
-	c.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	detail, ok := c.GetApp("demo")
 	if !ok {
@@ -46,7 +49,9 @@ events:
       event_name: [INSERT]
 `))
 	defaultedToken := seedToken(t, c, defaulted)
-	c.RecordReconcileSuccess("defaulted", "img", "fp", time.Now(), defaulted, defaultedToken)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "defaulted", "img", "fp", time.Now(), defaulted, defaultedToken); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	d2, ok := c.GetApp("defaulted")
 	if !ok {
 		t.Fatal("expected defaulted")

@@ -72,7 +72,9 @@ func TestAppSnapshotIsJSONB(t *testing.T) {
 	c.nowFn = func() time.Time { return base }
 	fn := fnFor(t, "demo", tmpl)
 	token := seedToken(t, c, fn)
-	c.RecordReconcileSuccess("demo", "img", "fp", base, fn, token)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", base, fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	data, updatedAt, jsonbType := rawAppData(t, c, "demo")
 	if jsonbType != "object" {
@@ -131,7 +133,9 @@ func TestAppSnapshotRoundTrip(t *testing.T) {
 	c.nowFn = func() time.Time { return base }
 	fn := fnFor(t, "demo", tmpl)
 	token := seedToken(t, c, fn)
-	c.RecordReconcileSuccess("demo", "img", "fp", base, fn, token)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", base, fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	detail, ok := c.GetApp("demo")
 	if !ok {
@@ -200,7 +204,9 @@ func TestAppSnapshotAtomicReplacement(t *testing.T) {
 	tmpl := mustTemplate(t, fullSnapshotTmpl)
 	fn := fnFor(t, "demo", tmpl)
 	token := seedToken(t, c, fn)
-	c.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	// Replace with a leaner template: one handler (new timeout), no schedules,
 	// one service (new source/port), no secrets.
@@ -216,7 +222,9 @@ services:
     port: 7000
     replicas: 4
 `)
-	c.RecordReconcileSuccess("demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed), token)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed), token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	detail, ok := c.GetApp("demo")
 	if !ok {
@@ -255,10 +263,14 @@ func TestAppRemovalDeletesSnapshotAndStats(t *testing.T) {
 	tmpl := mustTemplate(t, fullSnapshotTmpl)
 	fn := fnFor(t, "demo", tmpl)
 	token := seedToken(t, c, fn)
-	c.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	c.RecordAppStats(AppStats{App: "demo", EventsMatchedTotal: 5})
 
-	c.RecordRemoved("demo", token)
+	if _, err := c.RecordRemoved(context.Background(), "demo", token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	if _, ok := c.GetApp("demo"); ok {
 		t.Fatal("apps row must be removed")
@@ -297,7 +309,9 @@ events:
 `)
 	fn := fnFor(t, "demo", tmpl)
 	token := seedToken(t, c, fn)
-	c.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fn, token)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	data, _, _ := rawAppData(t, c, "demo")
 	if strings.Contains(data, envCanary) || strings.Contains(data, "another-literal") {
@@ -366,7 +380,9 @@ func TestCorruptAppSnapshotFailsClearly(t *testing.T) {
 // UPDATE ... WHERE name = ? semantics.
 func TestReconcileFailurePreservesSnapshotOnAbsentRow(t *testing.T) {
 	c := openTestState(t)
-	c.RecordReconcileFailure("ghost", &boomErr{}, absentToken())
+	if _, err := c.RecordReconcileFailure(context.Background(), "ghost", &boomErr{}, absentToken()); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	if _, ok := c.GetApp("ghost"); ok {
 		t.Fatal("failure for an unknown function must not create a row")
 	}
@@ -380,10 +396,14 @@ func TestReconcileFailurePreservesNestedSnapshot(t *testing.T) {
 	tmpl := mustTemplate(t, fullSnapshotTmpl)
 	fn := fnFor(t, "demo", tmpl)
 	token := seedToken(t, c, fn)
-	c.RecordReconcileSuccess("demo", "img-active", "fp-active", time.Now(), fn, token)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img-active", "fp-active", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	before, _ := c.GetApp("demo")
-	c.RecordReconcileFailure("demo", &boomErr{}, token)
+	if _, err := c.RecordReconcileFailure(context.Background(), "demo", &boomErr{}, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	after, ok := c.GetApp("demo")
 	if !ok {
 		t.Fatal("row must survive a failed reconcile")

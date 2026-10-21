@@ -112,7 +112,7 @@ func prepareAndStartApps(
 	// pull) — nor on the unavailable/no-services removals, which are published
 	// the same nonblocking way (the coordinator derives their own fresh bound).
 	_, enqueueSpan := tracing.Start(startupCtx, "services.enqueue")
-	enqueueStartupServicesWithState(prepared, services, st, startup.tokens, logger)
+	enqueueStartupServicesWithState(lifecycle, prepared, services, st, startup.tokens, logger)
 	enqueueSpan.End()
 
 	// Lifecycle-aware background housekeeping. It waits behind the coordinator's

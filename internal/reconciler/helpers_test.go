@@ -1,6 +1,7 @@
 package reconciler
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"testing"
@@ -49,7 +50,11 @@ func newTestReconciler(
 			// Seed the cross-worker fence from the SAME discovery write, never a
 			// later read of apps.generation (which could claim another writer's
 			// generation).
-			r.SeedStateToken(pf.App().Name, cfg.State.RecordDiscovered(pf.App()))
+			token, err := cfg.State.RecordDiscovered(context.Background(), pf.App())
+			if err != nil {
+				t.Fatalf("record initial app %q: %v", pf.App().Name, err)
+			}
+			r.SeedStateToken(pf.App().Name, token)
 		}
 	}
 	return r, reg
@@ -68,12 +73,19 @@ func recordSuccess(
 	fn app.App,
 ) state.Token {
 	t.Helper()
-	token := st.RecordDiscoveredWithFingerprint(fn, fingerprint)
+	token, err := st.RecordDiscoveredWithFingerprint(context.Background(), fn, fingerprint)
+	if err != nil {
+		t.Fatalf("RecordDiscoveredWithFingerprint(%q): %v", name, err)
+	}
 	if token <= 0 {
 		t.Fatalf("RecordDiscoveredWithFingerprint(%q) returned token %d, want positive",
 			name, token)
 	}
-	if !st.RecordReconcileSuccess(name, image, fingerprint, preparedAt, fn, token) {
+	landed, err := st.RecordReconcileSuccess(context.Background(), name, image, fingerprint, preparedAt, fn, token)
+	if err != nil {
+		t.Fatalf("RecordReconcileSuccess(%q): %v", name, err)
+	}
+	if !landed {
 		t.Fatalf("RecordReconcileSuccess(%q) did not persist with token %d",
 			name, token)
 	}

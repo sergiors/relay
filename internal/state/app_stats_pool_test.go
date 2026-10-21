@@ -45,7 +45,9 @@ func TestAppStatsPoolCountersRoundTrip(t *testing.T) {
 // replaces them, and that AllAppStats reads them back.
 func TestRecordStatsSnapshotPersistsPoolCounters(t *testing.T) {
 	c := openTestState(t)
-	c.RecordDiscovered(fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl)))
+	if _, err := c.RecordDiscovered(context.Background(), fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl))); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	fns := []AppStats{
 		{App: "alpha", EventsMatchedTotal: 10, WarmAcquiresTotal: 7, ColdStartsTotal: 3, DiscardedTotal: 2},

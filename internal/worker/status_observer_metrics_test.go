@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -28,14 +29,18 @@ func TestWireStatusObserverProjectsTransitions(t *testing.T) {
 	}
 
 	// Success -> ready.
-	st.RecordReconcileSuccess("alpha", "img", "fp", time.Now(), fn, token)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "alpha", "img", "fp", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	if got := reg.GaugeLabels(metrics.MetricAppStatus, []metrics.Label{{Name: "app", Value: "alpha"}, {Name: "status", Value: state.StatusReady}}); got != 1 {
 		t.Fatalf("ready after success = %v, want 1", got)
 	}
 
 	// Removal -> all status series deleted. Check the snapshot BEFORE any
 	// GaugeLabels read: the read-back creates a series as a side effect.
-	st.RecordRemoved("alpha", token)
+	if _, err := st.RecordRemoved(context.Background(), "alpha", token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	series := reg.Snapshot()
 	for _, s := range []string{"preparing", "building", "reconciling", "ready", "degraded", "unavailable"} {
 		if containsLabel(series, "app_status{app=alpha,status="+s+"}") {
@@ -52,7 +57,9 @@ func TestWireStatusObserverNilSafe(t *testing.T) {
 	st := openTempState(t)
 	wireStatusObserver(st, nil)
 	fn := stateApp("beta", t.TempDir())
-	st.RecordDiscoveredWithFingerprint(fn, "fp") // must not panic
+	if _, err := st.RecordDiscoveredWithFingerprint(context.Background(), fn, "fp"); err != nil {
+		t.Errorf("state write error: %v", err)
+	} // must not panic
 }
 
 // TestStatsResetDoesNotTouchAppStatus pins that `reset stats` (the
@@ -65,7 +72,9 @@ func TestStatsResetDoesNotTouchAppStatus(t *testing.T) {
 	wireStatusObserver(st, reg)
 	fn := stateApp("alpha", t.TempDir())
 	token := seedToken(t, st, fn)
-	st.RecordReconcileSuccess("alpha", "img", "fp", time.Now(), fn, token)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "alpha", "img", "fp", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	reg.Add(metrics.MetricEventsMatched, 100)
 	f := newStatsFlusher(st, reg)

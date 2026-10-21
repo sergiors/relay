@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -169,7 +170,7 @@ func TestRebuildFromFSKeepsStats(t *testing.T) {
 	c := openTestState(t)
 	c.RecordStats(Stats{EventsMatchedTotal: 55, PendingEntries: 3})
 
-	if err := c.RebuildFromFS(root); err != nil {
+	if err := c.RebuildFromFS(context.Background(), root); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
 
@@ -270,7 +271,9 @@ func TestRemovalDeletesAppStats(t *testing.T) {
 	token := seedToken(t, c, fnFor(t, "alpha", tmpl))
 	c.RecordAppStats(AppStats{App: "alpha", EventsMatchedTotal: 3})
 
-	c.RecordRemoved("alpha", token)
+	if _, err := c.RecordRemoved(context.Background(), "alpha", token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	if _, ok := c.AppStats("alpha"); ok {
 		t.Fatal("expected function stats row to be removed")

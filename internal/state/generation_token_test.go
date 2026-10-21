@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"testing"
@@ -40,38 +41,38 @@ func assertGenerationState(
 func TestStaleGenerationWritesAreRejected(t *testing.T) {
 	operations := []struct {
 		name  string
-		apply func(*State, appFixture, Token) bool
+		apply func(*State, appFixture, Token) (bool, error)
 	}{
 		{
 			name: "success",
-			apply: func(c *State, fx appFixture, token Token) bool {
-				return c.RecordReconcileSuccess(
+			apply: func(c *State, fx appFixture, token Token) (bool, error) {
+				return c.RecordReconcileSuccess(context.Background(),
 					fx.name, "img-stale", "fp-stale", time.Now(), fx.app, token)
 			},
 		},
 		{
 			name: "failure",
-			apply: func(c *State, fx appFixture, token Token) bool {
-				return c.RecordReconcileFailure(
+			apply: func(c *State, fx appFixture, token Token) (bool, error) {
+				return c.RecordReconcileFailure(context.Background(),
 					fx.name, errors.New("stale failure"), token)
 			},
 		},
 		{
 			name: "building",
-			apply: func(c *State, fx appFixture, token Token) bool {
-				return c.RecordReconcileBuilding(fx.name, token)
+			apply: func(c *State, fx appFixture, token Token) (bool, error) {
+				return c.RecordReconcileBuilding(context.Background(), fx.name, token)
 			},
 		},
 		{
 			name: "reconciling",
-			apply: func(c *State, fx appFixture, token Token) bool {
-				return c.RecordReconciling(fx.name, token)
+			apply: func(c *State, fx appFixture, token Token) (bool, error) {
+				return c.RecordReconciling(context.Background(), fx.name, token)
 			},
 		},
 		{
 			name: "service failure",
-			apply: func(c *State, fx appFixture, token Token) bool {
-				return c.RecordServiceFailure(
+			apply: func(c *State, fx appFixture, token Token) (bool, error) {
+				return c.RecordServiceFailure(context.Background(),
 					fx.name, errors.New("stale service failure"), token)
 			},
 		},
@@ -84,15 +85,18 @@ func TestStaleGenerationWritesAreRejected(t *testing.T) {
 			prepared := time.Now().Add(-time.Hour)
 
 			old := seedTokenWithFingerprint(t, c, fx.app, "fp-old")
-			if !c.RecordReconcileSuccess(
-				fx.name, "img-old", "fp-old", prepared, fx.app, old) {
+			if !requireWrite(t, fx.name, func() (bool, error) {
+				return c.RecordReconcileSuccess(context.Background(),
+					fx.name, "img-old", "fp-old", prepared, fx.app, old)
+			}) {
 				t.Fatal("precondition: old success did not persist")
 			}
 
 			// A newer worker advances the desired generation. Preparing must
 			// preserve the still-serving active generation.
-			next := requireToken(t, fx.name,
-				c.RecordPreparingWithFingerprint(fx.app.Name, fx.app, "fp-next"))
+			next := requireDesired(t, fx.name, func() (Token, error) {
+				return c.RecordPreparingWithFingerprint(context.Background(), fx.app.Name, fx.app, "fp-next")
+			})
 			afterPreparing := snapshotApp(t, c, fx.name)
 			if afterPreparing.Status != StatusPreparing {
 				t.Fatalf("status = %q, want preparing", afterPreparing.Status)
@@ -111,7 +115,11 @@ func TestStaleGenerationWritesAreRejected(t *testing.T) {
 			c.SetStatusObserver(observer)
 			*events = nil
 
-			if op.apply(c, fx, old) {
+			landed, err := op.apply(c, fx, old)
+			if err != nil {
+				t.Fatalf("stale generation write returned error: %v", err)
+			}
+			if landed {
 				t.Fatal("stale generation write reported success")
 			}
 			assertGenerationState(t, c, fx.name, afterPreparing)
@@ -120,8 +128,10 @@ func TestStaleGenerationWritesAreRejected(t *testing.T) {
 			}
 
 			// The current token still owns the row: a real completion lands.
-			if !c.RecordReconcileSuccess(
-				fx.name, "img-next", "fp-next", time.Now(), fx.app, next) {
+			if !requireWrite(t, fx.name, func() (bool, error) {
+				return c.RecordReconcileSuccess(context.Background(),
+					fx.name, "img-next", "fp-next", time.Now(), fx.app, next)
+			}) {
 				t.Fatal("current success did not persist")
 			}
 			if got := snapshotApp(t, c, fx.name); got.Status != StatusReady ||
@@ -141,8 +151,10 @@ func TestCurrentGenerationWritesPersist(t *testing.T) {
 		fx := newAppFixture(t, "current-success")
 		token := seedTokenWithFingerprint(t, c, fx.app, "fp-v1")
 
-		if !c.RecordReconcileSuccess(
-			fx.name, "img-v1", "fp-v1", time.Now(), fx.app, token) {
+		if !requireWrite(t, fx.name, func() (bool, error) {
+			return c.RecordReconcileSuccess(context.Background(),
+				fx.name, "img-v1", "fp-v1", time.Now(), fx.app, token)
+		}) {
 			t.Fatal("current success did not persist")
 		}
 		got := snapshotApp(t, c, fx.name)
@@ -157,15 +169,20 @@ func TestCurrentGenerationWritesPersist(t *testing.T) {
 		fx := newAppFixture(t, "current-failure")
 		prepared := time.Now().Add(-time.Hour)
 		old := seedTokenWithFingerprint(t, c, fx.app, "fp-old")
-		if !c.RecordReconcileSuccess(
-			fx.name, "img-active", "fp-active", prepared, fx.app, old) {
+		if !requireWrite(t, fx.name, func() (bool, error) {
+			return c.RecordReconcileSuccess(context.Background(),
+				fx.name, "img-active", "fp-active", prepared, fx.app, old)
+		}) {
 			t.Fatal("precondition: active success did not persist")
 		}
-		next := requireToken(t, fx.name,
-			c.RecordPreparingWithFingerprint(fx.app.Name, fx.app, "fp-next"))
+		next := requireDesired(t, fx.name, func() (Token, error) {
+			return c.RecordPreparingWithFingerprint(context.Background(), fx.app.Name, fx.app, "fp-next")
+		})
 
-		if !c.RecordReconcileFailure(
-			fx.name, errors.New("current build failed"), next) {
+		if !requireWrite(t, fx.name, func() (bool, error) {
+			return c.RecordReconcileFailure(context.Background(),
+				fx.name, errors.New("current build failed"), next)
+		}) {
 			t.Fatal("current failure did not persist")
 		}
 		got := snapshotApp(t, c, fx.name)
@@ -192,13 +209,17 @@ func TestCurrentGenerationWritesPersist(t *testing.T) {
 		fx := newAppFixture(t, "current-status")
 		token := seedToken(t, c, fx.app)
 
-		if !c.RecordReconcileBuilding(fx.name, token) {
+		if !requireWrite(t, fx.name, func() (bool, error) {
+			return c.RecordReconcileBuilding(context.Background(), fx.name, token)
+		}) {
 			t.Fatal("current building status did not persist")
 		}
 		if got := snapshotApp(t, c, fx.name); got.Status != StatusBuilding {
 			t.Fatalf("status = %q, want building", got.Status)
 		}
-		if !c.RecordReconciling(fx.name, token) {
+		if !requireWrite(t, fx.name, func() (bool, error) {
+			return c.RecordReconciling(context.Background(), fx.name, token)
+		}) {
 			t.Fatal("current reconciling status did not persist")
 		}
 		if got := snapshotApp(t, c, fx.name); got.Status != StatusReconciling {
@@ -210,13 +231,17 @@ func TestCurrentGenerationWritesPersist(t *testing.T) {
 		c := openTestState(t)
 		fx := newAppFixture(t, "current-service-failure")
 		token := seedToken(t, c, fx.app)
-		if !c.RecordReconcileSuccess(
-			fx.name, "img-active", "fp-active", time.Now(), fx.app, token) {
+		if !requireWrite(t, fx.name, func() (bool, error) {
+			return c.RecordReconcileSuccess(context.Background(),
+				fx.name, "img-active", "fp-active", time.Now(), fx.app, token)
+		}) {
 			t.Fatal("precondition: active success did not persist")
 		}
 
-		if !c.RecordServiceFailure(
-			fx.name, errors.New("current service failed"), token) {
+		if !requireWrite(t, fx.name, func() (bool, error) {
+			return c.RecordServiceFailure(context.Background(),
+				fx.name, errors.New("current service failed"), token)
+		}) {
 			t.Fatal("current service failure did not persist")
 		}
 		got := snapshotApp(t, c, fx.name)
@@ -233,7 +258,9 @@ func TestCurrentGenerationWritesPersist(t *testing.T) {
 		token := seedToken(t, c, fx.app)
 		c.RecordAppStats(AppStats{App: fx.name, EventsMatchedTotal: 3})
 
-		if !c.RecordRemoved(fx.name, token) {
+		if !requireWrite(t, fx.name, func() (bool, error) {
+			return c.RecordRemoved(context.Background(), fx.name, token)
+		}) {
 			t.Fatal("current removal did not delete the row")
 		}
 		if _, ok := c.GetApp(fx.name); ok {
@@ -254,24 +281,30 @@ func TestDesiredABAStillRejectsStaleToken(t *testing.T) {
 	fx := newAppFixture(t, "aba")
 
 	tokenA := seedTokenWithFingerprint(t, c, fx.app, "fp-A")
-	tokenB := requireToken(t, fx.name,
-		c.RecordPreparingWithFingerprint(fx.app.Name, fx.app, "fp-B"))
-	tokenA2 := requireToken(t, fx.name,
-		c.RecordPreparingWithFingerprint(fx.app.Name, fx.app, "fp-A"))
+	tokenB := requireDesired(t, fx.name, func() (Token, error) {
+		return c.RecordPreparingWithFingerprint(context.Background(), fx.app.Name, fx.app, "fp-B")
+	})
+	tokenA2 := requireDesired(t, fx.name, func() (Token, error) {
+		return c.RecordPreparingWithFingerprint(context.Background(), fx.app.Name, fx.app, "fp-A")
+	})
 	if tokenA == tokenA2 || tokenB == tokenA2 {
 		t.Fatalf("tokens not freshly allocated: A=%d B=%d A2=%d",
 			tokenA, tokenB, tokenA2)
 	}
 
 	before := snapshotApp(t, c, fx.name)
-	if c.RecordReconcileSuccess(
-		fx.name, "img-A", "fp-A", time.Now(), fx.app, tokenA) {
+	if requireWrite(t, fx.name, func() (bool, error) {
+		return c.RecordReconcileSuccess(context.Background(),
+			fx.name, "img-A", "fp-A", time.Now(), fx.app, tokenA)
+	}) {
 		t.Fatal("stale A completion persisted after A->B->A")
 	}
 	assertGenerationState(t, c, fx.name, before)
 
-	if !c.RecordReconcileSuccess(
-		fx.name, "img-A2", "fp-A", time.Now(), fx.app, tokenA2) {
+	if !requireWrite(t, fx.name, func() (bool, error) {
+		return c.RecordReconcileSuccess(context.Background(),
+			fx.name, "img-A2", "fp-A", time.Now(), fx.app, tokenA2)
+	}) {
 		t.Fatal("current A2 completion did not persist")
 	}
 	got := snapshotApp(t, c, fx.name)
@@ -288,7 +321,9 @@ func TestStaleRemovalCannotDeleteReaddedApp(t *testing.T) {
 	fx := newAppFixture(t, "readd")
 
 	old := seedToken(t, c, fx.app)
-	if !c.RecordRemoved(fx.name, old) {
+	if !requireWrite(t, fx.name, func() (bool, error) {
+		return c.RecordRemoved(context.Background(), fx.name, old)
+	}) {
 		t.Fatal("precondition: current removal did not delete the row")
 	}
 
@@ -301,7 +336,9 @@ func TestStaleRemovalCannotDeleteReaddedApp(t *testing.T) {
 	c.SetStatusObserver(observer)
 	*events = nil
 
-	if c.RecordRemoved(fx.name, old) {
+	if requireWrite(t, fx.name, func() (bool, error) {
+		return c.RecordRemoved(context.Background(), fx.name, old)
+	}) {
 		t.Fatal("stale removal deleted the re-added row")
 	}
 	assertGenerationState(t, c, fx.name, before)
@@ -313,8 +350,10 @@ func TestStaleRemovalCannotDeleteReaddedApp(t *testing.T) {
 	}
 
 	// A stale success from before the removal must not resurrect or overwrite.
-	if c.RecordReconcileSuccess(
-		fx.name, "img-old", "fp-old", time.Now(), fx.app, old) {
+	if requireWrite(t, fx.name, func() (bool, error) {
+		return c.RecordReconcileSuccess(context.Background(),
+			fx.name, "img-old", "fp-old", time.Now(), fx.app, old)
+	}) {
 		t.Fatal("stale success from before removal persisted")
 	}
 	assertGenerationState(t, c, fx.name, before)
@@ -323,8 +362,10 @@ func TestStaleRemovalCannotDeleteReaddedApp(t *testing.T) {
 	}
 
 	// The fresh generation still owns the row.
-	if !c.RecordReconcileSuccess(
-		fx.name, "img-fresh", "fp-fresh", time.Now(), fx.app, fresh) {
+	if !requireWrite(t, fx.name, func() (bool, error) {
+		return c.RecordReconcileSuccess(context.Background(),
+			fx.name, "img-fresh", "fp-fresh", time.Now(), fx.app, fresh)
+	}) {
 		t.Fatal("fresh success did not persist")
 	}
 	if got := snapshotApp(t, c, fx.name); got.Image != "img-fresh" {
@@ -342,10 +383,12 @@ func TestDesiredWritesAllocateFreshTokens(t *testing.T) {
 	fx := newAppFixture(t, "tokens")
 
 	discovered := seedTokenWithFingerprint(t, c, fx.app, "fp-1")
-	preparing := requireToken(t, fx.name,
-		c.RecordPreparingWithFingerprint(fx.name, fx.app, "fp-1"))
-	invalid := requireToken(t, fx.name,
-		c.RecordInvalidDesired(fx.name, errors.New("invalid template")))
+	preparing := requireDesired(t, fx.name, func() (Token, error) {
+		return c.RecordPreparingWithFingerprint(context.Background(), fx.name, fx.app, "fp-1")
+	})
+	invalid := requireDesired(t, fx.name, func() (Token, error) {
+		return c.RecordInvalidDesired(context.Background(), fx.name, errors.New("invalid template"))
+	})
 
 	if discovered >= preparing || preparing >= invalid {
 		t.Fatalf("tokens not strictly increasing: discovered=%d preparing=%d invalid=%d",
@@ -372,24 +415,28 @@ func TestZeroTokenWritesNeverPersist(t *testing.T) {
 
 	operations := []struct {
 		name  string
-		apply func() bool
+		apply func() (bool, error)
 	}{
-		{"success", func() bool {
-			return c.RecordReconcileSuccess(
+		{"success", func() (bool, error) {
+			return c.RecordReconcileSuccess(context.Background(),
 				fx.name, "img", "fp", time.Now(), fx.app, 0)
 		}},
-		{"failure", func() bool {
-			return c.RecordReconcileFailure(fx.name, errors.New("boom"), 0)
+		{"failure", func() (bool, error) {
+			return c.RecordReconcileFailure(context.Background(), fx.name, errors.New("boom"), 0)
 		}},
-		{"building", func() bool { return c.RecordReconcileBuilding(fx.name, 0) }},
-		{"reconciling", func() bool { return c.RecordReconciling(fx.name, 0) }},
-		{"service failure", func() bool {
-			return c.RecordServiceFailure(fx.name, errors.New("boom"), 0)
+		{"building", func() (bool, error) { return c.RecordReconcileBuilding(context.Background(), fx.name, 0) }},
+		{"reconciling", func() (bool, error) { return c.RecordReconciling(context.Background(), fx.name, 0) }},
+		{"service failure", func() (bool, error) {
+			return c.RecordServiceFailure(context.Background(), fx.name, errors.New("boom"), 0)
 		}},
-		{"removal", func() bool { return c.RecordRemoved(fx.name, 0) }},
+		{"removal", func() (bool, error) { return c.RecordRemoved(context.Background(), fx.name, 0) }},
 	}
 	for _, op := range operations {
-		if op.apply() {
+		landed, err := op.apply()
+		if err != nil {
+			t.Fatalf("%s with a zero token returned error: %v", op.name, err)
+		}
+		if landed {
 			t.Fatalf("%s with a zero token reported success", op.name)
 		}
 	}
@@ -402,8 +449,10 @@ func TestZeroTokenWritesNeverPersist(t *testing.T) {
 		t.Fatalf("zero-token removal changed app_stats: %+v ok=%v", stats, ok)
 	}
 	// The row still belongs to its real token.
-	if !c.RecordReconcileSuccess(
-		fx.name, "img-current", "fp", time.Now(), fx.app, token) {
+	if !requireWrite(t, fx.name, func() (bool, error) {
+		return c.RecordReconcileSuccess(context.Background(),
+			fx.name, "img-current", "fp", time.Now(), fx.app, token)
+	}) {
 		t.Fatal("current token success did not persist after zero-token writes")
 	}
 }

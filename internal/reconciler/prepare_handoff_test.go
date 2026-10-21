@@ -157,7 +157,9 @@ func TestReconcileRecordsBuiltIdentityNotPreBuildScan(t *testing.T) {
 	r, _, st := newTestStateReconciler(t, root, b, nil, nil)
 
 	// Seed a prior successful row so the rebuild is observed as a desired change.
-	st.RecordDiscovered(app.App{Name: "drift", Dir: filepath.Join(root, "drift"), Template: mustParse(template)})
+	if _, err := st.RecordDiscovered(context.Background(), app.App{Name: "drift", Dir: filepath.Join(root, "drift"), Template: mustParse(template)}); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	r.reconcileApp("drift")
 

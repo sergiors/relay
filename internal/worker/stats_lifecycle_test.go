@@ -54,7 +54,9 @@ func TestStatsPersistWithMetricsDisabled(t *testing.T) {
 		t.Fatal("precondition: metrics server must be nil when disabled")
 	}
 	st := openTempState(t)
-	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	reg.Add(metrics.MetricEventsMatched, 3)
 	reg.Add(metrics.MetricHandlerSuccess, 2)
 	reg.IncLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}})
@@ -113,7 +115,9 @@ func TestMetricsEnabledExposesSingleAccountingRegistry(t *testing.T) {
 	})
 
 	st := openTempState(t)
-	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	// ONE accounted event on the single registry.
 	reg.Inc(metrics.MetricEventsMatched)
@@ -142,7 +146,9 @@ func TestStatsResetWithMetricsDisabled(t *testing.T) {
 		t.Fatal("precondition: metrics server must be nil when disabled")
 	}
 	st := openTempState(t)
-	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	f := newStatsFlusher(st, reg)
 
 	reg.Add(metrics.MetricEventsMatched, 100)
@@ -189,7 +195,9 @@ func TestFinalStatsFlushWithMetricsDisabled(t *testing.T) {
 		t.Fatal("precondition: metrics server must be nil when disabled")
 	}
 	st := openTempState(t)
-	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	reg.Add(metrics.MetricEventsMatched, 42)
 	reg.Add(metrics.MetricHandlerSuccess, 30)
 
@@ -209,7 +217,9 @@ func TestFinalStatsFlushWithMetricsDisabled(t *testing.T) {
 // persisted totals and the first flush writes them back rather than zeroing.
 func TestStatsRestoreWithMetricsDisabled(t *testing.T) {
 	st := openTempState(t)
-	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	st.RecordStats(state.Stats{EventsMatchedTotal: 100, HandlerSuccessTotal: 70})
 	st.RecordAppStats(state.AppStats{App: "alpha", EventsMatchedTotal: 9})
 

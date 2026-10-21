@@ -291,7 +291,9 @@ func TestActiveBuildPlusPeriodicTickDoesNotBecomePreparing(t *testing.T) {
 	r, fn, st, token := readyServicesReconciler(t, root, "svc-building")
 
 	// An active build's status stands in the store.
-	st.RecordReconcileBuilding(fn.Name, token)
+	if _, err := st.RecordReconcileBuilding(context.Background(), fn.Name, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	before, _ := st.GetApp(fn.Name)
 	if before.Status != state.StatusBuilding {
 		t.Fatalf("precondition: status = %q, want building", before.Status)

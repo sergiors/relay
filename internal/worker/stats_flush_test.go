@@ -35,7 +35,9 @@ func waitForStatsRow(t *testing.T, what string, cond func() bool) {
 // and global counters survive in BOTH PostgreSQL and the registry.
 func TestStatsFlushSweepsStaleAppSeries(t *testing.T) {
 	st := openTempState(t)
-	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	ghost := stateApp("ghost", t.TempDir())
 	ghostToken := seedToken(t, st, ghost)
 	st.RecordAppStats(state.AppStats{App: "alpha", EventsMatchedTotal: 10})
@@ -51,7 +53,9 @@ func TestStatsFlushSweepsStaleAppSeries(t *testing.T) {
 	// Remove ghost's apps row (the reconciler's RecordRemoved) but KEEP its
 	// series in the registry, simulating an in-flight invocation that recreated
 	// them after removal. globals are untouched by removal.
-	st.RecordRemoved("ghost", ghostToken)
+	if _, err := st.RecordRemoved(context.Background(), "ghost", ghostToken); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	newStatsFlusher(st, m).flush(context.Background())
 
@@ -98,7 +102,9 @@ func TestStatsFlushSweepsStaleAppSeries(t *testing.T) {
 // held at a stale value).
 func TestReaddedAppPersistsFreshSeries(t *testing.T) {
 	st := openTempState(t)
-	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	m := metrics.New()
 
 	// Seed and flush an initial value, then remove the series as the reconciler
@@ -132,8 +138,12 @@ func TestReaddedAppPersistsFreshSeries(t *testing.T) {
 func TestSweepSkippedOnStateReadError(t *testing.T) {
 	dsn := testutil.NewStateDSN(t)
 	st := testutil.OpenState(t, dsn)
-	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
-	st.RecordDiscovered(stateApp("ghost", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("ghost", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	m := metrics.New()
 	m.IncLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}})
@@ -193,8 +203,12 @@ func TestSnapshotStatsAndFuncSnapshotAreInMemoryOnly(t *testing.T) {
 	// Give alpha/beta apps rows so their app_stats survive the flush's
 	// orphan pruning (a app_stats row with no apps row is pruned).
 	st := openTempState(t)
-	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
-	st.RecordDiscovered(stateApp("beta", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("beta", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	const loops = 500
 	for i := 0; i < loops; i++ {
@@ -262,7 +276,9 @@ func TestSnapshotStatsAndFuncSnapshotAreInMemoryOnly(t *testing.T) {
 // statsFlushInterval constant (5s, see TestStatsFlushIntervalConstant).
 func TestStatsLoopFlushesEveryInterval(t *testing.T) {
 	st := openTempState(t)
-	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	m := metrics.New()
 	m.Add(metrics.MetricEventsMatched, 10)
 	m.Add(metrics.MetricHandlerSuccess, 7)
@@ -322,7 +338,9 @@ func TestStatsLoopFlushesEveryInterval(t *testing.T) {
 func TestFinalStatsFlushPersistsOnShutdown(t *testing.T) {
 	m := metrics.New()
 	st := openTempState(t)
-	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	m.Add(metrics.MetricEventsMatched, 42)
 	m.Add(metrics.MetricHandlerSuccess, 30)
 	m.Add(metrics.MetricHandlerFailure, 12)
@@ -366,7 +384,9 @@ func TestFinalStatsFlushPersistsOnShutdown(t *testing.T) {
 // later bump persists the new absolute value without delta accumulation.
 func TestStatsFlushIdempotent(t *testing.T) {
 	st := openTempState(t)
-	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	m := metrics.New()
 	m.Add(metrics.MetricEventsMatched, 100)
 	m.Add(metrics.MetricHandlerSuccess, 90)
@@ -414,8 +434,12 @@ func TestStatsFlushIdempotent(t *testing.T) {
 // counters must equal the exact totals with no data race (-race).
 func TestConcurrentIncrementsAndFlushRaceSafe(t *testing.T) {
 	st := openTempState(t)
-	st.RecordDiscovered(stateApp("fn-a", t.TempDir()))
-	st.RecordDiscovered(stateApp("fn-b", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("fn-a", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("fn-b", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	m := metrics.New()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -501,7 +525,9 @@ func TestConcurrentIncrementsAndFlushRaceSafe(t *testing.T) {
 // the Prometheus counters stay monotonic.
 func TestStatsFlusherResetPersistsZero(t *testing.T) {
 	st := openTempState(t)
-	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	m := metrics.New()
 	m.Add(metrics.MetricEventsMatched, 100)
 	m.IncLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}})
@@ -552,7 +578,9 @@ func TestStatsFlusherResetPersistsZero(t *testing.T) {
 // the reset completes, because flush and ResetStats share the flusher mutex.
 func TestStatsFlusherResetRaceNoResurrection(t *testing.T) {
 	st := openTempState(t)
-	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	m := metrics.New()
 	m.Add(metrics.MetricEventsMatched, 1000)
 	m.AddLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}}, 10)

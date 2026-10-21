@@ -1,6 +1,7 @@
 package reconciler
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -53,7 +54,9 @@ func newCrossWorkerFixture(t *testing.T, name string) *crossWorkerFixture {
 	dsn := testutil.NewStateDSN(t)
 	olderDB := testutil.OpenState(t, dsn)
 	newerDB := testutil.OpenState(t, dsn)
-	olderDB.RecordDiscovered(fn)
+	if _, err := olderDB.RecordDiscovered(context.Background(), fn); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	f := &crossWorkerFixture{
 		fn:      fn,

@@ -48,7 +48,9 @@ func TestConcurrentAppSnapshotWritesPreserveFields(t *testing.T) {
 		// Seed a converged snapshot: config/runtime A, desired fp-A, and a usable
 		// active generation.
 		tokenA := seedTokenWithFingerprint(t, c, fnA, "fp-A")
-		c.RecordReconcileSuccess(name, "img-A", "fp-A", time.Now(), fnA, tokenA)
+		if _, err := c.RecordReconcileSuccess(context.Background(), name, "img-A", "fp-A", time.Now(), fnA, tokenA); err != nil {
+			t.Errorf("state write error: %v", err)
+		}
 
 		start := make(chan struct{})
 		var wg sync.WaitGroup
@@ -59,11 +61,17 @@ func TestConcurrentAppSnapshotWritesPreserveFields(t *testing.T) {
 				<-start
 				switch {
 				case i < 2: // desired-generation writers change config + desired fingerprint
-					c.RecordPreparingWithFingerprint(name, fnB, "fp-B")
+					if _, err := c.RecordPreparingWithFingerprint(context.Background(), name, fnB, "fp-B"); err != nil {
+						t.Errorf("state write error: %v", err)
+					}
 				case i%2 == 0:
-					c.RecordReconcileBuilding(name, tokenA)
+					if _, err := c.RecordReconcileBuilding(context.Background(), name, tokenA); err != nil {
+						t.Errorf("state write error: %v", err)
+					}
 				default:
-					c.RecordReconciling(name, tokenA)
+					if _, err := c.RecordReconciling(context.Background(), name, tokenA); err != nil {
+						t.Errorf("state write error: %v", err)
+					}
 				}
 			}(i)
 		}
@@ -118,7 +126,9 @@ func TestAppWriteTakesPerAppAdvisoryLock(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		c.RecordReconcileBuilding(name, token)
+		if _, err := c.RecordReconcileBuilding(context.Background(), name, token); err != nil {
+			t.Errorf("state write error: %v", err)
+		}
 		close(done)
 	}()
 
@@ -170,7 +180,9 @@ func TestAppWriteSerializesAbsentRowCreation(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		c.RecordDiscoveredWithFingerprint(fn, "fp")
+		if _, err := c.RecordDiscoveredWithFingerprint(context.Background(), fn, "fp"); err != nil {
+			t.Errorf("state write error: %v", err)
+		}
 		close(done)
 	}()
 

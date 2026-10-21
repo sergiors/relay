@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -781,7 +782,10 @@ func (st *State) nowTime() time.Time {
 }
 
 // rebuildTx runs fn inside a transaction, which the rebuild path uses so a
-// partial scan never leaves a half-populated state database.
+// partial scan never leaves a half-populated state database. database/sql
+// exposes no context-aware Commit, so the ctx is checked immediately before
+// committing: a lifecycle canceled after the last statement rolls back instead
+// of persisting a write that raced shutdown.
 func (st *State) rebuildTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	tx, err := st.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -791,7 +795,19 @@ func (st *State) rebuildTx(ctx context.Context, fn func(tx *sql.Tx) error) error
 	if err := fn(tx); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		// database/sql has no context-aware Commit. If the lifecycle was
+		// canceled while the commit was in flight, surface the cancellation so
+		// callers can classify the write as shutdown rather than a state failure.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.Join(err, ctxErr)
+		}
+		return err
+	}
+	return nil
 }
 
 // appWriteTx runs fn inside a short transaction that first takes the per-app
@@ -812,6 +828,19 @@ func (st *State) appWriteTx(ctx context.Context, name string, fn func(tx *sql.Tx
 		}
 		return fn(tx)
 	})
+}
+
+// logAppWriteFailure reports a non-fatal apps-table write failure. A write
+// interrupted by lifecycle cancellation is normal shutdown, not a state
+// failure, so it is logged at Debug; every other error is a genuine (but
+// non-fatal) state-view failure and is logged at Warn. The fixed message is the
+// same in both cases, so a real failure stays recognisable.
+func (st *State) logAppWriteFailure(msg string, err error, args ...any) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		st.log.Debug(msg, append(args, "error", err)...)
+		return
+	}
+	st.log.Warn(msg, append(args, "error", err)...)
 }
 
 // empty reports whether the apps table has no rows. Only an empty state
@@ -841,8 +870,10 @@ type DiscoveredApp struct {
 // point for callers that have not already loaded the apps (tests and other
 // standalone callers); the worker uses RebuildFromApps so its already-loaded
 // set is not re-read from disk.
-func (st *State) RebuildFromFS(dir string) error {
-	ctx := context.Background()
+//
+// ctx bounds the empty check and every write in the seed transaction, so a
+// lifecycle cancellation cannot leave a slow startup seed running.
+func (st *State) RebuildFromFS(ctx context.Context, dir string) error {
 	populated, err := st.empty(ctx)
 	if err != nil {
 		return fmt.Errorf("check state empty: %w", err)
@@ -866,8 +897,9 @@ func (st *State) RebuildFromFS(dir string) error {
 // RecordDiscoveredWithFingerprint upserts, so each app is hashed exactly
 // once per state phase. Like RebuildFromFS it is a no-op when the database
 // already has rows.
-func (st *State) RebuildFromApps(discovered []DiscoveredApp) error {
-	ctx := context.Background()
+//
+// ctx bounds the empty check and the seed transaction.
+func (st *State) RebuildFromApps(ctx context.Context, discovered []DiscoveredApp) error {
 	populated, err := st.empty(ctx)
 	if err != nil {
 		return fmt.Errorf("check state empty: %w", err)
@@ -951,10 +983,12 @@ func (st *State) fingerprint(fn app.App) string {
 // itself; callers that already hold one use RecordDiscoveredWithFingerprint.
 //
 // It returns the new transition token to carry through this generation's
-// build/service callbacks, or zero when the write failed (in which case those
-// callbacks must not persist anything).
-func (st *State) RecordDiscovered(fn app.App) Token {
-	return st.RecordDiscoveredWithFingerprint(fn, st.fingerprint(fn))
+// build/service callbacks, or zero with an error when the write failed (in
+// which case those callbacks must not persist anything). ctx bounds the write
+// transaction, including its advisory-lock wait, so a cancelled lifecycle
+// cannot block a startup or reload path.
+func (st *State) RecordDiscovered(ctx context.Context, fn app.App) (Token, error) {
+	return st.RecordDiscoveredWithFingerprint(ctx, fn, st.fingerprint(fn))
 }
 
 // RecordDiscoveredWithFingerprint records a discovered app using a
@@ -972,9 +1006,13 @@ func (st *State) RecordDiscovered(fn app.App) Token {
 //
 // The write transaction holds no external I/O: the fingerprint is passed in, not
 // computed inside the closure. The returned token is the exact generation the
-// write persisted; callers must not read it back later.
-func (st *State) RecordDiscoveredWithFingerprint(fn app.App, fingerprint string) Token {
-	ctx := context.Background()
+// write persisted; callers must not read it back later. A write interrupted by
+// ctx cancellation returns zero and an error wrapping the context error.
+func (st *State) RecordDiscoveredWithFingerprint(
+	ctx context.Context,
+	fn app.App,
+	fingerprint string,
+) (Token, error) {
 	ts := st.nowString()
 	var generation Token
 	err := st.appWriteTx(ctx, fn.Name, func(tx *sql.Tx) error {
@@ -983,11 +1021,12 @@ func (st *State) RecordDiscoveredWithFingerprint(fn app.App, fingerprint string)
 		return err
 	})
 	if err != nil {
-		st.log.Warn("State: record discovered failed", "app", fn.Name, "error", err)
-		return 0
+		err = fmt.Errorf("record discovered: %w", err)
+		st.logAppWriteFailure("State: record discovered failed", err, "app", fn.Name)
+		return 0, err
 	}
 	st.notifyStatus(fn.Name, StatusPreparing)
-	return generation
+	return generation, nil
 }
 
 // recordDesiredTx is the shared body of the desired-generation writes (startup
@@ -1043,20 +1082,21 @@ func recordDesiredTx(
 //
 // It is a generation-guarded UPDATE, never an upsert: a completion carrying a
 // stale token (another worker advanced the app, or the app was removed) affects
-// no row and is not published to the status observer. A success can only ever
-// describe the generation that already owns the row. It returns whether the
-// write landed.
+// no row and is not published to the status observer — it reports (false, nil).
+// A success can only ever describe the generation that already owns the row. It
+// returns whether the write landed and an error only when the write itself
+// failed. ctx bounds the transaction, including its advisory-lock wait.
 func (st *State) RecordReconcileSuccess(
+	ctx context.Context,
 	name,
 	image,
 	fingerprint string,
 	preparedAt time.Time,
 	fn app.App,
 	generation Token,
-) bool {
-	ctx := context.Background()
+) (bool, error) {
 	if generation <= 0 {
-		return false
+		return false, nil
 	}
 	ts := st.nowString()
 	prepared := preparedAt.UTC().Format(time.RFC3339)
@@ -1069,13 +1109,14 @@ func (st *State) RecordReconcileSuccess(
 		return err
 	})
 	if err != nil {
-		st.log.Warn("State: record success failed", "app", name, "error", err)
-		return false
+		err = fmt.Errorf("record reconcile success: %w", err)
+		st.logAppWriteFailure("State: record success failed", err, "app", name)
+		return false, err
 	}
 	if wrote {
 		st.notifyStatus(name, StatusReady)
 	}
-	return wrote
+	return wrote, nil
 }
 
 // RecordPreparing marks the desired configuration as in progress while retaining
@@ -1089,8 +1130,8 @@ func (st *State) RecordReconcileSuccess(
 // fingerprint; the fingerprint is computed BEFORE the write transaction opens so
 // the transaction holds no filesystem I/O. Callers that already computed it (the
 // reconciler's rebuild path) use RecordPreparingWithFingerprint.
-func (st *State) RecordPreparing(name string, fn app.App) Token {
-	return st.RecordPreparingWithFingerprint(name, fn, st.fingerprint(fn))
+func (st *State) RecordPreparing(ctx context.Context, name string, fn app.App) (Token, error) {
+	return st.RecordPreparingWithFingerprint(ctx, name, fn, st.fingerprint(fn))
 }
 
 // RecordPreparingWithFingerprint records a live desired-generation change using a
@@ -1102,10 +1143,15 @@ func (st *State) RecordPreparing(name string, fn app.App) Token {
 // active generation and the previous last-reconcile outcome.
 //
 // It returns the new transition token to carry through this generation's
-// callbacks, or zero when the write failed (fail closed: those callbacks must
-// not persist anything).
-func (st *State) RecordPreparingWithFingerprint(name string, fn app.App, fingerprint string) Token {
-	ctx := context.Background()
+// callbacks, or zero with an error when the write failed (fail closed: those
+// callbacks must not persist anything). ctx bounds the transaction, including
+// its advisory-lock wait.
+func (st *State) RecordPreparingWithFingerprint(
+	ctx context.Context,
+	name string,
+	fn app.App,
+	fingerprint string,
+) (Token, error) {
 	ts := st.nowString()
 	var generation Token
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
@@ -1114,22 +1160,29 @@ func (st *State) RecordPreparingWithFingerprint(name string, fn app.App, fingerp
 		return err
 	})
 	if err != nil {
-		st.log.Warn("State: record preparing failed", "app", name, "error", err)
-		return 0
+		err = fmt.Errorf("record preparing: %w", err)
+		st.logAppWriteFailure("State: record preparing failed", err, "app", name)
+		return 0, err
 	}
 	// recordDesiredTx writes StatusPreparing through the same desired-generation
 	// path as discovery, so the observer is notified with preparing here too.
 	st.notifyStatus(name, StatusPreparing)
-	return generation
+	return generation, nil
 }
 
 // RecordReconcileBuilding changes only the lifecycle status to building. It is
 // called at the actual managed-runtime image build boundary (an app or
 // dependency image build), not when a build is merely queued. Persistent
 // services have no separate image build, so the service path never publishes
-// building. It is generation-guarded: a stale build callback affects no row.
-func (st *State) RecordReconcileBuilding(name string, generation Token) bool {
-	return st.recordStatus(name, StatusBuilding, generation)
+// building. It is generation-guarded: a stale build callback affects no row and
+// reports (false, nil). ctx bounds the transaction, including its advisory-lock
+// wait, so a cancelled lifecycle returns promptly with a context error.
+func (st *State) RecordReconcileBuilding(
+	ctx context.Context,
+	name string,
+	generation Token,
+) (bool, error) {
+	return st.recordStatus(ctx, name, StatusBuilding, generation)
 }
 
 // RecordReconciling changes only the lifecycle status to reconciling. It is
@@ -1138,16 +1191,25 @@ func (st *State) RecordReconcileBuilding(name string, generation Token) bool {
 // convergence work that has not started. A fully-converged no-op verification
 // pass never calls it: an unchanged app stays ready rather than flashing
 // reconciling. It is generation-guarded: a stale convergence callback affects
-// no row.
-func (st *State) RecordReconciling(name string, generation Token) bool {
-	return st.recordStatus(name, StatusReconciling, generation)
+// no row and reports (false, nil). ctx bounds the transaction, including its
+// advisory-lock wait.
+func (st *State) RecordReconciling(
+	ctx context.Context,
+	name string,
+	generation Token,
+) (bool, error) {
+	return st.recordStatus(ctx, name, StatusReconciling, generation)
 }
 
-func (st *State) recordStatus(name, status string, generation Token) bool {
+func (st *State) recordStatus(
+	ctx context.Context,
+	name,
+	status string,
+	generation Token,
+) (bool, error) {
 	if generation <= 0 {
-		return false
+		return false, nil
 	}
-	ctx := context.Background()
 	ts := st.nowString()
 	wrote := false
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
@@ -1162,13 +1224,14 @@ func (st *State) recordStatus(name, status string, generation Token) bool {
 		return err
 	})
 	if err != nil {
-		st.log.Warn("State: record status failed", "app", name, "status", status, "error", err)
-		return false
+		err = fmt.Errorf("record status %q: %w", status, err)
+		st.logAppWriteFailure("State: record status failed", err, "app", name, "status", status)
+		return false, err
 	}
 	if wrote {
 		st.notifyStatus(name, status)
 	}
-	return wrote
+	return wrote, nil
 }
 
 // RecordReconcileFailure records that a reconcile build failed.
@@ -1183,13 +1246,18 @@ func (st *State) recordStatus(name, status string, generation Token) bool {
 // generation exists — the app still serves but the desired generation did
 // not converge — and unavailable otherwise; a failure never claims ready, so the
 // failed outcome is always visible to an operator. It is generation-guarded: a
-// stale failure affects no row and is not published. It returns whether the
-// write landed.
-func (st *State) RecordReconcileFailure(name string, err2 error, generation Token) bool {
+// stale failure affects no row and is not published (false, nil). It returns
+// whether the write landed and an error only when the write itself failed. ctx
+// bounds the transaction, including its advisory-lock wait.
+func (st *State) RecordReconcileFailure(
+	ctx context.Context,
+	name string,
+	err2 error,
+	generation Token,
+) (bool, error) {
 	if generation <= 0 {
-		return false
+		return false, nil
 	}
-	ctx := context.Background()
 	ts := st.nowString()
 	status := ""
 	wrote := false
@@ -1222,13 +1290,14 @@ func (st *State) RecordReconcileFailure(name string, err2 error, generation Toke
 		return err
 	})
 	if err != nil {
-		st.log.Warn("State: record failure failed", "app", name, "error", err)
-		return false
+		err = fmt.Errorf("record reconcile failure: %w", err)
+		st.logAppWriteFailure("State: record failure failed", err, "app", name)
+		return false, err
 	}
 	if wrote {
 		st.notifyStatus(name, status)
 	}
-	return wrote
+	return wrote, nil
 }
 
 // RecordInvalidDesired records that an app's desired definition is present
@@ -1256,11 +1325,15 @@ func (st *State) RecordReconcileFailure(name string, err2 error, generation Toke
 // It is an UPSERT: an invalid app never seen before (no prior row) is
 // inserted, so a fresh invalid desired state is visible to operators instead of
 // being silently absent. It advances the transition token, invalidating older
-// completions across workers, and returns that token (zero on a failed write).
-// The status observer is notified with the resulting status, keeping the one-hot
-// app_status gauge consistent.
-func (st *State) RecordInvalidDesired(name string, err2 error) Token {
-	ctx := context.Background()
+// completions across workers, and returns that token (zero with an error on a
+// failed write). The status observer is notified with the resulting status,
+// keeping the one-hot app_status gauge consistent. ctx bounds the transaction,
+// including its advisory-lock wait.
+func (st *State) RecordInvalidDesired(
+	ctx context.Context,
+	name string,
+	err2 error,
+) (Token, error) {
 	ts := st.nowString()
 	var generation Token
 	status := ""
@@ -1310,13 +1383,14 @@ func (st *State) RecordInvalidDesired(name string, err2 error) Token {
 		return nil
 	})
 	if err != nil {
-		st.log.Warn("State: record invalid desired failed", "app", name, "error", err)
-		return 0
+		err = fmt.Errorf("record invalid desired: %w", err)
+		st.logAppWriteFailure("State: record invalid desired failed", err, "app", name)
+		return 0, err
 	}
 	if status != "" {
 		st.notifyStatus(name, status)
 	}
-	return generation
+	return generation, nil
 }
 
 // ActiveImages returns the currently recorded active image reference for every
@@ -1362,12 +1436,18 @@ func (st *State) ActiveImages() map[string]string {
 // degraded; one without an active generation is unavailable. A no-runtime
 // external-image service-only app has no app image but a
 // successfully-prepared generation, so it is degraded, not unavailable. It is
-// generation-guarded and returns whether the write landed.
-func (st *State) RecordServiceFailure(name string, err2 error, generation Token) bool {
+// generation-guarded: a stale callback reports (false, nil) and writes nothing.
+// It returns whether the write landed and an error only when the write itself
+// failed. ctx bounds the transaction, including its advisory-lock wait.
+func (st *State) RecordServiceFailure(
+	ctx context.Context,
+	name string,
+	err2 error,
+	generation Token,
+) (bool, error) {
 	if generation <= 0 {
-		return false
+		return false, nil
 	}
-	ctx := context.Background()
 	ts := st.nowString()
 	status := ""
 	wrote := false
@@ -1395,13 +1475,14 @@ func (st *State) RecordServiceFailure(name string, err2 error, generation Token)
 		return err
 	})
 	if err != nil {
-		st.log.Warn("State: record service failure failed", "app", name, "error", err)
-		return false
+		err = fmt.Errorf("record service failure: %w", err)
+		st.logAppWriteFailure("State: record service failure failed", err, "app", name)
+		return false, err
 	}
 	if wrote {
 		st.notifyStatus(name, status)
 	}
-	return wrote
+	return wrote, nil
 }
 
 // RecordRemoved deletes an app and its per-app stats from the state
@@ -1412,12 +1493,16 @@ func (st *State) RecordServiceFailure(name string, err2 error, generation Token)
 // removed; both happen in one transaction. On a landed delete the status
 // observer is notified with an EMPTY status, the signal to delete the app's
 // status series (a removed app has no lifecycle). It returns whether the row was
-// deleted.
-func (st *State) RecordRemoved(name string, generation Token) bool {
+// deleted. ctx bounds the transaction, including its advisory-lock wait, so a
+// cancelled lifecycle never blocks a removal.
+func (st *State) RecordRemoved(
+	ctx context.Context,
+	name string,
+	generation Token,
+) (bool, error) {
 	if generation <= 0 {
-		return false
+		return false, nil
 	}
-	ctx := context.Background()
 	deleted := false
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		result, err := tx.ExecContext(ctx,
@@ -1442,13 +1527,14 @@ func (st *State) RecordRemoved(name string, generation Token) bool {
 		return nil
 	})
 	if err != nil {
-		st.log.Warn("State: record removed failed", "app", name, "error", err)
-		return false
+		err = fmt.Errorf("record removed: %w", err)
+		st.logAppWriteFailure("State: record removed failed", err, "app", name)
+		return false, err
 	}
 	if deleted {
 		st.notifyStatus(name, "")
 	}
-	return deleted
+	return deleted, nil
 }
 
 // PruneRemoved removes state rows for every app recorded in the database
@@ -1466,64 +1552,87 @@ func (st *State) RecordRemoved(name string, generation Token) bool {
 // app_stats (restorePersistedStats), so an app removed while the worker
 // was down is pruned before its stale app_stats row could be re-seeded into
 // metrics.
-func (st *State) PruneRemoved(dir string) {
-	ctx := context.Background()
-
+//
+// ctx bounds the listing query and every delete transaction. A cancelled ctx
+// stops the sweep promptly and returns an error wrapping the context error;
+// other per-row failures are logged and the first is returned after the
+// remaining rows have been attempted, so one bad row cannot hide the rest.
+func (st *State) PruneRemoved(ctx context.Context, dir string) error {
 	// Collect every recorded name up front and close the rows before deleting:
 	// the delete transaction below acquires its own connection from the pool, and
 	// fully consuming the query first keeps the read and write paths independent.
 	rows, err := st.db.QueryContext(ctx, `SELECT name FROM apps ORDER BY name`)
 	if err != nil {
-		st.log.Warn("State: prune removed: list apps failed", "error", err)
-		return
+		err = fmt.Errorf("prune removed: list apps: %w", err)
+		st.logAppWriteFailure("State: prune removed: list apps failed", err)
+		return err
 	}
 	var names []string
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			st.log.Warn("State: prune removed: scan name failed", "error", err)
 			_ = rows.Close()
-			return
+			err = fmt.Errorf("prune removed: scan name: %w", err)
+			st.logAppWriteFailure("State: prune removed: scan name failed", err)
+			return err
 		}
 		names = append(names, name)
 	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		err = fmt.Errorf("prune removed: list apps: %w", err)
+		st.logAppWriteFailure("State: prune removed: list apps failed", err)
+		return err
+	}
 	_ = rows.Close()
 
+	var firstErr error
 	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("prune removed: %w", err)
+		}
 		// A reserved Relay-owned staging name (git's ".sync-*") is
 		// definitionally not an app, so any persisted row for it is stale
 		// debris from a buggy discovery and must be pruned even if a (transient)
 		// directory of that name happens to exist. No legitimate app name
 		// can be reserved (ValidName forbids a leading '.'), so this can never
 		// drop a real app.
-		if app.IsReservedDir(name) {
-			if rerr := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
-				return removeTx(ctx, tx, name)
-			}); rerr != nil {
-				st.log.Warn("State: prune reserved row failed", "app", name, "error", rerr)
-			} else {
-				st.notifyStatus(name, "")
+		reserved := app.IsReservedDir(name)
+		if !reserved {
+			if _, statErr := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(statErr) {
+				// Any other stat error (permissions/I/O) is skipped: only a
+				// genuine os.IsNotExist means the app was removed from the
+				// filesystem.
+				continue
+			}
+		}
+		// Startup pruning is filesystem-authoritative and therefore
+		// unconditional: no generation token can own a directory that is
+		// genuinely gone at startup. removeTx is the UNCONDITIONAL removal.
+		if rerr := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
+			return removeTx(ctx, tx, name)
+		}); rerr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return fmt.Errorf("prune removed: %w", rerr)
+			}
+			msg := "State: prune removed failed"
+			if reserved {
+				msg = "State: prune reserved row failed"
+			}
+			st.log.Warn(msg, "app", name, "error", rerr)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("prune removed %q: %w", name, rerr)
 			}
 			continue
 		}
-		if _, err := os.Stat(filepath.Join(dir, name)); os.IsNotExist(err) {
-			// Startup pruning is filesystem-authoritative and therefore
-			// unconditional: no generation token can own a directory that is
-			// genuinely gone at startup.
-			if rerr := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
-				return removeTx(ctx, tx, name)
-			}); rerr != nil {
-				st.log.Warn("State: prune removed failed", "app", name, "error", rerr)
-				continue
-			}
-			// Notify the observer (empty status) so an app pruned at startup
-			// has its status series removed alongside the row.
-			st.notifyStatus(name, "")
+		// Notify the observer (empty status) so an app pruned at startup
+		// has its status series removed alongside the row.
+		st.notifyStatus(name, "")
+		if !reserved {
 			st.log.Info("State: app pruned at startup", "app", name)
 		}
-		// Any other stat error (permissions/I/O) is skipped: only a genuine
-		// os.IsNotExist means the app was removed from the filesystem.
 	}
+	return firstErr
 }
 
 // removeTx deletes an app and its per-app stats row — the apps

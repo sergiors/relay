@@ -167,14 +167,39 @@ func openUnlockedState(t *testing.T, dsn, worker, instance string) *State {
 // persists.
 func seedToken(t *testing.T, c *State, fn app.App) Token {
 	t.Helper()
-	return requireToken(t, fn.Name, c.RecordDiscovered(fn))
+	token, err := c.RecordDiscovered(context.Background(), fn)
+	return requireTokenResult(t, fn.Name, token, err)
 }
 
 // seedTokenWithFingerprint is seedToken with a caller-supplied desired
 // fingerprint.
 func seedTokenWithFingerprint(t *testing.T, c *State, fn app.App, fingerprint string) Token {
 	t.Helper()
-	return requireToken(t, fn.Name, c.RecordDiscoveredWithFingerprint(fn, fingerprint))
+	token, err := c.RecordDiscoveredWithFingerprint(context.Background(), fn, fingerprint)
+	return requireTokenResult(t, fn.Name, token, err)
+}
+
+func requireDesired(t *testing.T, name string, write func() (Token, error)) Token {
+	t.Helper()
+	token, err := write()
+	return requireTokenResult(t, name, token, err)
+}
+
+func requireTokenResult(t *testing.T, name string, token Token, err error) Token {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("desired-generation write for %q: %v", name, err)
+	}
+	return requireToken(t, name, token)
+}
+
+func requireWrite(t *testing.T, name string, write func() (bool, error)) bool {
+	t.Helper()
+	landed, err := write()
+	if err != nil {
+		t.Fatalf("state write for %q: %v", name, err)
+	}
+	return landed
 }
 
 func requireToken(t *testing.T, name string, token Token) Token {

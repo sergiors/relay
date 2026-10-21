@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -44,16 +45,28 @@ func TestStatusObserverTransitions(t *testing.T) {
 	// Discovery -> preparing.
 	token := seedTokenWithFingerprint(t, st, fn, "fp-1")
 	// Building / reconciling transient stages.
-	st.RecordReconcileBuilding("demo", token)
-	st.RecordReconciling("demo", token)
+	if _, err := st.RecordReconcileBuilding(context.Background(), "demo", token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
+	if _, err := st.RecordReconciling(context.Background(), "demo", token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	// Success -> ready.
-	st.RecordReconcileSuccess("demo", "img-1", "fp-1", time.Now(), fn, token)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img-1", "fp-1", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	// Failure with a usable generation -> degraded.
-	st.RecordReconcileFailure("demo", errors.New("boom"), token)
+	if _, err := st.RecordReconcileFailure(context.Background(), "demo", errors.New("boom"), token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	// Service failure with a usable generation -> degraded.
-	st.RecordServiceFailure("demo", errors.New("svc boom"), token)
+	if _, err := st.RecordServiceFailure(context.Background(), "demo", errors.New("svc boom"), token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	// Removal -> empty status.
-	st.RecordRemoved("demo", token)
+	if _, err := st.RecordRemoved(context.Background(), "demo", token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	want := []statusEvent{
 		{"demo", StatusPreparing},
@@ -90,7 +103,9 @@ func TestStatusObserverFailureWithoutGenerationUnavailable(t *testing.T) {
 	tmpl := &app.Template{Runtime: "python3.14"}
 	fn := app.App{Name: "fresh", Dir: t.TempDir(), Template: tmpl}
 	token := seedTokenWithFingerprint(t, st, fn, "fp")
-	st.RecordReconcileFailure("fresh", errors.New("first build failed"), token)
+	if _, err := st.RecordReconcileFailure(context.Background(), "fresh", errors.New("first build failed"), token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	last := (*events)[len(*events)-1]
 	if last.status != StatusUnavailable {
@@ -118,10 +133,18 @@ func TestStatusObserverNotNotifiedForMissingRow(t *testing.T) {
 	observer, events := recordingObserver()
 	st.SetStatusObserver(observer)
 
-	st.RecordReconcileBuilding("ghost", absentToken())
-	st.RecordReconciling("ghost", absentToken())
-	st.RecordReconcileFailure("ghost", errors.New("boom"), absentToken())
-	st.RecordServiceFailure("ghost", errors.New("boom"), absentToken())
+	if _, err := st.RecordReconcileBuilding(context.Background(), "ghost", absentToken()); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
+	if _, err := st.RecordReconciling(context.Background(), "ghost", absentToken()); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
+	if _, err := st.RecordReconcileFailure(context.Background(), "ghost", errors.New("boom"), absentToken()); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
+	if _, err := st.RecordServiceFailure(context.Background(), "ghost", errors.New("boom"), absentToken()); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	if len(*events) != 0 {
 		t.Fatalf("missing-row status writes must not notify: %+v", *events)
 	}
@@ -147,13 +170,17 @@ func TestStatusObserverPruneNotifiesRemoval(t *testing.T) {
 	if err := os.MkdirAll(fn.Dir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	st.RecordDiscoveredWithFingerprint(fn, "fp")
+	if _, err := st.RecordDiscoveredWithFingerprint(context.Background(), fn, "fp"); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	// Prune removes the row for an app whose directory no longer exists.
 	if err := os.RemoveAll(fn.Dir); err != nil {
 		t.Fatalf("remove dir: %v", err)
 	}
-	st.PruneRemoved(root)
+	if err := st.PruneRemoved(context.Background(), root); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	last := (*events)[len(*events)-1]
 	if last.name != "gone" || last.status != "" {
@@ -177,7 +204,9 @@ func TestStatusObserverNilSafe(t *testing.T) {
 	tmpl := &app.Template{Runtime: "python3.14"}
 	fn := app.App{Name: "quiet", Dir: t.TempDir(), Template: tmpl}
 	token := seedTokenWithFingerprint(t, st, fn, "fp")
-	st.RecordReconcileSuccess("quiet", "img", "fp", time.Now(), fn, token)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "quiet", "img", "fp", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	if len(*events) != 0 {
 		t.Fatalf("cleared observer must not be notified: %+v", *events)
 	}

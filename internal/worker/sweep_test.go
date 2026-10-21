@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -81,8 +82,12 @@ func TestStartupImageKeepSetRetainsRecordedImageAfterRediscovery(t *testing.T) {
 	// A prior process recorded an active generation; startup rediscovery then
 	// refreshes the desired fingerprint but must preserve the active image.
 	token := seedToken(t, st, fn)
-	st.RecordReconcileSuccess(fn.Name, "recorded-active-img", "fp-active", time.Now(), fn, token)
-	st.RecordDiscovered(fn)
+	if _, err := st.RecordReconcileSuccess(context.Background(), fn.Name, "recorded-active-img", "fp-active", time.Now(), fn, token); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
+	if _, err := st.RecordDiscovered(context.Background(), fn); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 
 	detail, ok := st.GetApp(fn.Name)
 	if !ok {

@@ -457,7 +457,9 @@ func TestStatsJSONReopenRoundTrip(t *testing.T) {
 // counters (including pool counters) are always replaced.
 func TestRecordStatsSnapshotMergesTimestampsThroughJSON(t *testing.T) {
 	c := openTestState(t)
-	c.RecordDiscovered(fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl)))
+	if _, err := c.RecordDiscovered(context.Background(), fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl))); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	exec := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
 	c.RecordAppStats(AppStats{
 		App: "alpha", EventsMatchedTotal: 1, WarmAcquiresTotal: 7, LastExecutionAt: exec,
@@ -486,7 +488,9 @@ func TestRecordStatsSnapshotMergesTimestampsThroughJSON(t *testing.T) {
 // absolute snapshot rewrites it.
 func TestRecordStatsSnapshotSelfHealsInvalidJSON(t *testing.T) {
 	c, buf := captureLogger(t)
-	c.RecordDiscovered(fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl)))
+	if _, err := c.RecordDiscovered(context.Background(), fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl))); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
 	ctx := context.Background()
 	if _, err := c.db.ExecContext(ctx,
 		`INSERT INTO app_stats (app_name, worker, data, updated_at) VALUES ($1, $2, $3, $4)`,

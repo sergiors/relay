@@ -534,7 +534,7 @@ func Run(logger *slog.Logger) (runErr error) {
 
 	startupSet, err := loadStartupApps(startupCtx, logger, st, metricsInstance)
 	if err != nil {
-		return err
+		return startupResult(err)
 	}
 	apps := startupSet.loaded
 	fingerprints := startupSet.fingerprints
@@ -1249,7 +1249,7 @@ func managedRuntimeBuildContext(
 		return ctx
 	}
 	return runtime.WithAppBuildObserver(ctx, func() {
-		st.RecordReconcileBuilding(fn.Name, token)
+		st.RecordReconcileBuilding(ctx, fn.Name, token)
 	})
 }
 
@@ -1383,6 +1383,9 @@ func startupSeedFingerprints(
 // It is split out of Run as a pure seam over the state handle so the
 // discovery/invalid persistence is unit-testable without Docker or Redis. A
 // rebuild error is returned for the caller to surface (state stays non-fatal).
+// A lifecycle cancellation stops the phase promptly and is returned wrapped so
+// the caller can classify it as a graceful startup interruption instead of a
+// state failure.
 //
 // The returned map carries the EXACT transition token each write persisted, so
 // startup preparation, its build observer, the startup service callbacks, and
@@ -1391,19 +1394,35 @@ func startupSeedFingerprints(
 // token means that app's write failed and its generation-specific callbacks must
 // stay suppressed.
 func persistStartupDiscovery(
+	ctx context.Context,
 	st *state.State,
 	dir string,
 	discovered []state.DiscoveredApp,
 	issues []app.LoadIssue,
 	logger *slog.Logger,
 ) (map[string]state.Token, error) {
+	checkCtx := func() error {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("seed state: %w", err)
+		}
+		return nil
+	}
+	if err := checkCtx(); err != nil {
+		return nil, err
+	}
 	tokens := make(map[string]state.Token, len(discovered))
 	var rebuildErr error
-	if err := st.RebuildFromApps(discovered); err != nil {
+	if err := st.RebuildFromApps(ctx, discovered); err != nil {
+		if startupInterrupted(ctx, err) {
+			return tokens, fmt.Errorf("seed state: %w", err)
+		}
 		rebuildErr = err
 		logger.Warn("State: rebuild from apps failed; continuing", "error", err)
 	}
 	for _, issue := range issues {
+		if err := checkCtx(); err != nil {
+			return tokens, err
+		}
 		if app.IsReservedDir(issue.Name) {
 			// Defense in depth: the loader already filters Relay-owned staging
 			// directories, so a reserved issue should never reach here. If one
@@ -1411,11 +1430,38 @@ func persistStartupDiscovery(
 			// directory that is not an app.
 			continue
 		}
-		tokens[issue.Name] = st.RecordInvalidDesired(issue.Name, issue.Err)
+		token, err := st.RecordInvalidDesired(ctx, issue.Name, issue.Err)
+		if err != nil {
+			if startupInterrupted(ctx, err) {
+				return tokens, fmt.Errorf("record invalid desired: %w", err)
+			}
+			continue
+		}
+		tokens[issue.Name] = token
 	}
-	st.PruneRemoved(dir)
+	if err := checkCtx(); err != nil {
+		return tokens, err
+	}
+	if err := st.PruneRemoved(ctx, dir); err != nil {
+		if startupInterrupted(ctx, err) {
+			return tokens, fmt.Errorf("prune removed: %w", err)
+		}
+	}
 	for _, d := range discovered {
-		tokens[d.App.Name] = st.RecordDiscoveredWithFingerprint(d.App, d.Fingerprint)
+		if err := checkCtx(); err != nil {
+			return tokens, err
+		}
+		token, err := st.RecordDiscoveredWithFingerprint(ctx, d.App, d.Fingerprint)
+		if err != nil {
+			if startupInterrupted(ctx, err) {
+				return tokens, fmt.Errorf("record discovered: %w", err)
+			}
+			continue
+		}
+		tokens[d.App.Name] = token
+	}
+	if err := checkCtx(); err != nil {
+		return tokens, err
 	}
 	return tokens, rebuildErr
 }
@@ -1498,7 +1544,7 @@ func prepareApps(
 			} else {
 				logger.Warn("App: prepare failed", "app", fn.Name, "error", err)
 				if st != nil {
-					st.RecordReconcileFailure(fn.Name, err, token)
+					st.RecordReconcileFailure(ctx, fn.Name, err, token)
 				}
 			}
 			prepared = append(prepared, runner.NewUnavailable(fn))
@@ -1512,7 +1558,7 @@ func prepareApps(
 			// a long build is not in the image, and the reconciler's watcher/periodic
 			// audit detects it by comparing the on-disk digest against this recorded
 			// built identity on the next pass.
-			st.RecordReconcileSuccess(fn.Name, prep.Image, prep.Fingerprint, time.Now(), fn, token)
+			st.RecordReconcileSuccess(ctx, fn.Name, prep.Image, prep.Fingerprint, time.Now(), fn, token)
 		}
 		prepared = append(prepared, runner.NewPrepared(fn, prep, manager))
 		preparedCount++
@@ -1644,14 +1690,18 @@ func acquireServiceLease(manager *runtime.Manager, name, image string) *runtime.
 // derives the removal's own fresh reconcileTimeout bound; the housekeeping
 // barrier serializes the image sweep behind it exactly as it does for Applys.
 func enqueueStartupServices(prepared []*runner.PreparedApp, services *reconciler.ServiceCoordinator, logger *slog.Logger) {
-	enqueueStartupServicesWithState(prepared, services, nil, nil, logger)
+	enqueueStartupServicesWithState(context.Background(), prepared, services, nil, nil, logger)
 }
 
 // enqueueStartupServicesWithState is enqueueStartupServices with the state sink
 // and the exact startup discovery transition tokens. The service status
 // callbacks are conditioned on those tokens, so a convergence superseded by a
-// newer generation cannot rewrite state.
+// newer generation cannot rewrite state. ctx is the worker lifecycle context:
+// callbacks that complete after shutdown attempt their state write with a
+// cancelled context, which is treated as normal shutdown (the write fails
+// closed and is logged at Debug) rather than a reconcile failure.
 func enqueueStartupServicesWithState(
+	ctx context.Context,
 	prepared []*runner.PreparedApp,
 	services *reconciler.ServiceCoordinator,
 	st *state.State,
@@ -1671,10 +1721,10 @@ func enqueueStartupServicesWithState(
 			if st != nil && len(fn.Template.Services) > 0 {
 				token := tokens[fn.Name]
 				services.EnqueueWithStatusLeased(fn.Name, fn.Template, prep.Image, prep.Env, lease,
-					func() { st.RecordReconciling(fn.Name, token) },
+					func() { st.RecordReconciling(ctx, fn.Name, token) },
 					func(err error) {
 						if err != nil {
-							st.RecordServiceFailure(fn.Name, err, token)
+							st.RecordServiceFailure(ctx, fn.Name, err, token)
 							return
 						}
 						// Persist the fingerprint the image was ACTUALLY built
@@ -1682,7 +1732,7 @@ func enqueueStartupServicesWithState(
 						// could record content the active image does not serve, and
 						// the next reconcile/audit detects any drift by comparing the
 						// on-disk digest against this built identity.
-						st.RecordReconcileSuccess(fn.Name, prep.Image, prep.Fingerprint, time.Now(), fn, token)
+						st.RecordReconcileSuccess(ctx, fn.Name, prep.Image, prep.Fingerprint, time.Now(), fn, token)
 					})
 			} else {
 				services.EnqueueLeased(fn.Name, fn.Template, prep.Image, prep.Env, lease)
