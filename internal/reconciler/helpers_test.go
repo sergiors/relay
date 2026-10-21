@@ -48,48 +48,48 @@ func newTestReconciler(
 		seedCurrent(r, pf.App())
 		if cfg.State != nil {
 			// Seed the cross-worker fence from the SAME discovery write, never a
-			// later read of apps.generation (which could claim another writer's
+			// later read of apps.fencing_token (which could claim another writer's
 			// generation).
-			token, err := cfg.State.RecordDiscovered(context.Background(), pf.App())
+			fencingToken, err := cfg.State.RecordDiscovered(context.Background(), pf.App())
 			if err != nil {
 				t.Fatalf("record initial app %q: %v", pf.App().Name, err)
 			}
-			r.SeedStateToken(pf.App().Name, token)
+			r.SeedFencingToken(pf.App().Name, fencingToken)
 		}
 	}
 	return r, reg
 }
 
 // recordSuccess gives name a usable persisted generation without reading the
-// token back from the database: the desired write returns the exact token and
-// the success is conditioned on it. A test that then drives the reconciler
-// through a generation-specific callback seeds this token with
-// Reconciler.SeedStateToken so the local fence matches the persisted row.
+// fencing token back from the database: the desired write returns the exact
+// token and the success is conditioned on it. A test that then drives the
+// reconciler through a fencing-token-guarded callback seeds this token with
+// Reconciler.SeedFencingToken so the local fence matches the persisted row.
 func recordSuccess(
 	t *testing.T,
 	st *state.State,
 	name, image, fingerprint string,
 	preparedAt time.Time,
 	fn app.App,
-) state.Token {
+) state.FencingToken {
 	t.Helper()
-	token, err := st.RecordDiscoveredWithFingerprint(context.Background(), fn, fingerprint)
+	fencingToken, err := st.RecordDiscoveredWithFingerprint(context.Background(), fn, fingerprint)
 	if err != nil {
 		t.Fatalf("RecordDiscoveredWithFingerprint(%q): %v", name, err)
 	}
-	if token <= 0 {
-		t.Fatalf("RecordDiscoveredWithFingerprint(%q) returned token %d, want positive",
-			name, token)
+	if fencingToken <= 0 {
+		t.Fatalf("RecordDiscoveredWithFingerprint(%q) returned fencing token %d, want positive",
+			name, fencingToken)
 	}
-	landed, err := st.RecordReconcileSuccess(context.Background(), name, image, fingerprint, preparedAt, fn, token)
+	landed, err := st.RecordReconcileSuccess(context.Background(), name, image, fingerprint, preparedAt, fn, fencingToken)
 	if err != nil {
 		t.Fatalf("RecordReconcileSuccess(%q): %v", name, err)
 	}
 	if !landed {
-		t.Fatalf("RecordReconcileSuccess(%q) did not persist with token %d",
-			name, token)
+		t.Fatalf("RecordReconcileSuccess(%q) did not persist with fencing token %d",
+			name, fencingToken)
 	}
-	return token
+	return fencingToken
 }
 
 // newTestStateReconciler is newTestReconciler with a temp state DB wired, and

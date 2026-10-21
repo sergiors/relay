@@ -118,8 +118,9 @@ func TestAppForPath(t *testing.T) {
 // TestShouldEnqueueUsesTemplateCandidacy pins the watcher's debounce filter:
 // edits under a directory that has never had template.yaml arm no timer, while
 // creating template.yaml does, and a known app remains responsive to losing its
-// template so the removal is observed. A token-only startup-invalid app is also
-// responsive. Reserved staging paths stay filtered before candidacy is checked.
+// template so the removal is observed. A fencing-token-only startup-invalid app
+// is also responsive. Reserved staging paths stay filtered before candidacy is
+// checked.
 func TestShouldEnqueueUsesTemplateCandidacy(t *testing.T) {
 	root := t.TempDir()
 
@@ -155,12 +156,12 @@ func TestShouldEnqueueUsesTemplateCandidacy(t *testing.T) {
 		t.Fatal("a known app's template removal must enqueue its removal")
 	}
 
-	// A token-only known name (startup invalid desired, no registry entry) also
-	// stays responsive.
+	// A fencing-token-only known name (startup invalid desired, no registry
+	// entry) also stays responsive.
 	rToken := New(Config{Root: root}, nil, nil, testutil.DiscardLogger())
-	rToken.SeedStateToken("startup-bad", 1)
+	rToken.SeedFencingToken("startup-bad", 1)
 	if !rToken.shouldEnqueue("startup-bad") {
-		t.Fatal("a token-only known app must remain responsive to template removal")
+		t.Fatal("a fencing-token-only known app must remain responsive to template removal")
 	}
 
 	// Reserved staging paths are filtered before candidacy.

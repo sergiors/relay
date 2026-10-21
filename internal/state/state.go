@@ -112,34 +112,34 @@ const (
 	ReconcileFailed  = "failed"
 )
 
-// Token is an opaque, PostgreSQL-authoritative transition token for one app's
-// current desired generation. Zero is never allocated: every positive token is
-// drawn from the global apps_generation_seq sequence while the per-app advisory
-// lock is held, so it is unique across all Relay processes sharing the database.
-// Generation-specific writes are conditioned on the token the caller observed, so
-// a stale completion updates no row instead of overwriting a newer generation or
-// resurrecting a removed app. It is deliberately not part of Detail or the
-// persisted JSONB snapshot: it is internal coordination state, never a
-// CLI/JSON field.
-type Token int64
+// FencingToken is an opaque, PostgreSQL-authoritative fencing token for one
+// app's current desired generation. Zero is never allocated: every positive
+// token is drawn from the global apps_fencing_token_seq sequence while the
+// per-app advisory lock is held, so it is unique across all Relay processes
+// sharing the database. Fencing-token-guarded writes are conditioned on the
+// token the caller observed, so a stale completion updates no row instead of
+// overwriting a newer desired generation or resurrecting a removed app. It is
+// deliberately not part of Detail or the persisted JSONB snapshot: it is
+// internal coordination state, never a CLI/JSON field.
+type FencingToken int64
 
-// nextGenerationTx allocates the next positive transition token. nextval is
+// nextFencingTokenTx allocates the next positive fencing token. nextval is
 // intentionally non-transactional: a rolled-back write merely skips a value, and
 // tokens only need to be unique and increasing, never gapless. Callers invoke it
 // while holding lockAppTx for the app whose desired state is advancing.
-func nextGenerationTx(ctx context.Context, tx *sql.Tx) (Token, error) {
-	var generation int64
+func nextFencingTokenTx(ctx context.Context, tx *sql.Tx) (FencingToken, error) {
+	var fencingToken int64
 	if err := tx.QueryRowContext(ctx,
-		`SELECT nextval('apps_generation_seq')`).Scan(&generation); err != nil {
-		return 0, fmt.Errorf("allocate app generation: %w", err)
+		`SELECT nextval('apps_fencing_token_seq')`).Scan(&fencingToken); err != nil {
+		return 0, fmt.Errorf("allocate app fencing token: %w", err)
 	}
-	return Token(generation), nil
+	return FencingToken(fencingToken), nil
 }
 
 // Row is the per-app summary returned by ListApps. Its fields are part
-// of the apps.data snapshot except the relational Name/UpdatedAt (columns)
-// and the derived HandlerCount; it is embedded in Detail, so the JSON tags below
-// also shape the persisted snapshot.
+// of the apps.data snapshot except relational Name/UpdatedAt and the derived
+// HandlerCount. The app fencing token is separate relational metadata and is
+// not part of Row or Detail.
 type Row struct {
 	Name                string `json:"-"`
 	Runtime             string `json:"runtime,omitempty"`
@@ -153,9 +153,9 @@ type Row struct {
 // Detail is the full per-app record returned by GetApp, including the
 // handler list, the schedules, and the services. It is the persistence model:
 // the whole snapshot is stored as one JSON object in apps.data (marshalled
-// through app_json.go), with only name and updated_at kept as columns. The
-// embedded Row fields and every field below — except Name, UpdatedAt, and the
-// derived HandlerCount — are part of that snapshot.
+// through app_json.go), while name, updated_at, and fencing_token are relational
+// columns. The embedded Row fields and every field below — except Name,
+// UpdatedAt, and the derived HandlerCount — are part of that snapshot.
 //
 // Env holds env-var names only (each value is RedactedEnvValue); literal env
 // values are never persisted. Secrets holds secret reference names only, never
@@ -580,8 +580,8 @@ func (st *State) acquireWorkerLock(ctx context.Context) (*sql.Conn, error) {
 // text.
 //
 // apps stores a whole per-app snapshot as one JSONB object in data, with only
-// the stable name key, the write timestamp, and the internal transition token
-// (generation) kept as columns. There are deliberately no
+// the stable name key, the write timestamp, and the internal fencing token
+// (fencing_token) kept as columns. There are deliberately no
 // per-handler/per-schedule/per-service child tables: the nested
 // configuration is part of the snapshot, so a template change replaces one row
 // atomically. stats is the per-worker global counter snapshot (keyed by worker
@@ -605,13 +605,13 @@ func (st *State) initSchema(ctx context.Context) error {
 			name TEXT PRIMARY KEY,
 			data JSONB NOT NULL,
 			updated_at TEXT NOT NULL,
-			generation BIGINT NOT NULL DEFAULT 0
+			fencing_token BIGINT NOT NULL DEFAULT 0
 		)`,
-		// generation is the internal per-app transition token (see Token). It is
-		// a column, never part of apps.data. The global sequence is CACHE 1 so
-		// concurrent allocators never hand out the same value; gaps from
+		// fencing_token is the internal per-app fencing token (see FencingToken).
+		// It is a column, never part of apps.data. The global sequence is CACHE 1
+		// so concurrent allocators never hand out the same value; gaps from
 		// rolled-back transactions are harmless.
-		`CREATE SEQUENCE IF NOT EXISTS apps_generation_seq AS BIGINT CACHE 1 START WITH 1`,
+		`CREATE SEQUENCE IF NOT EXISTS apps_fencing_token_seq AS BIGINT CACHE 1 START WITH 1`,
 		// stats holds each worker's "current operational snapshot". The row key
 		// is the OWNER worker identity, so N workers sharing this database keep N
 		// independent counter sets instead of last-writer-wins overwriting one
@@ -925,13 +925,13 @@ func (st *State) rebuildDiscoveredTx(ctx context.Context, discovered []Discovere
 			if err := lockAppTx(ctx, tx, d.App.Name); err != nil {
 				return err
 			}
-			generation, err := nextGenerationTx(ctx, tx)
+			fencingToken, err := nextFencingTokenTx(ctx, tx)
 			if err != nil {
 				return err
 			}
 			detail := appSnapshot(d.App.Name, d.App.Template, StatusPreparing, "", "", d.Fingerprint, "", "", "", "")
 			detail.UpdatedAt = st.nowString()
-			if err := upsertAppTx(ctx, tx, detail, generation); err != nil {
+			if err := upsertAppTx(ctx, tx, detail, fencingToken); err != nil {
 				return err
 			}
 		}
@@ -982,12 +982,12 @@ func (st *State) fingerprint(fn app.App) string {
 // still-serving image or a recent failure outcome. It computes the fingerprint
 // itself; callers that already hold one use RecordDiscoveredWithFingerprint.
 //
-// It returns the new transition token to carry through this generation's
+// It returns the new fencing token to carry through this generation's
 // build/service callbacks, or zero with an error when the write failed (in
 // which case those callbacks must not persist anything). ctx bounds the write
 // transaction, including its advisory-lock wait, so a cancelled lifecycle
 // cannot block a startup or reload path.
-func (st *State) RecordDiscovered(ctx context.Context, fn app.App) (Token, error) {
+func (st *State) RecordDiscovered(ctx context.Context, fn app.App) (FencingToken, error) {
 	return st.RecordDiscoveredWithFingerprint(ctx, fn, st.fingerprint(fn))
 }
 
@@ -1005,19 +1005,19 @@ func (st *State) RecordDiscovered(ctx context.Context, fn app.App) (Token, error
 // fingerprint is recorded.
 //
 // The write transaction holds no external I/O: the fingerprint is passed in, not
-// computed inside the closure. The returned token is the exact generation the
+// computed inside the closure. The returned fencing token is the exact token the
 // write persisted; callers must not read it back later. A write interrupted by
 // ctx cancellation returns zero and an error wrapping the context error.
 func (st *State) RecordDiscoveredWithFingerprint(
 	ctx context.Context,
 	fn app.App,
 	fingerprint string,
-) (Token, error) {
+) (FencingToken, error) {
 	ts := st.nowString()
-	var generation Token
+	var fencingToken FencingToken
 	err := st.appWriteTx(ctx, fn.Name, func(tx *sql.Tx) error {
 		var err error
-		generation, err = recordDesiredTx(ctx, tx, fn.Name, fn.Template, fingerprint, ts)
+		fencingToken, err = recordDesiredTx(ctx, tx, fn.Name, fn.Template, fingerprint, ts)
 		return err
 	})
 	if err != nil {
@@ -1026,19 +1026,19 @@ func (st *State) RecordDiscoveredWithFingerprint(
 		return 0, err
 	}
 	st.notifyStatus(fn.Name, StatusPreparing)
-	return generation, nil
+	return fencingToken, nil
 }
 
 // recordDesiredTx is the shared body of the desired-generation writes (startup
-// discovery and live desired-change detection): it allocates a fresh transition
+// discovery and live desired-change detection): it allocates a fresh fencing
 // token, refreshes the whole configuration snapshot and the desired fingerprint,
 // and sets status=preparing while preserving the last usable active generation
 // (image/fingerprint/prepared_at) and the previous last-reconcile outcome. Only
 // a successful full reconcile replaces the active generation. An absent row is
 // created with no active generation and the supplied desired fingerprint.
 //
-// Advancing the token is what invalidates older completions across workers: a
-// callback carrying a previous generation updates no row.
+// Advancing the fencing token is what invalidates older completions across
+// workers: a callback carrying a previous token updates no row.
 func recordDesiredTx(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -1046,8 +1046,8 @@ func recordDesiredTx(
 	tmpl *app.Template,
 	fingerprint,
 	ts string,
-) (Token, error) {
-	generation, err := nextGenerationTx(ctx, tx)
+) (FencingToken, error) {
+	fencingToken, err := nextFencingTokenTx(ctx, tx)
 	if err != nil {
 		return 0, err
 	}
@@ -1065,10 +1065,10 @@ func recordDesiredTx(
 			active.PreparedAt, active.LastReconcileAt, active.LastReconcileStatus, active.LastError)
 	}
 	detail.UpdatedAt = ts
-	if err := upsertAppTx(ctx, tx, detail, generation); err != nil {
+	if err := upsertAppTx(ctx, tx, detail, fencingToken); err != nil {
 		return 0, err
 	}
-	return generation, nil
+	return fencingToken, nil
 }
 
 // RecordReconcileSuccess records that an app built and serves an active
@@ -1080,7 +1080,7 @@ func recordDesiredTx(
 // fingerprint, so the next discovery/desired-change starts from a converged
 // desired value.
 //
-// It is a generation-guarded UPDATE, never an upsert: a completion carrying a
+// It is a fencing-token-guarded UPDATE, never an upsert: a completion carrying a
 // stale token (another worker advanced the app, or the app was removed) affects
 // no row and is not published to the status observer — it reports (false, nil).
 // A success can only ever describe the generation that already owns the row. It
@@ -1093,9 +1093,9 @@ func (st *State) RecordReconcileSuccess(
 	fingerprint string,
 	preparedAt time.Time,
 	fn app.App,
-	generation Token,
+	fencingToken FencingToken,
 ) (bool, error) {
-	if generation <= 0 {
+	if fencingToken <= 0 {
 		return false, nil
 	}
 	ts := st.nowString()
@@ -1105,7 +1105,7 @@ func (st *State) RecordReconcileSuccess(
 		detail := appSnapshot(name, fn.Template, StatusReady, image, fingerprint, fingerprint, prepared, ts, ReconcileSuccess, "")
 		detail.UpdatedAt = ts
 		var err error
-		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, generation)
+		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken)
 		return err
 	})
 	if err != nil {
@@ -1130,7 +1130,7 @@ func (st *State) RecordReconcileSuccess(
 // fingerprint; the fingerprint is computed BEFORE the write transaction opens so
 // the transaction holds no filesystem I/O. Callers that already computed it (the
 // reconciler's rebuild path) use RecordPreparingWithFingerprint.
-func (st *State) RecordPreparing(ctx context.Context, name string, fn app.App) (Token, error) {
+func (st *State) RecordPreparing(ctx context.Context, name string, fn app.App) (FencingToken, error) {
 	return st.RecordPreparingWithFingerprint(ctx, name, fn, st.fingerprint(fn))
 }
 
@@ -1142,7 +1142,7 @@ func (st *State) RecordPreparing(ctx context.Context, name string, fn app.App) (
 // desired fingerprint and sets status=preparing while preserving the last usable
 // active generation and the previous last-reconcile outcome.
 //
-// It returns the new transition token to carry through this generation's
+// It returns the new fencing token to carry through this generation's
 // callbacks, or zero with an error when the write failed (fail closed: those
 // callbacks must not persist anything). ctx bounds the transaction, including
 // its advisory-lock wait.
@@ -1151,12 +1151,12 @@ func (st *State) RecordPreparingWithFingerprint(
 	name string,
 	fn app.App,
 	fingerprint string,
-) (Token, error) {
+) (FencingToken, error) {
 	ts := st.nowString()
-	var generation Token
+	var fencingToken FencingToken
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		var err error
-		generation, err = recordDesiredTx(ctx, tx, name, fn.Template, fingerprint, ts)
+		fencingToken, err = recordDesiredTx(ctx, tx, name, fn.Template, fingerprint, ts)
 		return err
 	})
 	if err != nil {
@@ -1167,22 +1167,23 @@ func (st *State) RecordPreparingWithFingerprint(
 	// recordDesiredTx writes StatusPreparing through the same desired-generation
 	// path as discovery, so the observer is notified with preparing here too.
 	st.notifyStatus(name, StatusPreparing)
-	return generation, nil
+	return fencingToken, nil
 }
 
 // RecordReconcileBuilding changes only the lifecycle status to building. It is
 // called at the actual managed-runtime image build boundary (an app or
 // dependency image build), not when a build is merely queued. Persistent
 // services have no separate image build, so the service path never publishes
-// building. It is generation-guarded: a stale build callback affects no row and
-// reports (false, nil). ctx bounds the transaction, including its advisory-lock
-// wait, so a cancelled lifecycle returns promptly with a context error.
+// building. It is fencing-token-guarded: a stale build callback affects no row
+// and reports (false, nil). ctx bounds the transaction, including its
+// advisory-lock wait, so a cancelled lifecycle returns promptly with a context
+// error.
 func (st *State) RecordReconcileBuilding(
 	ctx context.Context,
 	name string,
-	generation Token,
+	fencingToken FencingToken,
 ) (bool, error) {
-	return st.recordStatus(ctx, name, StatusBuilding, generation)
+	return st.recordStatus(ctx, name, StatusBuilding, fencingToken)
 }
 
 // RecordReconciling changes only the lifecycle status to reconciling. It is
@@ -1190,24 +1191,24 @@ func (st *State) RecordReconcileBuilding(
 // work to perform (entrypoint/image services), so the status never claims
 // convergence work that has not started. A fully-converged no-op verification
 // pass never calls it: an unchanged app stays ready rather than flashing
-// reconciling. It is generation-guarded: a stale convergence callback affects
+// reconciling. It is fencing-token-guarded: a stale convergence callback affects
 // no row and reports (false, nil). ctx bounds the transaction, including its
 // advisory-lock wait.
 func (st *State) RecordReconciling(
 	ctx context.Context,
 	name string,
-	generation Token,
+	fencingToken FencingToken,
 ) (bool, error) {
-	return st.recordStatus(ctx, name, StatusReconciling, generation)
+	return st.recordStatus(ctx, name, StatusReconciling, fencingToken)
 }
 
 func (st *State) recordStatus(
 	ctx context.Context,
 	name,
 	status string,
-	generation Token,
+	fencingToken FencingToken,
 ) (bool, error) {
-	if generation <= 0 {
+	if fencingToken <= 0 {
 		return false, nil
 	}
 	ts := st.nowString()
@@ -1215,12 +1216,12 @@ func (st *State) recordStatus(
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		detail, found, err := scanApp(name, tx.QueryRowContext(ctx,
 			`SELECT `+jsonPayloadExpr+`, updated_at
-			 FROM apps WHERE name = $1 AND generation = $2`, name, int64(generation)))
+			 FROM apps WHERE name = $1 AND fencing_token = $2`, name, int64(fencingToken)))
 		if err != nil || !found {
 			return err
 		}
 		detail.Status, detail.UpdatedAt = status, ts
-		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, generation)
+		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken)
 		return err
 	})
 	if err != nil {
@@ -1245,17 +1246,17 @@ func (st *State) recordStatus(
 // inside the transaction. Status is degraded when a prior usable active
 // generation exists — the app still serves but the desired generation did
 // not converge — and unavailable otherwise; a failure never claims ready, so the
-// failed outcome is always visible to an operator. It is generation-guarded: a
-// stale failure affects no row and is not published (false, nil). It returns
+// failed outcome is always visible to an operator. It is fencing-token-guarded:
+// a stale failure affects no row and is not published (false, nil). It returns
 // whether the write landed and an error only when the write itself failed. ctx
 // bounds the transaction, including its advisory-lock wait.
 func (st *State) RecordReconcileFailure(
 	ctx context.Context,
 	name string,
 	err2 error,
-	generation Token,
+	fencingToken FencingToken,
 ) (bool, error) {
-	if generation <= 0 {
+	if fencingToken <= 0 {
 		return false, nil
 	}
 	ts := st.nowString()
@@ -1264,12 +1265,12 @@ func (st *State) RecordReconcileFailure(
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		detail, found, err := scanApp(name, tx.QueryRowContext(ctx,
 			`SELECT `+jsonPayloadExpr+`, updated_at
-			 FROM apps WHERE name = $1 AND generation = $2`, name, int64(generation)))
+			 FROM apps WHERE name = $1 AND fencing_token = $2`, name, int64(fencingToken)))
 		if err != nil {
 			return err
 		}
 		if !found {
-			// A stale generation no longer owns the row; do not resurrect it.
+			// A stale fencing token no longer owns the row; do not resurrect it.
 			return nil
 		}
 		detail.LastReconcileAt = ts
@@ -1286,7 +1287,7 @@ func (st *State) RecordReconcileFailure(
 		}
 		status = detail.Status
 		detail.UpdatedAt = ts
-		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, generation)
+		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken)
 		return err
 	})
 	if err != nil {
@@ -1324,7 +1325,7 @@ func (st *State) RecordReconcileFailure(
 //
 // It is an UPSERT: an invalid app never seen before (no prior row) is
 // inserted, so a fresh invalid desired state is visible to operators instead of
-// being silently absent. It advances the transition token, invalidating older
+// being silently absent. It advances the fencing token, invalidating older
 // completions across workers, and returns that token (zero with an error on a
 // failed write). The status observer is notified with the resulting status,
 // keeping the one-hot app_status gauge consistent. ctx bounds the transaction,
@@ -1333,12 +1334,12 @@ func (st *State) RecordInvalidDesired(
 	ctx context.Context,
 	name string,
 	err2 error,
-) (Token, error) {
+) (FencingToken, error) {
 	ts := st.nowString()
-	var generation Token
+	var fencingToken FencingToken
 	status := ""
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
-		gen, err := nextGenerationTx(ctx, tx)
+		nextFencingToken, err := nextFencingTokenTx(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -1376,10 +1377,10 @@ func (st *State) RecordInvalidDesired(
 		}
 		status = detail.Status
 		detail.UpdatedAt = ts
-		if err := upsertAppTx(ctx, tx, detail, gen); err != nil {
+		if err := upsertAppTx(ctx, tx, detail, nextFencingToken); err != nil {
 			return err
 		}
-		generation = gen
+		fencingToken = nextFencingToken
 		return nil
 	})
 	if err != nil {
@@ -1390,7 +1391,7 @@ func (st *State) RecordInvalidDesired(
 	if status != "" {
 		st.notifyStatus(name, status)
 	}
-	return generation, nil
+	return fencingToken, nil
 }
 
 // ActiveImages returns the currently recorded active image reference for every
@@ -1436,16 +1437,16 @@ func (st *State) ActiveImages() map[string]string {
 // degraded; one without an active generation is unavailable. A no-runtime
 // external-image service-only app has no app image but a
 // successfully-prepared generation, so it is degraded, not unavailable. It is
-// generation-guarded: a stale callback reports (false, nil) and writes nothing.
-// It returns whether the write landed and an error only when the write itself
-// failed. ctx bounds the transaction, including its advisory-lock wait.
+// fencing-token-guarded: a stale callback reports (false, nil) and writes
+// nothing. It returns whether the write landed and an error only when the write
+// itself failed. ctx bounds the transaction, including its advisory-lock wait.
 func (st *State) RecordServiceFailure(
 	ctx context.Context,
 	name string,
 	err2 error,
-	generation Token,
+	fencingToken FencingToken,
 ) (bool, error) {
-	if generation <= 0 {
+	if fencingToken <= 0 {
 		return false, nil
 	}
 	ts := st.nowString()
@@ -1454,7 +1455,7 @@ func (st *State) RecordServiceFailure(
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		detail, found, err := scanApp(name, tx.QueryRowContext(ctx,
 			`SELECT `+jsonPayloadExpr+`, updated_at
-			 FROM apps WHERE name = $1 AND generation = $2`, name, int64(generation)))
+			 FROM apps WHERE name = $1 AND fencing_token = $2`, name, int64(fencingToken)))
 		if err != nil {
 			return err
 		}
@@ -1471,7 +1472,7 @@ func (st *State) RecordServiceFailure(
 		}
 		status = detail.Status
 		detail.UpdatedAt = ts
-		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, generation)
+		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken)
 		return err
 	})
 	if err != nil {
@@ -1487,10 +1488,10 @@ func (st *State) RecordServiceFailure(
 
 // RecordRemoved deletes an app and its per-app stats from the state
 // database, so a removed app never leaves a stale stats row behind. The delete
-// is generation-guarded: it removes the row only while the caller's token still
-// owns it, so a removal observed by an older worker cannot delete a newer
-// generation. app_stats is deleted only when the matching apps row was actually
-// removed; both happen in one transaction. On a landed delete the status
+// is fencing-token-guarded: it removes the row only while the caller's token
+// still owns it, so a removal observed by an older worker cannot delete a newer
+// desired generation. app_stats is deleted only when the matching apps row was
+// actually removed; both happen in one transaction. On a landed delete the status
 // observer is notified with an EMPTY status, the signal to delete the app's
 // status series (a removed app has no lifecycle). It returns whether the row was
 // deleted. ctx bounds the transaction, including its advisory-lock wait, so a
@@ -1498,16 +1499,16 @@ func (st *State) RecordServiceFailure(
 func (st *State) RecordRemoved(
 	ctx context.Context,
 	name string,
-	generation Token,
+	fencingToken FencingToken,
 ) (bool, error) {
-	if generation <= 0 {
+	if fencingToken <= 0 {
 		return false, nil
 	}
 	deleted := false
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		result, err := tx.ExecContext(ctx,
-			`DELETE FROM apps WHERE name = $1 AND generation = $2`,
-			name, int64(generation))
+			`DELETE FROM apps WHERE name = $1 AND fencing_token = $2`,
+			name, int64(fencingToken))
 		if err != nil {
 			return err
 		}
@@ -1516,7 +1517,7 @@ func (st *State) RecordRemoved(
 			return err
 		}
 		if affected == 0 {
-			// A newer generation (or a re-added app) owns the row; leave it.
+			// A newer fencing token (or a re-added app) owns the row; leave it.
 			return nil
 		}
 		if _, err := tx.ExecContext(ctx,
@@ -1614,7 +1615,7 @@ func (st *State) PruneRemoved(ctx context.Context, dir string) error {
 			}
 		}
 		// Startup pruning is filesystem-authoritative and therefore
-		// unconditional: no generation token can own a directory that is
+		// unconditional: no fencing token can own a directory that is
 		// genuinely gone at startup. removeTx is the UNCONDITIONAL removal.
 		if rerr := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 			return removeTx(ctx, tx, name)
@@ -1646,8 +1647,8 @@ func (st *State) PruneRemoved(ctx context.Context, dir string) error {
 // row itself and the matching app_stats row — inside tx. The nested
 // handler/schedule/service configuration lives inside apps.data, so no
 // child-table delete is needed. It is the UNCONDITIONAL removal used by the
-// startup sweep (PruneRemoved), where the filesystem — not a generation — is the
-// source of truth. Live removal uses the generation-guarded DELETE in
+// startup sweep (PruneRemoved), where the filesystem — not a fencing token — is
+// the source of truth. Live removal uses the fencing-token-guarded DELETE in
 // RecordRemoved instead.
 func removeTx(ctx context.Context, tx *sql.Tx, name string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM app_stats WHERE app_name = $1`, name); err != nil {
@@ -1740,40 +1741,40 @@ func scanApp(name string, row *sql.Row) (Detail, bool, error) {
 }
 
 // upsertAppTx writes the whole Detail snapshot as one JSONB value in
-// apps.data, upserting on the name key and stamping generation. It is reserved
+// apps.data, upserting on the name key and stamping fencing_token. It is reserved
 // for desired-state writes (discovery, preparing, invalid), which are the only
-// operations allowed to CREATE a row or advance its generation. The snapshot
+// operations allowed to CREATE a row or advance its fencing token. The snapshot
 // replaces the previous one atomically, so a template change never leaves a
 // mixture of old and new handler/schedule/service configuration.
-func upsertAppTx(ctx context.Context, tx *sql.Tx, detail Detail, generation Token) error {
+func upsertAppTx(ctx context.Context, tx *sql.Tx, detail Detail, fencingToken FencingToken) error {
 	payload, err := marshalApp(detail)
 	if err != nil {
 		return err
 	}
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO apps (name, data, updated_at, generation)
+		`INSERT INTO apps (name, data, updated_at, fencing_token)
 		 VALUES ($1, $2, $3, $4)
 		 ON CONFLICT(name) DO UPDATE SET
-		   data       = excluded.data,
-		   updated_at = excluded.updated_at,
-		   generation = excluded.generation`,
-		detail.Name, payload, detail.UpdatedAt, int64(generation))
+		   data          = excluded.data,
+		   updated_at    = excluded.updated_at,
+		   fencing_token = excluded.fencing_token`,
+		detail.Name, payload, detail.UpdatedAt, int64(fencingToken))
 	return err
 }
 
 // updateAppIfCurrentTx rewrites one app snapshot only while the row still
-// carries generation, returning false when the token is stale or the row is
-// gone. Every generation-specific outcome (status, success, failure,
+// carries fencingToken, returning false when the token is stale or the row is
+// gone. Every fencing-token-specific outcome (status, success, failure,
 // service failure) goes through this guarded UPDATE so a delayed completion
 // from another worker — or from before a removal — can never overwrite a newer
-// generation, create a row, or publish a status.
+// desired generation, create a row, or publish a status.
 func updateAppIfCurrentTx(
 	ctx context.Context,
 	tx *sql.Tx,
 	detail Detail,
-	generation Token,
+	fencingToken FencingToken,
 ) (bool, error) {
-	if generation <= 0 {
+	if fencingToken <= 0 {
 		return false, nil
 	}
 	payload, err := marshalApp(detail)
@@ -1782,8 +1783,8 @@ func updateAppIfCurrentTx(
 	}
 	result, err := tx.ExecContext(ctx,
 		`UPDATE apps SET data = $1, updated_at = $2
-		 WHERE name = $3 AND generation = $4`,
-		payload, detail.UpdatedAt, detail.Name, int64(generation))
+		 WHERE name = $3 AND fencing_token = $4`,
+		payload, detail.UpdatedAt, detail.Name, int64(fencingToken))
 	if err != nil {
 		return false, err
 	}

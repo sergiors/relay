@@ -47,7 +47,7 @@
 //     a directory that is merely mid-copy.
 //   - The watcher arms a per-app debounce only for a directory that currently
 //     has a template.yaml or for a name this worker already knows (registry,
-//     pending rules, or a startup transition token). Unrelated writes in a
+//     pending rules, or a startup fencing token). Unrelated writes in a
 //     never-app directory therefore cause no reconcile churn, while template
 //     creation, deletion, and rename stay responsive.
 //

@@ -25,8 +25,8 @@ events:
       event_name: [INSERT]
 `)
 	fn := fnFor(t, "demo", tmpl)
-	token := seedToken(t, c, fn)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, c, fn)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -48,8 +48,8 @@ events:
     pattern:
       event_name: [INSERT]
 `))
-	defaultedToken := seedToken(t, c, defaulted)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "defaulted", "img", "fp", time.Now(), defaulted, defaultedToken); err != nil {
+	defaultedFencingToken := seedFencingToken(t, c, defaulted)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "defaulted", "img", "fp", time.Now(), defaulted, defaultedFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	d2, ok := c.GetApp("defaulted")

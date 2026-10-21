@@ -33,7 +33,7 @@ func TestStatusTransitionCanceledWhileWaitingForAppLock(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	const name = "canceled-status"
 	fn := fnFor(t, name, tmpl)
-	token := seedTokenWithFingerprint(t, c, fn, "fp")
+	fencingToken := seedFencingTokenWithFingerprint(t, c, fn, "fp")
 
 	seeded, ok := c.GetApp(name)
 	if !ok {
@@ -84,7 +84,7 @@ func TestStatusTransitionCanceledWhileWaitingForAppLock(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		landed, err := c.RecordReconcileBuilding(lifecycle, name, token)
+		landed, err := c.RecordReconcileBuilding(lifecycle, name, fencingToken)
 		results <- transitionResult{landed: landed, err: err}
 	}()
 
@@ -155,7 +155,7 @@ func TestStatusTransitionCanceledWhileWaitingForAppLock(t *testing.T) {
 	writeCtx, writeCancel := context.WithTimeout(
 		context.Background(), 10*time.Second)
 	defer writeCancel()
-	landed, err := c.RecordReconcileBuilding(writeCtx, name, token)
+	landed, err := c.RecordReconcileBuilding(writeCtx, name, fencingToken)
 	if err != nil {
 		t.Fatalf("transition after lock release: %v", err)
 	}

@@ -215,16 +215,17 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	if err := st.PruneRemoved(context.Background(), cfg.fnRoot); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
-	tokens := make(map[string]state.Token, len(functions))
+	fencingTokens := make(map[string]state.FencingToken, len(functions))
 	for _, fn := range functions {
-		token, err := st.RecordDiscovered(context.Background(), fn)
+		fencingToken, err := st.RecordDiscovered(context.Background(), fn)
 		if err != nil {
 			t.Fatalf("record discovered %s: %v", fn.Name, err)
 		}
-		if token <= 0 {
-			t.Fatalf("record discovered %s returned invalid token %d", fn.Name, token)
+		if fencingToken <= 0 {
+			t.Fatalf("record discovered %s returned invalid fencing token %d",
+				fn.Name, fencingToken)
 		}
-		tokens[fn.Name] = token
+		fencingTokens[fn.Name] = fencingToken
 	}
 	restorePersistedStats(m, st)
 
@@ -248,7 +249,7 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 			t.Fatalf("prepare %s: %v", fn.Name, err)
 		}
 		fingerprints[fn.Name] = p.Fingerprint
-		if _, err := st.RecordReconcileSuccess(context.Background(), fn.Name, p.Image, p.Fingerprint, time.Now(), fn, tokens[fn.Name]); err != nil {
+		if _, err := st.RecordReconcileSuccess(context.Background(), fn.Name, p.Image, p.Fingerprint, time.Now(), fn, fencingTokens[fn.Name]); err != nil {
 			t.Errorf("state write error: %v", err)
 		}
 		// Record the exact image ref this run built for post-close cleanup.

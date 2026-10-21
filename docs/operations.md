@@ -138,6 +138,14 @@ write failures remain non-fatal to the event pipeline.
 - Each app is stored as one native JSONB snapshot: runtime/status/image/
   fingerprint/prepared-at/reconcile outcome, env **names** (values redacted) and
   secret **references** (values never stored), handlers, schedules, and services.
+- App reconciliation ownership is tracked separately in `apps.fencing_token`,
+  allocated from the global `apps_fencing_token_seq` sequence. Each desired-state
+  transition advances it under the per-app advisory lock; callbacks with stale
+  tokens cannot update or recreate the row. The state schema is initialized for
+  the current release and is not migrated across releases. Stop old Relay workers
+  before switching binaries that expect a different schema; the `/apps` tree
+  remains authoritative, but replacing the PostgreSQL state database discards
+  its state view, stats, and schedule outbox.
 - `status` lifecycle: `preparing` → `building` → `reconciling` → `ready`;
   `degraded` retains a usable previous image, `unavailable` has none. A failed
   reconcile never displaces a still-serving previous generation and never reports

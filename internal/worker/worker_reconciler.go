@@ -40,7 +40,7 @@ func startAppReconciler(
 	rec *reconciler.Reconciler,
 	apps []app.App,
 	fingerprints map[string]string,
-	tokens map[string]state.Token,
+	fencingTokens map[string]state.FencingToken,
 	prepared []*runner.PreparedApp,
 	shutdown *shutdownRegistry,
 ) {
@@ -56,13 +56,13 @@ func startAppReconciler(
 		for _, fn := range apps {
 			rec.Seed(fn, seeds[fn.Name])
 		}
-		// Seed the EXACT token each startup discovery/invalid write returned.
-		// This lets the first live observation reuse that generation instead of
-		// allocating a new one (or reading back another worker's token), and it
-		// includes present-but-invalid desired definitions so their live removal
-		// can still be generation-guarded.
-		for name, token := range tokens {
-			rec.SeedStateToken(name, token)
+		// Seed the EXACT fencing token each startup discovery/invalid write
+		// returned. This lets the first live observation reuse that generation
+		// instead of allocating a new one (or reading back another worker's
+		// token), and it includes present-but-invalid desired definitions so their
+		// live removal can still be fencing-token-guarded.
+		for name, fencingToken := range fencingTokens {
+			rec.SeedFencingToken(name, fencingToken)
 		}
 		logger.Debug("Startup: seeded startup fingerprints",
 			"count", len(apps),

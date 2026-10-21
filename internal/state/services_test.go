@@ -30,8 +30,8 @@ func TestServiceRoundTrip(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, servicesTmpl)
 	fn := fnFor(t, "demo", tmpl)
-	token := seedToken(t, st, fn)
-	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, st, fn)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -58,8 +58,8 @@ func TestServiceReplacementUpdatesRows(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, servicesTmpl)
 	fn := fnFor(t, "demo", tmpl)
-	token := seedToken(t, st, fn)
-	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, st, fn)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -77,7 +77,7 @@ services:
     port: 8080
     replicas: 5
 `)
-	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed), token); err != nil {
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed), fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -99,12 +99,12 @@ func TestServiceRemovalClearsRows(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, servicesTmpl)
 	fn := fnFor(t, "demo", tmpl)
-	token := seedToken(t, st, fn)
-	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, st, fn)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
-	if _, err := st.RecordRemoved(context.Background(), "demo", token); err != nil {
+	if _, err := st.RecordRemoved(context.Background(), "demo", fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	if _, ok := st.GetApp("demo"); ok {
@@ -117,8 +117,8 @@ func TestServiceEmptyStored(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl) // no services key
 	fn := fnFor(t, "demo", tmpl)
-	token := seedToken(t, st, fn)
-	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, st, fn)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -151,8 +151,8 @@ func TestServiceSourceKindsRoundTrip(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, sourceServicesTmpl)
 	fn := fnFor(t, "demo", tmpl)
-	token := seedToken(t, st, fn)
-	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, st, fn)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 

@@ -18,7 +18,7 @@ import (
 )
 
 // crossWorkerServiceCompletion captures one service-convergence pass's
-// callbacks so the test can decide exactly when the older worker's generation
+// callbacks so the test can decide exactly when the older worker's reconcile
 // completes. Nothing sleeps: completion is driven by the captured closures.
 type crossWorkerServiceCompletion struct {
 	onReconcileStart func()
@@ -171,12 +171,11 @@ func assertAppStateUnchanged(
 	}
 }
 
-// TestCrossWorkerStaleGenerationCannotOverwriteNewerState is the F-02
-// regression: generation guards are local to one Reconciler, so an older
-// worker's captured service callbacks must not be allowed to rewrite state that
-// a newer worker already persisted. PostgreSQL serializes the writes but cannot
-// decide which generation is current.
-func TestCrossWorkerStaleGenerationCannotOverwriteNewerState(t *testing.T) {
+// TestCrossWorkerStaleFencingTokenCannotOverwriteNewerState pins the F-02
+// regression: local callback counters cannot fence another Reconciler. An older
+// worker's callbacks must not rewrite state after a newer worker persists it;
+// the PostgreSQL fencing token rejects those stale writes.
+func TestCrossWorkerStaleFencingTokenCannotOverwriteNewerState(t *testing.T) {
 	t.Run("stale success cannot overwrite newer success", func(t *testing.T) {
 		f := newCrossWorkerFixture(t, "shared")
 
@@ -244,7 +243,7 @@ func TestCrossWorkerStaleGenerationCannotOverwriteNewerState(t *testing.T) {
 			t.Fatal("precondition: newer worker removal must delete the state row")
 		}
 
-		// The older generation's success upsert must not recreate it.
+		// The older generation's guarded success must not recreate it.
 		f.olderCalls[0].onComplete(nil)
 
 		if got, ok := f.olderDB.GetApp(f.fn.Name); ok {

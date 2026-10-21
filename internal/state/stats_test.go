@@ -268,10 +268,10 @@ func TestAppStatsAbsent(t *testing.T) {
 func TestRemovalDeletesAppStats(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
-	token := seedToken(t, c, fnFor(t, "alpha", tmpl))
+	fencingToken := seedFencingToken(t, c, fnFor(t, "alpha", tmpl))
 	c.RecordAppStats(AppStats{App: "alpha", EventsMatchedTotal: 3})
 
-	if _, err := c.RecordRemoved(context.Background(), "alpha", token); err != nil {
+	if _, err := c.RecordRemoved(context.Background(), "alpha", fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 

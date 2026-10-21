@@ -66,7 +66,7 @@ func TestDiscoveredThenSuccessReplacesActiveFields(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 
 	fn := fnFor(t, "fn", tmpl)
-	token := seedToken(t, c, fn)
+	fencingToken := seedFencingToken(t, c, fn)
 
 	detail, ok := c.GetApp("fn")
 	if !ok {
@@ -79,7 +79,7 @@ func TestDiscoveredThenSuccessReplacesActiveFields(t *testing.T) {
 		t.Fatalf("handler count = %d, want 2", len(detail.Handlers))
 	}
 
-	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img-fn", "fp-new", time.Now(), fn, token); err != nil {
+	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img-fn", "fp-new", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -119,11 +119,11 @@ func TestDiscoveryPreservesActiveGenerationAndOutcome(t *testing.T) {
 	fn := fnFor(t, "fn", tmpl)
 	prepared := time.Now().Add(-time.Hour)
 
-	token := seedToken(t, c, fn)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img-active", "fp-active", prepared, fn, token); err != nil {
+	fencingToken := seedFencingToken(t, c, fn)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img-active", "fp-active", prepared, fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
-	if _, err := c.RecordReconcileFailure(context.Background(), "fn", &boomErr{}, token); err != nil {
+	if _, err := c.RecordReconcileFailure(context.Background(), "fn", &boomErr{}, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	} // degraded, last reconciliation failed
 
@@ -195,12 +195,12 @@ func TestSuccessReplacesActiveAndConvergesDesiredGeneration(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "fn", tmpl)
 
-	token := seedTokenWithFingerprint(t, c, fn, "fp-v1")
-	if _, err := c.RecordReconcileFailure(context.Background(), "fn", &boomErr{}, token); err != nil {
+	fencingToken := seedFencingTokenWithFingerprint(t, c, fn, "fp-v1")
+	if _, err := c.RecordReconcileFailure(context.Background(), "fn", &boomErr{}, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	} // unavailable: no prior image
 
-	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img-v1", "fp-v1", time.Now(), fn, token); err != nil {
+	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img-v1", "fp-v1", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -230,14 +230,14 @@ func TestPreparingRecordsDesiredFingerprintAndRetainsActive(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "fn", tmpl)
 
-	token := seedToken(t, c, fn)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img-v1", "fp-v1", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, c, fn)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img-v1", "fp-v1", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
-	next := requireDesired(t, "fn", func() (Token, error) {
+	nextFencingToken := requireDesired(t, "fn", func() (FencingToken, error) {
 		return c.RecordPreparingWithFingerprint(context.Background(), "fn", fn, "fp-v2")
 	})
-	requireToken(t, fn.Name, next)
+	requireFencingToken(t, fn.Name, nextFencingToken)
 
 	detail, _ := c.GetApp("fn")
 	if detail.Status != StatusPreparing {
@@ -250,7 +250,7 @@ func TestPreparingRecordsDesiredFingerprintAndRetainsActive(t *testing.T) {
 		t.Fatalf("active generation = %q/%q, want preserved img-v1/fp-v1", detail.Image, detail.Fingerprint)
 	}
 
-	if _, err := c.RecordReconcileFailure(context.Background(), "fn", &boomErr{}, next); err != nil {
+	if _, err := c.RecordReconcileFailure(context.Background(), "fn", &boomErr{}, nextFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -268,29 +268,29 @@ func TestReconcileStatusTransitionsRetainHealthyGeneration(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "fn", tmpl)
-	token := seedToken(t, c, fn)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img-v1", "fp-v1", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, c, fn)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img-v1", "fp-v1", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
-	token = requireDesired(t, fn.Name, func() (Token, error) {
+	fencingToken = requireDesired(t, fn.Name, func() (FencingToken, error) {
 		return c.RecordPreparing(context.Background(), "fn", fn)
 	})
 	if got, _ := c.GetApp("fn"); got.Status != StatusPreparing || got.Image != "img-v1" {
 		t.Fatalf("preparing status/image = %q/%q, want preparing/img-v1", got.Status, got.Image)
 	}
-	if _, err := c.RecordReconcileBuilding(context.Background(), "fn", token); err != nil {
+	if _, err := c.RecordReconcileBuilding(context.Background(), "fn", fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	if got, _ := c.GetApp("fn"); got.Status != StatusBuilding {
 		t.Fatalf("building status = %q, want building", got.Status)
 	}
-	if _, err := c.RecordReconciling(context.Background(), "fn", token); err != nil {
+	if _, err := c.RecordReconciling(context.Background(), "fn", fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	if got, _ := c.GetApp("fn"); got.Status != StatusReconciling {
 		t.Fatalf("reconciling status = %q, want reconciling", got.Status)
 	}
-	if _, err := c.RecordServiceFailure(context.Background(), "fn", &boomErr{}, token); err != nil {
+	if _, err := c.RecordServiceFailure(context.Background(), "fn", &boomErr{}, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	got, _ := c.GetApp("fn")
@@ -303,18 +303,18 @@ func TestReconcileFailuresWithoutActiveImageAreUnavailable(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "fn", tmpl)
-	token := seedToken(t, c, fn)
-	if _, err := c.RecordReconcileFailure(context.Background(), "fn", &boomErr{}, token); err != nil {
+	fencingToken := seedFencingToken(t, c, fn)
+	if _, err := c.RecordReconcileFailure(context.Background(), "fn", &boomErr{}, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	got, _ := c.GetApp("fn")
 	if got.Status != StatusUnavailable {
 		t.Fatalf("image failure status = %q, want unavailable", got.Status)
 	}
-	token = requireDesired(t, fn.Name, func() (Token, error) {
+	fencingToken = requireDesired(t, fn.Name, func() (FencingToken, error) {
 		return c.RecordPreparing(context.Background(), "fn", fn)
 	})
-	if _, err := c.RecordServiceFailure(context.Background(), "fn", &boomErr{}, token); err != nil {
+	if _, err := c.RecordServiceFailure(context.Background(), "fn", &boomErr{}, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	got, _ = c.GetApp("fn")
@@ -346,8 +346,8 @@ func TestImageLessPreparedAppTransitionsToDegradedOnFailure(t *testing.T) {
 		fn := fnFor(t, "svc", tmpl)
 
 		// Successful no-runtime prepare: no app image, but prepared.
-		token := seedToken(t, c, fn)
-		if _, err := c.RecordReconcileSuccess(context.Background(), "svc", "", "fp-svc", time.Now(), fn, token); err != nil {
+		fencingToken := seedFencingToken(t, c, fn)
+		if _, err := c.RecordReconcileSuccess(context.Background(), "svc", "", "fp-svc", time.Now(), fn, fencingToken); err != nil {
 			t.Errorf("state write error: %v", err)
 		}
 		if got, _ := c.GetApp("svc"); got.Image != "" || got.PreparedAt == "" {
@@ -355,7 +355,7 @@ func TestImageLessPreparedAppTransitionsToDegradedOnFailure(t *testing.T) {
 				got.Image, got.PreparedAt)
 		}
 
-		if _, err := c.RecordReconcileFailure(context.Background(), "svc", &boomErr{}, token); err != nil {
+		if _, err := c.RecordReconcileFailure(context.Background(), "svc", &boomErr{}, fencingToken); err != nil {
 			t.Errorf("state write error: %v", err)
 		}
 		got, _ := c.GetApp("svc")
@@ -372,11 +372,11 @@ func TestImageLessPreparedAppTransitionsToDegradedOnFailure(t *testing.T) {
 		tmpl := mustTemplate(t, noRuntimeServiceTmpl)
 		fn := fnFor(t, "svc", tmpl)
 
-		token := seedToken(t, c, fn)
-		if _, err := c.RecordReconcileSuccess(context.Background(), "svc", "", "fp-svc", time.Now(), fn, token); err != nil {
+		fencingToken := seedFencingToken(t, c, fn)
+		if _, err := c.RecordReconcileSuccess(context.Background(), "svc", "", "fp-svc", time.Now(), fn, fencingToken); err != nil {
 			t.Errorf("state write error: %v", err)
 		}
-		if _, err := c.RecordServiceFailure(context.Background(), "svc", &boomErr{}, token); err != nil {
+		if _, err := c.RecordServiceFailure(context.Background(), "svc", &boomErr{}, fencingToken); err != nil {
 			t.Errorf("state write error: %v", err)
 		}
 		got, _ := c.GetApp("svc")
@@ -391,12 +391,12 @@ func TestImageLessPreparedAppTransitionsToDegradedOnFailure(t *testing.T) {
 		fn := fnFor(t, "svc", tmpl)
 
 		// Discovered but never prepared: no image and no prepared_at.
-		token := seedToken(t, c, fn)
+		fencingToken := seedFencingToken(t, c, fn)
 		if got, _ := c.GetApp("svc"); got.Image != "" || got.PreparedAt != "" {
 			t.Fatalf("precondition: image=%q prepared_at=%q, want both empty", got.Image, got.PreparedAt)
 		}
 
-		if _, err := c.RecordReconcileFailure(context.Background(), "svc", &boomErr{}, token); err != nil {
+		if _, err := c.RecordReconcileFailure(context.Background(), "svc", &boomErr{}, fencingToken); err != nil {
 			t.Errorf("state write error: %v", err)
 		}
 		got, _ := c.GetApp("svc")
@@ -404,10 +404,10 @@ func TestImageLessPreparedAppTransitionsToDegradedOnFailure(t *testing.T) {
 			t.Fatalf("status = %q, want unavailable (no successful generation ever)", got.Status)
 		}
 
-		token = requireDesired(t, fn.Name, func() (Token, error) {
+		fencingToken = requireDesired(t, fn.Name, func() (FencingToken, error) {
 			return c.RecordPreparing(context.Background(), "svc", fn)
 		})
-		if _, err := c.RecordServiceFailure(context.Background(), "svc", &boomErr{}, token); err != nil {
+		if _, err := c.RecordServiceFailure(context.Background(), "svc", &boomErr{}, fencingToken); err != nil {
 			t.Errorf("state write error: %v", err)
 		}
 		got, _ = c.GetApp("svc")
@@ -426,12 +426,12 @@ func TestReconcileFailureKeepsPriorActiveAndMarksFailed(t *testing.T) {
 	prepared := time.Now().Add(-time.Hour)
 	fn := fnFor(t, "fn", tmpl)
 
-	token := seedToken(t, c, fn)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img-active", "fp-active", prepared, fn, token); err != nil {
+	fencingToken := seedFencingToken(t, c, fn)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img-active", "fp-active", prepared, fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
-	if _, err := c.RecordReconcileFailure(context.Background(), "fn", &boomErr{}, token); err != nil {
+	if _, err := c.RecordReconcileFailure(context.Background(), "fn", &boomErr{}, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -476,11 +476,11 @@ func TestRecordReconcileSuccessAdvancesLastReconcileAt(t *testing.T) {
 	c.nowFn = func() time.Time { return clock }
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "fn", tmpl)
-	token := seedToken(t, c, fn) // existing row, empty reconcile fields
+	fencingToken := seedFencingToken(t, c, fn) // existing row, empty reconcile fields
 
 	img1, fp1 := "img-v1", "fp-v1"
 	t1 := clock
-	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", img1, fp1, t1, fn, token); err != nil {
+	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", img1, fp1, t1, fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -500,7 +500,7 @@ func TestRecordReconcileSuccessAdvancesLastReconcileAt(t *testing.T) {
 	// second success; the persisted timestamp must advance.
 	clock = clock.Add(2 * time.Second)
 	t2 := clock
-	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", img1, fp1, t2, fn, token); err != nil {
+	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", img1, fp1, t2, fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -531,10 +531,10 @@ func TestLastReconcileSurvivesDiscoveredUpsert(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "fn", tmpl)
-	token := seedToken(t, c, fn)
+	fencingToken := seedFencingToken(t, c, fn)
 
 	// (i) success on the existing row persists status + timestamp.
-	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img", "fp", time.Now(), fn, token); err != nil {
+	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	detail, ok := c.GetApp("fn")
@@ -576,12 +576,12 @@ func TestRemovalDeletesRowAndHandlers(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "fn", tmpl)
-	token := seedToken(t, c, fn)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img", "fp", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, c, fn)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
-	if _, err := c.RecordRemoved(context.Background(), "fn", token); err != nil {
+	if _, err := c.RecordRemoved(context.Background(), "fn", fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -602,16 +602,16 @@ func TestListAppsShapeAndSort(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	zeta := fnFor(t, "zeta", tmpl)
-	zetaToken := seedToken(t, c, zeta)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "zeta", "i-z", "f-z", time.Now(), zeta, zetaToken); err != nil {
+	zetaFencingToken := seedFencingToken(t, c, zeta)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "zeta", "i-z", "f-z", time.Now(), zeta, zetaFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	if _, err := c.RecordDiscovered(context.Background(), fnFor(t, "alpha", tmpl)); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	mid := fnFor(t, "mid", tmpl)
-	midToken := seedToken(t, c, mid)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "mid", "i-m", "f-m", time.Now(), mid, midToken); err != nil {
+	midFencingToken := seedFencingToken(t, c, mid)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "mid", "i-m", "f-m", time.Now(), mid, midFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -789,8 +789,8 @@ func TestRecordReconcileSuccessRoundTripsFingerprintedImage(t *testing.T) {
 	img := "relay-app-user-events:3f8a2c1d9b6e4a17"
 	fp := "3f8a2c1d9b6e4a1700aa11bb22cc33dd44ee55ff66778899aabbccddeeff0011"
 	fn := fnFor(t, "user-events", tmpl)
-	token := seedToken(t, c, fn)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "user-events", img, fp, time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, c, fn)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "user-events", img, fp, time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -846,15 +846,15 @@ func TestPruneRemovedSweepsReservedStagingRow(t *testing.T) {
 	// A reserved name that (from a previous bad discovery) has a state row and
 	// app_stats, plus a transient stage directory on disk.
 	stage := fnFor(t, ".sync-old", tmpl)
-	stageToken := seedToken(t, c, stage)
-	if _, err := c.RecordReconcileSuccess(context.Background(), ".sync-old", "img-stage", "fp-stage", time.Now(), stage, stageToken); err != nil {
+	stageFencingToken := seedFencingToken(t, c, stage)
+	if _, err := c.RecordReconcileSuccess(context.Background(), ".sync-old", "img-stage", "fp-stage", time.Now(), stage, stageFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	c.RecordAppStats(AppStats{App: ".sync-old", EventsMatchedTotal: 3})
 	// A normal app that must survive.
 	kept := fnFor(t, "kept", tmpl)
-	keptToken := seedToken(t, c, kept)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "kept", "img-kept", "fp-kept", time.Now(), kept, keptToken); err != nil {
+	keptFencingToken := seedFencingToken(t, c, kept)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "kept", "img-kept", "fp-kept", time.Now(), kept, keptFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -938,14 +938,14 @@ func TestPruneRemovedSweepsStaleApps(t *testing.T) {
 	// "gone" exists only in the DB; "kept" exists on disk too. Give both state
 	// rows (snapshot + app_stats) so the sweep must clean them inclusively.
 	gone := fnFor(t, "gone", tmpl)
-	goneToken := seedToken(t, c, gone)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "gone", "img", "fp", time.Now(), gone, goneToken); err != nil {
+	goneFencingToken := seedFencingToken(t, c, gone)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "gone", "img", "fp", time.Now(), gone, goneFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	c.RecordAppStats(AppStats{App: "gone", EventsMatchedTotal: 5})
 	kept := fnFor(t, "kept", tmpl)
-	keptToken := seedToken(t, c, kept)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "kept", "img", "fp", time.Now(), kept, keptToken); err != nil {
+	keptFencingToken := seedFencingToken(t, c, kept)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "kept", "img", "fp", time.Now(), kept, keptFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	c.RecordAppStats(AppStats{App: "kept", EventsMatchedTotal: 9})
@@ -1007,8 +1007,8 @@ func TestPruneRemovedSweepsTemplateLessDirectory(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 
 	draft := fnFor(t, "draft", tmpl)
-	draftToken := seedToken(t, c, draft)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "draft", "img-draft", "fp-draft", time.Now(), draft, draftToken); err != nil {
+	draftFencingToken := seedFencingToken(t, c, draft)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "draft", "img-draft", "fp-draft", time.Now(), draft, draftFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	c.RecordAppStats(AppStats{App: "draft", EventsMatchedTotal: 4})
@@ -1101,13 +1101,13 @@ func TestPruneRemovedNotResurrectedByDiscovery(t *testing.T) {
 
 	// Both have active state; only "kept" still exists on disk.
 	gone := fnFor(t, "gone", tmpl)
-	goneToken := seedToken(t, c, gone)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "gone", "img-gone", "fp-gone", time.Now(), gone, goneToken); err != nil {
+	goneFencingToken := seedFencingToken(t, c, gone)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "gone", "img-gone", "fp-gone", time.Now(), gone, goneFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	kept := fnFor(t, "kept", tmpl)
-	keptToken := seedToken(t, c, kept)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "kept", "img-kept", "fp-kept", time.Now(), kept, keptToken); err != nil {
+	keptFencingToken := seedFencingToken(t, c, kept)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "kept", "img-kept", "fp-kept", time.Now(), kept, keptFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -1159,8 +1159,8 @@ events:
       event_name: [INSERT]
 `)
 	fn := fnFor(t, "fn", tmpl)
-	token := seedToken(t, c, fn)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img", "fp", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, c, fn)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -1202,8 +1202,8 @@ func TestEnvSecretsMappingsNilWhenAbsent(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "fn", tmpl)
-	token := seedToken(t, c, fn)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img", "fp", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, c, fn)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -1222,8 +1222,8 @@ func TestEnvSecretsMappingsNilWhenAbsent(t *testing.T) {
 	// must also persist nil maps.
 	direct := &app.Template{Runtime: "node24"}
 	directFn := fnFor(t, "direct", direct)
-	directToken := seedToken(t, c, directFn)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "direct", "img", "fp", time.Now(), directFn, directToken); err != nil {
+	directFencingToken := seedFencingToken(t, c, directFn)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "direct", "img", "fp", time.Now(), directFn, directFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	d, ok := c.GetApp("direct")
@@ -1286,34 +1286,34 @@ func tableColumnSet(t *testing.T, c *State, table string) map[string]bool {
 
 // TestFreshSchemaHasCurrentColumns checks the current schema shape directly:
 // initSchema must create the apps table with exactly name/data/updated_at plus
-// the internal generation token, and must NOT create any of the removed child
+// the internal fencing token, and must NOT create any of the removed child
 // tables. The whole nested app configuration (handlers, schedules, services,
 // env/secrets) lives inside apps.data, so there are no
-// per-handler/schedule/service tables. The global generation sequence backs the
-// token.
+// per-handler/schedule/service tables. The global apps_fencing_token_seq
+// sequence backs the fencing token.
 func TestFreshSchemaHasCurrentColumns(t *testing.T) {
 	c := openTestState(t)
 
 	fnCols := tableColumnSet(t, c, "apps")
-	for _, want := range []string{"name", "data", "updated_at", "generation"} {
+	for _, want := range []string{"name", "data", "updated_at", "fencing_token"} {
 		if !fnCols[want] {
 			t.Errorf("apps missing current column %q: %v", want, fnCols)
 		}
 	}
 	if len(fnCols) != 4 {
-		t.Errorf("apps must have exactly name/data/updated_at/generation, got %v", fnCols)
+		t.Errorf("apps must have exactly name/data/updated_at/fencing_token, got %v", fnCols)
 	}
-
 	var hasSequence bool
 	if err := c.db.QueryRowContext(context.Background(),
-		`SELECT EXISTS (SELECT 1 FROM information_schema.sequences
-		                WHERE sequence_schema = current_schema()
-		                  AND sequence_name = 'apps_generation_seq')`,
-	).Scan(&hasSequence); err != nil {
-		t.Fatalf("check apps_generation_seq: %v", err)
+		`SELECT EXISTS (
+			SELECT 1 FROM information_schema.sequences
+			WHERE sequence_schema = current_schema()
+			  AND sequence_name = 'apps_fencing_token_seq'
+		)`).Scan(&hasSequence); err != nil {
+		t.Fatalf("check apps_fencing_token_seq: %v", err)
 	}
 	if !hasSequence {
-		t.Error("apps_generation_seq sequence must exist")
+		t.Error("apps_fencing_token_seq sequence must exist")
 	}
 
 	for _, table := range []string{"handlers", "schedules", "services"} {

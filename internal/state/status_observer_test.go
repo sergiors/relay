@@ -43,28 +43,28 @@ func TestStatusObserverTransitions(t *testing.T) {
 	fn := app.App{Name: "demo", Dir: t.TempDir(), Template: tmpl}
 
 	// Discovery -> preparing.
-	token := seedTokenWithFingerprint(t, st, fn, "fp-1")
+	fencingToken := seedFencingTokenWithFingerprint(t, st, fn, "fp-1")
 	// Building / reconciling transient stages.
-	if _, err := st.RecordReconcileBuilding(context.Background(), "demo", token); err != nil {
+	if _, err := st.RecordReconcileBuilding(context.Background(), "demo", fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
-	if _, err := st.RecordReconciling(context.Background(), "demo", token); err != nil {
+	if _, err := st.RecordReconciling(context.Background(), "demo", fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	// Success -> ready.
-	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img-1", "fp-1", time.Now(), fn, token); err != nil {
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img-1", "fp-1", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	// Failure with a usable generation -> degraded.
-	if _, err := st.RecordReconcileFailure(context.Background(), "demo", errors.New("boom"), token); err != nil {
+	if _, err := st.RecordReconcileFailure(context.Background(), "demo", errors.New("boom"), fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	// Service failure with a usable generation -> degraded.
-	if _, err := st.RecordServiceFailure(context.Background(), "demo", errors.New("svc boom"), token); err != nil {
+	if _, err := st.RecordServiceFailure(context.Background(), "demo", errors.New("svc boom"), fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	// Removal -> empty status.
-	if _, err := st.RecordRemoved(context.Background(), "demo", token); err != nil {
+	if _, err := st.RecordRemoved(context.Background(), "demo", fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -102,8 +102,8 @@ func TestStatusObserverFailureWithoutGenerationUnavailable(t *testing.T) {
 
 	tmpl := &app.Template{Runtime: "python3.14"}
 	fn := app.App{Name: "fresh", Dir: t.TempDir(), Template: tmpl}
-	token := seedTokenWithFingerprint(t, st, fn, "fp")
-	if _, err := st.RecordReconcileFailure(context.Background(), "fresh", errors.New("first build failed"), token); err != nil {
+	fencingToken := seedFencingTokenWithFingerprint(t, st, fn, "fp")
+	if _, err := st.RecordReconcileFailure(context.Background(), "fresh", errors.New("first build failed"), fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -133,16 +133,16 @@ func TestStatusObserverNotNotifiedForMissingRow(t *testing.T) {
 	observer, events := recordingObserver()
 	st.SetStatusObserver(observer)
 
-	if _, err := st.RecordReconcileBuilding(context.Background(), "ghost", absentToken()); err != nil {
+	if _, err := st.RecordReconcileBuilding(context.Background(), "ghost", absentFencingToken()); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
-	if _, err := st.RecordReconciling(context.Background(), "ghost", absentToken()); err != nil {
+	if _, err := st.RecordReconciling(context.Background(), "ghost", absentFencingToken()); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
-	if _, err := st.RecordReconcileFailure(context.Background(), "ghost", errors.New("boom"), absentToken()); err != nil {
+	if _, err := st.RecordReconcileFailure(context.Background(), "ghost", errors.New("boom"), absentFencingToken()); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
-	if _, err := st.RecordServiceFailure(context.Background(), "ghost", errors.New("boom"), absentToken()); err != nil {
+	if _, err := st.RecordServiceFailure(context.Background(), "ghost", errors.New("boom"), absentFencingToken()); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	if len(*events) != 0 {
@@ -203,8 +203,8 @@ func TestStatusObserverNilSafe(t *testing.T) {
 
 	tmpl := &app.Template{Runtime: "python3.14"}
 	fn := app.App{Name: "quiet", Dir: t.TempDir(), Template: tmpl}
-	token := seedTokenWithFingerprint(t, st, fn, "fp")
-	if _, err := st.RecordReconcileSuccess(context.Background(), "quiet", "img", "fp", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingTokenWithFingerprint(t, st, fn, "fp")
+	if _, err := st.RecordReconcileSuccess(context.Background(), "quiet", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	if len(*events) != 0 {

@@ -117,10 +117,10 @@ func TestConcurrentReconcileAndStats(t *testing.T) {
 	// Precompute the app values up front: fnFor calls t.TempDir(), which is
 	// not safe to call from goroutines.
 	fns := make([]app.App, m)
-	tokens := make([]Token, m)
+	fencingTokens := make([]FencingToken, m)
 	for i := 0; i < m; i++ {
 		fns[i] = fnFor(t, "fn-"+string(rune('a'+i)), tmpl)
-		tokens[i] = seedToken(t, c, fns[i])
+		fencingTokens[i] = seedFencingToken(t, c, fns[i])
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -142,11 +142,11 @@ func TestConcurrentReconcileAndStats(t *testing.T) {
 			for i := 0; i < m; i++ {
 				name := "fn-" + string(rune('a'+i))
 				if i%2 == 0 {
-					if _, err := c.RecordReconcileSuccess(context.Background(), name, "img", "fp", time.Now(), fns[i], tokens[i]); err != nil {
+					if _, err := c.RecordReconcileSuccess(context.Background(), name, "img", "fp", time.Now(), fns[i], fencingTokens[i]); err != nil {
 						t.Errorf("state write error: %v", err)
 					}
 				} else {
-					if _, err := c.RecordReconcileSuccess(context.Background(), name, "img-else", "fp", time.Now(), fns[i], tokens[i]); err != nil {
+					if _, err := c.RecordReconcileSuccess(context.Background(), name, "img-else", "fp", time.Now(), fns[i], fencingTokens[i]); err != nil {
 						t.Errorf("state write error: %v", err)
 					}
 				}

@@ -32,8 +32,8 @@ func TestReconcileInvalidDesiredWritesFailureAndKeepsRegistry(t *testing.T) {
 	// Seed a usable active generation (the registry already serves img-guarded;
 	// the skip path deliberately records no outcome, so record it explicitly as
 	// startup/reconcile would after a real success).
-	token := recordSuccess(t, st, "guarded", "img-guarded", "fp-guarded", time.Now(), fn.App())
-	r.SeedStateToken("guarded", token)
+	fencingToken := recordSuccess(t, st, "guarded", "img-guarded", "fp-guarded", time.Now(), fn.App())
+	r.SeedFencingToken("guarded", fencingToken)
 	before, ok := st.GetApp("guarded")
 	if !ok || before.Status != state.StatusReady {
 		t.Fatalf("precondition: %+v ok=%v, want ready", before, ok)
@@ -85,8 +85,8 @@ func TestReconcileOverDeepPatternInvalidRetainsActive(t *testing.T) {
 	b := &fakeBuilder{}
 	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
-	token := recordSuccess(t, st, "deep", "img-deep", "fp-deep", time.Now(), fn.App())
-	r.SeedStateToken("deep", token)
+	fencingToken := recordSuccess(t, st, "deep", "img-deep", "fp-deep", time.Now(), fn.App())
+	r.SeedFencingToken("deep", fencingToken)
 	before, ok := st.GetApp("deep")
 	if !ok || before.Status != state.StatusReady {
 		t.Fatalf("precondition: %+v ok=%v, want ready", before, ok)
@@ -195,16 +195,16 @@ func TestReconcileTemplateRemovalRemovesKnownApp(t *testing.T) {
 		t.Fatalf("prepare calls = %d, want 0 (removal never builds)", b.prepares())
 	}
 	r.mu.Lock()
-	_, tokenHeld := r.stateTokens["known"]
+	_, fencingTokenHeld := r.fencingTokens["known"]
 	r.mu.Unlock()
-	if tokenHeld {
-		t.Fatal("removal must forget the app's transition token")
+	if fencingTokenHeld {
+		t.Fatal("removal must forget the app's transition fencing token")
 	}
 }
 
 // TestReconcileUnknownTemplateLessDirIsNoOp pins that a directory that was
 // never an app cannot cause state or registry churn: reconciling it writes no
-// state row, allocates no transition token, and performs no build.
+// state row, allocates no transition fencing token, and performs no build.
 func TestReconcileUnknownTemplateLessDirIsNoOp(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "unrelated")
@@ -233,18 +233,18 @@ func TestReconcileUnknownTemplateLessDirIsNoOp(t *testing.T) {
 		t.Fatalf("prepare calls = %d, want 0", b.prepares())
 	}
 	r.mu.Lock()
-	_, tokenHeld := r.stateTokens["unrelated"]
+	_, fencingTokenHeld := r.fencingTokens["unrelated"]
 	r.mu.Unlock()
-	if tokenHeld {
-		t.Fatal("a never-app directory must not allocate a transition token")
+	if fencingTokenHeld {
+		t.Fatal("a never-app directory must not allocate a transition fencing token")
 	}
 }
 
-// TestReconcileAllRemovesTokenOnlyTemplateLessApp pins the startup-only case:
-// an app that only ever persisted an invalid desired row (a transition token but
-// no registry entry) is still swept once its directory loses template.yaml, so
-// its stale state cannot outlive the definition.
-func TestReconcileAllRemovesTokenOnlyTemplateLessApp(t *testing.T) {
+// TestReconcileAllRemovesFencingTokenOnlyTemplateLessApp pins the startup-only
+// case: an app that only ever persisted an invalid desired row (a fencing token
+// but no registry entry) is still swept once its directory loses template.yaml,
+// so its stale state cannot outlive the definition.
+func TestReconcileAllRemovesFencingTokenOnlyTemplateLessApp(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "startup-bad")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -257,14 +257,14 @@ func TestReconcileAllRemovesTokenOnlyTemplateLessApp(t *testing.T) {
 	if err := os.WriteFile(templatePath, []byte("runtime: python9.9\n"), 0o644); err != nil {
 		t.Fatalf("write invalid template: %v", err)
 	}
-	token, err := st.RecordInvalidDesired(context.Background(), "startup-bad", errBoom)
+	fencingToken, err := st.RecordInvalidDesired(context.Background(), "startup-bad", errBoom)
 	if err != nil {
 		t.Fatalf("record invalid desired: %v", err)
 	}
-	if token <= 0 {
-		t.Fatalf("record invalid desired token = %d, want positive", token)
+	if fencingToken <= 0 {
+		t.Fatalf("record invalid desired fencing token = %d, want positive", fencingToken)
 	}
-	r.SeedStateToken("startup-bad", token)
+	r.SeedFencingToken("startup-bad", fencingToken)
 	if err := os.Remove(templatePath); err != nil {
 		t.Fatalf("remove template: %v", err)
 	}
@@ -280,16 +280,16 @@ func TestReconcileAllRemovesTokenOnlyTemplateLessApp(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	if _, ok := st.GetApp("startup-bad"); ok {
-		t.Fatal("a token-only app must be removed when its template is absent")
+		t.Fatal("a fencing-token-only app must be removed when its template is absent")
 	}
 	if reg.GetByName("startup-bad") != nil {
-		t.Fatal("a token-only app must not remain in the registry")
+		t.Fatal("a fencing-token-only app must not remain in the registry")
 	}
 	r.mu.Lock()
-	_, tokenHeld := r.stateTokens["startup-bad"]
+	_, fencingTokenHeld := r.fencingTokens["startup-bad"]
 	r.mu.Unlock()
-	if tokenHeld {
-		t.Fatal("removal must forget the token-only app's transition token")
+	if fencingTokenHeld {
+		t.Fatal("removal must forget the fencing-token-only app's transition fencing token")
 	}
 }
 
@@ -312,8 +312,8 @@ func TestReconcileFingerprintFailureRecordsInvalidAndKeepsRegistry(t *testing.T)
 	})
 
 	// Seed an active generation so the retained view is observable.
-	token := recordSuccess(t, st, "unreadable", "img-active", "fp-active", time.Now(), fn.App())
-	r.SeedStateToken("unreadable", token)
+	fencingToken := recordSuccess(t, st, "unreadable", "img-active", "fp-active", time.Now(), fn.App())
+	r.SeedFencingToken("unreadable", fencingToken)
 	before, _ := st.GetApp("unreadable")
 
 	r.reconcileApp("unreadable")
@@ -378,8 +378,8 @@ func TestReconcileInvalidThenRestoredIdenticalContentRecovers(t *testing.T) {
 	b := &fakeBuilder{}
 	r, _, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
-	token := recordSuccess(t, st, "restored", "img-v1", "fp-v1", time.Now(), fn.App())
-	r.SeedStateToken("restored", token)
+	fencingToken := recordSuccess(t, st, "restored", "img-v1", "fp-v1", time.Now(), fn.App())
+	r.SeedFencingToken("restored", fencingToken)
 	original, err := os.ReadFile(filepath.Join(dir, "template.yaml"))
 	if err != nil {
 		t.Fatalf("read template: %v", err)
@@ -423,8 +423,8 @@ func TestReconcileValidReplacementOverwritesInvalidGeneration(t *testing.T) {
 	b := &fakeBuilder{}
 	r, _, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
-	token := recordSuccess(t, st, "recovers", "img-v1", "fp-v1", time.Now(), fn.App())
-	r.SeedStateToken("recovers", token)
+	fencingToken := recordSuccess(t, st, "recovers", "img-v1", "fp-v1", time.Now(), fn.App())
+	r.SeedFencingToken("recovers", fencingToken)
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("runtime: python9.9\n"), 0o644); err != nil {
 		t.Fatalf("write broken template: %v", err)
 	}

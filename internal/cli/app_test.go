@@ -22,42 +22,43 @@ func normWS(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
-// seedToken persists fn's desired generation and returns the exact transition
-// token the write stored. Generation-specific writes must carry it; zero is a
+// seedFencingToken persists fn's desired generation and returns the exact
+// fencing token the write stored. Guarded writes must carry it; zero is a
 // failed write and never persists.
-func seedToken(t *testing.T, st *state.State, fn app.App) state.Token {
+func seedFencingToken(t *testing.T, st *state.State, fn app.App) state.FencingToken {
 	t.Helper()
-	token, err := st.RecordDiscovered(context.Background(), fn)
+	fencingToken, err := st.RecordDiscovered(context.Background(), fn)
 	if err != nil {
 		t.Fatalf("RecordDiscovered(%q): %v", fn.Name, err)
 	}
-	if token <= 0 {
-		t.Fatalf("RecordDiscovered(%q) returned token %d, want positive", fn.Name, token)
+	if fencingToken <= 0 {
+		t.Fatalf("RecordDiscovered(%q) returned fencing token %d, want positive",
+			fn.Name, fencingToken)
 	}
-	return token
+	return fencingToken
 }
 
 // recordSuccess gives name a usable persisted generation without reading the
-// token back from apps.generation: the desired write returns the exact token and
-// the success is conditioned on it.
+// fencing token back from apps.fencing_token: the desired write returns the
+// exact token and the success is conditioned on it.
 func recordSuccess(
 	t *testing.T,
 	st *state.State,
 	name, image, fingerprint string,
 	preparedAt time.Time,
 	fn app.App,
-) state.Token {
+) state.FencingToken {
 	t.Helper()
-	token := seedToken(t, st, fn)
-	landed, err := st.RecordReconcileSuccess(context.Background(), name, image, fingerprint, preparedAt, fn, token)
+	fencingToken := seedFencingToken(t, st, fn)
+	landed, err := st.RecordReconcileSuccess(context.Background(), name, image, fingerprint, preparedAt, fn, fencingToken)
 	if err != nil {
 		t.Fatalf("RecordReconcileSuccess(%q): %v", name, err)
 	}
 	if !landed {
-		t.Fatalf("RecordReconcileSuccess(%q) did not persist with token %d",
-			name, token)
+		t.Fatalf("RecordReconcileSuccess(%q) did not persist with fencing token %d",
+			name, fencingToken)
 	}
-	return token
+	return fencingToken
 }
 
 // openTempState opens a fresh temp state DB under per-test dependencies and
@@ -172,24 +173,24 @@ func TestAppListStatusesConsistentWithInspect(t *testing.T) {
 		t.Errorf("state write error: %v", err)
 	} // preparing
 	prepFn := fn("st-building")
-	prepToken := seedToken(t, st, prepFn)
-	if _, err := st.RecordReconcileBuilding(context.Background(), "st-building", prepToken); err != nil {
+	prepFencingToken := seedFencingToken(t, st, prepFn)
+	if _, err := st.RecordReconcileBuilding(context.Background(), "st-building", prepFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	reconFn := fn("st-reconciling")
-	reconToken := seedToken(t, st, reconFn)
-	if _, err := st.RecordReconciling(context.Background(), "st-reconciling", reconToken); err != nil {
+	reconFencingToken := seedFencingToken(t, st, reconFn)
+	if _, err := st.RecordReconciling(context.Background(), "st-reconciling", reconFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	recordSuccess(t, st, "st-ready", "img", "fp", time.Now(), fn("st-ready"))
 	degFn := fn("st-degraded")
-	degToken := recordSuccess(t, st, "st-degraded", "img", "fp", time.Now(), degFn)
-	if _, err := st.RecordServiceFailure(context.Background(), "st-degraded", errors.New("service failed"), degToken); err != nil {
+	degFencingToken := recordSuccess(t, st, "st-degraded", "img", "fp", time.Now(), degFn)
+	if _, err := st.RecordServiceFailure(context.Background(), "st-degraded", errors.New("service failed"), degFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	unavFn := fn("st-unavailable")
-	unavToken := seedToken(t, st, unavFn)
-	if _, err := st.RecordReconcileFailure(context.Background(), "st-unavailable", errors.New("build failed"), unavToken); err != nil {
+	unavFencingToken := seedFencingToken(t, st, unavFn)
+	if _, err := st.RecordReconcileFailure(context.Background(), "st-unavailable", errors.New("build failed"), unavFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -929,8 +930,8 @@ events:
 		t.Fatalf("parse runtime template: %v", err)
 	}
 	runtimeBuilding := app.App{Name: "runtime-building", Dir: filepath.Join(t.TempDir(), "rb"), Template: runtimeTmpl}
-	runtimeToken := seedToken(t, st, runtimeBuilding)
-	if _, err := st.RecordReconcileBuilding(context.Background(), "runtime-building", runtimeToken); err != nil {
+	runtimeFencingToken := seedFencingToken(t, st, runtimeBuilding)
+	if _, err := st.RecordReconcileBuilding(context.Background(), "runtime-building", runtimeFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 

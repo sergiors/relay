@@ -182,8 +182,8 @@ func TestRestartResetsBuildingStatusToPreparing(t *testing.T) {
 	}
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "demo", tmpl)
-	token := seedToken(t, c1, fn)
-	if _, err := c1.RecordReconcileBuilding(context.Background(), "demo", token); err != nil {
+	fencingToken := seedFencingToken(t, c1, fn)
+	if _, err := c1.RecordReconcileBuilding(context.Background(), "demo", fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	if got, _ := c1.GetApp("demo"); got.Status != StatusBuilding {

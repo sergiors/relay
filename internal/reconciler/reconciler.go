@@ -185,14 +185,14 @@ type Reconciler struct {
 	mu           sync.Mutex
 	fingerprints map[string]string // name -> last-reconciled fingerprint
 	generations  map[string]uint64
-	// stateTokens carries the PostgreSQL-authoritative transition token returned
+	// fencingTokens carries the PostgreSQL-authoritative fencing token returned
 	// by the desired-generation write that started each app's current
 	// generation. It is deliberately SEPARATE from generations: generations is a
 	// process-local counter used only to short-circuit this Reconciler's own
-	// stale callbacks, while stateTokens is the cross-worker fence persisted in
-	// apps.generation. A zero token means no generation-specific write may land.
-	stateTokens map[string]state.Token
-	timers      map[string]*time.Timer
+	// stale callbacks, while fencingTokens is the cross-worker fence persisted in
+	// apps.fencing_token. A zero token means no guarded write may land.
+	fencingTokens map[string]state.FencingToken
+	timers        map[string]*time.Timer
 
 	incoming chan string   // debounced, per-app trigger queue
 	done     chan struct{} // closed on shutdown to unblock pump/timer sends
@@ -246,7 +246,7 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 		removeServices:                      cfg.RemoveServices,
 		fingerprints:                        map[string]string{},
 		generations:                         map[string]uint64{},
-		stateTokens:                         map[string]state.Token{},
+		fencingTokens:                       map[string]state.FencingToken{},
 		timers:                              map[string]*time.Timer{},
 		incoming:                            make(chan string, DefaultQueueSize),
 		done:                                make(chan struct{}),
@@ -275,21 +275,21 @@ func (r *Reconciler) Seed(fn app.App, fingerprint string) {
 	r.fingerprints[fn.Name] = fingerprint
 }
 
-// SeedStateToken records the PostgreSQL transition token returned by the exact
-// startup discovery write for name. It seeds the cross-worker generation fence
-// for the first live pass (notably the unchanged-service observation path) and
-// must come from the caller's own discovery/persisting result — never from a
-// later read of apps.generation, which could claim another worker's generation.
-// A zero token clears any seeded value, so generation-specific writes stay
-// suppressed rather than guessing.
-func (r *Reconciler) SeedStateToken(name string, token state.Token) {
+// SeedFencingToken records the PostgreSQL fencing token returned by the exact
+// startup discovery write for name. It seeds the cross-worker fence for the
+// first live pass (notably the unchanged-service observation path) and must come
+// from the caller's own discovery/persisting result — never from a later read of
+// apps.fencing_token, which could claim another worker's generation. A zero
+// token clears any seeded value, so guarded writes stay suppressed rather than
+// guessing.
+func (r *Reconciler) SeedFencingToken(name string, fencingToken state.FencingToken) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if token > 0 {
-		r.stateTokens[name] = token
+	if fencingToken > 0 {
+		r.fencingTokens[name] = fencingToken
 		return
 	}
-	delete(r.stateTokens, name)
+	delete(r.fencingTokens, name)
 }
 
 // PrepareWatch creates the fsnotify watcher and installs the recursive watches
@@ -535,7 +535,7 @@ func (r *Reconciler) shouldEnqueue(name string) bool {
 }
 
 // knownLocally reports whether this Reconciler already holds state for name: an
-// active or pending registry entry, or a transition token from startup
+// active or pending registry entry, or a fencing token from startup
 // discovery/invalid persistence. It deliberately consults no database:
 // PostgreSQL is a view and must never decide whether an app is removed.
 func (r *Reconciler) knownLocally(name string) bool {
@@ -543,7 +543,7 @@ func (r *Reconciler) knownLocally(name string) bool {
 		return true
 	}
 	r.mu.Lock()
-	_, ok := r.stateTokens[name]
+	_, ok := r.fencingTokens[name]
 	r.mu.Unlock()
 	return ok
 }
@@ -708,26 +708,26 @@ func (r *Reconciler) reconcileAll() {
 		seen[name] = true
 		r.dispatch(name)
 	}
-	// Apps still registered, pending, or carrying a transition token but no
+	// Apps still registered, pending, or carrying a fencing token but no
 	// longer candidates on disk were removed. A brand-new app whose first
 	// preparation has not yet completed exists ONLY as a pending desired entry
 	// (nothing is published as active until the build succeeds), so PendingNames
 	// must be swept too: otherwise a directory that vanishes during preparation
-	// would leave a stale pending entry gating events forever. State tokens cover
-	// a name that only ever had a startup invalid-desired row and therefore never
-	// entered the registry.
+	// would leave a stale pending entry gating events forever. Fencing tokens
+	// cover a name that only ever had a startup invalid-desired row and therefore
+	// never entered the registry.
 	for _, name := range r.missingNames(seen) {
 		r.dispatch(name)
 	}
 }
 
 // missingNames returns the locally-known names (active, pending-only, or
-// carrying a startup transition token) that are NOT app candidates on disk, so
-// reconcileAll dispatches them for removal. State tokens are included so a name
-// that only ever had a startup invalid-desired row — and therefore never entered
-// the registry — is still removed once its definition disappears. An app that is
-// BOTH active and pending (an available generation being rebuilt) is returned
-// once.
+// carrying a startup fencing token) that are NOT app candidates on disk, so
+// reconcileAll dispatches them for removal. Fencing tokens are included so a
+// name that only ever had a startup invalid-desired row — and therefore never
+// entered the registry — is still removed once its definition disappears. An app
+// that is BOTH active and pending (an available generation being rebuilt) is
+// returned once.
 func (r *Reconciler) missingNames(seen map[string]bool) []string {
 	var out []string
 	added := map[string]bool{}
@@ -745,12 +745,12 @@ func (r *Reconciler) missingNames(seen map[string]bool) []string {
 		add(name)
 	}
 	r.mu.Lock()
-	tokenNames := make([]string, 0, len(r.stateTokens))
-	for name := range r.stateTokens {
-		tokenNames = append(tokenNames, name)
+	fencingTokenNames := make([]string, 0, len(r.fencingTokens))
+	for name := range r.fencingTokens {
+		fencingTokenNames = append(fencingTokenNames, name)
 	}
 	r.mu.Unlock()
-	for _, name := range tokenNames {
+	for _, name := range fencingTokenNames {
 		add(name)
 	}
 	return out
@@ -787,7 +787,7 @@ func (r *Reconciler) reconcileApp(name string) {
 		if errors.Is(err, app.ErrNotReady) {
 			// The directory has no template.yaml, so it is not an app candidate.
 			// If this Reconciler already knows the name (an active/pending
-			// registry entry, or a startup transition token for an invalid row),
+			// registry entry, or a startup fencing token for an invalid row),
 			// losing its template is a normal removal. A never-app directory
 			// holding only unrelated files is a no-op: no warning, no invalid
 			// state write, no generation churn.
@@ -940,9 +940,9 @@ func (r *Reconciler) reconcileApp(name string) {
 				// This is an observation of the current source generation, not a
 				// new desired generation. Its status callbacks must not invalidate
 				// meaningful source work that is still completing. They reuse the
-				// token from that generation's desired-state write: no new token is
-				// allocated, and a newer worker's token makes them stale.
-				generation, token := r.generationSnapshot(name)
+				// fencing token from that generation's desired-state write: no new
+				// token is allocated, and a newer worker's token makes them stale.
+				generation, fencingToken := r.generationAndFencingToken(name)
 				// This is a periodic VERIFICATION of an unchanged, already-
 				// available app: it must not claim that a new generation is
 				// being prepared. No RecordPreparing here — the public status is
@@ -965,14 +965,14 @@ func (r *Reconciler) reconcileApp(name string) {
 					func() {
 						worked = true
 						if r.st != nil && r.currentGeneration(name, generation) {
-							r.st.RecordReconciling(r.rctx(), name, token)
+							r.st.RecordReconciling(r.rctx(), name, fencingToken)
 						}
 					}, func(err error) {
 						if r.st == nil || !r.currentGeneration(name, generation) {
 							return
 						}
 						if err != nil {
-							r.st.RecordServiceFailure(r.rctx(), name, err, token)
+							r.st.RecordServiceFailure(r.rctx(), name, err, fencingToken)
 							return
 						}
 						if !worked {
@@ -981,7 +981,7 @@ func (r *Reconciler) reconcileApp(name string) {
 							// touch updated_at.
 							return
 						}
-						r.st.RecordReconcileSuccess(r.rctx(), name, cur.Prepared().Image, known, time.Now(), fn, token)
+						r.st.RecordReconcileSuccess(r.rctx(), name, cur.Prepared().Image, known, time.Now(), fn, fencingToken)
 					})
 			}
 		}
@@ -996,19 +996,19 @@ func (r *Reconciler) reconcileApp(name string) {
 	r.generations[name]++
 	generation := r.generations[name]
 	r.mu.Unlock()
-	var token state.Token
+	var fencingToken state.FencingToken
 	if r.st != nil {
 		// Reuse the fingerprint computed above for this desired generation: it is
 		// recorded as DesiredFingerprint without a second filesystem scan, so the
-		// state write transaction holds no external I/O. The returned token is
-		// the PostgreSQL-authoritative identity of this generation; every
+		// state write transaction holds no external I/O. The returned fencing
+		// token is the PostgreSQL-authoritative identity of this generation; every
 		// callback below carries it so another worker's newer generation wins.
-		token, _ = r.st.RecordPreparingWithFingerprint(r.rctx(), name, fn, fp)
-		r.setStateToken(name, token)
+		fencingToken, _ = r.st.RecordPreparingWithFingerprint(r.rctx(), name, fn, fp)
+		r.setFencingToken(name, fencingToken)
 	}
 
 	start := time.Now()
-	built, err := r.prepareImage(r.prepareContext(name, generation, token), fn, fp, selection)
+	built, err := r.prepareImage(r.prepareContext(name, generation, fencingToken), fn, fp, selection)
 	if err != nil {
 		r.log.Error(
 			"App: reload failed; retaining previous version",
@@ -1022,7 +1022,7 @@ func (r *Reconciler) reconcileApp(name string) {
 		if r.st != nil {
 			// The prior active version is retained in the state database; only
 			// the failure outcome is recorded.
-			r.st.RecordReconcileFailure(r.rctx(), name, err, token)
+			r.st.RecordReconcileFailure(r.rctx(), name, err, fencingToken)
 		}
 		return
 	}
@@ -1058,11 +1058,11 @@ func (r *Reconciler) reconcileApp(name string) {
 		if r.st == nil || !r.currentGeneration(name, generation) {
 			return
 		}
-		r.st.RecordReconcileSuccess(r.rctx(), name, built.Image, builtFP, time.Now(), fn, token)
+		r.st.RecordReconcileSuccess(r.rctx(), name, built.Image, builtFP, time.Now(), fn, fencingToken)
 	}
 	failServices := func(serviceErr error) {
 		if serviceErr != nil && r.st != nil && r.currentGeneration(name, generation) {
-			r.st.RecordServiceFailure(r.rctx(), name, serviceErr, token)
+			r.st.RecordServiceFailure(r.rctx(), name, serviceErr, fencingToken)
 		}
 	}
 	if len(fn.Template.Services) == 0 || r.updateServicesWithStatus == nil {
@@ -1088,7 +1088,7 @@ func (r *Reconciler) reconcileApp(name string) {
 		r.updateServicesWithStatus(name, fn.Template, built.Image,
 			func() {
 				if r.st != nil && r.currentGeneration(name, generation) {
-					r.st.RecordReconciling(r.rctx(), name, token)
+					r.st.RecordReconciling(r.rctx(), name, fencingToken)
 				}
 			}, func(err error) {
 				if err != nil {
@@ -1135,26 +1135,26 @@ func (r *Reconciler) currentGeneration(name string, generation uint64) bool {
 	return r.generations[name] == generation
 }
 
-// generationSnapshot returns the current local generation plus the PostgreSQL
-// token for name under one lock, so a periodic observation cannot pair one
-// generation's local counter with another's token.
-func (r *Reconciler) generationSnapshot(name string) (uint64, state.Token) {
+// generationAndFencingToken returns the current local generation plus the
+// PostgreSQL fencing token for name under one lock, so a periodic observation
+// cannot pair one generation's local counter with another's token.
+func (r *Reconciler) generationAndFencingToken(name string) (uint64, state.FencingToken) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.generations[name], r.stateTokens[name]
+	return r.generations[name], r.fencingTokens[name]
 }
 
-// setStateToken records the token returned by the desired-state write that
-// started the current generation. A failed write (zero) clears it so the
+// setFencingToken records the fencing token returned by the desired-state write
+// that started the current generation. A failed write (zero) clears it so the
 // generation's callbacks fail closed rather than reusing an older fence.
-func (r *Reconciler) setStateToken(name string, token state.Token) {
+func (r *Reconciler) setFencingToken(name string, fencingToken state.FencingToken) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if token > 0 {
-		r.stateTokens[name] = token
+	if fencingToken > 0 {
+		r.fencingTokens[name] = fencingToken
 		return
 	}
-	delete(r.stateTokens, name)
+	delete(r.fencingTokens, name)
 }
 
 // prepareImage builds the app's image, passing the fingerprint the
@@ -1186,13 +1186,13 @@ func (r *Reconciler) prepareImage(
 // app-image build observer that publishes status=building at the ACTUAL
 // managed-runtime image build boundary (runtime.WithAppBuildObserver). The
 // callback is local-generation-guarded, and the state write itself validates the
-// PostgreSQL token, so a stale in-flight build cannot overwrite a newer
+// PostgreSQL fencing token, so a stale in-flight build cannot overwrite a newer
 // generation's status. When no state sink is wired, the plain reconciler context
 // is returned.
 func (r *Reconciler) prepareContext(
 	name string,
 	generation uint64,
-	token state.Token,
+	fencingToken state.FencingToken,
 ) context.Context {
 	ctx := r.rctx()
 	if r.st == nil {
@@ -1200,7 +1200,7 @@ func (r *Reconciler) prepareContext(
 	}
 	return runtime.WithAppBuildObserver(ctx, func() {
 		if r.currentGeneration(name, generation) {
-			r.st.RecordReconcileBuilding(ctx, name, token)
+			r.st.RecordReconcileBuilding(ctx, name, fencingToken)
 		}
 	})
 }
@@ -1217,7 +1217,7 @@ func (r *Reconciler) prepareContext(
 // it is a no-op.
 //
 // It also FORGETS the stored fingerprint for name and invalidates this
-// Reconciler's local generation plus the persisted token. That stored
+// Reconciler's local generation plus the persisted fencing token. That stored
 // fingerprint is the reconciler's skip key: if it were left in place, a
 // definition later restored byte-identically would compare equal and take the
 // unchanged skip path, leaving the recorded failure visible forever (the skip
@@ -1231,35 +1231,35 @@ func (r *Reconciler) recordInvalidDesired(name string, err error) {
 	r.mu.Lock()
 	delete(r.fingerprints, name)
 	r.generations[name]++
-	delete(r.stateTokens, name)
+	delete(r.fencingTokens, name)
 	r.mu.Unlock()
 	if r.st == nil {
 		return
 	}
-	// The invalid desired write advances the persisted token, invalidating older
-	// completions from any worker. Keep the returned token as this Reconciler's
-	// current state identity; zero (write failure) leaves it cleared, so later
-	// callbacks fail closed.
-	token, _ := r.st.RecordInvalidDesired(r.rctx(), name, err)
-	r.setStateToken(name, token)
+	// The invalid desired write advances the persisted fencing token, invalidating
+	// older completions from any worker. Keep the returned token as this
+	// Reconciler's current state identity; zero (write failure) leaves it cleared,
+	// so later callbacks fail closed.
+	fencingToken, _ := r.st.RecordInvalidDesired(r.rctx(), name, err)
+	r.setFencingToken(name, fencingToken)
 }
 
 // remove drops an app from the registry and forgets its fingerprint. It
-// invalidates the app's local generation and persisted token before deleting, so
-// a captured service completion from the removed generation can neither write a
-// status nor recreate the row. Local services and images are still retired even
-// when the state delete is suppressed by a newer generation: the directory is
-// gone from THIS worker's point of view.
+// invalidates the app's local generation and persisted fencing token before
+// deleting, so a captured service completion from the removed generation can
+// neither write a status nor recreate the row. Local services and images are
+// still retired even when the state delete is suppressed by a newer generation:
+// the directory is gone from THIS worker's point of view.
 func (r *Reconciler) remove(name string) {
 	r.reg.Replace(name, nil)
 	r.mu.Lock()
 	delete(r.fingerprints, name)
 	r.generations[name]++
-	token := r.stateTokens[name]
-	delete(r.stateTokens, name)
+	fencingToken := r.fencingTokens[name]
+	delete(r.fencingTokens, name)
 	r.mu.Unlock()
 	if r.st != nil {
-		r.st.RecordRemoved(r.rctx(), name, token)
+		r.st.RecordRemoved(r.rctx(), name, fencingToken)
 	}
 	// The directory is gone, so every version of this app's images is now
 	// garbage. Let the runner retire all of them (once idle) when wired. The

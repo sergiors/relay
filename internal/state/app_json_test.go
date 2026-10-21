@@ -71,8 +71,8 @@ func TestAppSnapshotIsJSONB(t *testing.T) {
 	base := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
 	c.nowFn = func() time.Time { return base }
 	fn := fnFor(t, "demo", tmpl)
-	token := seedToken(t, c, fn)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", base, fn, token); err != nil {
+	fencingToken := seedFencingToken(t, c, fn)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", base, fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -132,8 +132,8 @@ func TestAppSnapshotRoundTrip(t *testing.T) {
 	base := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
 	c.nowFn = func() time.Time { return base }
 	fn := fnFor(t, "demo", tmpl)
-	token := seedToken(t, c, fn)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", base, fn, token); err != nil {
+	fencingToken := seedFencingToken(t, c, fn)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", base, fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -203,8 +203,8 @@ func TestAppSnapshotAtomicReplacement(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, fullSnapshotTmpl)
 	fn := fnFor(t, "demo", tmpl)
-	token := seedToken(t, c, fn)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, c, fn)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -222,7 +222,7 @@ services:
     port: 7000
     replicas: 4
 `)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed), token); err != nil {
+	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed), fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -262,13 +262,13 @@ func TestAppRemovalDeletesSnapshotAndStats(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, fullSnapshotTmpl)
 	fn := fnFor(t, "demo", tmpl)
-	token := seedToken(t, c, fn)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, c, fn)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	c.RecordAppStats(AppStats{App: "demo", EventsMatchedTotal: 5})
 
-	if _, err := c.RecordRemoved(context.Background(), "demo", token); err != nil {
+	if _, err := c.RecordRemoved(context.Background(), "demo", fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -308,8 +308,8 @@ events:
       event_name: [INSERT]
 `)
 	fn := fnFor(t, "demo", tmpl)
-	token := seedToken(t, c, fn)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, c, fn)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -380,7 +380,7 @@ func TestCorruptAppSnapshotFailsClearly(t *testing.T) {
 // UPDATE ... WHERE name = ? semantics.
 func TestReconcileFailurePreservesSnapshotOnAbsentRow(t *testing.T) {
 	c := openTestState(t)
-	if _, err := c.RecordReconcileFailure(context.Background(), "ghost", &boomErr{}, absentToken()); err != nil {
+	if _, err := c.RecordReconcileFailure(context.Background(), "ghost", &boomErr{}, absentFencingToken()); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	if _, ok := c.GetApp("ghost"); ok {
@@ -395,13 +395,13 @@ func TestReconcileFailurePreservesNestedSnapshot(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, fullSnapshotTmpl)
 	fn := fnFor(t, "demo", tmpl)
-	token := seedToken(t, c, fn)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img-active", "fp-active", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, c, fn)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "demo", "img-active", "fp-active", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
 	before, _ := c.GetApp("demo")
-	if _, err := c.RecordReconcileFailure(context.Background(), "demo", &boomErr{}, token); err != nil {
+	if _, err := c.RecordReconcileFailure(context.Background(), "demo", &boomErr{}, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	after, ok := c.GetApp("demo")

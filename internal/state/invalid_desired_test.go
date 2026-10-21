@@ -13,7 +13,7 @@ import (
 func TestRecordInvalidDesiredFreshRowIsUnavailable(t *testing.T) {
 	c := openTestState(t)
 
-	requireDesired(t, "broken", func() (Token, error) {
+	requireDesired(t, "broken", func() (FencingToken, error) {
 		return c.RecordInvalidDesired(context.Background(), "broken", &boomErr{})
 	})
 
@@ -53,12 +53,12 @@ func TestRecordInvalidDesiredPreservesActiveGeneration(t *testing.T) {
 	fn := fnFor(t, "fn", tmpl)
 	prepared := time.Now().Add(-time.Hour)
 
-	token := seedToken(t, c, fn)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img-active", "fp-active", prepared, fn, token); err != nil {
+	fencingToken := seedFencingToken(t, c, fn)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img-active", "fp-active", prepared, fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
-	requireDesired(t, "fn", func() (Token, error) {
+	requireDesired(t, "fn", func() (FencingToken, error) {
 		return c.RecordInvalidDesired(context.Background(), "fn", &boomErr{})
 	})
 
@@ -99,8 +99,8 @@ func TestRecordInvalidDesiredObserverNotified(t *testing.T) {
 
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "fn", tmpl)
-	token := seedToken(t, c, fn)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img", "fp", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, c, fn)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "fn", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	*events = nil
@@ -129,8 +129,8 @@ func TestActiveImagesListsRecordedImages(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 
 	withImg := fnFor(t, "with-img", tmpl)
-	withImgToken := seedToken(t, c, withImg)
-	if _, err := c.RecordReconcileSuccess(context.Background(), "with-img", "img-with", "fp", time.Now(), withImg, withImgToken); err != nil {
+	withImgFencingToken := seedFencingToken(t, c, withImg)
+	if _, err := c.RecordReconcileSuccess(context.Background(), "with-img", "img-with", "fp", time.Now(), withImg, withImgFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	if _, err := c.RecordDiscovered(context.Background(), fnFor(t, "no-img", tmpl)); err != nil {

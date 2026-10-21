@@ -29,8 +29,8 @@ func TestScheduleRoundTrip(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, schedulesTmpl)
 	fn := fnFor(t, "demo", tmpl)
-	token := seedToken(t, st, fn)
-	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, st, fn)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -63,8 +63,8 @@ func TestScheduleReplacementUpdatesRows(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, schedulesTmpl)
 	fn := fnFor(t, "demo", tmpl)
-	token := seedToken(t, st, fn)
-	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, st, fn)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -80,7 +80,7 @@ schedules:
     cron: "0 4 * * *"
     timezone: America/New_York
 `)
-	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed), token); err != nil {
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed), fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -105,12 +105,12 @@ func TestScheduleRemovalClearsRows(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, schedulesTmpl)
 	fn := fnFor(t, "demo", tmpl)
-	token := seedToken(t, st, fn)
-	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, st, fn)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
-	if _, err := st.RecordRemoved(context.Background(), "demo", token); err != nil {
+	if _, err := st.RecordRemoved(context.Background(), "demo", fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	if _, ok := st.GetApp("demo"); ok {
@@ -124,8 +124,8 @@ func TestScheduleEmptyStored(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl) // no schedules key
 	fn := fnFor(t, "demo", tmpl)
-	token := seedToken(t, st, fn)
-	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, st, fn)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "demo", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 

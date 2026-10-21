@@ -37,8 +37,8 @@ func TestPersistStartupDiscoveryIgnoresStagingDir(t *testing.T) {
 	}
 	// A stale reserved row from a previous bad discovery.
 	stage := stateApp(".sync-old", filepath.Join(root, ".sync-old"))
-	stageToken := seedToken(t, st, stage)
-	if _, err := st.RecordReconcileSuccess(context.Background(), ".sync-old", "img-stage", "fp-stage", time.Now(), stage, stageToken); err != nil {
+	stageFencingToken := seedFencingToken(t, st, stage)
+	if _, err := st.RecordReconcileSuccess(context.Background(), ".sync-old", "img-stage", "fp-stage", time.Now(), stage, stageFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 
@@ -93,7 +93,7 @@ func TestLoaderIgnoresStagingDirAtStartup(t *testing.T) {
 
 // TestPersistStartupDiscoveryTemplateLessDirLeavesNoState pins that a fresh
 // directory without template.yaml is not an app candidate: the startup phase
-// writes no apps row, no app_stats, and no transition token for it.
+// writes no apps row, no app_stats, and no transition fencing token for it.
 func TestPersistStartupDiscoveryTemplateLessDirLeavesNoState(t *testing.T) {
 	st := openTempState(t)
 	root := t.TempDir()
@@ -105,13 +105,13 @@ func TestPersistStartupDiscoveryTemplateLessDirLeavesNoState(t *testing.T) {
 		t.Fatalf("write unrelated file: %v", err)
 	}
 
-	tokens, err := persistStartupDiscovery(context.Background(), st, root, nil, nil, discardLogger())
+	fencingTokens, err := persistStartupDiscovery(context.Background(), st, root, nil, nil, discardLogger())
 	if err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
 
-	if len(tokens) != 0 {
-		t.Fatalf("tokens = %v, want none for a template-less directory", tokens)
+	if len(fencingTokens) != 0 {
+		t.Fatalf("fencing tokens = %v, want none for a template-less directory", fencingTokens)
 	}
 	if _, ok := st.GetApp("draft"); ok {
 		t.Fatal("a template-less directory must not create an apps row")
@@ -124,7 +124,7 @@ func TestPersistStartupDiscoveryTemplateLessDirLeavesNoState(t *testing.T) {
 // TestPersistStartupDiscoveryPrunesTemplateLessKnownApp pins the startup prune
 // boundary: a persisted app whose directory still exists but no longer has
 // template.yaml is removed from apps and app_stats, and its stale transition
-// token is never returned to the caller.
+// fencing token is never returned to the caller.
 func TestPersistStartupDiscoveryPrunesTemplateLessKnownApp(t *testing.T) {
 	st := openTempState(t)
 	root := t.TempDir()
@@ -138,7 +138,7 @@ func TestPersistStartupDiscoveryPrunesTemplateLessKnownApp(t *testing.T) {
 		t.Fatalf("mkdir draft: %v", err)
 	}
 
-	tokens, err := persistStartupDiscovery(context.Background(), st, root, nil, nil, discardLogger())
+	fencingTokens, err := persistStartupDiscovery(context.Background(), st, root, nil, nil, discardLogger())
 	if err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
@@ -149,8 +149,8 @@ func TestPersistStartupDiscoveryPrunesTemplateLessKnownApp(t *testing.T) {
 	if _, ok := st.AppStats("draft"); ok {
 		t.Fatal("a template-less app's app_stats must be pruned at startup")
 	}
-	if _, ok := tokens["draft"]; ok {
-		t.Fatal("a pruned app must not surface a transition token")
+	if _, ok := fencingTokens["draft"]; ok {
+		t.Fatal("a pruned app must not surface a transition fencing token")
 	}
 }
 

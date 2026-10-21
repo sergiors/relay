@@ -630,7 +630,7 @@ func Run(logger *slog.Logger) (runErr error) {
 	_, reconcilerSpan := tracing.Start(startupCtx, "reconciler.start")
 	startAppReconciler(
 		ctx, logger, reconcilerSpan, rec, apps, fingerprints,
-		startupSet.tokens, prepared, shutdown,
+		startupSet.fencingTokens, prepared, shutdown,
 	)
 
 	// Start the scheduler only after the reconciler watches and joins, so seeded
@@ -1237,19 +1237,19 @@ func wireStatusObserver(st *state.State, metricsInstance *metrics.Registry) {
 // image never flashes building, and a template that needs no runtime (Prepare is
 // then a fast no-op) never fires it at all. It is nil-state-safe. Installed
 // unconditionally: for a no-runtime template the observer simply never runs.
-// token is the startup generation's PostgreSQL transition token, so a build
+// fencingToken is the startup generation's PostgreSQL fencing token, so a build
 // observed after another worker advanced the app cannot overwrite its status.
 func managedRuntimeBuildContext(
 	ctx context.Context,
 	st *state.State,
 	fn app.App,
-	token state.Token,
+	fencingToken state.FencingToken,
 ) context.Context {
 	if st == nil {
 		return ctx
 	}
 	return runtime.WithAppBuildObserver(ctx, func() {
-		st.RecordReconcileBuilding(ctx, fn.Name, token)
+		st.RecordReconcileBuilding(ctx, fn.Name, fencingToken)
 	})
 }
 
@@ -1366,7 +1366,7 @@ func startupSeedFingerprints(
 // (directory absent OR template.yaml absent), and records each valid app as
 // discovered (preserving its active generation). A directory without
 // template.yaml is not an app candidate and is never an issue, so a fresh
-// template-less directory leaves no row, warning, or token behind.
+// template-less directory leaves no row, warning, or fencing token behind.
 //
 // Ordering matters. The invalid writes happen BEFORE the prune so a directory
 // the loader observed as present but which vanished before the sweep is still
@@ -1390,12 +1390,12 @@ func startupSeedFingerprints(
 // the caller can classify it as a graceful startup interruption instead of a
 // state failure.
 //
-// The returned map carries the EXACT transition token each write persisted, so
+// The returned map carries the EXACT fencing token each write persisted, so
 // startup preparation, its build observer, the startup service callbacks, and
-// the reconciler seed all use the same PostgreSQL generation instead of reading
-// it back (which could claim another worker's newer generation). A zero/absent
-// token means that app's write failed and its generation-specific callbacks must
-// stay suppressed.
+// the reconciler seed all use the same PostgreSQL fence instead of reading it
+// back (which could claim another worker's newer generation). A zero/absent
+// token means that app's write failed and its guarded callbacks must stay
+// suppressed.
 func persistStartupDiscovery(
 	ctx context.Context,
 	st *state.State,
@@ -1403,7 +1403,7 @@ func persistStartupDiscovery(
 	discovered []state.DiscoveredApp,
 	issues []app.LoadIssue,
 	logger *slog.Logger,
-) (map[string]state.Token, error) {
+) (map[string]state.FencingToken, error) {
 	checkCtx := func() error {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("seed state: %w", err)
@@ -1413,18 +1413,18 @@ func persistStartupDiscovery(
 	if err := checkCtx(); err != nil {
 		return nil, err
 	}
-	tokens := make(map[string]state.Token, len(discovered))
+	fencingTokens := make(map[string]state.FencingToken, len(discovered))
 	var rebuildErr error
 	if err := st.RebuildFromApps(ctx, discovered); err != nil {
 		if startupInterrupted(ctx, err) {
-			return tokens, fmt.Errorf("seed state: %w", err)
+			return fencingTokens, fmt.Errorf("seed state: %w", err)
 		}
 		rebuildErr = err
 		logger.Warn("State: rebuild from apps failed; continuing", "error", err)
 	}
 	for _, issue := range issues {
 		if err := checkCtx(); err != nil {
-			return tokens, err
+			return fencingTokens, err
 		}
 		if app.IsReservedDir(issue.Name) {
 			// Defense in depth: the loader already filters Relay-owned staging
@@ -1433,40 +1433,40 @@ func persistStartupDiscovery(
 			// directory that is not an app.
 			continue
 		}
-		token, err := st.RecordInvalidDesired(ctx, issue.Name, issue.Err)
+		fencingToken, err := st.RecordInvalidDesired(ctx, issue.Name, issue.Err)
 		if err != nil {
 			if startupInterrupted(ctx, err) {
-				return tokens, fmt.Errorf("record invalid desired: %w", err)
+				return fencingTokens, fmt.Errorf("record invalid desired: %w", err)
 			}
 			continue
 		}
-		tokens[issue.Name] = token
+		fencingTokens[issue.Name] = fencingToken
 	}
 	if err := checkCtx(); err != nil {
-		return tokens, err
+		return fencingTokens, err
 	}
 	if err := st.PruneRemoved(ctx, dir); err != nil {
 		if startupInterrupted(ctx, err) {
-			return tokens, fmt.Errorf("prune removed: %w", err)
+			return fencingTokens, fmt.Errorf("prune removed: %w", err)
 		}
 	}
 	for _, d := range discovered {
 		if err := checkCtx(); err != nil {
-			return tokens, err
+			return fencingTokens, err
 		}
-		token, err := st.RecordDiscoveredWithFingerprint(ctx, d.App, d.Fingerprint)
+		fencingToken, err := st.RecordDiscoveredWithFingerprint(ctx, d.App, d.Fingerprint)
 		if err != nil {
 			if startupInterrupted(ctx, err) {
-				return tokens, fmt.Errorf("record discovered: %w", err)
+				return fencingTokens, fmt.Errorf("record discovered: %w", err)
 			}
 			continue
 		}
-		tokens[d.App.Name] = token
+		fencingTokens[d.App.Name] = fencingToken
 	}
 	if err := checkCtx(); err != nil {
-		return tokens, err
+		return fencingTokens, err
 	}
-	return tokens, rebuildErr
+	return fencingTokens, rebuildErr
 }
 
 // appPreparer is the narrow view of the runtime Manager that startup
@@ -1511,7 +1511,7 @@ type appPreparer interface {
 // failure uses the existing failure semantics (unavailable without an active
 // image, degraded when a previous image is retained).
 //
-// tokens carries the exact transition tokens the startup discovery writes
+// fencingTokens carries the exact fencing tokens the startup discovery writes
 // returned, keyed by app name; the build observer, failure, and success writes
 // are all conditioned on them so a preparation superseded by another worker
 // cannot overwrite the newer desired state.
@@ -1526,16 +1526,16 @@ func prepareApps(
 	manager appPreparer,
 	startup []startupApp,
 	st *state.State,
-	tokens map[string]state.Token,
+	fencingTokens map[string]state.FencingToken,
 	logger *slog.Logger,
 ) []*runner.PreparedApp {
 	preparedCount := 0
 	prepared := make([]*runner.PreparedApp, 0, len(startup))
 	for _, s := range startup {
 		fn := s.App
-		token := tokens[fn.Name]
+		fencingToken := fencingTokens[fn.Name]
 		prep, err := manager.PrepareWithFingerprintAndSelection(
-			managedRuntimeBuildContext(ctx, st, fn, token), fn, s.Fingerprint, s.Selection,
+			managedRuntimeBuildContext(ctx, st, fn, fencingToken), fn, s.Fingerprint, s.Selection,
 		)
 		if err != nil {
 			// A build cancelled by the lifecycle is a shutdown, not a build
@@ -1547,7 +1547,7 @@ func prepareApps(
 			} else {
 				logger.Warn("App: prepare failed", "app", fn.Name, "error", err)
 				if st != nil {
-					st.RecordReconcileFailure(ctx, fn.Name, err, token)
+					st.RecordReconcileFailure(ctx, fn.Name, err, fencingToken)
 				}
 			}
 			prepared = append(prepared, runner.NewUnavailable(fn))
@@ -1561,7 +1561,7 @@ func prepareApps(
 			// a long build is not in the image, and the reconciler's watcher/periodic
 			// audit detects it by comparing the on-disk digest against this recorded
 			// built identity on the next pass.
-			st.RecordReconcileSuccess(ctx, fn.Name, prep.Image, prep.Fingerprint, time.Now(), fn, token)
+			st.RecordReconcileSuccess(ctx, fn.Name, prep.Image, prep.Fingerprint, time.Now(), fn, fencingToken)
 		}
 		prepared = append(prepared, runner.NewPrepared(fn, prep, manager))
 		preparedCount++
@@ -1697,7 +1697,7 @@ func enqueueStartupServices(prepared []*runner.PreparedApp, services *reconciler
 }
 
 // enqueueStartupServicesWithState is enqueueStartupServices with the state sink
-// and the exact startup discovery transition tokens. The service status
+// and the exact startup discovery fencing tokens. The service status
 // callbacks are conditioned on those tokens, so a convergence superseded by a
 // newer generation cannot rewrite state. ctx is the worker lifecycle context:
 // callbacks that complete after shutdown attempt their state write with a
@@ -1708,7 +1708,7 @@ func enqueueStartupServicesWithState(
 	prepared []*runner.PreparedApp,
 	services *reconciler.ServiceCoordinator,
 	st *state.State,
-	tokens map[string]state.Token,
+	fencingTokens map[string]state.FencingToken,
 	logger *slog.Logger,
 ) {
 	for _, pf := range prepared {
@@ -1722,12 +1722,12 @@ func enqueueStartupServicesWithState(
 			// lease and enqueues unleased.
 			lease := pf.SharePublication()
 			if st != nil && len(fn.Template.Services) > 0 {
-				token := tokens[fn.Name]
+				fencingToken := fencingTokens[fn.Name]
 				services.EnqueueWithStatusLeased(fn.Name, fn.Template, prep.Image, prep.Env, lease,
-					func() { st.RecordReconciling(ctx, fn.Name, token) },
+					func() { st.RecordReconciling(ctx, fn.Name, fencingToken) },
 					func(err error) {
 						if err != nil {
-							st.RecordServiceFailure(ctx, fn.Name, err, token)
+							st.RecordServiceFailure(ctx, fn.Name, err, fencingToken)
 							return
 						}
 						// Persist the fingerprint the image was ACTUALLY built
@@ -1735,7 +1735,7 @@ func enqueueStartupServicesWithState(
 						// could record content the active image does not serve, and
 						// the next reconcile/audit detects any drift by comparing the
 						// on-disk digest against this built identity.
-						st.RecordReconcileSuccess(ctx, fn.Name, prep.Image, prep.Fingerprint, time.Now(), fn, token)
+						st.RecordReconcileSuccess(ctx, fn.Name, prep.Image, prep.Fingerprint, time.Now(), fn, fencingToken)
 					})
 			} else {
 				services.EnqueueLeased(fn.Name, fn.Template, prep.Image, prep.Env, lease)

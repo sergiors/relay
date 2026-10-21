@@ -209,9 +209,11 @@ func TestStartupBuiltFingerprintIsReturnedIdentity(t *testing.T) {
 	}
 
 	st := testutil.NewState(t)
-	tokens := map[string]state.Token{startup[0].App.Name: seedToken(t, st, startup[0].App)}
+	fencingTokens := map[string]state.FencingToken{
+		startup[0].App.Name: seedFencingToken(t, st, startup[0].App),
+	}
 
-	prepareApps(context.Background(), spy, startup, st, tokens, discardLogger())
+	prepareApps(context.Background(), spy, startup, st, fencingTokens, discardLogger())
 
 	detail, ok := st.GetApp("runtime-fn")
 	if !ok {

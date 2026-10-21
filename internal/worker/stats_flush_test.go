@@ -39,7 +39,7 @@ func TestStatsFlushSweepsStaleAppSeries(t *testing.T) {
 		t.Errorf("state write error: %v", err)
 	}
 	ghost := stateApp("ghost", t.TempDir())
-	ghostToken := seedToken(t, st, ghost)
+	ghostFencingToken := seedFencingToken(t, st, ghost)
 	st.RecordAppStats(state.AppStats{App: "alpha", EventsMatchedTotal: 10})
 	st.RecordAppStats(state.AppStats{App: "ghost", EventsMatchedTotal: 5})
 
@@ -53,7 +53,7 @@ func TestStatsFlushSweepsStaleAppSeries(t *testing.T) {
 	// Remove ghost's apps row (the reconciler's RecordRemoved) but KEEP its
 	// series in the registry, simulating an in-flight invocation that recreated
 	// them after removal. globals are untouched by removal.
-	if _, err := st.RecordRemoved(context.Background(), "ghost", ghostToken); err != nil {
+	if _, err := st.RecordRemoved(context.Background(), "ghost", ghostFencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 

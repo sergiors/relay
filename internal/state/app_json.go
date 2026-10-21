@@ -7,9 +7,10 @@ import (
 
 // This file is the boundary between the typed app detail model (the source
 // of truth) and the native JSONB object stored in the apps.data column. The
-// schema keeps only the stable relational metadata as columns — apps.name
-// and apps.updated_at — while the whole snapshot (runtime/status/image/
-// fingerprint/desired_fingerprint/prepared_at/last-reconcile outcome/env/secret
+// schema keeps stable relational metadata as columns — apps.name,
+// apps.updated_at, and apps.fencing_token — while apps.data stores the whole
+// snapshot (runtime/status/image/fingerprint/desired_fingerprint/prepared_at/
+// last-reconcile outcome/env/secret
 // references/handlers/schedules/services) is marshalled here with encoding/json
 // and written as a PostgreSQL jsonb value. Reads render it back to JSON text
 // with `data::text`.
@@ -23,11 +24,10 @@ import (
 // name plus a fixed redaction marker, never the template's literal value (any
 // operator with database access can read the shared snapshot).
 
-// marshalApp encodes detail as the JSON object stored in apps.data. Name
-// and UpdatedAt are relational metadata (apps.name / apps.updated_at)
-// and HandlerCount is derived, so all three are excluded by their json:"-"
-// tags; every other field — including the whole handler, schedule, service, env,
-// and secret-reference lists — is part of the snapshot.
+// marshalApp encodes detail as the JSON object stored in apps.data. Name and
+// UpdatedAt are relational metadata (apps.name / apps.updated_at), and
+// HandlerCount is derived, so all three are excluded by their json:"-" tags.
+// The PostgreSQL fencing token is separate from Detail and is not serialized.
 func marshalApp(detail Detail) (string, error) {
 	b, err := json.Marshal(detail)
 	if err != nil {

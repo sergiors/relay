@@ -161,36 +161,36 @@ func openUnlockedState(t *testing.T, dsn, worker, instance string) *State {
 	return st
 }
 
-// seedToken persists fn's desired generation and returns the exact transition
-// token that write stored. Generation-specific writes (success, failure, status,
-// removal) must carry this token: zero is a failed desired write and never
-// persists.
-func seedToken(t *testing.T, c *State, fn app.App) Token {
+// seedFencingToken persists fn's desired generation and returns the exact
+// fencing token that write stored. Guarded writes (success, failure, status,
+// removal) must carry this fencing token: zero is a failed desired write and
+// never persists.
+func seedFencingToken(t *testing.T, c *State, fn app.App) FencingToken {
 	t.Helper()
-	token, err := c.RecordDiscovered(context.Background(), fn)
-	return requireTokenResult(t, fn.Name, token, err)
+	fencingToken, err := c.RecordDiscovered(context.Background(), fn)
+	return requireFencingTokenResult(t, fn.Name, fencingToken, err)
 }
 
-// seedTokenWithFingerprint is seedToken with a caller-supplied desired
+// seedFencingTokenWithFingerprint is seedFencingToken with a caller-supplied desired
 // fingerprint.
-func seedTokenWithFingerprint(t *testing.T, c *State, fn app.App, fingerprint string) Token {
+func seedFencingTokenWithFingerprint(t *testing.T, c *State, fn app.App, fingerprint string) FencingToken {
 	t.Helper()
-	token, err := c.RecordDiscoveredWithFingerprint(context.Background(), fn, fingerprint)
-	return requireTokenResult(t, fn.Name, token, err)
+	fencingToken, err := c.RecordDiscoveredWithFingerprint(context.Background(), fn, fingerprint)
+	return requireFencingTokenResult(t, fn.Name, fencingToken, err)
 }
 
-func requireDesired(t *testing.T, name string, write func() (Token, error)) Token {
+func requireDesired(t *testing.T, name string, write func() (FencingToken, error)) FencingToken {
 	t.Helper()
-	token, err := write()
-	return requireTokenResult(t, name, token, err)
+	fencingToken, err := write()
+	return requireFencingTokenResult(t, name, fencingToken, err)
 }
 
-func requireTokenResult(t *testing.T, name string, token Token, err error) Token {
+func requireFencingTokenResult(t *testing.T, name string, fencingToken FencingToken, err error) FencingToken {
 	t.Helper()
 	if err != nil {
 		t.Fatalf("desired-generation write for %q: %v", name, err)
 	}
-	return requireToken(t, name, token)
+	return requireFencingToken(t, name, fencingToken)
 }
 
 func requireWrite(t *testing.T, name string, write func() (bool, error)) bool {
@@ -202,20 +202,20 @@ func requireWrite(t *testing.T, name string, write func() (bool, error)) bool {
 	return landed
 }
 
-func requireToken(t *testing.T, name string, token Token) Token {
+func requireFencingToken(t *testing.T, name string, fencingToken FencingToken) FencingToken {
 	t.Helper()
-	if token <= 0 {
-		t.Fatalf("desired-generation write for %q returned token %d, want positive",
-			name, token)
+	if fencingToken <= 0 {
+		t.Fatalf("desired-generation write for %q returned fencing token %d, want positive",
+			name, fencingToken)
 	}
-	return token
+	return fencingToken
 }
 
-// absentToken is a positive token for writes that must not affect a row. It is
-// far beyond any value the test schema's sequence allocates, so it bypasses the
-// zero-token short-circuit and exercises the generation guard's stale/absent-row
-// path without colliding with a real generation.
-func absentToken() Token { return Token(1 << 62) }
+// absentFencingToken is a positive fencing token for writes that must not
+// affect a row. It is far beyond any value the test schema's sequence
+// allocates, so it bypasses the zero-token short-circuit and exercises the
+// fencing guard's stale/absent-row path without colliding with a real token.
+func absentFencingToken() FencingToken { return FencingToken(1 << 62) }
 
 // testSyncBuffer is a mutex-protected log buffer for tests whose logger is
 // written by background goroutines while the test goroutine asserts on it. It

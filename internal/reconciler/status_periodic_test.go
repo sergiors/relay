@@ -19,7 +19,7 @@ import (
 // state row recorded as ready — the state of an unchanged, already-converged
 // app that the periodic tick verifies. It returns the reconciler, the
 // app, and the state handle.
-func readyServicesReconciler(t *testing.T, root, name string) (*Reconciler, app.App, *state.State, state.Token) {
+func readyServicesReconciler(t *testing.T, root, name string) (*Reconciler, app.App, *state.State, state.FencingToken) {
 	t.Helper()
 	dir := writeServicesDir(t, root, name)
 	tmpl := mustParse(servicesTemplate)
@@ -33,9 +33,9 @@ func readyServicesReconciler(t *testing.T, root, name string) (*Reconciler, app.
 	if err != nil {
 		t.Fatalf("fingerprint: %v", err)
 	}
-	token := recordSuccess(t, st, name, "img-"+name, fp, time.Now(), fn)
-	r.SeedStateToken(name, token)
-	return r, fn, st, token
+	fencingToken := recordSuccess(t, st, name, "img-"+name, fp, time.Now(), fn)
+	r.SeedFencingToken(name, fencingToken)
+	return r, fn, st, fencingToken
 }
 
 // TestUnchangedPeriodicPathDoesNotRecordPreparing pins the focused fix: the
@@ -123,7 +123,7 @@ func TestActualDesiredChangeRecordsPreparingBeforePrepare(t *testing.T) {
 	fn := app.App{Name: "svc-change", Dir: dir, Template: tmpl}
 
 	st := testutil.NewState(t)
-	token := recordSuccess(t, st, fn.Name, "img-v1", "fp-v1", time.Now(), fn)
+	fencingToken := recordSuccess(t, st, fn.Name, "img-v1", "fp-v1", time.Now(), fn)
 
 	pf := runner.NewPrepared(fn, &runtime.Prepared{Name: fn.Name, Image: "img-v1"}, &fakeBuilder{})
 	reg := &runner.Registry{}
@@ -135,7 +135,7 @@ func TestActualDesiredChangeRecordsPreparingBeforePrepare(t *testing.T) {
 		UpdateServices: func(string, *app.Template, string) {},
 	}, reg, probe, testutil.DiscardLogger())
 	seedCurrent(r, fn)
-	r.SeedStateToken(fn.Name, token)
+	r.SeedFencingToken(fn.Name, fencingToken)
 
 	// Change content so the fingerprint changes and a rebuild is warranted.
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
@@ -159,7 +159,7 @@ func TestReconcilingReadyOrderingOnChange(t *testing.T) {
 	fn := app.App{Name: "svc-order", Dir: dir, Template: tmpl}
 
 	st := testutil.NewState(t)
-	token := recordSuccess(t, st, fn.Name, "img-v1", "fp-v1", time.Now(), fn)
+	fencingToken := recordSuccess(t, st, fn.Name, "img-v1", "fp-v1", time.Now(), fn)
 
 	pf := runner.NewPrepared(fn, &runtime.Prepared{Name: fn.Name, Image: "img-svc-order"}, &fakeBuilder{})
 	reg := &runner.Registry{}
@@ -180,7 +180,7 @@ func TestReconcilingReadyOrderingOnChange(t *testing.T) {
 		},
 	}, reg, &fakeBuilder{}, testutil.DiscardLogger())
 	seedCurrent(r, fn)
-	r.SeedStateToken(fn.Name, token)
+	r.SeedFencingToken(fn.Name, fencingToken)
 
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
@@ -242,7 +242,7 @@ func TestServiceLifecycleNeverPublishesBuilding(t *testing.T) {
 	fn := app.App{Name: "svc-nobuild", Dir: dir, Template: tmpl}
 
 	st := testutil.NewState(t)
-	token := recordSuccess(t, st, fn.Name, "img-v1", "fp-v1", time.Now(), fn)
+	fencingToken := recordSuccess(t, st, fn.Name, "img-v1", "fp-v1", time.Now(), fn)
 
 	pf := runner.NewPrepared(fn, &runtime.Prepared{Name: fn.Name, Image: "img-v2"}, &fakeBuilder{})
 	reg := &runner.Registry{}
@@ -265,7 +265,7 @@ func TestServiceLifecycleNeverPublishesBuilding(t *testing.T) {
 		},
 	}, reg, &fakeBuilder{}, testutil.DiscardLogger())
 	seedCurrent(r, fn)
-	r.SeedStateToken(fn.Name, token)
+	r.SeedFencingToken(fn.Name, fencingToken)
 
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
@@ -288,10 +288,10 @@ func TestServiceLifecycleNeverPublishesBuilding(t *testing.T) {
 // verification writes nothing.
 func TestActiveBuildPlusPeriodicTickDoesNotBecomePreparing(t *testing.T) {
 	root := t.TempDir()
-	r, fn, st, token := readyServicesReconciler(t, root, "svc-building")
+	r, fn, st, fencingToken := readyServicesReconciler(t, root, "svc-building")
 
 	// An active build's status stands in the store.
-	if _, err := st.RecordReconcileBuilding(context.Background(), fn.Name, token); err != nil {
+	if _, err := st.RecordReconcileBuilding(context.Background(), fn.Name, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	before, _ := st.GetApp(fn.Name)

@@ -47,8 +47,8 @@ func TestConcurrentAppSnapshotWritesPreserveFields(t *testing.T) {
 	for r := 0; r < rounds; r++ {
 		// Seed a converged snapshot: config/runtime A, desired fp-A, and a usable
 		// active generation.
-		tokenA := seedTokenWithFingerprint(t, c, fnA, "fp-A")
-		if _, err := c.RecordReconcileSuccess(context.Background(), name, "img-A", "fp-A", time.Now(), fnA, tokenA); err != nil {
+		fencingTokenA := seedFencingTokenWithFingerprint(t, c, fnA, "fp-A")
+		if _, err := c.RecordReconcileSuccess(context.Background(), name, "img-A", "fp-A", time.Now(), fnA, fencingTokenA); err != nil {
 			t.Errorf("state write error: %v", err)
 		}
 
@@ -65,11 +65,11 @@ func TestConcurrentAppSnapshotWritesPreserveFields(t *testing.T) {
 						t.Errorf("state write error: %v", err)
 					}
 				case i%2 == 0:
-					if _, err := c.RecordReconcileBuilding(context.Background(), name, tokenA); err != nil {
+					if _, err := c.RecordReconcileBuilding(context.Background(), name, fencingTokenA); err != nil {
 						t.Errorf("state write error: %v", err)
 					}
 				default:
-					if _, err := c.RecordReconciling(context.Background(), name, tokenA); err != nil {
+					if _, err := c.RecordReconciling(context.Background(), name, fencingTokenA); err != nil {
 						t.Errorf("state write error: %v", err)
 					}
 				}
@@ -111,7 +111,7 @@ func TestAppWriteTakesPerAppAdvisoryLock(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	const name = "locked"
-	token := seedTokenWithFingerprint(t, c, fnFor(t, name, tmpl), "fp")
+	fencingToken := seedFencingTokenWithFingerprint(t, c, fnFor(t, name, tmpl), "fp")
 
 	ctx := context.Background()
 	tx, err := c.db.BeginTx(ctx, nil)
@@ -126,7 +126,7 @@ func TestAppWriteTakesPerAppAdvisoryLock(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		if _, err := c.RecordReconcileBuilding(context.Background(), name, token); err != nil {
+		if _, err := c.RecordReconcileBuilding(context.Background(), name, fencingToken); err != nil {
 			t.Errorf("state write error: %v", err)
 		}
 		close(done)

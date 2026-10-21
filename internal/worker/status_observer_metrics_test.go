@@ -18,7 +18,7 @@ func TestWireStatusObserverProjectsTransitions(t *testing.T) {
 	wireStatusObserver(st, reg)
 
 	fn := stateApp("alpha", t.TempDir())
-	token := seedToken(t, st, fn)
+	fencingToken := seedFencingToken(t, st, fn)
 
 	// Discovery -> preparing (one-hot: preparing 1, others 0).
 	if got := reg.GaugeLabels(metrics.MetricAppStatus, []metrics.Label{{Name: "app", Value: "alpha"}, {Name: "status", Value: state.StatusPreparing}}); got != 1 {
@@ -29,7 +29,7 @@ func TestWireStatusObserverProjectsTransitions(t *testing.T) {
 	}
 
 	// Success -> ready.
-	if _, err := st.RecordReconcileSuccess(context.Background(), "alpha", "img", "fp", time.Now(), fn, token); err != nil {
+	if _, err := st.RecordReconcileSuccess(context.Background(), "alpha", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	if got := reg.GaugeLabels(metrics.MetricAppStatus, []metrics.Label{{Name: "app", Value: "alpha"}, {Name: "status", Value: state.StatusReady}}); got != 1 {
@@ -38,7 +38,7 @@ func TestWireStatusObserverProjectsTransitions(t *testing.T) {
 
 	// Removal -> all status series deleted. Check the snapshot BEFORE any
 	// GaugeLabels read: the read-back creates a series as a side effect.
-	if _, err := st.RecordRemoved(context.Background(), "alpha", token); err != nil {
+	if _, err := st.RecordRemoved(context.Background(), "alpha", fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	series := reg.Snapshot()
@@ -71,8 +71,8 @@ func TestStatsResetDoesNotTouchAppStatus(t *testing.T) {
 	reg := metrics.New()
 	wireStatusObserver(st, reg)
 	fn := stateApp("alpha", t.TempDir())
-	token := seedToken(t, st, fn)
-	if _, err := st.RecordReconcileSuccess(context.Background(), "alpha", "img", "fp", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, st, fn)
+	if _, err := st.RecordReconcileSuccess(context.Background(), "alpha", "img", "fp", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 

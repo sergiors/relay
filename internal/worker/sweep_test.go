@@ -81,8 +81,8 @@ func TestStartupImageKeepSetRetainsRecordedImageAfterRediscovery(t *testing.T) {
 
 	// A prior process recorded an active generation; startup rediscovery then
 	// refreshes the desired fingerprint but must preserve the active image.
-	token := seedToken(t, st, fn)
-	if _, err := st.RecordReconcileSuccess(context.Background(), fn.Name, "recorded-active-img", "fp-active", time.Now(), fn, token); err != nil {
+	fencingToken := seedFencingToken(t, st, fn)
+	if _, err := st.RecordReconcileSuccess(context.Background(), fn.Name, "recorded-active-img", "fp-active", time.Now(), fn, fencingToken); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
 	if _, err := st.RecordDiscovered(context.Background(), fn); err != nil {

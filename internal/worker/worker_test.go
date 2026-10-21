@@ -14,42 +14,42 @@ import (
 	"relay/internal/state"
 )
 
-// seedToken persists fn's desired generation and returns the exact transition
-// token the write stored. Generation-specific writes must carry it; token zero
-// is a failed write and never persists.
-func seedToken(t *testing.T, st *state.State, fn app.App) state.Token {
+// seedFencingToken persists fn's desired generation and returns the exact
+// fencing token the write stored. Guarded writes must carry it; zero is a
+// failed write and never persists.
+func seedFencingToken(t *testing.T, st *state.State, fn app.App) state.FencingToken {
 	t.Helper()
-	token, err := st.RecordDiscovered(context.Background(), fn)
+	fencingToken, err := st.RecordDiscovered(context.Background(), fn)
 	if err != nil {
 		t.Fatalf("RecordDiscovered(%q): %v", fn.Name, err)
 	}
-	if token <= 0 {
-		t.Fatalf("RecordDiscovered(%q) returned token %d, want positive", fn.Name, token)
+	if fencingToken <= 0 {
+		t.Fatalf("RecordDiscovered(%q) returned fencing token %d, want positive", fn.Name, fencingToken)
 	}
-	return token
+	return fencingToken
 }
 
 // recordSuccess gives fn a usable persisted generation without reading the
-// token back from apps.generation: the desired write returns the exact token and
-// the success is conditioned on it.
+// fencing token back from apps.fencing_token: the desired write returns the
+// exact token and the success is conditioned on it.
 func recordSuccess(
 	t *testing.T,
 	st *state.State,
 	fn app.App,
 	image, fingerprint string,
 	preparedAt time.Time,
-) state.Token {
+) state.FencingToken {
 	t.Helper()
-	token := seedToken(t, st, fn)
-	landed, err := st.RecordReconcileSuccess(context.Background(), fn.Name, image, fingerprint, preparedAt, fn, token)
+	fencingToken := seedFencingToken(t, st, fn)
+	landed, err := st.RecordReconcileSuccess(context.Background(), fn.Name, image, fingerprint, preparedAt, fn, fencingToken)
 	if err != nil {
 		t.Fatalf("RecordReconcileSuccess(%q): %v", fn.Name, err)
 	}
 	if !landed {
-		t.Fatalf("RecordReconcileSuccess(%q) did not persist with token %d",
-			fn.Name, token)
+		t.Fatalf("RecordReconcileSuccess(%q) did not persist with fencing token %d",
+			fn.Name, fencingToken)
 	}
-	return token
+	return fencingToken
 }
 
 // TestStatsLoopNilStateExitsOnCancel ensures the snapshot loop is nil-safe on
@@ -102,15 +102,15 @@ func TestManagedRuntimeBuildObserverPublishesBuildingOnlyOnActualBuild(t *testin
 		t.Fatal("fixture precondition: no-runtime template must not need a runtime")
 	}
 
-	runtimeToken := seedToken(t, st, runtimeFn)
-	noRuntimeToken := seedToken(t, st, noRuntimeFn)
+	runtimeFencingToken := seedFencingToken(t, st, runtimeFn)
+	noRuntimeFencingToken := seedFencingToken(t, st, noRuntimeFn)
 	if got, _ := st.GetApp(runtimeFn.Name); got.Status != state.StatusPreparing {
 		t.Fatalf("discovered runtime function status = %q, want preparing", got.Status)
 	}
 
 	// A real build fires the observer, moving preparing -> building.
 	runtime.AppBuildObserverFromContext(
-		managedRuntimeBuildContext(context.Background(), st, runtimeFn, runtimeToken),
+		managedRuntimeBuildContext(context.Background(), st, runtimeFn, runtimeFencingToken),
 	)()
 	if got, _ := st.GetApp(runtimeFn.Name); got.Status != state.StatusBuilding {
 		t.Fatalf("runtime function status = %q, want building", got.Status)
@@ -118,7 +118,7 @@ func TestManagedRuntimeBuildObserverPublishesBuildingOnlyOnActualBuild(t *testin
 
 	// A no-runtime preparation never fires the observer (there is no image to
 	// build), so it stays preparing.
-	noRuntimeCtx := managedRuntimeBuildContext(context.Background(), st, noRuntimeFn, noRuntimeToken)
+	noRuntimeCtx := managedRuntimeBuildContext(context.Background(), st, noRuntimeFn, noRuntimeFencingToken)
 	if runtime.AppBuildObserverFromContext(noRuntimeCtx) == nil {
 		t.Fatal("expected an observer to be installed for the no-runtime function too")
 	}
@@ -127,12 +127,12 @@ func TestManagedRuntimeBuildObserverPublishesBuildingOnlyOnActualBuild(t *testin
 	}
 
 	// A successful no-service preparation reaches ready, clearing building.
-	landed, err := st.RecordReconcileSuccess(context.Background(), runtimeFn.Name, "img", "fp", time.Now(), runtimeFn, runtimeToken)
+	landed, err := st.RecordReconcileSuccess(context.Background(), runtimeFn.Name, "img", "fp", time.Now(), runtimeFn, runtimeFencingToken)
 	if err != nil {
 		t.Fatalf("success write: %v", err)
 	}
 	if !landed {
-		t.Fatal("success did not persist with the current token")
+		t.Fatal("success did not persist with the current fencing token")
 	}
 	if got, _ := st.GetApp(runtimeFn.Name); got.Status != state.StatusReady {
 		t.Fatalf("after success status = %q, want ready", got.Status)
@@ -141,23 +141,23 @@ func TestManagedRuntimeBuildObserverPublishesBuildingOnlyOnActualBuild(t *testin
 	// A preparation failure without an active image is unavailable, again
 	// clearing building.
 	failFn := app.App{Name: "fail-fn", Dir: t.TempDir(), Template: &app.Template{Runtime: "node24"}}
-	failToken := seedToken(t, st, failFn)
+	failFencingToken := seedFencingToken(t, st, failFn)
 	runtime.AppBuildObserverFromContext(
-		managedRuntimeBuildContext(context.Background(), st, failFn, failToken),
+		managedRuntimeBuildContext(context.Background(), st, failFn, failFencingToken),
 	)()
-	landed, err = st.RecordReconcileFailure(context.Background(), failFn.Name, errors.New("build failed"), failToken)
+	landed, err = st.RecordReconcileFailure(context.Background(), failFn.Name, errors.New("build failed"), failFencingToken)
 	if err != nil {
 		t.Fatalf("failure write: %v", err)
 	}
 	if !landed {
-		t.Fatal("failure did not persist with the current token")
+		t.Fatal("failure did not persist with the current fencing token")
 	}
 	if got, _ := st.GetApp(failFn.Name); got.Status != state.StatusUnavailable {
 		t.Fatalf("after failure status = %q, want unavailable", got.Status)
 	}
 
 	// Nil state yields a context without an observer, not a panic.
-	if runtime.AppBuildObserverFromContext(managedRuntimeBuildContext(context.Background(), nil, runtimeFn, runtimeToken)) != nil {
+	if runtime.AppBuildObserverFromContext(managedRuntimeBuildContext(context.Background(), nil, runtimeFn, runtimeFencingToken)) != nil {
 		t.Fatal("nil state must not install a build observer")
 	}
 }

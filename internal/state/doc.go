@@ -61,10 +61,14 @@
 // App storage model:
 //
 //   - apps(name TEXT PRIMARY KEY, data JSONB NOT NULL, updated_at TEXT NOT
-//     NULL) stores ONE whole per-app snapshot as a native JSONB object in data.
-//     Only the stable name key and the write timestamp stay as columns. The
-//     nested configuration — the env names (each value is the fixed
-//     RedactedEnvValue marker, never the literal template value) and
+//     NULL, fencing_token BIGINT NOT NULL DEFAULT 0) stores ONE whole per-app
+//     snapshot as a native JSONB object in data. Only the stable name key, the
+//     write timestamp, and the internal fencing token stay as columns;
+//     fencing_token is allocated from apps_fencing_token_seq while the per-app
+//     advisory lock is held and is never part of the JSONB payload. It fences
+//     desired-state transitions across workers: a callback carrying a stale
+//     token updates no row. The nested configuration — the env names (each value
+//     is the fixed RedactedEnvValue marker, never the literal template value) and
 //     the secret REFERENCE names (never a secret value), the event handlers (name
 //   - timeout), the schedules (handler/cron/timezone/timeout/retries), and the
 //     services (entrypoint/image/host/path/port/replicas) — is all part of

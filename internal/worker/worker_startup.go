@@ -24,11 +24,11 @@ type startupAppSet struct {
 	issues       []app.LoadIssue
 	records      []startupApp
 	fingerprints map[string]string
-	// tokens carries the PostgreSQL transition token persisted for each app's
+	// fencingTokens carries the PostgreSQL fencing token persisted for each app's
 	// startup desired generation, keyed by app name. Startup preparation, its
 	// build observer, the startup service callbacks, and the reconciler seed all
-	// reuse these exact values instead of reading apps.generation back.
-	tokens map[string]state.Token
+	// reuse these exact values instead of reading apps.fencing_token back.
+	fencingTokens map[string]state.FencingToken
 }
 
 // loadStartupApps loads /apps, resolves each app's fingerprint and source
@@ -99,7 +99,7 @@ func loadStartupApps(
 	// cancellation, however, stops startup promptly: it is reported as a
 	// graceful interruption so Run converges on the normal teardown path.
 	_, discoverySpan := tracing.Start(startupCtx, "state.discovery")
-	tokens, rerr := persistStartupDiscovery(
+	fencingTokens, rerr := persistStartupDiscovery(
 		startupCtx, st, app.Dir, discovered, loadIssues, logger,
 	)
 	if rerr != nil {
@@ -122,10 +122,10 @@ func loadStartupApps(
 	statsRestoreSpan.End()
 
 	return startupAppSet{
-		loaded:       apps,
-		issues:       loadIssues,
-		records:      startup,
-		fingerprints: fingerprints,
-		tokens:       tokens,
+		loaded:        apps,
+		issues:        loadIssues,
+		records:       startup,
+		fingerprints:  fingerprints,
+		fencingTokens: fencingTokens,
 	}, nil
 }

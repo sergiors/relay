@@ -20,7 +20,7 @@ func snapshotApp(t *testing.T, c *State, name string) Detail {
 	return detail
 }
 
-func assertGenerationState(
+func assertFencingState(
 	t *testing.T,
 	c *State,
 	name string,
@@ -29,51 +29,52 @@ func assertGenerationState(
 	t.Helper()
 	got := snapshotApp(t, c, name)
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("generation-guarded write changed state:\n got: %+v\nwant: %+v",
+		t.Fatalf("fencing-token-guarded write changed state:\n got: %+v\nwant: %+v",
 			got, want)
 	}
 }
 
-// TestStaleGenerationWritesAreRejected is the state-level cross-worker fence:
-// once a newer desired generation has advanced the token, every completion
-// carrying the older token must update no row and publish no status, including
-// success, failure, building, reconciling, and service failure.
-func TestStaleGenerationWritesAreRejected(t *testing.T) {
+// TestStaleFencingTokenWritesAreRejected is the state-level cross-worker
+// fence: once a newer desired generation has advanced the fencing token, every
+// completion carrying the older fencing token must update no row and publish no
+// status, including success, failure, building, reconciling, and service
+// failure.
+func TestStaleFencingTokenWritesAreRejected(t *testing.T) {
 	operations := []struct {
 		name  string
-		apply func(*State, appFixture, Token) (bool, error)
+		apply func(*State, appFixture, FencingToken) (bool, error)
 	}{
 		{
 			name: "success",
-			apply: func(c *State, fx appFixture, token Token) (bool, error) {
+			apply: func(c *State, fx appFixture, fencingToken FencingToken) (bool, error) {
 				return c.RecordReconcileSuccess(context.Background(),
-					fx.name, "img-stale", "fp-stale", time.Now(), fx.app, token)
+					fx.name, "img-stale", "fp-stale", time.Now(), fx.app, fencingToken)
 			},
 		},
 		{
 			name: "failure",
-			apply: func(c *State, fx appFixture, token Token) (bool, error) {
+			apply: func(c *State, fx appFixture, fencingToken FencingToken) (bool, error) {
 				return c.RecordReconcileFailure(context.Background(),
-					fx.name, errors.New("stale failure"), token)
+					fx.name, errors.New("stale failure"), fencingToken)
 			},
 		},
 		{
 			name: "building",
-			apply: func(c *State, fx appFixture, token Token) (bool, error) {
-				return c.RecordReconcileBuilding(context.Background(), fx.name, token)
+			apply: func(c *State, fx appFixture, fencingToken FencingToken) (bool, error) {
+				return c.RecordReconcileBuilding(context.Background(), fx.name, fencingToken)
 			},
 		},
 		{
 			name: "reconciling",
-			apply: func(c *State, fx appFixture, token Token) (bool, error) {
-				return c.RecordReconciling(context.Background(), fx.name, token)
+			apply: func(c *State, fx appFixture, fencingToken FencingToken) (bool, error) {
+				return c.RecordReconciling(context.Background(), fx.name, fencingToken)
 			},
 		},
 		{
 			name: "service failure",
-			apply: func(c *State, fx appFixture, token Token) (bool, error) {
+			apply: func(c *State, fx appFixture, fencingToken FencingToken) (bool, error) {
 				return c.RecordServiceFailure(context.Background(),
-					fx.name, errors.New("stale service failure"), token)
+					fx.name, errors.New("stale service failure"), fencingToken)
 			},
 		},
 	}
@@ -84,17 +85,17 @@ func TestStaleGenerationWritesAreRejected(t *testing.T) {
 			fx := newAppFixture(t, "stale-"+op.name)
 			prepared := time.Now().Add(-time.Hour)
 
-			old := seedTokenWithFingerprint(t, c, fx.app, "fp-old")
+			oldFencingToken := seedFencingTokenWithFingerprint(t, c, fx.app, "fp-old")
 			if !requireWrite(t, fx.name, func() (bool, error) {
 				return c.RecordReconcileSuccess(context.Background(),
-					fx.name, "img-old", "fp-old", prepared, fx.app, old)
+					fx.name, "img-old", "fp-old", prepared, fx.app, oldFencingToken)
 			}) {
 				t.Fatal("precondition: old success did not persist")
 			}
 
 			// A newer worker advances the desired generation. Preparing must
 			// preserve the still-serving active generation.
-			next := requireDesired(t, fx.name, func() (Token, error) {
+			nextFencingToken := requireDesired(t, fx.name, func() (FencingToken, error) {
 				return c.RecordPreparingWithFingerprint(context.Background(), fx.app.Name, fx.app, "fp-next")
 			})
 			afterPreparing := snapshotApp(t, c, fx.name)
@@ -115,22 +116,23 @@ func TestStaleGenerationWritesAreRejected(t *testing.T) {
 			c.SetStatusObserver(observer)
 			*events = nil
 
-			landed, err := op.apply(c, fx, old)
+			landed, err := op.apply(c, fx, oldFencingToken)
 			if err != nil {
-				t.Fatalf("stale generation write returned error: %v", err)
+				t.Fatalf("stale fencing-token write returned error: %v", err)
 			}
 			if landed {
-				t.Fatal("stale generation write reported success")
+				t.Fatal("stale fencing-token write reported success")
 			}
-			assertGenerationState(t, c, fx.name, afterPreparing)
+			assertFencingState(t, c, fx.name, afterPreparing)
 			if len(*events) != 0 {
 				t.Fatalf("stale write published status events: %+v", *events)
 			}
 
-			// The current token still owns the row: a real completion lands.
+			// The current fencing token still owns the row: a real
+			// completion lands.
 			if !requireWrite(t, fx.name, func() (bool, error) {
 				return c.RecordReconcileSuccess(context.Background(),
-					fx.name, "img-next", "fp-next", time.Now(), fx.app, next)
+					fx.name, "img-next", "fp-next", time.Now(), fx.app, nextFencingToken)
 			}) {
 				t.Fatal("current success did not persist")
 			}
@@ -142,18 +144,18 @@ func TestStaleGenerationWritesAreRejected(t *testing.T) {
 	}
 }
 
-// TestCurrentGenerationWritesPersist keeps the acceptance controls alongside
-// the stale rejection: each generation-specific write must still land when the
-// caller carries the token of the current desired generation.
-func TestCurrentGenerationWritesPersist(t *testing.T) {
+// TestCurrentFencingTokenWritesPersist keeps the acceptance controls alongside
+// the stale rejection: each fencing-token-guarded write must still land when the
+// caller carries the fencing token of the current desired generation.
+func TestCurrentFencingTokenWritesPersist(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		c := openTestState(t)
 		fx := newAppFixture(t, "current-success")
-		token := seedTokenWithFingerprint(t, c, fx.app, "fp-v1")
+		fencingToken := seedFencingTokenWithFingerprint(t, c, fx.app, "fp-v1")
 
 		if !requireWrite(t, fx.name, func() (bool, error) {
 			return c.RecordReconcileSuccess(context.Background(),
-				fx.name, "img-v1", "fp-v1", time.Now(), fx.app, token)
+				fx.name, "img-v1", "fp-v1", time.Now(), fx.app, fencingToken)
 		}) {
 			t.Fatal("current success did not persist")
 		}
@@ -168,20 +170,20 @@ func TestCurrentGenerationWritesPersist(t *testing.T) {
 		c := openTestState(t)
 		fx := newAppFixture(t, "current-failure")
 		prepared := time.Now().Add(-time.Hour)
-		old := seedTokenWithFingerprint(t, c, fx.app, "fp-old")
+		oldFencingToken := seedFencingTokenWithFingerprint(t, c, fx.app, "fp-old")
 		if !requireWrite(t, fx.name, func() (bool, error) {
 			return c.RecordReconcileSuccess(context.Background(),
-				fx.name, "img-active", "fp-active", prepared, fx.app, old)
+				fx.name, "img-active", "fp-active", prepared, fx.app, oldFencingToken)
 		}) {
 			t.Fatal("precondition: active success did not persist")
 		}
-		next := requireDesired(t, fx.name, func() (Token, error) {
+		nextFencingToken := requireDesired(t, fx.name, func() (FencingToken, error) {
 			return c.RecordPreparingWithFingerprint(context.Background(), fx.app.Name, fx.app, "fp-next")
 		})
 
 		if !requireWrite(t, fx.name, func() (bool, error) {
 			return c.RecordReconcileFailure(context.Background(),
-				fx.name, errors.New("current build failed"), next)
+				fx.name, errors.New("current build failed"), nextFencingToken)
 		}) {
 			t.Fatal("current failure did not persist")
 		}
@@ -207,10 +209,10 @@ func TestCurrentGenerationWritesPersist(t *testing.T) {
 	t.Run("building and reconciling", func(t *testing.T) {
 		c := openTestState(t)
 		fx := newAppFixture(t, "current-status")
-		token := seedToken(t, c, fx.app)
+		fencingToken := seedFencingToken(t, c, fx.app)
 
 		if !requireWrite(t, fx.name, func() (bool, error) {
-			return c.RecordReconcileBuilding(context.Background(), fx.name, token)
+			return c.RecordReconcileBuilding(context.Background(), fx.name, fencingToken)
 		}) {
 			t.Fatal("current building status did not persist")
 		}
@@ -218,7 +220,7 @@ func TestCurrentGenerationWritesPersist(t *testing.T) {
 			t.Fatalf("status = %q, want building", got.Status)
 		}
 		if !requireWrite(t, fx.name, func() (bool, error) {
-			return c.RecordReconciling(context.Background(), fx.name, token)
+			return c.RecordReconciling(context.Background(), fx.name, fencingToken)
 		}) {
 			t.Fatal("current reconciling status did not persist")
 		}
@@ -230,17 +232,17 @@ func TestCurrentGenerationWritesPersist(t *testing.T) {
 	t.Run("service failure preserves active image", func(t *testing.T) {
 		c := openTestState(t)
 		fx := newAppFixture(t, "current-service-failure")
-		token := seedToken(t, c, fx.app)
+		fencingToken := seedFencingToken(t, c, fx.app)
 		if !requireWrite(t, fx.name, func() (bool, error) {
 			return c.RecordReconcileSuccess(context.Background(),
-				fx.name, "img-active", "fp-active", time.Now(), fx.app, token)
+				fx.name, "img-active", "fp-active", time.Now(), fx.app, fencingToken)
 		}) {
 			t.Fatal("precondition: active success did not persist")
 		}
 
 		if !requireWrite(t, fx.name, func() (bool, error) {
 			return c.RecordServiceFailure(context.Background(),
-				fx.name, errors.New("current service failed"), token)
+				fx.name, errors.New("current service failed"), fencingToken)
 		}) {
 			t.Fatal("current service failure did not persist")
 		}
@@ -255,11 +257,11 @@ func TestCurrentGenerationWritesPersist(t *testing.T) {
 	t.Run("removal deletes row and stats", func(t *testing.T) {
 		c := openTestState(t)
 		fx := newAppFixture(t, "current-removal")
-		token := seedToken(t, c, fx.app)
+		fencingToken := seedFencingToken(t, c, fx.app)
 		c.RecordAppStats(AppStats{App: fx.name, EventsMatchedTotal: 3})
 
 		if !requireWrite(t, fx.name, func() (bool, error) {
-			return c.RecordRemoved(context.Background(), fx.name, token)
+			return c.RecordRemoved(context.Background(), fx.name, fencingToken)
 		}) {
 			t.Fatal("current removal did not delete the row")
 		}
@@ -272,38 +274,38 @@ func TestCurrentGenerationWritesPersist(t *testing.T) {
 	})
 }
 
-// TestDesiredABAStillRejectsStaleToken proves the token, not the desired
-// fingerprint text, is the fence: a desired A -> B -> A sequence allocates a
-// fresh token for the second A, so A's original completion is still stale even
-// though the desired fingerprint matches again.
-func TestDesiredABAStillRejectsStaleToken(t *testing.T) {
+// TestDesiredABAStillRejectsStaleFencingToken proves the fencing token, not the
+// desired fingerprint text, is the fence: a desired A -> B -> A sequence
+// allocates a fresh fencing token for the second A, so A's original completion
+// is still stale even though the desired fingerprint matches again.
+func TestDesiredABAStillRejectsStaleFencingToken(t *testing.T) {
 	c := openTestState(t)
 	fx := newAppFixture(t, "aba")
 
-	tokenA := seedTokenWithFingerprint(t, c, fx.app, "fp-A")
-	tokenB := requireDesired(t, fx.name, func() (Token, error) {
+	fencingTokenA := seedFencingTokenWithFingerprint(t, c, fx.app, "fp-A")
+	fencingTokenB := requireDesired(t, fx.name, func() (FencingToken, error) {
 		return c.RecordPreparingWithFingerprint(context.Background(), fx.app.Name, fx.app, "fp-B")
 	})
-	tokenA2 := requireDesired(t, fx.name, func() (Token, error) {
+	fencingTokenA2 := requireDesired(t, fx.name, func() (FencingToken, error) {
 		return c.RecordPreparingWithFingerprint(context.Background(), fx.app.Name, fx.app, "fp-A")
 	})
-	if tokenA == tokenA2 || tokenB == tokenA2 {
-		t.Fatalf("tokens not freshly allocated: A=%d B=%d A2=%d",
-			tokenA, tokenB, tokenA2)
+	if fencingTokenA == fencingTokenA2 || fencingTokenB == fencingTokenA2 {
+		t.Fatalf("fencing tokens not freshly allocated: A=%d B=%d A2=%d",
+			fencingTokenA, fencingTokenB, fencingTokenA2)
 	}
 
 	before := snapshotApp(t, c, fx.name)
 	if requireWrite(t, fx.name, func() (bool, error) {
 		return c.RecordReconcileSuccess(context.Background(),
-			fx.name, "img-A", "fp-A", time.Now(), fx.app, tokenA)
+			fx.name, "img-A", "fp-A", time.Now(), fx.app, fencingTokenA)
 	}) {
 		t.Fatal("stale A completion persisted after A->B->A")
 	}
-	assertGenerationState(t, c, fx.name, before)
+	assertFencingState(t, c, fx.name, before)
 
 	if !requireWrite(t, fx.name, func() (bool, error) {
 		return c.RecordReconcileSuccess(context.Background(),
-			fx.name, "img-A2", "fp-A", time.Now(), fx.app, tokenA2)
+			fx.name, "img-A2", "fp-A", time.Now(), fx.app, fencingTokenA2)
 	}) {
 		t.Fatal("current A2 completion did not persist")
 	}
@@ -320,15 +322,15 @@ func TestStaleRemovalCannotDeleteReaddedApp(t *testing.T) {
 	c := openTestState(t)
 	fx := newAppFixture(t, "readd")
 
-	old := seedToken(t, c, fx.app)
+	oldFencingToken := seedFencingToken(t, c, fx.app)
 	if !requireWrite(t, fx.name, func() (bool, error) {
-		return c.RecordRemoved(context.Background(), fx.name, old)
+		return c.RecordRemoved(context.Background(), fx.name, oldFencingToken)
 	}) {
 		t.Fatal("precondition: current removal did not delete the row")
 	}
 
 	// A newer generation re-adds the app and creates its stats row.
-	fresh := seedToken(t, c, fx.app)
+	freshFencingToken := seedFencingToken(t, c, fx.app)
 	c.RecordAppStats(AppStats{App: fx.name, EventsMatchedTotal: 12})
 	before := snapshotApp(t, c, fx.name)
 
@@ -337,11 +339,11 @@ func TestStaleRemovalCannotDeleteReaddedApp(t *testing.T) {
 	*events = nil
 
 	if requireWrite(t, fx.name, func() (bool, error) {
-		return c.RecordRemoved(context.Background(), fx.name, old)
+		return c.RecordRemoved(context.Background(), fx.name, oldFencingToken)
 	}) {
 		t.Fatal("stale removal deleted the re-added row")
 	}
-	assertGenerationState(t, c, fx.name, before)
+	assertFencingState(t, c, fx.name, before)
 	if len(*events) != 0 {
 		t.Fatalf("stale removal published status events: %+v", *events)
 	}
@@ -352,11 +354,11 @@ func TestStaleRemovalCannotDeleteReaddedApp(t *testing.T) {
 	// A stale success from before the removal must not resurrect or overwrite.
 	if requireWrite(t, fx.name, func() (bool, error) {
 		return c.RecordReconcileSuccess(context.Background(),
-			fx.name, "img-old", "fp-old", time.Now(), fx.app, old)
+			fx.name, "img-old", "fp-old", time.Now(), fx.app, oldFencingToken)
 	}) {
 		t.Fatal("stale success from before removal persisted")
 	}
-	assertGenerationState(t, c, fx.name, before)
+	assertFencingState(t, c, fx.name, before)
 	if len(*events) != 0 {
 		t.Fatalf("stale success published status events: %+v", *events)
 	}
@@ -364,7 +366,7 @@ func TestStaleRemovalCannotDeleteReaddedApp(t *testing.T) {
 	// The fresh generation still owns the row.
 	if !requireWrite(t, fx.name, func() (bool, error) {
 		return c.RecordReconcileSuccess(context.Background(),
-			fx.name, "img-fresh", "fp-fresh", time.Now(), fx.app, fresh)
+			fx.name, "img-fresh", "fp-fresh", time.Now(), fx.app, freshFencingToken)
 	}) {
 		t.Fatal("fresh success did not persist")
 	}
@@ -373,39 +375,39 @@ func TestStaleRemovalCannotDeleteReaddedApp(t *testing.T) {
 	}
 }
 
-// TestDesiredWritesAllocateFreshTokens pins token allocation: every
-// desired-generation write (discovery, preparing, invalid desired) returns a
-// new positive token, strictly increasing within the schema, so two consecutive
-// writes can never share an identity even when their desired fingerprint text
-// repeats.
-func TestDesiredWritesAllocateFreshTokens(t *testing.T) {
+// TestDesiredWritesAllocateFreshFencingTokens pins fencing token allocation:
+// every desired-generation write (discovery, preparing, invalid desired)
+// returns a new positive fencing token, strictly increasing within the schema,
+// so two consecutive writes can never share an identity even when their desired
+// fingerprint text repeats.
+func TestDesiredWritesAllocateFreshFencingTokens(t *testing.T) {
 	c := openTestState(t)
-	fx := newAppFixture(t, "tokens")
+	fx := newAppFixture(t, "fencing-tokens")
 
-	discovered := seedTokenWithFingerprint(t, c, fx.app, "fp-1")
-	preparing := requireDesired(t, fx.name, func() (Token, error) {
+	discoveredFencingToken := seedFencingTokenWithFingerprint(t, c, fx.app, "fp-1")
+	preparingFencingToken := requireDesired(t, fx.name, func() (FencingToken, error) {
 		return c.RecordPreparingWithFingerprint(context.Background(), fx.name, fx.app, "fp-1")
 	})
-	invalid := requireDesired(t, fx.name, func() (Token, error) {
+	invalidFencingToken := requireDesired(t, fx.name, func() (FencingToken, error) {
 		return c.RecordInvalidDesired(context.Background(), fx.name, errors.New("invalid template"))
 	})
 
-	if discovered >= preparing || preparing >= invalid {
-		t.Fatalf("tokens not strictly increasing: discovered=%d preparing=%d invalid=%d",
-			discovered, preparing, invalid)
+	if discoveredFencingToken >= preparingFencingToken || preparingFencingToken >= invalidFencingToken {
+		t.Fatalf("fencing tokens not strictly increasing: discovered=%d preparing=%d invalid=%d",
+			discoveredFencingToken, preparingFencingToken, invalidFencingToken)
 	}
-	if invalid <= 0 {
-		t.Fatalf("invalid desired token = %d, want positive", invalid)
+	if invalidFencingToken <= 0 {
+		t.Fatalf("invalid desired fencing token = %d, want positive", invalidFencingToken)
 	}
 }
 
-// TestZeroTokenWritesNeverPersist pins the fail-closed contract: a zero token
-// means the desired-generation write failed, so no generation-specific write
-// may touch the row or publish a status.
-func TestZeroTokenWritesNeverPersist(t *testing.T) {
+// TestZeroFencingTokenWritesNeverPersist pins the fail-closed contract: a zero
+// fencing token means the desired-generation write failed, so no
+// fencing-token-guarded write may touch the row or publish a status.
+func TestZeroFencingTokenWritesNeverPersist(t *testing.T) {
 	c := openTestState(t)
-	fx := newAppFixture(t, "zero-token")
-	token := seedToken(t, c, fx.app)
+	fx := newAppFixture(t, "zero-fencing-token")
+	fencingToken := seedFencingToken(t, c, fx.app)
 	c.RecordAppStats(AppStats{App: fx.name, EventsMatchedTotal: 4})
 	before := snapshotApp(t, c, fx.name)
 
@@ -434,30 +436,30 @@ func TestZeroTokenWritesNeverPersist(t *testing.T) {
 	for _, op := range operations {
 		landed, err := op.apply()
 		if err != nil {
-			t.Fatalf("%s with a zero token returned error: %v", op.name, err)
+			t.Fatalf("%s with a zero fencing token returned error: %v", op.name, err)
 		}
 		if landed {
-			t.Fatalf("%s with a zero token reported success", op.name)
+			t.Fatalf("%s with a zero fencing token reported success", op.name)
 		}
 	}
 
-	assertGenerationState(t, c, fx.name, before)
+	assertFencingState(t, c, fx.name, before)
 	if len(*events) != 0 {
-		t.Fatalf("zero-token writes published status events: %+v", *events)
+		t.Fatalf("zero-fencing-token writes published status events: %+v", *events)
 	}
 	if stats, ok := c.AppStats(fx.name); !ok || stats.EventsMatchedTotal != 4 {
-		t.Fatalf("zero-token removal changed app_stats: %+v ok=%v", stats, ok)
+		t.Fatalf("zero-fencing-token removal changed app_stats: %+v ok=%v", stats, ok)
 	}
-	// The row still belongs to its real token.
+	// The row still belongs to its real fencing token.
 	if !requireWrite(t, fx.name, func() (bool, error) {
 		return c.RecordReconcileSuccess(context.Background(),
-			fx.name, "img-current", "fp", time.Now(), fx.app, token)
+			fx.name, "img-current", "fp", time.Now(), fx.app, fencingToken)
 	}) {
-		t.Fatal("current token success did not persist after zero-token writes")
+		t.Fatal("current fencing token success did not persist after zero-fencing-token writes")
 	}
 }
 
-// appFixture bundles the app and the name used by the token tests.
+// appFixture bundles the app and the name used by the fencing token tests.
 type appFixture struct {
 	app  app.App
 	name string
