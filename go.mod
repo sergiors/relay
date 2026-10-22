@@ -4,6 +4,7 @@ go 1.27.0
 
 require (
 	github.com/containerd/errdefs v1.0.0
+	github.com/creack/pty v1.1.24
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/go-co-op/gocron/v2 v2.16.6
 	github.com/go-git/go-git/v5 v5.19.2

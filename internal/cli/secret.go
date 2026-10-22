@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +14,11 @@ import (
 
 	"relay/internal/secrets"
 )
+
+// secretStdinArg is the only accepted second positional argument of
+// `secret set`: it explicitly selects stdin as the value source. Secret values
+// are never accepted as positional arguments.
+const secretStdinArg = "-"
 
 // secretsPath is the local secrets directory the CLI reads and writes. It
 // defaults to the fixed internal path; tests replace it with a temp dir so they
@@ -47,21 +53,34 @@ func secretCommand() *cli.Command {
 			{
 				Name:      "set",
 				Usage:     "Create or update a secret",
-				UsageText: "relay secret set NAME",
-				Description: "Create or update a secret. The value is read from the terminal " +
-					"(hidden) or, when stdin is not a terminal, from all of stdin. It is never " +
-					"accepted as a positional argument and never printed.",
+				UsageText: "relay secret set NAME [-]",
+				Description: "Create or update a secret. Without a second argument the value is " +
+					"read from an interactive terminal with echo disabled; use - to read all of " +
+					"stdin instead. A secret value is never accepted as a positional argument " +
+					"and is never printed.",
 				Arguments: []cli.Argument{
-					&cli.StringArgs{Name: "name", Min: 1, Max: 1},
+					&cli.StringArgs{Name: "name", Min: 1, Max: 1, UsageText: "NAME"},
+					&cli.StringArgs{Name: "source", Min: 0, Max: 1, UsageText: "[-]"},
 				},
+				// Stop flag parsing after NAME so a trailing "-" and any extra
+				// argument are preserved as positionals: urfave otherwise swallows
+				// everything after a lone "-", which would silently accept extra
+				// arguments instead of rejecting them.
+				StopOnNthArg: stopOnFirstPositional(),
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					if cmd.Args().Present() {
-						// A value must never be passed as a positional argument: the
-						// single name argument plus this guard makes
-						// `relay secret set foo bar` invalid.
 						return cli.Exit("secret set: too many arguments", 2)
 					}
-					return secretSet(ctx, cmd.Reader, cmd.Writer, cmd.StringArgs("name")[0])
+					source := cmd.StringArgs("source")
+					if len(source) > 0 && source[0] != secretStdinArg {
+						// A value must never be passed as a positional argument.
+						// Do not echo the rejected literal: it is secret material.
+						return cli.Exit(
+							"secret set: secret values must not be passed as arguments (use - to read the value from stdin)",
+							2,
+						)
+					}
+					return secretSet(ctx, cmd.Reader, cmd.Writer, cmd.StringArgs("name")[0], len(source) > 0)
 				},
 			},
 			{
@@ -107,26 +126,35 @@ func secretList(ctx context.Context, w io.Writer) error {
 	return nil
 }
 
-// secretSet reads a value (hidden on a terminal, or all of stdin when piped)
-// and writes it atomically. The value is never echoed and never printed.
-func secretSet(ctx context.Context, in io.Reader, out io.Writer, name string) error {
+// secretSet reads a value (hidden from an interactive terminal, or all of stdin
+// when `-` was given) and writes it atomically. The value is never echoed and
+// never printed.
+func secretSet(ctx context.Context, in io.Reader, out io.Writer, name string, fromStdin bool) error {
 	store, err := openSecretStore()
 	if err != nil {
 		return err
 	}
-	return secretSetValue(ctx, store, name, in, out)
+	return secretSetValue(ctx, store, name, in, out, fromStdin)
 }
 
 // secretSetValue is the testable core of `secret set`: it validates the name,
-// reads the value from in (hidden when in is a terminal, else all of stdin),
-// writes it via store, and reports success on out. It returns an error.
-func secretSetValue(ctx context.Context, store *secrets.LocalStore, name string, in io.Reader, out io.Writer) error {
+// reads the value from the explicitly selected source (the terminal when
+// fromStdin is false, otherwise all of stdin), writes it via store, and reports
+// success on out. It returns an error.
+func secretSetValue(ctx context.Context, store *secrets.LocalStore, name string, in io.Reader, out io.Writer, fromStdin bool) error {
 	if err := secrets.ValidateName(name); err != nil {
 		return err
 	}
-	value, err := readSecretValue(in)
+	read := readSecretFromTerminal
+	if fromStdin {
+		read = readSecretFromStdin
+	}
+	value, err := read(in)
 	if err != nil {
 		return err
+	}
+	if value == "" {
+		return errors.New("secret set: empty value")
 	}
 	if err := store.Set(ctx, name, value); err != nil {
 		return err
@@ -135,26 +163,42 @@ func secretSetValue(ctx context.Context, store *secrets.LocalStore, name string,
 	return nil
 }
 
-// readSecretValue reads a secret value from in. When in is a terminal, it
-// prompts and reads a single line with echo disabled (so the value is never
-// shown); otherwise it reads ALL of stdin (the safe non-interactive path, e.g.
-// `printf 'value' | relay secret set foo`). The stored bytes are authoritative
-// apart from exactly one trailing line ending (see trimSecretLineEnding).
-func readSecretValue(in io.Reader) (string, error) {
-	if f, ok := in.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
-		fmt.Fprint(os.Stderr, "Enter value: ")
-		line, err := term.ReadPassword(int(f.Fd()))
-		fmt.Fprintln(os.Stderr)
-		if err != nil {
-			return "", fmt.Errorf("read secret: %w", err)
-		}
-		return strings.TrimSuffix(string(line), "\n"), nil
+// readSecretFromTerminal prompts on stderr and reads one line with echo disabled,
+// so the value is never shown. It requires an actual terminal: when in is not an
+// interactive terminal it fails with guidance instead of blocking on a read.
+func readSecretFromTerminal(in io.Reader) (string, error) {
+	f, ok := in.(*os.File)
+	if !ok || !term.IsTerminal(int(f.Fd())) {
+		return "", errors.New(
+			"secret set: an interactive terminal is required to prompt for the value (use - to read it from stdin)",
+		)
+	}
+	fmt.Fprint(os.Stderr, "Enter value: ")
+	line, err := term.ReadPassword(int(f.Fd()))
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return "", fmt.Errorf("secret set: read terminal: %w", err)
+	}
+	return strings.TrimSuffix(string(line), "\n"), nil
+}
+
+// readSecretFromStdin reads ALL of stdin (the safe non-interactive path, e.g.
+// `printf 'value' | relay secret set foo -`). The stored bytes are authoritative
+// apart from exactly one trailing line ending (see trimSecretLineEnding), and an
+// empty value is rejected rather than stored.
+func readSecretFromStdin(in io.Reader) (string, error) {
+	if in == nil {
+		return "", errors.New("secret set: no stdin available to read (use - only when piping the value)")
 	}
 	data, err := io.ReadAll(in)
 	if err != nil {
-		return "", fmt.Errorf("read secret from stdin: %w", err)
+		return "", fmt.Errorf("secret set: read stdin: %w", err)
 	}
-	return trimSecretLineEnding(string(data)), nil
+	value := trimSecretLineEnding(string(data))
+	if value == "" {
+		return "", errors.New("secret set: empty value on stdin")
+	}
+	return value, nil
 }
 
 // trimSecretLineEnding removes exactly one trailing line ending from a piped

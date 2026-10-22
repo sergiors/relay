@@ -27,18 +27,18 @@ those operations.
 
 ## Prerequisites per command
 
-| Command                     | Needs Redis | Needs Docker | Needs a running worker | Reads/writes                                 |
-| --------------------------- | ----------- | ------------ | ---------------------- | -------------------------------------------- |
-| `start`                     | yes         | yes          | —                      | runtime                                      |
-| `health`                    | no          | no           | **yes**                | worker socket                                |
-| `stats`                     | no          | no           | no                     | state DB (read)                              |
-| `stats reset`               | no          | no           | optional (socket)      | state DB (write); worker socket when running |
-| `app ls` / `inspect` / `apps` | no       | no           | optional (inspect)     | state DB (read); socket for live pool gauges |
-| `app invoke`                | no          | no           | **yes**                | worker socket                                |
-| `dlq ls` / `inspect` / `rm` | yes         | no           | no                     | Redis DLQ stream                             |
-| `dlq replay`                | yes         | no           | **yes**                | Redis DLQ + worker socket                    |
-| `secret ls` / `set` / `rm`  | no          | no           | no                     | local secret files                           |
-| `git *`                     | no          | no           | no                     | local git config/key/checkout + `/apps`      |
+| Command                       | Needs Redis | Needs Docker | Needs a running worker | Reads/writes                                 |
+| ----------------------------- | ----------- | ------------ | ---------------------- | -------------------------------------------- |
+| `start`                       | yes         | yes          | —                      | runtime                                      |
+| `health`                      | no          | no           | **yes**                | worker socket                                |
+| `stats`                       | no          | no           | no                     | state DB (read)                              |
+| `stats reset`                 | no          | no           | optional (socket)      | state DB (write); worker socket when running |
+| `app ls` / `inspect` / `apps` | no          | no           | optional (inspect)     | state DB (read); socket for live pool gauges |
+| `app invoke`                  | no          | no           | **yes**                | worker socket                                |
+| `dlq ls` / `inspect` / `rm`   | yes         | no           | no                     | Redis DLQ stream                             |
+| `dlq replay`                  | yes         | no           | **yes**                | Redis DLQ + worker socket                    |
+| `secret ls` / `set` / `rm`    | no          | no           | no                     | local secret files                           |
+| `git *`                       | no          | no           | no                     | local git config/key/checkout + `/apps`      |
 
 Commands that need Redis resolve the Redis configuration with the same required
 `REDIS_*` validation as `relay start`, so a missing `REDIS_URI`,
@@ -165,21 +165,18 @@ labels `Message reclaims` and `DLQ entries` mean different things; see
 
 Runs an app's matching event handlers **synchronously on the running
 worker's live runtime pool**, without publishing to the stream. Supply the event
-as `--event JSON` or on stdin:
+as a positional JSON object, or use `-` to read it from stdin:
 
 ```sh
-relay app invoke user-events-python --event '{"event_name":"INSERT"}'
-relay app invoke user-events-python < event.json
-echo '{"event_name":"INSERT"}' | relay app invoke user-events-python
+relay app invoke user-events-python '{"event_name":"INSERT"}'
+relay app invoke user-events-python - < event.json
+echo '{"event_name":"INSERT"}' | relay app invoke user-events-python -
 ```
 
-`--event` takes precedence: when it is set, stdin is never read, so an explicit
-event cannot block on (or fail because of) an open stdin stream. Stdin is only
-read when `--event` is absent and stdin is not an interactive terminal, so a bare
-`relay app invoke NAME` is a usage error instead of blocking for a typed line.
-The payload must be a JSON **object** (arrays, scalars, and `null` are rejected),
-and malformed JSON is reported as `app invoke: invalid event JSON: ...`. Output
-is one of:
+A bare `relay app invoke NAME` is a usage error; stdin is never read implicitly,
+so an open stream cannot block the command. The payload must be a JSON **object**
+(arrays, scalars, and `null` are rejected), and malformed JSON is reported as
+`app invoke: invalid event JSON: ...`. Output is one of:
 
 ```
 No matching handlers
@@ -188,10 +185,10 @@ Invoked N handlers
 ```
 
 Inside Docker, pass `-T` so stdin stays a pipe (the default allocates a
-pseudo-TTY and an interactive terminal is never read):
+pseudo-TTY), and use `-` to select it:
 
 ```sh
-docker compose exec -T relay app invoke user-events-python < event.json
+docker compose exec -T relay app invoke user-events-python - < event.json
 ```
 
 Unlike stream consumption, a manual invocation is **not** part of the
@@ -230,24 +227,27 @@ These commands need Redis. The DLQ stream is `relay:<REDIS_STREAM>:dlq`.
 
 ```
 relay secret ls                      # NAME column, sorted
-relay secret set database-url        # read hidden from the terminal, or all of stdin
+relay secret set database-url        # hidden prompt on an interactive terminal
+relay secret set database-url -      # read all of stdin
 relay secret rm database-url         # a missing secret is an error
 ```
 
-`secret set NAME` never accepts a value as a positional argument and never
-prints it. When stdin is not a terminal it reads all of stdin. Use the portable
-`printf` form (or `echo -n` in bash/zsh) so no newline is added:
+`secret set NAME` requires an interactive terminal and prompts with echo
+disabled; if no terminal is available it fails with guidance instead of blocking.
+`secret set NAME -` reads all of stdin. A secret value is never accepted as a
+positional argument: the only allowed second argument is `-`, and the value is
+never printed.
 
 ```sh
-echo -n 'value' | relay secret set API_KEY    # bash/zsh
-printf '%s' 'value' | relay secret set API_KEY     # POSIX-portable
-docker compose exec -T relay secret set API_KEY < value.txt
+relay secret set API_KEY                          # hidden prompt
+printf '%s' 'value' | relay secret set API_KEY -  # read all of stdin
+docker compose exec -T relay secret set API_KEY - < value.txt
 ```
 
 Piped values are stored byte-for-byte except for exactly one trailing line
 ending: one `CRLF`, or else one `LF`, is removed. Everything else is preserved,
 including leading whitespace, trailing spaces, internal newlines, and a sole
-trailing `CR`.
+trailing `CR`. An empty piped value is rejected.
 
 Values are stored as files under `/var/lib/relay/secrets` and are only ever
 referenced by name from `template.yaml`.

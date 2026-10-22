@@ -226,7 +226,7 @@ func gitStatus(w io.Writer) error {
 // confirmed (or -y/--yes is set), performs the removal. It reads one answer
 // line from cmd.Reader (the injected stdin — tests drive it through runCLI's
 // Reader; never os.Stdin), prompts on os.Stderr (a prompt is UI, not a command
-// result, mirroring secret.go's readSecretValue), and routes the removal report
+// result, mirroring secret.go's terminal value reader), and routes the removal report
 // to cmd.Writer. The safe default is No: anything but an explicit y/yes on a
 // trimmed, lowercased line cancels silently with a nil error (exit 0, nothing
 // removed, no output on the command writer). That default makes the command

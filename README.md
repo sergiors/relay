@@ -394,10 +394,10 @@ relay stats reset
 
 relay app ls
 relay app inspect <name>
-relay app invoke <name>
+relay app invoke <name> [json|-]
 
 relay secret ls
-relay secret set <name>
+relay secret set <name> [-]
 relay secret rm <name>
 
 relay git keygen
@@ -412,25 +412,26 @@ relay dlq replay <id>
 relay dlq rm <id>
 ```
 
-Manual invocation takes an inline event or stdin (never an interactive terminal);
-an explicit `--event` takes precedence and stdin is not read. Secrets are read
-from a hidden prompt or stdin, never arguments:
+Manual invocation takes a positional JSON object, or `-` to read it from stdin;
+a bare `NAME` is a usage error and never reads stdin. Secrets are read from a
+hidden prompt on an interactive terminal, or from all of stdin when `-` is
+given; they are never arguments:
 
 ```sh
-relay app invoke user-events-python --event '{"event_name":"INSERT"}'
-relay app invoke user-events-python < event.json
-echo '{"event_name":"INSERT"}' | relay app invoke user-events-python
+relay app invoke user-events-python '{"event_name":"INSERT"}'
+relay app invoke user-events-python - < event.json
+echo '{"event_name":"INSERT"}' | relay app invoke user-events-python -
 
 # -T keeps stdin a pipe instead of an allocated pseudo-TTY.
-docker compose exec -T relay app invoke user-events-python < event.json
+docker compose exec -T relay app invoke user-events-python - < event.json
 
-echo -n 'value' | relay secret set API_KEY    # bash/zsh
-printf '%s' 'value' | relay secret set API_KEY     # POSIX-portable
-docker compose exec -T relay secret set API_KEY < value.txt
+relay secret set API_KEY                          # hidden prompt (requires a terminal)
+printf '%s' 'value' | relay secret set API_KEY -  # read all of stdin
+docker compose exec -T relay secret set API_KEY - < value.txt
 ```
 
 Piped secrets are stored byte-for-byte except for exactly one trailing line
-ending (one `CRLF`, or else one `LF`).
+ending (one `CRLF`, or else one `LF`). An empty piped value is rejected.
 
 Use:
 

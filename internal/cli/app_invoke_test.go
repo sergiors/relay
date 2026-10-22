@@ -1,12 +1,15 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -45,6 +48,26 @@ func (f *fakeInvoker) snapshot() (calls int, name string, event map[string]any) 
 	return f.calls, f.name, f.event
 }
 
+// invokeDeps returns dependencies for `app invoke`, whose only seam is the
+// worker socket. The state opener fails loudly so an accidental database
+// dependency is caught, and the socket lives under /tmp to stay inside the
+// Unix sun_path limit. Unlike testDeps, it never needs PostgreSQL, so the
+// focused invoke tests always run.
+func invokeDeps(t *testing.T) Dependencies {
+	t.Helper()
+	sockDir, err := os.MkdirTemp("/tmp", "relay-cli-sock-")
+	if err != nil {
+		t.Fatalf("short temp dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+	return Dependencies{
+		SocketPath: filepath.Join(sockDir, "relay.sock"),
+		OpenState: func(context.Context) (*state.State, func(), error) {
+			return nil, nil, errors.New("app invoke must not open the state DB")
+		},
+	}
+}
+
 // startTestSocketWithInvoker starts a real worker query socket at path with the
 // given manual invoker, so the CLI's socket round trip is exercised end to end
 // using the test's injected Dependencies.
@@ -81,14 +104,25 @@ func startTestSocketWithReplayer(t *testing.T, path string, replayer worker.Hand
 	t.Cleanup(func() { _ = s.Close() })
 }
 
-// TestAppInvokeEventFlag verifies the inline --event form: the event object
+// trackingReader records reads so a test can prove stdin was never touched.
+// A read must never be needed to prove absence of an implicit source.
+type trackingReader struct {
+	reads int
+}
+
+func (r *trackingReader) Read([]byte) (int, error) {
+	r.reads++
+	return 0, io.EOF
+}
+
+// TestAppInvokeInlineJSON verifies the positional JSON form: the event object
 // reaches the worker's invoker and the concise success line is written.
-func TestAppInvokeEventFlag(t *testing.T) {
-	_, deps := openTempState(t)
+func TestAppInvokeInlineJSON(t *testing.T) {
+	deps := invokeDeps(t)
 	inv := &fakeInvoker{invoked: 1}
 	startTestSocketWithInvoker(t, deps.SocketPath, inv)
 
-	out, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "fn", "--event", `{"event_name":"INSERT"}`)
+	out, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "fn", `{"event_name":"INSERT"}`)
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -107,10 +141,10 @@ func TestAppInvokeEventFlag(t *testing.T) {
 // TestAppInvokePluralOutput verifies the exact plural success line for more
 // than one handler.
 func TestAppInvokePluralOutput(t *testing.T) {
-	_, deps := openTempState(t)
+	deps := invokeDeps(t)
 	startTestSocketWithInvoker(t, deps.SocketPath, &fakeInvoker{invoked: 3})
 
-	out, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "fn", "--event", `{}`)
+	out, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "fn", `{}`)
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -122,10 +156,10 @@ func TestAppInvokePluralOutput(t *testing.T) {
 // TestAppInvokeNoMatch verifies the exact no-match line when the worker
 // reports zero invoked handlers.
 func TestAppInvokeNoMatch(t *testing.T) {
-	_, deps := openTempState(t)
+	deps := invokeDeps(t)
 	startTestSocketWithInvoker(t, deps.SocketPath, &fakeInvoker{invoked: 0})
 
-	out, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "fn", "--event", `{}`)
+	out, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "fn", `{}`)
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -134,13 +168,14 @@ func TestAppInvokeNoMatch(t *testing.T) {
 	}
 }
 
-// TestAppInvokeStdin verifies the piped-stdin form when no flag is given.
-func TestAppInvokeStdin(t *testing.T) {
-	_, deps := openTempState(t)
+// TestAppInvokeStdinMarker verifies `NAME -` explicitly selects stdin and the
+// payload is forwarded to the worker.
+func TestAppInvokeStdinMarker(t *testing.T) {
+	deps := invokeDeps(t)
 	inv := &fakeInvoker{invoked: 1}
 	startTestSocketWithInvoker(t, deps.SocketPath, inv)
 
-	out, _, err := runCLIWithDeps(t, deps, `{"event_name":"INSERT"}`, "app", "invoke", "fn")
+	out, _, err := runCLIWithDeps(t, deps, `{"event_name":"INSERT"}`, "app", "invoke", "fn", "-")
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -155,12 +190,12 @@ func TestAppInvokeStdin(t *testing.T) {
 // TestAppInvokeStdinMultiline verifies a pretty-printed, multiline JSON object
 // on stdin is read whole and decoded by the worker's invoker.
 func TestAppInvokeStdinMultiline(t *testing.T) {
-	_, deps := openTempState(t)
+	deps := invokeDeps(t)
 	inv := &fakeInvoker{invoked: 1}
 	startTestSocketWithInvoker(t, deps.SocketPath, inv)
 
 	stdin := "{\n  \"event_name\": \"INSERT\",\n  \"nested\": {\"id\": 9}\n}\n"
-	out, _, err := runCLIWithDeps(t, deps, stdin, "app", "invoke", "fn")
+	out, _, err := runCLIWithDeps(t, deps, stdin, "app", "invoke", "fn", "-")
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -178,14 +213,13 @@ func TestAppInvokeStdinMultiline(t *testing.T) {
 }
 
 // TestAppInvokeInvalidStdinJSON verifies malformed JSON from stdin is reported
-// locally as an invalid-event error (the same validation as --event) and never
-// dials the worker.
+// locally as an invalid-event error and never dials the worker.
 func TestAppInvokeInvalidStdinJSON(t *testing.T) {
-	_, deps := openTempState(t)
+	deps := invokeDeps(t)
 	inv := &fakeInvoker{invoked: 1}
 	startTestSocketWithInvoker(t, deps.SocketPath, inv)
 
-	_, _, err := runCLIWithDeps(t, deps, `{"event_name":`, "app", "invoke", "fn")
+	_, _, err := runCLIWithDeps(t, deps, `{"event_name":`, "app", "invoke", "fn", "-")
 	if err == nil || !strings.Contains(err.Error(), "app invoke: invalid event JSON") {
 		t.Fatalf("err = %v, want invalid event JSON error", err)
 	}
@@ -194,15 +228,16 @@ func TestAppInvokeInvalidStdinJSON(t *testing.T) {
 	}
 }
 
-// TestAppInvokeEventFlagIgnoresNonemptyStdin verifies an explicit --event is
-// authoritative: it succeeds and is used even when the injected stdin carries a
-// different nonempty payload.
-func TestAppInvokeEventFlagIgnoresNonemptyStdin(t *testing.T) {
-	_, deps := openTempState(t)
+// TestAppInvokeInlineIgnoresNonemptyStdin verifies inline JSON is authoritative:
+// it succeeds and is used even when stdin carries a different payload, because
+// only `-` selects stdin.
+func TestAppInvokeInlineIgnoresNonemptyStdin(t *testing.T) {
+	deps := invokeDeps(t)
 	inv := &fakeInvoker{invoked: 1}
 	startTestSocketWithInvoker(t, deps.SocketPath, inv)
 
-	out, _, err := runCLIWithDeps(t, deps, `{"from":"stdin"}`, "app", "invoke", "fn", "--event", `{"from":"flag"}`)
+	out, _, err := runCLIWithDeps(t, deps, `{"from":"stdin"}`,
+		"app", "invoke", "fn", `{"from":"argument"}`)
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -213,55 +248,93 @@ func TestAppInvokeEventFlagIgnoresNonemptyStdin(t *testing.T) {
 	if calls != 1 || name != "fn" {
 		t.Fatalf("invoker calls/name = %d/%q, want 1/fn", calls, name)
 	}
-	if event["from"] != "flag" {
-		t.Fatalf("invoker event = %#v, want the explicit --event payload", event)
+	if event["from"] != "argument" {
+		t.Fatalf("invoker event = %#v, want the positional payload", event)
 	}
 }
 
-// TestResolveInvokeEventEventFlagDoesNotReadBlockingStdin verifies the
-// authoritative --event path never touches a non-terminal stdin that would block
-// forever, so an explicit event cannot hang on a bridged terminal stream.
-func TestResolveInvokeEventEventFlagDoesNotReadBlockingStdin(t *testing.T) {
-	raw, err := resolveInvokeEvent(`{"from":"flag"}`, true, blockingReader{}, false)
+// TestResolveInvokeEventInlineDoesNotReadStdin verifies an inline positional
+// event never touches the injected reader.
+func TestResolveInvokeEventInlineDoesNotReadStdin(t *testing.T) {
+	stdin := &trackingReader{}
+	raw, err := resolveInvokeEvent([]string{`{"from":"argument"}`}, stdin)
 	if err != nil {
 		t.Fatalf("resolveInvokeEvent: %v", err)
 	}
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil || got["from"] != "flag" {
+	if err := json.Unmarshal(raw, &got); err != nil || got["from"] != "argument" {
 		t.Fatalf("raw = %q, decode err = %v (got %#v)", raw, err, got)
+	}
+	if stdin.reads != 0 {
+		t.Fatalf("stdin reads = %d, want 0 for an inline event", stdin.reads)
 	}
 }
 
-// TestAppInvokeEventFlagWithBlankStdin verifies whitespace-only piped stdin is
-// not treated as a competing source: the explicit --event is used.
-func TestAppInvokeEventFlagWithBlankStdin(t *testing.T) {
-	_, deps := openTempState(t)
+// TestAppInvokeInlineWithBlankStdin verifies whitespace-only piped stdin is not
+// a competing source: the positional event is used.
+func TestAppInvokeInlineWithBlankStdin(t *testing.T) {
+	deps := invokeDeps(t)
 	inv := &fakeInvoker{invoked: 1}
 	startTestSocketWithInvoker(t, deps.SocketPath, inv)
 
-	out, _, err := runCLIWithDeps(t, deps, "  \n", "app", "invoke", "fn", "--event", `{"from":"flag"}`)
+	out, _, err := runCLIWithDeps(t, deps, "  \n", "app", "invoke", "fn", `{"from":"argument"}`)
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
 	if strings.TrimSpace(out) != "Invoked 1 handler" {
 		t.Fatalf("stdout = %q", out)
 	}
-	if _, _, event := inv.snapshot(); event["from"] != "flag" {
-		t.Fatalf("invoker event = %#v, want the explicit --event payload", event)
+	if _, _, event := inv.snapshot(); event["from"] != "argument" {
+		t.Fatalf("invoker event = %#v, want the positional payload", event)
 	}
 }
 
-// TestAppInvokeEmptyEventFlagNoFallback verifies an explicitly empty --event is
-// a usage error even when stdin carries a valid payload: the CLI must not fall
-// back silently to stdin.
-func TestAppInvokeEmptyEventFlagNoFallback(t *testing.T) {
-	_, deps := openTempState(t)
+// TestAppInvokeEmptyInlineNoFallback verifies an explicitly empty positional
+// event is a usage error even when stdin carries a valid payload: stdin is
+// never an implicit fallback.
+func TestAppInvokeEmptyInlineNoFallback(t *testing.T) {
+	deps := invokeDeps(t)
 	inv := &fakeInvoker{invoked: 1}
 	startTestSocketWithInvoker(t, deps.SocketPath, inv)
 
-	_, _, err := runCLIWithDeps(t, deps, `{"a":1}`, "app", "invoke", "fn", "--event", "")
+	_, _, err := runCLIWithDeps(t, deps, `{"a":1}`, "app", "invoke", "fn", "")
 	if err == nil || !strings.Contains(err.Error(), "no event provided") {
 		t.Fatalf("err = %v, want no-event error", err)
+	}
+	if calls, _, _ := inv.snapshot(); calls != 0 {
+		t.Fatalf("invoker calls = %d, want 0", calls)
+	}
+}
+
+// TestAppInvokeEventFlagRemoved verifies the removed --event flag is rejected
+// as an unknown flag when it appears before NAME, and no legacy event path is
+// honored.
+func TestAppInvokeEventFlagRemoved(t *testing.T) {
+	deps := invokeDeps(t)
+	inv := &fakeInvoker{invoked: 1}
+	startTestSocketWithInvoker(t, deps.SocketPath, inv)
+
+	_, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "--event", `{"a":1}`, "fn")
+	if err == nil || !strings.Contains(err.Error(), "flag provided but not defined") ||
+		!strings.Contains(err.Error(), "event") {
+		t.Fatalf("err = %v, want an unknown --event flag error", err)
+	}
+	if calls, _, _ := inv.snapshot(); calls != 0 {
+		t.Fatalf("invoker calls = %d, want 0", calls)
+	}
+}
+
+// TestAppInvokeEventFlagAfterNameRejected verifies a trailing --event is not
+// silently swallowed after NAME: parsing stops at the first positional, so the
+// flag text and its value are extra arguments.
+func TestAppInvokeEventFlagAfterNameRejected(t *testing.T) {
+	deps := invokeDeps(t)
+	inv := &fakeInvoker{invoked: 1}
+	startTestSocketWithInvoker(t, deps.SocketPath, inv)
+
+	_, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "fn", "--event", `{"a":1}`)
+	if err == nil || !strings.Contains(err.Error(), "app invoke: too many arguments") {
+		t.Fatalf("err = %v, want too-many-arguments", err)
 	}
 	if calls, _, _ := inv.snapshot(); calls != 0 {
 		t.Fatalf("invoker calls = %d, want 0", calls)
@@ -271,12 +344,13 @@ func TestAppInvokeEmptyEventFlagNoFallback(t *testing.T) {
 // TestAppInvokeFileFlagUnknown verifies the removed --file flag is rejected as
 // an unknown flag and no legacy file path is honored.
 func TestAppInvokeFileFlagUnknown(t *testing.T) {
-	_, deps := openTempState(t)
+	deps := invokeDeps(t)
 	inv := &fakeInvoker{invoked: 1}
 	startTestSocketWithInvoker(t, deps.SocketPath, inv)
 
-	_, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "fn", "--file", "event.json")
-	if err == nil || !strings.Contains(err.Error(), "flag provided but not defined") || !strings.Contains(err.Error(), "file") {
+	_, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "--file", "event.json", "fn")
+	if err == nil || !strings.Contains(err.Error(), "flag provided but not defined") ||
+		!strings.Contains(err.Error(), "file") {
 		t.Fatalf("err = %v, want an unknown --file flag error", err)
 	}
 	if calls, _, _ := inv.snapshot(); calls != 0 {
@@ -284,14 +358,14 @@ func TestAppInvokeFileFlagUnknown(t *testing.T) {
 	}
 }
 
-// TestAppInvokeInvalidJSON verifies malformed inline JSON is rejected
-// locally with a clear error and never dials the worker.
+// TestAppInvokeInvalidJSON verifies malformed inline JSON is rejected locally
+// with a clear error and never dials the worker.
 func TestAppInvokeInvalidJSON(t *testing.T) {
-	_, deps := openTempState(t)
+	deps := invokeDeps(t)
 	inv := &fakeInvoker{invoked: 1}
 	startTestSocketWithInvoker(t, deps.SocketPath, inv)
 
-	_, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "fn", "--event", `{not json`)
+	_, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "fn", `{not json`)
 	if err == nil || !strings.Contains(err.Error(), "app invoke: invalid event JSON") {
 		t.Fatalf("err = %v, want invalid event JSON error", err)
 	}
@@ -301,11 +375,11 @@ func TestAppInvokeInvalidJSON(t *testing.T) {
 }
 
 // TestAppInvokeNonObjectJSONRejected verifies arrays, scalars, and null are
-// rejected identically from --event and stdin: the matcher is defined over a
-// JSON object. Null has a specific message so it is distinguishable from a
-// mere syntax error.
+// rejected identically from the inline argument and stdin: the matcher is
+// defined over a JSON object. Null has a specific message so it is
+// distinguishable from a mere syntax error.
 func TestAppInvokeNonObjectJSONRejected(t *testing.T) {
-	_, deps := openTempState(t)
+	deps := invokeDeps(t)
 	inv := &fakeInvoker{invoked: 1}
 	startTestSocketWithInvoker(t, deps.SocketPath, inv)
 
@@ -321,13 +395,14 @@ func TestAppInvokeNonObjectJSONRejected(t *testing.T) {
 		{"null", `null`, "must be a JSON object, not null"},
 	}
 	for _, p := range payloads {
-		for _, source := range []string{"event", "stdin"} {
+		for _, source := range []string{"inline", "stdin"} {
 			t.Run(p.name+"/"+source, func(t *testing.T) {
 				args := []string{"app", "invoke", "fn"}
 				stdin := ""
-				if source == "event" {
-					args = append(args, "--event", p.payload)
+				if source == "inline" {
+					args = append(args, p.payload)
 				} else {
+					args = append(args, "-")
 					stdin = p.payload
 				}
 				_, _, err := runCLIWithDeps(t, deps, stdin, args...)
@@ -342,33 +417,19 @@ func TestAppInvokeNonObjectJSONRejected(t *testing.T) {
 	}
 }
 
-// TestAppInvokeNoPayload verifies a whitespace-only stdin with no flag is a
-// usage error with guidance, not a silent success.
-func TestAppInvokeNoPayload(t *testing.T) {
-	_, deps := openTempState(t)
-	startTestSocketWithInvoker(t, deps.SocketPath, &fakeInvoker{invoked: 1})
-
-	// A non-empty stdin forces the test's reader (rather than os.Stdin), so the
-	// trim-to-empty path is exercised deterministically.
-	_, _, err := runCLIWithDeps(t, deps, "   \n", "app", "invoke", "fn")
-	if err == nil || !strings.Contains(err.Error(), "no event provided") {
-		t.Fatalf("err = %v, want no-event error", err)
-	}
-}
-
-// TestAppInvokeNoEventSource verifies a command with no --event and no stdin
-// payload fails with the usage guidance (naming both accepted sources) and
-// never dials the worker, without blocking for terminal input.
-func TestAppInvokeNoEventSource(t *testing.T) {
-	_, deps := openTempState(t)
+// TestAppInvokeBareNameIgnoresPipedStdin verifies a bare NAME never reads
+// stdin: even a valid piped payload is ignored and the command is a usage
+// error naming both accepted forms.
+func TestAppInvokeBareNameIgnoresPipedStdin(t *testing.T) {
+	deps := invokeDeps(t)
 	inv := &fakeInvoker{invoked: 1}
 	startTestSocketWithInvoker(t, deps.SocketPath, inv)
 
-	_, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "fn")
+	_, _, err := runCLIWithDeps(t, deps, `{"a":1}`, "app", "invoke", "fn")
 	if err == nil || !strings.Contains(err.Error(), "no event provided") {
 		t.Fatalf("err = %v, want no-event error", err)
 	}
-	for _, want := range []string{"--event", "stdin"} {
+	for _, want := range []string{"JSON object", "-"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("err = %v, want guidance mentioning %q", err, want)
 		}
@@ -378,56 +439,129 @@ func TestAppInvokeNoEventSource(t *testing.T) {
 	}
 }
 
-// TestResolveInvokeEventInteractiveTerminalFailsFast verifies an interactive
-// stdin with no payload fails fast with guidance instead of reading (and
-// blocking on) a typed line.
-func TestResolveInvokeEventInteractiveTerminalFailsFast(t *testing.T) {
-	// A blocking reader would hang forever if the terminal guard were absent.
-	_, err := resolveInvokeEvent("", false, blockingReader{}, true)
-	if err == nil || !strings.Contains(err.Error(), "no event provided") {
-		t.Fatalf("err = %v, want no-event error", err)
+// TestResolveInvokeEventBareNameDoesNotReadStdin verifies the bare-name path
+// never dereferences the reader: a tracked reader must record zero reads.
+func TestResolveInvokeEventBareNameDoesNotReadStdin(t *testing.T) {
+	for _, args := range [][]string{nil, {}} {
+		stdin := &trackingReader{}
+		_, err := resolveInvokeEvent(args, stdin)
+		if err == nil || !strings.Contains(err.Error(), "no event provided") {
+			t.Fatalf("args %v: err = %v, want no-event error", args, err)
+		}
+		if stdin.reads != 0 {
+			t.Fatalf("args %v: stdin reads = %d, want 0", args, stdin.reads)
+		}
 	}
 }
 
-// TestResolveInvokeEventTerminalNotReadWithEvent verifies an interactive
-// terminal is never read when an explicit --event is present.
-func TestResolveInvokeEventTerminalNotReadWithEvent(t *testing.T) {
-	raw, err := resolveInvokeEvent(`{"event_name":"INSERT"}`, true, blockingReader{}, true)
+// TestResolveInvokeEventStdinMarker verifies `-` reads the raw object from the
+// supplied reader.
+func TestResolveInvokeEventStdinMarker(t *testing.T) {
+	raw, err := resolveInvokeEvent([]string{"-"}, strings.NewReader(`{"a":1}`))
 	if err != nil {
 		t.Fatalf("resolveInvokeEvent: %v", err)
 	}
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil || got["event_name"] != "INSERT" {
+	if err := json.Unmarshal(raw, &got); err != nil || got["a"] != float64(1) {
 		t.Fatalf("raw = %q, decode err = %v (got %#v)", raw, err, got)
 	}
 }
 
-// TestResolveInvokeEventNoReader verifies a nil (unavailable) stdin without
-// --event is the no-payload usage error rather than a panic or a read.
-func TestResolveInvokeEventNoReader(t *testing.T) {
-	_, err := resolveInvokeEvent("", false, nil, false)
+// TestResolveInvokeEventStdinMarkerNoReader verifies `-` with no available
+// reader is the no-payload usage error rather than a panic.
+func TestResolveInvokeEventStdinMarkerNoReader(t *testing.T) {
+	_, err := resolveInvokeEvent([]string{"-"}, nil)
 	if err == nil || !strings.Contains(err.Error(), "no event provided") {
 		t.Fatalf("err = %v, want no-event error", err)
 	}
 }
 
-// blockingReader blocks forever on Read, so a test proves the interactive guard
-// short-circuits before touching stdin.
-type blockingReader struct{}
-
-func (blockingReader) Read([]byte) (int, error) {
-	select {} // block forever; the test would time out if Read were reached
+// TestResolveInvokeEventStdinMarkerEmpty verifies an empty or whitespace-only
+// stdin payload is the no-payload usage error.
+func TestResolveInvokeEventStdinMarkerEmpty(t *testing.T) {
+	for _, stdin := range []string{"", "   \n\t"} {
+		_, err := resolveInvokeEvent([]string{"-"}, strings.NewReader(stdin))
+		if err == nil || !strings.Contains(err.Error(), "no event provided") {
+			t.Fatalf("stdin %q: err = %v, want no-event error", stdin, err)
+		}
+	}
 }
 
-// TestAppInvokeUnknownApp verifies the worker's unknown-app
-// answer is surfaced as an error naming the app, so the operator sees the
-// real cause.
+// TestResolveInvokeEventStdinMarkerReadError verifies a stdin read failure is
+// reported as a wrapped read error and never parsed.
+func TestResolveInvokeEventStdinMarkerReadError(t *testing.T) {
+	_, err := resolveInvokeEvent([]string{"-"}, errReader{data: `{"a":1}`})
+	if err == nil || !strings.Contains(err.Error(), "app invoke: read stdin") {
+		t.Fatalf("err = %v, want a stdin read error", err)
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("err = %v, want the underlying read error", err)
+	}
+}
+
+// TestAppInvokeStdinMarkerEmptyPayload verifies `NAME -` with no payload on
+// stdin is a usage error, not a silent success.
+func TestAppInvokeStdinMarkerEmptyPayload(t *testing.T) {
+	deps := invokeDeps(t)
+	inv := &fakeInvoker{invoked: 1}
+	startTestSocketWithInvoker(t, deps.SocketPath, inv)
+
+	_, _, err := runCLIWithDeps(t, deps, "   \n", "app", "invoke", "fn", "-")
+	if err == nil || !strings.Contains(err.Error(), "no event provided") {
+		t.Fatalf("err = %v, want no-event error", err)
+	}
+	if calls, _, _ := inv.snapshot(); calls != 0 {
+		t.Fatalf("invoker calls = %d, want 0", calls)
+	}
+}
+
+// TestAppInvokeWhitespaceInline verifies a whitespace-only inline argument is
+// the no-payload usage error.
+func TestAppInvokeWhitespaceInline(t *testing.T) {
+	stdin := &trackingReader{}
+	_, err := resolveInvokeEvent([]string{"  \n"}, stdin)
+	if err == nil || !strings.Contains(err.Error(), "no event provided") {
+		t.Fatalf("err = %v, want no-event error", err)
+	}
+	if stdin.reads != 0 {
+		t.Fatalf("stdin reads = %d, want 0", stdin.reads)
+	}
+}
+
+// TestAppInvokeStdinMarkerReadError verifies a failing stdin read through the
+// full command path is reported as a read error and never dials the worker.
+func TestAppInvokeStdinMarkerReadError(t *testing.T) {
+	deps := invokeDeps(t)
+	inv := &fakeInvoker{invoked: 1}
+	startTestSocketWithInvoker(t, deps.SocketPath, inv)
+
+	var out, errOut bytes.Buffer
+	cmd := New(slog.New(slog.NewTextHandler(io.Discard, nil)), &out, deps)
+	cmd.Reader = errReader{data: `{"a":1}`}
+	cmd.ErrWriter = &errOut
+	err := cmd.Run(t.Context(), []string{"relay", "app", "invoke", "fn", "-"})
+	if err == nil || !strings.Contains(err.Error(), "app invoke: read stdin") {
+		t.Fatalf("err = %v, want a stdin read error", err)
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("err = %v, want the underlying read error", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", out.String())
+	}
+	if calls, _, _ := inv.snapshot(); calls != 0 {
+		t.Fatalf("invoker calls = %d, want 0", calls)
+	}
+}
+
+// TestAppInvokeUnknownApp verifies the worker's unknown-app answer is surfaced
+// as an error naming the app, so the operator sees the real cause.
 func TestAppInvokeUnknownApp(t *testing.T) {
-	_, deps := openTempState(t)
+	deps := invokeDeps(t)
 	inv := &fakeInvoker{err: fmt.Errorf("%w: %q", runner.ErrAppNotFound, "ghost")}
 	startTestSocketWithInvoker(t, deps.SocketPath, inv)
 
-	_, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "ghost", "--event", `{}`)
+	_, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "ghost", `{}`)
 	if err == nil || !strings.Contains(err.Error(), "app invoke") {
 		t.Fatalf("err = %v, want an app invoke error", err)
 	}
@@ -440,55 +574,78 @@ func TestAppInvokeUnknownApp(t *testing.T) {
 // error (there is no offline fallback for a manual invocation) and the error is
 // clear.
 func TestAppInvokeWorkerUnavailable(t *testing.T) {
-	_, deps := openTempState(t)
+	deps := invokeDeps(t)
 	// No socket server started at deps.SocketPath.
 
-	_, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "fn", "--event", `{}`)
+	_, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "fn", `{}`)
 	if err == nil || !strings.Contains(err.Error(), "app invoke") {
 		t.Fatalf("err = %v, want an app invoke error", err)
 	}
 }
 
 // TestAppInvokeTooManyArgs verifies extra positional arguments are a usage
-// error.
+// error. Parsing stops at NAME, so trailing tokens are never mistaken for
+// flags.
 func TestAppInvokeTooManyArgs(t *testing.T) {
-	_, deps := openTempState(t)
-	_, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "fn", "extra", "--event", `{}`)
-	if err == nil || !strings.Contains(err.Error(), "app invoke: too many arguments") {
-		t.Fatalf("err = %v, want too-many-arguments", err)
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"inline plus extra", []string{"fn", `{}`, "extra"}},
+		{"stdin marker plus extra", []string{"fn", "-", "extra"}},
+		{"trailing legacy flag", []string{"fn", "--event", `{}`}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := invokeDeps(t)
+			inv := &fakeInvoker{invoked: 1}
+			startTestSocketWithInvoker(t, deps.SocketPath, inv)
+
+			args := append([]string{"app", "invoke"}, tc.args...)
+			_, _, err := runCLIWithDeps(t, deps, `{"a":1}`, args...)
+			if err == nil || !strings.Contains(err.Error(), "app invoke: too many arguments") {
+				t.Fatalf("err = %v, want too-many-arguments", err)
+			}
+			if calls, _, _ := inv.snapshot(); calls != 0 {
+				t.Fatalf("invoker calls = %d, want 0", calls)
+			}
+		})
 	}
 }
 
 // TestAppInvokeMissingName verifies the required NAME argument is enforced.
 func TestAppInvokeMissingName(t *testing.T) {
-	_, deps := openTempState(t)
-	_, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "--event", `{}`)
-	if err == nil {
-		t.Fatal("err = nil, want a missing-argument error")
+	deps := invokeDeps(t)
+	_, _, err := runCLIWithDeps(t, deps, "", "app", "invoke")
+	if err == nil || !strings.Contains(err.Error(), "name") {
+		t.Fatalf("err = %v, want a missing-NAME error", err)
 	}
 }
 
-// TestAppInvokeHelp verifies `relay app invoke --help` renders the
-// usage line and the flag names, and does not dial the worker.
+// TestAppInvokeHelp verifies `relay app invoke --help` renders the positional
+// usage and stdin guidance, and advertises neither the removed --event nor
+// --file flags.
 func TestAppInvokeHelp(t *testing.T) {
-	out, _, err := runCLI(t, "", "app", "invoke", "--help")
+	out, _, err := runCLIWithDeps(t, invokeDeps(t), "", "app", "invoke", "--help")
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
-	for _, want := range []string{"relay app invoke NAME", "--event", "stdin"} {
+	for _, want := range []string{"relay app invoke NAME [JSON|-]", "stdin", "JSON object"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("help missing %q:\n%s", want, out)
 		}
 	}
-	if strings.Contains(out, "--file") {
-		t.Fatalf("help still advertises the removed --file flag:\n%s", out)
+	for _, removed := range []string{"--event", "--file"} {
+		if strings.Contains(out, removed) {
+			t.Fatalf("help still advertises the removed %s flag:\n%s", removed, out)
+		}
 	}
 }
 
-// TestAppHelpListsInvoke verifies the invoke subcommand is listed in the
-// app help (and therefore the command is registered in the family).
+// TestAppHelpListsInvoke verifies the invoke subcommand is listed in the app
+// help (and therefore the command is registered in the family).
 func TestAppHelpListsInvoke(t *testing.T) {
-	out, _, err := runCLI(t, "", "app", "--help")
+	out, _, err := runCLIWithDeps(t, invokeDeps(t), "", "app", "--help")
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -498,18 +655,13 @@ func TestAppHelpListsInvoke(t *testing.T) {
 }
 
 // TestAppInvokeDoesNotTouchStateDB verifies invoke never opens the state
-// database: with a state path pointing at a directory (an unopenable DB) the
-// command still succeeds through the socket, proving the state DB is not a
-// dependency of the invoke path.
+// database: the injected opener fails loudly, yet the command succeeds through
+// the socket.
 func TestAppInvokeDoesNotTouchStateDB(t *testing.T) {
-	deps := testDeps(t)
-	// Make opening the state database fail loudly: invoke must never call it.
-	deps.OpenState = func(context.Context) (*state.State, func(), error) {
-		return nil, nil, errors.New("state DB must not be opened by invoke")
-	}
+	deps := invokeDeps(t)
 	startTestSocketWithInvoker(t, deps.SocketPath, &fakeInvoker{invoked: 1})
 
-	out, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "fn", "--event", `{}`)
+	out, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "fn", `{}`)
 	if err != nil {
 		t.Fatalf("err = %v, want nil (invoke must not open the state DB)", err)
 	}
@@ -518,48 +670,13 @@ func TestAppInvokeDoesNotTouchStateDB(t *testing.T) {
 	}
 }
 
-// TestResolveInvokeEventExplicitEmptyFlag verifies an explicitly empty --event
-// value (as opposed to an omitted flag) is a no-payload error rather than a
-// silent fall-through to stdin.
-func TestResolveInvokeEventExplicitEmptyFlag(t *testing.T) {
-	_, err := resolveInvokeEvent("", true, strings.NewReader(`{"a":1}`), false)
-	if err == nil || !strings.Contains(err.Error(), "no event provided") {
-		t.Fatalf("err = %v, want no-event error", err)
-	}
-}
-
-// TestResolveInvokeEventStdinPassthrough verifies the stdin path forwards the
-// raw object.
-func TestResolveInvokeEventStdinPassthrough(t *testing.T) {
-	raw, err := resolveInvokeEvent("", false, strings.NewReader(`{"a":1}`), false)
-	if err != nil {
-		t.Fatalf("resolveInvokeEvent: %v", err)
-	}
-	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil || got["a"] != float64(1) {
-		t.Fatalf("raw = %q, decode err = %v (got %#v)", raw, err, got)
-	}
-}
-
-// TestStdinIsTerminalFalseForNonFile verifies the terminal check is false for a
-// non-*os.File reader, so tests and embedding hosts never take the interactive
-// branch.
-func TestStdinIsTerminalFalseForNonFile(t *testing.T) {
-	if stdinIsTerminal(strings.NewReader("")) {
-		t.Fatal("a strings.Reader must never be treated as an interactive terminal")
-	}
-	if stdinIsTerminal(nil) {
-		t.Fatal("nil reader must never be treated as an interactive terminal")
-	}
-}
-
 // TestAppInvokeNoLogOnWriter verifies the command writer carries only the
-// concise result line — no internal details or log output.
+// concise result line: no internal details or log output.
 func TestAppInvokeNoLogOnWriter(t *testing.T) {
-	_, deps := openTempState(t)
+	deps := invokeDeps(t)
 	startTestSocketWithInvoker(t, deps.SocketPath, &fakeInvoker{invoked: 1})
 
-	out, stderr, err := runCLIWithDeps(t, deps, "", "app", "invoke", "fn", "--event", `{}`)
+	out, stderr, err := runCLIWithDeps(t, deps, "", "app", "invoke", "fn", `{}`)
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -594,13 +711,14 @@ func (e *cliTestExecutor) got() []string {
 	return append([]string(nil), e.handlers...)
 }
 
-// TestAppInvokeFullStack drives the real runner through the real worker
-// socket via the CLI command, proving the whole stack end to end without Docker:
-// a matching event invokes the rule's handler and prints the count, a
-// non-matching event prints "No matching handlers", and an unknown app
-// surfaces the worker's error.
+// TestAppInvokeFullStack drives the real runner through the real worker socket
+// via the CLI command, proving the whole stack end to end without Docker: a
+// matching inline event invokes the rule's handler and prints the count, a
+// matching event supplied on stdin via `-` invokes it again, a non-matching
+// event prints "No matching handlers", and an unknown app surfaces the
+// worker's error.
 func TestAppInvokeFullStack(t *testing.T) {
-	_, deps := openTempState(t)
+	deps := invokeDeps(t)
 	exec := &cliTestExecutor{}
 	tmpl, err := app.ParseTemplate([]byte(`runtime: node24
 events:
@@ -619,9 +737,10 @@ events:
 	run := runner.New([]*runner.PreparedApp{prepared}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	startTestSocketWithInvoker(t, deps.SocketPath, run)
 
-	out, _, err := runCLIWithDeps(t, deps, "", "app", "invoke", "user-events", "--event", `{"event_name":"INSERT"}`)
+	out, _, err := runCLIWithDeps(t, deps, "",
+		"app", "invoke", "user-events", `{"event_name":"INSERT"}`)
 	if err != nil {
-		t.Fatalf("matching invoke: %v", err)
+		t.Fatalf("matching inline invoke: %v", err)
 	}
 	if strings.TrimSpace(out) != "Invoked 1 handler" {
 		t.Fatalf("stdout = %q, want %q", out, "Invoked 1 handler")
@@ -630,8 +749,9 @@ events:
 		t.Fatalf("executed handlers = %v", got)
 	}
 
-	// The stdin form must reach the same runner through the same socket.
-	out, _, err = runCLIWithDeps(t, deps, "{\n  \"event_name\": \"INSERT\"\n}\n", "app", "invoke", "user-events")
+	// The explicit stdin form must reach the same runner through the socket.
+	out, _, err = runCLIWithDeps(t, deps, "{\n  \"event_name\": \"INSERT\"\n}\n",
+		"app", "invoke", "user-events", "-")
 	if err != nil {
 		t.Fatalf("stdin matching invoke: %v", err)
 	}
@@ -642,7 +762,8 @@ events:
 		t.Fatalf("executed handlers = %v, want the handler to run again via stdin", got)
 	}
 
-	out, _, err = runCLIWithDeps(t, deps, `{"event_name":"MODIFY"}`, "app", "invoke", "user-events")
+	out, _, err = runCLIWithDeps(t, deps, "",
+		"app", "invoke", "user-events", `{"event_name":"MODIFY"}`)
 	if err != nil {
 		t.Fatalf("non-matching invoke: %v", err)
 	}
@@ -650,7 +771,7 @@ events:
 		t.Fatalf("stdout = %q, want no-match line", out)
 	}
 
-	_, _, err = runCLIWithDeps(t, deps, "", "app", "invoke", "ghost", "--event", `{}`)
+	_, _, err = runCLIWithDeps(t, deps, "", "app", "invoke", "ghost", `{}`)
 	if err == nil || !strings.Contains(err.Error(), "ghost") {
 		t.Fatalf("unknown function err = %v, want it to name ghost", err)
 	}
