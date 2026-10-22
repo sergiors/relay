@@ -1,6 +1,8 @@
 package app
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -101,9 +103,93 @@ var ErrInvalidPath = errors.New("not a valid app directory")
 // instead of silently leaving a stale view. A directory without template.yaml
 // is not an app candidate and is never reported, and a directory that VANISHED
 // between the directory read and the load is not a desired definition at all.
+//
+// Identity is the stable content identity of the successfully read
+// template.yaml bytes when the failure is a DETERMINISTIC parse/validation
+// failure of those bytes. It is empty for every other failure (invalid path, a
+// read/stat error, or any operational failure), which must stay retryable and
+// must never be treated as the same invalid desired definition. Recorded means
+// the caller already persisted this exact identity as invalid: the parse was
+// deliberately skipped so a caller must not log or record it again.
 type LoadIssue struct {
-	Name string
-	Err  error
+	Name     string
+	Err      error
+	Identity string
+	Recorded bool
+}
+
+// TemplateIdentity returns the stable content identity of raw template.yaml
+// bytes: the SHA-256 digest rendered as "sha256:<hex>". It is used only to
+// recognize that the exact same invalid input was already diagnosed; it is
+// deliberately NOT a fencing token and never participates in generation/claim
+// ordering.
+func TemplateIdentity(data []byte) string {
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// InvalidTemplateError wraps a DETERMINISTIC ParseTemplate failure with the
+// identity of the exact bytes that failed. Errors from reading the file, path
+// resolution, or any post-parse operational work are never wrapped: only a
+// successfully read template whose parse/validation fails deterministically can
+// be recognized again without re-parsing.
+type InvalidTemplateError struct {
+	Identity string
+	Err      error
+}
+
+func (e *InvalidTemplateError) Error() string { return e.Err.Error() }
+func (e *InvalidTemplateError) Unwrap() error { return e.Err }
+
+// InvalidTemplateIdentity reports the identity carried by a deterministic
+// template parse/validation failure. It is false for any other error.
+func InvalidTemplateIdentity(err error) (string, bool) {
+	var invalid *InvalidTemplateError
+	if !errors.As(err, &invalid) || invalid.Identity == "" {
+		return "", false
+	}
+	return invalid.Identity, true
+}
+
+// TemplateSource is a template.yaml that was read successfully but not parsed.
+// Splitting the read from the parse lets a caller hash the exact bytes, consult
+// persisted state, and skip a known-invalid parse without ever reusing an
+// identity from an earlier, different read.
+type TemplateSource struct {
+	Name     string
+	Dir      string
+	Data     []byte
+	Identity string
+}
+
+// Parse parses the source bytes into a loaded app. A deterministic
+// parse/validation failure is returned as *InvalidTemplateError carrying the
+// source identity; other errors are not wrapped that way.
+func (s TemplateSource) Parse() (App, error) {
+	tmpl, err := ParseTemplate(s.Data)
+	if err != nil {
+		return App{}, &InvalidTemplateError{
+			Identity: s.Identity,
+			Err:      fmt.Errorf("app %q: %w", s.Name, err),
+		}
+	}
+	return App{Name: s.Name, Dir: s.Dir, Template: tmpl}, nil
+}
+
+// TemplateParseGate lets a caller consult persisted state around a loader scan.
+// Observe is called with the app name immediately BEFORE its template.yaml is
+// read, so the implementation can snapshot the persisted generation the
+// observation is based on. SkipParse is called after a successful read and hash,
+// with the exact content identity, and may return true only when that identity
+// is still persisted as the already-recorded deterministic invalid desired
+// definition. The loader then reports a Recorded issue without parsing or
+// logging; the returned error is the already-persisted diagnostic.
+//
+// A gate is optional. Nil keeps the historical behavior: every readable
+// template is parsed and every failure is reported.
+type TemplateParseGate interface {
+	Observe(name string)
+	SkipParse(name, identity string) (skip bool, err error)
 }
 
 // resolveAppDir resolves name to its app directory under root, applying
@@ -171,23 +257,39 @@ func resolveAppDir(root, name string) (string, error) {
 // (the directory is not an app candidate), an invalid template returns a parse
 // error, and unreadable templates surface as an error too.
 func LoadSingle(root, name string) (App, error) {
-	dir, err := resolveAppDir(root, name)
+	source, err := ReadTemplateSource(root, name)
 	if err != nil {
 		return App{}, err
+	}
+	return source.Parse()
+}
+
+// ReadTemplateSource resolves and reads exactly one template.yaml without
+// parsing it. It applies the same path policy as LoadSingle and returns the same
+// error taxonomy (fs.ErrNotExist for a removal, ErrInvalidPath, ErrNotReady, and
+// a wrapped read error), but it surfaces the successfully read bytes plus their
+// stable identity so a caller can decide whether parsing is necessary. Only
+// BYTES THAT WERE ACTUALLY READ can produce an identity: a failed or ambiguous
+// read never yields one.
+func ReadTemplateSource(root, name string) (TemplateSource, error) {
+	dir, err := resolveAppDir(root, name)
+	if err != nil {
+		return TemplateSource{}, err
 	}
 	templatePath := filepath.Join(dir, TemplateFile)
 	data, err := os.ReadFile(templatePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return App{}, ErrNotReady
+			return TemplateSource{}, ErrNotReady
 		}
-		return App{}, fmt.Errorf("app %q: read template: %w", name, err)
+		return TemplateSource{}, fmt.Errorf("app %q: read template: %w", name, err)
 	}
-	tmpl, err := ParseTemplate(data)
-	if err != nil {
-		return App{}, fmt.Errorf("app %q: %w", name, err)
-	}
-	return App{Name: name, Dir: dir, Template: tmpl}, nil
+	return TemplateSource{
+		Name:     name,
+		Dir:      dir,
+		Data:     data,
+		Identity: TemplateIdentity(data),
+	}, nil
 }
 
 // Load returns the successfully loaded apps. Directories without a
@@ -199,7 +301,7 @@ func LoadSingle(root, name string) (App, error) {
 // reload apply exactly the same path policy. Callers that must observe the
 // invalid entries (rather than only skip them) use LoadWithDiagnostics.
 func (l *Loader) Load() ([]App, error) {
-	apps, issues, err := l.load()
+	apps, issues, err := l.load(nil)
 	if err != nil {
 		return nil, err
 	}
@@ -210,9 +312,14 @@ func (l *Loader) Load() ([]App, error) {
 // logIssues emits the historical warning for every present-but-invalid entry.
 // Directories without a template.yaml are not app candidates and never reach
 // this list. Both Load and LoadWithDiagnostics share it so the diagnostic
-// variant keeps exactly the logging Load has always produced.
+// variant keeps exactly the logging Load has always produced. A Recorded issue
+// is an already-persisted deterministic invalid identity whose parse was
+// skipped: it must not produce a duplicate warning on every scan/restart.
 func (l *Loader) logIssues(issues []LoadIssue) {
 	for _, issue := range issues {
+		if issue.Recorded {
+			continue
+		}
 		l.log.Warn("App: invalid; skipping", "app", issue.Name, "error", issue.Err)
 	}
 }
@@ -234,7 +341,23 @@ func (l *Loader) logIssues(issues []LoadIssue) {
 // that persists issues and prepares the valid set never executes or schedules an
 // invalid definition.
 func (l *Loader) LoadWithDiagnostics() ([]App, []LoadIssue, error) {
-	apps, issues, err := l.load()
+	apps, issues, err := l.load(nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	l.logIssues(issues)
+	return apps, issues, nil
+}
+
+// LoadWithDiagnosticsUsing is LoadWithDiagnostics with an optional
+// TemplateParseGate. The gate is consulted once per readable template, AFTER the
+// bytes are read and hashed but BEFORE they are parsed, so a caller can skip a
+// deterministic parse/validation failure whose exact identity is already
+// persisted. A skipped entry is still returned as a Recorded LoadIssue (so the
+// caller can track the app for removal) but is not logged. A nil gate is
+// exactly LoadWithDiagnostics.
+func (l *Loader) LoadWithDiagnosticsUsing(gate TemplateParseGate) ([]App, []LoadIssue, error) {
+	apps, issues, err := l.load(gate)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -243,14 +366,14 @@ func (l *Loader) LoadWithDiagnostics() ([]App, []LoadIssue, error) {
 }
 
 // load is the shared loader body: it enumerates the root's direct child
-// directories, loads each through LoadSingle, and classifies the outcome. It
-// returns the loaded apps plus the present-but-invalid entries as issues;
-// Relay-owned transient staging directories (IsReservedDir) are skipped
-// entirely, vanished entries (fs.ErrNotExist) are neither apps nor issues, and
-// directories without template.yaml (ErrNotReady) are not app candidates and are
-// likewise neither apps nor issues. Callers own the logging and the error
-// semantics.
-func (l *Loader) load() ([]App, []LoadIssue, error) {
+// directories, reads each through ReadTemplateSource (optionally consulting the
+// caller's parse gate), and classifies the outcome. It returns the loaded apps
+// plus the present-but-invalid entries as issues; Relay-owned transient staging
+// directories (IsReservedDir) are skipped entirely, vanished entries
+// (fs.ErrNotExist) are neither apps nor issues, and directories without
+// template.yaml (ErrNotReady) are not app candidates and are likewise neither
+// apps nor issues. Callers own the logging and the error semantics.
+func (l *Loader) load(gate TemplateParseGate) ([]App, []LoadIssue, error) {
 	entries, err := os.ReadDir(l.dir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read apps dir %q: %w", l.dir, err)
@@ -272,7 +395,13 @@ func (l *Loader) load() ([]App, []LoadIssue, error) {
 			// cannot surface a spurious invalid/unavailable state.
 			continue
 		}
-		fn, err := LoadSingle(l.dir, name)
+		// The gate snapshots persisted state BEFORE the read, so a later
+		// invalid observation can be rejected if another worker advances the
+		// app while this scan is still running.
+		if gate != nil {
+			gate.Observe(name)
+		}
+		source, err := ReadTemplateSource(l.dir, name)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				// The directory vanished between the read and the load: it is not
@@ -287,10 +416,33 @@ func (l *Loader) load() ([]App, []LoadIssue, error) {
 				// report.
 				continue
 			}
-			// An invalid name, symlink, non-directory, unreadable template, or
-			// invalid template: a present desired definition that cannot be
-			// loaded. Reported as an issue; the caller decides how to record it.
+			// An invalid name, symlink, non-directory, or unreadable template: a
+			// present desired definition that cannot be loaded. Reported as an
+			// issue; the caller decides how to record it.
 			issues = append(issues, LoadIssue{Name: name, Err: err})
+			continue
+		}
+		if gate != nil {
+			if skip, gateErr := gate.SkipParse(name, source.Identity); skip {
+				// The exact bytes are already persisted as a deterministic
+				// invalid desired definition. Report the already-recorded issue
+				// for tracking but do not parse, log, or re-record it.
+				issues = append(issues, LoadIssue{
+					Name:     name,
+					Err:      gateErr,
+					Identity: source.Identity,
+					Recorded: true,
+				})
+				continue
+			}
+		}
+		fn, err := source.Parse()
+		if err != nil {
+			identity, _ := InvalidTemplateIdentity(err)
+			// An invalid template is a present desired definition that cannot be
+			// loaded; Identity is non-empty only for a deterministic
+			// parse/validation failure of the bytes that were actually read.
+			issues = append(issues, LoadIssue{Name: name, Err: err, Identity: identity})
 			continue
 		}
 		apps = append(apps, fn)

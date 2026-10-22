@@ -369,6 +369,18 @@ Relay watches `/apps` and reconciles changes live: a new directory is
 built and becomes available to event matching and schedule dispatch; edits to
 template/source/dependencies rebuild only that app; a failed rebuild keeps the
 previous working version and retries on the next change or the 30s periodic pass.
+A readable template with deterministic parse or validation errors is marked
+`degraded` when a usable version is active, otherwise `unavailable`; the active
+runtime and its handlers remain in service during a live invalid update. Relay
+persists a SHA-256 identity of the bytes read from a deterministic invalid
+template in PostgreSQL, so identical input is not repeatedly parsed, logged,
+written to PostgreSQL, or
+assigned a new fencing token. Changed bytes are revalidated. Read, filesystem,
+and source
+fingerprinting failures are operational and continue retrying. The identity and
+original error survive restarts; however, startup does not reconstruct a runtime
+from an invalid template, even if PostgreSQL still records a previously active
+image.
 Under `HOT_RELOAD`, the source is source-mounted from `/apps` instead of baked,
 so a source-only edit does not rebuild the app or dependency image: the advanced
 fingerprint restarts the app's entrypoint service containers in place (same

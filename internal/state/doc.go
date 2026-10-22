@@ -47,6 +47,23 @@
 //     never recorded as invalid, and a known app that loses its template is
 //     removed (startup pruning and live removal share that rule).
 //
+// A DETERMINISTIC parse/validation failure of successfully read template bytes
+// additionally persists the content identity (SHA-256 of those exact bytes) as
+// invalid_source. While that same identity is persisted, a scan/reconcile skips
+// the repeat parse, warning, state write, and fencing-token allocation: the
+// persisted row is the authority, never a process-local negative cache. Changed
+// bytes revalidate and record; a valid correction clears the identity through
+// the normal desired/success snapshot. Operational failures (invalid path,
+// unreadable file, fingerprint/source traversal, dependency errors) carry NO
+// identity and stay retryable. An invalid observation snapshots the row's
+// fencing token BEFORE reading the template and is applied only while that token
+// is still current, so a stale observation cannot overwrite another worker's
+// newer valid correction. The check runs inside the per-app write transaction,
+// and a stale observation is reported as a distinct recoverable result rather
+// than a PostgreSQL error. Missing or unreadable observations are refused, never
+// treated as an absent row, so they cannot bypass concurrency. The identity is
+// never a fencing token.
+//
 // In both cases a failure never reports "ready": degraded when a usable active
 // generation exists, unavailable otherwise. All timestamps are RFC3339 strings.
 //

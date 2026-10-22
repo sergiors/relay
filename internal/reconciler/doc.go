@@ -30,15 +30,19 @@
 //     no-build path, and an unavailable-placeholder reconcile all clear pending
 //     so no removed rule keeps gating events.
 //   - Live/periodic reload applies the SAME discovery path policy as startup
-//     (app.LoadSingle): a legal single-element name, a real direct-child
-//     directory of the root, never a symlink, and a template.yaml present. An
-//     invalid path (bad name, symlink — even to an in-root or outside target,
-//     non-directory) RETAINS the previously-loaded app rather than removing or
-//     replacing it. A truly missing directory is a removal, and so is a known
-//     app whose directory remains but no longer contains template.yaml: a
-//     template-less directory is not an app candidate, so it follows the single
-//     remove lifecycle. An unknown template-less directory (one that was never
-//     an app) is ignored with no warning and no state write.
+//     (app.ReadTemplateSource, which LoadSingle also uses): a legal
+//     single-element name, a real direct-child directory of the root, never a
+//     symlink, and a template.yaml present. An invalid path (bad name, symlink —
+//     even to an in-root or outside target, non-directory) RETAINS the
+//     previously-loaded app rather than removing or replacing it. A truly
+//     missing directory is a removal, and so is a known app whose directory
+//     remains but no longer contains template.yaml: a template-less directory is
+//     not an app candidate, so it follows the single remove lifecycle. An
+//     unknown template-less directory (one that was never an app) is ignored
+//     with no warning and no state write. A deterministic parse/validation
+//     failure whose exact byte identity is still persisted as invalid is
+//     recognized without re-parsing, so an unchanged invalid input does not
+//     churn state across cycles or restarts.
 //   - Relay-owned transient staging directories (app.IsReservedDir, e.g.
 //     git's ".sync-*" created directly under the apps root during
 //     materialization) are never apps: their events and periodic entries

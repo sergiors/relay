@@ -133,7 +133,11 @@ building, or reconciliation. Unlike the former file-backed store, the database
 is a **required** dependency: the worker opens it (and initializes the schema)
 before the Redis/Docker preflight and before loading apps, and a missing or
 unreachable `DATABASE_URL` fails startup rather than degrading. Post-startup
-write failures remain non-fatal to the event pipeline.
+write failures remain non-fatal to the event pipeline. Startup persists each
+valid app's discovery state before preparation; a failed write aborts startup
+rather than allowing preparation or service publication without its exact
+fencing token. Invalid-app state writes are isolated per app because invalid
+apps are never prepared.
 
 - Each app is stored as one native JSONB snapshot: runtime/status/image/
   fingerprint/prepared-at/reconcile outcome, env **names** (values redacted) and
@@ -149,7 +153,15 @@ write failures remain non-fatal to the event pipeline.
 - `status` lifecycle: `preparing` → `building` → `reconciling` → `ready`;
   `degraded` retains a usable previous image, `unavailable` has none. A failed
   reconcile never displaces a still-serving previous generation and never reports
-  `ready`.
+  `ready`. An invalid desired template preserves a currently active runtime
+  during live reconciliation. A SHA-256 identity of the read template bytes and
+  the original error are persisted separately from desired/active fingerprints;
+  identical
+  bytes do not repeat the state transition or allocate another fencing token,
+  while changed bytes are revalidated. Filesystem reads and source fingerprinting
+  failures are transient and retried rather than cached. This state survives
+  restarts, but startup does not reconstruct a runtime from invalid source, even
+  when an older active image remains recorded in PostgreSQL.
 - Stats are stored as latest absolute snapshots (no history), **keyed by a stable
   worker identity** (`WORKER_ID`, required — the same value as the Redis consumer
   name and the `relay.hostname` label) plus a per-process `instance` fencing

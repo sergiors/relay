@@ -175,14 +175,23 @@ type Row struct {
 // outcome.
 type Detail struct {
 	Row
-	Image              string     `json:"image,omitempty"`
-	Fingerprint        string     `json:"fingerprint,omitempty"`
-	DesiredFingerprint string     `json:"desired_fingerprint,omitempty"`
-	LastReconcileAt    string     `json:"last_reconcile_at,omitempty"`
-	LastError          string     `json:"last_error,omitempty"`
-	Handlers           []Handler  `json:"handlers,omitempty"`
-	Schedules          []Schedule `json:"schedules,omitempty"`
-	Services           []Service  `json:"services,omitempty"`
+	Image              string `json:"image,omitempty"`
+	Fingerprint        string `json:"fingerprint,omitempty"`
+	DesiredFingerprint string `json:"desired_fingerprint,omitempty"`
+	// InvalidSource is the stable content identity (app.TemplateIdentity) of the
+	// template.yaml bytes that deterministically failed parse/validation. It is
+	// set ONLY for that failure class; read/path/fingerprint/dependency and
+	// other operational failures leave it empty so they stay retryable. It is
+	// not a fencing token and never orders generations: it only lets an
+	// unchanged invalid input avoid a repeat parse, warning, state write, and
+	// token allocation. A valid desired/success write starts from a fresh
+	// snapshot and therefore clears it.
+	InvalidSource   string     `json:"invalid_source,omitempty"`
+	LastReconcileAt string     `json:"last_reconcile_at,omitempty"`
+	LastError       string     `json:"last_error,omitempty"`
+	Handlers        []Handler  `json:"handlers,omitempty"`
+	Schedules       []Schedule `json:"schedules,omitempty"`
+	Services        []Service  `json:"services,omitempty"`
 	// Env holds the app's env-var NAMES only: each value is the fixed
 	// RedactedEnvValue marker, never the literal template value. Literal env
 	// values live only in template.yaml and in the runtime injection path; the
@@ -1301,11 +1310,51 @@ func (st *State) RecordReconcileFailure(
 	return wrote, nil
 }
 
-// RecordInvalidDesired records that an app's desired definition is present
-// on disk but cannot be loaded or validated (an invalid path or an
-// invalid/unreadable template). It is the state view of an
-// INVALID desired state, distinct from RecordReconcileFailure, which records a
-// valid desired generation that failed to prepare:
+// ErrMissingObservation reports a guarded invalid-desired write attempted
+// without a pre-read AppObservation. A missing observation means the state view
+// could not be read (or the caller forgot one); it is NOT evidence that the row
+// is absent. The write is refused so a failed read can never bypass the
+// optimistic concurrency guard.
+var ErrMissingObservation = errors.New("missing app observation")
+
+// InvalidDesiredResult reports how a guarded invalid-desired observation was
+// handled. Wrote and Stale are mutually exclusive: !Wrote && !Stale is the
+// read-only unchanged-identity fast path.
+type InvalidDesiredResult struct {
+	// FencingToken is the token this call owns: the newly persisted token when
+	// Wrote, the row's current token on the unchanged fast path, and zero when
+	// Stale or when an operational error was returned.
+	FencingToken FencingToken
+	// Wrote reports whether this call persisted a new invalid transition and
+	// thereby advanced the fencing token.
+	Wrote bool
+	// Stale reports that the write was rejected because the pre-read observation
+	// no longer matched the persisted row (another worker advanced it). This is a
+	// normal, recoverable outcome, not an operational PostgreSQL failure.
+	Stale bool
+}
+
+// RecordInvalidDesired is the legacy form of
+// RecordInvalidDesiredWithSource: it records an operational invalid desired
+// failure (invalid path, unreadable template, fingerprint failure, ...) with no
+// deterministic source identity and no observation guard. It always advances the
+// fencing token, so repeated operational failures stay retryable. Callers that DO
+// have successfully read template bytes use RecordInvalidDesiredWithSource so
+// an unchanged deterministic invalid input is recognized instead of re-recorded.
+func (st *State) RecordInvalidDesired(
+	ctx context.Context,
+	name string,
+	err2 error,
+) (FencingToken, error) {
+	result, err := st.recordInvalidDesired(ctx, name, "", err2, nil, false)
+	return result.FencingToken, err
+}
+
+// RecordInvalidDesiredWithSource records that an app's desired definition is
+// present on disk but cannot be loaded or validated (an invalid path, an
+// invalid/unreadable template, or an operational failure). It is the state view
+// of an INVALID desired state, distinct from RecordReconcileFailure, which
+// records a valid desired generation that failed to prepare:
 //
 //   - The last usable ACTIVE generation (image/fingerprint/prepared_at) is
 //     preserved untouched, so a previously-serving version is not erased and a
@@ -1323,29 +1372,96 @@ func (st *State) RecordReconcileFailure(
 //     (the old version still serves) and unavailable otherwise (nothing was ever
 //     prepared).
 //
-// It is an UPSERT: an invalid app never seen before (no prior row) is
-// inserted, so a fresh invalid desired state is visible to operators instead of
-// being silently absent. It advances the fencing token, invalidating older
-// completions across workers, and returns that token (zero with an error on a
-// failed write). The status observer is notified with the resulting status,
-// keeping the one-hot app_status gauge consistent. ctx bounds the transaction,
-// including its advisory-lock wait.
-func (st *State) RecordInvalidDesired(
+// sourceIdentity is the content identity of the successfully read template bytes
+// for a DETERMINISTIC parse/validation failure, and empty for every operational
+// failure (invalid path, read error, fingerprint/dependency failure). When a
+// non-empty identity matches the row's already-persisted InvalidSource, the call
+// is a READ-ONLY fast path: no parse (the loader skipped it), no write, no
+// fencing-token allocation, and no duplicate warning. The status observer is
+// still given the row's EXISTING status so a restarted worker's one-hot gauge is
+// populated without a write. It returns the row's current fencing token so a
+// caller can still track the app for eventual removal. An empty identity NEVER
+// takes that path, so a transient read failure can never reuse an earlier
+// identity.
+//
+// observed is the persisted row/token snapshot taken BEFORE the caller read the
+// template, and is REQUIRED for this guarded form. A write is applied only while
+// the row still matches that snapshot (same fencing token, or still absent).
+// Thus an invalid observation that began before another worker's valid change is
+// rejected instead of overwriting the newer state. The existing fencing token is
+// the concurrency guard; the content identity is never used as a fence. A
+// missing observation is refused (ErrMissingObservation): a failed state read is
+// not evidence of absence and must never bypass the guard. The legacy
+// RecordInvalidDesired keeps the unconditional form for callers without a
+// template read to guard.
+//
+// The observation check runs INSIDE the per-app write transaction, under the
+// same advisory lock as every other writer, and before the unchanged-identity
+// fast path. A stale observation therefore cannot overwrite a newer row and
+// cannot claim that row's token, even when the current row happens to carry the
+// same invalid identity (for example A -> valid -> A).
+//
+// It is an UPSERT: an invalid app never seen before (no prior row) is inserted,
+// so a fresh invalid desired state is visible to operators. A write advances the
+// fencing token, invalidating older completions across workers. Wrote reports
+// whether a write landed; an unchanged fast path returns the current token with
+// Wrote=false, and a stale observation returns Stale=true with a zero token and
+// no error. ctx bounds the transaction, including its advisory-lock wait.
+func (st *State) RecordInvalidDesiredWithSource(
 	ctx context.Context,
-	name string,
+	name,
+	sourceIdentity string,
 	err2 error,
-) (FencingToken, error) {
+	observed *AppObservation,
+) (InvalidDesiredResult, error) {
+	if observed == nil {
+		return InvalidDesiredResult{}, fmt.Errorf(
+			"record invalid desired %q: %w", name, ErrMissingObservation)
+	}
+	return st.recordInvalidDesired(ctx, name, sourceIdentity, err2, observed, true)
+}
+
+// recordInvalidDesired is the shared invalid-desired write body. guarded selects
+// the optimistic-concurrency check; only the legacy RecordInvalidDesired passes
+// false, and only it may pass a nil observation.
+func (st *State) recordInvalidDesired(
+	ctx context.Context,
+	name,
+	sourceIdentity string,
+	err2 error,
+	observed *AppObservation,
+	guarded bool,
+) (InvalidDesiredResult, error) {
 	ts := st.nowString()
-	var fencingToken FencingToken
+	var result InvalidDesiredResult
 	status := ""
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
-		nextFencingToken, err := nextFencingTokenTx(ctx, tx)
+		detail, currentToken, found, err := scanAppWithToken(name, tx.QueryRowContext(ctx,
+			`SELECT `+jsonPayloadExpr+`, updated_at, fencing_token
+			 FROM apps WHERE name = $1`, name))
 		if err != nil {
 			return err
 		}
-		detail, found, err := scanApp(name, tx.QueryRowContext(ctx,
-			`SELECT `+jsonPayloadExpr+`, updated_at
-			 FROM apps WHERE name = $1`, name))
+		if guarded && !observationCurrent(observed, found, currentToken) {
+			// A newer write (for example another worker's valid correction)
+			// advanced the row after this invalid observation began; discard the
+			// stale observation rather than overwriting the newer state, and do
+			// not claim its token.
+			result.Stale = true
+			return nil
+		}
+		if sourceIdentity != "" && found && detail.InvalidSource == sourceIdentity {
+			// The exact same deterministic invalid input is already the persisted
+			// desired state. This is the authority check (never a process-local
+			// negative cache): do not allocate a token, write, notify with a new
+			// transition, or log. The observer is still given the EXISTING status
+			// below (a fresh worker's one-hot gauge must reflect the row it did
+			// not rewrite); this is not a state write.
+			result.FencingToken = currentToken
+			status = detail.Status
+			return nil
+		}
+		nextFencingToken, err := nextFencingTokenTx(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -1359,6 +1475,11 @@ func (st *State) RecordInvalidDesired(
 		// presented as the current config. The active generation is preserved.
 		detail.Runtime = ""
 		detail.DesiredFingerprint = ""
+		// Only a deterministic parse/validation failure of the bytes that were
+		// actually read may claim an invalid source identity. Operational
+		// failures clear it so they stay retryable and cannot reuse an earlier
+		// identity.
+		detail.InvalidSource = sourceIdentity
 		detail.Handlers = nil
 		detail.Schedules = nil
 		detail.Services = nil
@@ -1380,18 +1501,35 @@ func (st *State) RecordInvalidDesired(
 		if err := upsertAppTx(ctx, tx, detail, nextFencingToken); err != nil {
 			return err
 		}
-		fencingToken = nextFencingToken
+		result.FencingToken = nextFencingToken
+		result.Wrote = true
 		return nil
 	})
 	if err != nil {
 		err = fmt.Errorf("record invalid desired: %w", err)
 		st.logAppWriteFailure("State: record invalid desired failed", err, "app", name)
-		return 0, err
+		return InvalidDesiredResult{}, err
 	}
 	if status != "" {
 		st.notifyStatus(name, status)
 	}
-	return fencingToken, nil
+	return result, nil
+}
+
+// observationCurrent reports whether the current row still matches the caller's
+// pre-read snapshot. An observed row must still exist with the SAME fencing
+// token; having observed absence requires it to still be absent. Token equality
+// is the guard: the invalid content identity is never a fencing token. The
+// guarded entry point refuses a nil observation before reaching this check;
+// nil is only permitted on the legacy unconditional path, which skips it.
+func observationCurrent(observed *AppObservation, found bool, current FencingToken) bool {
+	if observed == nil {
+		return true
+	}
+	if observed.Found {
+		return found && current == observed.FencingToken
+	}
+	return !found
 }
 
 // ActiveImages returns the currently recorded active image reference for every
@@ -1698,6 +1836,34 @@ func (st *State) ListApps() []Row {
 	return out
 }
 
+// AppObservation is a snapshot of an app's persisted row taken BEFORE a caller
+// reads/validates template.yaml. It is the optimistic-concurrency guard for an
+// invalid desired observation: a later invalid write is applied only while the
+// row still carries the observed fencing token (or is still absent), so an
+// observation that began before another worker's valid change cannot overwrite
+// that newer state. The token is the existing row fence, never the invalid
+// content identity.
+type AppObservation struct {
+	Detail       Detail
+	FencingToken FencingToken
+	Found        bool
+}
+
+// ObserveApp snapshots name's persisted row and fencing token. Unlike GetApp it
+// surfaces read/decoding errors so a caller can distinguish "the row is absent"
+// from "the state view could not be read": an unreadable observation must not be
+// mistaken for absence. It takes no advisory lock: the snapshot is only a
+// candidate guard, and the conditional write re-checks it under the app lock.
+func (st *State) ObserveApp(ctx context.Context, name string) (AppObservation, error) {
+	detail, fencingToken, found, err := scanAppWithToken(name, st.db.QueryRowContext(ctx,
+		`SELECT `+jsonPayloadExpr+`, updated_at, fencing_token
+		 FROM apps WHERE name = $1`, name))
+	if err != nil {
+		return AppObservation{}, fmt.Errorf("observe app %q: %w", name, err)
+	}
+	return AppObservation{Detail: detail, FencingToken: fencingToken, Found: found}, nil
+}
+
 // GetApp returns the full detail for name, or (zero, false) if unknown. A
 // corrupt persisted snapshot fails clearly: the decode error is logged and the
 // row reads as unknown rather than yielding a partial record.
@@ -1738,6 +1904,29 @@ func scanApp(name string, row *sql.Row) (Detail, bool, error) {
 	detail.UpdatedAt = updatedAt.String
 	detail.HandlerCount = len(detail.Handlers)
 	return detail, true, nil
+}
+
+// scanAppWithToken decodes one apps row selected as
+// (data::text, updated_at, fencing_token) into a Detail plus its persisted
+// fence. It is the observation/conditional-write form of scanApp.
+func scanAppWithToken(name string, row *sql.Row) (Detail, FencingToken, bool, error) {
+	var data sql.NullString
+	var updatedAt sql.NullString
+	var fencingToken int64
+	if err := row.Scan(&data, &updatedAt, &fencingToken); err != nil {
+		if err == sql.ErrNoRows {
+			return Detail{}, 0, false, nil
+		}
+		return Detail{}, 0, false, err
+	}
+	detail, err := unmarshalApp(data.String)
+	if err != nil {
+		return Detail{}, 0, false, err
+	}
+	detail.Name = name
+	detail.UpdatedAt = updatedAt.String
+	detail.HandlerCount = len(detail.Handlers)
+	return detail, FencingToken(fencingToken), true, nil
 }
 
 // upsertAppTx writes the whole Detail snapshot as one JSONB value in

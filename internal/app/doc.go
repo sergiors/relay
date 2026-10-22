@@ -16,7 +16,12 @@
 //     state instead of silently leaving a stale view; Load keeps its historical
 //     skip-and-log behavior. A directory without template.yaml is not a
 //     candidate and is never reported, and a directory that vanished is a
-//     removal, never an invalid definition.
+//     removal, never an invalid definition. A deterministic parse/validation
+//     failure carries the SHA-256 identity of the exact bytes that were read
+//     (TemplateIdentity/InvalidTemplateError), and LoadWithDiagnosticsUsing can
+//     consult the caller's persisted state to skip re-parsing an identity that
+//     is already recorded as invalid. File/read/path failures never carry an
+//     identity, so a transient read can never reuse an earlier one.
 //   - Model: rules pair handlers with patterns. This package owns the
 //     declarative model (Template/EventRule/Pattern and the parser that
 //     produces them); the matching behavior that evaluates events against a

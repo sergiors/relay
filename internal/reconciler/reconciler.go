@@ -769,14 +769,23 @@ func (r *Reconciler) reconcileApp(name string) {
 	if app.IsReservedDir(name) {
 		return
 	}
-	// LoadSingle enforces the SAME path policy as startup discovery (a legal
-	// single-element name, a real direct child of the root, never a symlink), so
-	// a reload can never read, fingerprint, or build a path the startup loader
-	// would have rejected. A missing directory wraps fs.ErrNotExist (a removal);
-	// a directory without template.yaml is ErrNotReady (not an app candidate); an
-	// invalid path is ErrInvalidPath and RETAINS the previously-loaded version
-	// rather than letting an invalid path remove or replace a healthy app.
-	fn, err := app.LoadSingle(r.root, name)
+	// Observe the persisted row BEFORE reading template.yaml. This snapshot is
+	// the optimistic guard an invalid observation carries: if another worker
+	// advances the app (for example with a valid correction) while this pass is
+	// still running, the conditional invalid write is rejected instead of
+	// overwriting the newer state. The fast path itself re-reads persisted state
+	// before skipping, so it never trusts this snapshot alone.
+	observed := r.observeApp(name)
+	// ReadTemplateSource enforces the SAME path policy as startup discovery (a
+	// legal single-element name, a real direct child of the root, never a
+	// symlink), so a reload can never read, fingerprint, or build a path the
+	// startup loader would have rejected, and it leaves parsing separate so an
+	// unchanged deterministic invalid input can avoid a repeat parse. A missing
+	// directory wraps fs.ErrNotExist (a removal); a directory without
+	// template.yaml is ErrNotReady (not an app candidate); an invalid path is
+	// ErrInvalidPath and RETAINS the previously-loaded version rather than
+	// letting an invalid path remove or replace a healthy app.
+	source, err := app.ReadTemplateSource(r.root, name)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			// Directory gone -> remove from registry. In-flight invocations keep
@@ -796,7 +805,7 @@ func (r *Reconciler) reconcileApp(name string) {
 			}
 			return
 		}
-		// Every other load failure (invalid path, flaky read, unreadable/invalid
+		// Every other load failure (invalid path, flaky read, unreadable
 		// template) means the desired definition is not a valid generation to
 		// prepare, so no desired pending rules are manufactured. Any stale
 		// pending entry from a previous, now-invalid desired state is cleared so
@@ -814,9 +823,50 @@ func (r *Reconciler) reconcileApp(name string) {
 				"app", name,
 				"error", err,
 			)
-			r.recordInvalidDesired(name, err)
+			// No bytes were read, so there is no deterministic invalid identity:
+			// this failure stays retryable and clears any earlier identity.
+			r.recordInvalidDesired(name, "", err, observed)
 			return
 		}
+		// A flaky read/stat (permissions, I/O) is not a removal: don't drop the
+		// app, but surface it so staleness isn't silently ignored. The entry
+		// is present, so record the failed desired view (the active generation is
+		// preserved and the registry untouched). It must not claim an invalid
+		// identity from an earlier, different read.
+		r.log.Warn(
+			"App: load error; retaining previous version",
+			"app", name,
+			"error", err,
+		)
+		r.recordInvalidDesired(name, "", err, observed)
+		return
+	}
+
+	// The bytes were read and hashed. If their exact deterministic-invalid
+	// identity is CURRENTLY persisted, skip the parse entirely. This is a fresh
+	// persisted-state read (not the pre-read snapshot and never a process-local
+	// negative cache): the row is the authority, so an unchanged invalid input is
+	// recognized across cycles and restarts, while another worker's valid
+	// correction is never overridden by a stale local view.
+	if source.Identity != "" && observed != nil && observed.Found &&
+		observed.Detail.InvalidSource == source.Identity {
+		if current := r.observeApp(name); current != nil &&
+			current.Found && current.Detail.InvalidSource == source.Identity {
+			r.reg.ClearPending(name)
+			r.skipUnchangedInvalidDesired(name, current)
+			return
+		}
+	}
+
+	fn, err := source.Parse()
+	if err != nil {
+		// Every other load failure (invalid path, flaky read, unreadable/invalid
+		// template) means the desired definition is not a valid generation to
+		// prepare, so no desired pending rules are manufactured. Any stale
+		// pending entry from a previous, now-invalid desired state is cleared so
+		// removed rules cannot keep gating events; the previously-active
+		// generation (if any) is retained exactly as today.
+		r.reg.ClearPending(name)
 		// A flaky read/stat (permissions, I/O) is not a removal: don't drop the
 		// app, but surface it so staleness isn't silently ignored. The entry
 		// is present, so record the failed desired view (the active generation is
@@ -826,7 +876,8 @@ func (r *Reconciler) reconcileApp(name string) {
 			"app", name,
 			"error", err,
 		)
-		r.recordInvalidDesired(name, err)
+		identity, _ := app.InvalidTemplateIdentity(err)
+		r.recordInvalidDesired(name, identity, err, observed)
 		return
 	}
 	dir := fn.Dir
@@ -888,8 +939,10 @@ func (r *Reconciler) reconcileApp(name string) {
 		// published above are deliberately RETAINED: the configuration is valid
 		// and preparation may succeed on a later pass, so holding matching
 		// events pending (rather than ACKing them as unmatched) is the
-		// at-least-once direction.
-		r.recordInvalidDesired(name, err)
+		// at-least-once direction. No invalid source identity is claimed: a
+		// fingerprint/source/dependency failure is operational and must stay
+		// retryable (and clear any earlier deterministic invalid identity).
+		r.recordInvalidDesired(name, "", err, observed)
 		return
 	}
 
@@ -1205,16 +1258,67 @@ func (r *Reconciler) prepareContext(
 	})
 }
 
+// observeApp snapshots the persisted row/token for name BEFORE this pass reads
+// template.yaml. It is the optimistic guard for an invalid observation: the
+// state write is applied only while the row still matches. A read failure is
+// logged and returns nil, which callers must treat as "no authority", never as
+// "the row is absent": recordInvalidDesired then skips the write instead of
+// bypassing the concurrency guard. The fast path re-reads state separately and
+// never skips on an unreadable observation.
+func (r *Reconciler) observeApp(name string) *state.AppObservation {
+	if r.st == nil {
+		return nil
+	}
+	observation, err := r.st.ObserveApp(r.rctx(), name)
+	if err != nil {
+		r.log.Warn("App: observe state failed", "app", name, "error", err)
+		return nil
+	}
+	return &observation
+}
+
+// skipUnchangedInvalidDesired is the LIVE fast path for an invalid template whose
+// exact content identity is (still) the persisted invalid desired state. The
+// parse, warning, state write, and fencing-token allocation are all skipped; only
+// process-local reconciliation bookkeeping is refreshed so a previously captured
+// callback cannot keep serving the invalid generation. The persisted row, not
+// this local map, remains the authority.
+func (r *Reconciler) skipUnchangedInvalidDesired(name string, observation *state.AppObservation) {
+	r.mu.Lock()
+	delete(r.fingerprints, name)
+	r.generations[name]++
+	if observation != nil && observation.Found && observation.FencingToken > 0 {
+		r.fencingTokens[name] = observation.FencingToken
+	} else {
+		delete(r.fencingTokens, name)
+	}
+	r.mu.Unlock()
+	r.log.Debug(
+		"App: invalid template unchanged; reconcile skipped",
+		"app", name,
+	)
+}
+
 // recordInvalidDesired records a present-but-unloadable desired definition into
 // the state view (degraded with a retained active generation, or unavailable
 // without one) while leaving the runtime registry untouched. It is the shared
 // seam for every reconcileApp failure that is NOT a removal and NOT a valid
-// desired generation that failed to build: ErrInvalidPath, a flaky read/stat,
-// and a fingerprint error. A directory without template.yaml is not an app
-// candidate and follows the removal/no-op path instead. State is a view
-// only — the previously-loaded version stays served — so an operator sees the
-// failed desired state instead of a stale ready row. When no state sink is wired
-// it is a no-op.
+// desired generation that failed to build: ErrInvalidPath, a flaky read/stat, an
+// invalid template, and a fingerprint error. A directory without template.yaml
+// is not an app candidate and follows the removal/no-op path instead. State is a
+// view only — the previously-loaded version stays served — so an operator sees
+// the failed desired state instead of a stale ready row. When no state sink is
+// wired it is a no-op.
+//
+// identity is non-empty ONLY for a deterministic parse/validation failure of the
+// template bytes that were actually read. The state write then takes its
+// read-only fast path when that identity is already persisted (no write, no
+// token allocation). Operational failures pass an empty identity and clear any
+// earlier identity, so a transient read can never reuse it. observed is the
+// pre-read state snapshot: a stale invalid observation (begun before another
+// worker's valid change) is rejected by the conditional write. A nil observed
+// means the snapshot could not be read; the write is skipped (fail closed)
+// instead of bypassing the guard with an unconditional write.
 //
 // It also FORGETS the stored fingerprint for name and invalidates this
 // Reconciler's local generation plus the persisted fencing token. That stored
@@ -1227,7 +1331,12 @@ func (r *Reconciler) prepareContext(
 // stable" behavior an unavailable app already has. Advancing the generation
 // prevents a callback captured for the previous desired state from writing after
 // the invalid state is recorded. It never writes a success itself.
-func (r *Reconciler) recordInvalidDesired(name string, err error) {
+func (r *Reconciler) recordInvalidDesired(
+	name,
+	identity string,
+	err error,
+	observed *state.AppObservation,
+) {
 	r.mu.Lock()
 	delete(r.fingerprints, name)
 	r.generations[name]++
@@ -1236,12 +1345,38 @@ func (r *Reconciler) recordInvalidDesired(name string, err error) {
 	if r.st == nil {
 		return
 	}
-	// The invalid desired write advances the persisted fencing token, invalidating
+	if observed == nil {
+		// A failed state read is not an absent row. Without the pre-read
+		// snapshot the conditional write has no concurrency authority, so keep
+		// this generation's token cleared (callbacks fail closed) and let a later
+		// pass retry.
+		r.log.Warn(
+			"App: invalid desired state not recorded; state observation unavailable",
+			"app", name,
+			"error", err,
+		)
+		return
+	}
+	// The invalid desired write advances the persisted fencing token (except on
+	// the unchanged-identity fast path, where no generation advances), invalidating
 	// older completions from any worker. Keep the returned token as this
-	// Reconciler's current state identity; zero (write failure) leaves it cleared,
-	// so later callbacks fail closed.
-	fencingToken, _ := r.st.RecordInvalidDesired(r.rctx(), name, err)
-	r.setFencingToken(name, fencingToken)
+	// Reconciler's current state identity; zero (write failure or a rejected stale
+	// observation) leaves it cleared, so later callbacks fail closed.
+	result, writeErr := r.st.RecordInvalidDesiredWithSource(
+		r.rctx(), name, identity, err, observed)
+	if writeErr != nil {
+		// The state layer already logged the operational failure. The token
+		// stays cleared (fail closed); state is a view, not this pass's authority.
+		return
+	}
+	if result.Stale {
+		// Another worker advanced the app after this pass read the template.
+		// Discarding the observation is a normal recovery, not a write failure;
+		// keep the local token cleared so no captured callback can write.
+		r.log.Debug("App: stale invalid desired observation rejected", "app", name)
+		return
+	}
+	r.setFencingToken(name, result.FencingToken)
 }
 
 // remove drops an app from the registry and forgets its fingerprint. It

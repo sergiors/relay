@@ -1384,24 +1384,38 @@ func startupSeedFingerprints(
 // live sync's ".sync-*" directory can never create, update, or retain state.
 //
 // It is split out of Run as a pure seam over the state handle so the
-// discovery/invalid persistence is unit-testable without Docker or Redis. A
-// rebuild error is returned for the caller to surface (state stays non-fatal).
-// A lifecycle cancellation stops the phase promptly and is returned wrapped so
-// the caller can classify it as a graceful startup interruption instead of a
-// state failure.
+// discovery/invalid persistence is unit-testable without Docker or Redis.
+//
+// Error semantics are deliberate. A VALID app's discovery write is the source
+// of its fencing authority: if it fails, this call returns an error and startup
+// must not prepare or publish that app, because no exact token exists for its
+// guarded build/service callbacks. The same applies if a discovery write ever
+// returns a non-positive token (an invariant violation). An invalid app's write
+// is NOT required for startup (invalid apps are never prepared): a stale
+// observation or an operational write failure for one issue is logged and
+// isolated, and the remaining apps are still recorded. RebuildFromApps only
+// seeds an empty database and is followed by the per-app discovery upserts, so
+// its failure is logged but not fatal; a failed empty-check is never treated as
+// "the database is empty". A lifecycle cancellation stops the phase promptly and
+// is returned wrapped so the caller can classify it as a graceful startup
+// interruption instead of a state failure.
 //
 // The returned map carries the EXACT fencing token each write persisted, so
 // startup preparation, its build observer, the startup service callbacks, and
 // the reconciler seed all use the same PostgreSQL fence instead of reading it
 // back (which could claim another worker's newer generation). A zero/absent
-// token means that app's write failed and its guarded callbacks must stay
-// suppressed.
+// token means that app has no authority and must not be prepared. observations
+// carries the pre-read state snapshots captured by the startup parse gate; they
+// are REQUIRED for an invalid write. A missing snapshot (a failed state read) is
+// never interpreted as "the row is absent": the issue write is skipped, so a
+// failed read cannot bypass the optimistic concurrency guard.
 func persistStartupDiscovery(
 	ctx context.Context,
 	st *state.State,
 	dir string,
 	discovered []state.DiscoveredApp,
 	issues []app.LoadIssue,
+	observed map[string]state.AppObservation,
 	logger *slog.Logger,
 ) (map[string]state.FencingToken, error) {
 	checkCtx := func() error {
@@ -1413,13 +1427,14 @@ func persistStartupDiscovery(
 	if err := checkCtx(); err != nil {
 		return nil, err
 	}
-	fencingTokens := make(map[string]state.FencingToken, len(discovered))
-	var rebuildErr error
+	fencingTokens := make(map[string]state.FencingToken, len(discovered)+len(issues))
 	if err := st.RebuildFromApps(ctx, discovered); err != nil {
 		if startupInterrupted(ctx, err) {
 			return fencingTokens, fmt.Errorf("seed state: %w", err)
 		}
-		rebuildErr = err
+		// The seed only populates an empty database and every valid app is
+		// upserted again below. A failed empty check is not "empty", and the
+		// per-app writes still decide whether this worker has fencing authority.
 		logger.Warn("State: rebuild from apps failed; continuing", "error", err)
 	}
 	for _, issue := range issues {
@@ -1433,14 +1448,40 @@ func persistStartupDiscovery(
 			// directory that is not an app.
 			continue
 		}
-		fencingToken, err := st.RecordInvalidDesired(ctx, issue.Name, issue.Err)
+		result, observedOK, err := recordStartupIssue(ctx, st, issue, observed)
+		if !observedOK {
+			// A failed observation read is not evidence of absence. Skip this
+			// issue rather than writing unconditionally (which could overwrite
+			// another worker's newer state). Invalid apps are never prepared, so
+			// this is recoverable per-app and the next scan retries.
+			logger.Warn("State: invalid desired observation unavailable; not recording",
+				"app", issue.Name)
+			continue
+		}
 		if err != nil {
 			if startupInterrupted(ctx, err) {
 				return fencingTokens, fmt.Errorf("record invalid desired: %w", err)
 			}
+			// Operational per-app failure: an invalid app is not prepared, so the
+			// rest of startup is unaffected.
+			logger.Warn("State: record invalid desired failed; continuing",
+				"app", issue.Name, "error", err)
 			continue
 		}
-		fencingTokens[issue.Name] = fencingToken
+		if result.Stale {
+			// Another worker advanced this app after our pre-read snapshot. This
+			// is a normal, recoverable rejection, not a PostgreSQL failure; keep
+			// this app out of the token map (fail closed) and continue.
+			logger.Debug("State: stale invalid desired observation rejected",
+				"app", issue.Name)
+			continue
+		}
+		if result.FencingToken <= 0 {
+			logger.Warn("State: invalid desired write returned no fencing token",
+				"app", issue.Name)
+			continue
+		}
+		fencingTokens[issue.Name] = result.FencingToken
 	}
 	if err := checkCtx(); err != nil {
 		return fencingTokens, err
@@ -1449,6 +1490,9 @@ func persistStartupDiscovery(
 		if startupInterrupted(ctx, err) {
 			return fencingTokens, fmt.Errorf("prune removed: %w", err)
 		}
+		// Pruning stale rows does not grant or remove fencing authority for a
+		// valid app, so it remains non-fatal at startup.
+		logger.Warn("State: prune removed failed; continuing", "error", err)
 	}
 	for _, d := range discovered {
 		if err := checkCtx(); err != nil {
@@ -1459,14 +1503,47 @@ func persistStartupDiscovery(
 			if startupInterrupted(ctx, err) {
 				return fencingTokens, fmt.Errorf("record discovered: %w", err)
 			}
-			continue
+			// Critical: a valid app without the exact token persisted by its own
+			// discovery write has no safe fencing authority, so startup must not
+			// proceed to prepare or publish it.
+			return fencingTokens, fmt.Errorf(
+				"record discovered %q: %w", d.App.Name, err)
+		}
+		if fencingToken <= 0 {
+			return fencingTokens, fmt.Errorf(
+				"record discovered %q: invalid fencing token %d", d.App.Name, fencingToken)
 		}
 		fencingTokens[d.App.Name] = fencingToken
 	}
 	if err := checkCtx(); err != nil {
 		return fencingTokens, err
 	}
-	return fencingTokens, rebuildErr
+	return fencingTokens, nil
+}
+
+// recordStartupIssue persists one loader diagnostic with the pre-read state
+// observation captured by startupParseGate. observedOK is false when no
+// observation exists (the state read failed): the caller must then skip the
+// write instead of treating a failed read as an absent row. An issue whose
+// deterministic invalid identity is already persisted takes the state layer's
+// read-only fast path (no write, no token allocation); a stale observation is
+// rejected rather than overwriting another worker's newer state.
+func recordStartupIssue(
+	ctx context.Context,
+	st *state.State,
+	issue app.LoadIssue,
+	observed map[string]state.AppObservation,
+) (state.InvalidDesiredResult, bool, error) {
+	if observed == nil {
+		return state.InvalidDesiredResult{}, false, nil
+	}
+	observation, ok := observed[issue.Name]
+	if !ok {
+		return state.InvalidDesiredResult{}, false, nil
+	}
+	result, err := st.RecordInvalidDesiredWithSource(
+		ctx, issue.Name, issue.Identity, issue.Err, &observation)
+	return result, true, err
 }
 
 // appPreparer is the narrow view of the runtime Manager that startup
@@ -1514,7 +1591,11 @@ type appPreparer interface {
 // fencingTokens carries the exact fencing tokens the startup discovery writes
 // returned, keyed by app name; the build observer, failure, and success writes
 // are all conditioned on them so a preparation superseded by another worker
-// cannot overwrite the newer desired state.
+// cannot overwrite the newer desired state. When a state sink is configured
+// (st != nil), an app without a positive token is NOT prepared: startup fails
+// closed rather than building/publishing an app whose guarded state writes have
+// no authority. The discovery phase already treats such a write as fatal; this
+// is the defense-in-depth check at the handoff boundary.
 //
 // ctx is the worker lifecycle context. It is passed to Prepare so a build (and
 // the fast reuse probes) is cancelled on shutdown; Prepare itself roots the
@@ -1534,6 +1615,17 @@ func prepareApps(
 	for _, s := range startup {
 		fn := s.App
 		fencingToken := fencingTokens[fn.Name]
+		if st != nil && fencingToken <= 0 {
+			// Fail closed: without the exact token from this app's discovery
+			// write there is no fencing authority for its build/service
+			// callbacks. Do not build, publish, or admit it to the registry. A
+			// later reconcile retries it with a freshly persisted generation.
+			logger.Error(
+				"App: startup preparation skipped without fencing token",
+				"app", fn.Name,
+			)
+			continue
+		}
 		prep, err := manager.PrepareWithFingerprintAndSelection(
 			managedRuntimeBuildContext(ctx, st, fn, fencingToken), fn, s.Fingerprint, s.Selection,
 		)
@@ -1713,6 +1805,17 @@ func enqueueStartupServicesWithState(
 ) {
 	for _, pf := range prepared {
 		fn := pf.App()
+		if st != nil && fencingTokens[fn.Name] <= 0 {
+			// Defense in depth: startup preparation already refuses a token-less
+			// app. Publishing service state without the discovery token would let
+			// container convergence proceed with no state authority, so fail
+			// closed here too.
+			logger.Error(
+				"Service: startup publication skipped without fencing token",
+				"app", fn.Name,
+			)
+			continue
+		}
 		if prep := pf.Prepared(); prep != nil {
 			// Share the app's publication lease into the startup service
 			// request, so a concurrent retirement cannot remove the image while
