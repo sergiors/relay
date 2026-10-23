@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"relay/internal/app"
 	"relay/internal/source"
 )
 
@@ -88,6 +89,53 @@ func TestMaterializeDiscoveryIgnoresNonApps(t *testing.T) {
 	writeFile(t, filepath.Join(src, "valid", "template.yaml"), "runtime: node\n")
 	writeFile(t, filepath.Join(src, "notadir.txt"), "x\n")
 	writeFile(t, filepath.Join(src, "nofn", "readme.md"), "not a function\n")
+	names, err := discoverApps(mustSelect(t, src, src))
+	if err != nil {
+		t.Fatalf("discoverApps: %v", err)
+	}
+	if len(names) != 1 || names[0] != "valid" {
+		t.Fatalf("discoverApps = %v, want [valid]", names)
+	}
+}
+
+func TestDiscoverAppsRejectsSymlinkedTemplate(t *testing.T) {
+	src := t.TempDir()
+	target := filepath.Join(t.TempDir(), "template.yaml")
+	if err := os.WriteFile(target, []byte("runtime: node24\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(src, "linked"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(src, "linked", "template.yaml")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	if names, err := discoverApps(mustSelect(t, src, src)); err == nil {
+		t.Fatalf("discoverApps = %v, want an error for a symlinked template", names)
+	} else if !errors.Is(err, app.ErrInvalidPath) {
+		t.Fatalf("discoverApps error = %v, want ErrInvalidPath", err)
+	}
+}
+
+// TestDiscoverAppsSkipsSymlinkEntries pins the os-level no-follow boundary in
+// checkout discovery for whole ENTRIES: an app directory replaced by a symlink
+// (to a real app inside the source), a symlink whose target has vanished, and a
+// plain file are never app directories and are skipped without any error, as
+// the loader would skip them. A real sibling with a template is still selected.
+func TestDiscoverAppsSkipsSymlinkEntries(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "valid", "template.yaml"), "runtime: node24\n")
+	if err := os.Symlink(filepath.Join(src, "valid"), filepath.Join(src, "aliased")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(t.TempDir(), "vanished"), filepath.Join(src, "dangling")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "plainfile"), []byte("not an app\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	names, err := discoverApps(mustSelect(t, src, src))
 	if err != nil {
 		t.Fatalf("discoverApps: %v", err)

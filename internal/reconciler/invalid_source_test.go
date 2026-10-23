@@ -386,6 +386,66 @@ func TestReconcileInvalidSourceReadFailureClearsIdentityAndRetries(t *testing.T)
 	}
 }
 
+// TestReconcileUnreadableAppDirRetainsActiveAndRetries pins the operational
+// failure boundary of the live read with REAL permission bits (chmod, the
+// portable way to induce a genuine filesystem error): a present app directory
+// the process cannot search is an ambiguous observation — the active generation
+// is retained, no deterministic identity is claimed, no build runs, and the
+// read is retryable (a later readable pass rebuilds the same bytes and replaces
+// the failure view without any edit).
+func TestReconcileUnreadableAppDirRetainsActiveAndRetries(t *testing.T) {
+	skipWithoutPosixPermissions(t)
+
+	root := t.TempDir()
+	dir := writeFnDir(t, root, "locked")
+
+	fn := initialFn("locked", dir)
+	b := &fakeBuilder{}
+	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
+	fencingToken := recordSuccess(t, st, "locked", "img-old", "fp-old", time.Now(), fn.App())
+	r.SeedFencingToken("locked", fencingToken)
+
+	if err := os.Chmod(dir, 0o000); err != nil {
+		t.Fatalf("chmod app dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	r.reconcileApp("locked")
+
+	detail, ok := st.GetApp("locked")
+	if !ok {
+		t.Fatal("a flaky read must not remove the app")
+	}
+	if detail.Status != state.StatusDegraded || detail.InvalidSource != "" {
+		t.Fatalf("state = %+v, want degraded with NO invalid identity (operational)", detail)
+	}
+	if detail.Image != "img-old" || detail.Fingerprint != "fp-old" {
+		t.Fatalf("active generation = %q/%q, want preserved", detail.Image, detail.Fingerprint)
+	}
+	if pf := reg.GetByName("locked"); pf == nil || pf.Prepared() == nil {
+		t.Fatal("a flaky read must leave the active runtime serving")
+	}
+	if b.prepares() != 0 {
+		t.Fatalf("prepares = %d, want 0 on an unreadable app dir", b.prepares())
+	}
+
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("restore app dir: %v", err)
+	}
+	r.reconcileApp("locked")
+
+	recovered, ok := st.GetApp("locked")
+	if !ok {
+		t.Fatal("expected row after recovery")
+	}
+	if recovered.Status != state.StatusReady || recovered.InvalidSource != "" || recovered.LastError != "" {
+		t.Fatalf("recovered state = %+v, want ready with no error", recovered)
+	}
+	if b.prepares() != 1 {
+		t.Fatalf("prepares = %d, want the recovery build", b.prepares())
+	}
+}
+
 // TestReconcileInvalidSourceObservationReadFailureFailsClosed pins that a
 // failed pre-read observation is not an absent row: the reconciler still keeps
 // the active runtime serving but does not write an invalid state view without

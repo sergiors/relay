@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -12,6 +13,19 @@ import (
 	"relay/internal/state"
 	"relay/internal/testutil"
 )
+
+// skipWithoutPosixPermissions guards tests that inject an operational
+// filesystem failure with permissions: they only define behavior where read
+// permission is actually enforced (a non-root unix user).
+func skipWithoutPosixPermissions(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("permission-based failure injection is not portable on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("running as uid 0: read permission is not enforced")
+	}
+}
 
 // seedCurrent fingerprints fn as it currently exists on disk and seeds the
 // reconciler with that value, mirroring the worker's startup wiring (the

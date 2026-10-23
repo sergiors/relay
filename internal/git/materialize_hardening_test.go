@@ -2,8 +2,10 @@ package git
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -274,6 +276,71 @@ func TestMaterializeStagingFailureLeavesLiveAppsUntouched(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(apps, "stale")); err != nil {
 		t.Fatalf("stale app removed by a failed staging pass: %v", err)
+	}
+	assertNoReservedEntries(t, apps)
+}
+
+// skipWithoutPosixPermissions guards tests that inject an operational
+// filesystem failure with permissions: they only define behavior where read
+// permission is actually enforced (a non-root unix user).
+func skipWithoutPosixPermissions(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("permission-based failure injection is not portable on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("running as uid 0: read permission is not enforced")
+	}
+}
+
+// TestMaterializeUnreadableSourceDirFailsClosed pins the fail-closed discovery
+// boundary with a REAL unreadable directory (chmod): an operational filesystem
+// failure while inspecting a candidate is never mistaken for absence — the
+// whole sync aborts with the permission error, no live app is replaced,
+// removed, or staged, and the deterministic-removal pass never runs.
+func TestMaterializeUnreadableSourceDirFailsClosed(t *testing.T) {
+	skipWithoutPosixPermissions(t)
+
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "alpha", "template.yaml"),
+		"runtime: node24\n# new-alpha\n")
+	writeFile(t, filepath.Join(src, "locked", "template.yaml"), "runtime: node24\n")
+	// Resolve the selection BEFORE the failure injection (as a real sync does:
+	// the checkout policy is read first), so the failure below lands on
+	// materialize's own discovery, not on the selection construction.
+	selection := mustSelect(t, src, src)
+	locked := filepath.Join(src, "locked")
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatalf("chmod locked: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+
+	apps := t.TempDir()
+	writeFile(t, filepath.Join(apps, "alpha", "template.yaml"),
+		"runtime: node24\n# old-alpha\n")
+	writeFile(t, filepath.Join(apps, "alpha", "old-only.txt"), "old\n")
+	writeFile(t, filepath.Join(apps, "stale", "template.yaml"),
+		"runtime: node24\n# stale\n")
+
+	mat, rem, err := materialize(selection, apps)
+	if err == nil {
+		t.Fatal("unreadable source app dir: nil error, want the sync to fail closed")
+	}
+	if !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("err = %v, want a permission error", err)
+	}
+	if len(mat) != 0 || len(rem) != 0 {
+		t.Fatalf("materialized/removed = %v/%v, want none: an operational failure is not a removal", mat, rem)
+	}
+	if got := mustReadFile(t,
+		filepath.Join(apps, "alpha", "template.yaml")); !strings.Contains(got, "old-alpha") {
+		t.Fatalf("live app template changed on failed discovery: %q", got)
+	}
+	if _, serr := os.Stat(filepath.Join(apps, "alpha", "old-only.txt")); serr != nil {
+		t.Fatalf("live app bytes changed on failed discovery: %v", serr)
+	}
+	if _, serr := os.Stat(filepath.Join(apps, "stale")); serr != nil {
+		t.Fatalf("stale app removed by failed discovery: %v", serr)
 	}
 	assertNoReservedEntries(t, apps)
 }

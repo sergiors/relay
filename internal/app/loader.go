@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -47,18 +48,37 @@ func IsReservedDir(name string) bool {
 // files) and must never be treated as an invalid desired definition.
 const TemplateFile = "template.yaml"
 
-// HasTemplate reports whether dir contains a template.yaml entry. It only
-// stats the path and never parses it, so a malformed, unreadable, or otherwise
-// invalid but PRESENT template is still an app candidate and keeps its normal
-// invalid-template diagnostics. A path that definitely does not exist is
-// (false, nil); any other stat error is returned so a caller can avoid treating
-// an ambiguous read as an app's removal.
-func HasTemplate(dir string) (bool, error) {
-	if _, err := os.Stat(filepath.Join(dir, TemplateFile)); err != nil {
-		if os.IsNotExist(err) {
+// IsRealAppDir reports whether path currently names a real directory, without
+// following a symlink. A missing path or an unsupported entry (a symlink or a
+// non-directory) returns (false, nil); other Lstat failures are returned so a
+// caller does not mistake an ambiguous observation for removal.
+func IsRealAppDir(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
 			return false, nil
 		}
 		return false, err
+	}
+	return info.Mode()&os.ModeSymlink == 0 && info.IsDir(), nil
+}
+
+// HasTemplate reports whether dir contains a template.yaml candidate. It only
+// inspects the entry and never parses it: a malformed or unreadable regular
+// template is still present. Symlinked or non-regular template entries are
+// present invalid candidates (true, ErrInvalidPath), never followed. A path
+// that definitely does not exist is (false, nil); other stat errors are
+// returned so callers can avoid treating an ambiguous read as removal.
+func HasTemplate(dir string) (bool, error) {
+	info, err := os.Lstat(filepath.Join(dir, TemplateFile))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return true, fmt.Errorf("%w: %q is not a regular non-symlink template", ErrInvalidPath, filepath.Join(dir, TemplateFile))
 	}
 	return true, nil
 }
@@ -192,60 +212,111 @@ type TemplateParseGate interface {
 	SkipParse(name, identity string) (skip bool, err error)
 }
 
-// resolveAppDir resolves name to its app directory under root, applying
-// the discovery policy shared by startup discovery (Loader.Load) and live/
-// periodic reload (LoadSingle): the name must be a single path element; the
-// directory must be a real DIRECT child of root; and a SYMLINK is never
-// accepted (os.Lstat, not Stat, so an outside target the link points at can
-// never be read, fingerprinted, or built). Invalid app names are rejected
-// after checking whether a safe directory is an app candidate.
+// resolveAppDir opens name beneath a handle to root, applying the discovery
+// policy shared by startup discovery (Loader.Load) and live/periodic reload
+// (LoadSingle). It rejects symlinked/non-directory direct children and verifies
+// that the opened directory is the same entry observed through the root handle.
+// The returned Root pins that directory across path replacement; all subsequent
+// template access must use it rather than rebuilding a path. Invalid app names
+// are rejected after checking whether the safely opened directory is a candidate.
 //
 // A missing directory wraps fs.ErrNotExist (so a caller can treat it as a
 // removal); an illegal name, a non-child path, a symlink, or a non-directory is
-// ErrInvalidPath; any other stat failure is returned as-is so a flaky read is
-// never mistaken for a removal.
-func resolveAppDir(root, name string) (string, error) {
+// ErrInvalidPath; other filesystem failures remain operational errors so a
+// flaky read is never mistaken for a removal.
+func resolveAppDir(root, name string) (*os.Root, string, error) {
 	// Reject names that could escape or fail to identify a single directory
 	// before touching the filesystem. Other invalid names may still identify a
 	// non-app directory, so their candidacy is decided after the directory check.
 	if name == "" || name == "." || name == ".." || filepath.IsAbs(name) ||
 		strings.ContainsAny(name, "/\\") || name != filepath.Base(name) {
-		return "", fmt.Errorf("%w: %q is not a single path element", ErrInvalidPath, name)
+		return nil, "", fmt.Errorf("%w: %q is not a single path element", ErrInvalidPath, name)
 	}
 	nameErr := ValidName(name)
-	dir := filepath.Join(root, name)
-	// The join is lexical: confirm the result is a direct child of root so a
-	// crafted name can never address an ancestor or a nested path.
-	if filepath.Dir(dir) != filepath.Clean(root) {
-		return "", fmt.Errorf("%w: %q is not a direct child of the apps root", ErrInvalidPath, name)
-	}
-	info, err := os.Lstat(dir)
+	appsRoot, err := os.OpenRoot(root)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if nameErr != nil {
+			return nil, "", fmt.Errorf("%w: %v", ErrInvalidPath, nameErr)
+		}
+		return nil, "", fmt.Errorf("app %q: open apps root: %w", name, err)
+	}
+	defer appsRoot.Close()
+	info, err := appsRoot.Lstat(name)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
 			if nameErr != nil {
-				return "", fmt.Errorf("%w: %v", ErrInvalidPath, nameErr)
+				return nil, "", fmt.Errorf("%w: %v", ErrInvalidPath, nameErr)
 			}
-			return "", fmt.Errorf("app %q: %w", name, fs.ErrNotExist)
+			return nil, "", fmt.Errorf("app %q: %w", name, fs.ErrNotExist)
 		}
 		if nameErr != nil {
-			return "", fmt.Errorf("%w: %v", ErrInvalidPath, nameErr)
+			return nil, "", fmt.Errorf("%w: %v", ErrInvalidPath, nameErr)
 		}
-		return "", fmt.Errorf("app %q: stat: %w", name, err)
+		return nil, "", fmt.Errorf("app %q: stat: %w", name, err)
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		return "", fmt.Errorf("%w: %q is a symlink", ErrInvalidPath, name)
+		return nil, "", fmt.Errorf("%w: %q is a symlink", ErrInvalidPath, name)
 	}
 	if !info.IsDir() {
-		return "", fmt.Errorf("%w: %q is not a directory", ErrInvalidPath, name)
+		return nil, "", fmt.Errorf("%w: %q is not a directory", ErrInvalidPath, name)
+	}
+	appRoot, err := appsRoot.OpenRoot(name)
+	if err != nil {
+		// The entry may have changed between Lstat and OpenRoot. Reclassify a
+		// now-missing, symlinked, or non-directory child without following it.
+		current, statErr := appsRoot.Lstat(name)
+		if statErr == nil && (current.Mode()&os.ModeSymlink != 0 || !current.IsDir()) {
+			return nil, "", fmt.Errorf("%w: %q changed to an unsupported app path", ErrInvalidPath, name)
+		}
+		if errors.Is(statErr, fs.ErrNotExist) && nameErr == nil {
+			return nil, "", fmt.Errorf("app %q: %w", name, fs.ErrNotExist)
+		}
+		if nameErr != nil {
+			return nil, "", fmt.Errorf("%w: %v", ErrInvalidPath, nameErr)
+		}
+		if statErr != nil {
+			return nil, "", fmt.Errorf("app %q: stat: %w", name, statErr)
+		}
+		return nil, "", fmt.Errorf("app %q: open directory: %w", name, err)
+	}
+	keepAppRoot := false
+	defer func() {
+		if !keepAppRoot {
+			_ = appRoot.Close()
+		}
+	}()
+	openedInfo, err := appRoot.Stat(".")
+	if err != nil {
+		return nil, "", fmt.Errorf("app %q: stat opened directory: %w", name, err)
+	}
+	if !openedInfo.IsDir() || !os.SameFile(info, openedInfo) {
+		return nil, "", fmt.Errorf("app %q: directory changed during open", name)
+	}
+	currentInfo, err := appsRoot.Lstat(name)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, "", fmt.Errorf("app %q: %w", name, fs.ErrNotExist)
+		}
+		return nil, "", fmt.Errorf("app %q: recheck directory: %w", name, err)
+	}
+	if currentInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, "", fmt.Errorf("%w: %q changed to a symlink", ErrInvalidPath, name)
+	}
+	if !currentInfo.IsDir() {
+		return nil, "", fmt.Errorf("%w: %q changed to a non-directory", ErrInvalidPath, name)
+	}
+	if !os.SameFile(openedInfo, currentInfo) {
+		return nil, "", fmt.Errorf("app %q: directory changed during open", name)
 	}
 	if nameErr != nil {
-		present, statErr := HasTemplate(dir)
-		if statErr == nil && !present {
-			return "", ErrNotReady
+		_, statErr := appRoot.Lstat(TemplateFile)
+		if errors.Is(statErr, fs.ErrNotExist) {
+			return nil, "", ErrNotReady
 		}
-		return "", fmt.Errorf("%w: %v", ErrInvalidPath, nameErr)
+		return nil, "", fmt.Errorf("%w: %v", ErrInvalidPath, nameErr)
 	}
-	return dir, nil
+	keepAppRoot = true
+	return appRoot, filepath.Join(root, name), nil
 }
 
 // LoadSingle loads exactly one app from root by name, enforcing the same
@@ -272,16 +343,64 @@ func LoadSingle(root, name string) (App, error) {
 // BYTES THAT WERE ACTUALLY READ can produce an identity: a failed or ambiguous
 // read never yields one.
 func ReadTemplateSource(root, name string) (TemplateSource, error) {
-	dir, err := resolveAppDir(root, name)
+	appRoot, dir, err := resolveAppDir(root, name)
 	if err != nil {
 		return TemplateSource{}, err
 	}
-	templatePath := filepath.Join(dir, TemplateFile)
-	data, err := os.ReadFile(templatePath)
+	defer appRoot.Close()
+	info, err := appRoot.Lstat(TemplateFile)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return TemplateSource{}, ErrNotReady
 		}
+		return TemplateSource{}, fmt.Errorf("app %q: stat template: %w", name, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return TemplateSource{}, fmt.Errorf("%w: app %q template is not a regular non-symlink file", ErrInvalidPath, name)
+	}
+	f, err := appRoot.Open(TemplateFile)
+	if err != nil {
+		currentInfo, statErr := appRoot.Lstat(TemplateFile)
+		if statErr == nil && (currentInfo.Mode()&os.ModeSymlink != 0 || !currentInfo.Mode().IsRegular()) {
+			return TemplateSource{}, fmt.Errorf("%w: app %q template changed to a non-regular or symlinked file", ErrInvalidPath, name)
+		}
+		if errors.Is(statErr, fs.ErrNotExist) {
+			return TemplateSource{}, ErrNotReady
+		}
+		if statErr != nil {
+			return TemplateSource{}, fmt.Errorf("app %q: recheck template: %w", name, statErr)
+		}
+		if errors.Is(err, fs.ErrNotExist) {
+			// The entry is regular now, but the open raced with a replacement.
+			// Do not wrap ENOENT: this is retryable, not a removal or invalid input.
+			return TemplateSource{}, fmt.Errorf("app %q: template changed during open (open error: %v)", name, err)
+		}
+		return TemplateSource{}, fmt.Errorf("app %q: read template: %w", name, err)
+	}
+	defer f.Close()
+	openedInfo, err := f.Stat()
+	if err != nil {
+		return TemplateSource{}, fmt.Errorf("app %q: stat opened template: %w", name, err)
+	}
+	// Recheck the path before deciding whether an identity mismatch is invalid
+	// input or a concurrent regular-file replacement. Symlinks and other
+	// non-regular observations remain invalid; a different regular inode is an
+	// operational race and must be retried without claiming an invalid identity.
+	currentInfo, err := appRoot.Lstat(TemplateFile)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return TemplateSource{}, ErrNotReady
+		}
+		return TemplateSource{}, fmt.Errorf("app %q: recheck template: %w", name, err)
+	}
+	if currentInfo.Mode()&os.ModeSymlink != 0 || !currentInfo.Mode().IsRegular() || !openedInfo.Mode().IsRegular() {
+		return TemplateSource{}, fmt.Errorf("%w: app %q template changed during read", ErrInvalidPath, name)
+	}
+	if !os.SameFile(info, openedInfo) || !os.SameFile(currentInfo, openedInfo) {
+		return TemplateSource{}, fmt.Errorf("app %q: template changed during read", name)
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
 		return TemplateSource{}, fmt.Errorf("app %q: read template: %w", name, err)
 	}
 	return TemplateSource{
@@ -292,14 +411,15 @@ func ReadTemplateSource(root, name string) (TemplateSource, error) {
 	}, nil
 }
 
-// Load returns the successfully loaded apps. Directories without a
-// template.yaml are not app candidates and are silently skipped; Relay-owned
-// transient staging directories (IsReservedDir) are ignored entirely; invalid
-// names, symlinked or non-directory entries, and invalid templates are logged
-// and skipped without aborting the
-// load. Each entry is loaded through LoadSingle, so startup discovery and live
-// reload apply exactly the same path policy. Callers that must observe the
-// invalid entries (rather than only skip them) use LoadWithDiagnostics.
+// Load returns the successfully loaded apps. Direct-child files and symlinks
+// are unsupported root entries and are silently skipped, as are real app
+// directories without template.yaml and Relay-owned transient staging
+// directories (IsReservedDir). Invalid names, unreadable or invalid templates,
+// and symlinked or non-regular template.yaml entries inside real app directories
+// are logged and skipped without aborting the load. Each app is loaded through
+// LoadSingle, so startup discovery and live reload apply the same path policy.
+// Callers that must observe invalid entries (rather than only skip them) use
+// LoadWithDiagnostics.
 func (l *Loader) Load() ([]App, error) {
 	apps, issues, err := l.load(nil)
 	if err != nil {
@@ -326,14 +446,16 @@ func (l *Loader) logIssues(issues []LoadIssue) {
 
 // LoadWithDiagnostics loads exactly like Load — returning the same valid
 // apps, with the same logging and the same root-read error semantics — but
-// ALSO returns one LoadIssue per PRESENT app candidate that could not be loaded
-// (an invalid name/symlink/non-directory path or an invalid/unreadable
-// template). A directory without template.yaml is not an app candidate and is
-// never reported. Relay-owned transient staging directories (IsReservedDir) are
-// ignored entirely and never reported. A directory that VANISHED between the
-// directory read and its load is not a desired definition and is deliberately
-// omitted, so a caller never mistakes a transient absence for an invalid desired
-// state.
+// ALSO returns LoadIssues for real direct-child app directories that could not
+// be loaded (for example, an invalid name, an unreadable or invalid template, or
+// a symlinked/non-regular template.yaml). Direct-child files and symlinks are
+// unsupported root entries and are skipped, not reported; a directory without
+// template.yaml is likewise not an app candidate. Relay-owned transient staging
+// directories (IsReservedDir) are ignored entirely. A directory that VANISHED
+// between the directory read and its load is not a desired definition and is
+// deliberately omitted, so a caller never mistakes a transient absence for an
+// invalid desired state. An ambiguous directory-inspection failure is reported
+// as an issue so it cannot be mistaken for absence.
 //
 // A root read error is returned as a fatal error (nil apps), exactly as
 // Load does: the loader cannot even enumerate the entries, so there is nothing
@@ -365,14 +487,16 @@ func (l *Loader) LoadWithDiagnosticsUsing(gate TemplateParseGate) ([]App, []Load
 	return apps, issues, nil
 }
 
-// load is the shared loader body: it enumerates the root's direct child
-// directories, reads each through ReadTemplateSource (optionally consulting the
-// caller's parse gate), and classifies the outcome. It returns the loaded apps
-// plus the present-but-invalid entries as issues; Relay-owned transient staging
-// directories (IsReservedDir) are skipped entirely, vanished entries
-// (fs.ErrNotExist) are neither apps nor issues, and directories without
-// template.yaml (ErrNotReady) are not app candidates and are likewise neither
-// apps nor issues. Callers own the logging and the error semantics.
+// load is the shared loader body: it skips unsupported direct-child files and
+// symlinks, then reads each real direct-child directory through
+// ReadTemplateSource (optionally consulting the caller's parse gate) and
+// classifies the outcome. It returns loaded apps plus issues for invalid names,
+// unreadable/invalid templates, and symlinked or non-regular template.yaml
+// entries. Relay-owned transient staging directories (IsReservedDir) are skipped
+// entirely; vanished entries (fs.ErrNotExist) and directories without
+// template.yaml (ErrNotReady) are neither apps nor issues. Ambiguous directory
+// inspection failures are issues rather than presumed removals. Callers own the
+// logging and error semantics.
 func (l *Loader) load(gate TemplateParseGate) ([]App, []LoadIssue, error) {
 	entries, err := os.ReadDir(l.dir)
 	if err != nil {
@@ -382,17 +506,26 @@ func (l *Loader) load(gate TemplateParseGate) ([]App, []LoadIssue, error) {
 	var apps []App
 	var issues []LoadIssue
 	for _, entry := range entries {
-		if !entry.IsDir() {
-			// A file, or a symlink (ReadDir reports the link's own type, never
-			// its target): never an app directory.
-			continue
-		}
 		name := entry.Name()
 		if IsReservedDir(name) {
 			// A Relay-owned transient staging directory (git's ".sync-*") is
 			// never an app and never a desired definition: it is skipped
 			// entirely — no app, no issue, no warning — so a live sync
 			// cannot surface a spurious invalid/unavailable state.
+			continue
+		}
+		dir := filepath.Join(l.dir, name)
+		realDir, dirErr := IsRealAppDir(dir)
+		if dirErr != nil {
+			// The entry was enumerated but its current type could not be checked.
+			// Keep the ambiguity visible rather than silently turning it into a
+			// missing desired app.
+			issues = append(issues, LoadIssue{Name: name, Err: fmt.Errorf("app %q: inspect directory: %w", name, dirErr)})
+			continue
+		}
+		if !realDir {
+			// Files, symlinks, and broken links are unsupported root entries,
+			// not app candidates.
 			continue
 		}
 		// The gate snapshots persisted state BEFORE the read, so a later
@@ -416,9 +549,9 @@ func (l *Loader) load(gate TemplateParseGate) ([]App, []LoadIssue, error) {
 				// report.
 				continue
 			}
-			// An invalid name, symlink, non-directory, or unreadable template: a
-			// present desired definition that cannot be loaded. Reported as an
-			// issue; the caller decides how to record it.
+			// An invalid name, invalid template entry (including a symlink), or
+			// unreadable template is a candidate that cannot be loaded. Report it
+			// as an issue; the caller decides how to record it.
 			issues = append(issues, LoadIssue{Name: name, Err: err})
 			continue
 		}

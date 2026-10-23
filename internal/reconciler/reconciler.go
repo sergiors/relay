@@ -3,6 +3,7 @@ package reconciler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -493,9 +494,10 @@ func (r *Reconciler) eventLoop() {
 			// installed tree, removing first so a stale detached-inode watch (and
 			// any of its old descendants) cannot survive and duplicates cannot leak
 			// handles. The removal above may already have done this; repeating it
-			// is a no-op. A genuinely removed path fails the stat and is not added.
+			// is a no-op. A genuinely removed path fails the no-follow stat and
+			// is not added.
 			if ev.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 && !r.isReservedDirPath(ev.Name) {
-				if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {
+				if info, err := os.Lstat(ev.Name); err == nil && info.Mode()&os.ModeSymlink == 0 && info.IsDir() {
 					r.removeWatchRecursive(ev.Name)
 					r.addWatchRecursive(ev.Name)
 				}
@@ -521,14 +523,21 @@ func (r *Reconciler) appForPath(path string) (string, bool) {
 	return name, true
 }
 
-// shouldEnqueue reports whether an event for name is worth a debounced reconcile:
-// the directory currently has a template.yaml (a creation or edit), or the name
-// is already known locally (so a template deletion/rename is observed as a
-// removal). A directory that has never been an app and still has no template
-// never arms a timer, so writes to unrelated files there (a README, say) cannot
-// cause reconcile churn.
+// shouldEnqueue reports whether an event for name is worth a debounced reconcile.
+// Real app directories are enqueued when a template is present or its status is
+// ambiguous; known names are also enqueued to observe removals. Unsupported or
+// missing root entries are only enqueued when already known, so unrelated files
+// and symlinks cannot create bogus app state.
 func (r *Reconciler) shouldEnqueue(name string) bool {
-	if present, err := app.HasTemplate(filepath.Join(r.root, name)); err == nil && present {
+	path := filepath.Join(r.root, name)
+	realDir, err := app.IsRealAppDir(path)
+	if err != nil {
+		return true
+	}
+	if !realDir {
+		return r.knownLocally(name)
+	}
+	if present, err := app.HasTemplate(path); err != nil || present {
 		return true
 	}
 	return r.knownLocally(name)
@@ -546,6 +555,14 @@ func (r *Reconciler) knownLocally(name string) bool {
 	_, ok := r.fencingTokens[name]
 	r.mu.Unlock()
 	return ok
+}
+
+// isSinglePathElement reports whether name can safely be joined to the root to
+// inspect exactly one child. App-name validation is intentionally separate:
+// invalid but single-element names may still identify a previously-known app.
+func isSinglePathElement(name string) bool {
+	return name != "" && name != "." && name != ".." && !filepath.IsAbs(name) &&
+		!strings.ContainsAny(name, "/\\") && name == filepath.Base(name)
 }
 
 // rootChildName returns the first path segment of p relative to the apps
@@ -679,9 +696,6 @@ func (r *Reconciler) reconcileAll() {
 		return
 	}
 	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
 		name := e.Name()
 		if app.IsReservedDir(name) {
 			// A Relay-owned transient staging directory (git's ".sync-*") is
@@ -690,7 +704,28 @@ func (r *Reconciler) reconcileAll() {
 			// produce a warning or an invalid state row while it briefly exists.
 			continue
 		}
-		present, statErr := app.HasTemplate(filepath.Join(r.root, name))
+		path := filepath.Join(r.root, name)
+		realDir, dirErr := app.IsRealAppDir(path)
+		if dirErr != nil {
+			// The entry was enumerated, but its current type could not be
+			// determined. Keep it out of the missing-name sweep and let the
+			// single-app path record the operational failure without removing an
+			// active generation.
+			seen[name] = true
+			r.dispatch(name)
+			continue
+		}
+		if !realDir {
+			// Files, symlinked directories, and broken links are unsupported, not
+			// app candidates. Known names are reconciled through normal removal;
+			// unknown root entries do not create app state.
+			if r.knownLocally(name) {
+				seen[name] = true
+				r.dispatch(name)
+			}
+			continue
+		}
+		present, statErr := app.HasTemplate(path)
 		if statErr != nil {
 			// An ambiguous template stat is not proof of removal. Keep the name
 			// seen and let the normal load classify it (a flaky read is recorded
@@ -776,21 +811,55 @@ func (r *Reconciler) reconcileApp(name string) {
 	// overwriting the newer state. The fast path itself re-reads persisted state
 	// before skipping, so it never trusts this snapshot alone.
 	observed := r.observeApp(name)
-	// ReadTemplateSource enforces the SAME path policy as startup discovery (a
-	// legal single-element name, a real direct child of the root, never a
-	// symlink), so a reload can never read, fingerprint, or build a path the
-	// startup loader would have rejected, and it leaves parsing separate so an
-	// unchanged deterministic invalid input can avoid a repeat parse. A missing
-	// directory wraps fs.ErrNotExist (a removal); a directory without
-	// template.yaml is ErrNotReady (not an app candidate); an invalid path is
-	// ErrInvalidPath and RETAINS the previously-loaded version rather than
-	// letting an invalid path remove or replace a healthy app.
-	source, err := app.ReadTemplateSource(r.root, name)
+	// Only inspect names that lexically identify one direct child. An unsafe
+	// name must never let a removal check touch a sibling or ancestor; the loader
+	// below will classify it as ErrInvalidPath instead.
+	checkDir := isSinglePathElement(name)
+	var templateSource app.TemplateSource
+	var err error
+	if checkDir {
+		realDir, inspectErr := app.IsRealAppDir(filepath.Join(r.root, name))
+		if inspectErr != nil {
+			err = fmt.Errorf("app %q: inspect directory: %w", name, inspectErr)
+		} else if !realDir {
+			// A missing path, regular file, or direct-child symlink is not an
+			// app. These are normal removals for known names, unlike an invalid
+			// template inside a real app directory, which preserves the active
+			// generation.
+			if r.knownLocally(name) {
+				r.remove(name)
+			}
+			return
+		}
+	}
+	// ReadTemplateSource applies the same no-follow policy as startup discovery
+	// and keeps parsing separate so an unchanged deterministic invalid input can
+	// avoid a repeat parse. For a real app directory, a missing template is a
+	// normal removal; a symlinked/non-regular template is invalid desired input.
+	if err == nil {
+		templateSource, err = app.ReadTemplateSource(r.root, name)
+	}
 	if err != nil {
+		// Directory paths can change type after the initial no-follow check.
+		// Reclassify invalid-path failures so missing/unsupported directories are
+		// removed, while invalid templates in real directories are retained.
+		if checkDir && errors.Is(err, app.ErrInvalidPath) {
+			realDir, inspectErr := app.IsRealAppDir(filepath.Join(r.root, name))
+			if inspectErr != nil {
+				err = fmt.Errorf("app %q: inspect directory: %w", name, inspectErr)
+			} else if !realDir {
+				if r.knownLocally(name) {
+					r.remove(name)
+				}
+				return
+			}
+		}
 		if errors.Is(err, fs.ErrNotExist) {
 			// Directory gone -> remove from registry. In-flight invocations keep
 			// the old snapshot; they are not killed.
-			r.remove(name)
+			if r.knownLocally(name) {
+				r.remove(name)
+			}
 			return
 		}
 		if errors.Is(err, app.ErrNotReady) {
@@ -805,7 +874,7 @@ func (r *Reconciler) reconcileApp(name string) {
 			}
 			return
 		}
-		// Every other load failure (invalid path, flaky read, unreadable
+		// Every other load failure (invalid template path, flaky read, unreadable
 		// template) means the desired definition is not a valid generation to
 		// prepare, so no desired pending rules are manufactured. Any stale
 		// pending entry from a previous, now-invalid desired state is cleared so
@@ -813,11 +882,10 @@ func (r *Reconciler) reconcileApp(name string) {
 		// generation (if any) is retained exactly as today.
 		r.reg.ClearPending(name)
 		if errors.Is(err, app.ErrInvalidPath) {
-			// An invalid path (bad name, symlink, non-directory, not a direct
-			// child) can never be an app; retain any previously-loaded
-			// version rather than removing or replacing it. The present invalid
-			// desired definition is recorded so its stale ready view is not left
-			// behind.
+			// An invalid name or template path inside a real app directory is
+			// invalid desired input, not removal. Retain any previously-loaded
+			// version and record the invalid view so its stale ready state is not
+			// left behind.
 			r.log.Warn(
 				"App: invalid path; retaining previous version",
 				"app", name,
@@ -841,6 +909,7 @@ func (r *Reconciler) reconcileApp(name string) {
 		r.recordInvalidDesired(name, "", err, observed)
 		return
 	}
+	source := templateSource
 
 	// The bytes were read and hashed. If their exact deterministic-invalid
 	// identity is CURRENTLY persisted, skip the parse entirely. This is a fresh

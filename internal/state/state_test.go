@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -36,6 +37,19 @@ events:
       event_name: [MODIFY]
     timeout: 20s
 `
+
+// skipWithoutPosixPermissions guards tests that inject an operational
+// filesystem failure with permissions: they only define behavior where read
+// permission is actually enforced (a non-root unix user).
+func skipWithoutPosixPermissions(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("permission-based failure injection is not portable on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("running as uid 0: read permission is not enforced")
+	}
+}
 
 // init is idempotent and re-opening the same file yields a working state DB.
 func TestOpenIdempotentAndReopen(t *testing.T) {
@@ -1087,6 +1101,170 @@ func TestPruneRemovedEmptyDBAndMissingDirName(t *testing.T) {
 	}
 	if _, ok := c.GetApp("demo"); !ok {
 		t.Fatal("demo must survive pruning while present on disk")
+	}
+}
+
+// TestPruneRemovedSweepsUnsupportedRootEntries pins the startup prune against
+// REAL filesystem entries that can never be backed by an app: a recorded app
+// whose live path is now a regular file, a symlinked directory (even to a real,
+// loadable app outside the root), or a dangling link is no longer an app
+// candidate, so its row and app_stats are pruned — while a real directory with
+// a regular template.yaml keeps its row and stats.
+func TestPruneRemovedSweepsUnsupportedRootEntries(t *testing.T) {
+	c := openTestState(t)
+	tmpl := mustTemplate(t, twoHandlerTmpl)
+
+	// Four recorded apps, each seeded with an active generation and stats.
+	names := []string{"filed-over", "linked-over", "dangling-over", "kept-real"}
+	for _, name := range names {
+		fn := fnFor(t, name, tmpl)
+		fencingToken := seedFencingToken(t, c, fn)
+		if _, err := c.RecordReconcileSuccess(context.Background(), name, "img-"+name, "fp-"+name, time.Now(), fn, fencingToken); err != nil {
+			t.Fatalf("seed %q: %v", name, err)
+		}
+		c.RecordAppStats(AppStats{App: name, EventsMatchedTotal: 4})
+	}
+
+	root := t.TempDir()
+	// kept-real: a real app directory with a regular template. Survives.
+	keptDir := filepath.Join(root, "kept-real")
+	if err := os.MkdirAll(keptDir, 0o755); err != nil {
+		t.Fatalf("mkdir kept-real: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(keptDir, "template.yaml"), []byte(twoHandlerTmpl), 0o644); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+	// filed-over: the app path is now a plain file.
+	if err := os.WriteFile(filepath.Join(root, "filed-over"), []byte("not an app\n"), 0o644); err != nil {
+		t.Fatalf("write file over app path: %v", err)
+	}
+	// linked-over: a symlinked directory whose TARGET is a real, loadable app
+	// outside the root — the live name is still an unsupported entry.
+	outside := t.TempDir()
+	targetDir := filepath.Join(outside, "target")
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatalf("mkdir outside target: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "template.yaml"), []byte(twoHandlerTmpl), 0o644); err != nil {
+		t.Fatalf("write outside template: %v", err)
+	}
+	if err := os.Symlink(targetDir, filepath.Join(root, "linked-over")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	// dangling-over: a symlink whose target does not exist at all.
+	if err := os.Symlink(filepath.Join(root, "vanished-target"), filepath.Join(root, "dangling-over")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	if err := c.PruneRemoved(context.Background(), root); err != nil {
+		t.Fatalf("PruneRemoved: %v", err)
+	}
+
+	for _, name := range []string{"filed-over", "linked-over", "dangling-over"} {
+		if _, ok := c.GetApp(name); ok {
+			t.Errorf("app %q behind a %q path must be pruned", name, name)
+		}
+		if _, ok := c.AppStats(name); ok {
+			t.Errorf("pruned app %q's app_stats must be pruned too", name)
+		}
+	}
+	if _, ok := c.GetApp("kept-real"); !ok {
+		t.Fatal("a real app directory with a regular template must survive the prune")
+	}
+	if _, ok := c.AppStats("kept-real"); !ok {
+		t.Fatal("a surviving app's app_stats must survive too")
+	}
+}
+
+// TestPruneRemovedKeepsRowForTemplateSymlink pins that a real app directory
+// whose template.yaml is a SYMLINK is an invalid (but present) candidate: the
+// row survives the startup prune so the invalid-desired diagnostic is not lost.
+func TestPruneRemovedKeepsRowForTemplateSymlink(t *testing.T) {
+	c := openTestState(t)
+	if _, err := c.RecordInvalidDesired(context.Background(), "symlinked-tmpl", &boomErr{}); err != nil {
+		t.Fatalf("seed invalid row: %v", err)
+	}
+
+	root := t.TempDir()
+	dir := filepath.Join(root, "symlinked-tmpl")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "template.yaml"), []byte(twoHandlerTmpl), 0o644); err != nil {
+		t.Fatalf("write outside template: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "template.yaml"), filepath.Join(dir, "template.yaml")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	if err := c.PruneRemoved(context.Background(), root); err != nil {
+		t.Fatalf("PruneRemoved: %v", err)
+	}
+
+	if _, ok := c.GetApp("symlinked-tmpl"); !ok {
+		t.Fatal("a real directory with a symlinked template must keep its row (present invalid candidate)")
+	}
+}
+
+// TestPruneRemovedKeepsRowOnTransientFilesystemErrors pins the tolerance
+// boundary with REAL permission bits: an unreadable apps ROOT makes every
+// directory inspection ambiguous so no row is pruned at all, and an unreadable
+// app DIRECTORY is likewise ambiguous — its row survives while a control row
+// whose directory is genuinely gone is still pruned in the same pass.
+func TestPruneRemovedKeepsRowOnTransientFilesystemErrors(t *testing.T) {
+	skipWithoutPosixPermissions(t)
+	c := openTestState(t)
+	tmpl := mustTemplate(t, twoHandlerTmpl)
+
+	unreadable := "unreadable-dir"
+	for _, name := range []string{unreadable, "vanished"} {
+		fn := fnFor(t, name, tmpl)
+		fencingToken := seedFencingToken(t, c, fn)
+		if _, err := c.RecordReconcileSuccess(context.Background(), name, "img-"+name, "fp-"+name, time.Now(), fn, fencingToken); err != nil {
+			t.Fatalf("seed %q: %v", name, err)
+		}
+	}
+
+	root := t.TempDir()
+	dir := filepath.Join(root, unreadable)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", unreadable, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(twoHandlerTmpl), 0o644); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+
+	// An unreadable apps ROOT: every inspection is ambiguous, so nothing is
+	// pruned — not even the genuinely absent "vanished".
+	t.Cleanup(func() { _ = os.Chmod(root, 0o755) })
+	if err := os.Chmod(root, 0o000); err != nil {
+		t.Fatalf("chmod root: %v", err)
+	}
+	if err := c.PruneRemoved(context.Background(), root); err != nil {
+		t.Fatalf("PruneRemoved with an unreadable root: %v", err)
+	}
+	if _, ok := c.GetApp("vanished"); !ok {
+		t.Fatal("an unreadable apps root must preserve every row, including an absent directory's")
+	}
+
+	// A readable root with an unreadable app directory: the ambiguous
+	// inspection preserves that row, while the absent directory is pruned.
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatalf("restore root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	if err := os.Chmod(dir, 0o000); err != nil {
+		t.Fatalf("chmod app dir: %v", err)
+	}
+	if err := c.PruneRemoved(context.Background(), root); err != nil {
+		t.Fatalf("PruneRemoved with an unreadable app dir: %v", err)
+	}
+	if _, ok := c.GetApp("vanished"); ok {
+		t.Fatal("the absent name must still be pruned once the root is readable")
+	}
+	if _, ok := c.GetApp(unreadable); !ok {
+		t.Fatal("an unreadable app directory must preserve its row (ambiguous, not absent)")
 	}
 }
 

@@ -22,11 +22,13 @@ import (
 var exchangeDirs = platformExchange
 
 // discoverApps returns the sorted set of app directories under the selected
-// source: each direct subdirectory with an app.ValidName name, an included
-// template.yaml path, and a stat-able template.yaml. It selects by presence,
-// not template contents; parsing and schema validation belong to the
-// reconciler. Subdirectories without a template.yaml, files, and directories
-// failing app.ValidName are ignored. An ignored directory is skipped just as
+// source: each real direct subdirectory with an app.ValidName name, an included
+// template.yaml path, and a regular non-symlink template. It selects by
+// presence, not template contents; parsing and schema validation belong to the
+// reconciler. Subdirectories without a template.yaml, files, symlinked dirs,
+// and directories failing app.ValidName are ignored. An invalid template entry
+// or operational filesystem error aborts discovery rather than being mistaken
+// for absence and removing a live app. An ignored directory is skipped just as
 // the loader would (git never descends into it), so an app directory excluded
 // by .gitignore is not materialized.
 func discoverApps(selection *source.Selection) ([]string, error) {
@@ -49,18 +51,30 @@ func discoverApps(selection *source.Selection) ([]string, error) {
 	// purely by the nil err.
 	var names []string
 	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
 		name := e.Name()
 		if app.ValidName(name) != nil {
+			continue
+		}
+		dir := filepath.Join(selection.Dir(), name)
+		realDir, err := app.IsRealAppDir(dir)
+		if err != nil {
+			return nil, fmt.Errorf("git: inspect app dir %q: %w", name, err)
+		}
+		if !realDir {
 			continue
 		}
 		if !selection.IncludesPath(filepath.Join(selection.Dir(), name, "template.yaml"), false) {
 			continue // excluded by the source-selection policy
 		}
-		if _, err := os.Stat(filepath.Join(selection.Dir(), name, "template.yaml")); err != nil {
-			continue // no template.yaml, or unreadable: not an app
+		present, err := app.HasTemplate(dir)
+		if err != nil {
+			// An invalid entry or operational failure is not proof that the app
+			// is absent. Fail the sync closed rather than removing a live app or
+			// silently suppressing a filesystem error.
+			return nil, fmt.Errorf("git: inspect app template %q: %w", name, err)
+		}
+		if !present {
+			continue // no template.yaml: not an app
 		}
 		names = append(names, name)
 	}
@@ -345,8 +359,12 @@ func stageAppDir(selection *source.Selection, dst, name string) (string, error) 
 	// partial copy before commit; template CONTENTS are still the reconciler's
 	// concern (a present-but-invalid template follows its normal invalid-desired
 	// path), so only presence is checked here.
-	if _, err := os.Stat(filepath.Join(tmp, app.TemplateFile)); err != nil {
-		return "", fmt.Errorf("git: staged app dir %q is incomplete: %w", name, err)
+	present, err := app.HasTemplate(tmp)
+	if err != nil {
+		return "", fmt.Errorf("git: staged app dir %q has an invalid template: %w", name, err)
+	}
+	if !present {
+		return "", fmt.Errorf("git: staged app dir %q is incomplete: template.yaml is missing", name)
 	}
 	ok = true
 	return tmp, nil

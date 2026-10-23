@@ -3,10 +3,12 @@ package app
 import (
 	"bytes"
 	"errors"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -634,6 +636,266 @@ func TestHasTemplateReportsPresence(t *testing.T) {
 	present, err = HasTemplate(filepath.Join(dir, "absent"))
 	if err != nil || present {
 		t.Fatalf("HasTemplate(absent dir) = (%v, %v), want (false, nil)", present, err)
+	}
+}
+
+func TestTemplateSymlinkIsPresentButInvalid(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "linked")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "template.yaml")
+	if err := os.WriteFile(target, []byte("runtime: python3.14\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, TemplateFile)); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	present, err := HasTemplate(dir)
+	if !present || !errors.Is(err, ErrInvalidPath) {
+		t.Fatalf("HasTemplate(symlink) = (%v, %v), want (true, ErrInvalidPath)", present, err)
+	}
+	if _, err := ReadTemplateSource(root, "linked"); !errors.Is(err, ErrInvalidPath) {
+		t.Fatalf("ReadTemplateSource(symlink) = %v, want ErrInvalidPath", err)
+	}
+}
+
+// skipWithoutPosixPermissions guards tests that inject an operational
+// filesystem failure with permissions: they only define behavior where read
+// permission is actually enforced (a non-root unix user).
+func skipWithoutPosixPermissions(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("permission-based failure injection is not portable on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("running as uid 0: read permission is not enforced")
+	}
+}
+
+// TestStartupAndLiveClassifyRootEntriesConsistently pins that startup discovery
+// (Loader.LoadWithDiagnostics) and the live/periodic single-app load
+// (LoadSingle) classify one adversarial apps root consistently, all on a real
+// filesystem: every app the scan loaded also loads by name; every present
+// invalid candidate the scan reported also fails by name; the template-less
+// directory is ErrNotReady on both paths; and the entries that can never be
+// app directories (a plain file, a symlinked directory, a dangling symlink)
+// are skipped by the scan WITHOUT an issue and report ErrInvalidPath by name —
+// never fs.ErrNotExist, so neither path can mistake an unsupported entry for a
+// removal.
+func TestStartupAndLiveClassifyRootEntriesConsistently(t *testing.T) {
+	root := t.TempDir()
+	writeTemplate(t, root, "valid", `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      event_name: [MODIFY]
+`)
+	// Not a candidate on either path: no template.yaml at all.
+	if err := os.MkdirAll(filepath.Join(root, "no-template"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Present but deterministically invalid.
+	writeTemplate(t, root, "bad-yaml", "events: [unclosed")
+	writeTemplate(t, root, "Invalid Name", "runtime: python3.14\n")
+	// Entries that can never be app directories. The dangling link has no
+	// target at all; the alias points at a real app inside the root.
+	if err := os.WriteFile(filepath.Join(root, "plainfile"), []byte("not an app\n"), 0o644); err != nil {
+		t.Fatalf("write plain file: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(root, "valid"), filepath.Join(root, "aliased")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(root, "vanished-target"), filepath.Join(root, "dangling")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	// Startup classification.
+	loader := NewLoader(root, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	apps, issues, err := loader.LoadWithDiagnostics()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(apps) != 1 || apps[0].Name != "valid" {
+		t.Fatalf("startup apps = %+v, want only 'valid'", apps)
+	}
+	scanIssues := map[string]bool{}
+	for _, issue := range issues {
+		scanIssues[issue.Name] = true
+	}
+	if len(issues) != 2 {
+		t.Fatalf("issues = %+v, want exactly the two present invalid candidates", issues)
+	}
+	for _, name := range []string{"bad-yaml", "Invalid Name"} {
+		if !scanIssues[name] {
+			t.Errorf("startup scan must report present invalid candidate %q", name)
+		}
+	}
+	for _, name := range []string{"no-template", "plainfile", "aliased", "dangling"} {
+		if scanIssues[name] {
+			t.Errorf("startup scan must not report non-candidate %q", name)
+		}
+	}
+
+	// Live classification by name, entry by entry.
+	for _, name := range []string{"plainfile", "aliased", "dangling", "Invalid Name"} {
+		if _, err := LoadSingle(root, name); !errors.Is(err, ErrInvalidPath) {
+			t.Errorf("LoadSingle(%q) = %v, want ErrInvalidPath", name, err)
+		}
+	}
+	if _, err := LoadSingle(root, "no-template"); !errors.Is(err, ErrNotReady) {
+		t.Errorf("LoadSingle(no-template) = %v, want ErrNotReady", err)
+	}
+	if fn, err := LoadSingle(root, "valid"); err != nil || fn.Name != "valid" {
+		t.Errorf("LoadSingle(valid) = (%+v, %v), want the scanned app", fn, err)
+	}
+	if _, err := LoadSingle(root, "bad-yaml"); err == nil ||
+		errors.Is(err, ErrInvalidPath) || errors.Is(err, ErrNotReady) {
+		t.Errorf("LoadSingle(bad-yaml) = %v, want the deterministic parse failure", err)
+	}
+}
+
+// TestUnreadablePathsAreOperationalFailuresNotAbsence pins the operational
+// failure boundary of the candidacy predicate and the single-app read with REAL
+// permission bits (chmod), the portable way to induce a genuine filesystem
+// error: an unreadable app DIRECTORY keeps candidacy ambiguous (a definite
+// error that is not not-exist, never a "no template means not an app" verdict),
+// and an unreadable REGULAR template stays a present candidate whose read
+// failure is operational (neither an invalid path, nor readiness, nor absence).
+// The loader surfaces both as issues so a flaky or restricted read can never be
+// mistaken for an app's removal, while the valid sibling still loads.
+func TestUnreadablePathsAreOperationalFailuresNotAbsence(t *testing.T) {
+	skipWithoutPosixPermissions(t)
+
+	t.Run("unreadable app directory", func(t *testing.T) {
+		root := t.TempDir()
+		writeTemplate(t, root, "valid", `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      event_name: [MODIFY]
+`)
+		dir := filepath.Join(root, "locked")
+		writeTemplate(t, root, "locked", "runtime: python3.14\n")
+		if err := os.Chmod(dir, 0o000); err != nil {
+			t.Fatalf("chmod app dir: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+		present, err := HasTemplate(dir)
+		if present || err == nil || errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("HasTemplate(unreadable dir) = (%v, %v), want (false, an ambiguous non-not-exist error)", present, err)
+		}
+		if _, err := ReadTemplateSource(root, "locked"); err == nil ||
+			errors.Is(err, ErrNotReady) || errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("ReadTemplateSource(unreadable dir) = %v, want an operational stat failure (not readiness, not absence)", err)
+		}
+
+		// The scan keeps the ambiguity visible instead of silently dropping
+		// the app as absent.
+		loader := NewLoader(root, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+		apps, issues, err := loader.LoadWithDiagnostics()
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if len(apps) != 1 || apps[0].Name != "valid" {
+			t.Fatalf("startup apps = %+v, want only 'valid'", apps)
+		}
+		if len(issues) != 1 || issues[0].Name != "locked" || !errors.Is(issues[0].Err, fs.ErrPermission) {
+			t.Fatalf("issues = %+v, want exactly 'locked' with the permission error", issues)
+		}
+	})
+
+	t.Run("unreadable regular template", func(t *testing.T) {
+		root := t.TempDir()
+		writeTemplate(t, root, "valid", `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      event_name: [MODIFY]
+`)
+		dir := filepath.Join(root, "locked-template")
+		writeTemplate(t, root, "locked-template", "runtime: python3.14\n")
+		if err := os.Chmod(filepath.Join(dir, TemplateFile), 0o000); err != nil {
+			t.Fatalf("chmod template: %v", err)
+		}
+
+		present, err := HasTemplate(dir)
+		if !present || err != nil {
+			t.Fatalf("HasTemplate(unreadable template) = (%v, %v), want (true, nil): presence needs no read permission", present, err)
+		}
+
+		_, err = ReadTemplateSource(root, "locked-template")
+		if err == nil || errors.Is(err, ErrInvalidPath) || errors.Is(err, ErrNotReady) || errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("ReadTemplateSource(unreadable template) = %v, want an operational read failure", err)
+		}
+		if !errors.Is(err, fs.ErrPermission) {
+			t.Fatalf("ReadTemplateSource(unreadable template) = %v, want a permission error", err)
+		}
+
+		// The scan reports it as a present-but-unloadable candidate (an issue,
+		// not a silent skip), never as an invalid path or a removal.
+		loader := NewLoader(root, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+		apps, issues, err := loader.LoadWithDiagnostics()
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if len(apps) != 1 || apps[0].Name != "valid" {
+			t.Fatalf("startup apps = %+v, want only 'valid'", apps)
+		}
+		if len(issues) != 1 || issues[0].Name != "locked-template" ||
+			errors.Is(issues[0].Err, ErrInvalidPath) || !errors.Is(issues[0].Err, fs.ErrPermission) {
+			t.Fatalf("issues = %+v, want exactly 'locked-template' with an operational permission error", issues)
+		}
+	})
+}
+
+func TestResolvedAppRootIsUnaffectedByParentSymlinkSwap(t *testing.T) {
+	root := t.TempDir()
+	appDir := filepath.Join(root, "managed")
+	want := []byte("runtime: python3.14\n")
+	if err := os.Mkdir(appDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, TemplateFile), want, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, TemplateFile), []byte("outside target\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	appRoot, _, err := resolveAppDir(root, "managed")
+	if err != nil {
+		t.Fatalf("resolveAppDir: %v", err)
+	}
+	defer appRoot.Close()
+
+	// Move the opened directory to another location within the managed root and
+	// replace its old path with an outside symlink. Access through the opened Root
+	// must remain on the original directory rather than following the new path.
+	if err := os.Rename(appDir, filepath.Join(root, "detached")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, appDir); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	f, err := appRoot.Open(TemplateFile)
+	if err != nil {
+		t.Fatalf("open template through resolved root: %v", err)
+	}
+	defer f.Close()
+	got, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatalf("read template through resolved root: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("template bytes = %q, want original managed bytes %q", got, want)
 	}
 }
 

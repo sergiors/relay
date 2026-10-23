@@ -1678,15 +1678,18 @@ func (st *State) RecordRemoved(
 
 // PruneRemoved removes state rows for every app recorded in the database
 // that is no longer an app candidate in dir (the authoritative /apps root),
-// including its app_stats. A direct child is an app candidate only when it
-// contains template.yaml, so a row is removed when its directory is gone OR the
-// directory exists but has no template.yaml. The filesystem is the source of
-// truth; this only removes rows for names that are no longer app candidates.
-// Transient stat errors (permissions/I/O) are skipped — a flaky read must not
-// drop an app whose template may still be present, mirroring the reconciler's
-// removal tolerance. A row for a Relay-owned staging name (app.IsReservedDir,
-// e.g. git's ".sync-*") is stale debris from a buggy discovery and is removed
-// unconditionally, even if a transient directory of that name happens to exist;
+// including its app_stats. A direct child is an app candidate only when it is a
+// real directory with a regular non-symlink template.yaml. Missing or
+// unsupported child entries and real directories without templates are pruned;
+// invalid template entries are preserved for invalid-desired reporting. The
+// filesystem is the source of truth; this only removes rows for names that are
+// no longer app candidates.
+// Transient no-follow directory/template inspection errors (permissions/I/O)
+// are skipped — a flaky read must not drop an app whose definition may still be
+// present, mirroring the reconciler's removal tolerance. A row for a
+// Relay-owned staging name (app.IsReservedDir, e.g. git's ".sync-*") is stale
+// debris from a buggy discovery and is removed unconditionally, even if a
+// transient directory of that name happens to exist;
 // no legitimate app name can be reserved. The global single-row stats table is
 // deliberately untouched. It is intended to run at startup, before the fresh
 // registry's counters are seeded from the persisted
@@ -1740,16 +1743,23 @@ func (st *State) PruneRemoved(ctx context.Context, dir string) error {
 		// drop a real app.
 		reserved := app.IsReservedDir(name)
 		if !reserved {
-			present, statErr := app.HasTemplate(filepath.Join(dir, name))
-			if statErr != nil {
-				// Any ambiguous stat error (permissions/I/O, or a non-directory
-				// path) is skipped: only a definite "no template.yaml" means the
-				// app is no longer a candidate. A flaky read must never drop a
-				// row whose definition may still be present.
+			appDir := filepath.Join(dir, name)
+			realDir, dirErr := app.IsRealAppDir(appDir)
+			if dirErr != nil {
+				// An ambiguous directory inspection is transient; preserve the row.
 				continue
 			}
-			if present {
-				continue
+			if realDir {
+				present, statErr := app.HasTemplate(appDir)
+				if statErr != nil {
+					// Invalid template entries (notably symlinks) are present
+					// candidates; operational errors are ambiguous. Neither proves
+					// the app is absent, so preserve the row.
+					continue
+				}
+				if present {
+					continue
+				}
 			}
 		}
 		// Startup pruning is filesystem-authoritative and therefore
