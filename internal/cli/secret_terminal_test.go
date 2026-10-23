@@ -134,16 +134,28 @@ func TestSecretSetTerminalEmptyValueRejected(t *testing.T) {
 	requireSecretMissing(t, store, "db")
 }
 
-// TestSecretSetTerminalReadError verifies a failing terminal read is reported as
-// a read error without storing a secret. The platform helper makes the pending
-// read fail immediately (or skips where that cannot be induced).
+// TestSecretSetTerminalReadError verifies a failing terminal read is reported
+// as a read error without storing a secret. The platform helper supplies a
+// terminal whose reads fail (or skips where that cannot be induced).
 func TestSecretSetTerminalReadError(t *testing.T) {
 	store := seedSecretStore(t)
 	master, slave := mustOpenTestPTY(t)
-	breakTerminalRead(t, master, slave)
+	in := breakTerminalRead(t, master, slave)
 
 	var out bytes.Buffer
-	err := secretSetValue(context.Background(), store, "db", slave, &out, false)
+	done := make(chan error, 1)
+	go func() {
+		done <- secretSetValue(context.Background(), store, "db", in, &out, false)
+	}()
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(10 * time.Second):
+		// A future regression must fail the test, not hang the whole package
+		// until the go test timeout.
+		t.Fatal("timed out waiting for the terminal read to fail")
+	}
 	if err == nil || !strings.Contains(err.Error(), "secret set: read terminal") {
 		t.Fatalf("err = %v, want a terminal read error", err)
 	}
