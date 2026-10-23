@@ -355,8 +355,9 @@ func runExternalPreflight(
 }
 
 // Run wires the whole worker: startup state, then the reconciler and stream
-// consumer. It blocks in Consume until the process is signalled, then runs the
-// graceful shutdown. It returns an error and never calls os.Exit: the CLI
+// consumer. It blocks in Consume until the process is signalled or a terminal
+// reconciler failure cancels the lifecycle, then runs graceful shutdown. It
+// returns an error and never calls os.Exit: the CLI
 // boundary owns process exit, and every post-resource startup or runtime failure
 // converges through the SAME deferred cleanup as a normal shutdown, rather than
 // abandoning live servers, goroutines, containers, and the state DB to process
@@ -406,6 +407,10 @@ func Run(logger *slog.Logger) (runErr error) {
 	// (scheduler, reconciler, housekeeping, services-join, loops) are strictly
 	// joined before a later step closes the dependency they use.
 	shutdown := &shutdownRegistry{}
+	// A terminal reconciler failure cancels the lifecycle, but Consume reports
+	// that cancellation as nil. The shutdown defer drains this after the
+	// reconciler barrier has joined its Start goroutine.
+	reconcilerFailures := make(chan error, 1)
 	// Latched by the ownership monitor and read by readiness, identity-scoped
 	// shutdown guards, and the override below.
 	ownership := &ownershipLoss{}
@@ -438,6 +443,7 @@ func Run(logger *slog.Logger) (runErr error) {
 		stop()
 		startupSpan.End()
 		shutdown.run(logger)
+		runErr = reconcilerRunResult(runErr, reconcilerFailures)
 	}()
 
 	// The state DB is a REQUIRED dependency (operator view, stats snapshots,
@@ -631,7 +637,18 @@ func Run(logger *slog.Logger) (runErr error) {
 	startAppReconciler(
 		ctx, logger, reconcilerSpan, rec, apps, fingerprints,
 		startupSet.fencingTokens, prepared, shutdown,
+		func(err error) {
+			reportReconcilerFailure(ctx, stop, reconcilerFailures, err)
+		},
 	)
+	if ctx.Err() != nil {
+		// A failed watch setup latches its error and cancels the lifecycle. A
+		// signal during startup is also cancellation, but is otherwise graceful;
+		// in either case let the deferred shutdown finish before returning rather
+		// than starting the scheduler or claiming readiness.
+		reconcilerSpan.End()
+		return nil
+	}
 
 	// Start the scheduler only after the reconciler watches and joins, so seeded
 	// jobs fire on their first tick and live changes converge immediately. Its

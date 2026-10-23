@@ -5,6 +5,12 @@
 //   - Watch: recursive fsnotify on the apps root; an atomically replaced app
 //     directory is re-registered on its current tree (old detached-inode watches
 //     are released first), and symlinks are not followed
+//   - Watch recovery: a directory whose registration or walk failed is retried
+//     with bounded exponential backoff, without abandoning the rest of the tree;
+//     recoverable fsnotify read/overflow errors trigger a watch rescan plus a
+//     coalesced full reconcile for the missed gap. Duplicate exchange
+//     notifications for an already-current inode are coalesced. A terminal
+//     watcher/channel close stops the loops and is returned by Start.
 //   - Debounce: per-app timers coalesce edit storms into one reconcile
 //   - Rebuild: a changed fingerprint gates a per-app rebuild, committed to
 //     the runner's registry as an atomic swap
@@ -60,7 +66,9 @@
 // Start (which reuses the watcher). Establishing the watch BEFORE seeding is
 // what makes a supplied seed safe: a change after the watch is observed as an
 // event, and a change before it is caught by the first reconcile's rescan
-// because the seeded value is older.
+// because the seeded value is older. Start returns a non-nil error only for a
+// watcher-construction failure or a terminal watcher/channel failure after its
+// loops started; a normal lifecycle cancellation returns nil.
 //
 // When Config.State is set, reconcile outcomes are recorded into the local
 // state database (a persisted, read-mostly state view) — success, failure

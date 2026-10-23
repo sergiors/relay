@@ -394,7 +394,15 @@ fingerprint is persisted.
 Because unchanged live directories are not exchanged, their inode and recursive
 watch remain valid. When a directory is replaced, the reconciler releases the
 watches that pointed at the detached old tree and registers the currently
-installed tree, so later nested edits are still observed. `/apps` itself is a
+installed tree, so later nested edits are still observed. A directory whose
+watch registration or walk failed is retried with bounded backoff; one
+unreadable or concurrently removed subtree does not disable watch delivery for
+the rest of `/apps`. Recoverable watcher errors (including an event-queue
+overflow) trigger a watch rescan and an immediate reconciliation sweep for the
+missed gap, while the periodic pass remains the final backstop. A terminal
+watcher/channel failure is logged at Error and returned by the reconciler's
+`Start`, so the worker surfaces a dead live-change path instead of silently
+continuing as if watches were healthy. `/apps` itself is a
 fixed bind mount and is never renamed as a root. The commit boundary is per app
 rather than a whole-revision snapshot, so a concurrent reader can briefly observe
 a mixture of old and new apps; per-app atomicity is not whole-revision atomicity.

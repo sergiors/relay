@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -28,6 +29,45 @@ const (
 	DefaultInterval  = 30 * time.Second
 	DefaultQueueSize = 64
 )
+
+// Watch-recovery bounds. A failed recursive registration is retried on one
+// timer owned by eventLoop, with exponential backoff capped well below the
+// periodic reconcile interval; retries are per-path so one unwatchable subtree
+// cannot starve the rest of the tree. Watch-error gap recovery is coalesced:
+// fsnotify can report a burst of read/overflow errors, and one rescan plus one
+// reconciliation request is enough to cover the resulting delivery gap.
+const (
+	watchRetryInitial       = 100 * time.Millisecond
+	watchRetryMax           = 10 * time.Second
+	watchGapRecoveryBackoff = 1 * time.Second
+)
+
+// errWatchEventsClosed and errWatchErrorsClosed report a watcher that stopped
+// delivering after Start. fsnotify closes its channels on Close; while the
+// reconciler is running an unexpected close is terminal (it is not proof that
+// only one path lost its watch), so the event loop stops and Start returns the
+// error to its caller instead of silently degrading to the periodic pass.
+var (
+	errWatchEventsClosed = errors.New("fsnotify events channel closed")
+	errWatchErrorsClosed = errors.New("fsnotify errors channel closed")
+)
+
+// watchEntry is the identity of the inode a path watch currently refers to.
+// fsnotify watches inodes, so after an atomic directory exchange the same path
+// can map to a different tree. Remembering the identity lets a duplicate
+// Create/Rename notification skip a redundant recursive refresh without ever
+// skipping a genuinely detached tree.
+type watchEntry struct {
+	info os.FileInfo
+}
+
+// watchRetryState is the bounded-backoff state for one path whose recursive
+// registration (or walk) failed. attempts is the number of consecutive
+// failures; next is when eventLoop should try again.
+type watchRetryState struct {
+	attempts int
+	next     time.Time
+}
 
 // Builder prepares an app image and executes invocations against it. It is
 // a concrete-need interface so reconcile logic can be unit-tested without Docker
@@ -197,10 +237,29 @@ type Reconciler struct {
 
 	incoming chan string   // debounced, per-app trigger queue
 	done     chan struct{} // closed on shutdown to unblock pump/timer sends
+	// resync is a coalesced request for a full reconcileAll pass. It is used
+	// after the initial watch walk, a recoverable watch-delivery gap (an
+	// fsnotify error reports lost or unread events), or after the root watch is
+	// restored, so missed creates, removals, and content changes are observed
+	// without waiting for the next periodic tick. The ticker goroutine consumes
+	// it; eventLoop never walks the tree for reconciliation itself.
+	resync chan struct{}
 
 	ctx     context.Context
 	w       *fsnotify.Watcher
-	watches sync.Map // dir path -> struct{} for tracked watches
+	watches sync.Map // dir path -> watchEntry for tracked watches
+
+	// watchMu guards watchRetries. Watcher mutations still happen only on the
+	// eventLoop goroutine (and synchronously in PrepareWatch before it starts),
+	// so registration/removal never races across goroutines. The mutex covers
+	// only the small retry index; filesystem walks and fsnotify calls stay
+	// outside it.
+	watchMu      sync.Mutex
+	watchRetries map[string]*watchRetryState
+	// watchWake coalesces "a retry was scheduled" notifications to eventLoop.
+	// watchTerm carries the terminal watcher/channel failure to Start.
+	watchWake chan struct{}
+	watchTerm chan error
 
 	// loops tracks the pump, ticker, and eventLoop goroutines Start launches, so
 	// Start returns only after every loop has exited. This is what lets the
@@ -251,6 +310,10 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 		timers:                              map[string]*time.Timer{},
 		incoming:                            make(chan string, DefaultQueueSize),
 		done:                                make(chan struct{}),
+		resync:                              make(chan struct{}, 1),
+		watchRetries:                        map[string]*watchRetryState{},
+		watchWake:                           make(chan struct{}, 1),
+		watchTerm:                           make(chan error, 1),
 	}
 }
 
@@ -305,9 +368,11 @@ func (r *Reconciler) SeedFencingToken(name string, fencingToken state.FencingTok
 //
 // It is idempotent: a watcher already prepared (Start called after
 // PrepareWatch, or a second PrepareWatch) is reused as-is. An error creating the
-// watcher is returned and leaves the reconciler unwatched; Start logs it and
-// returns without starting the loops, matching the historical fsnotify-failure
-// behavior.
+// watcher itself is returned and leaves the reconciler unwatched. Individual
+// directory watch registration failures during the initial walk are NOT
+// returned and do NOT abandon the watcher: they are indexed for bounded-backoff
+// retry (see addWatchRecursive and eventLoop), because one unreadable subtree
+// must not disable change detection for every other app.
 func (r *Reconciler) PrepareWatch(ctx context.Context) error {
 	r.ctx = ctx
 	if r.w != nil {
@@ -323,19 +388,24 @@ func (r *Reconciler) PrepareWatch(ctx context.Context) error {
 }
 
 // Start runs the watch loop, the debounce pump, and the periodic ticker in
-// background goroutines until ctx is cancelled, then JOINS them before
-// returning. It is intended to be called concurrently with the stream consumer;
-// the caller can therefore use Start's return (or the worker's reconciler
-// shutdown step) as a barrier that no further reconcile is in flight.
+// background goroutines until ctx is cancelled or watch delivery fails
+// terminally, then JOINS them before returning. It is intended to be called
+// concurrently with the stream consumer; the caller can therefore use Start's
+// return (or the worker's reconciler shutdown step) as a barrier that no further
+// reconcile is in flight.
 //
 // Start first calls PrepareWatch, so a caller that already established the
 // watch (the worker, to seed the supplied fingerprints safely) reuses it rather
 // than installing a second one; a caller that did not (tests, standalone
-// callers) gets the watcher created here.
-func (r *Reconciler) Start(ctx context.Context) {
+// callers) gets the watcher created here. A watcher-construction error is
+// returned without starting the loops. An unexpected close of the watcher's
+// events or errors channel (after Startup, and not caused by ctx) is a terminal
+// watcher failure: the event loop stops, Start tears the loops down, and returns
+// the error so the caller can surface it instead of leaving a silently running
+// reconciler with no change detection.
+func (r *Reconciler) Start(ctx context.Context) error {
 	if err := r.PrepareWatch(ctx); err != nil {
-		r.log.Error("Reconciler: fsnotify error", "error", err)
-		return
+		return err
 	}
 
 	r.loops.Add(3)
@@ -343,9 +413,15 @@ func (r *Reconciler) Start(ctx context.Context) {
 	go r.ticker()
 	go r.eventLoop()
 
-	<-ctx.Done()
+	var watchErr error
+	select {
+	case <-ctx.Done():
+	case watchErr = <-r.watchTerm:
+	}
 	// Close done FIRST: it releases a pump parked on an empty queue (or a
 	// dispatch blocked on a full queue) so the pump observes shutdown and stops.
+	// It also releases the ticker (which may otherwise still be waiting on its
+	// interval after a terminal watcher failure).
 	close(r.done)
 	_ = r.w.Close()
 	// Stop any still-pending debounce timers so they cannot fire and dispatch a
@@ -359,6 +435,7 @@ func (r *Reconciler) Start(ctx context.Context) {
 	// Join every loop. After this, no reconcile can be dispatched into the
 	// runtime manager or the state DB, so the worker may close them.
 	r.loops.Wait()
+	return watchErr
 }
 
 // Enqueue debounces an event for name: only one reconcile fires after the
@@ -431,6 +508,12 @@ func (r *Reconciler) pump() {
 // point for deferred image cleanup, so an image whose bounded removal retries
 // were exhausted while a service container still referenced it is removed once
 // the reference state changes, without a timer or goroutine per image.
+//
+// The same loop also consumes the coalesced resync requests raised after the
+// initial watch walk and by eventLoop after a recoverable watcher gap or a
+// restored root watch. They run the same discovery sweep immediately (without
+// the audit hook, which is specific to the periodic cadence) instead of waiting
+// for the next tick.
 func (r *Reconciler) ticker() {
 	defer r.loops.Done()
 	ticker := time.NewTicker(r.interval)
@@ -439,6 +522,14 @@ func (r *Reconciler) ticker() {
 		select {
 		case <-r.ctx.Done():
 			return
+		case <-r.done:
+			return
+		case <-r.resync:
+			// A recoverable watch gap (or a restored root watch) may have
+			// missed creates/removals, not only edits to known apps. Run the
+			// same discovery sweep the periodic backstop uses, without waiting
+			// for the interval. The eventLoop coalesces these requests.
+			r.reconcileAll()
 		case <-ticker.C:
 			if r.audit != nil {
 				r.audit()
@@ -454,61 +545,175 @@ func (r *Reconciler) ticker() {
 // currently installed tree at that path, so an atomic per-app directory exchange
 // (which can emit duplicate or reordered Rename/Create events) converges on the
 // new inode rather than leaving only the detached old tree watched.
+//
+// It also owns the single bounded-backoff retry timer for directory
+// registrations that failed during a walk. Registration, removal, refreshes,
+// and retries all run on this goroutine, so the fsnotify watch set and the
+// in-process watch index have one writer and cannot race. Filesystem walks and
+// fsnotify calls are deliberately outside watchMu, which only guards the small
+// retry index.
+//
+// fsnotify reports recoverable read/overflow errors on Errors (it keeps reading
+// afterwards on the current backends), so those trigger a rescan of missing
+// watches plus a coalesced full reconcile to cover the events lost during the
+// gap. An unexpected close of either channel is terminal: it is logged and sent
+// to Start, which tears the loops down and returns the failure to the worker.
 func (r *Reconciler) eventLoop() {
 	defer r.loops.Done()
+
+	// One reusable timer, armed at the earliest pending retry. An unarmed timer
+	// exposes a nil channel to the select below.
+	retryTimer := time.NewTimer(time.Hour)
+	if !retryTimer.Stop() {
+		<-retryTimer.C
+	}
+	var retryC <-chan time.Time
+	armRetry := func() {
+		if retryC != nil {
+			if !retryTimer.Stop() {
+				select {
+				case <-retryTimer.C:
+				default:
+				}
+			}
+			retryC = nil
+		}
+		next, ok := r.nextWatchRetry()
+		if !ok {
+			return
+		}
+		delay := time.Until(next)
+		if delay < 0 {
+			delay = 0
+		}
+		retryTimer.Reset(delay)
+		retryC = retryTimer.C
+	}
+	defer retryTimer.Stop()
+	armRetry()
+
+	var lastGapRecovery time.Time
 	for {
 		select {
 		case <-r.ctx.Done():
 			return
+		case <-r.watchWake:
+			armRetry()
 		case ev, ok := <-r.w.Events:
 			if !ok {
+				r.watchStopped(errWatchEventsClosed)
 				return
 			}
-			// Chmod events are excluded: permission-only changes don't trigger a
-			// rebuild, only actual content/tree changes do.
-			if ev.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename|fsnotify.Write) == 0 {
-				continue
-			}
-			if name, affected := r.appForPath(ev.Name); affected && r.shouldEnqueue(name) {
-				r.Enqueue(name)
-			}
-			// Release watches for a removed or renamed (moved-away) directory
-			// FIRST. fsnotify watches inodes, so after an atomic per-app exchange
-			// the path-keyed watches still refer to the DETACHED old tree; they
-			// must be dropped before the current tree at the same path can be
-			// registered. Doing this first also makes a Rename+Create notification
-			// pair idempotent instead of leaving only the old inode watched.
-			if ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
-				r.removeWatchRecursive(ev.Name)
-			}
-			// Maintain watches on created/removed/renamed directories (recursive
-			// watch). A Relay-owned reserved directory (git's ".sync-*") is never
-			// watched, and neither will addWatchRecursive descend into it, so a
-			// dynamic Create for a stage dir spends no handle; addWatchRecursive
-			// itself also prunes reserved subtrees defensively.
-			//
-			// A Create (or a Remove for a path that is already occupied again) can
-			// describe the NEW inode installed at a path that is already watched:
-			// that is one half of an atomic exchange (possibly duplicated), not
-			// necessarily a brand-new directory. Re-register from the currently
-			// installed tree, removing first so a stale detached-inode watch (and
-			// any of its old descendants) cannot survive and duplicates cannot leak
-			// handles. The removal above may already have done this; repeating it
-			// is a no-op. A genuinely removed path fails the no-follow stat and
-			// is not added.
-			if ev.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 && !r.isReservedDirPath(ev.Name) {
-				if info, err := os.Lstat(ev.Name); err == nil && info.Mode()&os.ModeSymlink == 0 && info.IsDir() {
-					r.removeWatchRecursive(ev.Name)
-					r.addWatchRecursive(ev.Name)
-				}
-			}
+			r.handleWatchEvent(ev)
+			armRetry()
 		case err, ok := <-r.w.Errors:
 			if !ok {
+				r.watchStopped(errWatchErrorsClosed)
 				return
 			}
-			r.log.Warn("Reconciler: watch error", "error", err)
+			// A backend error means delivery is degraded, not necessarily that
+			// a particular watch was removed: on inotify a read error is
+			// followed by continued reads, and overflow means events were
+			// dropped while the watch set itself survives. Re-register anything
+			// missing and reconcile all candidates to cover the gap. Coalesce
+			// bursts so one error storm cannot cause a walk per message.
+			now := time.Now()
+			if now.Sub(lastGapRecovery) >= watchGapRecoveryBackoff {
+				lastGapRecovery = now
+				r.warnWatch("Reconciler: watch error; rescanning", "error", err)
+				r.rescanWatches()
+				r.requestResync()
+			} else if r.log != nil {
+				r.log.Debug("Reconciler: watch error", "error", err)
+			}
+			armRetry()
+		case <-retryC:
+			retryC = nil
+			r.retryDueWatches(time.Now())
+			armRetry()
 		}
 	}
+}
+
+// handleWatchEvent applies one fsnotify event: map it to an app, maintain its
+// directory watches, and close the inspect/register race by scheduling a
+// reconcile AFTER a refresh that actually (re)registered the current tree. That
+// post-refresh enqueue is what makes a change landing between the event handler's
+// inspection and the registration converge on the next fingerprint scan.
+func (r *Reconciler) handleWatchEvent(ev fsnotify.Event) {
+	// Chmod events are excluded: permission-only changes don't trigger a
+	// rebuild, only actual content/tree changes do.
+	if ev.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename|fsnotify.Write) == 0 {
+		return
+	}
+	if name, affected := r.appForPath(ev.Name); affected && r.shouldEnqueue(name) {
+		r.Enqueue(name)
+	}
+	// Release watches for a removed or renamed (moved-away) directory FIRST.
+	// fsnotify watches inodes, so after an atomic per-app exchange the
+	// path-keyed watches still refer to the DETACHED old tree; they must be
+	// dropped before the current tree at the same path can be registered.
+	// Doing this first also makes a Rename+Create notification pair idempotent
+	// instead of leaving only the old inode watched. It is deliberately
+	// unconditional: an event for a removed/renamed inode is authoritative even
+	// if a rapid recreate reused the path (and possibly the inode number), so a
+	// stale registration must never survive by identity coincidence.
+	if ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+		r.removeWatchRecursive(ev.Name)
+	}
+	// Maintain watches on created/removed/renamed directories (recursive
+	// watch). A Relay-owned reserved directory (git's ".sync-*") is never
+	// watched, and neither will addWatchRecursive descend into it, so a dynamic
+	// Create for a stage dir spends no handle; addWatchRecursive itself also
+	// prunes reserved subtrees defensively.
+	if ev.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 && !r.isReservedDirPath(ev.Name) {
+		if r.refreshWatch(ev.Name) {
+			// A duplicate exchange notification can describe the inode that is
+			// already watched; refreshWatch then does nothing. Only a real
+			// refresh needs the post-refresh reconcile.
+			r.enqueueWatchPath(ev.Name)
+		}
+	}
+}
+
+// refreshWatch inspects path and, when it currently names a real directory whose
+// watched inode differs from the registered one, drops the detached subtree and
+// registers the current tree. It returns true when it performed a refresh. A
+// path that is absent, non-directory, symlinked, or reserved has any stale
+// watches removed and is not registered; a currently-watched identical inode is
+// left alone so duplicate exchange notifications coalesce instead of re-walking
+// the tree.
+func (r *Reconciler) refreshWatch(path string) bool {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		// Only a previously watched directory can have descendants here; a
+		// plain file Create is the common case and must not scan the watch map.
+		if _, ok := r.watches.Load(path); ok {
+			r.removeWatchRecursive(path)
+		}
+		return false
+	}
+	if r.watchIsCurrent(path, info) {
+		return false
+	}
+	r.removeWatchRecursive(path)
+	r.addWatchRecursive(path)
+	return true
+}
+
+// watchIsCurrent reports whether path's registered watch still refers to info's
+// inode. An entry without a recorded identity (a test-constructed reconciler)
+// is treated as current, matching the historical presence-only check.
+func (r *Reconciler) watchIsCurrent(path string, info os.FileInfo) bool {
+	v, ok := r.watches.Load(path)
+	if !ok {
+		return false
+	}
+	entry, ok := v.(watchEntry)
+	if !ok || entry.info == nil || info == nil {
+		return true
+	}
+	return os.SameFile(entry.info, info)
 }
 
 // appForPath maps an event path to the affected app name: the first
@@ -608,18 +813,23 @@ func (r *Reconciler) isReservedDirPath(p string) bool {
 // form of the walk. A symlinked dir is simply never watched, which is
 // acceptable.
 //
-// A failed watch registration is logged with its path. It is not reported as a
-// completed refresh: the periodic reconciliation remains the backstop until the
-// path is registered successfully (for example on a later Create/Rename).
+// A failed registration is indexed for bounded-backoff retry rather than being
+// only logged. This is what makes a PARTIAL recursive failure recover: the
+// walk can continue past one bad directory, every other subtree stays watched,
+// and the failing path is retried later. Errors are per-path, so one vanished
+// or unreadable directory cannot abandon the whole tree. A path already watched
+// at the same inode is skipped; a path whose watched inode was replaced (an
+// exchange notification that raced the refresh) drops the stale handle and
+// registers the current tree.
 func (r *Reconciler) addWatchRecursive(path string) {
 	_ = filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			// A concurrent rename/removal can make a path vanish between the
 			// event and this walk. There is nothing to watch in that case; any
 			// other traversal error means part of the live tree may be unwatched
-			// and must be surfaced.
+			// and must be retried.
 			if !errors.Is(err, fs.ErrNotExist) {
-				r.warnWatch("Reconciler: watch refresh failed", "path", p, "error", err)
+				r.recordWatchFailure(p, err)
 			}
 			return nil
 		}
@@ -633,18 +843,323 @@ func (r *Reconciler) addWatchRecursive(path string) {
 		if p != r.root && r.isReservedDirPath(p) {
 			return filepath.SkipDir
 		}
-		if _, ok := r.watches.Load(p); ok {
-			return nil
+		info, infoErr := d.Info()
+		if v, ok := r.watches.Load(p); ok {
+			if entry, ok := v.(watchEntry); ok && entry.info != nil && infoErr == nil && info != nil {
+				if !os.SameFile(entry.info, info) {
+					// The path now names a different inode (typically one half
+					// of an atomic exchange arriving after a duplicate event or
+					// a lost notification). Drop the whole detached subtree
+					// before registering the current tree; the ongoing walk
+					// re-adds the new descendants, so old detached handles
+					// cannot survive at paths absent from the replacement.
+					r.removeWatchRecursive(p)
+				} else {
+					r.clearWatchRetry(p)
+					return nil
+				}
+			} else {
+				// No identity to compare (test constructors) or the info read
+				// failed: keep the historical presence-only skip.
+				r.clearWatchRetry(p)
+				return nil
+			}
 		}
 		if err := r.w.Add(p); err != nil {
 			// Do not silently claim a complete recursive refresh: without this
-			// watch, nested edits below p are invisible until the periodic audit.
-			r.warnWatch("Reconciler: watch registration failed", "path", p, "error", err)
+			// watch, nested edits below p are invisible until the periodic audit
+			// or a retry. Track the exact path so only the failed subtree is
+			// retried.
+			r.recordWatchFailure(p, err)
 			return nil
 		}
-		r.watches.Store(p, struct{}{})
+		r.watches.Store(p, watchEntry{info: info})
+		r.clearWatchRetry(p)
 		return nil
 	})
+}
+
+// recordWatchFailure indexes a failed path registration or walk for retry. It
+// is a no-op for a path that is now absent, non-directory, symlinked, reserved,
+// or outside the root: there is nothing to watch and no reason to spin. A path
+// that still names a directory is retried even when the failure was a read
+// error, so a transient permission/I/O/handle-limit problem recovers.
+//
+// Only the first consecutive failure for a path is logged at Warn; later
+// attempts are Debug, and recovery is Info. This keeps an unrecoverable subtree
+// from flooding the log at every backoff interval.
+func (r *Reconciler) recordWatchFailure(path string, err error) {
+	if path == "" {
+		return
+	}
+	if !r.watchRetryEligible(path) {
+		r.clearWatchRetry(path)
+		r.removeWatchRecursive(path)
+		return
+	}
+	now := time.Now()
+	r.watchMu.Lock()
+	if r.watchRetries == nil {
+		r.watchRetries = map[string]*watchRetryState{}
+	}
+	retry := r.watchRetries[path]
+	first := retry == nil
+	if retry == nil {
+		retry = &watchRetryState{}
+		r.watchRetries[path] = retry
+	}
+	retry.attempts++
+	retry.next = now.Add(watchRetryDelay(retry.attempts))
+	attempts, next := retry.attempts, retry.next
+	r.watchMu.Unlock()
+
+	if first {
+		r.warnWatch(
+			"Reconciler: watch registration failed; retrying",
+			"path", path,
+			"error", err,
+			"retry_in", time.Until(next),
+		)
+	} else if r.log != nil {
+		r.log.Debug(
+			"Reconciler: watch registration retry scheduled",
+			"path", path,
+			"error", err,
+			"attempt", attempts,
+			"retry_in", time.Until(next),
+		)
+	}
+	r.wakeWatchRetry()
+}
+
+// watchRetryDelay is the bounded exponential backoff for the attempt-th
+// consecutive failure (1-based).
+func watchRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := watchRetryInitial
+	for i := 1; i < attempt; i++ {
+		if delay >= watchRetryMax {
+			return watchRetryMax
+		}
+		delay *= 2
+	}
+	if delay > watchRetryMax {
+		delay = watchRetryMax
+	}
+	return delay
+}
+
+// watchRetryEligible reports whether path is still a watch candidate: inside
+// the apps root, not a reserved root namespace, and currently a real
+// (non-symlink) directory. An inspection error is treated as retryable — a
+// permission or transient I/O failure is exactly what the retry exists for —
+// while a definite absence, symlink, or non-directory entry discards it.
+func (r *Reconciler) watchRetryEligible(path string) bool {
+	if path == "" {
+		return false
+	}
+	rel, err := filepath.Rel(r.root, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return false
+	}
+	if path != r.root && r.isReservedDirPath(path) {
+		return false
+	}
+	realDir, err := app.IsRealAppDir(path)
+	if err != nil {
+		// A path whose parent stopped being a directory can never become a
+		// watch again; treat it as gone rather than retrying an ENOTDIR forever.
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			return false
+		}
+		return true
+	}
+	return realDir
+}
+
+// wakeWatchRetry coalesces retry-scheduling notifications to eventLoop.
+func (r *Reconciler) wakeWatchRetry() {
+	if r.watchWake == nil {
+		return
+	}
+	select {
+	case r.watchWake <- struct{}{}:
+	default:
+	}
+}
+
+// clearWatchRetry removes any pending retry for path. It is called on every
+// successful registration so a recovered path cannot be removed and re-added
+// by an already-armed timer.
+func (r *Reconciler) clearWatchRetry(path string) {
+	r.watchMu.Lock()
+	delete(r.watchRetries, path)
+	r.watchMu.Unlock()
+}
+
+// nextWatchRetry returns the earliest pending retry deadline.
+func (r *Reconciler) nextWatchRetry() (time.Time, bool) {
+	r.watchMu.Lock()
+	defer r.watchMu.Unlock()
+	var next time.Time
+	found := false
+	for _, retry := range r.watchRetries {
+		if retry == nil {
+			continue
+		}
+		if !found || retry.next.Before(next) {
+			next = retry.next
+			found = true
+		}
+	}
+	return next, found
+}
+
+// retryDueWatches retries every path whose backoff has elapsed. Paths are
+// collected under watchMu and processed outside it, so walks never hold the
+// lock.
+func (r *Reconciler) retryDueWatches(now time.Time) {
+	r.watchMu.Lock()
+	var due []string
+	for path, retry := range r.watchRetries {
+		if retry != nil && !retry.next.After(now) {
+			due = append(due, path)
+		}
+	}
+	r.watchMu.Unlock()
+	for _, path := range due {
+		r.retryWatch(path)
+	}
+}
+
+// retryWatch re-registers one failed path from its CURRENT tree. The subtree is
+// dropped first because the failure may describe a detached inode (an exchange
+// that happened before or during the failed walk); re-adding without the drop
+// would skip stale entries through the presence/identity check. If the path no
+// longer qualifies, the retry and any lingering watches are discarded. A
+// successful restore schedules a reconcile of the affected app (or a full
+// resync when the root itself was restored) so changes made while monitoring
+// was degraded are observed immediately rather than at the next period.
+func (r *Reconciler) retryWatch(path string) {
+	if r.rctx().Err() != nil {
+		return
+	}
+	if !r.watchRetryEligible(path) {
+		r.clearWatchRetry(path)
+		r.removeWatchRecursive(path)
+		return
+	}
+	attempts, _ := r.watchAttempts(path)
+	r.removeWatchRecursive(path)
+	r.addWatchRecursive(path)
+	if _, ok := r.watches.Load(path); !ok {
+		// addWatchRecursive recorded the new failure with a longer backoff.
+		return
+	}
+	r.clearWatchRetry(path)
+	if attempts > 0 {
+		if r.log != nil {
+			r.log.Info(
+				"Reconciler: watch registration restored",
+				"path", path,
+				"attempts", attempts,
+			)
+		}
+	}
+	if path == r.root {
+		r.requestResync()
+		return
+	}
+	r.enqueueWatchPath(path)
+}
+
+// watchAttempts returns the consecutive failure count for path and whether a
+// retry was pending.
+func (r *Reconciler) watchAttempts(path string) (int, bool) {
+	r.watchMu.Lock()
+	defer r.watchMu.Unlock()
+	retry, ok := r.watchRetries[path]
+	if !ok || retry == nil {
+		return 0, false
+	}
+	return retry.attempts, true
+}
+
+// requestResync asks the ticker goroutine for an immediate full discovery
+// sweep. It is intentionally non-blocking and coalesced: eventLoop must never
+// wait for the pump, and a burst of watch errors needs only one sweep.
+func (r *Reconciler) requestResync() {
+	if r.resync == nil {
+		return
+	}
+	select {
+	case r.resync <- struct{}{}:
+	default:
+	}
+}
+
+// enqueueWatchPath debounces the app containing path, using the same app and
+// candidacy policy as an fsnotify event. Paths outside an app (the root itself,
+// a reserved staging path, an unknown non-app entry) enqueue nothing.
+func (r *Reconciler) enqueueWatchPath(path string) {
+	if name, affected := r.appForPath(path); affected && r.shouldEnqueue(name) {
+		r.Enqueue(name)
+	}
+}
+
+// rescanWatches reconciles the in-process watch index with fsnotify's actual
+// watch list, then walks the current tree to register anything missing. It is
+// the recovery used after a recoverable backend error: a read error does not by
+// itself prove that a particular watch disappeared, so the authoritative
+// WatchList is consulted instead of blindly re-adding or assuming failure. A
+// path that is no longer watched by the backend but still exists is re-added by
+// the walk from its current inode; a stale path that vanished stays dropped.
+func (r *Reconciler) rescanWatches() {
+	if r.w == nil || r.rctx().Err() != nil {
+		return
+	}
+	live := r.w.WatchList()
+	if live == nil {
+		// The watcher is closed (or closing); the channel/context path owns
+		// teardown, and there is no watch set to repair.
+		return
+	}
+	watched := make(map[string]struct{}, len(live))
+	for _, path := range live {
+		watched[path] = struct{}{}
+	}
+	r.watches.Range(func(key, _ any) bool {
+		path, ok := key.(string)
+		if !ok {
+			return true
+		}
+		if _, stillWatched := watched[path]; !stillWatched {
+			r.watches.Delete(path)
+		}
+		return true
+	})
+	r.addWatchRecursive(r.root)
+}
+
+// watchStopped surfaces a terminal watcher/channel failure. A close racing
+// lifecycle cancellation is normal shutdown, not a failure. Otherwise it is
+// logged at Error and handed to Start, which joins the loops and returns it.
+func (r *Reconciler) watchStopped(err error) {
+	if r.rctx().Err() != nil {
+		return
+	}
+	if r.log != nil {
+		r.log.Error("Reconciler: watch delivery stopped", "error", err)
+	}
+	if r.watchTerm == nil {
+		return
+	}
+	select {
+	case r.watchTerm <- err:
+	default:
+	}
 }
 
 // warnWatch logs a watch-maintenance failure. It is nil-safe because a few

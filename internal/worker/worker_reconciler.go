@@ -2,6 +2,8 @@ package worker
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -24,8 +26,8 @@ import (
 // observed as an fsnotify event, and a change between the fingerprint scan and
 // the watch installation is still caught because the seeded value is the OLDER
 // one. If the watcher cannot be created, the supplied fingerprints are NOT
-// trusted: seeding is skipped entirely and Start logs the error and does not
-// run its loops, so no stale seed can suppress a rebuild.
+// trusted: seeding is skipped entirely and Start is not retried, so a later
+// successful watcher construction cannot run against an unseeded reconciler.
 //
 // Seeding uses the identity each app's image was ACTUALLY built from
 // (startupSeedFingerprints), so the first reconcile compares the live tree
@@ -43,40 +45,104 @@ func startAppReconciler(
 	fencingTokens map[string]state.FencingToken,
 	prepared []*runner.PreparedApp,
 	shutdown *shutdownRegistry,
+	onFailure func(error),
 ) {
+	reconcilerDone := make(chan struct{})
 	if err := rec.PrepareWatch(lifecycle); err != nil {
-		logger.Error(
-			"Reconciler: fsnotify error; not seeding startup fingerprints",
-			"error", err,
-		)
-		span.RecordError(err)
-	} else {
-		seedStart := time.Now()
-		seeds := startupSeedFingerprints(apps, fingerprints, prepared)
-		for _, fn := range apps {
-			rec.Seed(fn, seeds[fn.Name])
+		// Do not let Start retry watcher construction: if that retry succeeded,
+		// the reconciler would run without the startup identities that are only
+		// safe to seed after the watch is installed.
+		close(reconcilerDone)
+		shutdown.register(reconcilerBarrierStep(reconcilerDone))
+		if lifecycle.Err() == nil {
+			logger.Error("Reconciler: watch setup failed", "error", err)
+			span.RecordError(err)
+			onFailure(fmt.Errorf("prepare app watch: %w", err))
 		}
-		// Seed the EXACT fencing token each startup discovery/invalid write
-		// returned. This lets the first live observation reuse that generation
-		// instead of allocating a new one (or reading back another worker's
-		// token), and it includes present-but-invalid desired definitions so their
-		// live removal can still be fencing-token-guarded.
-		for name, fencingToken := range fencingTokens {
-			rec.SeedFencingToken(name, fencingToken)
-		}
-		logger.Debug("Startup: seeded startup fingerprints",
-			"count", len(apps),
-			"duration", time.Since(seedStart),
-		)
+		return
 	}
+
+	seedStart := time.Now()
+	seeds := startupSeedFingerprints(apps, fingerprints, prepared)
+	for _, fn := range apps {
+		rec.Seed(fn, seeds[fn.Name])
+	}
+	// Seed the EXACT fencing token each startup discovery/invalid write
+	// returned. This lets the first live observation reuse that generation
+	// instead of allocating a new one (or reading back another worker's
+	// token), and it includes present-but-invalid desired definitions so their
+	// live removal can still be fencing-token-guarded.
+	for name, fencingToken := range fencingTokens {
+		rec.SeedFencingToken(name, fencingToken)
+	}
+	logger.Debug("Startup: seeded startup fingerprints",
+		"count", len(apps),
+		"duration", time.Since(seedStart),
+	)
 	logger.Info("Watching apps for changes", "root", app.Dir)
 
-	reconcilerDone := make(chan struct{})
 	go func() {
 		defer close(reconcilerDone)
-		rec.Start(lifecycle)
+		// A normal return is lifecycle cancellation. A non-nil error is either
+		// watcher construction failure or a terminal watcher/channel failure
+		// after the loops started; Start has already joined them, so no
+		// reconcile can still use the runtime manager or state DB. Surface it
+		// loudly rather than leaving a worker that believes it is watching apps
+		// while live reload has silently stopped.
+		runReconcilerStart(lifecycle, rec.Start, func(err error) {
+			logger.Error(
+				"Reconciler: watch loop stopped",
+				"error", err,
+			)
+			onFailure(err)
+		})
 	}()
 	shutdown.register(reconcilerBarrierStep(reconcilerDone))
+}
+
+// runReconcilerStart treats lifecycle cancellation as an ordinary shutdown and
+// reports only a terminal Start failure. Start joins its loops before returning,
+// so onFailure runs after the reconciler has stopped using shared dependencies.
+func runReconcilerStart(
+	lifecycle context.Context,
+	start func(context.Context) error,
+	onFailure func(error),
+) {
+	err := start(lifecycle)
+	if err == nil || lifecycle.Err() != nil ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	onFailure(err)
+}
+
+// reportReconcilerFailure latches a terminal reconciler error before cancelling
+// the lifecycle, so Run can distinguish that cancellation from normal shutdown.
+func reportReconcilerFailure(
+	lifecycle context.Context,
+	cancel context.CancelFunc,
+	failures chan<- error,
+	err error,
+) {
+	if lifecycle.Err() != nil {
+		return
+	}
+	failures <- fmt.Errorf("reconciler failed: %w", err)
+	cancel()
+}
+
+// reconcilerRunResult preserves an independent Consume failure while surfacing
+// a terminal reconciler failure after shutdown has joined Start.
+func reconcilerRunResult(runErr error, failures <-chan error) error {
+	select {
+	case err := <-failures:
+		if runErr == nil {
+			return err
+		}
+		return errors.Join(runErr, err)
+	default:
+		return runErr
+	}
 }
 
 // appReconcilerConfig builds the reconciler's callback wiring: the live
