@@ -31,11 +31,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -635,12 +637,20 @@ func TestWatchRepeatedExchangeNotificationsConvergeWithoutDuplicates(t *testing.
 	golfAnnex := filepath.Join(golfPath, "annex")
 	exchangeAppDirectory(t, golfPath, newTree)
 
-	// Two duplicate Rename+Create notification pairs for the same new inode.
-	// After the first pair the site is already current; the second must be a
-	// no-op side effect exactly like the first, never a stale or duplicated
-	// registration.
-	driveExchangeNotification(r, golfPath)
-	driveExchangeNotification(r, golfPath)
+	// The first Rename detects and refreshes the new inode; its paired Create
+	// and a duplicate Rename+Create pair must not refresh it again.
+	if !r.handleWatchEvent(fsnotify.Event{Name: golfPath, Op: fsnotify.Rename}) {
+		t.Fatal("first exchange Rename must refresh the new inode")
+	}
+	if r.handleWatchEvent(fsnotify.Event{Name: golfPath, Op: fsnotify.Create}) {
+		t.Fatal("paired Create for the current inode must not refresh")
+	}
+	if r.handleWatchEvent(fsnotify.Event{Name: golfPath, Op: fsnotify.Rename}) {
+		t.Fatal("duplicate Rename for the current inode must not refresh")
+	}
+	if r.handleWatchEvent(fsnotify.Event{Name: golfPath, Op: fsnotify.Create}) {
+		t.Fatal("duplicate Create for the current inode must not refresh")
+	}
 
 	want := map[string]struct{}{
 		root:      {},
@@ -747,6 +757,79 @@ func TestWatchExchangeRefreshReconcilesDetachedChanges(t *testing.T) {
 		}
 	case <-time.After(watchSettleDeadline):
 		t.Fatal("Start did not return on cancellation")
+	}
+}
+
+// TestWatchRefreshRestoresLostBackendWatchForSameInode covers the inotify
+// IN_MOVE_SELF case: the directory moves away and back with its inode intact,
+// but fsnotify has dropped its watch before Relay handles the refresh event.
+func TestWatchRefreshRestoresLostBackendWatchForSameInode(t *testing.T) {
+	root := t.TempDir()
+	golfPath := buildTree(t, root, "golf", "export function hi(e){}\n", "attic")
+	atticPath := filepath.Join(golfPath, "attic")
+	nestedFile := filepath.Join(atticPath, "nested.txt")
+	if err := os.WriteFile(nestedFile, []byte("before"), 0o644); err != nil {
+		t.Fatalf("write nested file: %v", err)
+	}
+	r := fixtureWithoutLoops(t, root, &fakeBuilder{}, nil)
+	shutdownSkeletonReconciler(t, r)
+	t.Cleanup(func() { _ = r.w.Close() })
+
+	before, err := os.Lstat(golfPath)
+	if err != nil {
+		t.Fatalf("stat watched directory: %v", err)
+	}
+	awayPath := golfPath + ".away"
+	if err := os.Rename(golfPath, awayPath); err != nil {
+		t.Fatalf("move directory away: %v", err)
+	}
+	if err := os.Rename(awayPath, golfPath); err != nil {
+		t.Fatalf("restore directory: %v", err)
+	}
+	after, err := os.Lstat(golfPath)
+	if err != nil {
+		t.Fatalf("stat restored directory: %v", err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("move-away/back must restore the same directory inode")
+	}
+
+	// Model the backend's IN_MOVE_SELF watch loss deterministically, without
+	// depending on when the platform watcher processes the queued rename events.
+	_ = r.w.Remove(golfPath)
+	if _, ok := watchListPaths(r)[golfPath]; ok {
+		t.Fatal("precondition: backend must no longer list the app-directory watch")
+	}
+	if !r.handleWatchEvent(fsnotify.Event{Name: golfPath, Op: fsnotify.Rename}) {
+		t.Fatal("refresh event must restore a lost backend watch despite matching inode")
+	}
+	mustWatchSet(t, r, map[string]struct{}{
+		root:      {},
+		golfPath:  {},
+		atticPath: {},
+	})
+	if !watchEntryIsCurrent(t, r, golfPath) || !watchEntryIsCurrent(t, r, atticPath) {
+		t.Fatal("recovered watch entries must refer to the current tree")
+	}
+
+	if err := os.WriteFile(nestedFile, []byte("after"), 0o644); err != nil {
+		t.Fatalf("modify nested file: %v", err)
+	}
+	deadline := time.NewTimer(watchSettleDeadline)
+	defer deadline.Stop()
+	for {
+		select {
+		case ev := <-r.w.Events:
+			if ev.Name == nestedFile && ev.Op&fsnotify.Write != 0 {
+				return
+			}
+		case err := <-r.w.Errors:
+			if err != nil {
+				t.Fatalf("watch error while awaiting nested modification: %v", err)
+			}
+		case <-deadline.C:
+			t.Fatal("nested modification was not detected after watch recovery")
+		}
 	}
 }
 
@@ -921,6 +1004,141 @@ func TestWatchGapErrorRestoresWatchAndReconciles(t *testing.T) {
 		}
 	case <-time.After(watchSettleDeadline):
 		t.Fatal("Start did not return on cancellation")
+	}
+}
+
+// TestWatchGapErrorsDuringSlowRescanAreThrottledFromCompletion pins both
+// properties of synchronous gap recovery: errors arriving during a slow walk
+// are handled after it, then coalesced using the scan's completion time rather
+// than triggering another full traversal immediately.
+func TestWatchGapErrorsDuringSlowRescanAreThrottledFromCompletion(t *testing.T) {
+	root := t.TempDir()
+	r, _ := newTestReconciler(t, root, &fakeBuilder{}, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := r.PrepareWatch(ctx); err != nil {
+		t.Fatalf("prepare watch: %v", err)
+	}
+
+	var walks atomic.Int32
+	walkStarted := make(chan struct{})
+	releaseWalk := make(chan struct{})
+	r.walkDir = func(path string, fn fs.WalkDirFunc) error {
+		if walks.Add(1) == 1 {
+			close(walkStarted)
+		}
+		return filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
+			if p == root {
+				<-releaseWalk
+			}
+			return fn(p, d, err)
+		})
+	}
+
+	var logs testutil.SyncBuffer
+	r.log = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	injectedErrors := make(chan error)
+	r.watchErrors = injectedErrors
+	errCh := make(chan error, 1)
+	go func() { errCh <- r.Start(ctx) }()
+
+	injectedErrors <- fsnotify.ErrEventOverflow
+	select {
+	case <-walkStarted:
+	case <-time.After(watchSettleDeadline):
+		t.Fatal("gap recovery did not start its recursive walk")
+	}
+
+	// These senders block until eventLoop resumes reading Errors after the
+	// active scan. Keeping the walk blocked past the configured backoff exposes
+	// the old scan-start timestamp bug without relying on a scheduling sleep.
+	firstConsumed := make(chan struct{})
+	secondConsumed := make(chan struct{})
+	go func() {
+		injectedErrors <- fsnotify.ErrEventOverflow
+		close(firstConsumed)
+	}()
+	go func() {
+		injectedErrors <- fsnotify.ErrEventOverflow
+		close(secondConsumed)
+	}()
+	timer := time.NewTimer(watchGapRecoveryBackoff + 50*time.Millisecond)
+	<-timer.C
+	close(releaseWalk)
+
+	for name, consumed := range map[string]<-chan struct{}{
+		"first":  firstConsumed,
+		"second": secondConsumed,
+	} {
+		select {
+		case <-consumed:
+		case <-time.After(watchSettleDeadline):
+			t.Fatalf("eventLoop did not handle the %s queued watch error", name)
+		}
+	}
+	pollUntil(t, "both queued errors to be logged after the scan", func() bool {
+		return strings.Count(logs.String(), "Reconciler: watch error") >= 3
+	})
+	if got := walks.Load(); got != 1 {
+		t.Fatalf("recursive walks = %d; errors queued during a slow scan must coalesce", got)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Start = %v on cancellation", err)
+		}
+	case <-time.After(watchSettleDeadline):
+		t.Fatal("Start did not join the event loop")
+	}
+}
+
+// TestWatchCancellationStopsActiveWalkAndStartJoins verifies that cancellation
+// is observed at the next WalkDir callback boundary and the synchronous walk
+// does not leave Start blocked during shutdown.
+func TestWatchCancellationStopsActiveWalkAndStartJoins(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "child"), 0o755); err != nil {
+		t.Fatalf("mkdir child: %v", err)
+	}
+	var callbacks atomic.Int32
+	callbackStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	r, _ := newTestReconciler(t, root, &fakeBuilder{}, nil, nil)
+	r.walkDir = func(path string, fn fs.WalkDirFunc) error {
+		return filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
+			callbacks.Add(1)
+			if callbacks.Load() == 1 {
+				close(callbackStarted)
+				<-releaseCallback
+			}
+			return fn(p, d, err)
+		})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- r.Start(ctx) }()
+	select {
+	case <-callbackStarted:
+	case <-time.After(watchSettleDeadline):
+		t.Fatal("initial watch walk did not enter its first callback")
+	}
+	cancel()
+	close(releaseCallback)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Start = %v on cancellation", err)
+		}
+	case <-time.After(watchSettleDeadline):
+		t.Fatal("Start did not join the cancelled walk")
+	}
+	if got := callbacks.Load(); got != 1 {
+		t.Fatalf("walk callbacks = %d; cancellation must stop at the next callback", got)
+	}
+	if got := len(pendingWatchRetries(r)); got != 0 {
+		t.Fatalf("pending retries = %d; cancellation must not create retries", got)
 	}
 }
 

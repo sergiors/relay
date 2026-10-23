@@ -256,6 +256,11 @@ type Reconciler struct {
 	// outside it.
 	watchMu      sync.Mutex
 	watchRetries map[string]*watchRetryState
+	// walkDir is the recursive-watch traversal seam. Production uses
+	// filepath.WalkDir; tests may control callback timing without changing the
+	// walk's cancellation and registration behavior.
+	walkDir     func(string, fs.WalkDirFunc) error
+	watchErrors <-chan error // optional eventLoop input seam for deterministic tests
 	// watchWake coalesces "a retry was scheduled" notifications to eventLoop.
 	// watchTerm carries the terminal watcher/channel failure to Start.
 	watchWake chan struct{}
@@ -560,6 +565,10 @@ func (r *Reconciler) ticker() {
 // to Start, which tears the loops down and returns the failure to the worker.
 func (r *Reconciler) eventLoop() {
 	defer r.loops.Done()
+	var watchErrors <-chan error = r.w.Errors
+	if r.watchErrors != nil {
+		watchErrors = r.watchErrors
+	}
 
 	// One reusable timer, armed at the earliest pending retry. An unarmed timer
 	// exposes a nil channel to the select below.
@@ -606,7 +615,7 @@ func (r *Reconciler) eventLoop() {
 			}
 			r.handleWatchEvent(ev)
 			armRetry()
-		case err, ok := <-r.w.Errors:
+		case err, ok := <-watchErrors:
 			if !ok {
 				r.watchStopped(errWatchErrorsClosed)
 				return
@@ -619,10 +628,15 @@ func (r *Reconciler) eventLoop() {
 			// bursts so one error storm cannot cause a walk per message.
 			now := time.Now()
 			if now.Sub(lastGapRecovery) >= watchGapRecoveryBackoff {
-				lastGapRecovery = now
 				r.warnWatch("Reconciler: watch error; rescanning", "error", err)
 				r.rescanWatches()
-				r.requestResync()
+				// The walk is synchronous, so throttle from its completion rather
+				// than its start. Errors queued during a slow walk then coalesce
+				// instead of immediately starting another full traversal.
+				lastGapRecovery = time.Now()
+				if r.rctx().Err() == nil {
+					r.requestResync()
+				}
 			} else if r.log != nil {
 				r.log.Debug("Reconciler: watch error", "error", err)
 			}
@@ -639,27 +653,16 @@ func (r *Reconciler) eventLoop() {
 // directory watches, and close the inspect/register race by scheduling a
 // reconcile AFTER a refresh that actually (re)registered the current tree. That
 // post-refresh enqueue is what makes a change landing between the event handler's
-// inspection and the registration converge on the next fingerprint scan.
-func (r *Reconciler) handleWatchEvent(ev fsnotify.Event) {
+// inspection and the registration converge on the next fingerprint scan. It
+// reports whether the event caused a watch refresh.
+func (r *Reconciler) handleWatchEvent(ev fsnotify.Event) bool {
 	// Chmod events are excluded: permission-only changes don't trigger a
 	// rebuild, only actual content/tree changes do.
 	if ev.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename|fsnotify.Write) == 0 {
-		return
+		return false
 	}
 	if name, affected := r.appForPath(ev.Name); affected && r.shouldEnqueue(name) {
 		r.Enqueue(name)
-	}
-	// Release watches for a removed or renamed (moved-away) directory FIRST.
-	// fsnotify watches inodes, so after an atomic per-app exchange the
-	// path-keyed watches still refer to the DETACHED old tree; they must be
-	// dropped before the current tree at the same path can be registered.
-	// Doing this first also makes a Rename+Create notification pair idempotent
-	// instead of leaving only the old inode watched. It is deliberately
-	// unconditional: an event for a removed/renamed inode is authoritative even
-	// if a rapid recreate reused the path (and possibly the inode number), so a
-	// stale registration must never survive by identity coincidence.
-	if ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
-		r.removeWatchRecursive(ev.Name)
 	}
 	// Maintain watches on created/removed/renamed directories (recursive
 	// watch). A Relay-owned reserved directory (git's ".sync-*") is never
@@ -667,13 +670,16 @@ func (r *Reconciler) handleWatchEvent(ev fsnotify.Event) {
 	// Create for a stage dir spends no handle; addWatchRecursive itself also
 	// prunes reserved subtrees defensively.
 	if ev.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 && !r.isReservedDirPath(ev.Name) {
-		if r.refreshWatch(ev.Name) {
+		refreshed := r.refreshWatch(ev.Name)
+		if refreshed {
 			// A duplicate exchange notification can describe the inode that is
 			// already watched; refreshWatch then does nothing. Only a real
 			// refresh needs the post-refresh reconcile.
 			r.enqueueWatchPath(ev.Name)
 		}
+		return refreshed
 	}
+	return false
 }
 
 // refreshWatch inspects path and, when it currently names a real directory whose
@@ -702,8 +708,8 @@ func (r *Reconciler) refreshWatch(path string) bool {
 }
 
 // watchIsCurrent reports whether path's registered watch still refers to info's
-// inode. An entry without a recorded identity (a test-constructed reconciler)
-// is treated as current, matching the historical presence-only check.
+// inode and remains registered with fsnotify. An entry without a recorded
+// identity (a test-constructed reconciler) relies on the backend registration.
 func (r *Reconciler) watchIsCurrent(path string, info os.FileInfo) bool {
 	v, ok := r.watches.Load(path)
 	if !ok {
@@ -711,9 +717,24 @@ func (r *Reconciler) watchIsCurrent(path string, info os.FileInfo) bool {
 	}
 	entry, ok := v.(watchEntry)
 	if !ok || entry.info == nil || info == nil {
-		return true
+		return r.backendWatchesPath(path)
 	}
-	return os.SameFile(entry.info, info)
+	return os.SameFile(entry.info, info) && r.backendWatchesPath(path)
+}
+
+// backendWatchesPath checks fsnotify's authoritative registration list. This
+// check belongs only on the event refresh path, not in addWatchRecursive's full
+// tree walk: WatchList is linear in the number of watches.
+func (r *Reconciler) backendWatchesPath(path string) bool {
+	if r.w == nil {
+		return false
+	}
+	for _, watched := range r.w.WatchList() {
+		if watched == path {
+			return true
+		}
+	}
+	return false
 }
 
 // appForPath maps an event path to the affected app name: the first
@@ -822,8 +843,18 @@ func (r *Reconciler) isReservedDirPath(p string) bool {
 // exchange notification that raced the refresh) drops the stale handle and
 // registers the current tree.
 func (r *Reconciler) addWatchRecursive(path string) {
-	_ = filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
+	walkDir := r.walkDir
+	if walkDir == nil {
+		walkDir = filepath.WalkDir
+	}
+	_ = walkDir(path, func(p string, d os.DirEntry, err error) error {
+		if r.rctx().Err() != nil {
+			return fs.SkipAll
+		}
 		if err != nil {
+			if r.rctx().Err() != nil {
+				return fs.SkipAll
+			}
 			// A concurrent rename/removal can make a path vanish between the
 			// event and this walk. There is nothing to watch in that case; any
 			// other traversal error means part of the live tree may be unwatched
@@ -865,7 +896,13 @@ func (r *Reconciler) addWatchRecursive(path string) {
 				return nil
 			}
 		}
+		if r.rctx().Err() != nil {
+			return fs.SkipAll
+		}
 		if err := r.w.Add(p); err != nil {
+			if r.rctx().Err() != nil {
+				return fs.SkipAll
+			}
 			// Do not silently claim a complete recursive refresh: without this
 			// watch, nested edits below p are invisible until the periodic audit
 			// or a retry. Track the exact path so only the failed subtree is
@@ -1128,9 +1165,15 @@ func (r *Reconciler) rescanWatches() {
 	}
 	watched := make(map[string]struct{}, len(live))
 	for _, path := range live {
+		if r.rctx().Err() != nil {
+			return
+		}
 		watched[path] = struct{}{}
 	}
 	r.watches.Range(func(key, _ any) bool {
+		if r.rctx().Err() != nil {
+			return false
+		}
 		path, ok := key.(string)
 		if !ok {
 			return true
@@ -1140,7 +1183,9 @@ func (r *Reconciler) rescanWatches() {
 		}
 		return true
 	})
-	r.addWatchRecursive(r.root)
+	if r.rctx().Err() == nil {
+		r.addWatchRecursive(r.root)
+	}
 }
 
 // watchStopped surfaces a terminal watcher/channel failure. A close racing
