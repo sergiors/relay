@@ -81,6 +81,14 @@ func TestRecordRedisReadErrorNoErrorLabel(t *testing.T) {
 	}
 }
 
+func TestNewConsumerInitializesBufferedEventsGauge(t *testing.T) {
+	m := metrics.New()
+	NewConsumer(ConsumerConfig{Metrics: m})
+	if got := m.Gauge(metrics.MetricBufferedEvents); got != 0 {
+		t.Fatalf("buffered_events = %v after consumer construction, want 0", got)
+	}
+}
+
 // fakePendingSummarizer is the streamMetricsReader seam: it records the exact
 // stream/group the sampler queries and returns canned XPENDING / XINFO GROUPS /
 // XLEN replies (or errors), so the depth/age/lag/DLQ gauge semantics are

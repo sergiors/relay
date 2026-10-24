@@ -234,21 +234,23 @@ func newConsumer(cfg ConsumerConfig, store invocationStateStore) *Consumer {
 		invocationRetention = *cfg.InvocationRetention
 	}
 	c := &Consumer{
-		client:              cfg.Client,
-		stream:              cfg.Stream,
-		group:               cfg.Group,
-		consumer:            cfg.Consumer,
-		block:               cfg.Block,
-		count:               cfg.Count,
-		reclaimInterval:     cfg.ReclaimInterval,
-		minPendingIdle:      cfg.MinPendingIdle,
-		dlqStream:           DLQStreamFor(cfg.Stream),
-		log:                 cfg.Log,
-		metrics:             cfg.Metrics,
-		metricsInterval:     cfg.MetricsInterval,
-		backoff:             newBackoff(cfg.backoffTable, cfg.backoffJitter),
-		capacity:            capacity,
-		buffer:              newBufferSemaphore(capacity),
+		client:          cfg.Client,
+		stream:          cfg.Stream,
+		group:           cfg.Group,
+		consumer:        cfg.Consumer,
+		block:           cfg.Block,
+		count:           cfg.Count,
+		reclaimInterval: cfg.ReclaimInterval,
+		minPendingIdle:  cfg.MinPendingIdle,
+		dlqStream:       DLQStreamFor(cfg.Stream),
+		log:             cfg.Log,
+		metrics:         cfg.Metrics,
+		metricsInterval: cfg.MetricsInterval,
+		backoff:         newBackoff(cfg.backoffTable, cfg.backoffJitter),
+		capacity:        capacity,
+		buffer: newBufferSemaphore(capacity, func(occupancy int) {
+			cfg.Metrics.SetGauge(metrics.MetricBufferedEvents, float64(occupancy))
+		}),
 		scheduleRunner:      cfg.ScheduleRunner,
 		maxEventBytes:       maxEventBytes,
 		invocationRetention: invocationRetention,
@@ -258,6 +260,7 @@ func newConsumer(cfg ConsumerConfig, store invocationStateStore) *Consumer {
 	// present (no nil guard), so the seam must be injected here.
 	c.invStateStore = store
 	c.healthy.Store(true)
+	c.metrics.SetGauge(metrics.MetricBufferedEvents, 0)
 	return c
 }
 
@@ -355,21 +358,26 @@ func recordRedisReadError(reg *metrics.Registry, operation string, err error) {
 	reg.IncLabels(metrics.MetricRedisReadErrors, []metrics.Label{{Name: "operation", Value: operation}})
 }
 
-// bufferSemaphore is a channel-based counting semaphore that bounds the number
+// bufferSemaphore is a counting semaphore that bounds the number
 // of locally buffered events (messages read from Redis but not yet finished).
-// It also tracks the current occupancy (a mutex-protected counter) so the
-// consumer can set the buffered_events gauge on acquire/release and compute the
-// current in-flight count without draining the channel.
+// It also tracks occupancy and publishes each transition under the occupancy
+// lock, so concurrent acquire/release callbacks cannot publish stale snapshots.
 type bufferSemaphore struct {
-	slots chan struct{}
-	mu    sync.Mutex
-	count int // current in-flight occupancy
+	capacity int
+	mu       sync.Mutex
+	count    int // current in-flight occupancy
+	changed  chan struct{}
+	onChange func(int)
 }
 
 // newBufferSemaphore builds a semaphore of the given capacity. capacity must be
 // >= 1 (callers pass a validated MaxBufferedEvents).
-func newBufferSemaphore(capacity int) *bufferSemaphore {
-	return &bufferSemaphore{slots: make(chan struct{}, capacity)}
+func newBufferSemaphore(capacity int, onChange func(int)) *bufferSemaphore {
+	return &bufferSemaphore{
+		capacity: capacity,
+		changed:  make(chan struct{}),
+		onChange: onChange,
+	}
 }
 
 // inflight returns the current occupancy (number of slots held).
@@ -382,14 +390,27 @@ func (s *bufferSemaphore) inflight() int {
 // acquire acquires one slot, blocking until either a slot is free or ctx is
 // cancelled. It returns false when ctx is done first (no slot acquired).
 func (s *bufferSemaphore) acquire(ctx context.Context) bool {
-	select {
-	case s.slots <- struct{}{}:
+	for {
+		if ctx.Err() != nil {
+			return false
+		}
 		s.mu.Lock()
-		s.count++
+		if s.count < s.capacity {
+			s.count++
+			if s.onChange != nil {
+				s.onChange(s.count)
+			}
+			s.notifyLocked()
+			s.mu.Unlock()
+			return true
+		}
+		changed := s.changed
 		s.mu.Unlock()
-		return true
-	case <-ctx.Done():
-		return false
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return false
+		}
 	}
 }
 
@@ -397,30 +418,58 @@ func (s *bufferSemaphore) acquire(ctx context.Context) bool {
 // immediately free. Used by the reclaim path, which must never block (it skips
 // a message for capacity and retries it next tick instead).
 func (s *bufferSemaphore) tryAcquire() bool {
-	select {
-	case s.slots <- struct{}{}:
-		s.mu.Lock()
-		s.count++
-		s.mu.Unlock()
-		return true
-	default:
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.count >= s.capacity {
 		return false
 	}
+	s.count++
+	if s.onChange != nil {
+		s.onChange(s.count)
+	}
+	s.notifyLocked()
+	return true
 }
 
 // release frees a slot, waking an acquire that is waiting. It must be called
 // exactly once for every successful acquire/tryAcquire.
 func (s *bufferSemaphore) release() {
-	<-s.slots
 	s.mu.Lock()
 	s.count--
+	if s.onChange != nil {
+		s.onChange(s.count)
+	}
+	s.notifyLocked()
 	s.mu.Unlock()
 }
 
-// setGauge publishes the current occupancy to the buffered_events gauge (nil-safe
-// in the registry).
-func (c *Consumer) setBufferGauge() {
-	c.metrics.SetGauge(metrics.MetricBufferedEvents, float64(c.buffer.inflight()))
+// waitForFree waits until at least one slot is available without reserving it.
+// The consumer rechecks capacity before reading, while avoiding a synthetic
+// semaphore acquisition that would temporarily count as a buffered message.
+func (s *bufferSemaphore) waitForFree(ctx context.Context) bool {
+	for {
+		if ctx.Err() != nil {
+			return false
+		}
+		s.mu.Lock()
+		if s.count < s.capacity {
+			s.mu.Unlock()
+			return true
+		}
+		changed := s.changed
+		s.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
+// notifyLocked wakes waiters after occupancy changes. s.mu must be held.
+func (s *bufferSemaphore) notifyLocked() {
+	close(s.changed)
+	s.changed = make(chan struct{})
 }
 
 // freeSlots returns the number of slots currently available (capacity - inFlight).
@@ -510,17 +559,11 @@ Drain:
 			// Wait for a slot release or shutdown. This is context-aware: on
 			// cancellation it returns promptly rather than spinning until a
 			// handler frees a slot.
-			if !c.buffer.acquire(ctx) {
+			if !c.buffer.waitForFree(ctx) {
 				// ctx done; nothing was handed out. Drain in-flight goroutines
 				// before returning (see below).
 				break
 			}
-			// We acquired a slot, so the buffer has room now; release it back so
-			// the read below is not double-counted — we only re-check free slots
-			// below and issue a read sized to them. (Keeping a slot held here
-			// and immediately releasing avoids needing a read to know how many
-			// it will produce.)
-			c.buffer.release()
 		} else if bufferFull {
 			// Buffer has room again: leave the paused state.
 			bufferFull = false
@@ -599,10 +642,8 @@ Drain:
 						}
 					}()
 					defer c.buffer.release()
-					c.setBufferGauge()
 					// A message read fresh from XREADGROUP is on its first delivery.
 					c.processMessage(ctx, m, 1, handler)
-					c.setBufferGauge()
 				}(msg)
 			}
 		}

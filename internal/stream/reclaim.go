@@ -249,8 +249,6 @@ func (c *Consumer) deliverClaimed(
 	// processMessage runs synchronously here on the reclaim goroutine (bounded
 	// by the reclaim cadence), exactly as before; the slot is held for its
 	// duration so the buffer occupancy reflects a reclaimed message too.
-	c.setBufferGauge()
+	defer c.buffer.release()
 	c.processMessage(ctx, msg, retryCount+1, handler)
-	c.setBufferGauge()
-	c.buffer.release()
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -251,7 +252,7 @@ func TestEnsureGroupBootstrapSemantics(t *testing.T) {
 // release frees it, and tryAcquire fails (without blocking) at capacity.
 func TestBufferSemaphoreAcquireReleaseGauge(t *testing.T) {
 	const capacity = 2
-	s := newBufferSemaphore(capacity)
+	s := newBufferSemaphore(capacity, nil)
 	ctx := context.Background()
 
 	for i := 0; i < capacity; i++ {
@@ -283,11 +284,49 @@ func TestBufferSemaphoreAcquireReleaseGauge(t *testing.T) {
 	}
 }
 
+func TestBufferSemaphorePublishesEveryOccupancyTransition(t *testing.T) {
+	const capacity = 4
+	var transitions []int
+	s := newBufferSemaphore(capacity, func(occupancy int) {
+		transitions = append(transitions, occupancy)
+	})
+	var workers sync.WaitGroup
+	for i := 0; i < capacity; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			if !s.acquire(context.Background()) {
+				t.Error("acquire failed")
+				return
+			}
+			s.release()
+		}()
+	}
+	workers.Wait()
+
+	if got := s.inflight(); got != 0 {
+		t.Fatalf("final occupancy = %d, want 0", got)
+	}
+	if len(transitions) != 2*capacity {
+		t.Fatalf("published transitions = %v, want %d acquire/release updates", transitions, 2*capacity)
+	}
+	occupancy := 0
+	for i, got := range transitions {
+		if got < 0 || got > capacity || got != occupancy-1 && got != occupancy+1 {
+			t.Fatalf("transition %d = %d after %d, want one serialized acquire/release step", i, got, occupancy)
+		}
+		occupancy = got
+	}
+	if occupancy != 0 {
+		t.Fatalf("last published occupancy = %d, want 0", occupancy)
+	}
+}
+
 // TestBufferSemaphoreAcquireCancelledContext pins the context-aware acquire: a
 // full semaphore returns false promptly when ctx is cancelled rather than
 // blocking past shutdown.
 func TestBufferSemaphoreAcquireCancelledContext(t *testing.T) {
-	s := newBufferSemaphore(1)
+	s := newBufferSemaphore(1, nil)
 	if !s.acquire(context.Background()) {
 		t.Fatal("initial acquire failed")
 	}
@@ -303,10 +342,10 @@ func TestBufferSemaphoreAcquireCancelledContext(t *testing.T) {
 }
 
 // TestBufferSemaphoreAcquireAfterReleaseWakesWaiter pins that a blocked acquire
-// is woken by release (deterministic channel handoff, no sleep): the waiting
+// is woken by release (deterministic notification, no sleep): the waiting
 // goroutine completes once a slot frees.
 func TestBufferSemaphoreAcquireAfterReleaseWakesWaiter(t *testing.T) {
-	s := newBufferSemaphore(1)
+	s := newBufferSemaphore(1, nil)
 	if !s.acquire(context.Background()) {
 		t.Fatal("initial acquire failed")
 	}
