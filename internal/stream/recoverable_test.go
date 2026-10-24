@@ -106,3 +106,105 @@ func TestProcessScheduleMessageMakeRecoverableFailureLeavesPending(t *testing.T)
 		t.Fatalf("relay.outcome = %q, want pending", got)
 	}
 }
+
+// TestProcessMessageMakeRecoverableCalledExactlyOnce pins the migration-once
+// split introduced with the schedule dispatch ordering: a valid schedule
+// occurrence with a wired ScheduleRunner is dispatched to the schedule path,
+// which performs its OWN makeRecoverable exactly once — the generic
+// preparation in processMessage must not run on top of it (a double migration
+// or a wasted event-handler context). Every other classified message keeps the
+// generic preparation exactly once: ordinary events, valid schedule envelopes
+// without a runner (the safe fallback), and never invalid claims (which are
+// dead-lettered unprepared).
+func TestProcessMessageMakeRecoverableCalledExactlyOnce(t *testing.T) {
+	valid := validEnvelope(t)
+	storeFields := map[string]string{"courses/jobs.cleanup.handler": "ok", "fn/h": "ok"}
+
+	tests := []struct {
+		name         string
+		body         string
+		runner       bool
+		migrations   int
+		handlerCalls int
+		schedCalls   int
+		outcome      string
+	}{
+		{
+			name:         "routed valid schedule with runner migrates once on the schedule path",
+			body:         envelopeBody(t, valid),
+			runner:       true,
+			migrations:   1,
+			handlerCalls: 0,
+			schedCalls:   1,
+			outcome:      "pending",
+		},
+		{
+			name:         "ordinary event migrates once on the generic path even with a runner",
+			body:         `{"event_name":"X"}`,
+			runner:       true,
+			migrations:   1,
+			handlerCalls: 1,
+			schedCalls:   0,
+			outcome:      "pending",
+		},
+		{
+			name:         "valid schedule without runner falls back to the generic path once",
+			body:         envelopeBody(t, valid),
+			runner:       false,
+			migrations:   1,
+			handlerCalls: 1,
+			schedCalls:   0,
+			outcome:      "pending",
+		},
+		{
+			name:         "invalid schedule claim is never prepared",
+			runner:       true,
+			migrations:   0,
+			handlerCalls: 0,
+			schedCalls:   0,
+			outcome:      "dlq",
+		},
+	}
+	// Make the last case structurally invalid before rendering it.
+	invalid := cloneMap(valid)
+	delete(invalid, "occurrence_id")
+	tests[3].body = envelopeBody(t, invalid)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := withSpanRecorder(t)
+			// The handler field lets the fake count real migrations; a run of
+			// the generic path on top of the schedule path would be visible as
+			// recoverableCalls == 2.
+			store := newFakeInvocationStore(storeFields)
+			c := processMessageConsumer(store)
+
+			handlerCalls, schedCalls := 0, 0
+			retryable := func(context.Context, string, map[string]any) error {
+				handlerCalls++
+				return errors.New("retryable")
+			}
+			if tt.runner {
+				c.scheduleRunner = func(context.Context, string, schedule.Occurrence, []byte) error {
+					schedCalls++
+					return errRetryableClaimTest
+				}
+			}
+			msg := redis.XMessage{ID: "1-0", Values: map[string]any{"event": tt.body}}
+			c.processMessage(context.Background(), msg, 1, retryable)
+
+			if store.recoverableCalls != tt.migrations {
+				t.Fatalf("makeRecoverable calls = %d, want %d", store.recoverableCalls, tt.migrations)
+			}
+			if handlerCalls != tt.handlerCalls {
+				t.Fatalf("ordinary handler calls = %d, want %d", handlerCalls, tt.handlerCalls)
+			}
+			if schedCalls != tt.schedCalls {
+				t.Fatalf("schedule runner calls = %d, want %d", schedCalls, tt.schedCalls)
+			}
+			if got := attrString(spanByName(t, rec, "stream.message"), "relay.outcome"); got != tt.outcome {
+				t.Fatalf("relay.outcome = %q, want %q", got, tt.outcome)
+			}
+		})
+	}
+}

@@ -140,9 +140,11 @@ func (c *Consumer) processMessage(
 	//     exactly like a malformed event body. This holds whether or not a
 	//     ScheduleRunner is wired: a malformed claim is malformed either way.
 	//
-	// Classification happens BEFORE the invocation-state migration below, like
-	// the malformed-message path: an invalid claim is non-retryable and needs no
-	// recoverable state, so it is dead-lettered directly.
+	// Classification happens BEFORE any invocation-state migration, like the
+	// malformed-message path: an invalid claim is non-retryable and needs no
+	// recoverable state, so it is dead-lettered directly. A valid occurrence
+	// with a wired ScheduleRunner is dispatched before the generic migration
+	// because the schedule path owns that setup itself.
 	occ, envelopeKind, envelopeErr := schedule.ClassifyScheduleEnvelope(event)
 	if envelopeKind == schedule.InvalidScheduleEnvelope {
 		c.log.Error("Message: invalid schedule claim; routing to DLQ",
@@ -152,6 +154,17 @@ func (c *Consumer) processMessage(
 		)
 		outcome, spanErr = "dlq", envelopeErr
 		c.routeToDLQ(ctx, msg, envelopeErr, deliveryNum)
+		return
+	}
+
+	// A valid schedule occurrence with a wired ScheduleRunner bypasses event
+	// matching entirely. Dispatch it before the generic invocation-state setup
+	// below: processScheduleMessage owns its own migration and handler context,
+	// so doing both here would migrate twice and build an unused event handler
+	// context. A valid envelope without a runner falls through to ordinary
+	// event handling (the safe fallback for unwired consumers).
+	if envelopeKind == schedule.ValidScheduleEnvelope && c.scheduleRunner != nil {
+		outcome, spanErr = c.processScheduleMessage(ctx, msg.ID, deliveryNum, occ)
 		return
 	}
 
@@ -190,11 +203,6 @@ func (c *Consumer) processMessage(
 	handlerCtx := WithDeliveryAttempt(ctx, deliveryNum)
 	handlerCtx = WithInvocationState(handlerCtx,
 		NewInvocationState(ctx, c.invStateStore, c.stream, c.group, msg.ID, c.log))
-
-	if envelopeKind == schedule.ValidScheduleEnvelope && c.scheduleRunner != nil {
-		outcome, spanErr = c.processScheduleMessage(ctx, msg.ID, deliveryNum, occ)
-		return
-	}
 
 	// A child span around the handler dispatch (the runner's matching and
 	// execution) keeps the Redis bookkeeping of processMessage visibly separate
@@ -278,7 +286,10 @@ func (c *Consumer) processMessage(
 // on exhaustion OR on a semantic validation failure (ErrScheduleInvalid).
 //
 // It returns the terminal outcome label and an error for the caller's message
-// span, so the schedule path is traced identically to the event path.
+// span, so the schedule path is traced identically to the event path. It owns
+// its own invocation-state migration and handler context, so a direct caller
+// stays self-contained; processMessage dispatches it before its generic event
+// setup.
 //
 // Schedule occurrences are deliberately NOT counted in the event-classification
 // counters (received/matched/unmatched): they bypass event matching, so they
