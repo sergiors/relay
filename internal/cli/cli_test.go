@@ -16,16 +16,17 @@ import (
 	"relay/internal/testutil"
 )
 
-// testDeps returns CLI dependencies whose state DB, worker socket, and process
-// lock all live under fresh per-test temp locations. The socket lives under
-// /tmp (not t.TempDir's /var/folders on macOS) to stay inside the ~104-byte
-// Unix socket sun_path limit. It replaces the former package-level path globals
-// (statePath, runtimeSocketPath, startLockPath) with per-test values, so tests
-// never touch /var/lib/relay or /run/relay. Start defaults to a no-op runner so
-// an accidental `start` never launches the real worker; tests asserting
-// dispatch override deps.Start directly. A few unrelated seams (the CLI git
-// dir globals and secretsPath) remain package vars; tests that mutate them
-// restore the previous value via t.Cleanup.
+// testDeps returns CLI dependencies whose state DB, worker socket, process
+// lock, git paths, and secrets dir all live under fresh per-test temp
+// locations. The socket lives under /tmp (not t.TempDir's /var/folders on
+// macOS) to stay inside the ~104-byte Unix socket sun_path limit. It replaces
+// the former package-level path globals (statePath, runtimeSocketPath,
+// startLockPath, the git dirs, and secretsPath) with per-test values, so tests
+// never touch /var/lib/relay or /run/relay. Start defaults to a no-op runner
+// so an accidental `start` never launches the real worker; tests asserting
+// dispatch override deps.Start directly. The only remaining package-level seam
+// is the git sync transport seam (gitCloneURL), which is a package var; tests
+// that mutate it restore the previous value via t.Cleanup.
 func testDeps(t *testing.T) Dependencies {
 	t.Helper()
 	dir := t.TempDir()
@@ -45,7 +46,14 @@ func testDeps(t *testing.T) Dependencies {
 		},
 		SocketPath: filepath.Join(sockDir, "relay.sock"),
 		LockPath:   filepath.Join(dir, "relay.lock"),
-		Start:      func(*slog.Logger) error { return nil },
+		// Git and secrets paths under the same per-test temp root, so git and
+		// secret commands never touch /var/lib/relay or the production store.
+		GitConfigPath:  filepath.Join(dir, "git", "source.json"),
+		GitCheckoutDir: filepath.Join(dir, "git", "checkout"),
+		GitSSHDir:      filepath.Join(dir, "ssh"),
+		GitAppsDir:     filepath.Join(dir, "apps"),
+		SecretsDir:     filepath.Join(dir, "secrets"),
+		Start:          func(*slog.Logger) error { return nil },
 	}
 }
 

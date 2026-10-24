@@ -13,27 +13,45 @@ import (
 	"relay/internal/secrets"
 )
 
-// runSecretCLI runs the command tree with dependencies that the secret family
-// never touches, so the focused secret tests run without PostgreSQL or Docker.
+// runSecretCLI runs the command tree with the caller-supplied dependencies
+// (whose SecretsDir the secret family reads), so the focused secret tests run
+// without PostgreSQL or Docker.
 // The injected Reader is always a strings.Reader, which is not an interactive
 // terminal, making the no-terminal path deterministic.
-func runSecretCLI(t *testing.T, stdin string, args ...string) (stdout, stderr string, err error) {
+func runSecretCLI(t *testing.T, deps Dependencies, stdin string, args ...string) (stdout, stderr string, err error) {
 	t.Helper()
-	return runCLIWithDeps(t, Dependencies{}, stdin, args...)
+	return runCLIWithDeps(t, deps, stdin, args...)
 }
 
-// seedSecretStore redirects the package secrets path to a temp dir, restoring
-// the previous value on cleanup, and returns a store over it.
-func seedSecretStore(t *testing.T) *secrets.LocalStore {
+// newSecretDeps returns Dependencies whose SecretsDir lives under a fresh
+// temp dir, together with a store over that dir (for seeding and assertions)
+// and the dir itself. It replaces the former secretsPath package var: the
+// store's directory and the CLI's directory are the same injected value.
+func newSecretDeps(t *testing.T) (Dependencies, *secrets.LocalStore, string) {
 	t.Helper()
-	prev := secretsPath
-	secretsPath = filepath.Join(t.TempDir(), "secrets")
-	t.Cleanup(func() { secretsPath = prev })
-	store, err := secrets.NewLocal(secretsPath)
+	dir := filepath.Join(t.TempDir(), "secrets")
+	store, err := secrets.NewLocal(dir)
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	return Dependencies{SecretsDir: dir}, store, dir
+}
+
+// seedSecretStore returns a store over a fresh temp secrets dir, for tests
+// that exercise secretSetValue directly and never run the command tree. The
+// store's directory is injected per test; there is no package-level path.
+func seedSecretStore(t *testing.T) *secrets.LocalStore {
+	t.Helper()
+	_, store, _ := newSecretDeps(t)
 	return store
+}
+
+// newSecretDepsOnly returns Dependencies with a fresh temp SecretsDir, for
+// tests that only run the secret command tree (no direct store access).
+func newSecretDepsOnly(t *testing.T) Dependencies {
+	t.Helper()
+	deps, _, _ := newSecretDeps(t)
+	return deps
 }
 
 // requireSecretMissing asserts name was not stored.
@@ -48,7 +66,7 @@ func requireSecretMissing(t *testing.T, store *secrets.LocalStore, name string) 
 // of stdin (never echoing it), writes it atomically with 0600 perms, and
 // reports success without printing the value.
 func TestSecretSetFromStdin(t *testing.T) {
-	store := seedSecretStore(t)
+	_, store, secretsDir := newSecretDeps(t)
 	var out bytes.Buffer
 	err := secretSetValue(context.Background(), store, "db", strings.NewReader("s3cr3t\n"), &out, true)
 	if err != nil {
@@ -67,7 +85,7 @@ func TestSecretSetFromStdin(t *testing.T) {
 	if got != "s3cr3t" {
 		t.Fatalf("resolved = %q, want s3cr3t (trailing newline stripped)", got)
 	}
-	info, err := os.Stat(filepath.Join(secretsPath, "db"))
+	info, err := os.Stat(filepath.Join(secretsDir, "db"))
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
@@ -79,7 +97,7 @@ func TestSecretSetFromStdin(t *testing.T) {
 // TestSecretSetAtomicUpdate verifies setting the same secret twice overwrites
 // atomically and leaves no temp files.
 func TestSecretSetAtomicUpdate(t *testing.T) {
-	store := seedSecretStore(t)
+	_, store, secretsDir := newSecretDeps(t)
 	var out bytes.Buffer
 	if err := secretSetValue(context.Background(), store, "tok",
 		strings.NewReader("v1\n"), &out, true); err != nil {
@@ -93,7 +111,7 @@ func TestSecretSetAtomicUpdate(t *testing.T) {
 	if got != "v2" {
 		t.Fatalf("resolved = %q, want v2", got)
 	}
-	entries, err := os.ReadDir(secretsPath)
+	entries, err := os.ReadDir(secretsDir)
 	if err != nil {
 		t.Fatalf("read dir: %v", err)
 	}
@@ -106,8 +124,8 @@ func TestSecretSetAtomicUpdate(t *testing.T) {
 // error (exit class 1). The message flows into the returned error (the
 // ExitErrHandler is a silent no-op); cmd/main.go prints it and exits 1.
 func TestSecretRmMissingError(t *testing.T) {
-	_ = seedSecretStore(t)
-	_, _, err := runSecretCLI(t, "", "secret", "rm", "ghost")
+	deps, _, _ := newSecretDeps(t)
+	_, _, err := runSecretCLI(t, deps, "", "secret", "rm", "ghost")
 	if err == nil || !strings.Contains(err.Error(), "ghost") {
 		t.Fatalf("returned error missing the missing-secret name: %v", err)
 	}
@@ -116,13 +134,13 @@ func TestSecretRmMissingError(t *testing.T) {
 // TestSecretLsNamesOnly verifies `secret ls` prints a NAME header and the
 // sorted names, and nothing else.
 func TestSecretLsNamesOnly(t *testing.T) {
-	store := seedSecretStore(t)
+	deps, store, _ := newSecretDeps(t)
 	for _, n := range []string{"zeta", "alpha"} {
 		if err := store.Set(context.Background(), n, "v"); err != nil {
 			t.Fatalf("set %s: %v", n, err)
 		}
 	}
-	out, _, err := runSecretCLI(t, "", "secret", "ls")
+	out, _, err := runSecretCLI(t, deps, "", "secret", "ls")
 	if err != nil {
 		t.Fatalf("secret ls: err = %v, want nil", err)
 	}
@@ -139,8 +157,8 @@ func TestSecretLsNamesOnly(t *testing.T) {
 // `secret set db -` reads the value from the injected Reader and never echoes
 // it.
 func TestSecretSetCommandReadsExplicitStdin(t *testing.T) {
-	store := seedSecretStore(t)
-	out, _, err := runSecretCLI(t, "v4lue\n", "secret", "set", "db", "-")
+	deps, store, _ := newSecretDeps(t)
+	out, _, err := runSecretCLI(t, deps, "v4lue\n", "secret", "set", "db", "-")
 	if err != nil {
 		t.Fatalf("secret set: err = %v, want nil", err)
 	}
@@ -159,9 +177,9 @@ func TestSecretSetCommandReadsExplicitStdin(t *testing.T) {
 // `secret set NAME` does not consume piped stdin implicitly: without a `-` it
 // requires an interactive terminal and stores nothing.
 func TestSecretSetCommandRequiresTerminalWithoutMarker(t *testing.T) {
-	store := seedSecretStore(t)
+	deps, store, _ := newSecretDeps(t)
 	const value = "implicit-stdin-super-secret"
-	out, stderr, err := runSecretCLI(t, value+"\n", "secret", "set", "db")
+	out, stderr, err := runSecretCLI(t, deps, value+"\n", "secret", "set", "db")
 	if err == nil || !strings.Contains(err.Error(), "interactive terminal is required") {
 		t.Fatalf("err = %v, want an interactive-terminal error", err)
 	}
@@ -183,7 +201,7 @@ func TestSecretSetCommandRequiresTerminalWithoutMarker(t *testing.T) {
 // error. `secret` alone no longer errors — it shows help (see
 // TestSecretBareShowsHelp).
 func TestSecretCommandErrors(t *testing.T) {
-	_ = seedSecretStore(t)
+	deps, _, _ := newSecretDeps(t)
 	for _, tc := range []struct {
 		args []string
 		want string
@@ -194,7 +212,7 @@ func TestSecretCommandErrors(t *testing.T) {
 		{[]string{"secret", "set", "db", "extra"}, "secret values must not be passed as arguments"},
 		{[]string{"secret", "set", "db", "-", "extra"}, "secret set: too many arguments"},
 	} {
-		_, _, err := runSecretCLI(t, "", tc.args...)
+		_, _, err := runSecretCLI(t, deps, "", tc.args...)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Fatalf("args %v: err = %v, want message containing %q", tc.args, err, tc.want)
 		}
@@ -204,7 +222,8 @@ func TestSecretCommandErrors(t *testing.T) {
 // A bare `relay secret` shows the subcommand help on stdout and exits 0,
 // listing the secret subcommands.
 func TestSecretBareShowsHelp(t *testing.T) {
-	out, _, err := runSecretCLI(t, "", "secret")
+	deps := newSecretDepsOnly(t)
+	out, _, err := runSecretCLI(t, deps, "", "secret")
 	if err != nil {
 		t.Fatalf("secret alone: err = %v, want nil", err)
 	}
@@ -221,7 +240,8 @@ func TestSecretBareShowsHelp(t *testing.T) {
 // An unknown secret subcommand returns the friendly Docker-style usage error
 // naming the full command path.
 func TestSecretUnknownCommandFriendly(t *testing.T) {
-	_, _, err := runSecretCLI(t, "", "secret", "bogus")
+	deps := newSecretDepsOnly(t)
+	_, _, err := runSecretCLI(t, deps, "", "secret", "bogus")
 	if err == nil {
 		t.Fatal("secret bogus: err = nil, want usage error")
 	}
@@ -237,7 +257,8 @@ func TestSecretUnknownCommandFriendly(t *testing.T) {
 
 // TestSecretHelp verifies the secret help and subcommand help render.
 func TestSecretHelp(t *testing.T) {
-	out, _, err := runSecretCLI(t, "", "secret", "--help")
+	deps := newSecretDepsOnly(t)
+	out, _, err := runSecretCLI(t, deps, "", "secret", "--help")
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -251,7 +272,8 @@ func TestSecretHelp(t *testing.T) {
 // TestSecretSetHelp verifies `secret set --help` documents the stdin marker and
 // the interactive-terminal requirement.
 func TestSecretSetHelp(t *testing.T) {
-	out, _, err := runSecretCLI(t, "", "secret", "set", "--help")
+	deps := newSecretDepsOnly(t)
+	out, _, err := runSecretCLI(t, deps, "", "secret", "set", "--help")
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -266,8 +288,8 @@ func TestSecretSetHelp(t *testing.T) {
 // a runtime error (exit class 1) before any value is read. The message flows
 // into the returned error; cmd/main.go prints it and exits 1.
 func TestSecretSetInvalidName(t *testing.T) {
-	_ = seedSecretStore(t)
-	_, _, err := runSecretCLI(t, "value\n", "secret", "set", "../etc", "-")
+	deps, _, _ := newSecretDeps(t)
+	_, _, err := runSecretCLI(t, deps, "value\n", "secret", "set", "../etc", "-")
 	if err == nil || !strings.Contains(err.Error(), "invalid secret name") {
 		t.Fatalf("returned error missing invalid-name message: %v", err)
 	}
@@ -316,7 +338,7 @@ func TestSecretSetMultilineStdin(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			store := seedSecretStore(t)
+			_, store, secretsDir := newSecretDeps(t)
 			var out bytes.Buffer
 			if err := secretSetValue(context.Background(), store, "db",
 				strings.NewReader(tc.stdin), &out, true); err != nil {
@@ -334,7 +356,7 @@ func TestSecretSetMultilineStdin(t *testing.T) {
 			if got != tc.want {
 				t.Fatalf("stored length = %d, want %d (byte-for-byte equality)", len(got), len(tc.want))
 			}
-			info, err := os.Stat(filepath.Join(secretsPath, "db"))
+			info, err := os.Stat(filepath.Join(secretsDir, "db"))
 			if err != nil {
 				t.Fatalf("stat: %v", err)
 			}
@@ -358,7 +380,7 @@ func TestSecretSetRejectsEmptyStdin(t *testing.T) {
 		{"one CRLF", "\r\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			store := seedSecretStore(t)
+			_, store, _ := newSecretDeps(t)
 			var out bytes.Buffer
 			err := secretSetValue(context.Background(), store, "db", strings.NewReader(tc.stdin), &out, true)
 			if err == nil || !strings.Contains(err.Error(), "empty value on stdin") {
@@ -375,8 +397,8 @@ func TestSecretSetRejectsEmptyStdin(t *testing.T) {
 // TestSecretSetCommandRejectsEmptyStdin verifies the full command path rejects
 // an empty explicit stdin instead of storing an empty secret.
 func TestSecretSetCommandRejectsEmptyStdin(t *testing.T) {
-	store := seedSecretStore(t)
-	out, _, err := runSecretCLI(t, "", "secret", "set", "db", "-")
+	deps, store, _ := newSecretDeps(t)
+	out, _, err := runSecretCLI(t, deps, "", "secret", "set", "db", "-")
 	if err == nil || !strings.Contains(err.Error(), "empty value on stdin") {
 		t.Fatalf("err = %v, want an empty-value error", err)
 	}
@@ -398,7 +420,7 @@ func (r errReader) Read(p []byte) (int, error) {
 // TestSecretSetFromStdinReadError verifies an explicit-stdin read failure is
 // reported without storing a secret or echoing any bytes that were read.
 func TestSecretSetFromStdinReadError(t *testing.T) {
-	store := seedSecretStore(t)
+	_, store, _ := newSecretDeps(t)
 	const value = "read-failure-super-secret"
 	var out bytes.Buffer
 	err := secretSetValue(context.Background(), store, "db", errReader{data: value}, &out, true)
@@ -421,7 +443,7 @@ func TestSecretSetFromStdinReadError(t *testing.T) {
 // reads a non-terminal reader: it fails with guidance instead of consuming
 // stdin, and stores nothing.
 func TestSecretSetPromptRequiresTerminal(t *testing.T) {
-	store := seedSecretStore(t)
+	_, store, _ := newSecretDeps(t)
 	const value = "nonterminal-super-secret"
 	var out bytes.Buffer
 	err := secretSetValue(context.Background(), store, "db",
@@ -473,7 +495,7 @@ func TestSecretSetNeverLeaksValueOnError(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("invalid name", func(t *testing.T) {
-		store := seedSecretStore(t)
+		_, store, _ := newSecretDeps(t)
 		const value = "invalid-name-super-secret"
 		var out bytes.Buffer
 		err := secretSetValue(ctx, store, "../etc", strings.NewReader(value+"\n"), &out, true)
@@ -489,7 +511,7 @@ func TestSecretSetNeverLeaksValueOnError(t *testing.T) {
 	})
 
 	t.Run("read failure", func(t *testing.T) {
-		store := seedSecretStore(t)
+		_, store, _ := newSecretDeps(t)
 		const value = "read-failure-super-secret"
 		var out bytes.Buffer
 		err := secretSetValue(ctx, store, "db", errReader{data: value}, &out, true)
@@ -505,7 +527,7 @@ func TestSecretSetNeverLeaksValueOnError(t *testing.T) {
 	})
 
 	t.Run("no terminal", func(t *testing.T) {
-		store := seedSecretStore(t)
+		_, store, _ := newSecretDeps(t)
 		const value = "no-terminal-super-secret"
 		var out bytes.Buffer
 		err := secretSetValue(ctx, store, "db", strings.NewReader(value), &out, false)
@@ -521,15 +543,13 @@ func TestSecretSetNeverLeaksValueOnError(t *testing.T) {
 	})
 
 	t.Run("store write failure", func(t *testing.T) {
-		// Make the secrets path a regular file, so creating the directory for
-		// the write fails after the value has been read.
-		prev := secretsPath
-		secretsPath = filepath.Join(t.TempDir(), "secrets")
-		t.Cleanup(func() { secretsPath = prev })
-		if err := os.WriteFile(secretsPath, []byte("blocker"), 0o600); err != nil {
+		// Make the secrets dir itself a regular file, so creating the
+		// directory for the write fails after the value has been read.
+		blocker := filepath.Join(t.TempDir(), "secrets")
+		if err := os.WriteFile(blocker, []byte("blocker"), 0o600); err != nil {
 			t.Fatalf("write blocker: %v", err)
 		}
-		store, err := secrets.NewLocal(secretsPath)
+		store, err := secrets.NewLocal(blocker)
 		if err != nil {
 			t.Fatalf("new store: %v", err)
 		}
@@ -562,9 +582,9 @@ func TestSecretSetRejectsPositionalValue(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			store := seedSecretStore(t)
+			deps, store, _ := newSecretDeps(t)
 			const piped = "piped-super-secret"
-			out, _, err := runSecretCLI(t, piped+"\n", "secret", "set", "db", tc.positional)
+			out, _, err := runSecretCLI(t, deps, piped+"\n", "secret", "set", "db", tc.positional)
 			if err == nil ||
 				!strings.Contains(err.Error(), "secret values must not be passed as arguments") {
 				t.Fatalf("err = %v, want the positional-value rejection", err)
@@ -588,8 +608,8 @@ func TestSecretSetRejectsPositionalValue(t *testing.T) {
 // stored byte-for-byte equal to the fixture (single trailing newline stripped)
 // and resolvable through a fresh store, with no fragment of the value echoed.
 func TestSecretSetMultilineViaCommandPipe(t *testing.T) {
-	_ = seedSecretStore(t)
-	out, _, err := runSecretCLI(t, pemValue+"\n", "secret", "set", "db", "-")
+	deps, _, secretsDir := newSecretDeps(t)
+	out, _, err := runSecretCLI(t, deps, pemValue+"\n", "secret", "set", "db", "-")
 	if err != nil {
 		t.Fatalf("secret set: err = %v, want nil", err)
 	}
@@ -603,7 +623,7 @@ func TestSecretSetMultilineViaCommandPipe(t *testing.T) {
 	}
 	// Resolve through a fresh store (not the CLI's) and require byte-for-byte
 	// equality with the fixture — proving the stored bytes are authoritative.
-	store, err := secrets.NewLocal(secretsPath)
+	store, err := secrets.NewLocal(secretsDir)
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}

@@ -20,18 +20,13 @@ import (
 // are never accepted as positional arguments.
 const secretStdinArg = "-"
 
-// secretsPath is the local secrets directory the CLI reads and writes. It
-// defaults to the fixed internal path; tests replace it with a temp dir so they
-// never touch /var/lib/relay.
-var secretsPath = secrets.SecretsDir
-
 // secretCommand builds the `relay secret ...` subcommand family. It manages
 // local secret files under the secrets directory only — it never touches
 // Redis, Docker, or the worker. It is a pure grouping command, so it uses the
 // shared namespaceAction: a bare `relay secret` shows the subcommand help, and
 // an unknown first token is a friendly Docker-style usage error naming the full
 // path.
-func secretCommand() *cli.Command {
+func secretCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "secret",
 		Usage: "Manage local secrets",
@@ -47,7 +42,7 @@ func secretCommand() *cli.Command {
 					if cmd.Args().Present() {
 						return cli.Exit("secret ls: too many arguments", 2)
 					}
-					return secretList(ctx, cmd.Writer)
+					return secretList(ctx, cmd.Writer, deps)
 				},
 			},
 			{
@@ -80,7 +75,7 @@ func secretCommand() *cli.Command {
 							2,
 						)
 					}
-					return secretSet(ctx, cmd.Reader, cmd.Writer, cmd.StringArgs("name")[0], len(source) > 0)
+					return secretSet(ctx, cmd.Reader, cmd.Writer, deps, cmd.StringArgs("name")[0], len(source) > 0)
 				},
 			},
 			{
@@ -94,22 +89,22 @@ func secretCommand() *cli.Command {
 					if cmd.Args().Present() {
 						return cli.Exit("secret rm: too many arguments", 2)
 					}
-					return secretRm(ctx, cmd.Writer, cmd.StringArgs("name")[0])
+					return secretRm(ctx, cmd.Writer, deps, cmd.StringArgs("name")[0])
 				},
 			},
 		},
 	}
 }
 
-// openSecretStore opens the local secrets store at the package path. It is
-// infallible to construct (the directory is created lazily on Set).
-func openSecretStore() (*secrets.LocalStore, error) {
-	return secrets.NewLocal(secretsPath)
+// openSecretStore opens the local secrets store at dir. It is infallible to
+// construct (the directory is created lazily on Set).
+func openSecretStore(dir string) (*secrets.LocalStore, error) {
+	return secrets.NewLocal(dir)
 }
 
 // secretList prints the sorted secret names as a single NAME column.
-func secretList(ctx context.Context, w io.Writer) error {
-	store, err := openSecretStore()
+func secretList(ctx context.Context, w io.Writer, deps Dependencies) error {
+	store, err := openSecretStore(deps.SecretsDir)
 	if err != nil {
 		return err
 	}
@@ -129,8 +124,8 @@ func secretList(ctx context.Context, w io.Writer) error {
 // secretSet reads a value (hidden from an interactive terminal, or all of stdin
 // when `-` was given) and writes it atomically. The value is never echoed and
 // never printed.
-func secretSet(ctx context.Context, in io.Reader, out io.Writer, name string, fromStdin bool) error {
-	store, err := openSecretStore()
+func secretSet(ctx context.Context, in io.Reader, out io.Writer, deps Dependencies, name string, fromStdin bool) error {
+	store, err := openSecretStore(deps.SecretsDir)
 	if err != nil {
 		return err
 	}
@@ -213,8 +208,8 @@ func trimSecretLineEnding(s string) string {
 }
 
 // secretRm removes a secret. A missing secret is an error (exit 1 via main).
-func secretRm(ctx context.Context, w io.Writer, name string) error {
-	store, err := openSecretStore()
+func secretRm(ctx context.Context, w io.Writer, deps Dependencies, name string) error {
+	store, err := openSecretStore(deps.SecretsDir)
 	if err != nil {
 		return err
 	}

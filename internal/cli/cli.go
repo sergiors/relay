@@ -15,8 +15,11 @@ import (
 
 	"github.com/urfave/cli/v3"
 
+	"relay/internal/app"
 	"relay/internal/config"
+	"relay/internal/git"
 	"relay/internal/processlock"
+	"relay/internal/secrets"
 	"relay/internal/state"
 	"relay/internal/stream"
 	"relay/internal/worker"
@@ -81,6 +84,23 @@ type Dependencies struct {
 	// lifetime; its parent directory is created before the lock is acquired.
 	// Production: processlock.DefaultPath.
 	LockPath string
+	// GitConfigPath is the persisted git-sync config file the `relay git`
+	// commands read and write. Production: git.ConfigPath.
+	GitConfigPath string
+	// GitCheckoutDir is the managed source checkout `relay git sync` clones
+	// into, `relay git status` inspects, and `relay git remove` deletes.
+	// Production: git.CheckoutDir.
+	GitCheckoutDir string
+	// GitSSHDir is the root holding Relay's SSH deploy key: `relay git keygen`
+	// writes it and `relay git sync` authenticates with it. Production:
+	// git.SSHDir.
+	GitSSHDir string
+	// GitAppsDir is the materialized applications root `relay git sync` writes
+	// into. Production: app.Dir.
+	GitAppsDir string
+	// SecretsDir is the local secret-store directory the `relay secret`
+	// commands read and write. Production: secrets.SecretsDir.
+	SecretsDir string
 	// Start runs the long-running Relay lifecycle `relay start` delegates to.
 	// Production: worker.Run.
 	Start StartRun
@@ -97,11 +117,16 @@ type Dependencies struct {
 // there are no environment overrides or setters.
 func DefaultDependencies() Dependencies {
 	return Dependencies{
-		OpenState:  openPostgresState,
-		SocketPath: worker.SocketPath,
-		LockPath:   processlock.DefaultPath,
-		Start:      worker.Run,
-		OpenDLQ:    openRedisDLQStore,
+		OpenState:      openPostgresState,
+		SocketPath:     worker.SocketPath,
+		LockPath:       processlock.DefaultPath,
+		GitConfigPath:  git.ConfigPath,
+		GitCheckoutDir: git.CheckoutDir,
+		GitSSHDir:      git.SSHDir,
+		GitAppsDir:     app.Dir,
+		SecretsDir:     secrets.SecretsDir,
+		Start:          worker.Run,
+		OpenDLQ:        openRedisDLQStore,
 	}
 }
 
@@ -153,8 +178,8 @@ func New(logger *slog.Logger, writer io.Writer, deps Dependencies) *cli.Command 
 			appCommand(deps),
 			appsCommand(deps),
 			dlqCommand(logger, deps),
-			secretCommand(),
-			gitCommand(),
+			secretCommand(deps),
+			gitCommand(deps),
 			statsCommand(deps),
 			healthCommand(deps),
 		},

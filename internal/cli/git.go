@@ -10,27 +10,15 @@ import (
 
 	"github.com/urfave/cli/v3"
 
-	"relay/internal/app"
 	git "relay/internal/git"
 )
 
-// gitConfigPath, gitCheckoutDir, gitSSHDir, and gitAppsDir are the derived
-// paths the CLI git commands operate on. They default to the fixed internal
-// paths (/var/lib/relay/... and app.Dir); tests replace them with temp dirs
-// so the commands never touch /var/lib/relay or /apps.
-//
 // gitCloneURL is the transport seam for `git sync`, mirroring the git package's
 // SyncOptions.CloneURL. It is empty in production (sync uses the persisted,
 // validated SSH repository); tests point it at a local filesystem repository so
 // a real `relay git sync` runs end to end with no SSH and no network. It is
 // never persisted: Config.Repository always remains the validated SSH URL.
-var (
-	gitConfigPath  = git.ConfigPath
-	gitCheckoutDir = git.CheckoutDir
-	gitSSHDir      = git.SSHDir
-	gitAppsDir     = app.Dir
-	gitCloneURL    string
-)
+var gitCloneURL string
 
 // gitCommand builds the `relay git ...` manual sync subcommand family. It never
 // runs automatically and never touches Redis, Docker, or the worker; it only
@@ -45,7 +33,7 @@ var (
 // removal report — is presentation and goes to the command writer. Operational
 // diagnostics for background sync (the worker/webhook path) are emitted by the
 // git package through SyncOptions.Log, which this command leaves nil.
-func gitCommand() *cli.Command {
+func gitCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "git",
 		Usage: "Manage manual Git synchronization",
@@ -57,7 +45,7 @@ func gitCommand() *cli.Command {
 				Name:      "keygen",
 				Usage:     "Generate an SSH deploy key",
 				UsageText: "relay git keygen",
-				Description: "Generate a new ed25519 pair under " + gitSSHDir + " (0700/0600) and " +
+				Description: "Generate a new ed25519 pair under " + deps.GitSSHDir + " (0700/0600) and " +
 					"print the public key in authorized_keys form. Add it as a read-only Deploy " +
 					"Key with your provider; Relay itself never calls a provider API. Fails if a " +
 					"key already exists (remove the file to regenerate).",
@@ -65,7 +53,7 @@ func gitCommand() *cli.Command {
 					if cmd.Args().Present() {
 						return cli.Exit("git keygen: too many arguments", 2)
 					}
-					return gitKeygen(cmd.Writer)
+					return gitKeygen(cmd.Writer, deps)
 				},
 			},
 			{
@@ -97,6 +85,7 @@ func gitCommand() *cli.Command {
 					return gitSet(
 						ctx,
 						cmd.Writer,
+						deps,
 						cmd.StringArgs("repository")[0],
 						cmd.String("ref"),
 						cmd.String("path"),
@@ -114,7 +103,7 @@ func gitCommand() *cli.Command {
 					if cmd.Args().Present() {
 						return cli.Exit("git sync: too many arguments", 2)
 					}
-					return gitSync(ctx, cmd.Writer)
+					return gitSync(ctx, cmd.Writer, deps)
 				},
 			},
 			{
@@ -126,7 +115,7 @@ func gitCommand() *cli.Command {
 					if cmd.Args().Present() {
 						return cli.Exit("git status: too many arguments", 2)
 					}
-					return gitStatus(cmd.Writer)
+					return gitStatus(cmd.Writer, deps)
 				},
 			},
 			{
@@ -143,7 +132,7 @@ func gitCommand() *cli.Command {
 					if cmd.Args().Present() {
 						return cli.Exit("git remove: too many arguments", 2)
 					}
-					return gitRemoveAction(ctx, cmd)
+					return gitRemoveAction(ctx, cmd, deps)
 				},
 			},
 		},
@@ -152,8 +141,8 @@ func gitCommand() *cli.Command {
 
 // gitKeygen generates the SSH key and prints the public key plus deployment
 // guidance. An existing key is an error (the message says so).
-func gitKeygen(w io.Writer) error {
-	pub, err := git.GenerateKey(gitSSHDir)
+func gitKeygen(w io.Writer, deps Dependencies) error {
+	pub, err := git.GenerateKey(deps.GitSSHDir)
 	if err != nil {
 		return err
 	}
@@ -171,14 +160,14 @@ func gitKeygen(w io.Writer) error {
 // confirmation line on w IS the complete record of this single-step command. The
 // confirmation line may mention the webhook-secret REFERENCE name (never its
 // value).
-func gitSet(ctx context.Context, w io.Writer, repository, ref, path, webhookSecretRef string) error {
+func gitSet(ctx context.Context, w io.Writer, deps Dependencies, repository, ref, path, webhookSecretRef string) error {
 	// Default the ref to DefaultRef when the flag was omitted, so the
 	// confirmation line shows the effective ref. SetSource applies the same
 	// default and the full canonical validation.
 	if ref == "" {
 		ref = git.DefaultRef
 	}
-	if err := git.SetSource(gitConfigPath, repository, ref, path, webhookSecretRef); err != nil {
+	if err := git.SetSource(deps.GitConfigPath, repository, ref, path, webhookSecretRef); err != nil {
 		return err
 	}
 	fmt.Fprintf(w, "Set git source repository=%s ref=%s", repository, ref)
@@ -193,16 +182,17 @@ func gitSet(ctx context.Context, w io.Writer, repository, ref, path, webhookSecr
 }
 
 // gitSync runs the manual sync; the process context propagates Ctrl-C. The sync
-// reads the persisted config itself (via opts.ConfigPath), so production simply
-// points at the CLI-level dir defaults. SyncOptions.Log is left nil: this
-// short-lived command's step summary on w is its complete user-facing record,
-// and background operational diagnostics belong to the worker/webhook path.
-func gitSync(ctx context.Context, w io.Writer) error {
+// reads the persisted config itself (via opts.ConfigPath), so the CLI passes its
+// injected filesystem locations straight through. SyncOptions.Log is left nil:
+// this short-lived command's step summary on w is its complete user-facing
+// record, and background operational diagnostics belong to the worker/webhook
+// path.
+func gitSync(ctx context.Context, w io.Writer, deps Dependencies) error {
 	o := git.NewSyncOptions()
-	o.ConfigPath = gitConfigPath
-	o.CheckoutDir = gitCheckoutDir
-	o.AppsDir = gitAppsDir
-	o.SSHDir = gitSSHDir
+	o.ConfigPath = deps.GitConfigPath
+	o.CheckoutDir = deps.GitCheckoutDir
+	o.AppsDir = deps.GitAppsDir
+	o.SSHDir = deps.GitSSHDir
 	o.CloneURL = gitCloneURL
 	o.Out = w
 	return git.Sync(ctx, o)
@@ -212,8 +202,8 @@ func gitSync(ctx context.Context, w io.Writer) error {
 // NOT an error: it prints "No git source configured." and returns nil (exit 0).
 // It takes no logger: the rendered table on w IS the status report, and there is
 // no multi-step progress to trail.
-func gitStatus(w io.Writer) error {
-	s, err := git.Status(gitConfigPath, gitSSHDir, gitCheckoutDir)
+func gitStatus(w io.Writer, deps Dependencies) error {
+	s, err := git.Status(deps.GitConfigPath, deps.GitSSHDir, deps.GitCheckoutDir)
 	if err != nil {
 		// A corrupt config is a genuine error; nothing-configured is not.
 		return err
@@ -232,9 +222,9 @@ func gitStatus(w io.Writer) error {
 // removed, no output on the command writer). That default makes the command
 // safe for automation: piped stdin with EOF reads "" and therefore cancels, so
 // a bare non-interactive `git remove` can never remove anything.
-func gitRemoveAction(ctx context.Context, cmd *cli.Command) error {
+func gitRemoveAction(ctx context.Context, cmd *cli.Command, deps Dependencies) error {
 	if cmd.Bool("yes") {
-		return gitRemove(cmd.Writer)
+		return gitRemove(cmd.Writer, deps)
 	}
 	yes, err := confirmRemove(cmd.Reader, cmd.Writer, os.Stderr)
 	if err != nil {
@@ -246,7 +236,7 @@ func gitRemoveAction(ctx context.Context, cmd *cli.Command) error {
 		// the removal report is the only record.
 		return nil
 	}
-	return gitRemove(cmd.Writer)
+	return gitRemove(cmd.Writer, deps)
 }
 
 // confirmRemove asks the operator on stderr for a remove confirmation and
@@ -290,6 +280,6 @@ func readLine(in io.Reader) (string, error) {
 // gitRemove removes the config and checkout, leaving /apps and the key.
 // It takes no logger: the removal report on w IS the complete record of this
 // single-step command.
-func gitRemove(w io.Writer) error {
-	return git.Remove(gitConfigPath, gitCheckoutDir, w)
+func gitRemove(w io.Writer, deps Dependencies) error {
+	return git.Remove(deps.GitConfigPath, deps.GitCheckoutDir, w)
 }

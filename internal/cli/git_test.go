@@ -17,36 +17,50 @@ type cliGitPaths struct {
 	configPath, checkoutDir, sshDir, appsDir string
 }
 
-// redirectGitDirs points the CLI git paths at temp dirs so tests never touch
-// /var/lib/relay or /apps, and returns the redirected paths. It also clears
-// the git sync transport seam (gitCloneURL) so a test that wants a local
-// filesystem source opts in explicitly; the previous values are restored on
-// cleanup.
-func redirectGitDirs(t *testing.T) cliGitPaths {
+// redirectGitDirs builds test dependencies whose CLI git paths live under
+// fresh temp dirs so tests never touch /var/lib/relay or /apps, and returns
+// the dependencies together with the injected paths for assertions. The only
+// remaining package-level seam, the git sync transport seam (gitCloneURL), is
+// cleared here and restored on cleanup: a test that wants a local filesystem
+// source opts in explicitly.
+func redirectGitDirs(t *testing.T) (Dependencies, cliGitPaths) {
 	t.Helper()
-	oldCfg, oldCo, oldSSH, oldFn := gitConfigPath, gitCheckoutDir, gitSSHDir, gitAppsDir
 	oldClone := gitCloneURL
 	gitCloneURL = ""
+	t.Cleanup(func() { gitCloneURL = oldClone })
 	p := cliGitPaths{
 		configPath:  filepath.Join(t.TempDir(), "git", "source.json"),
 		checkoutDir: filepath.Join(t.TempDir(), "git", "checkout"),
 		sshDir:      filepath.Join(t.TempDir(), "ssh"),
 		appsDir:     filepath.Join(t.TempDir(), "functions"),
 	}
-	gitConfigPath, gitCheckoutDir, gitSSHDir, gitAppsDir = p.configPath, p.checkoutDir, p.sshDir, p.appsDir
-	t.Cleanup(func() {
-		gitConfigPath, gitCheckoutDir, gitSSHDir, gitAppsDir = oldCfg, oldCo, oldSSH, oldFn
-		gitCloneURL = oldClone
-	})
-	return p
+	deps := testDeps(t)
+	deps.GitConfigPath = p.configPath
+	deps.GitCheckoutDir = p.checkoutDir
+	deps.GitSSHDir = p.sshDir
+	deps.GitAppsDir = p.appsDir
+	return deps, p
+}
+
+// runGitCLI is runCLI with caller-supplied git dependencies.
+func runGitCLI(t *testing.T, deps Dependencies, stdin string, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
+	return runCLIWithDeps(t, deps, stdin, args...)
+}
+
+// runGitCLIWithLogger is runCLIWithLogger with caller-supplied git dependencies.
+func runGitCLIWithLogger(t *testing.T, logger *slog.Logger, deps Dependencies, stdin string, args ...string) (
+	stdout, stderr string, err error) {
+	t.Helper()
+	return runCLIWithLoggerAndDeps(t, logger, deps, stdin, args...)
 }
 
 // TestGitKeygenPrintsPublicKey drives the CLI keygen command and verifies the
 // public key line prints with the authorized_keys prefix and the key file is
 // written under the redirected SSH dir.
 func TestGitKeygenPrintsPublicKey(t *testing.T) {
-	p := redirectGitDirs(t)
-	out, _, err := runCLI(t, "", "git", "keygen")
+	deps, p := redirectGitDirs(t)
+	out, _, err := runGitCLI(t, deps, "", "git", "keygen")
 	if err != nil {
 		t.Fatalf("git keygen: err = %v, want nil", err)
 	}
@@ -61,11 +75,11 @@ func TestGitKeygenPrintsPublicKey(t *testing.T) {
 // TestGitKeygenRefusesExistingKey drives a second keygen through the CLI and
 // expects an error mentioning the key already exists.
 func TestGitKeygenRefusesExistingKey(t *testing.T) {
-	_ = redirectGitDirs(t)
-	if _, _, err := runCLI(t, "", "git", "keygen"); err != nil {
+	deps, _ := redirectGitDirs(t)
+	if _, _, err := runGitCLI(t, deps, "", "git", "keygen"); err != nil {
 		t.Fatalf("first keygen: %v", err)
 	}
-	_, _, err := runCLI(t, "", "git", "keygen")
+	_, _, err := runGitCLI(t, deps, "", "git", "keygen")
 	if err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("second keygen err = %v, want 'already exists'", err)
 	}
@@ -74,8 +88,8 @@ func TestGitKeygenRefusesExistingKey(t *testing.T) {
 // TestGitSetPersistsAndDefaultsRef drives `git set` through the CLI and verifies
 // the config file persists with the repository and the default ref.
 func TestGitSetPersistsAndDefaultsRef(t *testing.T) {
-	p := redirectGitDirs(t)
-	out, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git")
+	deps, p := redirectGitDirs(t)
+	out, _, err := runGitCLI(t, deps, "", "git", "set", "git@github.com:acme/repo.git")
 	if err != nil {
 		t.Fatalf("git set: %v", err)
 	}
@@ -93,8 +107,8 @@ func TestGitSetPersistsAndDefaultsRef(t *testing.T) {
 
 // TestGitSetExplicitRefAndPath verifies --ref and --path are persisted.
 func TestGitSetExplicitRefAndPath(t *testing.T) {
-	p := redirectGitDirs(t)
-	_, _, err := runCLI(t, "", "git", "set", "--ref", "v1.2.3", "--path", "pkg/fn", "git@github.com:acme/repo.git")
+	deps, p := redirectGitDirs(t)
+	_, _, err := runGitCLI(t, deps, "", "git", "set", "--ref", "v1.2.3", "--path", "pkg/fn", "git@github.com:acme/repo.git")
 	if err != nil {
 		t.Fatalf("git set: %v", err)
 	}
@@ -108,8 +122,8 @@ func TestGitSetExplicitRefAndPath(t *testing.T) {
 // secret REFERENCE name into source.json and reflects it in the confirmation
 // line (the name, never the value).
 func TestGitSetWebhookSecretPersistsRef(t *testing.T) {
-	p := redirectGitDirs(t)
-	out, _, err := runCLI(t, "", "git", "set", "--webhook-secret", "gh_secret", "git@github.com:acme/repo.git")
+	deps, p := redirectGitDirs(t)
+	out, _, err := runGitCLI(t, deps, "", "git", "set", "--webhook-secret", "gh_secret", "git@github.com:acme/repo.git")
 	if err != nil {
 		t.Fatalf("git set --webhook-secret: %v", err)
 	}
@@ -128,8 +142,8 @@ func TestGitSetWebhookSecretPersistsRef(t *testing.T) {
 // TestGitSetWebhookSecretDefaultsEmpty verifies omitting --webhook-secret leaves
 // it empty (the webhook endpoint stays disabled) and the confirmation omits the field.
 func TestGitSetWebhookSecretDefaultsEmpty(t *testing.T) {
-	p := redirectGitDirs(t)
-	out, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git")
+	deps, p := redirectGitDirs(t)
+	out, _, err := runGitCLI(t, deps, "", "git", "set", "git@github.com:acme/repo.git")
 	if err != nil {
 		t.Fatalf("git set: %v", err)
 	}
@@ -145,9 +159,9 @@ func TestGitSetWebhookSecretDefaultsEmpty(t *testing.T) {
 // TestGitSetRejectsInvalidWebhookSecret verifies an invalid --webhook-secret
 // name (uppercase, slash) is rejected and nothing is persisted.
 func TestGitSetRejectsInvalidWebhookSecret(t *testing.T) {
-	p := redirectGitDirs(t)
+	deps, p := redirectGitDirs(t)
 	for _, ref := range []string{"GH_secret", "a/b"} {
-		_, _, err := runCLI(t, "", "git", "set", "--webhook-secret", ref, "git@github.com:acme/repo.git")
+		_, _, err := runGitCLI(t, deps, "", "git", "set", "--webhook-secret", ref, "git@github.com:acme/repo.git")
 		if err == nil {
 			t.Fatalf("git set --webhook-secret %q: nil, want error", ref)
 		}
@@ -159,9 +173,9 @@ func TestGitSetRejectsInvalidWebhookSecret(t *testing.T) {
 
 // TestGitSetRejectsInvalidURL ensures an http/https/non-SSH URL is rejected.
 func TestGitSetRejectsInvalidURL(t *testing.T) {
-	p := redirectGitDirs(t)
+	deps, p := redirectGitDirs(t)
 	for _, u := range []string{"https://github.com/a/r", "http://x/y", "file:///tmp/r"} {
-		_, _, err := runCLI(t, "", "git", "set", u)
+		_, _, err := runGitCLI(t, deps, "", "git", "set", u)
 		if err == nil || !strings.Contains(err.Error(), "SSH") {
 			t.Fatalf("git set %q err = %v, want SSH-only error", u, err)
 		}
@@ -173,9 +187,9 @@ func TestGitSetRejectsInvalidURL(t *testing.T) {
 
 // TestGitSetRejectsTraversal ensures a monorepo --path that escapes is rejected.
 func TestGitSetRejectsTraversal(t *testing.T) {
-	p := redirectGitDirs(t)
+	deps, p := redirectGitDirs(t)
 	for _, path := range []string{"../x", "/abs", "a/../../b"} {
-		_, _, err := runCLI(t, "", "git", "set", "--path", path, "git@github.com:acme/repo.git")
+		_, _, err := runGitCLI(t, deps, "", "git", "set", "--path", path, "git@github.com:acme/repo.git")
 		if err == nil {
 			t.Fatalf("git set --path %q: nil, want traversal error", path)
 		}
@@ -222,8 +236,8 @@ func TestGitSetAndLoadConfigShareValidators(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			p := redirectGitDirs(t)
-			_, _, setErr := runCLI(t, "", c.args...)
+			deps, p := redirectGitDirs(t)
+			_, _, setErr := runGitCLI(t, deps, "", c.args...)
 			if setErr == nil {
 				t.Fatal("git set: nil error, want rejection")
 			}
@@ -256,8 +270,8 @@ func TestGitSetAndLoadConfigShareValidators(t *testing.T) {
 // TestGitStatusNoConfig drives `git status` with nothing configured: it prints
 // "No git source configured." and exits 0 (not an error).
 func TestGitStatusNoConfig(t *testing.T) {
-	_ = redirectGitDirs(t)
-	out, _, err := runCLI(t, "", "git", "status")
+	deps, _ := redirectGitDirs(t)
+	out, _, err := runGitCLI(t, deps, "", "git", "status")
 	if err != nil {
 		t.Fatalf("git status (no config): err = %v, want nil", err)
 	}
@@ -269,11 +283,11 @@ func TestGitStatusNoConfig(t *testing.T) {
 // TestGitStatusShowsConfigured drives `git status` after a set: it prints the
 // configured repository/ref and the key/checkout booleans, never key material.
 func TestGitStatusShowsConfigured(t *testing.T) {
-	_ = redirectGitDirs(t)
-	if _, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
+	deps, _ := redirectGitDirs(t)
+	if _, _, err := runGitCLI(t, deps, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
 		t.Fatalf("set: %v", err)
 	}
-	out, _, err := runCLI(t, "", "git", "status")
+	out, _, err := runGitCLI(t, deps, "", "git", "status")
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
@@ -289,7 +303,7 @@ func TestGitStatusShowsConfigured(t *testing.T) {
 // and multi-token) returns a friendly Docker-style usage error naming the full
 // command path and pointing at the exact help command.
 func TestGitUnknownSubcommandFriendlyError(t *testing.T) {
-	_ = redirectGitDirs(t)
+	deps, _ := redirectGitDirs(t)
 	for _, c := range []struct {
 		args []string
 		full string
@@ -297,7 +311,7 @@ func TestGitUnknownSubcommandFriendlyError(t *testing.T) {
 		{[]string{"git", "asdsa"}, "relay git asdsa"},
 		{[]string{"git", "foo", "bar"}, "relay git foo bar"},
 	} {
-		_, _, err := runCLI(t, "", c.args...)
+		_, _, err := runGitCLI(t, deps, "", c.args...)
 		if err == nil {
 			t.Fatalf("%v: err = nil, want usage error", c.args)
 		}
@@ -316,8 +330,8 @@ func TestGitUnknownSubcommandFriendlyError(t *testing.T) {
 // TestGitBareShowsHelp verifies `git` alone shows the subcommand help on stdout
 // and exits 0 (nil error), listing every subcommand.
 func TestGitBareShowsHelp(t *testing.T) {
-	_ = redirectGitDirs(t)
-	out, _, err := runCLI(t, "", "git")
+	deps, _ := redirectGitDirs(t)
+	out, _, err := runGitCLI(t, deps, "", "git")
 	if err != nil {
 		t.Fatalf("git alone: err = %v, want nil", err)
 	}
@@ -336,11 +350,11 @@ func TestGitBareShowsHelp(t *testing.T) {
 func TestGitRemoveConfirmed(t *testing.T) {
 	for _, answer := range []string{"y\n", "yes\n"} {
 		t.Run("answer="+strings.TrimSpace(answer), func(t *testing.T) {
-			p := redirectGitDirs(t)
-			if _, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
+			deps, p := redirectGitDirs(t)
+			if _, _, err := runGitCLI(t, deps, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
 				t.Fatalf("set: %v", err)
 			}
-			out, _, err := runCLI(t, answer, "git", "remove")
+			out, _, err := runGitCLI(t, deps, answer, "git", "remove")
 			if err != nil {
 				t.Fatalf("remove: %v", err)
 			}
@@ -358,12 +372,12 @@ func TestGitRemoveConfirmed(t *testing.T) {
 // a junk answer) cancel silently: nil error, NO output on the command writer,
 // the config STILL present, and the checkout untouched.
 func TestGitRemoveCancelled(t *testing.T) {
-	p := redirectGitDirs(t)
+	deps, p := redirectGitDirs(t)
 	for _, answer := range []string{"n\n", "maybe\n"} {
-		if _, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
+		if _, _, err := runGitCLI(t, deps, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
 			t.Fatalf("set: %v", err)
 		}
-		out, _, err := runCLI(t, answer, "git", "remove")
+		out, _, err := runGitCLI(t, deps, answer, "git", "remove")
 		if err != nil {
 			t.Fatalf("remove with %q: err = %v, want nil", answer, err)
 		}
@@ -384,12 +398,12 @@ func TestGitRemoveCancelled(t *testing.T) {
 // with empty stdin and the -y flag is accepted.
 func TestGitRemoveSkipsPromptWithYesFlag(t *testing.T) {
 	for _, flag := range []string{"-y", "--yes"} {
-		p := redirectGitDirs(t)
-		if _, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
+		deps, p := redirectGitDirs(t)
+		if _, _, err := runGitCLI(t, deps, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
 			t.Fatalf("set: %v", err)
 		}
 		// Empty stdin: with the flag the prompt is skipped, so removal proceeds.
-		out, _, err := runCLI(t, "", "git", "remove", flag)
+		out, _, err := runGitCLI(t, deps, "", "git", "remove", flag)
 		if err != nil {
 			t.Fatalf("remove %s: err = %v, want nil", flag, err)
 		}
@@ -406,11 +420,11 @@ func TestGitRemoveSkipsPromptWithYesFlag(t *testing.T) {
 // non-interactive stdin: a bare `git remove` reading EOF (empty piped stdin)
 // cancels silently (nil error, no output) and leaves the config intact.
 func TestGitRemoveCancelledEmptyStdin(t *testing.T) {
-	p := redirectGitDirs(t)
-	if _, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
+	deps, p := redirectGitDirs(t)
+	if _, _, err := runGitCLI(t, deps, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
 		t.Fatalf("set: %v", err)
 	}
-	out, _, err := runCLI(t, "", "git", "remove")
+	out, _, err := runGitCLI(t, deps, "", "git", "remove")
 	if err != nil {
 		t.Fatalf("remove: err = %v, want nil", err)
 	}
@@ -427,17 +441,17 @@ func TestGitRemoveCancelledEmptyStdin(t *testing.T) {
 // The first remove passes -y so it skips the confirmation gate; the second
 // passes -y too (there is nothing configured, so there is no risk either way).
 func TestGitRemoveIdempotent(t *testing.T) {
-	p := redirectGitDirs(t)
-	if _, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
+	deps, p := redirectGitDirs(t)
+	if _, _, err := runGitCLI(t, deps, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
 		t.Fatalf("set: %v", err)
 	}
-	if _, _, err := runCLI(t, "", "git", "remove", "-y"); err != nil {
+	if _, _, err := runGitCLI(t, deps, "", "git", "remove", "-y"); err != nil {
 		t.Fatalf("first remove: %v", err)
 	}
 	if _, err := os.Stat(p.configPath); !os.IsNotExist(err) {
 		t.Fatal("config not removed")
 	}
-	out, _, err := runCLI(t, "", "git", "remove", "-y")
+	out, _, err := runGitCLI(t, deps, "", "git", "remove", "-y")
 	if err != nil {
 		t.Fatalf("second remove: %v", err)
 	}
@@ -452,7 +466,7 @@ func TestGitRemoveIdempotent(t *testing.T) {
 // never parses the contents. The persisted config is dropped and the checkout is
 // cleaned up alongside it.
 func TestGitRemoveInvalidConfig(t *testing.T) {
-	p := redirectGitDirs(t)
+	deps, p := redirectGitDirs(t)
 
 	// A hand-edited config with bad JSON: LoadConfig rejects it.
 	if err := os.MkdirAll(filepath.Dir(p.configPath), 0o700); err != nil {
@@ -469,7 +483,7 @@ func TestGitRemoveInvalidConfig(t *testing.T) {
 		t.Fatalf("mkdir checkout: %v", err)
 	}
 
-	out, _, err := runCLI(t, "", "git", "remove", "-y")
+	out, _, err := runGitCLI(t, deps, "", "git", "remove", "-y")
 	if err != nil {
 		t.Fatalf("git remove -y with invalid config: %v", err)
 	}
@@ -486,8 +500,8 @@ func TestGitRemoveInvalidConfig(t *testing.T) {
 
 // TestGitHelpRendersSubcommands verifies `git --help` lists the subcommands.
 func TestGitHelpRendersSubcommands(t *testing.T) {
-	_ = redirectGitDirs(t)
-	out, _, err := runCLI(t, "", "git", "--help")
+	deps, _ := redirectGitDirs(t)
+	out, _, err := runGitCLI(t, deps, "", "git", "--help")
 	if err != nil {
 		t.Fatalf("git --help: %v", err)
 	}
@@ -501,8 +515,8 @@ func TestGitHelpRendersSubcommands(t *testing.T) {
 // TestGitSetTooManyArgs verifies extra positional args after the repository are
 // rejected.
 func TestGitSetTooManyArgs(t *testing.T) {
-	_ = redirectGitDirs(t)
-	_, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git", "extra")
+	deps, _ := redirectGitDirs(t)
+	_, _, err := runGitCLI(t, deps, "", "git", "set", "git@github.com:acme/repo.git", "extra")
 	if err == nil || !strings.Contains(err.Error(), "too many arguments") {
 		t.Fatalf("git set extra err = %v, want too many arguments", err)
 	}
@@ -514,12 +528,12 @@ func TestGitSetTooManyArgs(t *testing.T) {
 // future change cannot reintroduce CLI debug/progress logging without also
 // changing the signature; this guards the wiring through the command tree.
 func TestGitCommandsDoNotUseLogger(t *testing.T) {
-	_ = redirectGitDirs(t)
+	deps, _ := redirectGitDirs(t)
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	// keygen: public key + guidance on the writer.
-	out, _, err := runCLIWithLogger(t, logger, "", "git", "keygen")
+	out, _, err := runGitCLIWithLogger(t, logger, deps, "", "git", "keygen")
 	if err != nil {
 		t.Fatalf("git keygen: %v", err)
 	}
@@ -528,7 +542,7 @@ func TestGitCommandsDoNotUseLogger(t *testing.T) {
 	}
 
 	// set: confirmation on the writer.
-	out, _, err = runCLIWithLogger(t, logger, "", "git", "set", "git@github.com:acme/repo.git")
+	out, _, err = runGitCLIWithLogger(t, logger, deps, "", "git", "set", "git@github.com:acme/repo.git")
 	if err != nil {
 		t.Fatalf("git set: %v", err)
 	}
@@ -537,7 +551,7 @@ func TestGitCommandsDoNotUseLogger(t *testing.T) {
 	}
 
 	// status: table on the writer.
-	out, _, err = runCLIWithLogger(t, logger, "", "git", "status")
+	out, _, err = runGitCLIWithLogger(t, logger, deps, "", "git", "status")
 	if err != nil {
 		t.Fatalf("git status: %v", err)
 	}
@@ -546,7 +560,7 @@ func TestGitCommandsDoNotUseLogger(t *testing.T) {
 	}
 
 	// remove: report on the writer (-y skips the prompt).
-	out, _, err = runCLIWithLogger(t, logger, "", "git", "remove", "-y")
+	out, _, err = runGitCLIWithLogger(t, logger, deps, "", "git", "remove", "-y")
 	if err != nil {
 		t.Fatalf("git remove: %v", err)
 	}
@@ -576,14 +590,14 @@ func seedLocalBareRepo(t *testing.T) string {
 // exclusively to the background worker/webhook path (covered by the git package
 // tests); a short-lived CLI sync must not trail debug output.
 func TestGitSyncCLIStepsAreWriterOnlyAtDebug(t *testing.T) {
-	p := redirectGitDirs(t)
+	deps, p := redirectGitDirs(t)
 	bare := seedLocalBareRepo(t)
 
 	// Persist a valid SSH source (the only thing Config.Repository may hold now)
 	// and route the actual transport through the CLI's documented local-test seam
 	// (gitCloneURL), exactly as the git package drives local sources via
 	// SyncOptions.CloneURL.
-	if _, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
+	if _, _, err := runGitCLI(t, deps, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
 		t.Fatalf("git set: %v", err)
 	}
 	gitCloneURL = bare
@@ -591,7 +605,7 @@ func TestGitSyncCLIStepsAreWriterOnlyAtDebug(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	out, _, err := runCLIWithLogger(t, logger, "", "git", "sync")
+	out, _, err := runGitCLIWithLogger(t, logger, deps, "", "git", "sync")
 	if err != nil {
 		t.Fatalf("git sync: %v", err)
 	}
