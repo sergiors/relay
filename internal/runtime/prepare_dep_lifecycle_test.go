@@ -397,10 +397,12 @@ func TestPrepareDependencyLeaseReleasedOnCancellation(t *testing.T) {
 
 // TestPrepareMultipleDependencyLeasesSpanGC is the N-concurrent-preparations
 // proof for the shared, content-addressed dependency layer. Two apps with
-// identical manifests resolve to ONE dependency image; while both preparations
-// are parked in its build, each holds its OWN lease, so the count is 2 and GC
-// must keep the layer. Releasing one preparation leaves the other pinning it; GC
-// still keeps it; only when the last releases does the same GC pass remove it.
+// identical manifests resolve to ONE dependency image; the first preparation
+// builds it while the second waits on the per-reference build deduplication,
+// and each still holds its OWN lease, so the count is 2 and GC must keep the
+// layer. The app-image builds are then parked so one preparation can return
+// while the other keeps pinning the layer; only the last release makes it
+// collectible.
 func TestPrepareMultipleDependencyLeasesSpanGC(t *testing.T) {
 	fnA, imageA, depRef := dependencyLifecycleFixture(t, "dep-multi-a")
 	fnB, imageB, depRefB := dependencyLifecycleFixture(t, "dep-multi-b")
@@ -408,8 +410,12 @@ func TestPrepareMultipleDependencyLeasesSpanGC(t *testing.T) {
 		t.Fatalf("A and B must share one dependency layer, got %s and %s", depRef, depRefB)
 	}
 
-	gate := newCountingRaceGate(2)
-	defer gate.releaseAll()
+	// Only ONE dependency build runs for the shared layer; both app builds are
+	// parked afterwards so the lease-release ordering is observable.
+	depGate := newCountingRaceGate(1)
+	appGate := newCountingRaceGate(2)
+	defer depGate.releaseAll()
+	defer appGate.releaseAll()
 
 	dels := 0
 	cli := newScriptedDockerClient(t,
@@ -419,8 +425,11 @@ func TestPrepareMultipleDependencyLeasesSpanGC(t *testing.T) {
 		dockerRoute{
 			method: http.MethodPost, path: "/build", body: `{"stream":"ok"}`,
 			onRequest: func(req *http.Request) {
-				if req.URL.Query().Get("t") == depRef {
-					gate.parked(req, gate.arrive())
+				switch req.URL.Query().Get("t") {
+				case depRef:
+					depGate.parked(req, depGate.arrive())
+				case imageA, imageB:
+					appGate.parked(req, appGate.arrive())
 				}
 			},
 		},
@@ -437,9 +446,11 @@ func TestPrepareMultipleDependencyLeasesSpanGC(t *testing.T) {
 		}()
 	}
 
-	gate.waitEntered(t, "both preparations parked in the shared dependency build")
-	if got := m.LeaseCount(depRef); got != 2 {
-		t.Fatalf("dependency lease count = %d, want 2 (one per in-flight preparation)", got)
+	depGate.waitEntered(t, "the leader parked in the shared dependency build")
+	// The follower admits its dependency lease before it joins the in-flight
+	// build, so a bounded poll is only bridging that goroutine scheduling gap.
+	if !pollUntil(nil, 2*time.Second, func() bool { return m.LeaseCount(depRef) == 2 }) {
+		t.Fatalf("dependency lease count = %d, want 2 (one per in-flight preparation)", m.LeaseCount(depRef))
 	}
 
 	// Both preparations hold the layer: GC must keep it and issue no DELETE.
@@ -451,8 +462,16 @@ func TestPrepareMultipleDependencyLeasesSpanGC(t *testing.T) {
 		t.Fatalf("GC removed %d (DELETE %d) while two preparations held the dependency, want 0", removed, dels)
 	}
 
+	// Let the shared dependency build finish: both preparations proceed to their
+	// own app-image build and park there, still each holding the dependency lease.
+	close(depGate.slot(0))
+	appGate.waitEntered(t, "both preparations parked in their app-image builds")
+	if got := m.LeaseCount(depRef); got != 2 {
+		t.Fatalf("dependency lease count with both app builds parked = %d, want 2", got)
+	}
+
 	// Release one preparation: the other still pins the layer.
-	close(gate.slot(0))
+	close(appGate.slot(0))
 	if err := <-done; err != nil {
 		t.Fatalf("first prepare failed: %v", err)
 	}
@@ -468,7 +487,7 @@ func TestPrepareMultipleDependencyLeasesSpanGC(t *testing.T) {
 	}
 
 	// The last preparation releases: the layer is now collectible.
-	close(gate.slot(1))
+	close(appGate.slot(1))
 	if err := <-done; err != nil {
 		t.Fatalf("second prepare failed: %v", err)
 	}

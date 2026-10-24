@@ -41,16 +41,15 @@ const DefaultWarmContainerIdleTimeout = 5 * time.Minute
 // maxConcurrentInvocations zero (treated as this default, never "uncapped").
 const DefaultMaxConcurrentInvocations = 8
 
-// DefaultMaxConcurrentBuilds is the cap on runtime-backed image-preparation
-// pipelines running concurrently in this worker, applied by NewManager when no
+// DefaultMaxConcurrentBuilds is the cap on dependency-image and app-image
+// builds running concurrently in this worker, applied by NewManager when no
 // WithMaxConcurrentBuilds option is given. It mirrors
 // config.DefaultMaxConcurrentBuilds (this leaf package cannot import config);
 // the worker always passes config's resolved value explicitly, and a Manager
 // constructed directly by tests leaves maxConcurrentBuilds zero (treated as
-// this default, never unbounded). The cap is per Manager (one per worker), so
-// it bounds aggregate preparation — source selection/snapshot, dependency
-// snapshot, reuse probes, dependency image build, and app image build — and is
-// independent of the invocation-concurrency cap.
+// this default, never unbounded). The cap is per Manager (one per worker); a
+// permit is held only while a build runs, so non-build preparation does not
+// consume build capacity. It is independent of the invocation-concurrency cap.
 const DefaultMaxConcurrentBuilds = 2
 
 // DefaultMaxWarmContainers is the worker-global hard bound on warm execution
@@ -136,16 +135,16 @@ type Manager struct {
 	// default runner).
 	maxConcurrentInvocations int
 	// maxConcurrentBuilds is the per-worker cap (MAX_CONCURRENT_BUILDS) on
-	// runtime-backed image-preparation pipelines running concurrently: one
-	// permit is held for a preparation's WHOLE duration — source selection and
-	// snapshot, dependency snapshot, reuse probes, dependency image build, and
-	// app image build — so dependency and app sub-builds are sequential within
-	// one permit. It is set once at construction (WithMaxConcurrentBuilds; the
-	// worker wires config's resolved value) and read without the lock: it is
-	// startup configuration and is NOT hot-reloadable. A zero value falls back
-	// to DefaultMaxConcurrentBuilds, never "unbounded". The limiter itself is
-	// built lazily and race-safely (see buildLimiterFor) so a Manager
-	// constructed directly by tests is bounded too.
+	// dependency-image and app-image builds running concurrently. A permit is
+	// held only for an actual build, never for source selection/snapshot,
+	// dependency snapshots, or reuse probes, so non-build preparation does not
+	// consume build capacity. It is set once at construction
+	// (WithMaxConcurrentBuilds; the worker wires config's resolved value) and
+	// read without the lock: it is startup configuration and is NOT
+	// hot-reloadable. A zero value falls back to DefaultMaxConcurrentBuilds,
+	// never "unbounded". The limiter itself is built lazily and race-safely
+	// (see buildLimiterFor) so a Manager constructed directly by tests is
+	// bounded too.
 	maxConcurrentBuilds int
 	// maxWarmContainers is the worker-global hard bound (MAX_WARM_CONTAINERS) on
 	// warm EXECUTION containers this worker keeps across all apps. It is set
@@ -155,12 +154,13 @@ type Manager struct {
 	// "unbounded". It bounds the pooled execution-container population, not
 	// invocation concurrency; persistent service containers are outside it.
 	maxWarmContainers int
-	// buildLimit is the per-Manager preparation semaphore. It is created by
-	// NewManager; a Manager constructed directly by tests lazily initializes it
-	// on first use (buildLimiterFor), so every preparation is bounded even when
-	// the option was never supplied. Capacity is immutable after creation. It is
-	// an atomic pointer so the lazy fallback can be read concurrently with a
-	// racing initialization without a data race.
+	// buildLimit is the per-Manager build semaphore shared by every Prepare
+	// caller (startup and live reconcile). It is created by NewManager; a
+	// Manager constructed directly by tests lazily initializes it on first use
+	// (buildLimiterFor), so every build is bounded even when the option was
+	// never supplied. Capacity is immutable after creation. It is an atomic
+	// pointer so the lazy fallback can be read concurrently with a racing
+	// initialization without a data race.
 	buildLimit     atomic.Pointer[buildLimiter]
 	buildLimitInit sync.Once
 	// networks is the worker-global Docker network set (NETWORKS) every
@@ -211,6 +211,13 @@ type Manager struct {
 	// pullMu.
 	pullMu     sync.Mutex
 	pullChecks map[string]time.Time
+	// depBuilds deduplicates concurrent builds of the SAME content-addressed
+	// dependency image. Parallel preparations of apps with identical manifest
+	// inputs are common at startup, and the layer is shared, so only one caller
+	// builds it while the others wait for that outcome. Guarded by depBuildMu;
+	// lazy-initialized so a directly constructed Manager is usable.
+	depBuildMu sync.Mutex
+	depBuilds  map[string]*dependencyBuild
 	// sourceMount is the worker-global HOT_RELOAD switch: when true, a runtime
 	// whose dependency layout permits it (plan.Spec.MountableSource) builds a
 	// source-independent app image and bind-mounts the app's live /apps source
@@ -318,13 +325,23 @@ type Manager struct {
 	// released when Prepare returns — including on the cancellation path. It is
 	// read and never mutated after construction.
 	afterSourceSnapshot func(*app.SourceSnapshot)
-	// afterBuildPermit is the deterministic seam immediately after a
-	// runtime-backed prepare acquires its preparation permit and before any
-	// source selection, snapshot, or build work. It is nil in production and
-	// never called then. A test uses it to hold a preparation inside the
-	// bounded section (tracking how many run concurrently) and to prove the
+	// afterBuildPermit is the deterministic seam immediately after an image
+	// build acquires its permit and before the build runs. It is nil in
+	// production and never called then. A test uses it to hold a build inside
+	// the bounded section (tracking how many run concurrently) and to prove the
 	// per-worker build cap is enforced without sleeps.
 	afterBuildPermit func()
+	// afterDependencyJoin is the deterministic seam fired when a preparation
+	// takes the in-flight deduplication JOIN branch in buildDependencyOnce —
+	// i.e. exactly when a concurrent preparation with the same
+	// content-addressed dependency reference starts waiting on another
+	// caller's in-flight build instead of issuing its own. It fires before the
+	// joiner blocks on that build's outcome, so a test receives a channel
+	// witness that the follower joined while the leader is still parked
+	// mid-build: the exactly-one-shared-build invariant is provable without
+	// sleeping and without racing the leader's completion. Nil in production,
+	// never called then.
+	afterDependencyJoin func(depRef string)
 }
 
 // ManagerOption tunes NewManager. Options keep the three-argument constructor
@@ -341,9 +358,9 @@ type managerOptions struct {
 	// package default (DefaultMaxConcurrentInvocations), matching the runner's
 	// normalization.
 	maxConcurrentInvocations int
-	// maxConcurrentBuilds is the cap on concurrent runtime-backed preparation
-	// pipelines. Zero means the package default (DefaultMaxConcurrentBuilds),
-	// never "unbounded".
+	// maxConcurrentBuilds is the cap on concurrent dependency-image and
+	// app-image builds. Zero means the package default
+	// (DefaultMaxConcurrentBuilds), never "unbounded".
 	maxConcurrentBuilds int
 	// maxWarmContainers is the worker-global hard bound on warm execution
 	// containers (MAX_WARM_CONTAINERS). Zero means the package default
@@ -394,17 +411,18 @@ func WithMaxConcurrentInvocations(n int) ManagerOption {
 }
 
 // WithMaxConcurrentBuilds sets the per-worker cap (MAX_CONCURRENT_BUILDS) on
-// runtime-backed image-preparation pipelines running concurrently. A permit is
-// held for a preparation's whole duration (source selection and snapshot,
-// dependency snapshot, reuse probes, dependency image build, and app image
-// build), so the cap bounds aggregate preparation, not just each Docker build
-// call. It is independent of the invocation-concurrency cap and of the local
-// event buffer, and it is NOT a host-wide resource quota: each worker enforces
-// its own, so N workers may run up to N * capacity preparations. A
-// non-positive value is treated as DefaultMaxConcurrentBuilds (never
-// "unbounded"). It is startup configuration: changing it requires a worker
-// restart (there is no live setter). The worker wires it from config; a direct
-// NewManager caller that omits it gets DefaultMaxConcurrentBuilds.
+// dependency-image and app-image builds running concurrently. A permit is held
+// only while a build is actually running, so source selection/snapshot,
+// dependency snapshots, and reuse probes do not consume build capacity.
+// Dependency and app sub-builds of one preparation remain sequential because
+// they run in the same preparation goroutine. The cap is independent of the
+// invocation-concurrency cap and of the local event buffer, and it is NOT a
+// host-wide resource quota: each worker enforces its own, so N workers may run
+// up to N * capacity builds. A non-positive value is treated as
+// DefaultMaxConcurrentBuilds (never "unbounded"). It is startup configuration:
+// changing it requires a worker restart (there is no live setter). The worker
+// wires it from config; a direct NewManager caller that omits it gets
+// DefaultMaxConcurrentBuilds.
 func WithMaxConcurrentBuilds(n int) ManagerOption {
 	return func(o *managerOptions) { o.maxConcurrentBuilds = n }
 }
@@ -552,8 +570,8 @@ func NewManager(
 		sourceMount:              resolved.sourceMount,
 		pullChecks:               map[string]time.Time{},
 	}
-	// Construct the preparation limiter now with the resolved capacity, so the
-	// lazy fallback in buildLimiterFor is never needed for a NewManager-built
+	// Construct the build limiter now with the resolved capacity, so the lazy
+	// fallback in buildLimiterFor is never needed for a NewManager-built
 	// Manager. A direct-construction Manager (tests) builds an equivalent one on
 	// first use. Capacity is immutable after construction.
 	mgr.buildLimit.Store(newBuildLimiter(resolved.maxConcurrentBuilds))

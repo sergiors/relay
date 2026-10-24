@@ -53,8 +53,8 @@ worker; admin commands communicate with it or read persistent state.
   persisted-stats owner key. It must be unique per concurrent worker and stable
   across restarts; there is no hostname or generated fallback. `InstanceID` is a
   fresh per-process fencing token, never configured.
-- Invocation concurrency, runtime image preparation, and worker-global warm
-  execution containers are separate limits. Do not conflate their scope or
+- Invocation concurrency, runtime image build concurrency, and worker-global
+  warm execution containers are separate limits. Do not conflate their scope or
   backpressure semantics; consult `README.md` and runtime/runner docs.
 - Shutdown must join work that can use shared dependencies before closing those
   dependencies.

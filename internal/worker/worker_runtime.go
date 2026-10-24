@@ -40,13 +40,14 @@ func openRuntimeManager(
 		// reports, and admits only the cap's worth. It is startup
 		// configuration; a global change requires a worker restart.
 		runtime.WithMaxConcurrentInvocations(cfg.MaxConcurrentInvocations),
-		// The per-worker cap (MAX_CONCURRENT_BUILDS) on runtime-backed
-		// image-preparation pipelines running concurrently. It bounds the
-		// whole preparation (source selection/snapshot, dependency
-		// snapshot, reuse probes, dependency and app image builds), so it
-		// is independent of invocation concurrency and of the local event
-		// buffer. It is startup configuration; a change requires a worker
-		// restart.
+		// The per-worker cap (MAX_CONCURRENT_BUILDS) on dependency and app
+		// image builds running concurrently. It is held only while a build
+		// actually runs, so non-build preparation (source
+		// selection/snapshot, dependency snapshot, reuse probes) does not
+		// consume a slot. The same Manager limiter bounds both startup and
+		// live reconcile preparations, independent of invocation concurrency
+		// and of the local event buffer. It is startup configuration; a
+		// change requires a worker restart.
 		runtime.WithMaxConcurrentBuilds(cfg.MaxConcurrentBuilds),
 		// The worker-global hard bound (MAX_WARM_CONTAINERS) on warm
 		// EXECUTION containers this worker keeps across all apps. It

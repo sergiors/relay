@@ -112,15 +112,17 @@ type Config struct {
 	// runner.SetMaxConcurrentInvocations); it is always positive after Load.
 	MaxConcurrentInvocations int
 	// MaxConcurrentBuilds is the MAX_CONCURRENT_BUILDS value (default 2): the
-	// cap on runtime-backed image-preparation pipelines running concurrently in
-	// this single Relay worker. One preparation pipeline (source selection and
-	// snapshot, dependency snapshot, dependency image build, app image build)
-	// occupies one slot for its WHOLE duration, so a preparation's dependency
-	// and app sub-builds are sequential within one permit. It is INDEPENDENT of
-	// MaxConcurrentInvocations and of MAX_BUFFERED_EVENTS, and it is not a
-	// host-wide resource quota: each worker enforces its own, so a deployment of
-	// N workers can run up to N * MaxConcurrentBuilds preparations. It is always
-	// positive after Load.
+	// cap on dependency-image and app-image builds running concurrently in this
+	// single Relay worker. It is held only while a build actually runs, so
+	// non-build preparation (source selection and snapshot, dependency
+	// snapshot, reuse probes) does not consume a slot; a preparation's
+	// dependency and app sub-builds remain sequential within its own goroutine.
+	// Startup preparation also uses this value as its worker-pool size, so it
+	// never starts one goroutine per app.
+	// It is INDEPENDENT of MaxConcurrentInvocations and of MAX_BUFFERED_EVENTS,
+	// and it is not a host-wide resource quota: each worker enforces its own,
+	// so a deployment of N workers can run up to N * MaxConcurrentBuilds
+	// builds. It is always positive after Load.
 	MaxConcurrentBuilds int
 	// MaxWarmContainers is the MAX_WARM_CONTAINERS value (default 8): the hard
 	// per-worker bound on warm EXECUTION containers this worker keeps across all

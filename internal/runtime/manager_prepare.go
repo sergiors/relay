@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -34,15 +35,22 @@ func engineFor(spec plan.Spec) (interface {
 	}
 }
 
+// errBuildSlotWait marks a build that never started because the caller's
+// context was cancelled before a permit became available. Shared dependency
+// builds use it to distinguish "the leader never built" (safe to retry) from a
+// genuine build failure (whose outcome every waiter must observe).
+var errBuildSlotWait = errors.New("wait for build slot")
+
 // buildLimiter is the per-Manager counting semaphore that bounds how many
-// runtime-backed image-preparation pipelines run concurrently. It is a plain
-// buffered channel of permits, mirroring the runner's invocation semaphore: a
-// preparation holds one permit for its WHOLE duration (source selection and
-// snapshot, dependency snapshot, reuse probes, dependency image build, and app
-// image build), so the cap bounds aggregate preparation and dependency/app
-// sub-builds are sequential within one permit. Capacity is immutable after
-// construction; a Manager owns exactly one limiter, so the bound is per worker,
-// never global across workers.
+// image builds run concurrently. It is a plain buffered channel of permits,
+// mirroring the runner's invocation semaphore. A permit is acquired immediately
+// before a dependency-image or app-image build and released when that build
+// returns, so non-build preparation (source selection/snapshot, dependency
+// snapshot, and reuse probes) never occupies a build slot. Dependency and app
+// sub-builds of one preparation are still sequential because they run in the
+// same preparation goroutine. Capacity is immutable after construction; a
+// Manager owns exactly one limiter, so the bound is per worker, never global
+// across workers.
 type buildLimiter struct {
 	permits chan struct{}
 }
@@ -54,10 +62,10 @@ func newBuildLimiter(n int) *buildLimiter {
 	return &buildLimiter{permits: make(chan struct{}, n)}
 }
 
-// acquire takes one preparation permit, blocking until a permit frees or ctx is
-// done. On success the caller MUST release exactly once. On cancellation it
-// returns ctx.Err() and holds no permit, so a cancelled preparation never enters
-// the bounded section and never needs a release.
+// acquire takes one build permit, blocking until a permit frees or ctx is done.
+// On success the caller MUST release exactly once. On cancellation it returns
+// ctx.Err() and holds no permit, so a cancelled build never enters the bounded
+// section and never needs a release.
 //
 // Cancellation is preferred even when a permit is free: the pre-select ctx.Err
 // check and the post-send re-check make a cancelled waiter lose deterministically
@@ -82,17 +90,17 @@ func (l *buildLimiter) acquire(ctx context.Context) error {
 	}
 }
 
-// release returns one preparation permit. It must be called exactly once per
+// release returns one build permit. It must be called exactly once per
 // successful acquire.
 func (l *buildLimiter) release() {
 	<-l.permits
 }
 
-// buildLimiterFor returns the Manager's preparation limiter, lazily creating a
+// buildLimiterFor returns the Manager's build limiter, lazily creating a
 // default-capacity one only for a Manager constructed directly (tests) that
 // never went through NewManager. The sync.Once makes the fallback race-safe, so
-// concurrent preparations cannot each build their own limiter, and the limiter
-// is stored in an atomic pointer so a racing initialization can also be read
+// concurrent builds cannot each create their own limiter, and the limiter is
+// stored in an atomic pointer so a racing initialization can also be read
 // safely. Capacity is immutable once created.
 func (m *Manager) buildLimiterFor() *buildLimiter {
 	if l := m.buildLimit.Load(); l != nil {
@@ -106,6 +114,16 @@ func (m *Manager) buildLimiterFor() *buildLimiter {
 		m.buildLimit.Store(newBuildLimiter(capacity))
 	})
 	return m.buildLimit.Load()
+}
+
+// MaxConcurrentBuilds returns the effective per-worker cap on concurrent image
+// builds. Startup preparation uses it to size its bounded worker pool: at most
+// this many preparations run at once, while only the actual dependency/app
+// builds take a limiter slot. A Manager constructed directly (tests) with no
+// configured value reports DefaultMaxConcurrentBuilds, exactly like its build
+// limiter, so startup never launches an unbounded goroutine per app.
+func (m *Manager) MaxConcurrentBuilds() int {
+	return cap(m.buildLimiterFor().permits)
 }
 
 // Prepared is an app whose image has been built.
@@ -324,31 +342,6 @@ func (m *Manager) prepare(
 		// stale mount record from a previous runtime-backed version.
 		m.clearSourceMount(fn.Name)
 		return prepared, nil
-	}
-
-	// Acquire one preparation permit BEFORE any runtime-backed disk/metadata
-	// work, so the per-worker cap (MAX_CONCURRENT_BUILDS) bounds the WHOLE
-	// pipeline that follows — source selection (when resolved here), the source
-	// snapshot, the dependency snapshot, the reuse probes, the dependency image
-	// build, and the app image build — not merely the Docker call. Dependency
-	// and app sub-builds are therefore sequential within one permit. The wait
-	// selects on the caller's ctx and returns ctx.Err() WITHOUT taking the
-	// snapshot, probing, building, or logging when cancelled; the build itself
-	// stays independently bounded by the manager lifecycle once the permit is
-	// held, since the limiter capacity is immutable and the permits channel is
-	// never closed. The deferred release runs on every return, failure, and
-	// panic. The limiter is per Manager (one per worker), so this bounds this
-	// worker's preparations only.
-	limit := m.buildLimiterFor()
-	if err := limit.acquire(ctx); err != nil {
-		return nil, fmt.Errorf("app %q: wait for build slot: %w", fn.Name, err)
-	}
-	defer limit.release()
-	if m.afterBuildPermit != nil {
-		// Test-only seam: fires immediately after the permit is acquired and
-		// before any source/build work, so a test can hold a preparation inside
-		// the bounded section without sleeps. Nil in production.
-		m.afterBuildPermit()
 	}
 
 	// Resolve the source-selection policy ONCE. The policy (the app's
@@ -661,7 +654,6 @@ func (m *Manager) prepare(
 		planResult.RuntimeTools = nil
 	}
 
-	start := time.Now()
 	// The build runs on an independent, lifecycle-rooted buildTimeout context,
 	// NOT on the caller's ctx. In production the reconciler and the startup
 	// preparation both pass the worker LIFECYCLE context (Prepare is a seam
@@ -671,18 +663,9 @@ func (m *Manager) prepare(
 	// keep using the caller's ctx — they are quick and must honor its
 	// cancellation.
 	//
-	// notifyAppBuild fires at this exact boundary — after every reuse probe,
-	// immediately before buildImage — so the caller publishes the persisted
-	// building status only when an image build is actually issued; a reused image
-	// never flashes building.
-	notifyAppBuild(ctx)
-	buildCtx, buildCancel := m.buildContext()
-	defer buildCancel()
-	// The actual managed image build boundary (after every reuse probe). The span
-	// is rooted in the caller's context so it nests under the preparing
-	// app's span; the build itself still runs on the lifecycle-bounded
-	// buildCtx. Only a real build is spanned; a reuse probe (above) is not.
-	_, buildSpan := startRuntimeSpan(ctx, "runtime.build", fn.Name, image)
+	// runImageBuild acquires a build slot, fires notifyAppBuild only at the
+	// point a build is actually issued, and opens the runtime.build span. A
+	// reused image never flashes building or occupies a slot.
 	// The managed-image relay.fingerprint label. For a baked-source image it is
 	// the source fingerprint the tag embeds. For a HOT_RELOAD image it is
 	// deliberately EMPTY: the image is source-independent, and Execute derives
@@ -709,11 +692,14 @@ func (m *Manager) prepare(
 	if mountSource {
 		appLabels[labelFingerprint] = ""
 	}
-	if err := buildImage(buildCtx, m.cli, fn.Name, fn, planResult, image, appLabels, sourceSnapshot, m.metrics, !mountSource); err != nil {
-		buildSpan.RecordError(err)
-		buildSpan.SetStatus(codes.Error, err.Error())
-		buildSpan.End()
-		elapsed := time.Since(start)
+	buildElapsed, buildErr := m.runImageBuild(ctx, fn.Name, image, func(buildCtx context.Context) error {
+		return buildImage(
+			buildCtx, m.cli, fn.Name, fn, planResult, image, appLabels,
+			sourceSnapshot, m.metrics, !mountSource,
+		)
+	})
+	if buildErr != nil {
+		elapsed := buildElapsed
 		m.metrics.ObserveDurationLabels(metrics.MetricAppBuild, []metrics.Label{
 			{Name: "app", Value: fn.Name},
 		}, elapsed)
@@ -751,10 +737,9 @@ func (m *Manager) prepare(
 				)
 			}
 		}
-		return nil, err
+		return nil, buildErr
 	}
-	buildSpan.End()
-	elapsed := time.Since(start)
+	elapsed := buildElapsed
 	m.metrics.ObserveDurationLabels(metrics.MetricAppBuild,
 		[]metrics.Label{{Name: "app", Value: fn.Name}}, elapsed)
 	m.log.Info("App: built",
@@ -918,53 +903,175 @@ func (m *Manager) ensureDependencyImage(
 		)
 		return depRef, nil
 	}
-	m.log.Debug(
-		"Dependency image absent; building",
-		"dep_image", depRef,
-		"inspect_duration", time.Since(depReuseStart),
-	)
 
-	start := time.Now()
-	// As in Prepare's app-image build, the dependency build uses an
-	// independent lifecycle-rooted buildTimeout context rather than the caller's
-	// ctx, so a slow install step is never cut off by a short reconcile budget
-	// while still being cancelled at Relay shutdown. The imageExists probe above
-	// keeps the caller's ctx. notifyAppBuild fires at this exact boundary so
-	// a dependency build also reports the building status.
-	notifyAppBuild(ctx)
-	buildCtx, buildCancel := m.buildContext()
-	defer buildCancel()
-	// The dependency layer is a real build, so it is spanned like the app
-	// image build. The span nests under the preparing app's span.
-	_, depBuildSpan := startRuntimeSpan(ctx, "runtime.build", fn.Name, depRef)
-	if err := buildDependencyImage(buildCtx, m.cli, spec, deps, snap, depRef, depFingerprint, arch, m.metrics); err != nil {
-		depBuildSpan.RecordError(err)
-		depBuildSpan.SetStatus(codes.Error, err.Error())
-		depBuildSpan.End()
-		elapsed := time.Since(start)
-		// Dependency-image build failures count as app build failures so the
-		// existing failure metric/label surface stays the single observability
-		// contract for "this app could not be prepared".
-		m.metrics.IncLabels(metrics.MetricAppBuildFailures, []metrics.Label{
-			{Name: "app", Value: fn.Name},
+	// Content-addressed dependency layers are shared by every app that declares
+	// the same manifest inputs. Concurrent preparations therefore claim at most
+	// ONE build per reference: the first caller builds, the rest wait for its
+	// outcome instead of issuing the same expensive install again. A waiter
+	// holds no build permit while it waits.
+	err := m.buildDependencyOnce(ctx, depRef, func() error {
+		// The layer may have appeared while this preparation resolved its own
+		// inputs and claimed the build. Re-probe before spending a slot.
+		reprobeStart := time.Now()
+		if m.imageExists(ctx, depRef) {
+			m.log.Debug(
+				"Dependency image exists; reusing",
+				"dep_image", depRef,
+				"inspect_duration", time.Since(reprobeStart),
+			)
+			return nil
+		}
+		m.log.Debug(
+			"Dependency image absent; building",
+			"dep_image", depRef,
+			"inspect_duration", time.Since(reprobeStart),
+		)
+
+		elapsed, buildErr := m.runImageBuild(ctx, fn.Name, depRef, func(buildCtx context.Context) error {
+			// As in Prepare's app-image build, the dependency build uses an
+			// independent lifecycle-rooted buildTimeout context rather than the
+			// caller's ctx, so a slow install step is never cut off by a short
+			// reconcile budget while still being cancelled at Relay shutdown.
+			return buildDependencyImage(
+				buildCtx, m.cli, spec, deps, snap, depRef, depFingerprint,
+				arch, m.metrics,
+			)
 		})
-		m.log.Error("App: dependency build failed",
+		if buildErr != nil {
+			// Dependency-image build failures count as app build failures so the
+			// existing failure metric/label surface stays the single
+			// observability contract for "this app could not be prepared".
+			m.metrics.IncLabels(metrics.MetricAppBuildFailures, []metrics.Label{
+				{Name: "app", Value: fn.Name},
+			})
+			m.log.Error("App: dependency build failed",
+				"app", fn.Name,
+				"duration", elapsed,
+				"dep_image", depRef,
+				"result", "failed",
+			)
+			return buildErr
+		}
+		m.metrics.ObserveDurationLabels(metrics.MetricAppBuild,
+			[]metrics.Label{{Name: "app", Value: fn.Name}}, elapsed)
+		m.log.Info("App: dependency layer built",
 			"app", fn.Name,
 			"duration", elapsed,
 			"dep_image", depRef,
-			"result", "failed",
+			"result", "success",
 		)
+		return nil
+	})
+	if err != nil {
 		return "", err
 	}
-	depBuildSpan.End()
-	elapsed := time.Since(start)
-	m.metrics.ObserveDurationLabels(metrics.MetricAppBuild,
-		[]metrics.Label{{Name: "app", Value: fn.Name}}, elapsed)
-	m.log.Info("App: dependency layer built",
-		"app", fn.Name,
-		"duration", elapsed,
-		"dep_image", depRef,
-		"result", "success",
-	)
 	return depRef, nil
+}
+
+// dependencyBuild is one in-flight dependency-image build that concurrent
+// preparations with the same content-addressed reference may wait on.
+type dependencyBuild struct {
+	done chan struct{}
+	// err is written before done is closed and read only after receiving from
+	// done, so the channel close provides the happens-before edge.
+	err error
+}
+
+// buildDependencyOnce runs build for depRef unless an identical build is
+// already in flight, in which case it waits for that build's outcome instead.
+// It is the per-Manager deduplication point for shared dependency layers: a
+// parallel startup or live reconcile can resolve the same layer from several
+// apps at once, but the expensive install runs at most once per in-flight
+// generation.
+//
+// Waiting is cancellable by the caller's ctx without cancelling the leader's
+// build. If the leader was cancelled while waiting for a build slot, its build
+// never started (errBuildSlotWait); a caller whose own context is still live
+// then retries as the new leader rather than inheriting an unrelated
+// cancellation. A genuine build failure — including an actual build cut off by
+// the manager lifecycle or the build timeout — is returned to every waiter and
+// is never retried here.
+func (m *Manager) buildDependencyOnce(ctx context.Context, depRef string, build func() error) error {
+	for {
+		m.depBuildMu.Lock()
+		if m.depBuilds == nil {
+			m.depBuilds = make(map[string]*dependencyBuild)
+		}
+		if inflight, ok := m.depBuilds[depRef]; ok {
+			m.depBuildMu.Unlock()
+			// Test-only seam: fires exactly when this caller JOINED the
+			// in-flight build rather than claiming it, before it blocks on the
+			// leader's outcome. Nil in production, never called then.
+			if m.afterDependencyJoin != nil {
+				m.afterDependencyJoin(depRef)
+			}
+			select {
+			case <-inflight.done:
+				if inflight.err == nil {
+					return nil
+				}
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				if errors.Is(inflight.err, errBuildSlotWait) {
+					continue
+				}
+				return inflight.err
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		inflight := &dependencyBuild{done: make(chan struct{})}
+		m.depBuilds[depRef] = inflight
+		m.depBuildMu.Unlock()
+
+		err := build()
+
+		m.depBuildMu.Lock()
+		delete(m.depBuilds, depRef)
+		inflight.err = err
+		close(inflight.done)
+		m.depBuildMu.Unlock()
+		return err
+	}
+}
+
+// runImageBuild executes one dependency-image or app-image build under the
+// Manager's shared MAX_CONCURRENT_BUILDS limiter and the lifecycle-bounded
+// build context. The permit is acquired only for the build itself, so source
+// selection/snapshot, dependency snapshots, and reuse probes never occupy a
+// slot. notifyAppBuild and the runtime.build span fire only once the slot is
+// held and a build is actually issued; a reused image does neither. The
+// returned duration measures the build itself, excluding any wait for a slot.
+func (m *Manager) runImageBuild(
+	ctx context.Context,
+	appName string,
+	image string,
+	build func(context.Context) error,
+) (time.Duration, error) {
+	limit := m.buildLimiterFor()
+	if err := limit.acquire(ctx); err != nil {
+		return 0, fmt.Errorf("app %q: %w: %w", appName, errBuildSlotWait, err)
+	}
+	defer limit.release()
+	if m.afterBuildPermit != nil {
+		// Test-only seam: fires immediately after the permit is acquired and
+		// before the build runs, so a test can hold a build inside the bounded
+		// section without sleeps. Nil in production.
+		m.afterBuildPermit()
+	}
+
+	start := time.Now()
+	notifyAppBuild(ctx)
+	buildCtx, buildCancel := m.buildContext()
+	defer buildCancel()
+	_, buildSpan := startRuntimeSpan(ctx, "runtime.build", appName, image)
+	err := build(buildCtx)
+	elapsed := time.Since(start)
+	if err != nil {
+		buildSpan.RecordError(err)
+		buildSpan.SetStatus(codes.Error, err.Error())
+	}
+	buildSpan.End()
+	return elapsed, err
 }

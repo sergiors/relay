@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"relay/internal/app"
@@ -21,8 +22,14 @@ type handoffCapture struct {
 // Manager so the startup handoff is provable without Docker: the fingerprint and
 // selection must be the ones the startup resolver produced, not a recomputation.
 type startupSpyPreparer struct {
+	// mu guards the recording fields: prepareApps calls Prepare concurrently for
+	// distinct apps.
+	mu        sync.Mutex
 	calls     int
 	callsByFn map[string]handoffCapture
+	// maxConcurrentBuilds sizes prepareApps' worker pool; zero means the runtime
+	// default, mirroring a directly constructed Manager.
+	maxConcurrentBuilds int
 	// overrideFingerprint, when non-empty, is returned as the Prepared.Fingerprint
 	// instead of echoing the supplied value. It stands in for the snapshot-derived
 	// identity the real Prepare returns, so a test can prove callers persist the
@@ -36,6 +43,7 @@ func (s *startupSpyPreparer) PrepareWithFingerprintAndSelection(
 	fingerprint string,
 	selection *source.Selection,
 ) (*runtime.Prepared, error) {
+	s.mu.Lock()
 	s.calls++
 	if s.callsByFn == nil {
 		s.callsByFn = make(map[string]handoffCapture)
@@ -45,11 +53,19 @@ func (s *startupSpyPreparer) PrepareWithFingerprintAndSelection(
 	if s.overrideFingerprint != "" {
 		built = s.overrideFingerprint
 	}
+	s.mu.Unlock()
 	return &runtime.Prepared{
 		Name:        fn.Name,
 		Image:       "img-" + fn.Name,
 		Fingerprint: built,
 	}, nil
+}
+
+func (s *startupSpyPreparer) MaxConcurrentBuilds() int {
+	if s.maxConcurrentBuilds > 0 {
+		return s.maxConcurrentBuilds
+	}
+	return runtime.DefaultMaxConcurrentBuilds
 }
 
 func (s *startupSpyPreparer) Execute(context.Context, *runtime.Prepared, string, []byte, []string) error {

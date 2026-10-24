@@ -31,7 +31,7 @@ provides fencing to prevent stale instances from overwriting statistics (see
 | ----------------------------- | ------------- | ---------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `LOG_LEVEL`                   | `INFO`        | `DEBUG`, `INFO`, `WARN`, `ERROR` (case-insensitive, trimmed)                       | Fails startup. `WARNING` is **not** an alias.                                                                                                                                                                                                                                                                                                                                                                   |
 | `MAX_CONCURRENT_INVOCATIONS`  | `8`           | positive integer                                                                   | Fails startup. Bounds concurrent invocations **per worker**.                                                                                                                                                                                                                                                                                                                                                    |
-| `MAX_CONCURRENT_BUILDS`       | `2`           | positive integer                                                                   | Fails startup. Bounds concurrent runtime-backed image-preparation pipelines **per worker**.                                                                                                                                                                                                                                                                                                                     |
+| `MAX_CONCURRENT_BUILDS`       | `2`           | positive integer                                                                   | Fails startup. Bounds concurrent dependency-image and app-image builds **per worker**; non-build preparation does not consume a slot.                                                                                                                                                                                                                                                                            |
 | `MAX_WARM_CONTAINERS`         | `8`           | positive integer                                                                   | Fails startup. Hard per-worker bound on warm **execution** containers across all apps (idle + busy); when saturated every idle container is LRU-evicted, and if all are busy the invocation stays pending. See below.                                                                                                                                                                                           |
 | `MAX_BUFFERED_EVENTS`         | `16`          | positive integer                                                                   | Fails startup. Per-worker bound on messages read from Redis and held locally, including deliveries waiting on execution capacity. It is **not** a bound on the Redis consumer-group PEL. See below.                                                                                                                                                                                                             |
 | `MAX_EVENT_BYTES`             | `256KiB`      | human-readable binary size (`256B`, `256KiB`, `1MiB`; bare integer bytes accepted) | Fails startup on zero/negative/malformed/decimal-unit/above-1MiB. Byte length of a message's raw `event` value; over-limit messages are non-retryably dead-lettered with a bounded summary.                                                                                                                                                                                                                     |
@@ -91,16 +91,20 @@ The third is **group-wide**, not a Relay buffer:
   delivered, while the PEL grows until that delivery is acknowledged.
 
 `MAX_CONCURRENT_BUILDS` (default `2`) is also **per worker** and bounds how many
-runtime-backed image-preparation pipelines run at once: one pipeline — source
-selection and snapshot, dependency snapshot, reuse probes, dependency image
-build, and app image build — holds one slot for its **whole** duration, so a
-preparation's dependency and app sub-builds are sequential within its slot. It
-is independent of `MAX_CONCURRENT_INVOCATIONS` and of `MAX_BUFFERED_EVENTS`, and
-it is **not** a host-wide resource quota: each worker enforces its own, so a
-deployment of `N` workers can run up to `N * MAX_CONCURRENT_BUILDS` preparations
-concurrently. It is startup configuration (restart to change). Only
-runtime-backed preparations take a slot; a template-only (no-runtime) prepare
-does not.
+dependency-image and app-image builds run at once: a slot is held only while a
+build is actually running, so non-build preparation (source selection and
+snapshot, dependency snapshot, and reuse probes) does not consume one. The
+dependency and app sub-builds of one preparation remain sequential because they
+run in the same preparation goroutine. Startup preparation also uses this cap as
+its worker-pool size, so it runs at most this many preparations at once and never
+starts a goroutine per app. Shared dependency layers are built at most
+once per in-flight generation even when parallel preparations resolve the same
+one. The cap is independent of `MAX_CONCURRENT_INVOCATIONS` and of
+`MAX_BUFFERED_EVENTS`, and it is **not** a host-wide resource quota: each worker
+enforces its own, so a deployment of `N` workers can run up to
+`N * MAX_CONCURRENT_BUILDS` builds concurrently. It is startup configuration
+(restart to change). Only runtime-backed preparations build an image; a
+template-only (no-runtime) prepare never takes a slot.
 
 ```
 Redis stream → bounded local buffer → matcher/dispatcher →

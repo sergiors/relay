@@ -1564,11 +1564,14 @@ func recordStartupIssue(
 }
 
 // appPreparer is the narrow view of the runtime Manager that startup
-// preparation needs: the selection-aware Prepare, plus (via runner.Executor) the
-// Execute used to pair each returned handle with its executor for the runner.
+// preparation needs: the selection-aware Prepare, the normalized build cap that
+// sizes the bounded startup worker pool, plus (via runner.Executor) the Execute
+// used to pair each returned handle with its executor for the runner.
 // *runtime.Manager satisfies it; a test spy can implement it, so the startup
 // handoff (the resolved fingerprint+selection must reach Prepare, not be
-// recomputed) is unit-testable without Docker.
+// recomputed) is unit-testable without Docker. prepareApps calls Prepare
+// concurrently for distinct apps, so implementations must be safe for
+// concurrent use (the Manager already is).
 type appPreparer interface {
 	PrepareWithFingerprintAndSelection(
 		ctx context.Context,
@@ -1576,12 +1579,24 @@ type appPreparer interface {
 		fingerprint string,
 		selection *source.Selection,
 	) (*runtime.Prepared, error)
+	// MaxConcurrentBuilds is the effective MAX_CONCURRENT_BUILDS cap, including
+	// its default normalization for a directly constructed Manager.
+	MaxConcurrentBuilds() int
 	runner.Executor
 }
 
-// prepareApps builds each app's image and returns the prepared set. A
+// prepareApps builds each app's image and returns the prepared set. An
 // app whose image cannot be built is marked unavailable (the runner skips
-// it) rather than failing startup; the rest carry their fresh image. It receives
+// it) rather than failing startup; the rest carry their fresh image.
+// Preparations run in a bounded worker pool sized by the runtime Manager's
+// effective MAX_CONCURRENT_BUILDS, so startup never launches one goroutine per
+// app. The Manager's single shared limiter still bounds actual image builds
+// (non-build snapshot/probe work takes no slot), and the returned set remains in
+// startup order. Jobs are assigned incrementally: each worker takes the next app
+// as soon as it finishes the previous one, with no batch barrier. A cancelled
+// lifecycle stops assigning new work and joins the active workers before
+// returning, as startup preparation must complete before service enqueue and
+// runner construction. It receives
 // the startup records — each app with the fingerprint resolved exactly once
 // and (for a runtime-backed app) the source selection that fingerprint was
 // derived from — and supplies BOTH to the selection-aware Prepare. Prepare
@@ -1627,9 +1642,55 @@ func prepareApps(
 	fencingTokens map[string]state.FencingToken,
 	logger *slog.Logger,
 ) []*runner.PreparedApp {
-	preparedCount := 0
-	prepared := make([]*runner.PreparedApp, 0, len(startup))
-	for _, s := range startup {
+	// A small fixed worker pool, sized by the Manager's effective
+	// MAX_CONCURRENT_BUILDS, takes jobs incrementally from an unbuffered channel:
+	// when any worker finishes, it receives the next app. This keeps startup
+	// concurrency bounded without a second semaphore, while the Manager's shared
+	// limiter still bounds the actual builds. Slots are indexed by startup order
+	// so the returned registry preserves that order regardless of completion
+	// order. Cancellation is honored while waiting to hand out a job: the
+	// scheduler then stops assigning and the workers finish only what was
+	// already admitted.
+	slots := make([]*runner.PreparedApp, len(startup))
+	workers := manager.MaxConcurrentBuilds()
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(startup) {
+		workers = len(startup)
+	}
+	type prepareJob struct {
+		index        int
+		app          startupApp
+		fencingToken state.FencingToken
+	}
+	jobs := make(chan prepareJob)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				slots[job.index] = prepareStartupApp(
+					ctx, manager, job.app, st, job.fencingToken, logger,
+				)
+			}
+		}()
+	}
+
+	stoppedAt := len(startup)
+schedule:
+	for i, s := range startup {
+		if err := ctx.Err(); err != nil {
+			// Stop ASSIGNING new preparations once the lifecycle is cancelled;
+			// already-assigned ones are joined below. The remaining apps are
+			// marked unavailable (the same terminal state a cancelled prepare
+			// produces) without being built or written to state.
+			stoppedAt = i
+			logger.Debug("Startup: app preparation stopped by shutdown",
+				"app", s.App.Name, "error", err)
+			break
+		}
 		fn := s.App
 		fencingToken := fencingTokens[fn.Name]
 		if st != nil && fencingToken <= 0 {
@@ -1643,40 +1704,83 @@ func prepareApps(
 			)
 			continue
 		}
-		prep, err := manager.PrepareWithFingerprintAndSelection(
-			managedRuntimeBuildContext(ctx, st, fn, fencingToken), fn, s.Fingerprint, s.Selection,
-		)
-		if err != nil {
-			// A build cancelled by the lifecycle is a shutdown, not a build
-			// failure: it must not record a spurious reconcile failure in the
-			// state DB. The app is still marked unavailable, but Run is
-			// already converging on shutdown.
-			if startupInterrupted(ctx, err) {
-				logger.Debug("App: prepare interrupted by shutdown", "app", fn.Name, "error", err)
-			} else {
-				logger.Warn("App: prepare failed", "app", fn.Name, "error", err)
-				if st != nil {
-					st.RecordReconcileFailure(ctx, fn.Name, err, fencingToken)
-				}
-			}
-			prepared = append(prepared, runner.NewUnavailable(fn))
+		select {
+		case jobs <- prepareJob{index: i, app: s, fencingToken: fencingToken}:
+		case <-ctx.Done():
+			stoppedAt = i
+			logger.Debug("Startup: app preparation stopped by shutdown",
+				"app", fn.Name, "error", ctx.Err())
+			break schedule
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	// Every worker has joined. Apps that were never assigned because of the
+	// cancellation are reported unavailable, in startup order, but are not
+	// prepared or persisted.
+	for i := stoppedAt; i < len(slots); i++ {
+		slots[i] = runner.NewUnavailable(startup[i].App)
+	}
+
+	prepared := make([]*runner.PreparedApp, 0, len(slots))
+	preparedCount := 0
+	for _, pf := range slots {
+		if pf == nil {
 			continue
 		}
-		if st != nil && len(fn.Template.Services) == 0 {
-			// Persist the fingerprint the image was ACTUALLY built from
-			// (prep.Fingerprint, derived from the one immutable source snapshot the
-			// build staged), never a later live rescan. Recording a post-build scan
-			// would claim the image serves content it does not: a source edit during
-			// a long build is not in the image, and the reconciler's watcher/periodic
-			// audit detects it by comparing the on-disk digest against this recorded
-			// built identity on the next pass.
-			st.RecordReconcileSuccess(ctx, fn.Name, prep.Image, prep.Fingerprint, time.Now(), fn, fencingToken)
+		prepared = append(prepared, pf)
+		if pf.Prepared() != nil {
+			preparedCount++
 		}
-		prepared = append(prepared, runner.NewPrepared(fn, prep, manager))
-		preparedCount++
 	}
 	logger.Info("Prepared apps", "count", preparedCount)
 	return prepared
+}
+
+// prepareStartupApp prepares ONE startup app and records its terminal state.
+// It is the per-app unit run concurrently by prepareApps: all per-app failure
+// semantics (unavailable without an active image, the interruption
+// classification that suppresses a spurious state failure, and the
+// building/ready observations) are unchanged. The exact startup fencing token
+// for this app is used for every guarded write.
+func prepareStartupApp(
+	ctx context.Context,
+	manager appPreparer,
+	s startupApp,
+	st *state.State,
+	fencingToken state.FencingToken,
+	logger *slog.Logger,
+) *runner.PreparedApp {
+	fn := s.App
+	prep, err := manager.PrepareWithFingerprintAndSelection(
+		managedRuntimeBuildContext(ctx, st, fn, fencingToken), fn, s.Fingerprint, s.Selection,
+	)
+	if err != nil {
+		// A build cancelled by the lifecycle is a shutdown, not a build
+		// failure: it must not record a spurious reconcile failure in the
+		// state DB. The app is still marked unavailable, but Run is
+		// already converging on shutdown.
+		if startupInterrupted(ctx, err) {
+			logger.Debug("App: prepare interrupted by shutdown", "app", fn.Name, "error", err)
+		} else {
+			logger.Warn("App: prepare failed", "app", fn.Name, "error", err)
+			if st != nil {
+				st.RecordReconcileFailure(ctx, fn.Name, err, fencingToken)
+			}
+		}
+		return runner.NewUnavailable(fn)
+	}
+	if st != nil && len(fn.Template.Services) == 0 {
+		// Persist the fingerprint the image was ACTUALLY built from
+		// (prep.Fingerprint, derived from the one immutable source snapshot the
+		// build staged), never a later live rescan. Recording a post-build scan
+		// would claim the image serves content it does not: a source edit during
+		// a long build is not in the image, and the reconciler's watcher/periodic
+		// audit detects it by comparing the on-disk digest against this recorded
+		// built identity on the next pass.
+		st.RecordReconcileSuccess(ctx, fn.Name, prep.Image, prep.Fingerprint, time.Now(), fn, fencingToken)
+	}
+	return runner.NewPrepared(fn, prep, manager)
 }
 
 // enqueueLiveServices snapshots the current prepared environment and publishes

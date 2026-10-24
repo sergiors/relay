@@ -46,6 +46,11 @@ type dockerRoute struct {
 	// simulate a transport-level failure (e.g. a request whose context was
 	// cancelled) through the real client call path.
 	fail func(req *http.Request) error
+	// serve, when set, REPLACES the route's static status/body with a per-request
+	// response. It lets a test model dynamic daemon state — e.g. an image that
+	// does not exist until a build completes — through the real client call path.
+	// Returning (0, "") falls back to the static status/body.
+	serve func(req *http.Request) (status int, body string)
 }
 
 func (s *scriptedDocker) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -80,10 +85,18 @@ func (s *scriptedDocker) RoundTrip(r *http.Request) (*http.Response, error) {
 			rt.onBody(reqBody)
 		}
 		status := rt.status
+		body := rt.body
+		if rt.serve != nil {
+			// A dynamic route answers per request; a (0, "") answer falls back
+			// to the static status/body above.
+			serveStatus, serveBody := rt.serve(r)
+			if serveStatus != 0 || serveBody != "" {
+				status, body = serveStatus, serveBody
+			}
+		}
 		if status == 0 {
 			status = http.StatusOK
 		}
-		body := rt.body
 		if body == "" {
 			body = "{}"
 		}
