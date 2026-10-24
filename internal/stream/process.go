@@ -126,32 +126,32 @@ func (c *Consumer) processMessage(
 
 	// Classify the decoded event against the schedule envelope. Three outcomes:
 	//
-	//   - NotScheduleClaim: an ordinary external event, handled below exactly as
-	//     before.
-	//   - ValidScheduleClaim: a well-formed schedule occurrence; when a
+	//   - NotScheduleEnvelope: an ordinary external event, handled below exactly
+	//     as before.
+	//   - ValidScheduleEnvelope: a well-formed schedule occurrence; when a
 	//     ScheduleRunner is wired it is routed to it, bypassing event matching
 	//     entirely. A nil ScheduleRunner falls back to treating it as a normal
 	//     event (the safe fallback for tests/unwired consumers).
-	//   - InvalidScheduleClaim: the event deliberately claims schedule identity
-	//     (source==relay.schedule) but is structurally incomplete, malformed, or
-	//     carries a mismatched occurrence_id. It must NEVER fall through to event
-	//     matching and be executed/ACKed as unmatched: it can never succeed, so
-	//     it is dead-lettered as a non-retryable failure, exactly like a
-	//     malformed event body. This holds whether or not a ScheduleRunner is
-	//     wired: a malformed claim is malformed either way.
+	//   - InvalidScheduleEnvelope: the event deliberately claims schedule
+	//     identity (source==relay.schedule) but is structurally incomplete,
+	//     malformed, or carries a mismatched occurrence_id. It must NEVER fall
+	//     through to event matching and be executed/ACKed as unmatched: it can
+	//     never succeed, so it is dead-lettered as a non-retryable failure,
+	//     exactly like a malformed event body. This holds whether or not a
+	//     ScheduleRunner is wired: a malformed claim is malformed either way.
 	//
 	// Classification happens BEFORE the invocation-state migration below, like
 	// the malformed-message path: an invalid claim is non-retryable and needs no
 	// recoverable state, so it is dead-lettered directly.
-	occ, claimKind, claimErr := schedule.ClassifyClaim(event)
-	if claimKind == schedule.InvalidScheduleClaim {
+	occ, envelopeKind, envelopeErr := schedule.ClassifyScheduleEnvelope(event)
+	if envelopeKind == schedule.InvalidScheduleEnvelope {
 		c.log.Error("Message: invalid schedule claim; routing to DLQ",
 			"message_id", msg.ID,
 			"delivery_attempt", deliveryNum,
-			"error", claimErr,
+			"error", envelopeErr,
 		)
-		outcome, spanErr = "dlq", claimErr
-		c.routeToDLQ(ctx, msg, claimErr, deliveryNum)
+		outcome, spanErr = "dlq", envelopeErr
+		c.routeToDLQ(ctx, msg, envelopeErr, deliveryNum)
 		return
 	}
 
@@ -191,7 +191,7 @@ func (c *Consumer) processMessage(
 	handlerCtx = WithInvocationState(handlerCtx,
 		NewInvocationState(ctx, c.invStateStore, c.stream, c.group, msg.ID, c.log))
 
-	if claimKind == schedule.ValidScheduleClaim && c.scheduleRunner != nil {
+	if envelopeKind == schedule.ValidScheduleEnvelope && c.scheduleRunner != nil {
 		outcome, spanErr = c.processScheduleMessage(ctx, msg.ID, deliveryNum, occ)
 		return
 	}

@@ -76,34 +76,36 @@ func (o Occurrence) Envelope() ([]byte, error) {
 	})
 }
 
-// ClaimKind classifies a decoded event against the schedule envelope:
+// ScheduleEnvelopeKind classifies a decoded event against the schedule
+// envelope:
 //
-//   - NotScheduleClaim: the event does not carry the reserved
+//   - NotScheduleEnvelope: the event does not carry the reserved
 //     source=="relay.schedule" marker, so it is an ordinary external event and
 //     must be left untouched by the schedule path.
-//   - ValidScheduleClaim: the event is a structurally valid schedule claim
+//   - ValidScheduleEnvelope: the event is a structurally valid schedule
+//     envelope
 //     (app/schedule/handler non-empty, a parseable scheduled_at, and an
 //     occurrence_id that matches the derived identity). It is routed to the
 //     schedule runner.
-//   - InvalidScheduleClaim: the event carries the reserved schedule marker but
-//     is structurally incomplete or inconsistent (a missing/empty/non-string
-//     field, an unparseable or sub-second scheduled_at, or an occurrence_id
-//     that does not match the derived identity). It is a malformed claim that
-//     must NEVER fall through to ordinary event matching and be executed/ACKed
-//     as unmatched; the stream routes it to the DLQ as a non-retryable failure.
-type ClaimKind int
+//   - InvalidScheduleEnvelope: the event carries the reserved schedule marker
+//     but is structurally incomplete or inconsistent (missing, empty, or
+//     non-string fields, an unparseable or sub-second scheduled_at, or an
+//     occurrence_id that does not match the derived identity). It must NEVER
+//     fall through to event matching or be ACKed as unmatched. The stream
+//     routes it to the DLQ as non-retryable.
+type ScheduleEnvelopeKind int
 
 const (
-	// NotScheduleClaim is an ordinary event that does not claim schedule identity.
-	NotScheduleClaim ClaimKind = iota
-	// ValidScheduleClaim is a well-formed schedule occurrence envelope.
-	ValidScheduleClaim
-	// InvalidScheduleClaim carries the schedule marker but is malformed.
-	InvalidScheduleClaim
+	// NotScheduleEnvelope is an ordinary event without the schedule source marker.
+	NotScheduleEnvelope ScheduleEnvelopeKind = iota
+	// ValidScheduleEnvelope is a well-formed schedule occurrence envelope.
+	ValidScheduleEnvelope
+	// InvalidScheduleEnvelope carries the schedule marker but is malformed.
+	InvalidScheduleEnvelope
 )
 
 // claimFields is the decoded envelope shape shared by ParseEnvelope (raw JSON)
-// and ClassifyClaim (an already-decoded event map).
+// and ClassifyScheduleEnvelope (an already-decoded event map).
 type claimFields struct {
 	App          string
 	Schedule     string
@@ -189,30 +191,32 @@ func ParseEnvelope(raw string) (Occurrence, error) {
 	})
 }
 
-// ClassifyClaim classifies a decoded event map against the schedule envelope.
-// Schedule messages are recognized by the reserved "source" == "relay.schedule".
-// A missing/empty source marker is NotScheduleClaim, so ordinary external events
-// are untouched. Once the marker is present the event is a deliberate claim of
-// schedule identity: a well-formed envelope is ValidScheduleClaim, and any
-// structural failure (missing/empty/non-string app, schedule, handler, or
-// occurrence_id; an unparseable or sub-second scheduled_at; or a
-// mismatched occurrence_id) is InvalidScheduleClaim. The returned Occurrence is
-// populated only for a valid claim; the error is populated only for an invalid
-// one.
-func ClassifyClaim(event map[string]any) (Occurrence, ClaimKind, error) {
+// ClassifyScheduleEnvelope classifies a decoded event map against the schedule
+// envelope. Schedule messages are recognized by the reserved "source" ==
+// "relay.schedule". A missing/empty source marker is NotScheduleEnvelope, so
+// ordinary external events are untouched. Once the marker is present the event
+// is a deliberate schedule envelope: a well-formed one is
+// ValidScheduleEnvelope, and any structural failure (missing/empty/non-string
+// app, schedule, handler, or occurrence_id; an unparseable or sub-second
+// scheduled_at; or a mismatched occurrence_id) is InvalidScheduleEnvelope. The
+// returned Occurrence is populated only for a valid envelope; the error is
+// populated only for an invalid one.
+func ClassifyScheduleEnvelope(
+	event map[string]any,
+) (Occurrence, ScheduleEnvelopeKind, error) {
 	src, ok := event["source"].(string)
 	if !ok || src != "relay.schedule" {
-		return Occurrence{}, NotScheduleClaim, nil
+		return Occurrence{}, NotScheduleEnvelope, nil
 	}
 	f, err := claimFieldsFromEvent(event)
 	if err != nil {
-		return Occurrence{}, InvalidScheduleClaim, err
+		return Occurrence{}, InvalidScheduleEnvelope, err
 	}
 	occ, err := validateClaim(f)
 	if err != nil {
-		return Occurrence{}, InvalidScheduleClaim, err
+		return Occurrence{}, InvalidScheduleEnvelope, err
 	}
-	return occ, ValidScheduleClaim, nil
+	return occ, ValidScheduleEnvelope, nil
 }
 
 // claimFieldsFromEvent extracts the string envelope fields from a decoded event
@@ -249,14 +253,14 @@ func claimFieldsFromEvent(event map[string]any) (claimFields, error) {
 
 // IsScheduleEvent reports whether a decoded event map is a STRUCTURALLY VALID
 // schedule message and, when it is, returns the parsed Occurrence. It is the
-// boolean convenience over ClassifyClaim: a marker-with-missing-fields event or
-// a mismatched occurrence_id is NOT reported as a schedule event here (those are
-// handled by the stream's ClassifyClaim-based non-retryable path). An ordinary
-// user event carrying source==relay.schedule AND a complete, self-consistent
-// envelope is a deliberate, acceptable claim of schedule identity; the
-// occurrence id is re-derived and cross-checked, so a forged value cannot
+// boolean convenience over ClassifyScheduleEnvelope: a marker-with-missing
+// fields event or a mismatched occurrence_id is NOT reported as a schedule
+// event here (those are handled by the stream's ClassifyScheduleEnvelope-based
+// non-retryable path). An ordinary user event carrying source==relay.schedule
+// and a complete, self-consistent envelope is accepted as a schedule envelope;
+// the occurrence id is re-derived and cross-checked, so a forged value cannot
 // redirect the invocation.
 func IsScheduleEvent(event map[string]any) (Occurrence, bool) {
-	occ, kind, _ := ClassifyClaim(event)
-	return occ, kind == ValidScheduleClaim
+	occ, kind, _ := ClassifyScheduleEnvelope(event)
+	return occ, kind == ValidScheduleEnvelope
 }

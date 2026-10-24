@@ -305,7 +305,7 @@ func TestIntegrationScheduleObsoleteIsAckedNotDLQed(t *testing.T) {
 // required field) must never fall through to event matching and be ACKed as
 // unmatched: it is dead-lettered as a non-retryable failure, even though a
 // normal-event handler is wired. The handler is never invoked.
-func TestIntegrationInvalidScheduleClaimDLQedNotMatched(t *testing.T) {
+func TestIntegrationInvalidScheduleEnvelopeDLQedNotMatched(t *testing.T) {
 	testutil.RequireRedis(t)
 	rr := &scriptedRunner{}
 	env := newEnv(t, ConsumerConfig{ScheduleRunner: rr.Run})

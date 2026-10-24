@@ -134,8 +134,8 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 // IsScheduleEvent recognizes structurally VALID schedule messages and ignores
 // normal events and malformed claims. A marker with a missing/invalid field, or
 // a mismatched occurrence_id, is NOT a valid schedule event: it is classified
-// as an invalid claim (see TestClassifyClaim) so the stream dead-letters it
-// instead of executing it as an ordinary event.
+// as an invalid envelope (see TestEnvelopeClassifyInvalid) so the stream
+// dead-letters it instead of executing it as an ordinary event.
 func TestIsScheduleEvent(t *testing.T) {
 	o := Occurrence{App: "courses", Schedule: "cleanup", Handler: "jobs.cleanup.handler", ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)}
 	raw, err := o.Envelope()
@@ -185,9 +185,12 @@ func TestIsScheduleEvent(t *testing.T) {
 	if _, ok := IsScheduleEvent(tampered); ok {
 		t.Fatal("a mismatched occurrence_id must not be recognized as a valid schedule event")
 	}
-	occ, kind, err := ClassifyClaim(tampered)
-	if kind != InvalidScheduleClaim || err == nil {
-		t.Fatalf("ClassifyClaim(mismatched id) = (%+v, %v, %v), want InvalidScheduleClaim with an error", occ, kind, err)
+	occ, kind, err := ClassifyScheduleEnvelope(tampered)
+	if kind != InvalidScheduleEnvelope || err == nil {
+		t.Fatalf(
+			"classification(mismatched id) = (%+v, %v, %v), want invalid envelope",
+			occ, kind, err,
+		)
 	}
 }
 

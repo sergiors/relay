@@ -64,14 +64,14 @@ func cloneMap(m map[string]any) map[string]any {
 	return out
 }
 
-// TestProcessMessageInvalidScheduleClaimNeverDispatched pins the core C3
+// TestProcessMessageInvalidScheduleEnvelopeNeverDispatched pins the core C3
 // integrity rule: an event that claims schedule identity
 // (source==relay.schedule) but is structurally incomplete, malformed, or carries
 // a mismatched occurrence_id is NEVER handed to ordinary event matching (so it
 // cannot execute an event rule and be ACKed as unmatched) and never reaches the
 // schedule runner. It is classified as a non-retryable failure and routed to the
 // DLQ on first encounter.
-func TestProcessMessageInvalidScheduleClaimNeverDispatched(t *testing.T) {
+func TestProcessMessageInvalidScheduleEnvelopeNeverDispatched(t *testing.T) {
 	valid := validEnvelope(t)
 	tests := []struct {
 		name  string
@@ -137,10 +137,10 @@ func TestProcessMessageInvalidScheduleClaimNeverDispatched(t *testing.T) {
 	}
 }
 
-// TestProcessMessageValidScheduleClaimRoutesToRunner pins that a well-formed
+// TestProcessMessageValidScheduleEnvelopeRoutesToRunner pins that a well-formed
 // occurrence is still routed to the schedule runner (bypass) and never to the
 // ordinary handler, and that the runner now receives the full Occurrence.
-func TestProcessMessageValidScheduleClaimRoutesToRunner(t *testing.T) {
+func TestProcessMessageValidScheduleEnvelopeRoutesToRunner(t *testing.T) {
 	rec := withSpanRecorder(t)
 	store := newFakeInvocationStore(nil)
 

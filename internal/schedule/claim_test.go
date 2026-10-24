@@ -37,10 +37,10 @@ func clone(event map[string]any) map[string]any {
 	return out
 }
 
-// TestClassifyClaimNotSchedule pins that only the reserved source marker claims
-// schedule identity: an absent, empty, or foreign source is an ordinary event and
-// must be left to normal matching.
-func TestClassifyClaimNotSchedule(t *testing.T) {
+// TestEnvelopeClassifyNotSchedule pins that only the reserved source marker
+// identifies a schedule envelope. An absent, empty, or foreign source is an
+// ordinary event and must be left to normal matching.
+func TestEnvelopeClassifyNotSchedule(t *testing.T) {
 	for _, event := range []map[string]any{
 		{},
 		{"event_name": "INSERT"},
@@ -49,19 +49,22 @@ func TestClassifyClaimNotSchedule(t *testing.T) {
 		{"source": 42, "app": "f", "schedule": "s", "handler": "h", "scheduled_at": "2026-07-01T08:00:00Z"},
 		{"source": "relay.scheduleX", "app": "f", "schedule": "s", "handler": "h", "scheduled_at": "2026-07-01T08:00:00Z"},
 	} {
-		occ, kind, err := ClassifyClaim(event)
-		if kind != NotScheduleClaim || err != nil {
-			t.Fatalf("ClassifyClaim(%+v) = (%+v, %v, %v), want NotScheduleClaim with no error", event, occ, kind, err)
+		occ, kind, err := ClassifyScheduleEnvelope(event)
+		if kind != NotScheduleEnvelope || err != nil {
+			t.Fatalf(
+				"classification(%+v) = (%+v, %v, %v), want NotScheduleEnvelope",
+				event, occ, kind, err,
+			)
 		}
 	}
 }
 
-// TestClassifyClaimValid pins that a complete, self-consistent envelope is a
-// valid schedule claim.
-func TestClassifyClaimValid(t *testing.T) {
-	occ, kind, err := ClassifyClaim(claimMap(t))
-	if err != nil || kind != ValidScheduleClaim {
-		t.Fatalf("ClassifyClaim(valid) = (%+v, %v, %v), want ValidScheduleClaim", occ, kind, err)
+// TestEnvelopeClassifyValid pins that a complete, self-consistent envelope is
+// valid.
+func TestEnvelopeClassifyValid(t *testing.T) {
+	occ, kind, err := ClassifyScheduleEnvelope(claimMap(t))
+	if err != nil || kind != ValidScheduleEnvelope {
+		t.Fatalf("classification(valid) = (%+v, %v, %v), want valid", occ, kind, err)
 	}
 	if occ.App != "courses" || occ.Schedule != "cleanup" || occ.Handler != "jobs.cleanup.handler" {
 		t.Fatalf("occurrence = %+v", occ)
@@ -71,10 +74,9 @@ func TestClassifyClaimValid(t *testing.T) {
 	}
 }
 
-// TestClassifyClaimInvalid pins that a marker-present event with ANY structural
-// failure is an invalid claim (never an ordinary event, never a valid schedule),
-// so the stream can route it to the DLQ as non-retryable.
-func TestClassifyClaimInvalid(t *testing.T) {
+// TestEnvelopeClassifyInvalid pins that a marker-present event with any
+// structural failure is invalid, so the stream routes it to the DLQ.
+func TestEnvelopeClassifyInvalid(t *testing.T) {
 	valid := claimMap(t)
 	tests := []struct {
 		name   string
@@ -101,9 +103,9 @@ func TestClassifyClaimInvalid(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			occ, kind, err := ClassifyClaim(tt.event)
-			if kind != InvalidScheduleClaim {
-				t.Fatalf("kind = %v, want InvalidScheduleClaim", kind)
+			occ, kind, err := ClassifyScheduleEnvelope(tt.event)
+			if kind != InvalidScheduleEnvelope {
+				t.Fatalf("kind = %v, want InvalidScheduleEnvelope", kind)
 			}
 			if err == nil {
 				t.Fatal("expected a non-nil structural error")
@@ -119,7 +121,8 @@ func TestClassifyClaimInvalid(t *testing.T) {
 }
 
 // TestParseEnvelopeRequiresOccurrenceID pins that the raw-JSON decoder enforces
-// the same occurrence_id requirement and identity match as ClassifyClaim.
+// the same occurrence_id requirement and identity match as the event
+// classifier.
 func TestParseEnvelopeRequiresOccurrenceID(t *testing.T) {
 	o := Occurrence{
 		App:         "courses",
@@ -152,7 +155,7 @@ func TestParseEnvelopeRequiresOccurrenceID(t *testing.T) {
 	}
 }
 
-// TestClassifyClaimRejectsFractionalScheduledAt pins that structural validation
+// TestEnvelopeClassifyRejectsFractionalTime pins that structural validation
 // rejects only a sub-second scheduled_at: cron evaluation is whole-second
 // granularity, so a fractional second (e.g. "08:00:00.500Z") can never be a real
 // occurrence even when its occurrence_id matches the second-truncated derived
@@ -160,7 +163,7 @@ func TestParseEnvelopeRequiresOccurrenceID(t *testing.T) {
 // historical IANA offsets can carry a seconds component, so a legitimate
 // local-minute firing may have a nonzero UTC second; whether it actually fires is
 // decided semantically (schedule.IsFiring) against the schedule's timezone.
-func TestClassifyClaimRejectsFractionalScheduledAt(t *testing.T) {
+func TestEnvelopeClassifyRejectsFractionalTime(t *testing.T) {
 	valid := claimMap(t)
 
 	fractional := clone(valid)
@@ -168,9 +171,9 @@ func TestClassifyClaimRejectsFractionalScheduledAt(t *testing.T) {
 	// occurrence_id matches what ID derives from the truncated second, so only
 	// the whole-second rule can reject this.
 	fractional["occurrence_id"] = "schedule:courses:cleanup:2026-07-01T08:00:00Z"
-	occ, kind, err := ClassifyClaim(fractional)
-	if kind != InvalidScheduleClaim {
-		t.Fatalf("kind = %v, want InvalidScheduleClaim", kind)
+	occ, kind, err := ClassifyScheduleEnvelope(fractional)
+	if kind != InvalidScheduleEnvelope {
+		t.Fatalf("kind = %v, want InvalidScheduleEnvelope", kind)
 	}
 	if err == nil {
 		t.Fatal("expected a non-nil structural error")
@@ -187,9 +190,12 @@ func TestClassifyClaimRejectsFractionalScheduledAt(t *testing.T) {
 	nonzero := clone(valid)
 	nonzero["scheduled_at"] = "2026-07-01T08:00:30Z"
 	nonzero["occurrence_id"] = "schedule:courses:cleanup:2026-07-01T08:00:30Z"
-	got, kind, err := ClassifyClaim(nonzero)
-	if err != nil || kind != ValidScheduleClaim {
-		t.Fatalf("ClassifyClaim(nonzero whole second) = (%+v, %v, %v), want ValidScheduleClaim", got, kind, err)
+	got, kind, err := ClassifyScheduleEnvelope(nonzero)
+	if err != nil || kind != ValidScheduleEnvelope {
+		t.Fatalf(
+			"classification(nonzero whole second) = (%+v, %v, %v), want valid",
+			got, kind, err,
+		)
 	}
 	if !got.ScheduledAt.Equal(time.Date(2026, 7, 1, 8, 0, 30, 0, time.UTC)) {
 		t.Fatalf("parsed scheduled_at = %v, want 08:00:30Z preserved", got.ScheduledAt)
@@ -197,14 +203,16 @@ func TestClassifyClaimRejectsFractionalScheduledAt(t *testing.T) {
 
 	// The exact minute is still a valid claim, so the canonical identity path is
 	// unchanged for real occurrences.
-	if _, kind, err := ClassifyClaim(valid); err != nil || kind != ValidScheduleClaim {
-		t.Fatalf("ClassifyClaim(exact minute) = (%v, %v), want ValidScheduleClaim", kind, err)
+	if _, kind, err := ClassifyScheduleEnvelope(valid); err != nil ||
+		kind != ValidScheduleEnvelope {
+		t.Fatalf("classification(exact minute) = (%v, %v), want valid", kind, err)
 	}
 }
 
 // TestParseEnvelopeRejectsFractionalScheduledAt pins that the raw-JSON decoder
-// applies the same whole-second structural rule as ClassifyClaim: a fractional
-// second is rejected even when the occurrence_id matches the truncated identity,
+// applies the same whole-second structural rule as the event classifier: a
+// fractional second is rejected even when the occurrence_id matches the
+// truncated identity,
 // while an exact minute and a nonzero whole second (a possible historical
 // timezone firing) both parse.
 func TestParseEnvelopeRejectsFractionalScheduledAt(t *testing.T) {
