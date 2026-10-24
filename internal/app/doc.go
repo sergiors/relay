@@ -96,6 +96,13 @@
 //     the `@every <duration>` descriptor is rejected because it is anchored to
 //     each worker's own job start rather than a shared calendar instant.
 //
-// The package has no side effects beyond reading the filesystem; building,
-// execution, and Redis are owned elsewhere.
+// The package reads the /apps tree and has no filesystem side effects beyond
+// that read except CaptureSourceSnapshot (and CaptureSourceSnapshotIn), which
+// writes a private, temporary on-disk snapshot of the SELECTED source. That
+// snapshot is owned by the CALLER, which must release it with
+// SourceSnapshot.Discard (a deferred call covers success, error, and
+// cancellation). The runtime Manager captures inside its own private build-temp
+// session, defers that Discard, and uses the snapshot root as the image build
+// context. This package owns neither Docker execution nor the Manager
+// lifecycle; building, execution, and Redis are owned elsewhere.
 package app

@@ -100,13 +100,20 @@
 // The package owns no Redis, Docker, or matching internals; execution is
 // delegated to a runtime executor.
 //
-// Schedules: cron-triggered handlers reach the runner through InvokeHandler
-// (see internal/schedule for coordination and internal/cron for timing). Every worker evaluates a cron
-// schedule locally but publishes one stream entry per occurrence cluster-wide
-// (atomic publish-if-new), and the consumer routes that single schedule
-// message directly to InvokeHandler, bypassing event matching. Schedules ride
-// the normal stream machinery: retry, backoff, exhaustion, DLQ, and
-// invocation-state semantics apply exactly like any other stream message.
+// Schedules: cron-triggered handlers reach the runner through the stream's
+// ScheduleRunner seam, which the worker wires to Runner.InvokeOccurrence (see
+// internal/schedule for coordination and internal/cron for timing). Every
+// worker evaluates a cron schedule locally but publishes one stream entry per
+// occurrence cluster-wide (atomic publish-if-new), and the consumer routes that
+// single schedule message directly to InvokeOccurrence, bypassing event
+// matching. InvokeOccurrence validates the occurrence against the current
+// template (configured and available app, existing stable schedule name, a real
+// firing of the current cron/timezone) before admission, then reaches the same
+// invocation execution path as events. InvokeHandler is the lower-level entry
+// for callers that carry only app/schedule/handler (such as DLQ replay) and
+// performs no occurrence validation. Schedules ride the normal stream
+// machinery: retry, backoff, exhaustion, DLQ, and invocation-state semantics
+// apply exactly like any other stream message.
 //
 // Schedule admission boundary: BEFORE ADMISSION an occurrence resolves the
 // app's CURRENT template by its stable schedule NAME on every delivery, so

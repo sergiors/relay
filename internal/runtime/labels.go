@@ -6,7 +6,7 @@ package runtime
 //	event    — a one-shot invocation container for a matching event rule
 //	          (runner.Handle). relay.handler is the rule handler.
 //	schedule — a one-shot invocation container for a schedule occurrence
-//	          (runner.InvokeHandler). relay.handler is the schedule handler.
+//	          (runner.InvokeOccurrence). relay.handler is the schedule handler.
 //	service  — a persistent, long-lived service container (Manager.StartService).
 //	          relay.service is the service identity: the template's stable
 //	          service name. relay.identity additionally records the configured

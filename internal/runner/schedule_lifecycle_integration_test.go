@@ -2,10 +2,10 @@
 
 // These tests drive the full schedule-occurrence path against real Redis end to
 // end: a real stream.Consumer is wired with a ScheduleRunner that dispatches to
-// runner.InvokeHandler, and the real InvokeHandler executes the (fake) executor
-// and drives the invocation-state lifecycle — running/complete/backoff/exhausted
-// markers — as the stream ACKs, leaves pending, and clears the invocation-state
-// key. They live in the runner package (rather than the stream package) because
+// runner.InvokeOccurrence, whose path executes the fake executor and drives the
+// invocation-state lifecycle (running/complete/backoff/exhausted) as the stream
+// ACKs, leaves pending, and clears the invocation-state key. They live in the
+// runner package (rather than the stream package) because
 // the stream package cannot import the runner (an import cycle).
 package runner
 
@@ -121,7 +121,7 @@ func (e *stateAwareExecutor) count() int {
 }
 
 // scheduleEnv is a self-contained schedule integration harness: a real consumer
-// (with the real runner's InvokeHandler wired as ScheduleRunner) on a
+// (with the real runner's InvokeOccurrence wired as ScheduleRunner) on a
 // unixnano-unique stream/group.
 type scheduleEnv struct {
 	t      *testing.T
@@ -136,8 +136,8 @@ type scheduleEnv struct {
 	errCh  chan error
 }
 
-// newScheduleEnv builds the harness, wiring r.InvokeHandler as the consumer's
-// ScheduleRunner.
+// newScheduleEnv builds the harness and wires r.InvokeOccurrence as the
+// consumer's ScheduleRunner.
 func newScheduleEnv(t *testing.T, r *Runner) *scheduleEnv {
 	t.Helper()
 	addr := testutil.EnvOr("REDIS_TEST_ADDR", "localhost:6379")
