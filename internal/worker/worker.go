@@ -47,7 +47,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os/signal"
 	"sync"
@@ -60,7 +59,6 @@ import (
 	"relay/internal/app"
 	"relay/internal/bytesize"
 	"relay/internal/config"
-	"relay/internal/cron"
 	gitwh "relay/internal/git/webhook"
 	"relay/internal/observability/metrics"
 	"relay/internal/observability/tracing"
@@ -1113,20 +1111,6 @@ func shutdownServices(
 	)
 }
 
-// schedulerStorage is the narrow scheduler view the worker's storage wiring
-// needs. *cron.Scheduler satisfies it. It is defined here (not in cron) so the
-// worker-owned wiring decision — install the shared handle when available, or
-// mark unavailable and start a bootstrap otherwise — is unit-testable with a
-// deterministic fake and without a real state DB or gocron.
-type schedulerStorage interface {
-	SetOutbox(o cron.Outbox)
-	StartPendingRetry(ctx context.Context)
-	MarkStorageUnavailable()
-	StartStorageBootstrap(ctx context.Context, open cron.OutboxOpener)
-}
-
-var _ schedulerStorage = (*cron.Scheduler)(nil)
-
 // *runtime.Manager must always implement the reconciler's optional
 // shutdown-scoped Docker capability. The reconciler type-asserts the
 // configured Docker for it and otherwise silently falls back to the ordinary
@@ -1134,72 +1118,6 @@ var _ schedulerStorage = (*cron.Scheduler)(nil)
 // production regression from degrading graceful service cleanup without
 // failing the build. It is always compiled, unlike the capability tests.
 var _ reconciler.ShutdownDocker = (*runtime.Manager)(nil)
-
-// wireSchedulerStorage connects the scheduler to its durable outbox. A non-nil
-// shared state handle is installed and its durable retry worker started, which
-// enables schedule publication. Current Run ALWAYS takes this path: state.Open
-// is fatal, so the shared handle is non-nil by the time this runs.
-//
-// A nil shared handle is therefore a DEFENSIVE fallback, unreachable via the
-// current Run, retained as a seam for an embedding host (or a future where the
-// shared open could be non-fatal): the scheduler is marked unavailable (so it
-// never fires a schedule without a durable store) and a scheduler-owned,
-// cancellable bootstrap retries opening the store; on success the bootstrap
-// installs it, recovers existing rows, runs the bounded latest-only catch-up,
-// and enables publication. It never fails and never gates the event consumer or
-// services.
-func wireSchedulerStorage(
-	ctx context.Context,
-	sched schedulerStorage,
-	shared *state.State,
-	open cron.OutboxOpener,
-) {
-	if shared != nil {
-		sched.SetOutbox(shared)
-		sched.StartPendingRetry(ctx)
-		return
-	}
-	sched.MarkStorageUnavailable()
-	// Record the lifecycle first so a later bootstrap recovery can start the
-	// durable retry worker without re-supplying the context; no worker is started
-	// while no outbox is installed.
-	sched.StartPendingRetry(ctx)
-	sched.StartStorageBootstrap(ctx, open)
-}
-
-// schedulerStorageOpener returns the cron.OutboxOpener the worker's DEFENSIVE
-// storage-unavailable bootstrap uses to retry opening the scheduler's durable
-// outbox (the PostgreSQL state database) when a nil shared handle was supplied.
-// Current Run never supplies one because its state.Open is fatal; the opener
-// exists so the nil-shared fallback stays a complete, testable seam for an
-// embedding host or a future non-fatal open. dsn is cfg.DatabaseURL; it is a
-// parameter so the retry path is unit-testable without a real database. The
-// opened *state.State is a scheduler-OWNED handle: cron closes it after all
-// scheduler work has stopped, so the shared global handle is never touched. It
-// deliberately opens an independent handle on the same DSN — the smallest
-// clean equivalent — and wires the same status observer so a recovered
-// store's status writes still project onto the app_status gauge. It opens with
-// NO stats owner: the handle exists only for the schedule outbox and never
-// writes stats rows, and an owner without a paired instance is rejected by
-// state.Open.
-func schedulerStorageOpener(dsn string, logger *slog.Logger, metricsInstance *metrics.Registry) cron.OutboxOpener {
-	return func() (cron.Outbox, io.Closer, error) {
-		st, err := state.Open(context.Background(), state.Options{
-			DSN:             dsn,
-			Logger:          logger,
-			MaxOpenConns:    config.DefaultDatabaseMaxOpenConns,
-			MaxIdleConns:    config.DefaultDatabaseMaxIdleConns,
-			ConnMaxLifetime: config.DefaultDatabaseConnMaxLifetime,
-			ConnMaxIdleTime: config.DefaultDatabaseConnMaxIdleTime,
-			ConnectTimeout:  config.DefaultDatabaseConnectTimeout,
-		})
-		if err != nil {
-			return nil, nil, err
-		}
-		wireStatusObserver(st, metricsInstance)
-		return st, st, nil
-	}
-}
 
 // setupMetrics constructs the metrics components. The accounting registry is
 // ALWAYS constructed — it is the single source of truth for the counters the
