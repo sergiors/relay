@@ -71,6 +71,10 @@ func TestIntegrationSourceMountDaemonPathMapsRelayContainerMount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
+	// Real-daemon prep work here still needs cross-process dependency-image
+	// coordination: inject the State-backed coordinator over the shared test
+	// database (per-test schema), mirroring production wiring.
+	m.depCoord = stateDepCoordinator{st: testutil.OpenState(t, testutil.NewStateDSN(t))}
 	defer func() { _ = m.Close() }()
 	// NewManager resolves selfHostname from os.Hostname (the test runner, not the
 	// probe container); point self-inspection at the probe's short ID instead, as

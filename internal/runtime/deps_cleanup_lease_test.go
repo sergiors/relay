@@ -24,7 +24,7 @@ func TestDependencyGCSkipsWhileLeaseHeld(t *testing.T) {
 		dockerRoute{method: http.MethodGet, path: "/images/json", body: depGCImageListJSON("relay-dep-aaaaaaaaaaaaaaaa")},
 		dockerRoute{method: http.MethodDelete, path: "/images/", body: "[]", onMatch: func() { dels++ }},
 	)
-	m := &Manager{cli: cli, log: testutil.DiscardLogger()}
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), depCoord: newInProcessDepCoordinator()}
 
 	// An active Prepare holds the dependency lease.
 	lease, err := m.AcquireImageLease("relay-dep-aaaaaaaaaaaaaaaa")
@@ -70,7 +70,7 @@ func TestDependencyGCFailedRemoveRetryable(t *testing.T) {
 		dockerRoute{method: http.MethodGet, path: "/images/json", body: depGCImageListJSON("relay-dep-bbbbbbbbbbbbbbbb")},
 		dockerRoute{method: http.MethodDelete, path: "/images/", status: http.StatusInternalServerError, body: `{"message":"boom"}`},
 	)
-	m := &Manager{cli: cli, log: testutil.DiscardLogger()}
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), depCoord: newInProcessDepCoordinator()}
 
 	if _, err := m.CleanupUnusedDependencies(context.Background()); err == nil {
 		t.Fatal("expected the failed removal to surface")

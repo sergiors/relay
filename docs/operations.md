@@ -180,6 +180,33 @@ apps are never prepared.
 - The scheduler's durable publication outbox (`schedule_pending`) lives here too;
   its per-row claims use `FOR UPDATE SKIP LOCKED` and a fencing token so
   concurrent retriers — in one process or several — never double-claim.
+- Dependency-image coordination also lives here. Dependency layers are
+  content-addressed and shared by every app version built from the same
+  manifest, and they live on the Docker daemon, which several Relay processes
+  may share. A preparation therefore holds a **shared** PostgreSQL session
+  advisory lock for its dependency reference from before the dependency probe
+  through the app-image build, and dependency garbage collection takes the
+  **exclusive** lock for one candidate (non-blocking: a contended candidate is
+  skipped) and re-reads the daemon's label-derived referenced set before
+  removing it. The daemon is **not**
+  a parent-reference guard — force-free removal can untag a layer that a
+  completed app image still references (observed on Docker 29.9.2) — so this
+  database-scoped coordination, not a Docker refusal, is what keeps a layer
+  unremovable while any process is building from it.
+  - Advisory locks are scoped to one PostgreSQL database. **Every Relay process
+    that shares a Docker daemon must use the same `DATABASE_URL` database.**
+    Separate state databases on one daemon are unsupported; there is no
+    Docker-level fallback.
+  - A preparation that cannot take the shared lock within the fixed contention
+    bound fails retryably (the app keeps its previous generation and the
+    reconcile is retried). GC fails closed: when it cannot take the exclusive
+    lock it removes nothing and retries at the next natural lifecycle point.
+  - The coordination session is the worker's pinned ownership connection, so a
+    lost database connection releases these locks at the same moment the
+    existing ownership monitor observes the loss and cancels the lifecycle. A
+    lease is revalidated immediately before and after the Docker build it
+    protects; the short window between a revalidation and the Docker call cannot
+    be fenced from the database side.
 
 The bundled `compose.yaml` runs an internal PostgreSQL (`postgres` service, no
 published port by default) with a named volume, and points Relay at it via

@@ -120,7 +120,7 @@ CMD []
 	// daemon; a unit-scoped lifecycle test must not assert on whole-daemon state
 	// it does not own, since it races anything else creating relay-app-* images on
 	// a shared daemon (e.g. another Go test package running concurrently).
-	m1, err := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, "test-host")
+	m1, err := newCoordinatedRealManager(t, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}

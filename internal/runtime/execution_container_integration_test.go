@@ -32,10 +32,9 @@ import (
 // window is impractical for a test). Close is registered as cleanup.
 func newManagerWithIdleTimeout(t *testing.T, idle time.Duration) *Manager {
 	t.Helper()
-	m, err := NewManager(
+	m, err := newCoordinatedRealManager(t,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 		nil,
-		"test-host",
 		WithWarmContainerIdleTimeout(idle),
 	)
 	if err != nil {
@@ -51,7 +50,7 @@ func newManagerWithIdleTimeout(t *testing.T, idle time.Duration) *Manager {
 func newMetricsManager(t *testing.T) (*Manager, *metrics.Registry) {
 	t.Helper()
 	reg := metrics.New()
-	m, err := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)), reg, "test-host")
+	m, err := newCoordinatedRealManager(t, slog.New(slog.NewTextHandler(io.Discard, nil)), reg)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}

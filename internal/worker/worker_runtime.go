@@ -8,6 +8,7 @@ import (
 	"relay/internal/config"
 	"relay/internal/observability/metrics"
 	"relay/internal/runtime"
+	"relay/internal/state"
 )
 
 // openRuntimeManager constructs the Docker runtime manager and registers its
@@ -18,6 +19,14 @@ import (
 // preflight failure (NETWORKS verification) still converges through the
 // deferred shutdown.
 //
+// st is the REQUIRED state handle opened earlier in Run. The manager's
+// cross-process dependency-image coordination is built on it: dependency layers
+// live on the Docker daemon, which may be shared by several Relay processes, so
+// the only authority that can make a layer unremovable across them is the
+// database they share. A nil handle leaves the manager uncoordinated (a build
+// that consumes a dependency image and GC fail closed); Run always passes the
+// opened handle.
+//
 // lifecycle is the worker's signal context, not the preflight step's span
 // context: builds and the startup ping must be cancelled by SIGTERM/SIGINT, and
 // the startup span is used only for the preflight's phase span.
@@ -26,6 +35,7 @@ func openRuntimeManager(
 	logger *slog.Logger,
 	metricsInstance *metrics.Registry,
 	cfg config.Config,
+	st *state.State,
 	shutdown *shutdownRegistry,
 ) (*runtime.Manager, error) {
 	manager, err := runtime.NewManager(
@@ -74,6 +84,14 @@ func openRuntimeManager(
 		// down. Builds must NOT inherit the short 30s reconcile budget
 		// the worker uses for normal service operations.
 		runtime.WithLifecycleContext(lifecycle),
+		// Cross-process dependency-image coordination. The per-Manager lease
+		// coordinator only protects this process's own uses; a dependency layer
+		// lives on the Docker daemon, which several Relay processes may share, so
+		// the shared state database is the only place a cross-process shared
+		// use / exclusive GC decision can be made. Any Relay processes sharing one
+		// Docker daemon must therefore use the same DATABASE_URL database (see
+		// README/docs/operations.md).
+		runtime.WithDependencyImageCoordinator(newStateDependencyImageCoordinator(st)),
 		// Do NOT start the warm-container maintenance loop in the
 		// constructor: the manager is opened before NETWORKS is
 		// verified, and the request is that all configured networks

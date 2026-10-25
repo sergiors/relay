@@ -407,6 +407,12 @@ events:
 
 	faultCli, proxy := faultBuildClient(t, appImage)
 	m := newLifecycleManager(t, faultCli, context.Background())
+	// This test prepares and garbage-collects REAL dependency images on the
+	// daemon other tests/processes share, so it uses REAL cross-process
+	// coordination (State-backed, per-test schema on TEST_DATABASE_URL) even
+	// though the client arrives pre-wrapped: the lifecycle helper's in-process
+	// coordinator is for scripted (process-local) daemons only.
+	m.depCoord = stateDepCoordinator{st: testutil.OpenState(t, testutil.NewStateDSN(t))}
 
 	if _, err := m.Prepare(ctx, fn); err == nil {
 		t.Fatal("Prepare must fail on the injected app image build failure")

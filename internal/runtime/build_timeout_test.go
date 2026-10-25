@@ -32,17 +32,35 @@ func (b *buildDeadline) capture(req *http.Request) {
 	b.ok = ok
 }
 
-// newLifecycleManager builds a Manager directly (no daemon) whose Dockerfile
-// builds are rooted in lifecycle. It is the minimal wiring buildContext needs:
-// a scripted client, a logger, a container cache, and the lifecycle context.
-func newLifecycleManager(t *testing.T, cli *client.Client, lifecycle context.Context) *Manager {
+// newLifecycleManager builds a Manager directly (no daemon required) whose
+// Dockerfile builds are rooted in lifecycle. Its wiring: a scripted client,
+// a logger, a container cache, the lifecycle context, and — see below — an
+// explicit test dependency-image coordinator.
+// newLifecycleManager constructs a Manager wired to the supplied Docker client
+// and installs an explicit TEST-ONLY in-process dependency-image coordinator,
+// so every dep-bearing preparation and dependency GC in this test coordinates
+// rather than failing closed by omission. When one test drives SEVERAL
+// managers over the SAME dependency layer, pass one already-installed
+// coordinator (coordOf) in the optional coords argument: all managers in the
+// test then share one authority.
+func newLifecycleManager(
+	t *testing.T,
+	cli *client.Client,
+	lifecycle context.Context,
+	coords ...*inProcessDepCoordinator,
+) *Manager {
 	t.Helper()
+	coord := newInProcessDepCoordinator()
+	if len(coords) > 0 && coords[0] != nil {
+		coord = coords[0]
+	}
 	m := &Manager{
 		log:        testutil.DiscardLogger(),
 		cli:        cli,
 		hostname:   "test-host",
 		lifecycle:  lifecycle,
 		containers: newContainerCache(),
+		depCoord:   coord,
 	}
 	t.Cleanup(func() { _ = m.Close() })
 	return m

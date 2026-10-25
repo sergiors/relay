@@ -435,7 +435,7 @@ func Run(logger *slog.Logger) (runErr error) {
 		// Root the manager in the worker lifecycle, not the preflight span, so
 		// builds and the startup ping observe SIGTERM/SIGINT.
 		OpenManager: func(_ context.Context) (*runtime.Manager, error) {
-			return openRuntimeManager(ctx, logger, metricsInstance, cfg, shutdown)
+			return openRuntimeManager(ctx, logger, metricsInstance, cfg, st, shutdown)
 		},
 		VerifyNetworks: func(ctx context.Context, m *runtime.Manager) error {
 			// Relay never creates networks, so a missing one must fail startup

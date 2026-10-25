@@ -259,7 +259,7 @@ func TestIntegrationAppOutputIgnoresLogLevel(t *testing.T) {
 	// Relay-operational logger discards everything below ERROR, so no handler
 	// output can possibly flow through it (forwarding must be independent).
 	opLogger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	m, err := NewManager(opLogger, nil, "test-host")
+	m, err := newCoordinatedRealManager(t, opLogger, nil)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}

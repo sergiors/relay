@@ -15,6 +15,19 @@
 //     embedders and tests may call with any context), and a caller's deadline
 //     must never cut off a legitimate image build; the lifecycle root keeps
 //     builds cancellable on Relay shutdown.
+//   - Dependency-image coordination: a dependency layer is shared daemon-wide
+//     by every app version with the same manifest, so a Manager needs a
+//     cross-process authority (WithDependencyImageCoordinator, wired by the
+//     worker from the shared PostgreSQL state database). A Prepare that must
+//     build from a dependency holds a SHARED use lease before the dependency
+//     probe through the app-image build that consumes it via FROM, revalidating
+//     before and after. Dependency GC takes a non-blocking EXCLUSIVE lease per
+//     candidate and re-reads the daemon's label-derived referenced set before
+//     removing. The daemon is not a parent-reference guard: force-free removal
+//     can untag a layer a completed child image still references. Coordination,
+//     not a Docker refusal, is authoritative. A Manager with no coordinator
+//     fails closed for dependency-image builds and GC; there is no manager-local
+//     fallback because a process-local lock cannot protect a shared Docker image.
 //   - Source mount (HOT_RELOAD): when enabled, a runtime whose dependency
 //     layout permits it (Python and Node; see plan.Spec.MountableSource) builds
 //     the app image WITHOUT the source and bind-mounts the app's live directory

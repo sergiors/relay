@@ -146,6 +146,16 @@ Relay is designed around explicit delivery, recovery, and convergence semantics.
   pattern matching.
 - **Redis pending work is recoverable.** Unacknowledged messages remain subject to normal PEL/reclaim handling.
 - **Persistent services converge toward declared state.** Relay continuously reconciles service containers against their configured replicas and runtime configuration.
+- **Dependency images are protected across processes.** Dependency layers are
+  content-addressed and shared by every app version with the same manifest.
+  Relay coordinates their use and garbage collection through PostgreSQL
+  advisory locks: a preparation holds a shared lease from before the dependency
+  probe through the app-image build, and GC removes a layer only under an
+  exclusive lease and after re-reading the daemon's label-derived references.
+  Processes sharing a Docker daemon must use the same `DATABASE_URL` database;
+  separate state databases on one daemon are unsupported (there is no Docker
+  fallback). Without a coordinator, dependency-consuming builds and dependency
+  GC fail closed.
 - **Warm container generations converge safely.** Idle stale containers are retired while busy old-generation containers are allowed to drain.
 - **Resource limits are per container.** Increasing app concurrency or service replicas multiplies the possible aggregate resource usage.
 - **Shutdown uses a cleanup budget and strict dependency barriers.** Relay performs ordered graceful teardown under an aggregate deadline that caps each best-effort cleanup step (for example metrics, webhook, service-container cleanup, and the stats flush) by the budget remaining at that point; when a best-effort step misses its bound the timeout is logged, its context is cancelled, and the registry proceeds without waiting for that operation to finish — an uncooperative operation may therefore continue in the background — though every later step is still attempted. Steps that gate a shared dependency (scheduler, reconciler, startup housekeeping, the service coordinator, and the background loops) are quiescence barriers: each has a per-step timeout used only to log and cancel the step, after which the registry waits for the operation to actually exit before advancing. Cancellation requests a stop but does not instantly terminate in-flight work, so those strict joins can extend total shutdown beyond the aggregate deadline — a wedged dependency-holding operation is waited out rather than used to close a resource another operation is still using.

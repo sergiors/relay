@@ -545,13 +545,36 @@ func (m *Manager) prepare(
 	prepared.lease = funcLease
 
 	var depLease *ImageLease
-	// releaseDep releases the dependency lease (if admitted). The dependency
+	// depProtection is the cross-process SHARED use lease for depRef. It is what
+	// keeps the dependency layer from being garbage-collected by another manager
+	// or another Relay process while this preparation probes, builds, and then
+	// consumes it via FROM; the local depLease above only protects this Manager's
+	// own view. It is admitted on the build path (the reuse path never touches the
+	// dependency) and released on every path, including explicitly before the
+	// failed-build dependency GC.
+	var depProtection DependencyImageLease
+	// releaseDep releases the dependency image lease (if admitted). The dependency
 	// snapshot root is released by the deferred depSnap.release above. It is
 	// deferred so the lease is dropped on success, failure, and cancellation.
 	releaseDep := func() {
 		if depLease != nil {
 			depLease.Release()
 			depLease = nil
+		}
+	}
+	// releaseDepProtection drops the cross-process shared protection. It is
+	// idempotent (a released lease ignores a second Release), so the deferred call
+	// and the explicit failed-build call cannot double-release. A release failure
+	// is logged, not returned: it can only leave the layer pinned (fail-safe)
+	// until the coordination session ends, and it must never replace the
+	// preparation outcome the caller needs.
+	releaseDepProtection := func() {
+		if depProtection != nil {
+			if err := depProtection.Release(); err != nil {
+				m.log.Debug("App: dependency image protection release failed",
+					"app", fn.Name, "dep_image", depRef, "error", err)
+			}
+			depProtection = nil
 		}
 	}
 	// The dependency lease is held from its admission below through the ACTUAL
@@ -561,6 +584,7 @@ func (m *Manager) prepare(
 	// The lease therefore spans the whole dependency use in Prepare, not merely
 	// the probe. See TestPrepareDependencyLeaseSpansBuildVsGC.
 	defer releaseDep()
+	defer releaseDepProtection()
 	if depRef != "" {
 		// Admit the dependency layer BEFORE its own reuse/existence probe, the
 		// dependency image build, and the app image build below, so
@@ -636,6 +660,16 @@ func (m *Manager) prepare(
 	// a changed requirements.txt yields a NEW tag and an unchanged one reuses the
 	// existing layer with no rebuild (even when the app's source changed).
 	if !planResult.Deps.IsZero() {
+		// Take the cross-process shared use protection BEFORE the dependency
+		// probe/build. It is held through the app-image build below, so no GC pass
+		// in any process can untag the layer between its probe and its FROM
+		// consumption. It is deliberately acquired only on this build path: a
+		// reused app image never consumes the dependency, so it needs no
+		// cross-process protection.
+		depProtection, err = m.acquireDependencyImageUse(ctx, depRef)
+		if err != nil {
+			return nil, fmt.Errorf("app %q: dependency %s: %w", fn.Name, depRef, err)
+		}
 		depRef, err = m.ensureDependencyImage(
 			ctx, fn, spec, planResult.Deps, depSnap, depFingerprint, depRef,
 		)
@@ -692,6 +726,13 @@ func (m *Manager) prepare(
 	if mountSource {
 		appLabels[labelFingerprint] = ""
 	}
+	// Re-prove the cross-process dependency protection immediately before the
+	// build that consumes the layer via FROM. A lease lost while the dependency
+	// was being ensured (a dropped database session) means another process may
+	// have been able to remove the layer, so the build must not proceed.
+	if err := verifyDependencyImageUse(ctx, depProtection, depRef); err != nil {
+		return nil, fmt.Errorf("app %q: %w", fn.Name, err)
+	}
 	buildElapsed, buildErr := m.runImageBuild(ctx, fn.Name, image, func(buildCtx context.Context) error {
 		return buildImage(
 			buildCtx, m.cli, fn.Name, fn, planResult, image, appLabels,
@@ -714,19 +755,24 @@ func (m *Manager) prepare(
 			"result", "failed",
 		)
 		// The app image build failed AFTER this preparation admitted (and
-		// possibly built) its dependency layer. Release the preparation's
-		// dependency lease FIRST, then run the lifecycle-driven dependency GC:
-		// while the lease is held the layer is deliberately unremovable, so
-		// releasing first is what lets the GC observe a layer THIS failed
-		// preparation uniquely consumed as unreferenced and prune it. Another
-		// concurrent preparation holding its OWN lease on the same
-		// content-addressed layer still keeps it (the GC's lease gate defers),
-		// and any app image that still inherits the layer keeps it too (the
-		// referenced set). The call is best-effort: a cleanup error must NEVER
-		// replace the build error the caller needs to classify and report, and
-		// a layer skipped here is retried at the next natural lifecycle point.
-		// Only a preparation that actually consumed a dependency layer runs it:
-		// a dependency-less app has nothing this failure could orphan.
+		// possibly built) its dependency layer. Release the cross-process shared
+		// protection and this Manager's local dependency lease FIRST, then run the
+		// lifecycle-driven dependency GC: while either is held the layer is
+		// deliberately unremovable, so releasing first is what lets the GC observe
+		// a layer THIS failed preparation uniquely consumed as unreferenced and
+		// prune it. Releasing the shared protection before GC is also what keeps
+		// this call from deadlocking against its own protection: GC takes the
+		// exclusive view, which cannot be granted while this session still holds
+		// the shared one. Another concurrent preparation holding its OWN protection
+		// on the same content-addressed layer still keeps it (the GC's exclusive
+		// acquisition is refused and the candidate is skipped), and any app image
+		// that still references the layer keeps it too (the authoritative
+		// label-derived referenced set). The call is best-effort: a cleanup error
+		// must NEVER replace the build error the caller needs to classify and
+		// report, and a layer skipped here is retried at the next natural lifecycle
+		// point. Only a preparation that actually consumed a dependency layer runs
+		// it: a dependency-less app has nothing this failure could orphan.
+		releaseDepProtection()
 		releaseDep()
 		if depRef != "" {
 			if _, cerr := m.CleanupUnusedDependencies(ctx); cerr != nil {
@@ -738,6 +784,15 @@ func (m *Manager) prepare(
 			}
 		}
 		return nil, buildErr
+	}
+	// The build consumed the protected layer via FROM. Re-prove the protection
+	// AFTER it: if the coordination session lost the lease while the build ran,
+	// this generation was built while another process was free to remove the
+	// layer, so it must not be published. Fail closed and let the reconciler
+	// retry; the content-addressed image is reused by the retry when it is still
+	// valid. The deferred release still runs on this path.
+	if err := verifyDependencyImageUse(ctx, depProtection, depRef); err != nil {
+		return nil, fmt.Errorf("app %q: %w", fn.Name, err)
 	}
 	elapsed := buildElapsed
 	m.metrics.ObserveDurationLabels(metrics.MetricAppBuild,

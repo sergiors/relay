@@ -408,14 +408,27 @@ events:
 	wantDep := expectedDependencyRef(t, fn)
 
 	// managerOutcome keeps every failure dimension of one independent Manager
-	// (construction, Prepare, close) together with its index, so diagnostics can
-	// name the Manager that failed without losing the underlying error.
+	// (Prepare, close) together with its index, so diagnostics can name the
+	// Manager that failed without losing the underlying error.
 	type managerOutcome struct {
-		manager       int
-		prepared      *Prepared
-		newManagerErr error
-		prepareErr    error
-		closeErr      error
+		manager    int
+		prepared   *Prepared
+		prepareErr error
+		closeErr   error
+	}
+	// Construction happens ON THE TEST GOROUTINE, before any concurrent work:
+	// newCoordinatedRealManager creates per-Manager State handles
+	// (testutil.NewStateDSN/OpenState) and may t.Fatalf / register cleanup,
+	// which is only safe there. The goroutines keep ONLY Prepare + Close
+	// concurrent; the handles remain fully independent (own State schema, own
+	// Docker client), sharing just the identical app fixture.
+	mgrs := make([]*Manager, 2)
+	for i := range mgrs {
+		m, err := newCoordinatedRealManager(t, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+		if err != nil {
+			t.Fatalf("manager %d: NewManager failed: %v", i, err)
+		}
+		mgrs[i] = m
 	}
 	start := make(chan struct{})
 	outcomes := make(chan managerOutcome, 2)
@@ -426,13 +439,8 @@ events:
 			// outcome, so cleanup observes fully joined work.
 			defer wg.Done()
 			<-start
-			m, err := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, "test-host")
-			if err != nil {
-				outcomes <- managerOutcome{manager: manager, newManagerErr: err}
-				return
-			}
-			p, prepErr := m.Prepare(ctx, fn)
-			closeErr := m.Close()
+			p, prepErr := mgrs[manager].Prepare(ctx, fn)
+			closeErr := mgrs[manager].Close()
 			outcomes <- managerOutcome{
 				manager:    manager,
 				prepared:   p,
@@ -446,9 +454,6 @@ events:
 	for i := 0; i < 2; i++ {
 		select {
 		case o := <-outcomes:
-			if o.newManagerErr != nil {
-				t.Fatalf("manager %d: NewManager failed: %v", o.manager, o.newManagerErr)
-			}
 			if o.prepareErr != nil {
 				t.Fatalf("manager %d: Prepare(app %q) failed: %v (Close error: %v)",
 					o.manager, fn.Name, o.prepareErr, o.closeErr)

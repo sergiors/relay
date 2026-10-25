@@ -264,6 +264,26 @@
 //     and pgx fails the overlapping calls with "conn busy"; the monitor and the
 //     startup/shutdown ownership proofs all share it. The lock is narrow
 //     (ownerConn only), so unrelated state work remains fully concurrent.
+//   - Dependency-image coordination rides the same pinned connection
+//     (AcquireDependencyImageUse/TryAcquireDependencyImageGC, see
+//     dep_image_lease.go): dependency layers live on a Docker daemon that
+//     several Relay processes may share, so their shared-use/exclusive-GC
+//     decision is made in the one database those processes share, using the
+//     two-int advisory-lock namespace 2 with a stable FNV-1a hash of the full
+//     layer reference. Local lease bookkeeping (and the local use-versus-GC
+//     conflict check) is keyed by that advisory-lock identity rather than the
+//     reference string, so a 32-bit hash collision conservatively serializes
+//     colliding references on one handle — PostgreSQL grants a session a
+//     conflicting lock mode on a key it already holds, so reference-keyed
+//     bookkeeping would let one handle use one colliding layer while
+//     garbage-collecting the other. Both forms live on a session (never a
+//     transaction), because a Docker build outlives any transaction. Advisory
+//     locks are scoped to one database: processes sharing a daemon must share
+//     this database. Ownerless handles pin their own coordination connection for
+//     the same reason. Every query on that connection (including lease Verify)
+//     and its closure are serialized by depConnMu: database/sql does not make a
+//     whole query-and-scan atomic, so overlapping pgx calls on one connection
+//     fail with "conn busy".
 //   - Transactions are short and hold no external I/O: fingerprints are computed
 //     before the transaction opens (see RebuildFromFS/RecordDiscovered), so a
 //     write transaction never blocks on the filesystem. Callers that already

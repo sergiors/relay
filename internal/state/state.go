@@ -301,6 +301,45 @@ type State struct {
 	// lack the lock) is detected as a loss rather than a held lock. Zero for an
 	// ownerless handle.
 	ownerPID int
+	// depMu guards the dependency-image coordination state below: the local lease
+	// view, an ownerless handle's pinned coordination connection, and the closed
+	// flag. It is deliberately separate from ownerMu (which guards ownerConn) and
+	// from the operation gates (see dep_image_lease.go). Lock order is
+	// depConnMu -> depMu. No path holds depMu while taking ownerMu or depConnMu, so
+	// Close cannot deadlock against coordination.
+	depMu sync.Mutex
+	// depGateMu serializes one handle's COMPLETE dependency-image coordination
+	// operations: the local shared/exclusive decision together with the session
+	// query that grants it. It is required because PostgreSQL grants a session a
+	// conflicting advisory-lock mode on a key it already holds, so the database
+	// alone cannot prevent this handle from using a layer and garbage-collecting
+	// it at the same time. It is never held while waiting for contention (the
+	// poll backoff runs outside it), and its lock order is depGateMu ->
+	// depMu/ownerMu, never the reverse, so Close cannot deadlock against it.
+	depGateMu sync.Mutex
+	// depConn is the pinned connection dependency-image coordination uses for an
+	// ownerless handle (a CLI/admin handle has no ownerConn). It is nil for an
+	// ownerful handle, which reuses ownerConn, and nil until first use otherwise.
+	// Close releases it, which releases every session advisory lock it holds.
+	depConn *sql.Conn
+	// depConnMu serializes EVERY use of depConn — every query and the close — so
+	// concurrent dependency operations on one ownerless handle (a Verify that does
+	// not take the lease gate racing another Verify, an Acquire, or Close) can
+	// never overlap pgx calls on the pinned connection. database/sql serializes
+	// individual driver calls but not a whole query-and-scan, and overlapping
+	// calls fail with "conn busy" and can poison the connection. It is held only
+	// for one query, never across a contention wait. Lock order is depConnMu ->
+	// depMu.
+	depConnMu sync.Mutex
+	// depPID is the PostgreSQL backend PID of depConn, captured at allocation so a
+	// lease Verify can detect a silently replaced connection.
+	depPID int
+	// depLeases is this handle's local view of the dependency-image locks it holds
+	// (see dependencyLeaseState). Nil until first use.
+	depLeases *dependencyLeaseState
+	// depClosed reports that Close has released dependency coordination; every
+	// later acquisition and verification fails closed.
+	depClosed bool
 	// ownerMu serializes EVERY access to the pinned lock connection (ownerConn):
 	// VerifyOwnerLock reads and queries it, and Close closes and clears it.
 	// database/sql serializes individual driver calls on a *sql.Conn but NOT a
@@ -517,21 +556,26 @@ func (st *State) notifyStatus(name, status string) {
 	}
 }
 
-// Close releases the worker lock (if this handle holds one) and the underlying
-// connection pool. Closing the pinned lock connection releases its session
-// advisory lock, so a restart on the same WORKER_ID can reopen immediately;
-// PostgreSQL also releases the lock if the process dies without a clean Close.
-// It is non-fatal on error and safe on a nil receiver.
+// Close releases the worker lock (if this handle holds one), the dependency-image
+// coordination connection, and the underlying connection pool. Closing the
+// pinned lock connections releases their session advisory locks, so a restart on
+// same WORKER_ID can reopen immediately; PostgreSQL also releases the locks if
+// the process dies without a clean Close. It is non-fatal on error and safe on a
+// nil receiver.
 //
 // Close serializes with VerifyOwnerLock through ownerMu: the pinned lock
 // connection is never closed or cleared while a verification is querying it. A
 // verification queued behind Close observes the cleared connection and fails
-// closed. Only the pinned connection is guarded; the pool Close stays outside
-// the mutex so unrelated database work is not serialized.
+// closed. Dependency-image coordination is marked closed first, so a lease
+// verification or acquisition racing Close fails closed, and an ownerless
+// coordination connection is closed (releasing its session locks). Only the
+// pinned connections are guarded; the pool Close stays outside the mutexes so
+// unrelated database work is not serialized.
 func (st *State) Close() error {
 	if st == nil {
 		return nil
 	}
+	st.closeDependencyCoordination()
 	st.ownerMu.Lock()
 	if st.ownerConn != nil {
 		_ = st.ownerConn.Close()

@@ -181,6 +181,15 @@ type Manager struct {
 	// by tests lazily initializes it on first use (leaseInit).
 	leases    *imageCoordinator
 	leaseInit sync.Once
+	// depCoord is the cross-process dependency-image coordination authority
+	// (shared use versus exclusive GC), injected by the worker from the shared
+	// state database. It complements, and never replaces, the per-Manager lease
+	// coordinator above: the local coordinator protects this manager's own
+	// in-flight uses, while depCoord makes a dependency layer unremovable across
+	// managers and processes. Nil when no coordinator was supplied, in which case
+	// a dependency-consuming app-image build and dependency GC fail closed. See
+	// dep_coord.go.
+	depCoord DependencyImageCoordinator
 	// ops is the Manager's single Docker operation lifecycle: it gates admission
 	// of Manager-owned Docker work, tracks it, owns the cancellation every
 	// detached path derives from, and drains it before CloseContext closes the
@@ -388,6 +397,10 @@ type managerOptions struct {
 	// sourceMount is the worker-global HOT_RELOAD switch (WithSourceMount).
 	// False preserves the historical baked-source behavior.
 	sourceMount bool
+	// depCoord is the cross-process dependency-image coordination authority
+	// (WithDependencyImageCoordinator). Nil means no coordination: a preparation
+	// that must build from a dependency image and dependency GC fail closed.
+	depCoord DependencyImageCoordinator
 }
 
 // WithWarmContainerIdleTimeout sets how long a healthy idle warm execution
@@ -569,6 +582,7 @@ func NewManager(
 		now:                      resolved.now,
 		sourceMount:              resolved.sourceMount,
 		pullChecks:               map[string]time.Time{},
+		depCoord:                 resolved.depCoord,
 	}
 	// Construct the build limiter now with the resolved capacity, so the lazy
 	// fallback in buildLimiterFor is never needed for a NewManager-built

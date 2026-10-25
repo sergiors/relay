@@ -21,6 +21,8 @@ import (
 	"github.com/moby/moby/client"
 
 	"relay/internal/app"
+	"relay/internal/observability/metrics"
+	"relay/internal/testutil"
 )
 
 func writeFile(t *testing.T, dir, name, content string) {
@@ -36,6 +38,15 @@ func writeFile(t *testing.T, dir, name, content string) {
 // registered as cleanup: Manager.Close discards the per-app reused
 // execution containers it may have started.
 //
+// The manager is constructed with an explicit State-backed dependency-image
+// coordinator over a fresh schema on TEST_DATABASE_URL, mirroring production
+// wiring: real integration tests share one Docker daemon with other tests,
+// other packages, and possibly a live worker, so their dep-bearing Prepare and
+// dependency GC must coordinate through the SAME database those processes use.
+// A Postgres at TEST_DATABASE_URL is therefore required like the state
+// integration suite; a missing database fails here rather than silently
+// running an uncoordinated manager.
+//
 // Handler stdout/stderr is NO LONGER routed through the logger (it is forwarded
 // as a raw transport to the app-output sink; see output.go and
 // newAppOutputSink), so handler-output assertions must read from that sink,
@@ -45,7 +56,9 @@ func newManager(t *testing.T) (*Manager, *bytes.Buffer) {
 	t.Helper()
 	var buf bytes.Buffer
 	l := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	m, err := NewManager(l, nil, "test-host")
+	dsn := testutil.NewStateDSN(t)
+	coord := stateDepCoordinator{st: testutil.OpenState(t, dsn)}
+	m, err := NewManager(l, nil, "test-host", WithDependencyImageCoordinator(coord))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -320,15 +333,38 @@ func imageExistsInDaemon(cli *client.Client, ctx context.Context, ref string) bo
 	return err == nil
 }
 
-// mPrepare builds an app via a fresh Manager wired to a discard logger.
+// mPrepare builds an app via a fresh Manager wired to a discard logger and an
+// explicit State-backed dependency-image coordinator (per-test schema on
+// TEST_DATABASE_URL), so dep-bearing prepares coordinate like production.
 func mPrepare(ctx context.Context, t *testing.T, fn app.App) (*Prepared, error) {
 	t.Helper()
-	m, err := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, "test-host")
+	m, err := newCoordinatedRealManager(t, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
 	defer m.Close()
 	return m.Prepare(ctx, fn)
+}
+
+// newCoordinatedRealManager constructs a real-daemon Manager with the
+// State-backed dependency-image coordinator over its own schema on the shared
+// TEST_DATABASE_URL database, plus the supplied options. It mirrors production
+// wiring (the worker always injects the State-backed coordinator). The test
+// binary must have a reachable Postgres, exactly like the state integration
+// suite: a missing database fails rather than skipping.
+func newCoordinatedRealManager(
+	t *testing.T,
+	logger *slog.Logger,
+	registry *metrics.Registry,
+	opts ...ManagerOption,
+) (*Manager, error) {
+	t.Helper()
+	dsn := testutil.NewStateDSN(t)
+	coord := stateDepCoordinator{st: testutil.OpenState(t, dsn)}
+	return NewManager(
+		logger, registry, "test-host",
+		append([]ManagerOption{WithDependencyImageCoordinator(coord)}, opts...)...,
+	)
 }
 
 // buildTestImage builds a tiny image with the given tag and an inline Dockerfile

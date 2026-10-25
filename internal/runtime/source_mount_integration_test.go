@@ -40,7 +40,7 @@ func TestIntegrationSourceMountPythonReflectsSourceChange(t *testing.T) {
 	writeFile(t, dir, "handler.py", "def run(event):\n    raise ValueError('V1')\n")
 
 	fn := app.App{Name: "src-mount-it", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
-	m, err := NewManager(testutil.DiscardLogger(), nil, "test-host", WithSourceMount(true))
+	m, err := newCoordinatedRealManager(t, testutil.DiscardLogger(), nil, WithSourceMount(true))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -103,7 +103,7 @@ export function handler(event) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	m, err := NewManager(testutil.DiscardLogger(), nil, "test-host", WithSourceMount(true))
+	m, err := newCoordinatedRealManager(t, testutil.DiscardLogger(), nil, WithSourceMount(true))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -187,7 +187,7 @@ exports.handler = function (event) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	m, err := NewManager(testutil.DiscardLogger(), nil, "test-host", WithSourceMount(true))
+	m, err := newCoordinatedRealManager(t, testutil.DiscardLogger(), nil, WithSourceMount(true))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -264,7 +264,7 @@ export function handler(event: { event_id: string }): void {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	m, err := NewManager(testutil.DiscardLogger(), nil, "test-host", WithSourceMount(true))
+	m, err := newCoordinatedRealManager(t, testutil.DiscardLogger(), nil, WithSourceMount(true))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -360,7 +360,7 @@ export function handler(event: { event_id: string }): void {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	m, err := NewManager(testutil.DiscardLogger(), nil, "test-host", WithSourceMount(true))
+	m, err := newCoordinatedRealManager(t, testutil.DiscardLogger(), nil, WithSourceMount(true))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -440,7 +440,7 @@ export function handler(event) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	m, err := NewManager(testutil.DiscardLogger(), nil, "test-host", WithSourceMount(true))
+	m, err := newCoordinatedRealManager(t, testutil.DiscardLogger(), nil, WithSourceMount(true))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -502,7 +502,7 @@ export function handler(event) {
 		t.Fatalf("fingerprint before prepare: %v", err)
 	}
 
-	m, err := NewManager(testutil.DiscardLogger(), nil, "test-host", WithSourceMount(true))
+	m, err := newCoordinatedRealManager(t, testutil.DiscardLogger(), nil, WithSourceMount(true))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -575,7 +575,7 @@ export function handler(event) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	m, err := NewManager(testutil.DiscardLogger(), nil, "test-host", WithSourceMount(true))
+	m, err := newCoordinatedRealManager(t, testutil.DiscardLogger(), nil, WithSourceMount(true))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -640,7 +640,7 @@ setInterval(() => {}, 1 << 30);
 		t.Fatalf("fingerprint before prepare: %v", err)
 	}
 
-	m, err := NewManager(testutil.DiscardLogger(), nil, "test-host", WithSourceMount(true))
+	m, err := newCoordinatedRealManager(t, testutil.DiscardLogger(), nil, WithSourceMount(true))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -767,7 +767,7 @@ setInterval(() => {}, 1 << 30);
 	// cannot accumulate.
 	isolateAppServiceContainers(t, ctx, cli, appName)
 
-	m, err := NewManager(testutil.DiscardLogger(), nil, "test-host", WithSourceMount(true))
+	m, err := newCoordinatedRealManager(t, testutil.DiscardLogger(), nil, WithSourceMount(true))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -866,7 +866,7 @@ export function handler(event) {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 
-	m, err := NewManager(testutil.DiscardLogger(), nil, "test-host", WithSourceMount(true))
+	m, err := newCoordinatedRealManager(t, testutil.DiscardLogger(), nil, WithSourceMount(true))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -1008,10 +1008,7 @@ func waitForContainerIDGone(ctx context.Context, cli *client.Client, id string) 
 func newSourceMountWarmManager(t *testing.T, maxWarm int) (*Manager, *metrics.Registry) {
 	t.Helper()
 	reg := metrics.New()
-	m, err := NewManager(
-		testutil.DiscardLogger(),
-		reg,
-		"test-host",
+	m, err := newCoordinatedRealManager(t, testutil.DiscardLogger(), reg,
 		WithSourceMount(true),
 		WithMaxWarmContainers(maxWarm),
 	)
@@ -1299,7 +1296,7 @@ setInterval(() => {}, 1 << 30);
 	// client (no live Manager required), before the scenario starts.
 	isolateAppServiceContainers(t, ctx, cli, appName)
 
-	m, err := NewManager(testutil.DiscardLogger(), nil, "test-host", WithSourceMount(true))
+	m, err := newCoordinatedRealManager(t, testutil.DiscardLogger(), nil, WithSourceMount(true))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -1486,7 +1483,7 @@ setInterval(() => {}, 1 << 30);
 	// cannot accumulate.
 	isolateAppServiceContainers(t, ctx, cli, appName)
 
-	m, err := NewManager(testutil.DiscardLogger(), nil, "test-host", WithSourceMount(true))
+	m, err := newCoordinatedRealManager(t, testutil.DiscardLogger(), nil, WithSourceMount(true))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -1642,7 +1639,7 @@ export function handler(event: { event_id: string }): void {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 
-	m, err := NewManager(testutil.DiscardLogger(), nil, "test-host", WithSourceMount(true))
+	m, err := newCoordinatedRealManager(t, testutil.DiscardLogger(), nil, WithSourceMount(true))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}

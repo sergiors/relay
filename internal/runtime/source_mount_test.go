@@ -664,7 +664,7 @@ func TestPrepareSourceMountDependencyChangeBuildsNewGeneration(t *testing.T) {
 		dockerRoute{method: http.MethodGet, path: "/images/", status: http.StatusNotFound, body: `{"message":"no such image"}`},
 		countBuildsRoute(&second, &depCtx, &appCtx),
 	)
-	m2 := newLifecycleManager(t, cli2, context.Background())
+	m2 := newLifecycleManager(t, cli2, context.Background(), coordOf(m))
 	m2.sourceMount = true
 	preparedSecond, err := m2.Prepare(context.Background(), fn)
 	if err != nil {
@@ -743,7 +743,7 @@ func TestPrepareSourceMountSourceOnlyChangeDoesNotBuildDependency(t *testing.T) 
 		dockerRoute{method: http.MethodGet, path: "/images/", body: present},
 		countBuildsRoute(&second, nil, nil),
 	)
-	m2 := newLifecycleManager(t, cli2, context.Background())
+	m2 := newLifecycleManager(t, cli2, context.Background(), coordOf(m))
 	m2.sourceMount = true
 	preparedSecond, err := m2.Prepare(context.Background(), fn)
 	if err != nil {
