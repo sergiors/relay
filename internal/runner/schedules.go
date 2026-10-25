@@ -597,7 +597,8 @@ func (r *Runner) invokeHandler(
 		}
 		// A create-time warm-budget saturation is BACKPRESSURE, not a handler
 		// failure: leave the occurrence pending (a later delivery retries the
-		// claim) without charging a retry or a DLQ. As on the event path, this
+		// claim) without charging a retry, a DLQ entry, or handler-failure
+		// telemetry. As on the event path, this
 		// race happens after the confirmed admission, so the attempt it claimed
 		// is spent even though nothing is charged (see Handle's create-time
 		// saturation branch).

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"relay/internal/app"
+	"relay/internal/observability/metrics"
 	"relay/internal/runtime"
 	"relay/internal/stream"
 	"relay/internal/testutil"
@@ -233,6 +234,37 @@ func TestRunnerWarmBudgetScheduleCreateSaturationLeavesPending(t *testing.T) {
 	defer prog.mu.Unlock()
 	if len(prog.failures) != 0 || len(prog.exhausted) != 0 {
 		t.Fatalf("failures=%v exhausted=%v, want none", prog.failures, prog.exhausted)
+	}
+}
+
+// TestRunnerWarmBudgetScheduleCreateSaturationIsNotHandlerFailure pins the
+// telemetry side of the same schedule-path race: create-time warm-budget
+// saturation is backpressure, not a handler failure, so it must charge no
+// handler failure attribution even though the claimed attempt is spent. The
+// event and manual paths already guard the sentinel before
+// recordHandlerFailure; the schedule path must agree.
+func TestRunnerWarmBudgetScheduleCreateSaturationIsNotHandlerFailure(t *testing.T) {
+	m := metrics.New()
+	exec := &warmAdmitterExecutor{executeErr: runtime.ErrWarmBudgetSaturated}
+	app := schedFn(t, "fn", exec, time.Second)
+	r := NewWithMetrics([]*PreparedApp{app}, testutil.DiscardLogger(), m)
+	r.SetMaxConcurrentInvocations(2)
+
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	err := r.InvokeHandler(ctx, "m-1", "fn", "sched", "index.run", []byte(`{}`))
+	if !errors.Is(err, stream.ErrInvocationNotEligible) {
+		t.Fatalf("InvokeHandler on create-time saturation = %v, want ErrInvocationNotEligible", err)
+	}
+	if got := prog.attempts["fn/index.run"]; got != 1 {
+		t.Fatalf("handler attempt after create-time saturation = %d, want 1 (the post-claim race spends the claimed attempt)", got)
+	}
+	assertNoHandlerFailureTelemetry(t, m, "fn", "index.run")
+	for _, s := range m.AppStatsSnapshot() {
+		if s.App == "fn" && s.LastFailure != 0 {
+			t.Fatalf("last_failure_at = %d, want 0 (backpressure is not a failed execution)", s.LastFailure)
+		}
 	}
 }
 

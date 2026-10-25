@@ -129,6 +129,9 @@ func (r *Runner) executeWithRefs(
 // InvokeHandler (with or without invocation state): it resolves the per-invocation
 // template env/secrets, runs the handler inside the panic boundary and the
 // caller-provided capped timeout, and emits the handler success/failure metrics.
+// A create-time warm-budget saturation is the one executor error that is NOT a
+// failed execution: it is backpressure, so no failure metric is emitted and the
+// caller maps the sentinel to its pending (or synchronous error) contract.
 // It assumes the caller has already reserved the concurrency slots; on success,
 // when invState is non-nil it marks the invocation complete BEFORE the success
 // metrics so a crash between the side effect and MarkComplete re-runs the
@@ -198,6 +201,15 @@ func (r *Runner) invokeOnce(
 		return err
 	}
 	if err != nil {
+		// A create-time warm-budget saturation is BACKPRESSURE, not a failed
+		// execution: the caller leaves the occurrence pending without a retry,
+		// exhaustion, or DLQ entry (see schedules.go). It must therefore not be
+		// attributed as a handler failure either. The event and manual paths
+		// guard the same sentinel before recordHandlerFailure; this shared
+		// schedule core does the same so the telemetry contract is identical.
+		if warmSaturated(err) {
+			return err
+		}
 		r.recordHandlerFailure(pf.fn.Name, handler, elapsed)
 		r.log.Warn("App handler: execution failed for schedule",
 			"app", pf.fn.Name,
