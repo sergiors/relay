@@ -77,6 +77,26 @@ func TestReadinessStartsFalseAndClearsBeforeShutdown(t *testing.T) {
 	}
 }
 
+// TestReadinessNilReceiverReportsStarting pins Ready's nil-receiver contract:
+// a direct call on a nil *readiness must not panic and must answer the
+// established not-ready result for a worker that has not crossed the
+// ready-to-consume boundary — false with reason "worker starting", the same
+// reason the non-nil false-flag path reports — so a query holding a nil state
+// can never crash the health path.
+func TestReadinessNilReceiverReportsStarting(t *testing.T) {
+	var r *readiness
+
+	// Returning at all proves no panic: a nil receiver is inspected before any
+	// flag, ownership, lifecycle, or probe access.
+	ready, reason := r.Ready(context.Background())
+	if ready {
+		t.Fatalf("nil readiness must report not-ready, got ready (reason %q)", reason)
+	}
+	if reason != "worker starting" {
+		t.Fatalf("reason = %q, want %q", reason, "worker starting")
+	}
+}
+
 // TestReadinessNotReadyWhenLifecycleCancelledBeforeClear pins the race the flag
 // alone cannot win: the worker lifecycle context can be cancelled before Run
 // reaches its deferred setNotReady (a signal during the final startup wiring, or

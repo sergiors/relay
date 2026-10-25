@@ -164,7 +164,13 @@ func (r *readiness) setProbe(probe func(context.Context) (bool, string)) {
 // flag on a live lifecycle runs the live probe. It is nil-safe and never blocks
 // beyond the probe's own bound.
 func (r *readiness) Ready(ctx context.Context) (bool, string) {
-	if r == nil || !r.ready.Load() {
+	if r == nil {
+		// A nil receiver has no ownership state to inspect; report the
+		// established not-ready result for a worker that has not crossed the
+		// ready-to-consume boundary.
+		return false, "worker starting"
+	}
+	if !r.ready.Load() {
 		// A false flag means the worker has not crossed the ready-to-consume
 		// boundary yet: it is still starting. The socket only exists once the
 		// worker is running, so there is no "not running" case here.
