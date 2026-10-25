@@ -6,6 +6,7 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/client"
 
 	"relay/internal/app"
@@ -260,6 +262,16 @@ events:
 // successfully; Remove:true does not apply to failed builds). It uses a
 // malformed package.json so the node engine's `pnpm install --prod
 // --frozen-lockfile` step fails deterministically.
+//
+// The kept intermediate is identified from the build output Prepare itself
+// carries in err.Error(): the classic builder's `Running in <id>` lines name
+// the exact containers a failed build leaves behind. Inspecting ONLY those
+// parsed IDs (never a daemon-wide container enumeration) keeps this test
+// race-free on a shared daemon: another package's transient container can
+// vanish between a ContainerList and its inspection, but a container ID that
+// was named as an intermediate of OUR failed build is ours alone. A missing or
+// inspect-erroring intermediate is a FAILURE (it is the expected debugging
+// intermediate — its NotFound must not be suppressed generically).
 func TestIntegrationFailedBuildKeepsIntermediatesAndPropagatesError(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -282,17 +294,55 @@ events:
 	// step must fail parsing it, failing the build deterministically.
 	writeFile(t, dir, "package.json", "{ not json")
 
-	fn := app.App{Name: "failed-build-int", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	// Per-invocation unique app identity: cleanup below removes only this run's
+	// relay-app-<appName>:* tags, never another invocation's image namespace.
+	appName := testutil.UniqueName(t, "failed-build-int")
+	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "node24"}}
 
-	// Snapshot the container set BEFORE the failed build.
-	preList, err := cli.ContainerList(ctx, client.ContainerListOptions{All: true})
-	if err != nil {
-		t.Fatalf("snapshot containers before failed build: %v", err)
-	}
-	before := make(map[string]bool, len(preList.Items))
-	for _, c := range preList.Items {
-		before[c.ID] = true
-	}
+	// The intermediate IDs the failed build names (parsed after the failure,
+	// BEFORE the closure below runs — t.Cleanup is deferred to test end).
+	var intermediates []string
+
+	// Scoped cleanup registered BEFORE the build, ownership-checked and
+	// error-reporting:
+	//   - intermediates: safe exact IDs parsed from THIS test's own build
+	//     output (the daemon named them); removeContainer already treats
+	//     NotFound as benign, and every other removal failure is REPORTED
+	//     with t.Errorf instead of silently discarded.
+	//   - app images: only tags on images whose EXISTING Relay labels prove
+	//     relay.type == ImageTypeApp AND relay.app == this run's unique
+	//     appName — never a repo prefix, never unlabeled or foreign images.
+	//   - ImageList/ImageRemove errors are reported with t.Errorf; NotFound
+	//     on an ImageRemove is benign (the failed build may tag nothing).
+	// The context is fresh and bounded: t.Cleanup runs after the test's
+	// deferred cancel() has fired.
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		for _, id := range intermediates {
+			if err := removeContainer(cli, id); err != nil {
+				t.Errorf("cleanup: remove failed-build intermediate %s: %v", id, err)
+			}
+		}
+		// This test's own FAILED build produced (at most) one tagged
+		// relay-app-<appName>:* image; remove ONLY tags whose image carries the
+		// proof of ownership — the existing Relay labels — never a repo prefix.
+		imgs, err := cli.ImageList(cleanupCtx, client.ImageListOptions{})
+		if err != nil {
+			t.Errorf("cleanup: list images: %v", err)
+			return
+		}
+		for _, img := range imgs.Items {
+			if img.Labels[labelType] != ImageTypeApp || img.Labels[labelApp] != appName {
+				continue // not this test's app image; untouchable
+			}
+			for _, tag := range img.RepoTags {
+				if _, err := cli.ImageRemove(cleanupCtx, tag, client.ImageRemoveOptions{Force: true}); err != nil && !cerrdefs.IsNotFound(err) {
+					t.Errorf("cleanup: remove app image tag %s: %v", tag, err)
+				}
+			}
+		}
+	})
 
 	// Prepare must fail. mPrepare returns the Prepare error (it only t.Fatalfs on
 	// NewManager failure), so a non-nil error here is the expected outcome.
@@ -300,68 +350,42 @@ events:
 	if err == nil {
 		t.Fatalf("expected Prepare to fail on malformed package.json, got success (image %s)", prepared.Image)
 	}
+	errText := fmt.Sprint(err)
 	t.Logf("prepare error: %v", err)
 
 	// The error must propagate the build stream: assert it carries the pnpm/JSON
 	// failure text, proving drainBuildResponse surfaced the stream error rather
 	// than a silent success. Keep to a stable substring observed on the daemon.
-	if !strings.Contains(err.Error(), "pnpm") && !strings.Contains(err.Error(), "JSON") && !strings.Contains(err.Error(), "package.json") {
+	if !strings.Contains(errText, "pnpm") && !strings.Contains(errText, "JSON") && !strings.Contains(errText, "package.json") {
 		t.Errorf("expected the build-stream error to mention pnpm/JSON/package.json, got: %v", err)
 	}
 
-	// After the failed build, at least one NEW classic-builder intermediate
-	// container must remain (failed builds keep intermediates for debugging).
-	after, err := cli.ContainerList(ctx, client.ContainerListOptions{All: true})
-	if err != nil {
-		t.Fatalf("list containers after failed build: %v", err)
+	// The failed build output names the intermediates of THIS build:
+	// `Running in <id>` lines from the classic builder. Parse them out; the
+	// daemon-wide before/after container enumeration this used to do is gone
+	// (it raced other processes' transient containers).
+	intermediates = failedBuildIntermediateIDs(errText)
+	if len(intermediates) == 0 {
+		t.Fatalf("the failed build output must name its classic-builder intermediate containers "+
+			"(no 'Running in <id>' line found in the propagated build stream): %s", errText)
 	}
-	var leakedIntermediates []string
-	for _, c := range after.Items {
-		if before[c.ID] {
-			continue // pre-existing; not ours
-		}
-		insp, err := cli.ContainerInspect(ctx, c.ID, client.ContainerInspectOptions{})
+	t.Logf("failed build named %d intermediate container(s): %v", len(intermediates), intermediates)
+
+	// Each parsed intermediate is the expected debugging leftover and MUST
+	// remain inspectable; a missing (NotFound) or erroring one FAILS the test.
+	for _, id := range intermediates {
+		insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
 		if err != nil {
-			t.Fatalf("inspect new container %s after failed build: %v", c.ID, err)
+			t.Fatalf("the failed-build intermediate %s must remain inspectable: %v", id, err)
 		}
 		var cmd []string
 		if insp.Container.Config != nil {
 			cmd = insp.Container.Config.Cmd
 		}
-		if isClassicBuilderIntermediate(cmd) {
-			leakedIntermediates = append(leakedIntermediates, c.ID)
+		if !isClassicBuilderIntermediate(cmd) {
+			t.Fatalf("the parsed intermediate %s must be a classic-builder intermediate", id)
 		}
 	}
-	if len(leakedIntermediates) == 0 {
-		t.Error("expected at least one classic-builder intermediate container to remain after the " +
-			"failed build (failed builds keep intermediates for debugging)")
-	}
-	t.Logf("failed build left %d intermediate container(s): %v", len(leakedIntermediates), leakedIntermediates)
-
-	// Cleanup: force-remove the leftover intermediate containers and any
-	// relay-app-failed-build-int:* image the failed build created. t.Cleanup runs
-	// after the test's deferred cancel() has fired, so use a fresh context.
-	t.Cleanup(func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cleanupCancel()
-		for _, id := range leakedIntermediates {
-			_ = removeContainer(cli, id)
-		}
-		// Remove any tagged relay-app-failed-build-int:* image (the failed build
-		// may or may not have produced a tagged image).
-		imgs, err := cli.ImageList(cleanupCtx, client.ImageListOptions{})
-		if err != nil {
-			return
-		}
-		for _, img := range imgs.Items {
-			for _, tag := range img.RepoTags {
-				if strings.HasPrefix(tag, "relay-app-failed-build-int:") {
-					cleanupImage(cli, cleanupCtx, tag)
-					break
-				}
-			}
-		}
-	})
 }
 
 // TestIntegrationConcurrentManagersResolveSameDependencyReference verifies that
