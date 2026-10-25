@@ -173,6 +173,10 @@ func TestServerStartServesInBackground(t *testing.T) {
 	if err := srv.Stop(stopCtx); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
+	// Success persists: a second Stop still observes the first (nil) result.
+	if err := srv.Stop(stopCtx); err != nil {
+		t.Fatalf("second Stop: %v", err)
+	}
 }
 
 // TestServerStartFailsFastOnBadAddr verifies Start returns the bind error

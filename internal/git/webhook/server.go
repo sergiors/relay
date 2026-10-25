@@ -90,6 +90,9 @@ type Server struct {
 	serveErr     chan error
 	started      atomic.Bool
 	shutdownOnce sync.Once
+	// stopErr retains the first Stop result so repeated (and concurrent) calls
+	// observe it instead of the zero value. shutdownOnce publishes it.
+	stopErr error
 }
 
 // NewServer assembles the whole webhook subsystem in a single constructor
@@ -316,9 +319,8 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s == nil || !s.started.Load() {
 		return nil
 	}
-	var err error
 	s.shutdownOnce.Do(func() {
-		err = s.srv.Shutdown(ctx)
+		err := s.srv.Shutdown(ctx)
 		if err == nil || errors.Is(err, http.ErrServerClosed) {
 			err = nil
 		}
@@ -335,11 +337,12 @@ func (s *Server) Stop(ctx context.Context) error {
 				logServer(s.logger, slog.LevelWarn, "Git webhook scheduler: graceful shutdown failed", "error", serr)
 			}
 		}
+		s.stopErr = err
 	})
-	if err == nil {
+	if s.stopErr == nil {
 		logServer(s.logger, slog.LevelInfo, "Webhook server stopped")
 	}
-	return err
+	return s.stopErr
 }
 
 // Config carries the shared dependencies and high-level configuration the

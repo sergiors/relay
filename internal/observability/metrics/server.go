@@ -49,6 +49,9 @@ type Server struct {
 
 	started      atomic.Bool
 	shutdownOnce sync.Once
+	// stopErr retains the first Stop result so repeated (and concurrent) calls
+	// observe it instead of the zero value. shutdownOnce publishes it.
+	stopErr error
 }
 
 // NewServer builds a Server exposing handler on addr. handler must be
@@ -119,9 +122,8 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s == nil || !s.started.Load() {
 		return nil
 	}
-	var err error
 	s.shutdownOnce.Do(func() {
-		err = s.srv.Shutdown(ctx)
+		err := s.srv.Shutdown(ctx)
 		if err == nil || errors.Is(err, http.ErrServerClosed) {
 			err = nil
 		}
@@ -129,6 +131,7 @@ func (s *Server) Stop(ctx context.Context) error {
 		// serving goroutine before returning so a caller can be sure no handler
 		// is still running.
 		<-s.serveErr
+		s.stopErr = err
 	})
-	return err
+	return s.stopErr
 }
