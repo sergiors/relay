@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -375,13 +376,20 @@ func TestIntegrationConcurrentDepBuilds(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// Register cleanup FIRST (before any Fatalf) so a mid-test failure never
-	// leaks the dep-layer nor app images into the sibling tests that follow
-	// on the shared daemon. The dep cleanup is scoped to this test's own
-	// additions (delta vs snapshot).
-	depBefore := depTagSet(ctx, cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
-	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-dep-race:"))
+	appName := testutil.UniqueName(t, "dep-race")
+	var wg sync.WaitGroup
+	// One cleanup owns the concurrent test's teardown: it joins BOTH Prepare
+	// goroutines (each closes its Manager before signaling done) and only then
+	// removes this test's app image, so no image cleanup can race an active
+	// Prepare. The app name is unique per invocation (both Managers still share
+	// it), so parallel package processes cannot remove or retag each other's app
+	// image. Dependency layers are content-addressed and shared daemon-wide; a
+	// baseline delta is not proof of exclusive ownership, so they are
+	// intentionally retained rather than deleted here.
+	t.Cleanup(func() {
+		wg.Wait()
+		cleanupImagePrefixes(cli, "relay-app-"+appName+":")()
+	})
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -393,14 +401,18 @@ events:
 `)
 	writeFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
 	writeFile(t, dir, "requirements.txt", "six==1.16.0\n")
-	fn := app.App{Name: "dep-race", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
+	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 	wantDep := expectedDependencyRef(t, fn)
 
 	start := make(chan struct{})
 	errs := make(chan error, 2)
 	results := make(chan *Prepared, 2)
+	wg.Add(2)
 	for i := 0; i < 2; i++ {
 		go func() {
+			// Done runs after m.Close (defer LIFO), so the cleanup above observes
+			// fully closed Managers as well as finished Prepare calls.
+			defer wg.Done()
 			<-start
 			m, err := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, "test-host")
 			if err != nil {

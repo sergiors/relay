@@ -32,8 +32,6 @@ func TestIntegrationDependencyImageLabels(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	depBefore := depTagSet(ctx, cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
 	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-dep-labels:"))
 
 	dir := t.TempDir()
@@ -146,8 +144,6 @@ func TestIntegrationSharedDependencyGC(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	depBefore := depTagSet(ctx, cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
 	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-dep-gc-a:", "relay-app-dep-gc-b:", "relay-dep-evil"))
 
 	newManaged := func(name, deps string) app.App {
@@ -381,8 +377,6 @@ func TestIntegrationAppBuildFailurePrunesBuiltDependency(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	depBefore := depTagSet(ctx, cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
 	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-dep-fail-build:"))
 
 	dir := t.TempDir()

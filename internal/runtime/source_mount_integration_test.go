@@ -85,8 +85,6 @@ func TestIntegrationSourceMountPythonReflectsSourceChange(t *testing.T) {
 // a real dependency resolves from the dependency image.
 func TestIntegrationSourceMountNodeJSReflectsSourceChange(t *testing.T) {
 	cli := testutil.RequireDocker(t)
-	depBefore := depTagSet(context.Background(), cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
 
 	dir := t.TempDir()
 	writeFile(t, dir, "package.json", `{
@@ -172,8 +170,6 @@ export function handler(event) {
 // source. A source-only edit reuses the image and runs the edited code.
 func TestIntegrationSourceMountNodeCJSReflectsSourceChange(t *testing.T) {
 	cli := testutil.RequireDocker(t)
-	depBefore := depTagSet(context.Background(), cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
 
 	dir := t.TempDir()
 	writeFile(t, dir, "package.json", `{
@@ -240,8 +236,6 @@ exports.handler = function (event) {
 // bare packages resolving from the dependency image.
 func TestIntegrationSourceMountNodeTSReflectsSourceChange(t *testing.T) {
 	cli := testutil.RequireDocker(t)
-	depBefore := depTagSet(context.Background(), cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
 
 	dir := t.TempDir()
 	writeFile(t, dir, "package.json", `{
@@ -328,8 +322,6 @@ export function message(event: { event_id: string }): string {
 // source-independent image.
 func TestIntegrationSourceMountNodeTSSelfReference(t *testing.T) {
 	cli := testutil.RequireDocker(t)
-	depBefore := depTagSet(context.Background(), cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
 
 	dir := t.TempDir()
 	writeFile(t, dir, "package.json", `{
@@ -423,8 +415,6 @@ export function where(): string {
 // dependency image) rather than /app/src/node_modules (the masked host stub).
 func TestIntegrationSourceMountNodeHostNodeModulesDoesNotShadow(t *testing.T) {
 	cli := testutil.RequireDocker(t)
-	depBefore := depTagSet(context.Background(), cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
 
 	dir := t.TempDir()
 	writeFile(t, dir, "package.json", `{
@@ -486,8 +476,6 @@ export function handler(event) {
 // import to /app/node_modules, so the real dependency package wins.
 func TestIntegrationSourceMountNodeLateHostNodeModulesDoesNotShadow(t *testing.T) {
 	cli := testutil.RequireDocker(t)
-	depBefore := depTagSet(context.Background(), cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
 
 	dir := t.TempDir()
 	// node_modules is excluded from the selected source, so creating it after
@@ -618,8 +606,6 @@ export function handler(event) {
 // real dependency package wins over the host stub.
 func TestIntegrationSourceMountNodeServiceLateHostNodeModulesDoesNotShadow(t *testing.T) {
 	cli := testutil.RequireDocker(t)
-	depBefore := depTagSet(context.Background(), cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
 
 	dir := t.TempDir()
 	// node_modules is excluded from the selected source, so creating it after
@@ -862,8 +848,6 @@ setInterval(() => {}, 1 << 30);
 // source.
 func TestIntegrationSourceMountNodeDependencyChangeBuildsAndExecutes(t *testing.T) {
 	cli := testutil.RequireDocker(t)
-	depBefore := depTagSet(context.Background(), cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
 
 	dir := t.TempDir()
 	writeFile(t, dir, "package.json", `{
@@ -1283,8 +1267,6 @@ func TestIntegrationSourceMountWarmBoundBackpressuresBusyGeneration(t *testing.T
 // bare imports from the dependency image through the preloaded hook.
 func TestIntegrationSourceMountNodeServiceSourceReplacementReusesDependency(t *testing.T) {
 	cli := testutil.RequireDocker(t)
-	depBefore := depTagSet(context.Background(), cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
 
 	dir := t.TempDir()
 	writeFile(t, dir, "package.json", `{
@@ -1329,9 +1311,9 @@ setInterval(() => {}, 1 << 30);
 	//  2. remove this app's images, now that no container references them (an
 	//     image removed while a container still uses it is merely untagged and
 	//     survives as a dangling layer);
-	//  3. close the manager;
-	//  4. remove only the dependency images this test's builds added
-	//     (cleanupNewDepImagesSince, registered first at the top of the test).
+	//  3. close the manager.
+	// Dependency images are content-addressed and shared, so they are retained:
+	// no snapshot/delta in this test is an ownership proof for deletion.
 	t.Cleanup(func() { _ = m.Close() })
 	t.Cleanup(func() { cleanupImagePrefixes(cli, "relay-app-"+appName+":")() })
 	t.Cleanup(func() {
@@ -1355,6 +1337,9 @@ setInterval(() => {}, 1 << 30);
 	if first.Dependency == "" {
 		t.Fatal("expected the Node app to build FROM a dependency image")
 	}
+	// Daemon-wide observation for the non-destructive assertion below: it is a
+	// tag-addition snapshot, NOT an ownership claim (another test/worker may add
+	// an unrelated relay-dep-* tag concurrently), and it is never used to delete.
 	depAfterFirst := depTagSet(ctx, cli)
 
 	tmpl := &app.Template{Runtime: "node24"}
@@ -1405,6 +1390,10 @@ setInterval(() => {}, 1 << 30);
 	if second.Fingerprint == first.Fingerprint {
 		t.Fatal("source-only change must advance the source fingerprint")
 	}
+	// Non-destructive delta assertion only: the authoritative reuse proof is the
+	// unchanged dependency reference above. The snapshot is a daemon-wide
+	// observation, not ownership proof, and is never used to delete anything; on
+	// a shared daemon a concurrent unrelated build can legitimately add a tag.
 	if got := newDepTagsSince(ctx, cli, depAfterFirst); len(got) != 0 {
 		t.Fatalf("source-only change built a new dependency image: %v", got)
 	}
@@ -1477,8 +1466,6 @@ setInterval(() => {}, 1 << 30);
 // operation the service reconciler performs for a source-only change.
 func TestIntegrationSourceMountServiceRestartInPlaceReloadsSource(t *testing.T) {
 	cli := testutil.RequireDocker(t)
-	depBefore := depTagSet(context.Background(), cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
 
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "app"), 0o755); err != nil {
@@ -1619,8 +1606,6 @@ func awaitServiceLog(t *testing.T, ctx context.Context, cli *client.Client, id s
 // reuses the same source-independent image while running the re-bundled code.
 func TestIntegrationSourceMountNodeTSTsconfigAliasReflectsSourceChange(t *testing.T) {
 	cli := testutil.RequireDocker(t)
-	depBefore := depTagSet(context.Background(), cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
 
 	dir := t.TempDir()
 	writeFile(t, dir, "package.json", `{

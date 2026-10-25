@@ -166,13 +166,11 @@ func TestIntegrationDependencyLayerReuse(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// Register cleanup FIRST (before any Fatalf) so a mid-test failure can never
-	// leak the dep-layer and app images this test creates into the sibling
-	// tests that follow on the shared daemon. We remove only the dep images this
-	// test built (delta vs the snapshot below), not every relay-dep-* layer on
-	// the daemon, and force-remove this test's own app image.
-	depBefore := depTagSet(ctx, cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
+	// Register the app-image cleanup FIRST (before any Fatalf) so a mid-test
+	// failure can never leak this test's app image into sibling tests on the
+	// shared daemon. Dependency layers are content-addressed and shared
+	// daemon-wide, so this test intentionally does not delete them: a
+	// before/after tag delta is not proof of exclusive ownership.
 	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-dep-reuse:"))
 
 	dir := t.TempDir()
@@ -313,11 +311,11 @@ func TestIntegrationDependencyChangeProducesNewDepLayer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// Register cleanup FIRST (before any Fatalf) so a mid-test failure can never
-	// leak the dep-layer and app images this test creates into the sibling
-	// tests that follow on the shared daemon.
-	depBefore := depTagSet(ctx, cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
+	// Register the app-image cleanup FIRST (before any Fatalf) so a mid-test
+	// failure can never leak this test's app image into sibling tests on the
+	// shared daemon. Dependency layers are content-addressed and shared: this
+	// test intentionally retains them rather than deleting everything a
+	// before/after delta observed.
 	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-dep-change:"))
 
 	dir := t.TempDir()

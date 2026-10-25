@@ -1563,14 +1563,6 @@ export function check(event) {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			defer cancel()
 
-			// Neither subtest declares dependencies, so no relay-dep-* layer is
-			// built (this cleanup is a harmless no-op). It is kept as a safety net
-			// so any dep image a future edit introduces is still cleaned up, and
-			// it scopes removal to this subtest's own additions (delta vs
-			// snapshot, leaving other tests'/workers' layers untouched).
-			depBefore := depTagSet(ctx, m.cli)
-			t.Cleanup(cleanupNewDepImagesSince(m.cli, depBefore))
-
 			prepared, err := m.Prepare(ctx, fn)
 			if err != nil {
 				t.Fatalf("prepare: %v", err)

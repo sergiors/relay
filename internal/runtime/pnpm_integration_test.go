@@ -107,8 +107,8 @@ func TestIntegrationNodePnpmInstallsDependencyAndExecutes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	depBefore := depTagSet(ctx, cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
+	// Dependency layers are content-addressed and shared daemon-wide, so they
+	// are intentionally retained; only this test's app image is test-specific.
 	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-pnpm-dep:"))
 
 	fn := newPnpmNodeApp(t, "pnpm-dep", map[string]string{

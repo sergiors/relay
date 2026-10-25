@@ -160,8 +160,6 @@ func TestIntegrationRequirementsInstalledWithUvAndExecutes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	depBefore := depTagSet(ctx, cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
 	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-uv-req:"))
 
 	fn := newUvPythonApp(t, "uv-req", map[string]string{
@@ -194,8 +192,6 @@ func TestIntegrationNativeUvProjectExecutes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	depBefore := depTagSet(ctx, cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
 	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-uv-native:"))
 
 	fn := newUvPythonApp(t, "uv-native", map[string]string{

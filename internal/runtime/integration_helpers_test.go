@@ -406,13 +406,12 @@ func depTags(ctx context.Context, cli *client.Client) []string {
 	return out
 }
 
-// depTagSet snapshots the CURRENT set of relay-dep-* tags on the daemon into a
-// map so tests can diff their OWN additions against a baseline. The relay-dep-*
-// namespace is content-addressed and shared across every test and worker
-// process on a daemon (any Python build with a requirements manifest creates a
-// relay-dep-* image), so asserting on whole-daemon relay-dep-* counts is
-// inherently racy. Tests must snapshot at test start and assert only on the
-// tags that appear SINCE that snapshot.
+// depTagSet snapshots the CURRENT set of relay-dep-* tags on the daemon. The
+// relay-dep-* namespace is content-addressed and shared across every test and
+// worker process on a daemon, so this snapshot is a daemon-wide observation and
+// never proof of ownership: tags present since a baseline may have been built
+// concurrently by another test or worker. Snapshots are therefore used only for
+// non-destructive assertions; they must never drive image deletion.
 func depTagSet(ctx context.Context, cli *client.Client) map[string]bool {
 	before := make(map[string]bool)
 	for _, d := range depTags(ctx, cli) {
@@ -422,9 +421,11 @@ func depTagSet(ctx context.Context, cli *client.Client) map[string]bool {
 }
 
 // newDepTagsSince returns the relay-dep-* tags present NOW but NOT present in
-// the given baseline snapshot. On a shared daemon this scopes a dep-layer
-// assertion to exactly the images this test's builds created, ignoring relay-dep-*
-// layers other tests or workers legitimately created.
+// the given baseline snapshot. It is a non-destructive observation for
+// assertions (for example, proving a source-only edit did not add a layer), not
+// an ownership claim: another test or worker may have concurrently built and
+// tagged a layer since the snapshot. Its result must never be used to delete
+// images; shared content-addressed layers are intentionally retained.
 func newDepTagsSince(ctx context.Context, cli *client.Client, before map[string]bool) []string {
 	var out []string
 	for _, d := range depTags(ctx, cli) {
@@ -433,21 +434,6 @@ func newDepTagsSince(ctx context.Context, cli *client.Client, before map[string]
 		}
 	}
 	return out
-}
-
-// cleanupNewDepImagesSince force-removes only the relay-dep-* images that
-// appeared since the given baseline snapshot, leaving dep layers built
-// concurrently by other tests/workers on the shared daemon untouched. It is
-// t.Cleanup glue so dep-image-creating tests clean up after themselves and never
-// leak relay-dep-* images into later sibling tests.
-func cleanupNewDepImagesSince(cli *client.Client, before map[string]bool) func() {
-	return func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		for _, d := range newDepTagsSince(ctx, cli, before) {
-			cleanupImage(cli, ctx, d)
-		}
-	}
 }
 
 // expectedDependencyRef computes the dependency image reference an app's

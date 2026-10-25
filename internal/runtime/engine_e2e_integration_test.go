@@ -418,9 +418,7 @@ export function message(event: { event_id: string }): string {
 // resolve at runtime from the dependency layer: the .ts handler imports a real
 // CJS dependency installed into /app/node_modules by the dependency image.
 func TestIntegrationNodeTSDepsEndToEnd(t *testing.T) {
-	cli := testutil.RequireDocker(t)
-	depBefore := depTagSet(context.Background(), cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
+	testutil.RequireDocker(t)
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `

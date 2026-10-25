@@ -247,12 +247,15 @@ func TestAppImageTagsScopesRetirementToRelayOwnedAppImages(t *testing.T) {
 // TestRemoveImagesExceptStrictOwnership pins the startup sweep's ownership
 // scope: only strict managed app images are removal candidates, an active
 // labeled image in the keep set is preserved, a stale labeled image is removed,
-// and prefix-only or external images are never touched.
+// and dependency, prefix-only, or external images are never touched. Dependency
+// images are content-addressed and shared daemon-wide, so app-image cleanup must
+// retain them (the dependency GC owns their lifecycle).
 func TestRemoveImagesExceptStrictOwnership(t *testing.T) {
 	const (
 		active   = "relay-app-a:0000000000000000"
 		stale    = "relay-app-a:1111111111111111"
 		legacy   = "relay-app-legacy:2222222222222222"
+		dep      = "relay-dep-deadbeef:latest"
 		external = "ghcr.io/acme/api:1.2"
 	)
 	var deleted []string
@@ -264,6 +267,7 @@ func TestRemoveImagesExceptStrictOwnership(t *testing.T) {
 			scriptedImage{tags: []string{active}, labels: appImageLabelsForTest("a")},
 			scriptedImage{tags: []string{stale}, labels: appImageLabelsForTest("a")},
 			scriptedImage{tags: []string{legacy}},
+			scriptedImage{tags: []string{dep}, labels: map[string]string{labelType: ImageTypeDependency}},
 			scriptedImage{tags: []string{external}},
 		)},
 		dockerRoute{method: http.MethodDelete, path: "/images/", body: "[]", onMatch: func() { deleted = append(deleted, "x") }},
