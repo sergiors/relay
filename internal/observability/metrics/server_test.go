@@ -2,8 +2,10 @@ package metrics
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -182,12 +184,62 @@ func TestServerStartServesInBackground(t *testing.T) {
 // TestServerStartFailsFastOnBadAddr verifies Start returns the bind error
 // IMMEDIATELY for an unparseable address, without retrying. This is the
 // deliberate replacement for the old retry-bind: a metrics port conflict is a
-// fatal config error, not a transient race.
+// fatal config error, not a transient race. Both logger variants are covered:
+// the bind diagnosis is optional, but the wrapped error and unstarted state
+// are not (FT-005).
 func TestServerStartFailsFastOnBadAddr(t *testing.T) {
-	err := NewServer("crap", New().Handler(), slog.New(slog.NewTextHandler(io.Discard, nil))).Start()
-	if err == nil {
-		t.Fatal("Start on bad addr returned nil, want error")
-	}
+	t.Run("nonnil logger", func(t *testing.T) {
+		err := NewServer("crap", New().Handler(), slog.New(slog.NewTextHandler(io.Discard, nil))).Start()
+		if err == nil {
+			t.Fatal("Start on bad addr returned nil, want error")
+		}
+	})
+
+	// A nil logger must not panic: dropping the diagnosis must not cost the
+	// error contract on which fail-fast callers depend (FT-005).
+	t.Run("nil logger", func(t *testing.T) {
+		// Given: a server with a nil logger and an unbindable address.
+		srv := NewServer("crap", New().Handler(), nil)
+
+		// When: Start attempts the doomed bind under a recover guard so a
+		// panic regression surfaces as a readable failure, not a crash.
+		var err error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("Start panicked with a nil logger: %v", r)
+				}
+			}()
+			err = srv.Start()
+		}()
+
+		// Then: the bind error is returned with the metrics prefix, and the
+		// underlying listener error stays identifiable through the wrap.
+		if err == nil {
+			t.Fatal("Start on bad addr with nil logger returned nil, want error")
+		}
+		if prefix := "metrics: "; !strings.HasPrefix(err.Error(), prefix) {
+			t.Fatalf("error %q lacks %q prefix", err, prefix)
+		}
+		var opErr *net.OpError
+		if !errors.As(err, &opErr) {
+			t.Fatalf("error %v does not wrap a *net.OpError", err)
+		}
+		if opErr.Op != "listen" {
+			t.Fatalf("wrapped OpError Op = %q, want listen", opErr.Op)
+		}
+		if srv.started.Load() {
+			t.Fatal("server is marked started after the bind failed")
+		}
+
+		// And: the failed Start leaves the server unstarted — Stop is a no-op
+		// returning nil, the documented observable for a never-started server.
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if stopErr := srv.Stop(ctx); stopErr != nil {
+			t.Fatalf("Stop after failed Start: %v", stopErr)
+		}
+	})
 }
 
 // TestServerStopIdempotentAndNeverStarted verifies Stop is safe on a

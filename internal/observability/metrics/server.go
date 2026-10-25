@@ -95,7 +95,11 @@ func (s *Server) Start() error {
 	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		s.started.Store(false)
-		s.logger.Error("Metrics: listen failed", "addr", s.addr, "error", err)
+		// logger is optional: a nil logger drops the bind diagnosis, but the
+		// wrapped error below is the contract callers depend on.
+		if s.logger != nil {
+			s.logger.Error("Metrics: listen failed", "addr", s.addr, "error", err)
+		}
 		return fmt.Errorf("metrics: listen %s: %w", s.addr, err)
 	}
 	s.srv = &http.Server{
