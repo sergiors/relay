@@ -707,13 +707,6 @@ func (m *Manager) prepare(
 	// fingerprint) by falling back to it when no label is present. Stamping the
 	// build-time fingerprint would freeze the generation identity at build time
 	// and a later source-only change would not recycle the warm containers.
-	// The managed-image relay.fingerprint label. For a baked-source image it is
-	// the source fingerprint the tag embeds. For a HOT_RELOAD image it is
-	// deliberately EMPTY: the image is source-independent, and Execute derives
-	// the warm generation identity from Prepared.Fingerprint (the live source
-	// fingerprint) by falling back to it when no label is present. Stamping the
-	// build-time fingerprint would freeze the generation identity at build time
-	// and a later source-only change would not recycle the warm containers.
 	//
 	// The label is stamped as an explicit EMPTY string rather than omitted: a
 	// source-mounted app image is built FROM a dependency image, and Docker

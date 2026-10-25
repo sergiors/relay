@@ -103,8 +103,9 @@ type Config struct {
 	// manual command; the webhook server only schedules syncs through the
 	// coalescing trigger in internal/git/webhook, never directly.
 	GitWebhookAddr string
-	// LogLevel is the slog level selected by LOG_LEVEL (default Info). It is
-	// used by cmd/main.go to build the process logger after config.Load.
+	// LogLevel is the slog level parsed from LOG_LEVEL (default Info). Load
+	// stores it on Config; cmd/main.go independently bootstraps the process
+	// logger directly from LOG_LEVEL before configuration is loaded.
 	LogLevel slog.Level
 	// MaxConcurrentInvocations is the MAX_CONCURRENT_INVOCATIONS value (default
 	// 8): the total number of app invocations executing concurrently in this
