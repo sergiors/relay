@@ -364,14 +364,17 @@ events:
 	})
 }
 
-// TestIntegrationConcurrentDepBuilds verifies two concurrent Prepare calls for
-// the same app version (two Manager instances, as two worker replicas
-// would) both succeed and resolve to exactly ONE dependency image — the shared,
-// content-addressed layer is build-once under a build race. The dependency
+// TestIntegrationConcurrentManagersResolveSameDependencyReference verifies that
+// two independent Managers concurrently preparing identical dependency content
+// both succeed and resolve to the SAME valid content-addressed dependency image
+// reference. It does NOT assert global physical build deduplication or
+// build-once behavior: the Managers are independent and may each perform build
+// work; the contract is only that identical content resolves to one shared
+// reference and that reference names a valid Docker image. The dependency
 // reference is derived deterministically from the manifest with the production
 // helpers; a whole-daemon before/after tag delta would race any other test/worker
 // building the same content-addressed manifest on the shared daemon.
-func TestIntegrationConcurrentDepBuilds(t *testing.T) {
+func TestIntegrationConcurrentManagersResolveSameDependencyReference(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -404,58 +407,87 @@ events:
 	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 	wantDep := expectedDependencyRef(t, fn)
 
+	// managerOutcome keeps every failure dimension of one independent Manager
+	// (construction, Prepare, close) together with its index, so diagnostics can
+	// name the Manager that failed without losing the underlying error.
+	type managerOutcome struct {
+		manager       int
+		prepared      *Prepared
+		newManagerErr error
+		prepareErr    error
+		closeErr      error
+	}
 	start := make(chan struct{})
-	errs := make(chan error, 2)
-	results := make(chan *Prepared, 2)
+	outcomes := make(chan managerOutcome, 2)
 	wg.Add(2)
 	for i := 0; i < 2; i++ {
-		go func() {
-			// Done runs after m.Close (defer LIFO), so the cleanup above observes
-			// fully closed Managers as well as finished Prepare calls.
+		go func(manager int) {
+			// Done runs after this goroutine has closed its Manager and sent its
+			// outcome, so cleanup observes fully joined work.
 			defer wg.Done()
 			<-start
 			m, err := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, "test-host")
 			if err != nil {
-				errs <- err
+				outcomes <- managerOutcome{manager: manager, newManagerErr: err}
 				return
 			}
-			defer m.Close()
-			p, err := m.Prepare(ctx, fn)
-			if err != nil {
-				errs <- err
-				return
+			p, prepErr := m.Prepare(ctx, fn)
+			closeErr := m.Close()
+			outcomes <- managerOutcome{
+				manager:    manager,
+				prepared:   p,
+				prepareErr: prepErr,
+				closeErr:   closeErr,
 			}
-			results <- p
-		}()
+		}(i)
 	}
 	close(start)
 	deps := make(map[string]bool, 2)
 	for i := 0; i < 2; i++ {
 		select {
-		case err := <-errs:
-			t.Fatalf("concurrent prepare failed: %v", err)
-		case p := <-results:
-			// Two concurrent Prepare calls build the SAME app image
-			// ref. The second build can briefly un-tag/rebuild the ref while
-			// the daemon finishes, so poll for the ref to exist rather than
-			// asserting at the instant this goroutine finished.
-			if !pollUntil(ctx, 20*time.Second, func() bool { return imageExistsInDaemon(cli, ctx, p.Image) }) {
-				t.Fatalf("concurrently prepared image %s must exist", p.Image)
+		case o := <-outcomes:
+			if o.newManagerErr != nil {
+				t.Fatalf("manager %d: NewManager failed: %v", o.manager, o.newManagerErr)
 			}
-			// Both goroutines must resolve to the SAME dependency reference: the
-			// shared, content-addressed layer is one image even under the race.
+			if o.prepareErr != nil {
+				t.Fatalf("manager %d: Prepare(app %q) failed: %v (Close error: %v)",
+					o.manager, fn.Name, o.prepareErr, o.closeErr)
+			}
+			if o.closeErr != nil {
+				t.Fatalf("manager %d: Close after preparing app %q failed: %v", o.manager, fn.Name, o.closeErr)
+			}
+			p := o.prepared
+			if p == nil {
+				t.Fatalf("manager %d: Prepare returned no result for app %q", o.manager, fn.Name)
+			}
+			// Both independent Managers prepare the same app ref (same unique app
+			// and fingerprint). One build can briefly retag the ref while the
+			// daemon finishes, so poll rather than asserting at the instant this
+			// Manager finished; report the last inspection error with the ref.
+			var inspectErr error
+			if !pollUntil(ctx, 20*time.Second, func() bool {
+				_, inspectErr = cli.ImageInspect(ctx, p.Image)
+				return inspectErr == nil
+			}) {
+				t.Fatalf("manager %d: prepared app image %q for app %q must exist: %v",
+					o.manager, p.Image, fn.Name, inspectErr)
+			}
+			// Both Managers must resolve to the SAME dependency reference: identical
+			// dependency content maps to one content-addressed reference.
 			if p.Dependency != wantDep {
-				t.Fatalf("concurrent prepare dependency = %q, want the shared layer %q", p.Dependency, wantDep)
+				t.Fatalf("manager %d: Prepare(app %q) resolved dependency %q, want shared content-addressed reference %q (app image %q)",
+					o.manager, fn.Name, p.Dependency, wantDep, p.Image)
 			}
 			deps[p.Dependency] = true
 		case <-ctx.Done():
-			t.Fatal("timed out waiting for concurrent prepares")
+			t.Fatalf("timed out waiting for both concurrent prepares of app %q: %v", fn.Name, ctx.Err())
 		}
 	}
 	if len(deps) != 1 {
-		t.Errorf("expected exactly one dependency image after concurrent builds, got %v", deps)
+		t.Errorf("expected exactly one dependency reference after concurrent prepares, got %v", deps)
 	}
-	if !imageExistsInDaemon(cli, ctx, wantDep) {
-		t.Errorf("shared dependency image %s must exist after concurrent builds", wantDep)
+	if _, err := cli.ImageInspect(ctx, wantDep); err != nil {
+		t.Errorf("shared dependency image %q resolved for app %q must exist and be a valid Docker image: %v",
+			wantDep, fn.Name, err)
 	}
 }
