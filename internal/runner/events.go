@@ -658,11 +658,15 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				eventJSON, err := json.Marshal(event)
 				if err != nil {
 					// The invocation was already claimed (deferred-released) but
-					// will not execute: this is a failed attempt, so treat it as
-					// such — schedule a retry (or exhaust), then CONTINUE to the
-					// next matching rule so each independent invocation gets its own
-					// failed attempt.
+					// will not execute: this is a failed attempt, so count the
+					// handler failure, schedule a retry (or exhaust), then CONTINUE
+					// to the next matching rule so each independent invocation gets
+					// its own failed attempt. The failure telemetry is charged only
+					// for a CONFIRMED claim (hasState): a no-state caller never
+					// claimed an attempt, so its marshal failure stays
+					// telemetry-free.
 					if hasState {
+						r.recordHandlerFailure(pf.fn.Name, rule.Handler, 0)
 						return r.recordFailure(ctx, invState, invocation, claim, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
 					}
 					return outcomeRetryable, fmt.Errorf("app %q handler %q: marshal event: %w", pf.fn.Name, rule.Handler, err)
@@ -679,7 +683,13 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				// REFERENCE only — never any value.
 				extraEnv, err := r.resolveExtraEnv(ctx, pf.fn.Template)
 				if err != nil {
+					// A claimed attempt that cannot resolve its env/secret
+					// references is a failed attempt with zero execution time:
+					// count the handler failure (only for a confirmed claim, as
+					// above), then drive the same retry/exhaustion machinery as an
+					// execution failure.
 					if hasState {
+						r.recordHandlerFailure(pf.fn.Name, rule.Handler, 0)
 						return r.recordFailure(ctx, invState, invocation, claim, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
 					}
 					return outcomeRetryable, fmt.Errorf("app %q handler %q: %w", pf.fn.Name, rule.Handler, err)
@@ -746,27 +756,10 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					return outcomePendingSkip, nil
 				}
 				if err != nil {
-					r.metrics.IncLabels(metrics.MetricHandlerInvocations,
-						[]metrics.Label{
-							{Name: "outcome", Value: "failure"},
-							{Name: "app", Value: pf.fn.Name},
-							{Name: "handler", Value: rule.Handler},
-						})
-					// Unlabeled total for the PostgreSQL snapshot; the labeled counter
-					// above stays for Prometheus.
-					r.metrics.Inc(metrics.MetricHandlerFailure)
-					// Per-app failure attribution (per rule execution). A
-					// failed attempt that will retry still counts as a failure
-					// (and as an execution above); only a DLQ-routed exhaustion
-					// additionally sets last_dlq_at (see recordFailure).
-					r.metrics.IncLabels(metrics.MetricFunctionHandlerFailure,
-						[]metrics.Label{{Name: "app", Value: pf.fn.Name}})
-					r.metrics.SetAppTimestamp(pf.fn.Name, metrics.AppTimestampFailure, time.Now().Unix())
-					r.metrics.ObserveDurationLabels(metrics.MetricHandlerDuration,
-						[]metrics.Label{
-							{Name: "app", Value: pf.fn.Name},
-							{Name: "handler", Value: rule.Handler},
-						}, elapsed)
+					// Count the failed attempt through the shared helper (elapsed
+					// execution time), so this path attributes exactly the same
+					// metrics as the schedule/manual invocation paths.
+					r.recordHandlerFailure(pf.fn.Name, rule.Handler, elapsed)
 					r.log.Warn("App handler: execution failed for event",
 						append(handlerLogFields(hasState, pf.fn.Name, rule.Handler, msgID, handlerAttempt, deliveryAttempt),
 							"duration", elapsed,

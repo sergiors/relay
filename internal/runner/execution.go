@@ -275,7 +275,8 @@ func (r *Runner) recordHandlerSuccess(fnName, handler string, duration time.Dura
 }
 
 // recordHandlerFailure increments the failure metrics shared by Handle's
-// failure branch, InvokeHandler, and manual invocation: the labeled invocation
+// execution-error branches and its post-claim marshal/env/secret failures,
+// InvokeHandler, and manual invocation: the labeled invocation
 // outcome counter, the unlabeled total, per-app failure attribution, and
 // the duration histogram. A failed attempt that will retry still counts as a
 // failure here (it sets last_failure_at); only the DLQ-routed exhaustion

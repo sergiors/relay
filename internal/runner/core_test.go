@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -268,13 +269,17 @@ func TestHandleTimeoutSchedulesRetry(t *testing.T) {
 }
 
 // TestHandleMarshalErrorSchedulesRetry verifies that when json.Marshal fails
-// after TryStart has already claimed the invocation, Handle records a retry
-// backoff (RecordFailure) so the deterministic marshal failure is treated as a
-// failed attempt. The event carries a value json.Marshal cannot encode (a chan),
-// which errors with "unsupported type".
+// after TryStart has already claimed the invocation, Handle treats the
+// deterministic marshal failure as a failed attempt: the failure telemetry is
+// charged exactly once (one failure across the global, labeled, and per-app
+// counters, plus one zero-duration observation — nothing executed), a retry
+// backoff is recorded (RecordFailure), and the original json.UnsupportedTypeError
+// identity survives the retryable error wrap. The event carries a value
+// json.Marshal cannot encode (a chan), which errors with "unsupported type".
 func TestHandleMarshalErrorSchedulesRetry(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
+	m := metrics.New()
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), m)
 
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
@@ -282,18 +287,75 @@ func TestHandleMarshalErrorSchedulesRetry(t *testing.T) {
 	// json.Marshal of a map containing a chan value errors ("unsupported type"),
 	// so Handle fails after TryStart has claimed the invocation.
 	event := map[string]any{"bad": make(chan int)}
-	if err := r.Handle(ctx, "1757-0", event); err == nil {
+	err := r.Handle(ctx, "1757-0", event)
+	if err == nil {
 		t.Fatal("expected a marshal error")
+	}
+	// The claim happened before the failure and nothing executed: attempt 1 is
+	// persisted and the executor is never reached.
+	if got := prog.attempts["user-events/index.run"]; got != 1 {
+		t.Fatalf("claimed attempt = %d, want 1 (marshal failed after TryStart)", got)
+	}
+	if exec.count() != 0 {
+		t.Fatalf("executor calls = %d, want 0 (marshal failed before execution)", exec.count())
+	}
+	// The original marshal error identity survives the retryable error wrap.
+	var ute *json.UnsupportedTypeError
+	if !errors.As(err, &ute) {
+		t.Fatalf("error = %v, want it to expose *json.UnsupportedTypeError", err)
+	}
+	// The failed attempt counts exactly one failure across the global,
+	// labeled, and per-app counters — and one zero-duration observation, since
+	// nothing executed.
+	if got := m.Counter(metrics.MetricHandlerFailure); got != 1 {
+		t.Fatalf("handler_failure_total = %d, want 1", got)
+	}
+	if got := m.CounterLabels(metrics.MetricHandlerInvocations, []metrics.Label{
+		{Name: "outcome", Value: "failure"},
+		{Name: "app", Value: "user-events"},
+		{Name: "handler", Value: "index.run"},
+	}); got != 1 {
+		t.Fatalf("handler_invocations_total{outcome=failure} = %d, want 1", got)
+	}
+	if got := m.CounterLabels(metrics.MetricHandlerInvocations, []metrics.Label{
+		{Name: "outcome", Value: "success"},
+		{Name: "app", Value: "user-events"},
+		{Name: "handler", Value: "index.run"},
+	}); got != 0 {
+		t.Fatalf("handler_invocations_total{outcome=success} = %d, want 0", got)
+	}
+	if got := m.CounterLabels(metrics.MetricFunctionHandlerFailure, []metrics.Label{{Name: "app", Value: "user-events"}}); got != 1 {
+		t.Fatalf("function_handler_failure_total{app=user-events} = %d, want 1", got)
+	}
+	if count, sum := m.HistogramLabels(metrics.MetricHandlerDuration, []metrics.Label{
+		{Name: "app", Value: "user-events"},
+		{Name: "handler", Value: "index.run"},
+	}); count != 1 || sum != 0 {
+		t.Fatalf("handler_duration_seconds = (%d observations, sum %v), want exactly one zero-duration observation", count, sum)
 	}
 	// The running marker must be cleared and a retry backoff recorded.
 	if _, ok := prog.runningDeadline("user-events/index.run"); ok {
 		t.Fatalf("running marker should be cleared after marshal error")
 	}
-	if len(prog.failures) != 1 {
-		t.Fatalf("failures = %v, want one RecordFailure after marshal error", prog.failures)
+	if len(prog.failures) != 1 || prog.failures[0] != time.Minute {
+		t.Fatalf("failures = %v, want one 1m RecordFailure after marshal error", prog.failures)
 	}
-	// The executor must never have been reached (marshal failed before handoff).
+}
+
+// TestHandleMarshalErrorWithoutStateStaysUncounted verifies the other side of
+// the marshal-failure boundary: a direct caller with no invocation state in ctx
+// never confirmed a claim, so the marshal failure is telemetry-free — the
+// failure counters and the duration histogram stay untouched.
+func TestHandleMarshalErrorWithoutStateStaysUncounted(t *testing.T) {
+	exec := &countingExecutor{}
+	m := metrics.New()
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), m)
+
+	if err := r.Handle(context.Background(), "1757-0", map[string]any{"bad": make(chan int)}); err == nil {
+		t.Fatal("expected a marshal error")
+	}
 	if exec.count() != 0 {
 		t.Fatalf("executor calls = %d, want 0 (marshal failed before execution)", exec.count())
 	}
+	assertNoHandlerFailureTelemetry(t, m, "user-events", "index.run")
 }

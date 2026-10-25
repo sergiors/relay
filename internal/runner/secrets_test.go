@@ -6,8 +6,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"relay/internal/app"
+	"relay/internal/observability/metrics"
 	"relay/internal/stream"
 	"relay/internal/testutil"
 )
@@ -69,14 +71,19 @@ func TestHandleInjectsEnvAndResolvedSecrets(t *testing.T) {
 }
 
 // TestHandleSecretResolutionFailureSchedulesRetry verifies a secret resolution
-// error is a failed attempt: it records a retry backoff (RecordFailure) and the
-// executor is never reached. The error names the reference but never a value.
+// error is a failed attempt: it records a retry backoff (RecordFailure), never
+// reaches the executor, and counts the failure telemetry exactly once per
+// failed attempt — one failure across the global, labeled, and per-app counters
+// with a zero-duration observation, since nothing executed — and once again
+// (never twice) for each retried attempt. The error names the reference but
+// never a value.
 func TestHandleSecretResolutionFailureSchedulesRetry(t *testing.T) {
 	exec := &countingExecutor{}
 	prov := &fakeProvider{err: errors.New("secret \"db-url\" not found")}
+	m := metrics.New()
 	r := NewWithMetrics([]*PreparedApp{
 		fnWithEnv(t, "user-events", exec, nil, map[string]app.SecretRef{"DATABASE_URL": "db-url"}),
-	}, testutil.DiscardLogger(), nil)
+	}, testutil.DiscardLogger(), m)
 	r.SetSecretProvider(prov)
 
 	prog := newFakeInvocationState()
@@ -95,16 +102,87 @@ func TestHandleSecretResolutionFailureSchedulesRetry(t *testing.T) {
 	if len(prog.failures) != 1 {
 		t.Fatalf("failures = %v, want one RecordFailure", prog.failures)
 	}
+	if got := prog.attempts["user-events/index.run"]; got != 1 {
+		t.Fatalf("claimed attempt = %d, want 1 (resolution failed after TryStart)", got)
+	}
+	// The claimed, never-executed attempt counts exactly one zero-duration
+	// failure across the global, labeled, and per-app counters.
+	if got := m.Counter(metrics.MetricHandlerFailure); got != 1 {
+		t.Fatalf("handler_failure_total = %d, want 1", got)
+	}
+	if got := m.CounterLabels(metrics.MetricHandlerInvocations, []metrics.Label{
+		{Name: "outcome", Value: "failure"},
+		{Name: "app", Value: "user-events"},
+		{Name: "handler", Value: "index.run"},
+	}); got != 1 {
+		t.Fatalf("handler_invocations_total{outcome=failure} = %d, want 1", got)
+	}
+	if got := m.CounterLabels(metrics.MetricHandlerInvocations, []metrics.Label{
+		{Name: "outcome", Value: "success"},
+		{Name: "app", Value: "user-events"},
+		{Name: "handler", Value: "index.run"},
+	}); got != 0 {
+		t.Fatalf("handler_invocations_total{outcome=success} = %d, want 0", got)
+	}
+	if got := m.CounterLabels(metrics.MetricFunctionHandlerFailure, []metrics.Label{{Name: "app", Value: "user-events"}}); got != 1 {
+		t.Fatalf("function_handler_failure_total{app=user-events} = %d, want 1", got)
+	}
+	if count, sum := m.HistogramLabels(metrics.MetricHandlerDuration, []metrics.Label{
+		{Name: "app", Value: "user-events"},
+		{Name: "handler", Value: "index.run"},
+	}); count != 1 || sum != 0 {
+		t.Fatalf("handler_duration_seconds = (%d observations, sum %v), want exactly one zero-duration observation", count, sum)
+	}
+
+	// Past the first backoff the retry claims the next attempt and fails the
+	// same way, raising the same telemetry exactly once more: each failed
+	// attempt must charge the failure counters once (no duplicate charging)
+	// while the executor is still never reached.
+	prog.advance(2 * time.Minute)
+	err = r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	if err == nil || !strings.Contains(err.Error(), "db-url") {
+		t.Fatalf("retry error = %v, want the same resolution failure", err)
+	}
+	if exec.count() != 0 {
+		t.Fatalf("executor calls after retry = %d, want 0", exec.count())
+	}
+	if got := prog.attempts["user-events/index.run"]; got != 2 {
+		t.Fatalf("attempts after retry = %d, want 2", got)
+	}
+	if len(prog.failures) != 2 || prog.failures[0] != time.Minute || prog.failures[1] != 2*time.Minute {
+		t.Fatalf("failures = %v, want the retry backoffs [1m 2m]", prog.failures)
+	}
+	if got := m.Counter(metrics.MetricHandlerFailure); got != 2 {
+		t.Fatalf("handler_failure_total after retry = %d, want 2 (one per failed attempt)", got)
+	}
+	if got := m.CounterLabels(metrics.MetricHandlerInvocations, []metrics.Label{
+		{Name: "outcome", Value: "failure"},
+		{Name: "app", Value: "user-events"},
+		{Name: "handler", Value: "index.run"},
+	}); got != 2 {
+		t.Fatalf("handler_invocations_total{outcome=failure} after retry = %d, want 2", got)
+	}
+	if got := m.CounterLabels(metrics.MetricFunctionHandlerFailure, []metrics.Label{{Name: "app", Value: "user-events"}}); got != 2 {
+		t.Fatalf("function_handler_failure_total{app=user-events} after retry = %d, want 2", got)
+	}
+	if count, sum := m.HistogramLabels(metrics.MetricHandlerDuration, []metrics.Label{
+		{Name: "app", Value: "user-events"},
+		{Name: "handler", Value: "index.run"},
+	}); count != 2 || sum != 0 {
+		t.Fatalf("handler_duration_seconds after retry = (%d observations, sum %v), want two zero-duration observations", count, sum)
+	}
 }
 
 // TestHandleSecretNoProviderFails verifies a template that references a secret
 // with no provider configured fails the invocation with a clear error naming
-// the reference.
+// the reference. Without invocation state there is no confirmed claim, so the
+// preparation failure stays telemetry-free.
 func TestHandleSecretNoProviderFails(t *testing.T) {
 	exec := &countingExecutor{}
+	m := metrics.New()
 	r := NewWithMetrics([]*PreparedApp{
 		fnWithEnv(t, "user-events", exec, nil, map[string]app.SecretRef{"TOKEN": "tok"}),
-	}, testutil.DiscardLogger(), nil)
+	}, testutil.DiscardLogger(), m)
 	// SetSecretProvider deliberately NOT called.
 
 	err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"})
@@ -120,6 +198,7 @@ func TestHandleSecretNoProviderFails(t *testing.T) {
 	if exec.count() != 0 {
 		t.Fatalf("executor calls = %d, want 0", exec.count())
 	}
+	assertNoHandlerFailureTelemetry(t, m, "user-events", "index.run")
 }
 
 // TestHandleResolvesSecretsPerInvocation verifies secrets are resolved per

@@ -238,6 +238,10 @@ func TestHandlePreClaimCapacityRejectionDoesNotSpendAttempt(t *testing.T) {
 	if got := m.Counter(metrics.MetricHandlerSuccess) + m.Counter(metrics.MetricHandlerFailure); got != 0 {
 		t.Fatalf("handler execution counters = %d, want 0", got)
 	}
+	// No handler failure telemetry either: a pre-claim rejection is pure
+	// backpressure, not a failed attempt — no labeled outcome counter, no
+	// per-app failure attribution, and no duration observation.
+	assertNoHandlerFailureTelemetry(t, m, "fn", "index.run")
 	fs := m.AppStatsSnapshot()
 	for _, s := range fs {
 		if s.RetriesTotal != 0 || s.DLQTotal != 0 {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"relay/internal/observability/metrics"
 	"relay/internal/stream"
@@ -48,7 +49,9 @@ func TestHandleRecordsSuccessMetrics(t *testing.T) {
 
 func TestHandleRecordsFailureMetrics(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", &countingExecutor{fail: true})}, testutil.DiscardLogger(), m)
+	// The short hold keeps the observed duration deterministically nonzero.
+	exec := &countingExecutor{fail: true, hold: 2 * time.Millisecond}
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), m)
 
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err == nil {
 		t.Fatal("expected handle to fail")
@@ -66,6 +69,80 @@ func TestHandleRecordsFailureMetrics(t *testing.T) {
 	}
 	if strings.Contains(got, metrics.MetricHandlerSuccess) {
 		t.Errorf("unexpected success total; got:\n%s", got)
+	}
+	// The direct (no-state) path counts the failed attempt exactly once too:
+	// one per-app attribution and exactly one nonzero-duration observation.
+	if got := m.CounterLabels(metrics.MetricFunctionHandlerFailure, []metrics.Label{{Name: "app", Value: "user-events"}}); got != 1 {
+		t.Errorf("function_handler_failure_total{app=user-events} = %d, want 1", got)
+	}
+	if count, sum := m.HistogramLabels(metrics.MetricHandlerDuration, []metrics.Label{
+		{Name: "app", Value: "user-events"},
+		{Name: "handler", Value: "index.run"},
+	}); count != 1 || sum <= 0 {
+		t.Errorf("handler_duration_seconds = (%d observations, sum %v), want exactly one nonzero-duration observation", count, sum)
+	}
+}
+
+// TestHandleClaimedExecutionFailureCountsOnce pins the claimed execution
+// failure path against duplicate charging: one failing handler execution with
+// a confirmed claim counts the failure telemetry exactly once across the
+// global, labeled, and per-app counters, with exactly one nonzero-duration
+// observation, and leaves the retry machinery unchanged (one 1m RecordFailure
+// backoff and one retry counter, not terminal).
+func TestHandleClaimedExecutionFailureCountsOnce(t *testing.T) {
+	m := metrics.New()
+	// The short hold keeps the observed duration deterministically nonzero.
+	exec := &countingExecutor{fail: true, hold: 2 * time.Millisecond}
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), m)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err == nil {
+		t.Fatal("expected handle to fail")
+	}
+	if exec.count() != 1 {
+		t.Fatalf("executor calls = %d, want 1", exec.count())
+	}
+	if got := prog.attempts["user-events/index.run"]; got != 1 {
+		t.Fatalf("claimed attempt = %d, want 1", got)
+	}
+	if got := m.Counter(metrics.MetricHandlerFailure); got != 1 {
+		t.Fatalf("handler_failure_total = %d, want 1", got)
+	}
+	if got := m.CounterLabels(metrics.MetricHandlerInvocations, []metrics.Label{
+		{Name: "outcome", Value: "failure"},
+		{Name: "app", Value: "user-events"},
+		{Name: "handler", Value: "index.run"},
+	}); got != 1 {
+		t.Fatalf("handler_invocations_total{outcome=failure} = %d, want 1", got)
+	}
+	if got := m.CounterLabels(metrics.MetricHandlerInvocations, []metrics.Label{
+		{Name: "outcome", Value: "success"},
+		{Name: "app", Value: "user-events"},
+		{Name: "handler", Value: "index.run"},
+	}); got != 0 {
+		t.Fatalf("handler_invocations_total{outcome=success} = %d, want 0", got)
+	}
+	if got := m.CounterLabels(metrics.MetricFunctionHandlerFailure, []metrics.Label{{Name: "app", Value: "user-events"}}); got != 1 {
+		t.Fatalf("function_handler_failure_total{app=user-events} = %d, want 1", got)
+	}
+	count, sum := m.HistogramLabels(metrics.MetricHandlerDuration, []metrics.Label{
+		{Name: "app", Value: "user-events"},
+		{Name: "handler", Value: "index.run"},
+	})
+	if count != 1 || sum <= 0 {
+		t.Fatalf("handler_duration_seconds = (%d observations, sum %v), want exactly one nonzero-duration observation", count, sum)
+	}
+	// The retry outcome is unchanged: one retry backoff was recorded and the
+	// retry counter moved once, with the invocation not yet terminal.
+	if len(prog.failures) != 1 || prog.failures[0] != time.Minute {
+		t.Fatalf("failures = %v, want one 1m RecordFailure", prog.failures)
+	}
+	if got := m.CounterLabels(metrics.MetricFunctionRetries, []metrics.Label{{Name: "app", Value: "user-events"}}); got != 1 {
+		t.Fatalf("function_retries_total{app=user-events} = %d, want 1", got)
+	}
+	if prog.IsTerminal("user-events/index.run") {
+		t.Fatal("a first failure under the default retry budget must not be terminal")
 	}
 }
 
@@ -170,6 +247,37 @@ func containsDuration(snapshot, prefix string) bool {
 		}
 	}
 	return false
+}
+
+// assertNoHandlerFailureTelemetry pins the telemetry-free side of the failed
+// attempt boundary for one app/handler series: no global failure total, no
+// labeled invocation outcome counter (either outcome), no per-app failure
+// attribution, and no duration observation moved. It is the counterpart of
+// recordHandlerFailure, so a path that never confirmed a claim (or rejected the
+// work pre-claim) can prove it charged nothing.
+func assertNoHandlerFailureTelemetry(t *testing.T, m *metrics.Registry, app, handler string) {
+	t.Helper()
+	if got := m.Counter(metrics.MetricHandlerFailure); got != 0 {
+		t.Fatalf("handler_failure_total = %d, want 0", got)
+	}
+	for _, outcome := range []string{"failure", "success"} {
+		if got := m.CounterLabels(metrics.MetricHandlerInvocations, []metrics.Label{
+			{Name: "outcome", Value: outcome},
+			{Name: "app", Value: app},
+			{Name: "handler", Value: handler},
+		}); got != 0 {
+			t.Fatalf("handler_invocations_total{outcome=%s} = %d, want 0", outcome, got)
+		}
+	}
+	if got := m.CounterLabels(metrics.MetricFunctionHandlerFailure, []metrics.Label{{Name: "app", Value: app}}); got != 0 {
+		t.Fatalf("function_handler_failure_total{app=%s} = %d, want 0", app, got)
+	}
+	if count, sum := m.HistogramLabels(metrics.MetricHandlerDuration, []metrics.Label{
+		{Name: "app", Value: app},
+		{Name: "handler", Value: handler},
+	}); count != 0 || sum != 0 {
+		t.Fatalf("handler_duration_seconds = (%d observations, sum %v), want no observations", count, sum)
+	}
 }
 
 func TestHandleAppLevelCounters(t *testing.T) {
