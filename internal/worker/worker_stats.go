@@ -348,7 +348,7 @@ func (flusher *statsFlusher) flushLocked(ctx context.Context) {
 	// the sweep is skipped entirely rather than run against an empty map — an
 	// empty live set would delete every app-scoped series, including live apps'.
 	// Sweeping is best-effort and re-applied on the next successful flush.
-	if names, ok := flusher.st.AppNames(); ok {
+	if names, ok := flusher.st.AppNames(ctx); ok {
 		active := make(map[string]bool, len(names))
 		for _, name := range names {
 			active[name] = true

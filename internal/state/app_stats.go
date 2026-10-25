@@ -201,8 +201,11 @@ func (st *State) OwnerAppStats() []AppStats {
 // OPEN — retain every series; the next successful flush sweeps — because
 // sweeping with an empty set would delete live apps' series. This is why
 // callers must distinguish an empty-but-known live set from a failed read.
-func (st *State) AppNames() ([]string, bool) {
-	ctx := context.Background()
+// A failure part-way through iteration is a failed read, not a shorter live
+// set: partial names are never reported as a complete answer. ctx bounds the
+// read (the worker passes its flush context), so a cancelled flush cannot
+// block the sweep on the database.
+func (st *State) AppNames(ctx context.Context) ([]string, bool) {
 	rows, err := st.db.QueryContext(ctx, `SELECT name FROM apps ORDER BY name`)
 	if err != nil {
 		st.log.Warn("State: list app names failed", "error", err)
@@ -215,9 +218,13 @@ func (st *State) AppNames() ([]string, bool) {
 		var name string
 		if err := rows.Scan(&name); err != nil {
 			st.log.Warn("State: scan app name failed", "error", err)
-			return out, false
+			return nil, false
 		}
 		out = append(out, name)
+	}
+	if err := rows.Err(); err != nil {
+		st.log.Warn("State: list app names failed", "error", err)
+		return nil, false
 	}
 	return out, true
 }

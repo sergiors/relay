@@ -185,6 +185,64 @@ func TestSweepSkippedOnStateReadError(t *testing.T) {
 	}
 }
 
+// TestSweepSkippedOnCancelledFlushPreservesSeries is the flush-side FT-001
+// regression: AppNames reads the live set through the caller-supplied flush
+// context, so a flush whose context was already cancelled makes the live-set
+// read fail (ok=false on an entirely OPEN state handle — QueryContext surfaces
+// the cancellation itself, no sleeps or disconnect tricks). The sweep must
+// then be skipped entirely and the ghost series that a correct sweep WOULD
+// delete must survive in the registry; record persistence under the dead
+// context is expected not to happen and is not asserted. A subsequent flush
+// with a healthy context finally sweeps ghost and keeps alpha, proving the
+// preservation is fail-open behavior (not permanent).
+func TestSweepSkippedOnCancelledFlushPreservesSeries(t *testing.T) {
+	st := openTempState(t)
+	// Only alpha has an apps row: ghost's row is gone, so its series are stale
+	// exactly like TestStatsFlushSweepsStaleAppSeries's ghost.
+	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
+		t.Errorf("state write error: %v", err)
+	}
+
+	m := metrics.New()
+	m.IncLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}})
+	m.IncLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}})
+	m.IncLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "ghost"}})
+	m.Add(metrics.MetricEventsMatched, 42)
+
+	// Prove the failure first: AppNames with this context returns ok=false on
+	// the still-open handle, so the flush below goes through the documented
+	// fail-open branch rather than coincidentally skipping for another reason.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if names, ok := st.AppNames(ctx); ok {
+		t.Fatalf("AppNames = %v on a cancelled flush context; want ok=false", names)
+	}
+
+	// The flush must neither panic nor sweep against a nonexistent live set.
+	newStatsFlusher(st, m).flush(ctx)
+
+	// Incomplete read => fail-open: alpha (live) AND ghost (stale) survive
+	// in the registry, even though record persistence under the dead context
+	// may not happen — the sweep decision is what this test pins.
+	if fs := m.AppStatsSnapshot(); !metricsStat(fs, "alpha") || !metricsStat(fs, "ghost") {
+		t.Fatalf("incomplete AppNames read must not sweep away valid series, want alpha+ghost present:\n%+v", fs)
+	}
+	if !strings.Contains(m.Snapshot(), "{app=ghost}") {
+		t.Fatalf("ghost series must survive the incomplete read:\n%s", m.Snapshot())
+	}
+
+	// Control: on a healthy flush the sweep really does discard ghost (and
+	// keeps alpha), proving the assertion above would have caught a wrongful
+	// sweep and that the preserved state is sweepable once the read recovers.
+	newStatsFlusher(st, m).flush(context.Background())
+	if fs := m.AppStatsSnapshot(); !metricsStat(fs, "alpha") || metricsStat(fs, "ghost") {
+		t.Fatalf("recovered flush must sweep ghost and keep alpha:\n%+v", fs)
+	}
+	if strings.Contains(m.Snapshot(), "app=ghost,") {
+		t.Fatalf("ghost series must be swept once AppNames succeeds:\n%s", m.Snapshot())
+	}
+}
+
 // metricsStat reports whether metrics.AppStats fs has a stat for name.
 func metricsStat(fs []metrics.AppStat, name string) bool {
 	for _, f := range fs {
