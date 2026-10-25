@@ -29,28 +29,43 @@ import (
 	"relay/internal/testutil"
 )
 
+// serviceTestHostname is the stable manager identity the service integration
+// tests use. The Manager stamps it as relay.hostname on every service container
+// it creates, and cleanup requires that exact label value, so it can never
+// select another worker's container even on a shared daemon.
+const serviceTestHostname = "test-host"
+
+// serviceTestCleanupTimeout bounds the entire service integration cleanup: the
+// container list/stop round trips, app-image listing, image removal, and the
+// Manager close. It is generous for a real daemon but never unbounded.
+const serviceTestCleanupTimeout = 30 * time.Second
+
 // TestServicesReconcileIntegration reconciles an app's services end to end.
 func TestServicesReconcileIntegration(t *testing.T) {
-	testutil.RequireDocker(t)
+	cli := testutil.RequireDocker(t)
 
 	root := t.TempDir()
 	var buf strings.Builder
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
-	m, err := runtime.NewManager(logger, nil, "test-host")
+	// The name is derived from the test name + a nanosecond stamp so concurrent
+	// runs on one daemon do not collide on app, container, or image names;
+	// testutil.UniqueName keeps it within app.ValidName's 63-char cap even
+	// for a long test name. It is also the ownership scope of cleanup.
+	name := testutil.UniqueName(t, "svc-rec")
+	m, err := runtime.NewManager(logger, nil, serviceTestHostname)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
-	defer m.Close()
+	// Register cleanup before any app directory or container exists, so a
+	// partial setup still tears down whatever this test started. The helper
+	// closes the Manager last, after its own Docker cleanup, so the Manager
+	// APIs remain usable for the entire cleanup.
+	registerServiceTestCleanup(t, m, cli, name, serviceTestHostname)
 
 	// Manager is both the reconcile Builder and the services Docker seam.
 	adapter := dockerManagerAdapter{m}
 
-	// Write a node app dir that declares one service (port 3000). The name
-	// is derived from the test name + a nanosecond stamp so concurrent runs on
-	// one daemon do not collide on app, container, or image names;
-	// testutil.UniqueName keeps it within app.ValidName's 63-char cap even
-	// for a long test name.
-	name := testutil.UniqueName(t, "svc-rec")
+	// Write a node app dir that declares one service (port 3000).
 	dir := filepath.Join(root, name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -67,33 +82,6 @@ func TestServicesReconcileIntegration(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "app", "service.js"), []byte("process.on('SIGTERM', () => process.exit(0));\nsetInterval(() => {}, 1 << 30);\n"), 0o644); err != nil {
 		t.Fatalf("write service: %v", err)
 	}
-
-	// Cleanup: stop every service container belonging to this app and remove
-	// every relay-app-<name>:* image this test builds.
-	cleanupCli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		t.Fatalf("cleanup client: %v", err)
-	}
-	t.Cleanup(func() {
-		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer ccancel()
-		defer cleanupCli.Close()
-		if c, err := m.ServiceContainerList(cc); err == nil {
-			_ = m.StopServiceContainers(cc, c)
-		}
-		imgs, err := cleanupCli.ImageList(cc, client.ImageListOptions{All: true})
-		if err != nil {
-			return
-		}
-		for _, img := range imgs.Items {
-			for _, tag := range img.RepoTags {
-				if strings.HasPrefix(tag, "relay-app-"+name+":") {
-					_, _ = cleanupCli.ImageRemove(cc, tag, client.ImageRemoveOptions{Force: true})
-					break
-				}
-			}
-		}
-	})
 
 	reg := &runner.Registry{}
 	reg.Set(nil)
@@ -160,17 +148,22 @@ func serviceReconcileTemplate(port, replicas int) string {
 // entrypoint image reference is unchanged): the container id changes and the
 // replacement's Config.Env carries the new value and the matching relay.env_hash.
 func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
-	testutil.RequireDocker(t)
+	cli := testutil.RequireDocker(t)
 
 	root := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	m, err := runtime.NewManager(logger, nil, "test-host")
+	name := testutil.UniqueName(t, "svc-env")
+	m, err := runtime.NewManager(logger, nil, serviceTestHostname)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
-	defer m.Close()
+	// Register cleanup before any app directory or container exists, so a
+	// partial setup or an early t.Fatalf still tears down whatever started. The
+	// helper selects only this unique app's containers on this manager identity,
+	// removes only its label-classified app images, and closes the Manager last
+	// so its APIs stay usable throughout cleanup.
+	registerServiceTestCleanup(t, m, cli, name, serviceTestHostname)
 
-	name := testutil.UniqueName(t, "svc-env")
 	dir := filepath.Join(root, name)
 	if err := os.MkdirAll(filepath.Join(dir, "app"), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -185,37 +178,6 @@ func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "app", "service.js"), []byte("process.on('SIGTERM', () => process.exit(0));\nsetInterval(() => {}, 1 << 30);\n"), 0o644); err != nil {
 		t.Fatalf("write service: %v", err)
 	}
-
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		t.Fatalf("client: %v", err)
-	}
-	t.Cleanup(func() {
-		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer ccancel()
-		defer cli.Close()
-		if c, err := m.ServiceContainerList(cc); err == nil {
-			var own []runtime.ServiceContainer
-			for _, ct := range c {
-				if ct.App == name {
-					own = append(own, ct)
-				}
-			}
-			_ = m.StopServiceContainers(cc, own)
-		}
-		imgs, err := cli.ImageList(cc, client.ImageListOptions{All: true})
-		if err != nil {
-			return
-		}
-		for _, img := range imgs.Items {
-			for _, tag := range img.RepoTags {
-				if strings.HasPrefix(tag, "relay-app-"+name+":") {
-					_, _ = cli.ImageRemove(cc, tag, client.ImageRemoveOptions{Force: true})
-					break
-				}
-			}
-		}
-	})
 
 	reg := &runner.Registry{}
 	reg.Set(nil)
@@ -331,6 +293,103 @@ func assertServiceCounts(t *testing.T, m *runtime.Manager, name string, want int
 		}
 	}
 	t.Fatalf("expected %d running service containers for %s, got %d", want, name, got)
+}
+
+// registerServiceTestCleanup registers the complete teardown for a service
+// integration test. Call it immediately after creating the Manager and before
+// creating any app directory, image, or container, so a partial setup or early
+// t.Fatalf still cleans up whatever the test managed to start.
+//
+// The cleanup selects containers STRICTLY from the labels the daemon returned:
+// relay.type=service proves Relay ownership, while relay.app (this test's unique
+// app) and relay.hostname (this manager's identity) scope it to this test. App
+// or container names alone are not ownership proof, so another test's or
+// worker's service containers can never be stopped or removed. Images are
+// selected through AppImageTags, which is likewise label-derived (relay.type=app
+// plus a matching relay.app), so a foreign image that merely shares the
+// relay-app-<name> prefix is never removed.
+//
+// After stopping, cleanup re-lists and verifies that no service container with
+// the same strict ownership labels remains. App images are removed only when the
+// initial listing succeeded, every owned container was stopped/removed without
+// error, and post-stop verification found no survivor. If any of those steps
+// fails, an image may still be referenced by a surviving container, so cleanup
+// reports the failure and leaves the images alone instead of force-removing
+// possibly-in-use references.
+//
+// The Manager close is deferred INSIDE the cleanup, after container and image
+// cleanup and on the same bounded context, so every Manager API used here is
+// still admitted. A test-scoped defer m.Close() would run before every t.Cleanup
+// and leave this cleanup talking to a shut-down Manager. Every failure is
+// reported with t.Errorf: cleanup problems are observable without masking an
+// original test failure or aborting the rest of the cleanup.
+func registerServiceTestCleanup(t *testing.T, m *runtime.Manager, cli *client.Client, name, hostname string) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), serviceTestCleanupTimeout)
+		defer cancel()
+		defer func() {
+			if err := m.CloseContext(ctx); err != nil {
+				t.Errorf("cleanup: close manager: %v", err)
+			}
+		}()
+
+		listed, err := m.ServiceContainerList(ctx)
+		if err != nil {
+			t.Errorf("cleanup: list service containers: %v", err)
+			return
+		}
+		var owned []runtime.ServiceContainer
+		for _, ct := range listed {
+			if serviceContainerOwnedBy(ct.Labels, name, hostname) {
+				owned = append(owned, ct)
+			}
+		}
+		var stopErr error
+		if len(owned) > 0 {
+			stopErr = m.StopServiceContainers(ctx, owned)
+			if stopErr != nil {
+				t.Errorf("cleanup: stop service containers: %v", stopErr)
+			}
+		}
+
+		// Re-list after the stop so a survivor is observable even when the stop
+		// was best-effort and removed only some of its containers.
+		remaining, err := m.ServiceContainerList(ctx)
+		if err != nil {
+			t.Errorf("cleanup: verify service containers: %v", err)
+			return
+		}
+		var survivors []runtime.ServiceContainer
+		for _, ct := range remaining {
+			if serviceContainerOwnedBy(ct.Labels, name, hostname) {
+				survivors = append(survivors, ct)
+			}
+		}
+		if len(survivors) > 0 {
+			ids := make([]string, 0, len(survivors))
+			for _, ct := range survivors {
+				ids = append(ids, ct.ID)
+			}
+			t.Errorf("cleanup: %d service container(s) for app %q survived cleanup: %v", len(survivors), name, ids)
+		}
+		// Never force-remove an image reference while a container may still use
+		// it, or when the stop/verification was inconclusive.
+		if stopErr != nil || len(survivors) > 0 {
+			return
+		}
+
+		tags, err := m.AppImageTags(ctx, name)
+		if err != nil {
+			t.Errorf("cleanup: list app images: %v", err)
+			return
+		}
+		for _, tag := range tags {
+			if _, err := cli.ImageRemove(ctx, tag, client.ImageRemoveOptions{Force: true}); err != nil {
+				t.Errorf("cleanup: remove image %s: %v", tag, err)
+			}
+		}
+	})
 }
 
 // TestIntegrationShutdownCleanupHostnameScoped proves graceful-shutdown cleanup
