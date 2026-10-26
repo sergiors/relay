@@ -103,10 +103,6 @@ type Config struct {
 	// manual command; the webhook server only schedules syncs through the
 	// coalescing trigger in internal/git/webhook, never directly.
 	GitWebhookAddr string
-	// LogLevel is the slog level parsed from LOG_LEVEL (default Info). Load
-	// stores it on Config; cmd/main.go independently bootstraps the process
-	// logger directly from LOG_LEVEL before configuration is loaded.
-	LogLevel slog.Level
 	// MaxConcurrentInvocations is the MAX_CONCURRENT_INVOCATIONS value (default
 	// 8): the total number of app invocations executing concurrently in this
 	// single Relay worker. Values below the default fall back in the runner (see
@@ -388,7 +384,7 @@ func Load(logger *slog.Logger) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	workerID, err = loadWorkerID(workerID)
+	workerID, err = ParseWorkerID(workerID)
 	if err != nil {
 		return Config{}, err
 	}
@@ -413,13 +409,11 @@ func Load(logger *slog.Logger) (Config, error) {
 	cfg.MetricsAddr = getEnv("METRICS_ADDR", "")
 	cfg.GitWebhookAddr = getEnv("GIT_WEBHOOK_ADDR", "")
 
-	level, err := loadLogLevel(getEnv("LOG_LEVEL", "INFO"))
-	if err != nil {
+	if _, err := ParseLogLevel(getEnv("LOG_LEVEL", "INFO")); err != nil {
 		return Config{}, err
 	}
-	cfg.LogLevel = level
 
-	maxInvocations, err := loadPositiveInt(
+	maxInvocations, err := ParsePositiveInt(
 		"MAX_CONCURRENT_INVOCATIONS",
 		getEnv("MAX_CONCURRENT_INVOCATIONS", strconv.Itoa(DefaultMaxConcurrentInvocations)),
 	)
@@ -428,7 +422,7 @@ func Load(logger *slog.Logger) (Config, error) {
 	}
 	cfg.MaxConcurrentInvocations = maxInvocations
 
-	maxBuilds, err := loadPositiveInt(
+	maxBuilds, err := ParsePositiveInt(
 		"MAX_CONCURRENT_BUILDS",
 		getEnv("MAX_CONCURRENT_BUILDS", strconv.Itoa(DefaultMaxConcurrentBuilds)),
 	)
@@ -437,7 +431,7 @@ func Load(logger *slog.Logger) (Config, error) {
 	}
 	cfg.MaxConcurrentBuilds = maxBuilds
 
-	maxWarm, err := loadPositiveInt(
+	maxWarm, err := ParsePositiveInt(
 		"MAX_WARM_CONTAINERS",
 		getEnv("MAX_WARM_CONTAINERS", strconv.Itoa(DefaultMaxWarmContainers)),
 	)
@@ -446,7 +440,7 @@ func Load(logger *slog.Logger) (Config, error) {
 	}
 	cfg.MaxWarmContainers = maxWarm
 
-	maxBufferedEvents, err := loadPositiveInt(
+	maxBufferedEvents, err := ParsePositiveInt(
 		"MAX_BUFFERED_EVENTS",
 		getEnv("MAX_BUFFERED_EVENTS", strconv.Itoa(DefaultMaxBufferedEvents)),
 	)
@@ -455,7 +449,10 @@ func Load(logger *slog.Logger) (Config, error) {
 	}
 	cfg.MaxBufferedEvents = maxBufferedEvents
 
-	maxEventBytes, err := loadMaxEventBytes(getEnv("MAX_EVENT_BYTES", bytesize.Format(DefaultMaxEventBytes)))
+	maxEventBytes, err := ParseMaxEventBytes(
+		"MAX_EVENT_BYTES",
+		getEnv("MAX_EVENT_BYTES", bytesize.Format(DefaultMaxEventBytes)),
+	)
 	if err != nil {
 		return Config{}, err
 	}
@@ -466,7 +463,7 @@ func Load(logger *slog.Logger) (Config, error) {
 	cfg.TraefikEntryPoints = getEnv("TRAEFIK_ENTRYPOINTS", "")
 	cfg.TraefikCertResolver = getEnv("TRAEFIK_CERTRESOLVER", "")
 
-	priority, err := loadOptionalPositiveInt("TRAEFIK_PRIORITY", getEnv("TRAEFIK_PRIORITY", ""))
+	priority, err := ParseOptionalPositiveInt("TRAEFIK_PRIORITY", getEnv("TRAEFIK_PRIORITY", ""))
 	if err != nil {
 		return Config{}, err
 	}
@@ -474,7 +471,7 @@ func Load(logger *slog.Logger) (Config, error) {
 
 	cfg.TraefikHostOverride = getEnv("TRAEFIK_HOST_OVERRIDE", "")
 
-	warmTimeout, err := loadPositiveDuration(
+	warmTimeout, err := ParsePositiveDuration(
 		"WARM_CONTAINER_IDLE_TIMEOUT",
 		getEnv("WARM_CONTAINER_IDLE_TIMEOUT", DefaultWarmContainerIdleTimeout.String()),
 	)
@@ -483,7 +480,7 @@ func Load(logger *slog.Logger) (Config, error) {
 	}
 	cfg.WarmContainerIdleTimeout = warmTimeout
 
-	hotReload, err := loadBool("HOT_RELOAD", getEnv("HOT_RELOAD", "false"))
+	hotReload, err := ParseBool("HOT_RELOAD", getEnv("HOT_RELOAD", "false"))
 	if err != nil {
 		return Config{}, err
 	}
@@ -539,36 +536,6 @@ func LoadRedisConfig() (RedisConfig, error) {
 		return RedisConfig{}, err
 	}
 	return RedisConfig{URI: uri, Stream: stream, Group: group}, nil
-}
-
-// loadPositiveInt parses a positive-integer environment value. Defaults are
-// resolved at the getEnv call site (the env value is already non-empty), so an
-// unparseable, zero, or negative value is a returned configuration error naming
-// the variable (see ParsePositiveInt).
-func loadPositiveInt(name, value string) (int, error) {
-	return ParsePositiveInt(name, value)
-}
-
-// loadPositiveDuration parses a positive-duration environment value. Defaults
-// are resolved at the getEnv call site, so an invalid (malformed or
-// non-positive) value is a returned configuration error naming the variable
-// (see ParsePositiveDuration).
-func loadPositiveDuration(name, value string) (time.Duration, error) {
-	return ParsePositiveDuration(name, value)
-}
-
-// loadMaxEventBytes parses MAX_EVENT_BYTES. Defaults are resolved at the
-// getEnv call site (the value is always non-empty here), so an invalid value is
-// a returned configuration error naming the variable (see ParseMaxEventBytes).
-func loadMaxEventBytes(value string) (int, error) {
-	return ParseMaxEventBytes("MAX_EVENT_BYTES", value)
-}
-
-// loadBool parses a boolean environment value. Defaults are resolved at the
-// getEnv call site (the value is always non-empty here), so an invalid value is
-// a returned configuration error naming the variable (see ParseBool).
-func loadBool(name, value string) (bool, error) {
-	return ParseBool(name, value)
 }
 
 // ParseBool parses a boolean environment value using strconv.ParseBool's
@@ -688,14 +655,6 @@ func ParseOptionalPositiveInt(name, value string) (*int, error) {
 	return &n, nil
 }
 
-// loadOptionalPositiveInt wraps ParseOptionalPositiveInt with Load's returned-
-// error style: an invalid value returns a clear configuration error naming the
-// variable. It returns nil for an unset value (see the parse helper for the
-// nil-vs-provided contract).
-func loadOptionalPositiveInt(name, value string) (*int, error) {
-	return ParseOptionalPositiveInt(name, value)
-}
-
 // ParseWorkerID validates a WORKER_ID value into the stable worker identity.
 // WORKER_ID is REQUIRED: callers resolve it with requiredEnv before validating,
 // so an empty (or whitespace-only) value is an error rather than a generated
@@ -732,11 +691,6 @@ func isWorkerIDChar(r rune) bool {
 	default:
 		return false
 	}
-}
-
-// loadWorkerID wraps ParseWorkerID with Load's returned-error style.
-func loadWorkerID(value string) (string, error) {
-	return ParseWorkerID(value)
 }
 
 // newIdentityToken returns prefix followed by 8 bytes of crypto/rand rendered as
@@ -781,16 +735,6 @@ func ParseLogLevel(value string) (slog.Level, error) {
 			value, strings.Join(logLevelNames, ", "),
 		)
 	}
-}
-
-// loadLogLevel parses LOG_LEVEL and returns a clear configuration error for an
-// invalid value. Unlike optional tuning knobs (parseRetention falls back), an
-// invalid log level is an error: silently running at an unintended level would
-// obscure precisely the operational feedback the operator asked for. The valid
-// value set is small and enumerated, so there is no ambiguity worth falling back
-// on.
-func loadLogLevel(value string) (slog.Level, error) {
-	return ParseLogLevel(value)
 }
 
 // retentionEnv resolves a retention window from the environment variable name.

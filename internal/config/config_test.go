@@ -463,46 +463,87 @@ func TestLoadReturnsErrorOnMissingVariable(t *testing.T) {
 	}
 }
 
-// TestLoadDefaultLogLevel pins that an unset LOG_LEVEL resolves to Info.
-func TestLoadDefaultLogLevel(t *testing.T) {
-	setRequiredEnv(t)
-	t.Setenv("LOG_LEVEL", "")
-	logger, _ := testLogger()
-	cfg, err := Load(logger)
-	if err != nil {
-		t.Fatalf("Load returned error: %v", err)
-	}
-	if cfg.LogLevel != slog.LevelInfo {
-		t.Fatalf("LogLevel = %v, want INFO default", cfg.LogLevel)
+// TestParseLogLevel pins the direct LOG_LEVEL parser contract (following the
+// TestParseBool/TestParsePositiveInt pattern for exported Parsers). LogLevel is
+// no longer a Config field, so this parser is where the behavior lives: both
+// Load (via getEnv("LOG_LEVEL", "INFO") validation) and cmd/main.go (via the raw
+// os.Getenv value, unset arriving as empty) depend on it. An empty or
+// whitespace-only value returns the documented INFO default; DEBUG, INFO, WARN,
+// and ERROR map 1:1 onto slog's built-in levels, case-insensitively with
+// surrounding whitespace trimmed; and any other value is an error naming
+// LOG_LEVEL, quoting the offending value, and listing every valid value.
+// "WARNING" is NOT an alias for WARN — it is rejected like any unknown value.
+func TestParseLogLevel(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		value     string
+		want      slog.Level
+		wantError bool
+	}{
+		{"empty is the INFO default", "", slog.LevelInfo, false},
+		{"whitespace only is the INFO default", "  \t\n ", slog.LevelInfo, false},
+		{"lower debug", "debug", slog.LevelDebug, false},
+		{"upper DEBUG", "DEBUG", slog.LevelDebug, false},
+		{"mixed Debug", "Debug", slog.LevelDebug, false},
+		{"lower info", "info", slog.LevelInfo, false},
+		{"upper INFO", "INFO", slog.LevelInfo, false},
+		{"mixed Info", "Info", slog.LevelInfo, false},
+		{"lower warn", "warn", slog.LevelWarn, false},
+		{"upper WARN", "WARN", slog.LevelWarn, false},
+		{"mixed Warn", "Warn", slog.LevelWarn, false},
+		{"lower error", "error", slog.LevelError, false},
+		{"upper ERROR", "ERROR", slog.LevelError, false},
+		{"mixed Error", "Error", slog.LevelError, false},
+		{"trimmed INFO", " INFO ", slog.LevelInfo, false},
+		{"trimmed debug with tabs and newline", "\tdebug\n", slog.LevelDebug, false},
+		{"bogus rejected", "bogus", slog.LevelInfo, true},
+		{"verbose rejected", "verbose", slog.LevelInfo, true},
+		{"warning is not an alias for WARN", "warning", slog.LevelInfo, true},
+		{"WARNING is not an alias for WARN", "WARNING", slog.LevelInfo, true},
+		{"numeric rejected", "1", slog.LevelInfo, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseLogLevel(tc.value)
+			if tc.wantError {
+				if err == nil {
+					t.Fatalf("ParseLogLevel(%q) = %v, nil; want an error", tc.value, got)
+				}
+				// Exact error semantics: the variable name, the quoted offending
+				// value, and each valid value must appear so the caller (Load or
+				// cmd/main.go) renders a clear configuration error. The returned
+				// level on an error is incidental and intentionally unasserted:
+				// callers discard it.
+				for _, want := range []string{"LOG_LEVEL", strconv.Quote(tc.value), "DEBUG", "INFO", "WARN", "ERROR"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Fatalf("error %q does not mention %s", err, want)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseLogLevel(%q) error: %v", tc.value, err)
+			}
+			if got != tc.want {
+				t.Fatalf("ParseLogLevel(%q) = %v, want %v", tc.value, got, tc.want)
+			}
+		})
 	}
 }
 
-// TestLoadLogLevelParses pins that each explicit (case-insensitive, whitespace-
-// trimmed) LOG_LEVEL resolves to the correct slog level. An empty value is the
-// default (INFO). "warning" is not an alias and is covered by the invalid-value
-// test.
-func TestLoadLogLevelParses(t *testing.T) {
-	for _, tc := range []struct {
-		value string
-		want  slog.Level
-	}{
-		{"", slog.LevelInfo},
-		{"debug", slog.LevelDebug},
-		{"DEBUG", slog.LevelDebug},
-		{" INFO ", slog.LevelInfo},
-		{"info", slog.LevelInfo},
-		{"WARN", slog.LevelWarn},
-		{"warn", slog.LevelWarn},
-		{"error", slog.LevelError},
-		{"ERROR", slog.LevelError},
-	} {
-		t.Run(tc.value, func(t *testing.T) {
+// TestLoadAcceptsValidLogLevel pins the Load-boundary companion to the direct
+// ParseLogLevel tests: Load still validates LOG_LEVEL at startup but no longer
+// reports the resolved level on Config, so what Load proves here is that every
+// supported value (case-insensitive, whitespace-trimmed) and the empty/unset
+// default are accepted without error, while invalid values fail via
+// TestLoadInvalidLogLevelReturnsError.
+func TestLoadAcceptsValidLogLevel(t *testing.T) {
+	for _, value := range []string{"", "info", "INFO", "debug", "DEBUG", " WARN ", " error "} {
+		t.Run(value, func(t *testing.T) {
 			setRequiredEnv(t)
-			t.Setenv("LOG_LEVEL", tc.value)
-			cfg := mustLoad(t)
-			if cfg.LogLevel != tc.want {
-				t.Fatalf("LogLevel = %v, want %v", cfg.LogLevel, tc.want)
-			}
+			t.Setenv("LOG_LEVEL", value)
+			// The empty value exercises getEnv's "INFO" fallback (Load's unset
+			// default); mustLoad fails the test if Load rejects any of these.
+			mustLoad(t)
 		})
 	}
 }
