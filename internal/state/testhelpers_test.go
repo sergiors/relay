@@ -1,3 +1,5 @@
+//go:build integration
+
 package state
 
 import (
@@ -21,14 +23,17 @@ import (
 
 // The state tests run against a real PostgreSQL instance (the suite is a
 // database integration suite). TEST_DATABASE_URL selects it; the default
-// matches the CI service container. When no database is reachable the shared
-// helpers skip, so a host without PostgreSQL can still run the unit suite;
-// CI provisions PostgreSQL for both the unit and integration jobs, where these
-// tests run for real.
+// matches the CI service container. The real-database tests are excluded from
+// the default suite by the integration build tag, and when that suite runs they
+// FAIL rather than skip if no database is reachable: they are meaningless
+// without PostgreSQL. TEST_DATABASE_URL never appears in diagnostics; valid
+// URL DSNs report only host:port, and keyword/value or malformed DSNs report a
+// generic non-secret label.
 //
 // Every test gets its own uniquely-named schema (search_path-pinned), so tests
 // never share tables or destructively mutate one another. The schema is dropped
-// on cleanup.
+// on cleanup; because cleanup runs LIFO, handles opened after newTestDSN close
+// before the schema is dropped.
 
 func testDatabaseURL() string {
 	if v := os.Getenv("TEST_DATABASE_URL"); v != "" {
@@ -49,12 +54,22 @@ func testDatabaseAvailable(t *testing.T) bool {
 	return db.PingContext(ctx) == nil
 }
 
+// testDatabaseEndpoint describes the configured server without credentials, so
+// a missing-database failure stays actionable without leaking a password.
+func testDatabaseEndpoint() string {
+	return safeDatabaseEndpoint(testDatabaseURL())
+}
+
 // newTestDSN creates a fresh isolated schema and returns a DSN pinned to it.
+// It fails (never skips) when PostgreSQL is unreachable: only
+// integration-tagged tests call it, and they require a real database.
 func newTestDSN(t *testing.T) string {
 	t.Helper()
 	base := testDatabaseURL()
 	if !testDatabaseAvailable(t) {
-		t.Skipf("state tests require PostgreSQL at TEST_DATABASE_URL (%s); none reachable", base)
+		t.Fatalf("state integration test requires a reachable PostgreSQL at %s "+
+			"(from TEST_DATABASE_URL); start one and point TEST_DATABASE_URL at it",
+			testDatabaseEndpoint())
 	}
 	schema := "relay_test_" + randHex(t)
 	admin, err := sql.Open("pgx", base)

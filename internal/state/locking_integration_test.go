@@ -27,7 +27,8 @@ import (
 func requireTestDB(t *testing.T) {
 	t.Helper()
 	if !testDatabaseAvailable(t) {
-		t.Fatalf("state integration test requires a reachable PostgreSQL at TEST_DATABASE_URL (%s)", testDatabaseURL())
+		t.Fatalf("state integration test requires a reachable PostgreSQL at %s "+
+			"(from TEST_DATABASE_URL)", testDatabaseEndpoint())
 	}
 }
 
@@ -244,7 +245,6 @@ func TestIntegrationConcurrentSchemaInit(t *testing.T) {
 // contract: Open returns a clear error (never a degraded handle) when the
 // database is unreachable, and a working DSN succeeds.
 func TestIntegrationOpenRejectsUnreachableDSN(t *testing.T) {
-	requireTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	st, err := Open(ctx, Options{

@@ -67,6 +67,7 @@ func newSharedStatePair(t *testing.T) (*state.State, *state.State) {
 // image simultaneously, and both must be released before anything else's
 // exclusive view exists.
 func TestIntegrationDependencyLeaseSharedConcurrency(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	a, b := newSharedStatePair(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -129,6 +130,7 @@ func TestIntegrationDependencyLeaseSharedConcurrency(t *testing.T) {
 // TryAcquireGC reports acquired=false with no error and must NOT leak the
 // exclusive lease; after the shared holder releases, the SAME handle acquires.
 func TestIntegrationDependencyLeaseExclusiveContended(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	a, b := newSharedStatePair(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -181,6 +183,7 @@ func TestIntegrationDependencyLeaseExclusiveContended(t *testing.T) {
 // direction: an exclusive GC lease on one handle REFUSES a shared use
 // acquisition from the other; both succeed once the exclusive lease releases.
 func TestIntegrationDependencyLeaseExclusiveBlocksShared(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	a, b := newSharedStatePair(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -212,6 +215,7 @@ func TestIntegrationDependencyLeaseExclusiveBlocksShared(t *testing.T) {
 // that cannot wait long enough fails with ErrDependencyImageBusy (retryable),
 // never with something a caller would treat as a lost layer.
 func TestIntegrationDependencyLeaseBusyRetryable(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	a, b := newSharedStatePair(t)
 	ref := leaseRefFor("busy")
 
@@ -249,6 +253,7 @@ func TestIntegrationDependencyLeaseBusyRetryable(t *testing.T) {
 // runs on a goroutine and the release happens deterministically before the
 // acquisition's contention budget expires).
 func TestIntegrationDependencyLeaseBusyWaitThenGrant(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	a, b := newSharedStatePair(t)
 	ref := leaseRefFor("wait-grant")
 
@@ -289,6 +294,7 @@ func TestIntegrationDependencyLeaseBusyWaitThenGrant(t *testing.T) {
 // must close and join BEFORE the State handle closes, never the reverse, and a
 // closed handle's locks are the process-cleanup release.
 func TestIntegrationDependencyLeaseClosedHandleFailsClosed(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	st, _ := newSharedStatePair(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -343,6 +349,7 @@ func advisoryKeyFor(depRef string) int64 {
 // can only then acquire the exclusive GC view — after the backend is gone.
 // No Docker work is involved anywhere.
 func TestIntegrationDependencyLeaseBackendLossDetected(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	a, b := newOwnerfulStatePair(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -411,6 +418,7 @@ func TestIntegrationDependencyLeaseBackendLossDetected(t *testing.T) {
 // first is held, and the SAME try succeeds once the first releases. Fully
 // deterministic single calls, run-unique refs, no sleeps, no Docker.
 func TestIntegrationDependencyLeaseExclusiveExclusive(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	a, b := newOwnerfulStatePair(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -455,6 +463,7 @@ func TestIntegrationDependencyLeaseExclusiveExclusive(t *testing.T) {
 // handle must not prevent an exclusive GC of dep B on the other handle. This
 // is what keeps one contended build from blocking unrelated GC candidates.
 func TestIntegrationDependencyLeasePerReferenceIsolation(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	a, b := newSharedStatePair(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -498,6 +507,7 @@ func TestIntegrationDependencyLeasePerReferenceIsolation(t *testing.T) {
 // holder unblocks the cross-handle exclusive gate deterministically
 // (release → try succeeds without any timing assistance).
 func TestIntegrationDependencyLeaseReleaseUnblocks(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	a, b := newSharedStatePair(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -552,6 +562,7 @@ func TestIntegrationDependencyLeaseReleaseUnblocks(t *testing.T) {
 // acquisition grants nothing and leaves no residue: the immediately
 // following full-context acquisition succeeds as if nothing happened.
 func TestIntegrationDependencyLeaseCanceledAcquisition(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	st, _ := newSharedStatePair(t)
 	ref := leaseRefFor("canceled")
 
@@ -579,6 +590,7 @@ func TestIntegrationDependencyLeaseCanceledAcquisition(t *testing.T) {
 // lease no longer verifies: Verify must report an error, not success, once the
 // holder released its reference.
 func TestIntegrationDependencyLeaseReleaseLeavesVerifyDead(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	a, b := newSharedStatePair(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -614,6 +626,7 @@ func TestIntegrationDependencyLeaseReleaseLeavesVerifyDead(t *testing.T) {
 // token from before the Close no longer verifies, while a sibling handle
 // regains the full gate.
 func TestIntegrationDependencyLeaseCloseLifecycle(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	open := func() *state.State { return testutil.OpenState(t, dsn) }
 	a := open()
