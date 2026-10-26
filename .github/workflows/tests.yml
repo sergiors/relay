@@ -100,52 +100,7 @@ jobs:
         run: go vet -tags=integration ./...
 
       - name: Test
-        shell: bash
-        run: |
-          result=0
-          make test-integration GOTEST="go test -json" > integration.jsonl 2>&1 || result=$?
-
-          if [ "$result" -ne 0 ]; then
-            echo "=== Failed tests/packages ==="
-            jq -Rr '
-              fromjson?
-              | select(.Action == "fail")
-              | "\(.Package) :: \(.Test // "(package)")"
-            ' integration.jsonl || true
-
-            echo "=== Last 80 log lines ==="
-            tail -n 80 integration.jsonl
-          fi
-
-          exit "$result"
+        run: make test-integration GOTEST="go test"
 
       - name: Test (race)
-        shell: bash
-        run: |
-          result=0
-          make test-integration-race GOTEST="go test -json" > integration-race.jsonl 2>&1 || result=$?
-
-          if [ "$result" -ne 0 ]; then
-            echo "=== Failed tests/packages (race) ==="
-            jq -Rr '
-              fromjson?
-              | select(.Action == "fail")
-              | "\(.Package) :: \(.Test // "(package)")"
-            ' integration-race.jsonl || true
-
-            echo "=== Last 80 log lines ==="
-            tail -n 80 integration-race.jsonl
-          fi
-
-          exit "$result"
-
-      - name: Upload integration logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: integration-test-results
-          path: |
-            integration.jsonl
-            integration-race.jsonl
-          if-no-files-found: warn
-          retention-days: 14
+        run: make test-integration-race GOTEST="go test"
