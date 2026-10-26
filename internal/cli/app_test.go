@@ -61,13 +61,15 @@ func recordSuccess(
 	return fencingToken
 }
 
-// openTempState opens a fresh temp state DB under per-test dependencies and
-// returns it with those deps. It replaces the former package-level statePath
-// global: each test owns its explicit temp locations, so no shared filesystem
-// state is mutated or restored.
+// openTempState opens a fresh isolated state DB under per-test dependencies and
+// returns it with those deps. It uses stateTestDeps because the returned handle
+// and every command run with deps must read the same per-test schema. It
+// replaces the former package-level statePath global: each test owns its
+// explicit schema and filesystem locations, so no shared state is mutated or
+// restored.
 func openTempState(t *testing.T) (*state.State, Dependencies) {
 	t.Helper()
-	deps := testDeps(t)
+	deps := stateTestDeps(t)
 	st, cleanup, err := deps.OpenState(context.Background())
 	if err != nil {
 		t.Fatalf("open: %v", err)

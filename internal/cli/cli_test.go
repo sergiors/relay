@@ -16,17 +16,30 @@ import (
 	"relay/internal/testutil"
 )
 
-// testDeps returns CLI dependencies whose state DB, worker socket, process
-// lock, git paths, and secrets dir all live under fresh per-test temp
+// errUnexpectedStateAccess is the default test fixture's state-opener error.
+// It makes accidental state access fail loudly instead of silently opening
+// PostgreSQL (or returning a fake success): a test that needs state must opt in
+// with stateTestDeps.
+var errUnexpectedStateAccess = errors.New(
+	"cli test fixture: unexpected state access; use stateTestDeps for state-backed tests")
+
+// testDeps returns the default CLI test dependencies. The worker socket,
+// process lock, git paths, and secrets dir all live under fresh per-test temp
 // locations. The socket lives under /tmp (not t.TempDir's /var/folders on
 // macOS) to stay inside the ~104-byte Unix socket sun_path limit. It replaces
 // the former package-level path globals (statePath, runtimeSocketPath,
 // startLockPath, the git dirs, and secretsPath) with per-test values, so tests
 // never touch /var/lib/relay or /run/relay. Start defaults to a no-op runner
 // so an accidental `start` never launches the real worker; tests asserting
-// dispatch override deps.Start directly. The only remaining package-level seam
-// is the git sync transport seam (gitCloneURL), which is a package var; tests
-// that mutate it restore the previous value via t.Cleanup.
+// dispatch override deps.Start directly.
+//
+// testDeps is deliberately database-free: OpenState returns
+// errUnexpectedStateAccess without opening PostgreSQL, so tests that never
+// touch state (help, start, health, DLQ, git, secrets) need no database. Tests
+// that genuinely read or write state opt in with stateTestDeps. The only
+// remaining package-level seam is the git sync transport seam (gitCloneURL),
+// which is a package var; tests that mutate it restore the previous value via
+// t.Cleanup.
 func testDeps(t *testing.T) Dependencies {
 	t.Helper()
 	dir := t.TempDir()
@@ -35,14 +48,9 @@ func testDeps(t *testing.T) Dependencies {
 		t.Fatalf("short temp dir: %v", err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
-	dsn := testutil.NewStateDSN(t)
 	return Dependencies{
-		OpenState: func(ctx context.Context) (*state.State, func(), error) {
-			st, err := state.Open(ctx, state.Options{DSN: dsn})
-			if err != nil {
-				return nil, nil, err
-			}
-			return st, func() { _ = st.Close() }, nil
+		OpenState: func(context.Context) (*state.State, func(), error) {
+			return nil, nil, errUnexpectedStateAccess
 		},
 		SocketPath: filepath.Join(sockDir, "relay.sock"),
 		LockPath:   filepath.Join(dir, "relay.lock"),
@@ -54,6 +62,45 @@ func testDeps(t *testing.T) Dependencies {
 		GitAppsDir:     filepath.Join(dir, "apps"),
 		SecretsDir:     filepath.Join(dir, "secrets"),
 		Start:          func(*slog.Logger) error { return nil },
+	}
+}
+
+// stateTestDeps is the opt-in real-state fixture: testDeps plus an OpenState
+// that opens a PostgreSQL handle on a fresh per-test schema. It reuses
+// testutil.NewStateDSN, so every test gets its own schema (dropped on cleanup
+// after the handles opened on it close) and a missing PostgreSQL skips the
+// test. Only tests that genuinely read or write state should use it; the
+// default testDeps stays database-free.
+func stateTestDeps(t *testing.T) Dependencies {
+	t.Helper()
+	deps := testDeps(t)
+	dsn := testutil.NewStateDSN(t)
+	deps.OpenState = func(ctx context.Context) (*state.State, func(), error) {
+		st, err := state.Open(ctx, state.Options{DSN: dsn})
+		if err != nil {
+			return nil, nil, err
+		}
+		return st, func() { _ = st.Close() }, nil
+	}
+	return deps
+}
+
+// TestDefaultFixtureRejectsStateAccess pins the default fixture's state
+// contract: OpenState must fail loudly with exactly errUnexpectedStateAccess,
+// naming stateTestDeps, and return no handle. The fixture neither opens nor
+// depends on PostgreSQL, so the test passes with or without a reachable server;
+// a regression that makes testDeps need a database fails wherever one is
+// reachable (and visibly skips the no-database suites where none is).
+func TestDefaultFixtureRejectsStateAccess(t *testing.T) {
+	st, _, err := testDeps(t).OpenState(context.Background())
+	if !errors.Is(err, errUnexpectedStateAccess) {
+		t.Fatalf("OpenState err = %v, want the fixture's unexpected-state-access error", err)
+	}
+	if !strings.Contains(err.Error(), "stateTestDeps") {
+		t.Fatalf("OpenState err %q must name the real-state fixture it requires", err)
+	}
+	if st != nil {
+		t.Fatalf("OpenState returned a handle %v alongside its error", st)
 	}
 }
 
@@ -153,6 +200,27 @@ func TestRootHelpContainsStart(t *testing.T) {
 	fi := strings.Index(cmds, "app")
 	if si == -1 || fi == -1 || si > fi {
 		t.Fatalf("start should be listed before app:\n%s", out)
+	}
+}
+
+// TestHelpAndArgumentValidationRunWithoutReachableDatabase pins that help
+// rendering and argument validation never touch state: --help succeeds and
+// `start extra` reports the arity usage error, never the fixture's state-access
+// error, so a regression that routes these paths through the database fails
+// here. TEST_DATABASE_URL is set to an unreachable address only as a defensive
+// tripwire: the database-free fixture itself does not consult it, so no
+// database is required or touched.
+func TestHelpAndArgumentValidationRunWithoutReachableDatabase(t *testing.T) {
+	t.Setenv("TEST_DATABASE_URL",
+		"postgres://relay:relay@127.0.0.1:1/relay?sslmode=disable")
+
+	if _, _, err := runCLI(t, "", "--help"); err != nil {
+		t.Fatalf("--help: err = %v, want nil without a reachable database", err)
+	}
+	_, _, err := runCLI(t, "", "start", "extra")
+	if err == nil || !strings.Contains(err.Error(), "start: too many arguments") {
+		t.Fatalf("start extra: err = %v, want the arity usage error without a reachable database",
+			err)
 	}
 }
 
@@ -347,7 +415,7 @@ func TestStartPropagatesWorkerError(t *testing.T) {
 // touch the start lock: with the lock held elsewhere, they still succeed and the
 // lock file is not created or modified by them.
 func TestNonStartCommandsDoNotAcquireLock(t *testing.T) {
-	deps := testDeps(t)
+	deps := stateTestDeps(t)
 	held, err := processlock.Acquire(deps.LockPath)
 	if err != nil {
 		t.Fatalf("pre-acquire lock: %v", err)
@@ -379,5 +447,53 @@ func TestNonStartCommandsDoNotAcquireLock(t *testing.T) {
 	}
 	if !after.ModTime().Equal(before.ModTime()) {
 		t.Fatal("administrative commands modified the lock file; they must not touch it")
+	}
+}
+
+// TestStatelessAdminCommandsDoNotAcquireLockWithoutDatabase pins the non-start
+// lock contract for commands that never read state (git, secret): with the
+// start lock held elsewhere, both succeed and the lock file is neither
+// recreated nor modified. TEST_DATABASE_URL is set to an unreachable address
+// only as a defensive tripwire: the database-free fixture itself does not
+// consult it, and these commands never read state. The state-backed sibling
+// TestNonStartCommandsDoNotAcquireLock covers only state-reading commands, so
+// it skips without PostgreSQL; the default database-free suite keeps a lock
+// regression guard here.
+func TestStatelessAdminCommandsDoNotAcquireLockWithoutDatabase(t *testing.T) {
+	t.Setenv("TEST_DATABASE_URL",
+		"postgres://relay:relay@127.0.0.1:1/relay?sslmode=disable")
+
+	deps := testDeps(t)
+	held, err := processlock.Acquire(deps.LockPath)
+	if err != nil {
+		t.Fatalf("pre-acquire lock: %v", err)
+	}
+	defer held.Close()
+
+	// The lock file exists (created by Acquire) and is held; capture its
+	// identity so the commands can be proven not to recreate or modify it.
+	before, err := os.Stat(deps.LockPath)
+	if err != nil {
+		t.Fatalf("stat held lock: %v", err)
+	}
+
+	for _, args := range [][]string{
+		{"git", "status"},
+		{"secret", "ls"},
+	} {
+		if _, _, err := runCLIWithDeps(t, deps, "", args...); err != nil {
+			t.Fatalf("%v: err = %v, want nil (held lock must not matter)", args, err)
+		}
+	}
+
+	after, err := os.Stat(deps.LockPath)
+	if err != nil {
+		t.Fatalf("stat lock after stateless admin commands: %v", err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("stateless admin commands replaced the lock file; they must not touch it")
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatal("stateless admin commands modified the lock file; they must not touch it")
 	}
 }

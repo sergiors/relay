@@ -48,11 +48,12 @@ func (f *fakeInvoker) snapshot() (calls int, name string, event map[string]any) 
 	return f.calls, f.name, f.event
 }
 
-// invokeDeps returns dependencies for `app invoke`, whose only seam is the
-// worker socket. The state opener fails loudly so an accidental database
-// dependency is caught, and the socket lives under /tmp to stay inside the
-// Unix sun_path limit. Unlike testDeps, it never needs PostgreSQL, so the
-// focused invoke tests always run.
+// invokeDeps returns the minimal dependencies for `app invoke`, whose only
+// seam is the worker socket. The state opener fails loudly with an
+// invoke-specific message so an accidental database dependency is caught, and
+// the socket lives under /tmp to stay inside the Unix sun_path limit. Like the
+// default testDeps, it never needs PostgreSQL, so the focused invoke tests
+// always run.
 func invokeDeps(t *testing.T) Dependencies {
 	t.Helper()
 	sockDir, err := os.MkdirTemp("/tmp", "relay-cli-sock-")

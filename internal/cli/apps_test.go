@@ -55,7 +55,9 @@ events:
 // error. The two entry points share one Action, so this guards against a future
 // divergence such as a second formatting path.
 func TestAppsAliasMatchesAppLsEmptyDB(t *testing.T) {
-	deps := testDeps(t)
+	// `app ls` reads the state database, so this needs the real-state fixture
+	// even though the database is fresh and empty.
+	deps := stateTestDeps(t)
 
 	canonicalOut, canonicalErrOut, canonicalErr := runCLIWithDeps(t, deps, "", "app", "ls")
 	aliasOut, aliasErrOut, aliasErr := runCLIWithDeps(t, deps, "", "apps")
