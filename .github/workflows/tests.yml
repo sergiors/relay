@@ -13,13 +13,9 @@ jobs:
     name: Unit tests
     runs-on: ubuntu-latest
     env:
-      # The state-backed unit suite runs for real against this service; without
-      # TEST_DATABASE_URL it would silently skip every state test.
       TEST_DATABASE_URL: postgres://relay:relay@localhost:5432/relay?sslmode=disable
-      # WORKER_ID is required by config.Load with no hostname or generated
-      # fallback, so CI provides a stable non-empty identity. Tests that pin the
-      # missing-WORKER_ID failure clear it themselves.
       WORKER_ID: relay-ci
+
     services:
       postgres:
         image: postgres:17-alpine
@@ -59,10 +55,8 @@ jobs:
     env:
       DOCKER_BUILDKIT: 1
       TEST_DATABASE_URL: postgres://relay:relay@localhost:5432/relay?sslmode=disable
-      # WORKER_ID is required by config.Load with no hostname or generated
-      # fallback, so CI provides a stable non-empty identity. Tests that pin the
-      # missing-WORKER_ID failure clear it themselves.
       WORKER_ID: relay-ci
+
     services:
       redis:
         image: redis:8-alpine
@@ -73,6 +67,7 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 5
+
       postgres:
         image: postgres:17-alpine
         env:
@@ -105,7 +100,52 @@ jobs:
         run: go vet -tags=integration ./...
 
       - name: Test
-        run: make test-integration
+        shell: bash
+        run: |
+          result=0
+          make test-integration GOTEST="go test -json" > integration.jsonl 2>&1 || result=$?
+
+          if [ "$result" -ne 0 ]; then
+            echo "=== Failed tests/packages ==="
+            jq -Rr '
+              fromjson?
+              | select(.Action == "fail")
+              | "\(.Package) :: \(.Test // "(package)")"
+            ' integration.jsonl || true
+
+            echo "=== Last 80 log lines ==="
+            tail -n 80 integration.jsonl
+          fi
+
+          exit "$result"
 
       - name: Test (race)
-        run: make test-integration-race
+        shell: bash
+        run: |
+          result=0
+          make test-integration-race GOTEST="go test -json" > integration-race.jsonl 2>&1 || result=$?
+
+          if [ "$result" -ne 0 ]; then
+            echo "=== Failed tests/packages (race) ==="
+            jq -Rr '
+              fromjson?
+              | select(.Action == "fail")
+              | "\(.Package) :: \(.Test // "(package)")"
+            ' integration-race.jsonl || true
+
+            echo "=== Last 80 log lines ==="
+            tail -n 80 integration-race.jsonl
+          fi
+
+          exit "$result"
+
+      - name: Upload integration logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results
+          path: |
+            integration.jsonl
+            integration-race.jsonl
+          if-no-files-found: warn
+          retention-days: 14

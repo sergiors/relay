@@ -368,7 +368,7 @@ func (flusher *statsFlusher) flushLocked(ctx context.Context) {
 	// in-memory baseline to the registry's current values and retry once under
 	// the new epoch. A second advance is left for the next tick rather than
 	// looped on.
-	for attempt := 0; attempt < 2; attempt++ {
+	for range 2 {
 		gen, err := flusher.st.RecordStatsSnapshot(
 			ctx,
 			flusher.generation,
