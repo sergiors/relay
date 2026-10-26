@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -231,14 +232,33 @@ func TestStartupParseGateStaleObservationDoesNotOverwriteCorrection(t *testing.T
 	writeStartupTemplate(t, root, "shared", startupInvalidTemplate)
 	oldToken, identity := seedStartupInvalid(t, older, "shared")
 
+	// corrected is the full post-correction row captured synchronously by the
+	// callback, after newerWrite commits and before the stale persistence phase.
+	var corrected state.AppObservation
 	newerWrite := func() {
 		fn := stateApp("shared", filepath.Join(root, "shared"))
-		if _, err := newer.RecordDiscoveredWithFingerprint(
-			context.Background(), fn, "fp-corrected"); err != nil {
+		correctedToken, err := newer.RecordDiscoveredWithFingerprint(
+			context.Background(), fn, "fp-corrected")
+		if err != nil {
 			t.Fatalf("newer valid correction: %v", err)
 		}
+		if correctedToken <= oldToken {
+			t.Fatalf("corrected token = %d, want it past the invalid %d",
+				correctedToken, oldToken)
+		}
+		corrected, err = newer.ObserveApp(context.Background(), "shared")
+		if err != nil {
+			t.Fatalf("observe corrected row: %v", err)
+		}
+		if !corrected.Found {
+			t.Fatal("newer valid correction left no row")
+		}
+		if corrected.FencingToken != correctedToken {
+			t.Fatalf("observed corrected token = %d, want the written %d",
+				corrected.FencingToken, correctedToken)
+		}
+		assertCorrectedStartupRow(t, corrected.Detail)
 	}
-	correctedBefore, _ := newer.GetApp("shared")
 
 	logger := discardLogger()
 	inner := newStartupGate(context.Background(), older, logger)
@@ -258,23 +278,72 @@ func TestStartupParseGateStaleObservationDoesNotOverwriteCorrection(t *testing.T
 		t.Fatalf("issue identity = %q, want %q", issues[0].Identity, identity)
 	}
 
+	oldObserved, ok := inner.observed["shared"]
+	if !ok || !oldObserved.Found {
+		t.Fatalf("pre-read observation = %+v ok=%v, want the seeded invalid row",
+			oldObserved, ok)
+	}
+	if oldObserved.FencingToken != oldToken {
+		t.Fatalf("pre-read observation token = %d, want the old %d",
+			oldObserved.FencingToken, oldToken)
+	}
+	if oldObserved.Detail.InvalidSource != identity {
+		t.Fatalf("pre-read invalid source = %q, want %q",
+			oldObserved.Detail.InvalidSource, identity)
+	}
+	if !corrected.Found {
+		t.Fatal("the concurrent correction callback did not run")
+	}
+
 	tokens, err := persistStartupDiscovery(
 		context.Background(), older, root, nil, issues, inner.observed, logger)
 	if err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
-	if _, ok := tokens["shared"]; ok {
-		t.Fatal("a rejected stale observation must not surface a fencing token")
+	if token, ok := tokens["shared"]; ok {
+		t.Fatalf("rejected stale observation surfaced token %d", token)
 	}
-	if got := persistedObservationForTest(t, older, "shared").FencingToken; got <= oldToken {
-		t.Fatalf("persisted token = %d, want the newer correction's token past %d", got, oldToken)
+	after, err := older.ObserveApp(context.Background(), "shared")
+	if err != nil {
+		t.Fatalf("observe row after stale persistence: %v", err)
 	}
-	after, _ := older.GetApp("shared")
-	if after.InvalidSource != "" || after.Status != state.StatusPreparing {
-		t.Fatalf("stale write corrupted the valid correction: %+v", after)
+	if !after.Found {
+		t.Fatal("stale persistence removed the corrected row")
 	}
-	if after.UpdatedAt != correctedBefore.UpdatedAt || after.LastError != correctedBefore.LastError {
-		t.Fatalf("stale write changed the newer row:\n got: %+v\nwant: %+v", after, correctedBefore)
+	if after.FencingToken != corrected.FencingToken {
+		t.Fatalf("fencing token after stale persistence = %d, want the corrected %d",
+			after.FencingToken, corrected.FencingToken)
+	}
+	if !reflect.DeepEqual(after.Detail, corrected.Detail) {
+		t.Fatalf("stale write changed the corrected row:\n got: %+v\nwant: %+v",
+			after.Detail, corrected.Detail)
+	}
+}
+
+// assertCorrectedStartupRow pins the valid correction's persisted fields. The
+// non-empty timestamp keeps the later full-row comparison meaningful rather than
+// comparing zero values.
+func assertCorrectedStartupRow(t *testing.T, detail state.Detail) {
+	t.Helper()
+	if detail.Name != "shared" {
+		t.Fatalf("corrected name = %q, want shared", detail.Name)
+	}
+	if detail.Runtime != "node24" {
+		t.Fatalf("corrected runtime = %q, want node24", detail.Runtime)
+	}
+	if detail.Status != state.StatusPreparing {
+		t.Fatalf("corrected status = %q, want preparing", detail.Status)
+	}
+	if detail.DesiredFingerprint != "fp-corrected" {
+		t.Fatalf("corrected desired fingerprint = %q, want fp-corrected",
+			detail.DesiredFingerprint)
+	}
+	if detail.InvalidSource != "" {
+		t.Fatalf("corrected invalid source = %q, want cleared",
+			detail.InvalidSource)
+	}
+	if detail.UpdatedAt == "" {
+		t.Fatal("corrected row has no updated_at; baseline comparison is meaningless")
 	}
 }
 
