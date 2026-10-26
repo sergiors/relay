@@ -18,7 +18,10 @@ import (
 func TestStatsFlusherRebasesAfterRemoteReset(t *testing.T) {
 	ctx := context.Background()
 	dsn := testutil.NewStateDSN(t)
-	st := testutil.OpenState(t, dsn, state.Options{Owner: "worker-a", Instance: "inst-a"})
+	// Owner identities must be unique per test: PostgreSQL session advisory locks
+	// are database-wide, so per-test schemas do not isolate them.
+	owner := testutil.UniqueName(t, "stats-rebases")
+	st := testutil.OpenState(t, dsn, state.Options{Owner: owner, Instance: "inst-a"})
 	// A second, owner-less handle plays the admin process that resets.
 	admin := testutil.OpenState(t, dsn)
 
@@ -68,7 +71,8 @@ func TestStatsFlusherStopsOnOwnershipLost(t *testing.T) {
 	ctx := context.Background()
 	dsn := testutil.NewStateDSN(t)
 
-	stale := testutil.OpenState(t, dsn, state.Options{Owner: "worker-a", Instance: "inst-1"})
+	owner := testutil.UniqueName(t, "stats-lost")
+	stale := testutil.OpenState(t, dsn, state.Options{Owner: owner, Instance: "inst-1"})
 	mStale := metrics.New()
 	mStale.Add(metrics.MetricEventsMatched, 5)
 	fStale := newStatsFlusher(stale, mStale)
@@ -78,7 +82,7 @@ func TestStatsFlusherStopsOnOwnershipLost(t *testing.T) {
 	raw := newRawStateConn(t, dsn)
 	if _, err := raw.ExecContext(ctx,
 		`UPDATE stats SET instance = $2, data = $3, updated_at = $4 WHERE worker = $1`,
-		"worker-a", "inst-2", `{"events_matched_total":30}`,
+		owner, "inst-2", `{"events_matched_total":30}`,
 		time.Now().UTC().Format(time.RFC3339)); err != nil {
 		t.Fatalf("simulate successor claim: %v", err)
 	}
@@ -107,7 +111,8 @@ func TestStatsFlusherStopsOnOwnershipLost(t *testing.T) {
 // second time.
 func TestStatsFlusherResetAdoptsEpoch(t *testing.T) {
 	ctx := context.Background()
-	st := testutil.NewState(t, state.Options{Owner: "worker-a", Instance: "inst-a"})
+	owner := testutil.UniqueName(t, "stats-reset")
+	st := testutil.NewState(t, state.Options{Owner: owner, Instance: "inst-a"})
 	m := metrics.New()
 	m.Add(metrics.MetricEventsMatched, 100)
 

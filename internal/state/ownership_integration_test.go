@@ -37,7 +37,8 @@ func TestIntegrationVerifyOwnerLockDetectsTerminatedBackend(t *testing.T) {
 	dsn := newTestDSN(t)
 	ctx := context.Background()
 
-	live := openWithIdentity(t, dsn, "worker-monitor", "inst-1")
+	owner := uniqueWorkerID(t, "worker-monitor")
+	live := openWithIdentity(t, dsn, owner, "inst-1")
 	ownerPID := live.OwnerBackendPID()
 	if ownerPID <= 0 {
 		t.Fatalf("owner OwnerBackendPID = %d, want > 0", ownerPID)
@@ -77,7 +78,7 @@ func TestIntegrationVerifyOwnerLockDetectsTerminatedBackend(t *testing.T) {
 
 	// The session advisory lock died with the backend, so a replacement
 	// incarnation of the same WORKER_ID can open and verify.
-	replacement := openWithIdentity(t, dsn, "worker-monitor", "inst-2")
+	replacement := openWithIdentity(t, dsn, owner, "inst-2")
 	if err := replacement.VerifyOwnerLock(ctx); err != nil {
 		t.Fatalf("replacement VerifyOwnerLock = %v, want nil", err)
 	}
@@ -94,7 +95,7 @@ func TestIntegrationVerifyOwnerLockDetectsTerminatedBackend(t *testing.T) {
 func TestIntegrationConcurrentVerifyOwnerLockOnPinnedConn(t *testing.T) {
 	requireTestDB(t)
 	dsn := newTestDSN(t)
-	st := openWithIdentity(t, dsn, "worker-stress", "inst-1")
+	st := openWithIdentity(t, dsn, uniqueWorkerID(t, "worker-stress"), "inst-1")
 
 	const (
 		callers = 8

@@ -32,7 +32,8 @@ func TestIntegrationOwnershipMonitorDetectsTerminatedLockBackend(t *testing.T) {
 	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 
-	st := testutil.OpenState(t, dsn, state.Options{Owner: "worker-monitor", Instance: "inst-1"})
+	owner := testutil.UniqueName(t, "owner-monitor")
+	st := testutil.OpenState(t, dsn, state.Options{Owner: owner, Instance: "inst-1"})
 	ownerPID := st.OwnerBackendPID()
 	if ownerPID <= 0 {
 		t.Fatalf("owner backend pid = %d, want > 0", ownerPID)
@@ -45,7 +46,7 @@ func TestIntegrationOwnershipMonitorDetectsTerminatedLockBackend(t *testing.T) {
 	loss := &ownershipLoss{}
 
 	done := startOwnershipMonitor(lifecycle,
-		ownershipLossAction(loss, ready, slog.New(slog.NewTextHandler(io.Discard, nil)), "worker-monitor", "inst-1", cancel),
+		ownershipLossAction(loss, ready, slog.New(slog.NewTextHandler(io.Discard, nil)), owner, "inst-1", cancel),
 		ownershipMonitorConfig{
 			verify:   st.VerifyOwnerLock,
 			interval: 50 * time.Millisecond,
@@ -78,7 +79,7 @@ func TestIntegrationOwnershipMonitorDetectsTerminatedLockBackend(t *testing.T) {
 
 	// The session advisory lock died with the backend, so a replacement
 	// incarnation of the same WORKER_ID can open and verify.
-	replacement := testutil.OpenState(t, dsn, state.Options{Owner: "worker-monitor", Instance: "inst-2"})
+	replacement := testutil.OpenState(t, dsn, state.Options{Owner: owner, Instance: "inst-2"})
 	if err := replacement.VerifyOwnerLock(context.Background()); err != nil {
 		t.Fatalf("replacement VerifyOwnerLock = %v, want nil", err)
 	}
@@ -155,7 +156,8 @@ func TestIntegrationVerifyOwnerLockConcurrentUnderMonitor(t *testing.T) {
 	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 
-	st := testutil.OpenState(t, dsn, state.Options{Owner: "worker-stress", Instance: "inst-1"})
+	owner := testutil.UniqueName(t, "owner-stress")
+	st := testutil.OpenState(t, dsn, state.Options{Owner: owner, Instance: "inst-1"})
 
 	lifecycle, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -163,7 +165,7 @@ func TestIntegrationVerifyOwnerLockConcurrentUnderMonitor(t *testing.T) {
 	ready.setReady()
 	loss := &ownershipLoss{}
 	done := startOwnershipMonitor(lifecycle,
-		ownershipLossAction(loss, ready, slog.New(slog.NewTextHandler(io.Discard, nil)), "worker-stress", "inst-1", cancel),
+		ownershipLossAction(loss, ready, slog.New(slog.NewTextHandler(io.Discard, nil)), owner, "inst-1", cancel),
 		ownershipMonitorConfig{
 			verify:   st.VerifyOwnerLock,
 			interval: 10 * time.Millisecond,

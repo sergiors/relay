@@ -8,6 +8,16 @@ import (
 	"time"
 )
 
+// uniqueWorkerID returns a worker owner identity unique to this test.
+// PostgreSQL session advisory locks are database-wide: the per-test schemas do
+// not namespace them, so a fixed owner shared with another test running
+// concurrently in ANY package would make the second Open fail as "already in
+// use".
+func uniqueWorkerID(t *testing.T, prefix string) string {
+	t.Helper()
+	return prefix + "-" + randHex(t)
+}
+
 // openWithIdentity opens a state handle on dsn scoped to a worker identity
 // (Owner + Instance) and registers its close. It is the identity-aware companion
 // of testOpenOrFail for the ownership/fencing tests.
@@ -116,7 +126,8 @@ func TestOwnershipLostSkipsAppStats(t *testing.T) {
 func TestRestartSameWorkerKeepsTotalsOnce(t *testing.T) {
 	ctx := context.Background()
 	dsn := newTestDSN(t)
-	first := openWithIdentity(t, dsn, "worker-a", "inst-1")
+	owner := uniqueWorkerID(t, "worker-restart")
+	first := openWithIdentity(t, dsn, owner, "inst-1")
 	if _, err := first.RecordStatsSnapshot(ctx, -1, Stats{EventsMatchedTotal: 100}, nil); err != nil {
 		t.Fatalf("first snapshot: %v", err)
 	}
@@ -124,7 +135,7 @@ func TestRestartSameWorkerKeepsTotalsOnce(t *testing.T) {
 		t.Fatalf("close first handle: %v", err)
 	}
 
-	restarted := openWithIdentity(t, dsn, "worker-a", "inst-2")
+	restarted := openWithIdentity(t, dsn, owner, "inst-2")
 	restored, ok := restarted.OwnerStats()
 	if !ok || restored.EventsMatchedTotal != 100 {
 		t.Fatalf("restored = %+v ok=%v, want events 100", restored, ok)
@@ -147,8 +158,9 @@ func TestRestartSameWorkerKeepsTotalsOnce(t *testing.T) {
 func TestResetStatsFencesEveryWorker(t *testing.T) {
 	ctx := context.Background()
 	dsn := newTestDSN(t)
-	a := openWithIdentity(t, dsn, "worker-a", "inst-a")
-	b := openWithIdentity(t, dsn, "worker-b", "inst-b")
+	suffix := randHex(t)
+	a := openWithIdentity(t, dsn, "worker-a-"+suffix, "inst-a")
+	b := openWithIdentity(t, dsn, "worker-b-"+suffix, "inst-b")
 	admin := testOpenOrFail(t, dsn)
 
 	genA, err := a.RecordStatsSnapshot(ctx, -1, Stats{EventsMatchedTotal: 10}, nil)
