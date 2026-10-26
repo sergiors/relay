@@ -67,19 +67,28 @@ func (r *Runner) imageRemovedIdle(image string) {
 	r.driveImageRemoval(image)
 }
 
-// resolver returns the runner's resolved image cleaner, or nil when the executor
-// does not implement retirement (tests, unavailable-only runners). It is resolved
-// once and cached; resolution scanning the registry is cheap and safe.
+// resolver returns the runner's resolved image cleaner, or nil when no
+// currently published executor implements retirement (tests,
+// unavailable-only runners). A positive result is cached; a miss is NOT,
+// because the registry is live-swappable: an app whose executor has the
+// capability may be published after an early miss (for example, while the
+// registry is empty during startup or a removal), and caching that miss would
+// permanently disable image retirement for the worker. A cached cleaner is
+// retained after the last app is removed, so the removal's cleanup still has a
+// cleaner to use even though the registry entry is gone.
 func (r *Runner) resolver() ImageCleaner {
-	r.cleanerOnce.Do(func() {
-		for _, pf := range r.reg.snapshot() {
-			if cleaner, ok := pf.executor.(ImageCleaner); ok {
-				r.cleaner = cleaner
-				return
-			}
+	r.cleanerMu.Lock()
+	defer r.cleanerMu.Unlock()
+	if r.cleaner != nil {
+		return r.cleaner
+	}
+	for _, pf := range r.reg.snapshot() {
+		if cleaner, ok := pf.executor.(ImageCleaner); ok {
+			r.cleaner = cleaner
+			return cleaner
 		}
-	})
-	return r.cleaner
+	}
+	return nil
 }
 
 // invalidatorResolver returns the runner's resolved container invalidator, or

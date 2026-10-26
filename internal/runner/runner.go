@@ -95,19 +95,24 @@ type Runner struct {
 	// superseded app versions without interrupting an in-flight execution
 	// (see ImageInUse / RetireImage).
 	refs *imageRefCounter
-	// cleaner resolves to the optional image lifecycle capability of the
-	// executor, resolved once and reused. A nil cleaner (fake executors in tests)
-	// makes every retirement a no-op.
-	cleanerOnce sync.Once
-	cleaner     ImageCleaner
-	// invalidator resolves to the executor's ContainerInvalidator capability
-	// the same way cleaner above is resolved (one pass over the registry).
+	// cleanerMu guards cleaner, the optional image lifecycle capability
+	// discovered from a registry executor. The cache is POSITIVE-ONLY: a lookup
+	// that finds no ImageCleaner entry does not cache that absence, because the
+	// registry is live-swappable and a capable app can be published later. Once
+	// discovered, the cleaner is retained even after the last app is removed
+	// from the registry, so that removal's image cleanup can still run (the
+	// reconciler removes the registry entry before calling RemoveAppImages). A
+	// lookup miss can be retried after a registry change.
+	cleanerMu sync.Mutex
+	cleaner   ImageCleaner
+	// invalidator resolves once to the executor's ContainerInvalidator
+	// capability. Unlike cleaner, a missing capability is cached.
 	invalidatorOnce sync.Once
 	invalidator     ContainerInvalidator
 	// warmAdmitter resolves to the executor's warm-budget admitter capability
-	// (runtime.WarmAdmitter) the same way cleaner above is resolved (one pass
-	// over the registry); a nil admitter means warm-budget admission is
-	// unconditional (fake/in-process executors, an unbounded runtime).
+	// (runtime.WarmAdmitter) once. Unlike cleaner, a missing capability is
+	// cached; a nil admitter means warm-budget admission is unconditional
+	// (fake/in-process executors, an unbounded runtime).
 	warmAdmitterOnce sync.Once
 	warmAdmitter     runtime.WarmAdmitter
 	// hostname is this worker's container-ownership identity, stamped as the
