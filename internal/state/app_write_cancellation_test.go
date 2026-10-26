@@ -26,9 +26,6 @@ const advisoryLockWaitersQuery = `
 // notify the status observer, and its transaction/connection must be released
 // once it returns.
 func TestStatusTransitionCanceledWhileWaitingForAppLock(t *testing.T) {
-	if !testDatabaseAvailable(t) {
-		t.Fatal("cancellation regression requires a reachable real PostgreSQL database")
-	}
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	const name = "canceled-status"
