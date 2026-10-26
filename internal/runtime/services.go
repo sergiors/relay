@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"maps"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -211,10 +212,7 @@ func sanitizeContainerNamePart(s string) string {
 func serviceContainerName(appName, serviceName string, replica int) string {
 	suffix := "-" + serviceNameHash(appName, serviceName) + "-" + strconv.Itoa(replica)
 	base := "relay-svc-" + appName + "-" + sanitizeContainerNamePart(serviceName)
-	maxBase := serviceContainerNameLenCap - len(suffix)
-	if maxBase < 0 {
-		maxBase = 0
-	}
+	maxBase := max(serviceContainerNameLenCap - len(suffix), 0)
 	if len(base) > maxBase {
 		base = strings.TrimRight(base[:maxBase], "-")
 	}
@@ -392,9 +390,7 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 	if sourceID != "" {
 		labels[labelSource] = sourceID
 	}
-	for k, v := range spec.Labels {
-		labels[k] = v
-	}
+	maps.Copy(labels, spec.Labels)
 	labels[labelType] = ContainerTypeService
 	labels[labelApp] = spec.App
 	labels[labelService] = spec.Name
@@ -712,9 +708,7 @@ func (m *Manager) serviceContainerList(ctx context.Context, admit dockerOpAdmitt
 		var labelsCopy map[string]string
 		if len(c.Labels) > 0 {
 			labelsCopy = make(map[string]string, len(c.Labels))
-			for k, v := range c.Labels {
-				labelsCopy[k] = v
-			}
+			maps.Copy(labelsCopy, c.Labels)
 		}
 		out = append(out, ServiceContainer{
 			ID:        c.ID,
@@ -916,7 +910,7 @@ func validateServiceEntrypoint(entrypoint string) error {
 	if strings.HasPrefix(entrypoint, "/") {
 		return fmt.Errorf("service entrypoint %q: must be a relative path inside the application directory", entrypoint)
 	}
-	for _, el := range strings.Split(entrypoint, "/") {
+	for el := range strings.SplitSeq(entrypoint, "/") {
 		if el == "" {
 			return fmt.Errorf("service entrypoint %q: must not contain empty path elements", entrypoint)
 		}

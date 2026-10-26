@@ -337,8 +337,8 @@ func (g *generation) matches(image, config string) bool {
 // match every content identity of a tag without threading the reference
 // separately through the pool.
 func identityRef(identity string) string {
-	if i := strings.IndexByte(identity, 0); i >= 0 {
-		return identity[:i]
+	if before, _, ok := strings.Cut(identity, "\x00"); ok {
+		return before
 	}
 	return identity
 }

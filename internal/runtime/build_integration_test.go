@@ -263,13 +263,15 @@ events:
 // malformed package.json so the node engine's `pnpm install --prod
 // --frozen-lockfile` step fails deterministically.
 //
-// The kept intermediate is identified from the build output Prepare itself
-// carries in err.Error(): the classic builder's `Running in <id>` lines name
-// the exact containers a failed build leaves behind. Inspecting ONLY those
-// parsed IDs (never a daemon-wide container enumeration) keeps this test
-// race-free on a shared daemon: another package's transient container can
-// vanish between a ContainerList and its inspection, but a container ID that
-// was named as an intermediate of OUR failed build is ours alone. A missing or
+// The RETAINED intermediate is identified from the build output Prepare itself
+// carries in err.Error(): the classic builder's `Running in <id>` lines START a
+// container per step, and it removes each successful step's container again
+// (`Removed intermediate container <id>`); the failing step's container is the
+// one left behind. Inspecting ONLY those started-but-not-removed IDs (never a
+// daemon-wide container enumeration) keeps this test race-free on a shared
+// daemon: another package's transient container can vanish between a
+// ContainerList and its inspection, but a container ID that was named as a
+// RETAINED intermediate of OUR failed build is ours alone. A missing or
 // inspect-erroring intermediate is a FAILURE (it is the expected debugging
 // intermediate — its NotFound must not be suppressed generically).
 func TestIntegrationFailedBuildKeepsIntermediatesAndPropagatesError(t *testing.T) {
@@ -299,16 +301,19 @@ events:
 	appName := testutil.UniqueName(t, "failed-build-int")
 	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "node24"}}
 
-	// The intermediate IDs the failed build names (parsed after the failure,
-	// BEFORE the closure below runs — t.Cleanup is deferred to test end).
+	// The RETAINED intermediate IDs the failed build leaves behind (started by
+	// `Running in` and not later retired by `Removed intermediate container`),
+	// parsed after the failure, BEFORE the closure below runs — t.Cleanup is
+	// deferred to test end.
 	var intermediates []string
 
 	// Scoped cleanup registered BEFORE the build, ownership-checked and
 	// error-reporting:
-	//   - intermediates: safe exact IDs parsed from THIS test's own build
-	//     output (the daemon named them); removeContainer already treats
-	//     NotFound as benign, and every other removal failure is REPORTED
-	//     with t.Errorf instead of silently discarded.
+	//   - retained intermediates: safe exact IDs parsed from THIS test's own
+	//     build output (started by `Running in`, not already removed); the
+	//     daemon named them and left them behind. removeContainer already
+	//     treats NotFound as benign, and every other removal failure is
+	//     REPORTED with t.Errorf instead of silently discarded.
 	//   - app images: only tags on images whose EXISTING Relay labels prove
 	//     relay.type == ImageTypeApp AND relay.app == this run's unique
 	//     appName — never a repo prefix, never unlabeled or foreign images.
@@ -360,10 +365,12 @@ events:
 		t.Errorf("expected the build-stream error to mention pnpm/JSON/package.json, got: %v", err)
 	}
 
-	// The failed build output names the intermediates of THIS build:
-	// `Running in <id>` lines from the classic builder. Parse them out; the
-	// daemon-wide before/after container enumeration this used to do is gone
-	// (it raced other processes' transient containers).
+	// The failed build output names the intermediates of THIS build that the
+	// daemon STARTED (`Running in <id>`) and did not subsequently remove
+	// (`Removed intermediate container <id>`) — the retained leftovers of the
+	// failing step. Parse them out; the daemon-wide before/after container
+	// enumeration this used to do is gone (it raced other processes' transient
+	// containers).
 	intermediates = failedBuildIntermediateIDs(errText)
 	if len(intermediates) == 0 {
 		t.Fatalf("the failed build output must name its classic-builder intermediate containers "+
@@ -371,8 +378,9 @@ events:
 	}
 	t.Logf("failed build named %d intermediate container(s): %v", len(intermediates), intermediates)
 
-	// Each parsed intermediate is the expected debugging leftover and MUST
-	// remain inspectable; a missing (NotFound) or erroring one FAILS the test.
+	// Each parsed retained intermediate is the expected debugging leftover and
+	// MUST remain inspectable; a missing (NotFound) or erroring one FAILS the
+	// test.
 	for _, id := range intermediates {
 		insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
 		if err != nil {

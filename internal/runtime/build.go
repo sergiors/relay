@@ -244,7 +244,7 @@ func validateArtifactMember(member string) error {
 	if path.Clean(member) != member {
 		return fmt.Errorf("artifact member %q must be a clean relative path", member)
 	}
-	for _, seg := range strings.Split(member, "/") {
+	for seg := range strings.SplitSeq(member, "/") {
 		if seg == "" || seg == "." || seg == ".." {
 			return fmt.Errorf("artifact member %q must not contain an empty, \".\", or \"..\" segment", member)
 		}
