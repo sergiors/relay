@@ -728,7 +728,7 @@ func (m *Manager) prepare(
 	}
 	buildElapsed, buildErr := m.runImageBuild(ctx, fn.Name, image, func(buildCtx context.Context) error {
 		return buildImage(
-			buildCtx, m.cli, fn.Name, fn, planResult, image, appLabels,
+			buildCtx, m.cli, fn.Name, planResult, image, appLabels,
 			sourceSnapshot, m.metrics, !mountSource,
 		)
 	})

@@ -58,6 +58,10 @@ func TestBuildImageOptionsCarriesManagedLabels(t *testing.T) {
 	}
 }
 
+// TestDockerfileTemplateEmbedsAppSource pins a Node-style baked-source plan's
+// rendered Dockerfile byte-for-byte: FROM → WORKDIR → the whole-tree source
+// COPY → one COPY per generated plan file → the install RUN → the ENTRYPOINT as
+// a JSON array. No USER line: an unhardened Node plan emits no user switch.
 func TestDockerfileTemplateEmbedsAppSource(t *testing.T) {
 	p := plan.BuildPlan{
 		BaseImage: "node:24-alpine",
@@ -71,40 +75,34 @@ func TestDockerfileTemplateEmbedsAppSource(t *testing.T) {
 
 	df := mustRenderDockerfile(t, p)
 
-	if !strings.Contains(df, "FROM node:24-alpine") {
-		t.Errorf("expected FROM line, got:\n%s", df)
-	}
-	if !strings.Contains(df, "WORKDIR /app") {
-		t.Errorf("expected WORKDIR line, got:\n%s", df)
-	}
-	if !strings.Contains(df, "COPY . /app") {
-		t.Errorf("expected COPY sources line, got:\n%s", df)
-	}
-	if !strings.Contains(df, "COPY relay/bootstrap.mjs /relay/") {
-		t.Errorf("expected COPY bootstrap line, got:\n%s", df)
-	}
-	if !strings.Contains(df, "RUN pnpm install --prod --frozen-lockfile") {
-		t.Errorf("expected RUN line, got:\n%s", df)
-	}
-	if !strings.Contains(df, `ENTRYPOINT ["node", "/relay/bootstrap.mjs"]`) {
-		t.Errorf("expected quoted ENTRYPOINT JSON array, got:\n%s", df)
+	want := `FROM node:24-alpine
+WORKDIR /app
+COPY . /app
+COPY relay/bootstrap.mjs /relay/
+RUN pnpm install --prod --frozen-lockfile
+ENTRYPOINT ["node", "/relay/bootstrap.mjs"]
+`
+	if df != want {
+		t.Errorf("rendered dockerfile mismatch.\n--- got ---\n%s\n--- want ---\n%s", df, want)
 	}
 }
 
+// TestRenderDockerfileNoInstallNoEntrypoint pins the minimal baked-source image
+// byte-for-byte: a plan with no Install, UserSetup, User, or Entrypoint renders
+// exactly FROM, WORKDIR, and the source COPY. The full match is what proves the
+// absence: no optional instruction may appear in place of an absent one.
 func TestRenderDockerfileNoInstallNoEntrypoint(t *testing.T) {
 	p := plan.BuildPlan{
 		BaseImage: "python:3.14-slim",
 		WorkDir:   "/app",
 	}
 	df := mustRenderDockerfile(t, p)
-	if strings.Contains(df, "RUN ") {
-		t.Errorf("did not expect RUN instruction, got:\n%s", df)
-	}
-	if strings.Contains(df, "ENTRYPOINT") {
-		t.Errorf("did not expect ENTRYPOINT instruction, got:\n%s", df)
-	}
-	if !strings.Contains(df, "COPY . /app") {
-		t.Errorf("expected COPY sources line, got:\n%s", df)
+	want := `FROM python:3.14-slim
+WORKDIR /app
+COPY . /app
+`
+	if df != want {
+		t.Errorf("rendered dockerfile mismatch.\n--- got ---\n%s\n--- want ---\n%s", df, want)
 	}
 }
 
@@ -220,6 +218,54 @@ func TestRenderDockerfileNoUser(t *testing.T) {
 	}
 }
 
+// TestRenderDockerfileSourceMountedOmitsSourceCopy pins the HOT_RELOAD rendering
+// byte-for-byte: with copySource=false the renderer emits everything the
+// historical baked-source image did EXCEPT the whole-tree source COPY — the
+// generated-plan-file COPYs, the runtime tool, the install, the user setup, the
+// USER switch, and the ENTRYPOINT are unchanged, in the same order. The
+// copySource=true form must stay byte-identical to renderDockerfile, so the
+// flag is the ONLY difference between a baked and a mounted Dockerfile.
+func TestRenderDockerfileSourceMountedOmitsSourceCopy(t *testing.T) {
+	p := plan.BuildPlan{
+		BaseImage: "python:3.14-slim",
+		WorkDir:   "/app",
+		Files: []plan.File{
+			{Path: "/relay/bootstrap.py", Content: []byte("x"), Mode: fs.FileMode(0o644)},
+		},
+		RuntimeTools: []plan.RuntimeTool{{
+			From: "ghcr.io/astral-sh/uv:0.12.17", Source: "/uv", Destination: "/usr/local/bin/uv",
+		}},
+		Install:    []string{"uv pip install --system --no-cache -r requirements.txt"},
+		UserSetup:  pythonUserSetup,
+		User:       "10001:10001",
+		Entrypoint: []string{"python", "/relay/bootstrap.py"},
+	}
+
+	want := `FROM python:3.14-slim
+WORKDIR /app
+COPY relay/bootstrap.py /relay/
+COPY --from=ghcr.io/astral-sh/uv:0.12.17 /uv /usr/local/bin/uv
+RUN uv pip install --system --no-cache -r requirements.txt
+RUN ` + pythonUserSetup + `
+USER 10001:10001
+ENTRYPOINT ["python", "/relay/bootstrap.py"]
+`
+	if got := mustRenderDockerfileWithSource(t, p, false); got != want {
+		t.Errorf("source-mounted dockerfile mismatch.\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+
+	// The baked form is the mounted form plus exactly the one source COPY line;
+	// and copySource=true stays byte-identical to the historical renderDockerfile
+	// entry point.
+	wantBaked := strings.Replace(want, "WORKDIR /app\n", "WORKDIR /app\nCOPY . /app\n", 1)
+	if got := mustRenderDockerfileWithSource(t, p, true); got != wantBaked {
+		t.Errorf("copySource=true dockerfile mismatch.\n--- got ---\n%s\n--- want ---\n%s", got, wantBaked)
+	}
+	if got, baked := mustRenderDockerfile(t, p), mustRenderDockerfileWithSource(t, p, true); got != baked {
+		t.Errorf("renderDockerfile must stay byte-identical to copySource=true.\n--- got ---\n%s\n--- want ---\n%s", got, baked)
+	}
+}
+
 // TestRenderDockerfileDependencyBase verifies the synthetic plan the builder
 // renders for a dependency image: FROM the runtime base -> WORKDIR the install
 // dir -> COPY the staged manifests -> RUN install. It must carry NO user setup,
@@ -319,6 +365,17 @@ func mustRenderDockerfile(t *testing.T, p plan.BuildPlan) string {
 	return df
 }
 
+// mustRenderDockerfileWithSource renders a plan with an explicit copySource flag
+// and fails the test on a render error.
+func mustRenderDockerfileWithSource(t *testing.T, p plan.BuildPlan, copySource bool) string {
+	t.Helper()
+	df, err := renderDockerfileWithSource(p, copySource)
+	if err != nil {
+		t.Fatalf("renderDockerfileWithSource: %v", err)
+	}
+	return df
+}
+
 // artifactPnpmTool is a two-architecture artifact tool fixture for the renderer
 // tests. The member is nested ("bin/pnpm") so the extraction path is exercised.
 func artifactPnpmTool() plan.RuntimeTool {
@@ -346,31 +403,30 @@ func TestRenderDockerfileArtifactTool(t *testing.T) {
 	}
 	df := mustRenderDockerfile(t, p)
 
-	for _, want := range []string{
-		"wget -q -O /tmp/relay-tool-0.tar.gz https://example.test/pnpm-x64.tgz",
-		strings.Repeat("a", 64),
-		"sha256sum -c -",
-		"tar -xzf /tmp/relay-tool-0.tar.gz -C /tmp/relay-tool-0.unpack bin/pnpm",
-		"mv /tmp/relay-tool-0.unpack/bin/pnpm /usr/local/bin/pnpm",
-		"chmod 0755 /usr/local/bin/pnpm",
-	} {
-		if !strings.Contains(df, want) {
-			t.Errorf("artifact Dockerfile missing %q:\n%s", want, df)
-		}
-	}
-	// The whole acquisition (download, verify, extract, install, cleanup) is ONE
-	// fail-closed RUN, so the downloaded archive never becomes a retained layer.
-	if strings.Count(df, "RUN ") != 2 { // the artifact RUN plus the install RUN
-		t.Errorf("artifact acquisition must be a single RUN:\n%s", df)
-	}
-	// Only the target architecture's artifact is referenced.
-	if strings.Contains(df, "pnpm-arm64.tgz") {
-		t.Errorf("amd64 render must not reference the arm64 artifact:\n%s", df)
-	}
-	fetchIdx := strings.Index(df, "wget -q -O /tmp/relay-tool-0.tar.gz")
-	installIdx := strings.Index(df, "RUN pnpm install")
-	if fetchIdx < 0 || installIdx < 0 || fetchIdx > installIdx {
-		t.Errorf("artifact acquisition must precede the install RUN (fetch=%d install=%d):\n%s", fetchIdx, installIdx, df)
+	// The full expected output, byte-for-byte: one fail-closed RUN (download the
+	// amd64 archive with wget falling back to curl, verify the SHA-256, extract
+	// exactly the validated member, install it, and remove every scratch path
+	// before the layer commits) BEFORE the install RUN, so the whole acquisition
+	// is a single RUN (the archive never becomes a retained layer) and only the
+	// target architecture's artifact is referenced. The digest argument is
+	// quoted as one shell word (it contains the two sha256sum separator spaces).
+	digest := strings.Repeat("a", 64)
+	want := "FROM node:24-alpine\n" +
+		"WORKDIR /app\n" +
+		"COPY . /app\n" +
+		"RUN ( wget -q -O /tmp/relay-tool-0.tar.gz https://example.test/pnpm-x64.tgz" +
+		" || curl -fsSL -o /tmp/relay-tool-0.tar.gz https://example.test/pnpm-x64.tgz )" +
+		" && echo '" + digest + "  /tmp/relay-tool-0.tar.gz' | sha256sum -c -" +
+		" && rm -rf /tmp/relay-tool-0.unpack" +
+		" && mkdir -p /tmp/relay-tool-0.unpack" +
+		" && tar -xzf /tmp/relay-tool-0.tar.gz -C /tmp/relay-tool-0.unpack bin/pnpm" +
+		" && mkdir -p /usr/local/bin" +
+		" && mv /tmp/relay-tool-0.unpack/bin/pnpm /usr/local/bin/pnpm" +
+		" && chmod 0755 /usr/local/bin/pnpm" +
+		" && rm -rf /tmp/relay-tool-0.unpack /tmp/relay-tool-0.tar.gz\n" +
+		"RUN pnpm install --prod\n"
+	if df != want {
+		t.Errorf("rendered dockerfile mismatch.\n--- got ---\n%s\n--- want ---\n%s", df, want)
 	}
 }
 
