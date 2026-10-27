@@ -31,23 +31,14 @@ func startTestSocketServer(t *testing.T, path string, pools map[string]runtime.P
 	t.Cleanup(func() { _ = s.Close() })
 }
 
-// withProviderDisabled clears the in-process provider for the duration of the
-// test, so inspect falls through to the worker query socket. It is the one
-// remaining non-path test seam.
-func withProviderDisabled(t *testing.T) {
-	t.Helper()
-	orig := poolSnapshotProvider
-	SetPoolSnapshotProvider(nil)
-	t.Cleanup(func() { SetPoolSnapshotProvider(orig) })
-}
-
-// TestAppInspectRuntimePoolSection verifies that when a live pool provider
-// is wired, inspect renders the compact Runtime pool section with the live
-// gauges (capacity and container counts) from the provider, while the cumulative
-// acquire/discard counters STILL come from the persisted stats row — the
-// provider's own counter fields are ignored. The provider counters are
-// deliberately set to different values than the persisted row so the test
-// fails if the renderer ever prefers the live counters.
+// TestAppInspectRuntimePoolSection verifies that when a live pool provider is
+// wired into the command's Dependencies, inspect renders the compact Runtime
+// pool section with the live gauges (capacity and container counts) from that
+// provider, while the cumulative acquire/discard counters STILL come from the
+// persisted stats row — the provider's own counter fields are ignored. A live
+// socket holding deliberately different gauges proves both the provider's
+// precedence over the socket AND that the counters come only from the persisted
+// row; it fails if the renderer ever prefers the socket or the live counters.
 func TestAppInspectRuntimePoolSection(t *testing.T) {
 	st, deps := seedTestState(t)
 	st.RecordAppStats(state.AppStats{
@@ -61,30 +52,36 @@ func TestAppInspectRuntimePoolSection(t *testing.T) {
 		t.Fatal("expected function")
 	}
 
-	orig := poolSnapshotProvider
-	SetPoolSnapshotProvider(func(name string) (runtime.PoolSnapshot, bool) {
+	// The socket holds different gauges (and serves a different pool state) so
+	// any renderer regression that consults the socket before — or instead of —
+	// the injected provider renders 40/20 instead of 4/2.
+	startTestSocketServer(t, deps.SocketPath, map[string]runtime.PoolSnapshot{
+		"user-events-python": {App: "user-events-python", Capacity: 40, Containers: 20, Busy: 10, Idle: 10},
+	})
+
+	// Deliberately different gauges and counters than the socket and the
+	// persisted stats: the CLI must take the gauges from here and the counters
+	// from the persisted row.
+	deps.PoolSnapshotProvider = func(name string) (runtime.PoolSnapshot, bool) {
 		if name != "user-events-python" {
 			return runtime.PoolSnapshot{}, false
 		}
 		return runtime.PoolSnapshot{
-			App:        name,
-			Capacity:   4,
-			Containers: 2,
-			Busy:       1,
-			Idle:       1,
-			Starting:   0,
-			// Deliberately different from the persisted stats: the CLI must
-			// ignore these and render the persisted row.
+			App:          name,
+			Capacity:     4,
+			Containers:   2,
+			Busy:         1,
+			Idle:         1,
+			Starting:     0,
 			WarmAcquires: 700,
 			ColdStarts:   300,
 			Discarded:    200,
 		}, true
-	})
-	defer SetPoolSnapshotProvider(orig)
+	}
 
 	var w bytes.Buffer
 	fs := printInspect(&w, st, detail)
-	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
+	appendRuntimePool(&w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
 	out := normWS(w.String())
 	for _, want := range []string{
 		"Runtime pool:",
@@ -137,12 +134,12 @@ func TestAppInspectRuntimePoolPersistedCountersWithoutProvider(t *testing.T) {
 	if !ok {
 		t.Fatal("expected function")
 	}
-
-	withProviderDisabled(t)
+	// The provider stays unwired (nil) and no worker socket is started, so
+	// neither live source resolves a pool.
 
 	var w bytes.Buffer
 	fs := printInspect(&w, st, detail)
-	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
+	appendRuntimePool(&w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
 	out := normWS(w.String())
 	if !strings.Contains(out, "Runtime pool:") {
 		t.Fatalf("standalone inspect must render the Runtime pool section from persisted counters:\n%s", out)
@@ -184,13 +181,12 @@ func TestAppInspectRuntimePoolProviderUnknownApp(t *testing.T) {
 		t.Fatal("expected function")
 	}
 
-	orig := poolSnapshotProvider
-	SetPoolSnapshotProvider(func(string) (runtime.PoolSnapshot, bool) { return runtime.PoolSnapshot{}, false })
-	defer SetPoolSnapshotProvider(orig)
+	// The provider is wired but reports no live pool for the app.
+	deps.PoolSnapshotProvider = noPoolProvider
 
 	var w bytes.Buffer
 	fs := printInspect(&w, st, detail)
-	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
+	appendRuntimePool(&w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
 	out := normWS(w.String())
 	if !strings.Contains(out, "Runtime pool:") || !strings.Contains(out, "Warm acquires: 4") {
 		t.Fatalf("not-found provider must still render persisted counters:\n%s", out)
@@ -203,11 +199,11 @@ func TestAppInspectRuntimePoolProviderUnknownApp(t *testing.T) {
 // TestAppInspectCommandRendersPersistedPoolCounters is the end-to-end
 // command-path check: the standalone `relay app inspect NAME` command
 // renders the Runtime pool section from the persisted stats row with a zero
-// counters fallback when no pool activity has been recorded and no worker socket
-// is reachable.
+// counters fallback when the provider is unwired and no worker socket is
+// reachable.
 func TestAppInspectCommandRendersPersistedPoolCounters(t *testing.T) {
+	// The seed leaves PoolSnapshotProvider nil and SocketPath unbound.
 	_, deps := seedTestState(t)
-	withProviderDisabled(t)
 	out, _, err := runCLIWithDeps(t, deps, "", "app", "inspect", "user-events-python")
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
@@ -222,9 +218,9 @@ func TestAppInspectCommandRendersPersistedPoolCounters(t *testing.T) {
 }
 
 // TestAppInspectSocketLiveGauges verifies the standalone CLI path: with the
-// in-process provider absent and a worker socket answering, inspect renders the
-// live gauges from the socket while the cumulative counters still come from the
-// persisted stats row.
+// in-process provider unwired (nil) and a worker socket answering, inspect
+// renders the live gauges from the socket while the cumulative counters still
+// come from the persisted stats row.
 func TestAppInspectSocketLiveGauges(t *testing.T) {
 	st, deps := seedTestState(t)
 	st.RecordAppStats(state.AppStats{
@@ -237,14 +233,15 @@ func TestAppInspectSocketLiveGauges(t *testing.T) {
 	if !ok {
 		t.Fatal("expected function")
 	}
-	withProviderDisabled(t)
+	// The provider stays unwired (nil): the standalone CLI resolves the gauges
+	// from the socket.
 	startTestSocketServer(t, deps.SocketPath, map[string]runtime.PoolSnapshot{
 		"user-events-python": {App: "user-events-python", Capacity: 4, Containers: 2, Busy: 1, Idle: 1},
 	})
 
 	var w bytes.Buffer
 	fs := printInspect(&w, st, detail)
-	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
+	appendRuntimePool(&w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
 	out := normWS(w.String())
 	for _, row := range []string{
 		"Capacity: 4",
@@ -277,7 +274,7 @@ func TestAppInspectSocketKnownZeros(t *testing.T) {
 	if !ok {
 		t.Fatal("expected function")
 	}
-	withProviderDisabled(t)
+	// The provider stays unwired (nil): the socket is the only live source.
 	// An all-zero pool is a valid live reading: the app exists in the
 	// worker's pool map with zero gauges.
 	startTestSocketServer(t, deps.SocketPath, map[string]runtime.PoolSnapshot{
@@ -286,7 +283,7 @@ func TestAppInspectSocketKnownZeros(t *testing.T) {
 
 	var w bytes.Buffer
 	fs := printInspect(&w, st, detail)
-	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
+	appendRuntimePool(&w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
 	out := normWS(w.String())
 	for _, row := range []string{
 		"Capacity: 0",
@@ -316,16 +313,15 @@ func TestAppInspectSocketUnknownApp(t *testing.T) {
 	if !ok {
 		t.Fatal("expected function")
 	}
-	withProviderDisabled(t)
-	// The socket is live but serves a DIFFERENT app, so the query answers
-	// unknown_app.
+	// The provider stays unwired (nil), and the socket is live but serves a
+	// DIFFERENT app, so the query answers unknown_app.
 	startTestSocketServer(t, deps.SocketPath, map[string]runtime.PoolSnapshot{
 		"other": {App: "other", Capacity: 1},
 	})
 
 	var w bytes.Buffer
 	fs := printInspect(&w, st, detail)
-	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
+	appendRuntimePool(&w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
 	out := normWS(w.String())
 	if !strings.Contains(out, "Warm acquires: 5") || !strings.Contains(out, "Capacity: unknown") {
 		t.Fatalf("unknown-function answer must render persisted counters and unknown gauges:\n%s", out)
@@ -345,14 +341,86 @@ func TestAppInspectSocketUnavailable(t *testing.T) {
 	if !ok {
 		t.Fatal("expected function")
 	}
-	withProviderDisabled(t)
-	// No socket server is started at deps.SocketPath: the dial fails.
+	// The provider stays unwired (nil) and no socket server is started at
+	// deps.SocketPath: the dial fails.
 
 	var w bytes.Buffer
 	fs := printInspect(&w, st, detail)
-	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
+	appendRuntimePool(&w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
 	out := normWS(w.String())
 	if !strings.Contains(out, "Warm acquires: 6") || !strings.Contains(out, "Capacity: unknown") {
 		t.Fatalf("unavailable socket must render persisted counters and unknown gauges:\n%s", out)
+	}
+}
+
+// TestAppInspectCommandTreesCaptureIndependentProviders proves two constructed
+// command trees use their own pool providers even if the original Dependencies
+// values are changed after New. Persisted counters still come from state.
+func TestAppInspectCommandTreesCaptureIndependentProviders(t *testing.T) {
+	st, deps := seedTestState(t)
+	st.RecordAppStats(state.AppStats{
+		App:               "user-events-python",
+		WarmAcquiresTotal: 7,
+		ColdStartsTotal:   3,
+		DiscardedTotal:    2,
+	})
+	var callsA, callsB int
+	depsA, depsB := deps, deps
+	depsA.PoolSnapshotProvider = func(name string) (runtime.PoolSnapshot, bool) {
+		callsA++
+		if name != "user-events-python" {
+			return runtime.PoolSnapshot{}, false
+		}
+		return runtime.PoolSnapshot{App: name, Capacity: 4, Containers: 2, Busy: 1, Idle: 1}, true
+	}
+	depsB.PoolSnapshotProvider = func(name string) (runtime.PoolSnapshot, bool) {
+		callsB++
+		if name != "user-events-python" {
+			return runtime.PoolSnapshot{}, false
+		}
+		return runtime.PoolSnapshot{App: name, Capacity: 9, Containers: 5, Busy: 2, Idle: 3}, true
+	}
+	var outA, outB, errA, errB bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cmdA := New(logger, &outA, depsA)
+	cmdA.Reader = strings.NewReader("")
+	cmdA.ErrWriter = &errA
+	cmdB := New(logger, &outB, depsB)
+	cmdB.Reader = strings.NewReader("")
+	cmdB.ErrWriter = &errB
+
+	// Mutating the caller's values after New must not retarget either command.
+	depsA.PoolSnapshotProvider = noPoolProvider
+	depsB.PoolSnapshotProvider = depsA.PoolSnapshotProvider
+
+	args := []string{"relay", "app", "inspect", "user-events-python"}
+	if err := cmdA.Run(t.Context(), args); err != nil {
+		t.Fatalf("tree A inspect: %v", err)
+	}
+	if err := cmdB.Run(t.Context(), args); err != nil {
+		t.Fatalf("tree B inspect: %v", err)
+	}
+	if errA.Len() != 0 || errB.Len() != 0 {
+		t.Fatalf("CLI command errors: tree A %q; tree B %q", errA.String(), errB.String())
+	}
+
+	for name, output := range map[string]string{"tree A": normWS(outA.String()), "tree B": normWS(outB.String())} {
+		for _, row := range []string{"Warm acquires: 7", "Cold starts: 3", "Discarded: 2"} {
+			if !strings.Contains(output, row) {
+				t.Errorf("%s must use persisted counters, missing %q:\n%s", name, row, output)
+			}
+		}
+		if strings.Contains(output, "unknown") {
+			t.Errorf("%s should have its own live provider:\n%s", name, output)
+		}
+	}
+	if !strings.Contains(outA.String(), "Capacity: 4") || strings.Contains(outA.String(), "Capacity: 9") {
+		t.Errorf("tree A must render provider A only:\n%s", outA.String())
+	}
+	if !strings.Contains(outB.String(), "Capacity: 9") || strings.Contains(outB.String(), "Capacity: 4") {
+		t.Errorf("tree B must render provider B only:\n%s", outB.String())
+	}
+	if callsA != 1 || callsB != 1 {
+		t.Errorf("provider calls: A=%d B=%d; want one call per tree", callsA, callsB)
 	}
 }

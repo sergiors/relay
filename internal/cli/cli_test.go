@@ -35,10 +35,11 @@ var errUnexpectedStateAccess = errors.New(
 // testDeps is deliberately database-free: OpenState returns
 // errUnexpectedStateAccess without opening PostgreSQL, so tests that never
 // touch state (help, start, health, DLQ, git, secrets) need no database. Tests
-// that genuinely read or write state opt in with stateTestDeps. The only
-// remaining package-level seam is the git sync transport seam (gitCloneURL),
-// which is a package var; tests that mutate it restore the previous value via
-// t.Cleanup.
+// that genuinely read or write state opt in with stateTestDeps. The optional
+// command-local seams — the inspect pool provider (PoolSnapshotProvider) and
+// the git sync transport override (GitCloneURL) — stay zero-valued, so each
+// test that wants them sets the field on its own dependencies instead of
+// mutating any package state.
 func testDeps(t *testing.T) Dependencies {
 	t.Helper()
 	dir := t.TempDir()

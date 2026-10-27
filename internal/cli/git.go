@@ -13,13 +13,6 @@ import (
 	git "relay/internal/git"
 )
 
-// gitCloneURL is the transport seam for `git sync`, mirroring the git package's
-// SyncOptions.CloneURL. It is empty in production (sync uses the persisted,
-// validated SSH repository); tests point it at a local filesystem repository so
-// a real `relay git sync` runs end to end with no SSH and no network. It is
-// never persisted: Config.Repository always remains the validated SSH URL.
-var gitCloneURL string
-
 // gitCommand builds the `relay git ...` manual sync subcommand family. It never
 // runs automatically and never touches Redis, Docker, or the worker; it only
 // writes the local git config/key/checkout and materializes /apps (on
@@ -183,17 +176,19 @@ func gitSet(ctx context.Context, w io.Writer, deps Dependencies, repository, ref
 
 // gitSync runs the manual sync; the process context propagates Ctrl-C. The sync
 // reads the persisted config itself (via opts.ConfigPath), so the CLI passes its
-// injected filesystem locations straight through. SyncOptions.Log is left nil:
-// this short-lived command's step summary on w is its complete user-facing
-// record, and background operational diagnostics belong to the worker/webhook
-// path.
+// injected filesystem locations straight through. opts.CloneURL is the injected
+// transport override (deps.GitCloneURL): empty in production, and never
+// persisted, so the configured repository remains the validated SSH URL.
+// SyncOptions.Log is left nil: this short-lived command's step summary on w is
+// its complete user-facing record, and background operational diagnostics belong
+// to the worker/webhook path.
 func gitSync(ctx context.Context, w io.Writer, deps Dependencies) error {
 	o := git.NewSyncOptions()
 	o.ConfigPath = deps.GitConfigPath
 	o.CheckoutDir = deps.GitCheckoutDir
 	o.AppsDir = deps.GitAppsDir
 	o.SSHDir = deps.GitSSHDir
-	o.CloneURL = gitCloneURL
+	o.CloneURL = deps.GitCloneURL
 	o.Out = w
 	return git.Sync(ctx, o)
 }

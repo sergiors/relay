@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -19,15 +20,13 @@ type cliGitPaths struct {
 
 // redirectGitDirs builds test dependencies whose CLI git paths live under
 // fresh temp dirs so tests never touch /var/lib/relay or /apps, and returns
-// the dependencies together with the injected paths for assertions. The only
-// remaining package-level seam, the git sync transport seam (gitCloneURL), is
-// cleared here and restored on cleanup: a test that wants a local filesystem
-// source opts in explicitly.
+// the dependencies together with the injected paths for assertions. The sync
+// transport override (deps.GitCloneURL) stays zero-valued here: sync uses the
+// persisted, validated SSH repository, and a test that wants a local
+// filesystem source opts in explicitly by setting the field on its own
+// dependencies.
 func redirectGitDirs(t *testing.T) (Dependencies, cliGitPaths) {
 	t.Helper()
-	oldClone := gitCloneURL
-	gitCloneURL = ""
-	t.Cleanup(func() { gitCloneURL = oldClone })
 	p := cliGitPaths{
 		configPath:  filepath.Join(t.TempDir(), "git", "source.json"),
 		checkoutDir: filepath.Join(t.TempDir(), "git", "checkout"),
@@ -574,10 +573,11 @@ func TestGitCommandsDoNotUseLogger(t *testing.T) {
 }
 
 // seedLocalBareRepo builds a local work repo with one app and a bare remote
-// cloned from it via the shared testutil fixture, returning the bare path. It lets
-// a CLI git sync run end to end against a filesystem source (no SSH, no network)
-// through the CLI's gitCloneURL transport seam while the persisted repository
-// stays a valid SSH URL.
+// cloned from it via the shared testutil fixture, returning the bare path. It
+// lets a CLI git sync run end to end against a filesystem source (no SSH, no
+// network) through the CLI's injected deps.GitCloneURL transport override,
+// exactly as the git package drives local sources via SyncOptions.CloneURL,
+// while the persisted repository stays a valid SSH URL.
 func seedLocalBareRepo(t *testing.T) string {
 	t.Helper()
 	return testutil.NewBareRepo(t)
@@ -594,13 +594,14 @@ func TestGitSyncCLIStepsAreWriterOnlyAtDebug(t *testing.T) {
 	bare := seedLocalBareRepo(t)
 
 	// Persist a valid SSH source (the only thing Config.Repository may hold now)
-	// and route the actual transport through the CLI's documented local-test seam
-	// (gitCloneURL), exactly as the git package drives local sources via
-	// SyncOptions.CloneURL.
+	// and route the actual transport through the CLI's injected deps.GitCloneURL
+	// override, exactly as the git package drives local sources via
+	// SyncOptions.CloneURL. The override is per-dependencies command state and
+	// is never persisted.
 	if _, _, err := runGitCLI(t, deps, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
 		t.Fatalf("git set: %v", err)
 	}
-	gitCloneURL = bare
+	deps.GitCloneURL = bare
 
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -622,5 +623,113 @@ func TestGitSyncCLIStepsAreWriterOnlyAtDebug(t *testing.T) {
 	// The sync actually materialized the app.
 	if _, err := os.Stat(filepath.Join(p.appsDir, "fn", "template.yaml")); err != nil {
 		t.Fatalf("function not materialized: %v", err)
+	}
+}
+
+// TestSeparateTreesUseIndependentGitCloneOverrides drives two independently
+// constructed command trees, each pointed at its OWN local filesystem repo
+// through its own deps.GitCloneURL (go-git's real file transport, no host Git,
+// no SSH, no network), and pins that the override is command-local and never
+// persisted: tree A's sync materializes repo A's app from A's template into
+// A's apps dir only, tree B's does the same for B, neither tree's materialized
+// app is visible in the other's apps dir, and both persisted configs still
+// hold their validated SSH URLs after the sync.
+func TestSeparateTreesUseIndependentGitCloneOverrides(t *testing.T) {
+	depsA, pathsA := redirectGitDirs(t)
+	depsB, pathsB := redirectGitDirs(t)
+	// Distinguishable template content per repo: the materialized app name is
+	// the fixture's fn dir in both trees, so the RENDERED template content is
+	// what proves which repo each tree cloned from.
+	bareA := testutil.New(t, testutil.Options{Template: "runtime: node24\n"}).Bare
+	bareB := testutil.New(t, testutil.Options{Template: "runtime: python3.14\n"}).Bare
+
+	// Each tree persists its own validated SSH URL; the transport override is
+	// set on that tree's dependencies only.
+	if _, _, err := runGitCLI(t, depsA, "", "git", "set", "git@github.com:acme/repo-a.git"); err != nil {
+		t.Fatalf("tree A git set: %v", err)
+	}
+	if _, _, err := runGitCLI(t, depsB, "", "git", "set", "git@github.com:acme/repo-b.git"); err != nil {
+		t.Fatalf("tree B git set: %v", err)
+	}
+	depsA.GitCloneURL = bareA
+	depsB.GitCloneURL = bareB
+
+	var outA, outB, errA, errB bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	cmdA := New(logger, &outA, depsA)
+	cmdA.Reader = strings.NewReader("")
+	cmdA.ErrWriter = &errA
+	cmdB := New(logger, &outB, depsB)
+	cmdB.Reader = strings.NewReader("")
+	cmdB.ErrWriter = &errB
+
+	// Changing the source Dependencies after construction cannot retarget either
+	// command tree: each action captured its own value at New time.
+	depsA.GitCloneURL = bareB
+	depsB.GitCloneURL = bareA
+
+	// Tree A syncs from repo A: fn is materialized into A's apps dir from A's
+	// template.
+	if err := cmdA.Run(context.Background(), []string{"relay", "git", "sync"}); err != nil {
+		t.Fatalf("tree A git sync: %v", err)
+	}
+	// Tree B still has nothing: A's sync wrote only into A's apps dir.
+	if _, err := os.Stat(filepath.Join(pathsB.appsDir, "fn", "template.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("tree B apps dir saw tree A's materialization: %v", err)
+	}
+	tmplA, err := os.ReadFile(filepath.Join(pathsA.appsDir, "fn", "template.yaml"))
+	if err != nil {
+		t.Fatalf("read tree A materialized template: %v", err)
+	}
+
+	// Tree B syncs from repo B: fn is materialized into B's apps dir from B's
+	// template, and A's materialized app is untouched.
+	if err := cmdB.Run(context.Background(), []string{"relay", "git", "sync"}); err != nil {
+		t.Fatalf("tree B git sync: %v", err)
+	}
+	if errA.Len() != 0 || errB.Len() != 0 {
+		t.Fatalf("CLI command errors: tree A %q; tree B %q", errA.String(), errB.String())
+	}
+	tmplB, err := os.ReadFile(filepath.Join(pathsB.appsDir, "fn", "template.yaml"))
+	if err != nil {
+		t.Fatalf("read tree B materialized template: %v", err)
+	}
+	if !strings.Contains(string(tmplA), "runtime: node24") || strings.Contains(string(tmplA), "python3.14") {
+		t.Fatalf("tree A materialized from the wrong source: %s", tmplA)
+	}
+	if !strings.Contains(string(tmplB), "runtime: python3.14") || strings.Contains(string(tmplB), "node24") {
+		t.Fatalf("tree B did not sync from its own local repo: %s", tmplB)
+	}
+
+	// The overrides were never persisted: every config still holds exactly the
+	// SSH URL `git set` wrote, not the local bare path it cloned from.
+	cfgA, err := gitpkg.LoadConfig(pathsA.configPath)
+	if err != nil || cfgA.Repository != "git@github.com:acme/repo-a.git" {
+		t.Fatalf("tree A config after sync = %+v (%v), want the persisted SSH URL", cfgA, err)
+	}
+	cfgB, err := gitpkg.LoadConfig(pathsB.configPath)
+	if err != nil || cfgB.Repository != "git@github.com:acme/repo-b.git" {
+		t.Fatalf("tree B config after sync = %+v (%v), want the persisted SSH URL", cfgB, err)
+	}
+	// Neither bare path (nor any local filesystem trace) appears in the
+	// persisted configs: the transport override is command state only.
+	rawA, err := os.ReadFile(pathsA.configPath)
+	if err != nil {
+		t.Fatalf("read tree A config: %v", err)
+	}
+	rawB, err := os.ReadFile(pathsB.configPath)
+	if err != nil {
+		t.Fatalf("read tree B config: %v", err)
+	}
+	for _, entry := range []struct {
+		config string
+		bare   string
+	}{
+		{config: string(rawA), bare: bareA},
+		{config: string(rawB), bare: bareB},
+	} {
+		if strings.Contains(entry.config, entry.bare) {
+			t.Fatalf("persisted config leaked the local transport override %q:\n%s", entry.bare, entry.config)
+		}
 	}
 }

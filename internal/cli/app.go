@@ -15,28 +15,6 @@ import (
 	"relay/internal/worker"
 )
 
-// poolSnapshotProvider is the optional IN-PROCESS seam for the live warm-
-// container pool view rendered by `relay app inspect`. It defaults to nil.
-// An in-process host (embedding the worker, an admin path, or a test) wires the
-// provider via SetPoolSnapshotProvider and avoids a socket round trip. The
-// standalone inspect process leaves it nil and falls back to the worker query
-// socket (Dependencies.SocketPath); when neither resolves a live pool, the live
-// gauges render as explicitly unavailable rather than from stale persisted
-// state. The provider supplies ONLY the live gauges; the cumulative
-// acquire/discard counters always come from the persisted per-app stats
-// row, so the section is useful without the worker.
-var poolSnapshotProvider func(name string) (runtime.PoolSnapshot, bool)
-
-// SetPoolSnapshotProvider installs the live warm-container pool provider used by
-// `relay app inspect`. Passing nil (the default) leaves inspect to consult
-// the worker query socket, then to render persisted cumulative counters with the
-// live gauges marked unavailable. It is safe to call before any command runs;
-// the worker does not call it today (inspect is a distinct process), but an
-// embedding host may.
-func SetPoolSnapshotProvider(fn func(name string) (runtime.PoolSnapshot, bool)) {
-	poolSnapshotProvider = fn
-}
-
 // appCommand builds the `relay app ...` subcommand family. `ls` and
 // `inspect` touch the local state database only — never Redis, Docker, or the
 // /apps loader — so they work with no REDIS_URI and no worker reachable;
@@ -131,9 +109,9 @@ func appList(ctx context.Context, w io.Writer, deps Dependencies) error {
 }
 
 // appInspect prints the full detail for one app, reading the state
-// database through deps.OpenState and resolving the live pool gauges (when the
-// in-process provider is absent) from the worker socket at deps.SocketPath. An
-// unknown name returns a runtime error (exit 1 via main).
+// database through deps.OpenState and resolving the live pool gauges from the
+// in-process provider when wired, otherwise from the worker socket at
+// deps.SocketPath. An unknown name returns a runtime error (exit 1 via main).
 func appInspect(ctx context.Context, w io.Writer, name string, deps Dependencies) error {
 	st, cleanup, err := deps.OpenState(ctx)
 	if err != nil {
@@ -146,7 +124,7 @@ func appInspect(ctx context.Context, w io.Writer, name string, deps Dependencies
 		return fmt.Errorf("unknown app %q", name)
 	}
 	fs := printInspect(w, st, detail)
-	appendRuntimePool(w, name, fs, deps.SocketPath)
+	appendRuntimePool(w, name, fs, deps.PoolSnapshotProvider, deps.SocketPath)
 	return nil
 }
 
@@ -353,7 +331,7 @@ type poolGauges struct {
 // container counts by lease state) are resolved from a live source, in
 // preference order:
 //
-//  1. an in-process provider, when wired (an embedding host or test);
+//  1. the injected in-process provider, when non-nil and it reports a pool;
 //  2. the worker query socket at socketPath (the standalone CLI);
 //  3. otherwise explicitly unavailable ("unknown").
 //
@@ -361,8 +339,14 @@ type poolGauges struct {
 // gauge would go stale between flushes, so "unknown" is always the honest
 // fallback. name is passed separately because fs is the zero value when no stats
 // row exists yet.
-func appendRuntimePool(w io.Writer, name string, fs state.AppStats, socketPath string) {
-	gauges, ok := livePoolGauges(name, socketPath)
+func appendRuntimePool(
+	w io.Writer,
+	name string,
+	fs state.AppStats,
+	provider PoolSnapshotProvider,
+	socketPath string,
+) {
+	gauges, ok := livePoolGauges(name, provider, socketPath)
 	if !ok {
 		printRuntimePool(w, nil, fs.WarmAcquiresTotal, fs.ColdStartsTotal, fs.DiscardedTotal)
 		return
@@ -370,13 +354,17 @@ func appendRuntimePool(w io.Writer, name string, fs state.AppStats, socketPath s
 	printRuntimePool(w, &gauges, fs.WarmAcquiresTotal, fs.ColdStartsTotal, fs.DiscardedTotal)
 }
 
-// livePoolGauges resolves name's live pool gauges from the in-process provider
-// first, then the worker query socket at socketPath. It reports (zero, false)
-// when neither source resolves a live pool, so the caller renders the gauges
-// unknown. The cumulative counters are deliberately NOT read here: they always
-// come from the persisted stats row.
-func livePoolGauges(name, socketPath string) (poolGauges, bool) {
-	if snap, ok := livePoolSnapshot(name); ok {
+// livePoolGauges resolves name's live pool gauges from the injected in-process
+// provider first, then the worker query socket at socketPath. It reports
+// (zero, false) when neither source resolves a live pool, so the caller renders
+// the gauges unknown. The cumulative counters are deliberately NOT read here:
+// they always come from the persisted stats row.
+func livePoolGauges(
+	name string,
+	provider PoolSnapshotProvider,
+	socketPath string,
+) (poolGauges, bool) {
+	if snap, ok := livePoolSnapshot(name, provider); ok {
 		return poolGauges{
 			Capacity:   snap.Capacity,
 			Containers: snap.Containers,
@@ -388,14 +376,17 @@ func livePoolGauges(name, socketPath string) (poolGauges, bool) {
 	return socketPoolGauges(name, socketPath)
 }
 
-// livePoolSnapshot consults the optional in-process provider. It returns
+// livePoolSnapshot consults the injected in-process provider. It returns
 // (zero, false) when no provider is wired (the standalone inspect process) or
 // the provider does not report a live pool for the app.
-func livePoolSnapshot(name string) (runtime.PoolSnapshot, bool) {
-	if poolSnapshotProvider == nil {
+func livePoolSnapshot(
+	name string,
+	provider PoolSnapshotProvider,
+) (runtime.PoolSnapshot, bool) {
+	if provider == nil {
 		return runtime.PoolSnapshot{}, false
 	}
-	return poolSnapshotProvider(name)
+	return provider(name)
 }
 
 // socketPoolGauges queries the live worker socket at socketPath for name's pool

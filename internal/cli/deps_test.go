@@ -41,6 +41,24 @@ func TestDefaultDependenciesMatchProductionPaths(t *testing.T) {
 	}
 }
 
+// TestDefaultDependenciesLeaveOptionalSeamsZero pins that production wiring
+// keeps the two optional command-local seams at their zero values: `app
+// inspect` resolves the live gauges from the worker query socket (nil
+// in-process provider) and `git sync` clones the persisted, validated SSH
+// repository (empty transport override). A regression that sets either default
+// changes production behavior — inspect would consult a nonexistent in-process
+// provider, sync would clone the wrong source — instead of requiring an
+// explicit embedding-host or test injection.
+func TestDefaultDependenciesLeaveOptionalSeamsZero(t *testing.T) {
+	deps := DefaultDependencies()
+	if deps.PoolSnapshotProvider != nil {
+		t.Fatal("PoolSnapshotProvider must stay nil in production: inspect falls back to the worker socket")
+	}
+	if deps.GitCloneURL != "" {
+		t.Fatalf("GitCloneURL = %q, want empty: sync must use the persisted SSH repository", deps.GitCloneURL)
+	}
+}
+
 // TestSeparateTreesUseDistinctPathsIndependently pins the F-04 injection
 // boundary: two CLI trees built from separately constructed Dependencies run
 // against their own Git and secrets directories, and neither tree observes the

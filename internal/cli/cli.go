@@ -19,6 +19,7 @@ import (
 	"relay/internal/config"
 	"relay/internal/git"
 	"relay/internal/processlock"
+	"relay/internal/runtime"
 	"relay/internal/secrets"
 	"relay/internal/state"
 	"relay/internal/stream"
@@ -61,12 +62,20 @@ type StartRun func(logger *slog.Logger) error
 // isolated handle.
 type OpenState func(ctx context.Context) (*state.State, func(), error)
 
+// PoolSnapshotProvider is the optional in-process source of live warm-container
+// pool gauges for `relay app inspect`. It reports whether the named app has a
+// live pool in this process and, when it does, the current gauge reading. It
+// supplies ONLY the live gauges: the cumulative acquire/discard counters always
+// come from the persisted per-app stats row.
+type PoolSnapshotProvider func(name string) (runtime.PoolSnapshot, bool)
+
 // Dependencies carries the CLI's injectable process seams: the filesystem
 // locations plus the state-database and DLQ-store openers the administrative
-// commands need. Production wires the immutable defaults via
+// commands need, and the optional in-process runtime-pool provider and git sync
+// transport override. Production wires the immutable defaults via
 // DefaultDependencies, while tests (and any embedding host) construct their own.
 // It deliberately replaces package-level mutable variables, so a command's paths
-// and connection come from its construction rather than from global state.
+// and connections come from its construction rather than from global state.
 type Dependencies struct {
 	// OpenState opens the PostgreSQL state database the administrative commands
 	// (app, stats) use. It is read-mostly, not read-only: the read paths
@@ -80,6 +89,12 @@ type Dependencies struct {
 	// it to run against the live runtime, and a running `relay stats reset`
 	// dials it to reset the worker's statistics. Production: worker.SocketPath.
 	SocketPath string
+	// PoolSnapshotProvider optionally resolves an app's live warm-container
+	// pool gauges in-process, avoiding a socket round trip. It takes precedence
+	// over SocketPath, which remains the fallback when it is nil or reports no
+	// live pool. Nil in production (the standalone CLI); an embedding host or a
+	// test may set it. It never supplies the cumulative counters.
+	PoolSnapshotProvider PoolSnapshotProvider
 	// LockPath is the process-level lock file `relay start` holds for its
 	// lifetime; its parent directory is created before the lock is acquired.
 	// Production: processlock.DefaultPath.
@@ -98,6 +113,13 @@ type Dependencies struct {
 	// GitAppsDir is the materialized applications root `relay git sync` writes
 	// into. Production: app.Dir.
 	GitAppsDir string
+	// GitCloneURL overrides the transport source `relay git sync` actually
+	// clones or fetches from, mirroring git.SyncOptions.CloneURL. It is empty
+	// in production, where sync uses the persisted, validated SSH repository.
+	// It is never persisted: the config's Repository always remains the
+	// validated SSH URL. Tests point it at a local repository so a real sync
+	// runs with no SSH and no network.
+	GitCloneURL string
 	// SecretsDir is the local secret-store directory the `relay secret`
 	// commands read and write. Production: secrets.SecretsDir.
 	SecretsDir string
@@ -112,8 +134,10 @@ type Dependencies struct {
 }
 
 // DefaultDependencies returns the fixed production seams: the filesystem
-// locations, the worker lifecycle, the config-driven state- and DLQ-store
-// openers. The referenced constants stay immutable application conventions;
+// locations, the worker lifecycle, and the config-driven state- and DLQ-store
+// openers. The in-process pool provider and git clone URL stay at their zero
+// values, so inspect uses the worker socket and git sync uses the persisted
+// repository. The referenced constants stay immutable application conventions;
 // there are no environment overrides or setters.
 func DefaultDependencies() Dependencies {
 	return Dependencies{
