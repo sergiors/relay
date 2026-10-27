@@ -25,7 +25,16 @@ import (
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing/transport/client"
+	"github.com/go-git/go-git/v5/plumbing/transport/server"
 )
+
+func init() {
+	// go-git's default file transport launches git-upload-pack. Use its embedded
+	// client/server implementation in tests so local fetches remain real go-git
+	// protocol operations without requiring a host Git executable.
+	client.InstallProtocol("file", server.NewClient(server.DefaultLoader))
+}
 
 // DefaultTemplate is the minimal app template committed at fn/template.yaml
 // when Options.Template is empty.
@@ -116,7 +125,10 @@ func SeedBare(t *testing.T, bare, work string) {
 	if err != nil {
 		t.Fatalf("open bare: %v", err)
 	}
-	orig, err := b.CreateRemote(&config.RemoteConfig{Name: "origin", URLs: []string{work}})
+	// Point the file transport at the actual Git directory. go-git's embedded
+	// server opens bare repositories directly; a worktree URL would require the
+	// external git-upload-pack helper with the default file transport.
+	orig, err := b.CreateRemote(&config.RemoteConfig{Name: "origin", URLs: []string{filepath.Join(work, ".git")}})
 	if err != nil {
 		orig, err = b.Remote("origin")
 		if err != nil {

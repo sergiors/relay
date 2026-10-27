@@ -1,3 +1,5 @@
+//go:build integration
+
 package node
 
 import (
@@ -12,7 +14,7 @@ import (
 // source-only edit triggers, since the image itself is reused — runs the edited
 // code. The image-reuse half is pinned by the runtime-package source-mount tests.
 func TestNodeRuntimeSourceMountRunsEditedSourceOnFreshProcess(t *testing.T) {
-	skipIfNoNode(t)
+	requireNode(t)
 	root := appRoot(t)
 	writeMountedModule(t, root, "index.mjs", `
 export function handler(event) {

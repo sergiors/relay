@@ -1,6 +1,9 @@
+//go:build integration
+
 package source
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,6 +12,10 @@ import (
 )
 
 func TestGitIgnoreMatchesGitSemantics(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Fatalf("Git executable is required for these integration tests: %v", err)
+	}
+
 	patterns := []string{
 		"*.log",
 		"/build",
@@ -55,11 +62,12 @@ func TestGitIgnoreMatchesGitSemantics(t *testing.T) {
 		os.WriteFile(filepath.Join(repo, ".gitignore"), []byte(pat+"\n"), 0o644)
 
 		// git
-		exec.Command("git", "-C", repo, "init", "-q").Run()
+		if err := exec.Command("git", "-C", repo, "init", "-q").Run(); err != nil {
+			t.Fatalf("git init in %q: %v", repo, err)
+		}
 		var gitExcluded []string
 		for _, f := range files {
-			cmd := exec.Command("git", "-C", repo, "check-ignore", "-q", "--", f)
-			if err := cmd.Run(); err == nil {
+			if gitCheckIgnored(t, repo, f) {
 				gitExcluded = append(gitExcluded, f)
 			}
 		}
@@ -76,8 +84,7 @@ func TestGitIgnoreMatchesGitSemantics(t *testing.T) {
 		}
 		// also dirs
 		for _, d := range dirs {
-			cmd := exec.Command("git", "-C", repo, "check-ignore", "-q", "--", d)
-			g := cmd.Run() == nil
+			g := gitCheckIgnored(t, repo, d)
 			o := !selection.Includes(d, true)
 			if g != o {
 				t.Errorf("PATTERN %q DIR %q: git=%v ours=%v", pat, d, g, o)
@@ -87,4 +94,19 @@ func TestGitIgnoreMatchesGitSemantics(t *testing.T) {
 			t.Errorf("PATTERN %q:\n git  = %v\n ours = %v", pat, gitExcluded, ourExcluded)
 		}
 	}
+}
+
+func gitCheckIgnored(t *testing.T, repo, path string) bool {
+	t.Helper()
+	cmd := exec.Command("git", "-C", repo, "check-ignore", "-q", "--", path)
+	err := cmd.Run()
+	if err == nil {
+		return true
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false
+	}
+	t.Fatalf("git check-ignore %q in %q: %v", path, repo, err)
+	return false
 }

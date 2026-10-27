@@ -86,6 +86,9 @@ Docker infrastructure is unavailable. CI provides PostgreSQL for unit and
 integration tests, plus Redis and Node 24 for integration. Tests require only
 the relevant services: Docker (client uses `FromEnv`), Redis (`REDIS_TEST_ADDR`,
 default `localhost:6379`), and PostgreSQL (`TEST_DATABASE_URL`, default CI DSN).
+The default tests in `internal/runtime/node`, `internal/runtime/python`, and
+`internal/source` require only Go. Host Node, Python, and Git process tests are
+integration-tagged and fail if their required executable is missing.
 
 For behavior and detailed contracts, consult `README.md`, `docs/*.md`, relevant
 `internal/*/doc.go` files, `Makefile`, and `.github/workflows/tests.yml`. In
