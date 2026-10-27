@@ -1,13 +1,14 @@
-// Package git provides the manual, operator-driven Git synchronization
-// workflow for Relay.
+// Package git provides Relay's explicit Git synchronization workflow: it
+// downloads a configured repository once, deterministically rewrites /apps to
+// match the configured ref, and lets the existing reconciler pick up the
+// resulting directory tree.
 //
-// Git is NOT an automatic part of the runtime. `relay start` never polls, never
-// watches a repository, and never fetches: the worker only watches /apps
-// for filesystem changes (see internal/reconciler). Git synchronization exists
-// as a separate, explicit operator command that downloads a repository once,
-// deterministically rewrites /apps to match a configured ref, and then
-// lets the existing reconciler pick up the resulting directory tree. The flow is
-// always manual:
+// Git is NOT a polling part of the runtime. `relay start` never watches a
+// repository and never fetches on a timer: the worker only watches /apps for
+// filesystem changes (see internal/reconciler). A sync runs only when requested —
+// explicitly by the operator, or, when the opt-in authenticated GitHub webhook
+// is enabled, by a matching push through internal/git/webhook, which schedules
+// the same one-shot Sync. The operator flow is:
 //
 //	relay git keygen     # generate an SSH deploy key once
 //	relay git set <repo> # remember the SSH repository to sync
@@ -15,15 +16,15 @@
 //	relay git status     # inspect the current sync state
 //	relay git remove     # forget the source and drop the checkout
 //
-// Only `relay git sync` ever modifies /apps. When a git source is
-// configured and a sync has run, /apps is treated as fully managed by git:
-// a sync rewrites it to reflect exactly the configured repository/path, removing
-// any directory it does not contain (the "deterministic replace" rule). Source
-// selection honors .gitignore rules via the shared internal/source policy: an
-// ignored app directory is not materialized and an ignored file inside a
-// app is not copied, while the applicable .gitignore files themselves are
-// copied (they are the policy). See Sync's documentation and docs/operations.md
-// "Git" for the precise contract.
+// Only a sync (operator- or webhook-triggered) modifies /apps. When a git
+// source is configured and a sync has run, /apps is treated as fully managed by
+// git: a sync rewrites it to reflect exactly the configured repository/path,
+// removing any directory it does not contain (the "deterministic replace"
+// rule). Source selection honors .gitignore rules via the shared internal/source
+// policy: an ignored app directory is not materialized and an ignored file
+// inside an app is not copied, while the applicable .gitignore files themselves
+// are copied (they are the policy). See Sync's documentation and
+// docs/operations.md "Git" for the precise contract.
 //
 // Materialization is staged before it is committed. Every desired app tree is
 // copied into a reserved .sync-* directory directly under /apps (which the

@@ -1,4 +1,4 @@
-package state
+package cli
 
 import (
 	"testing"
@@ -20,14 +20,16 @@ func TestRelativeAgo(t *testing.T) {
 		in   string
 		want string
 	}{
+		{in: "not an RFC3339 timestamp", want: "not an RFC3339 timestamp"},
 		{in: mk(15 * time.Second), want: "15s ago"},
 		{in: mk(3 * time.Minute), want: "3m ago"},
 		{in: mk(2 * time.Hour), want: "2h ago"},
 		{in: mk(5 * 24 * time.Hour), want: "5d ago"},
 		{in: mk(45 * 24 * time.Hour), want: time.Unix(0, now.Add(-45*24*time.Hour).UnixNano()).UTC().Format("2006-01-02")},
+		{in: "9999-12-31T23:59:59Z", want: "just now"},
 	}
 	for _, tc := range cases {
-		if got := RelativeAgo(tc.in); got != tc.want {
+		if got := relativeAgo(tc.in); got != tc.want {
 			t.Errorf("relativeAgo(%s) = %q, want %q", tc.in, got, tc.want)
 		}
 	}

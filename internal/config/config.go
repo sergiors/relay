@@ -13,11 +13,12 @@ import (
 	"relay/internal/bytesize"
 )
 
-// Config holds the application settings Relay's runtime (see internal/worker)
-// and its supporting commands derive from the environment. Every field maps to
-// a single environment variable, except the always-generated per-process
-// InstanceID (see below). Load() is the only constructor — application code
-// should consume a Config value instead of reading environment variables
+// Config holds the worker's environment-resolved settings, assembled by Load at
+// worker startup. The administrative CLI commands do not build a Config; they
+// resolve only the values they need through the narrow LoadDatabaseURL and
+// LoadRedisConfig loaders. Every field maps to a single environment variable,
+// except the always-generated per-process InstanceID (see below). Application
+// code should consume resolved values instead of reading environment variables
 // directly.
 //
 // The required fields name the Redis stream, group, and address the worker
@@ -99,9 +100,9 @@ type Config struct {
 	// Like MetricsAddr it is opt-in via the GIT_WEBHOOK_ADDR environment
 	// variable: empty (unset) disables the webhook server entirely, and a
 	// non-empty value makes the worker bind it at startup (a bad address is a
-	// fatal startup error, matching metrics). Sync itself remains a separate
-	// manual command; the webhook server only schedules syncs through the
-	// coalescing trigger in internal/git/webhook, never directly.
+	// fatal startup error, matching metrics). Sync still runs through the
+	// separate git.Sync entry; the webhook server only schedules a sync through
+	// the coalescing trigger in internal/git/webhook, never in the request path.
 	GitWebhookAddr string
 	// MaxConcurrentInvocations is the MAX_CONCURRENT_INVOCATIONS value (default
 	// 8): the total number of app invocations executing concurrently in this
@@ -308,18 +309,17 @@ const (
 	DefaultDatabaseConnectTimeout = 10 * time.Second
 )
 
-// Load reads Relay's configuration from the environment and returns a Config and
-// the first configuration error, if any. It is the single entry point for
-// application configuration: callers get a Config value instead of reading
-// environment variables directly.
+// Load reads the worker's configuration from the environment and returns a
+// Config and the first configuration error, if any. Production calls it from
+// worker.Run; administrative CLI commands use the narrow loaders below. A
+// caller gets a Config value instead of reading environment variables directly.
 //
 // Every failure path RETURNS a clear, variable-naming error rather than logging
 // and exiting, so Load never writes to a process boundary and never calls
 // os.Exit: a missing required variable, an invalid WORKER_ID, an
 // invalid LOG_LEVEL, or an invalid positive integer/duration tuning knob is
-// returned for the caller (the CLI command or worker startup) to propagate. The
-// process boundary — printing the error exactly once and choosing the exit code
-// — stays in cmd/main.go.
+// returned for worker startup to propagate. The process boundary — printing the
+// error exactly once and choosing the exit code — stays in cmd/main.go.
 //
 // The required variables — the three REDIS_* values, DATABASE_URL, and WORKER_ID
 // — must be non-empty or Load returns an error (see requiredEnv); WORKER_ID is
@@ -330,8 +330,9 @@ const (
 // unique to this process. The optional variables are read with os.Getenv and
 // stay zero/empty when
 // unset: the metrics and git-webhook addresses (METRICS_ADDR, GIT_WEBHOOK_ADDR)
-// stay "" (no HTTP server), preserving their opt-in semantics through the
-// caller's non-empty guards. The retention windows are the exception to
+// stay "" (no HTTP server), as do the Traefik routing fields and the NETWORKS
+// list, preserving their opt-in semantics through the caller's non-empty
+// guards. The retention windows are the exception to
 // the "zero when unset" rule: REDIS_STREAM_RETENTION defaults to
 // DefaultStreamRetention (24h), REDIS_DLQ_RETENTION to DefaultDLQRetention (7
 // days), REDIS_INVOCATION_RETENTION to DefaultInvocationRetention (48h), and
@@ -780,9 +781,9 @@ func parseRetention(logger *slog.Logger, name, value string) time.Duration {
 }
 
 // requiredEnv returns the value of the environment variable key, or a clear
-// configuration error if it is empty. It returns rather than exiting so Load's
-// caller (the CLI or worker startup) propagates the failure to cmd/main.go,
-// which owns error printing and process exit.
+// configuration error if it is empty. It returns rather than exiting so the
+// caller (worker startup or a narrow loader) propagates the failure to
+// cmd/main.go, which owns error printing and process exit.
 func requiredEnv(key string) (string, error) {
 	if value := os.Getenv(key); value != "" {
 		return value, nil

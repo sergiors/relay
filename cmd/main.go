@@ -27,9 +27,10 @@ import (
 func main() {
 	// Bootstrap the process logger from LOG_LEVEL before any command runs, so
 	// all process-level logging follows the configured level. LOG_LEVEL is
-	// parsed here (fail-fast on an invalid value) and parsed again inside
-	// config.Load as the commands dispatch; both agree, so the value is
-	// validated exactly once at the executable boundary.
+	// parsed here (fail-fast on an invalid value) so logger construction can
+	// never use an invalid level, and config.Load validates it again when the
+	// worker starts. Both checks are deliberate: an invalid value is rejected at
+	// the earliest process boundary, not only after command dispatch.
 	level, err := config.ParseLogLevel(os.Getenv("LOG_LEVEL"))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

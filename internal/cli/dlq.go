@@ -12,7 +12,6 @@ import (
 	"github.com/urfave/cli/v3"
 
 	"relay/internal/config"
-	"relay/internal/state"
 	"relay/internal/stream"
 	"relay/internal/worker"
 )
@@ -204,7 +203,7 @@ func dlqList(ctx context.Context, w io.Writer, store DLQStore) error {
 			e.App,
 			e.Handler,
 			e.HandlerAttempts,
-			state.RelativeAgo(e.Timestamp),
+			relativeAgo(e.Timestamp),
 		)
 	}
 	return tw.Flush()
@@ -238,7 +237,7 @@ func dlqInspect(ctx context.Context, w io.Writer, store DLQStore, id string) err
 	if entry.Trace != "" {
 		fmt.Fprintf(tw, "Trace:\t%s\n", entry.Trace)
 	}
-	fmt.Fprintf(tw, "Timestamp:\t%s (%s)\n", entry.Timestamp, state.RelativeAgo(entry.Timestamp))
+	fmt.Fprintf(tw, "Timestamp:\t%s (%s)\n", entry.Timestamp, relativeAgo(entry.Timestamp))
 	fmt.Fprintf(tw, "Reason:\t%s\n", entry.Reason)
 	_ = tw.Flush()
 

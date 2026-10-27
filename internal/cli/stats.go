@@ -115,7 +115,7 @@ func printStats(w io.Writer, st *state.State) {
 	s, _ := st.Stats()
 	updated := "never"
 	if s.UpdatedAt != "" {
-		updated = state.RelativeAgo(s.UpdatedAt)
+		updated = relativeAgo(s.UpdatedAt)
 	}
 
 	fmt.Fprintf(tw, "Events received:\t%d\n", s.EventsReceivedTotal)

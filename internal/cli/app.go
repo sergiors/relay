@@ -196,10 +196,10 @@ func printInspect(w io.Writer, st *state.State, detail state.Detail) state.AppSt
 		fmt.Fprintf(tw, "Fingerprint:\t%s\n", detail.Fingerprint)
 	}
 	if detail.PreparedAt != "" {
-		fmt.Fprintf(tw, "Prepared:\t%s (%s)\n", detail.PreparedAt, state.RelativeAgo(detail.PreparedAt))
+		fmt.Fprintf(tw, "Prepared:\t%s (%s)\n", detail.PreparedAt, relativeAgo(detail.PreparedAt))
 	}
 	if detail.LastReconcileAt != "" {
-		fmt.Fprintf(tw, "Last reconcile:\t%s (%s)\n", detail.LastReconcileStatus, state.RelativeAgo(detail.LastReconcileAt))
+		fmt.Fprintf(tw, "Last reconcile:\t%s (%s)\n", detail.LastReconcileStatus, relativeAgo(detail.LastReconcileAt))
 	}
 	if detail.LastError != "" {
 		fmt.Fprintf(tw, "Last error:\t%s\n", detail.LastError)
@@ -473,13 +473,13 @@ func printRuntimePool(w io.Writer, live *poolGauges, warm, cold, discarded int64
 
 // lastAgo renders a per-app timestamp for inspect: the empty string means
 // the event was never observed ("never"); any other value renders through
-// state.RelativeAgo, which falls back to the raw string when parsing fails — an
+// relativeAgo, which falls back to the raw string when parsing fails — an
 // acceptable cosmetic fallback that keeps inspect rendering non-fatal.
 func lastAgo(rfc3339 string) string {
 	if rfc3339 == "" {
 		return "never"
 	}
-	return state.RelativeAgo(rfc3339)
+	return relativeAgo(rfc3339)
 }
 
 // displayTime returns the UPDATED column value: prepared_at (if set) else
@@ -489,5 +489,5 @@ func displayTime(r state.Row) string {
 	if raw == "" {
 		raw = r.UpdatedAt
 	}
-	return state.RelativeAgo(raw)
+	return relativeAgo(raw)
 }
