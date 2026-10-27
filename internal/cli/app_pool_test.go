@@ -404,7 +404,11 @@ func TestAppInspectCommandTreesCaptureIndependentProviders(t *testing.T) {
 		t.Fatalf("CLI command errors: tree A %q; tree B %q", errA.String(), errB.String())
 	}
 
-	for name, output := range map[string]string{"tree A": normWS(outA.String()), "tree B": normWS(outB.String())} {
+	// Each tree's section is normalized once so the tabwriter column padding
+	// between label and value cannot defeat content checks; raw output stays
+	// in the failure messages.
+	normalizedA, normalizedB := normWS(outA.String()), normWS(outB.String())
+	for name, output := range map[string]string{"tree A": normalizedA, "tree B": normalizedB} {
 		for _, row := range []string{"Warm acquires: 7", "Cold starts: 3", "Discarded: 2"} {
 			if !strings.Contains(output, row) {
 				t.Errorf("%s must use persisted counters, missing %q:\n%s", name, row, output)
@@ -414,10 +418,10 @@ func TestAppInspectCommandTreesCaptureIndependentProviders(t *testing.T) {
 			t.Errorf("%s should have its own live provider:\n%s", name, output)
 		}
 	}
-	if !strings.Contains(outA.String(), "Capacity: 4") || strings.Contains(outA.String(), "Capacity: 9") {
+	if !strings.Contains(normalizedA, "Capacity: 4") || strings.Contains(normalizedA, "Capacity: 9") {
 		t.Errorf("tree A must render provider A only:\n%s", outA.String())
 	}
-	if !strings.Contains(outB.String(), "Capacity: 9") || strings.Contains(outB.String(), "Capacity: 4") {
+	if !strings.Contains(normalizedB, "Capacity: 9") || strings.Contains(normalizedB, "Capacity: 4") {
 		t.Errorf("tree B must render provider B only:\n%s", outB.String())
 	}
 	if callsA != 1 || callsB != 1 {
