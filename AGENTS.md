@@ -74,21 +74,17 @@ worker; admin commands communicate with it or read persistent state.
 ## Validation
 
 - `make fmt`, `make vet`
-- `make test-unit` (`go test -short ./...`), `make test-unit-race`
+- `make test-unit` (`go test ./...`), `make test-unit-race`
   (`go test -race ./...`)
 - `make test-integration` (integration tag, 20m timeout),
   `make test-integration-race`, `make test-all` (unit + integration)
 - Focus a test with `go test ./internal/<package> -run '^TestName$'`; add
   `-tags=integration` when needed.
 
-Integration tests fail rather than skip when required PostgreSQL, Redis, or
-Docker infrastructure is unavailable. CI provides PostgreSQL for unit and
-integration tests, plus Redis and Node 24 for integration. Tests require only
-the relevant services: Docker (client uses `FromEnv`), Redis (`REDIS_TEST_ADDR`,
-default `localhost:6379`), and PostgreSQL (`TEST_DATABASE_URL`, default CI DSN).
-The default tests in `internal/runtime/node`, `internal/runtime/python`, and
-`internal/source` require only Go. Host Node, Python, and Git process tests are
-integration-tagged and fail if their required executable is missing.
+Unit tests require Go only. Integration tests fail rather than skip when
+required dependencies are unavailable: PostgreSQL (`TEST_DATABASE_URL`, default
+CI DSN), Redis (`REDIS_TEST_ADDR`, default `localhost:6379`), and Docker (client
+uses `FromEnv`), plus Node 24, Python 3.14, and Git on the runner.
 
 For behavior and detailed contracts, consult `README.md`, `docs/*.md`, relevant
 `internal/*/doc.go` files, `Makefile`, and `.github/workflows/tests.yml`. In
