@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/moby/moby/client"
@@ -82,29 +81,6 @@ func buildImage(
 	}
 
 	return runImageBuild(ctx, cli, name, ctxDir, image, labels, reg)
-}
-
-// writePlanFiles writes the generated plan files (bootstrap, injected
-// package.json) into the staged build context. The caller's app directory is
-// never modified: generated files live only in the transient context.
-func writePlanFiles(ctxDir, name string, files []plan.File) error {
-	for _, f := range files {
-		rel := strings.TrimPrefix(filepath.Clean(f.Path), "/")
-		target := filepath.Join(ctxDir, rel)
-		if dir := filepath.Dir(target); dir != ctxDir {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return fmt.Errorf("app %q: mkdir for %s: %w", name, f.Path, err)
-			}
-		}
-		mode := f.Mode
-		if mode == 0 {
-			mode = 0o644
-		}
-		if err := os.WriteFile(target, f.Content, mode); err != nil {
-			return fmt.Errorf("app %q: write %s: %w", name, f.Path, err)
-		}
-	}
-	return nil
 }
 
 // buildDependencyImage builds the reusable dependency layer for an app. The

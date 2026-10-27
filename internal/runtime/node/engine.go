@@ -303,7 +303,7 @@ func (Engine) Plan(spec plan.Spec, fnDir string, handlers []string) (plan.BuildP
 	}
 	if deps.IsZero() && !fileExists(fnDir, pkgFile) {
 		files = append(files, plan.File{
-			Path:    filepath.Join(workDir, pkgFile),
+			Path:    path.Join(workDir, pkgFile),
 			Content: esmPackageJSON,
 			Mode:    fs.FileMode(0o644),
 		})

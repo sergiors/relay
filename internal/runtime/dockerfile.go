@@ -3,7 +3,6 @@ package runtime
 import (
 	"fmt"
 	"path"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -24,6 +23,14 @@ func renderDockerfile(p plan.BuildPlan) (string, error) {
 // immutable snapshot the fingerprint was derived from, so the tag and the
 // mounted tree cannot describe different bytes.
 func renderDockerfileWithSource(p plan.BuildPlan, copySource bool) (string, error) {
+	// Validate the generated file list once and use the SAME relative paths the
+	// stager writes, so a rendered COPY can never name a path the stager would
+	// reject or resolve differently.
+	planFileRels, err := validatePlanFiles(p.Files)
+	if err != nil {
+		return "", err
+	}
+
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "FROM %s\n", p.BaseImage)
@@ -39,16 +46,11 @@ func renderDockerfileWithSource(p plan.BuildPlan, copySource bool) (string, erro
 		fmt.Fprintf(&b, "COPY . %s\n", dest)
 	}
 
-	// Each file's absolute Path is mirrored into the context with the leading
-	// '/' stripped, so COPY names that same relative path and writes it into the
-	// file's parent directory in the image.
-	for _, f := range p.Files {
-		rel := strings.TrimPrefix(filepath.Clean(f.Path), "/")
-		dir := "/"
-		if i := strings.LastIndex(f.Path, "/"); i > 0 {
-			dir = f.Path[:i]
-		}
-		fmt.Fprintf(&b, "COPY %s %s/\n", rel, dir)
+	// Each file's absolute Path is mirrored into the context at its validated
+	// relative path, so COPY names that same relative path and writes it into
+	// the file's parent directory in the image.
+	for i, f := range p.Files {
+		fmt.Fprintf(&b, "COPY %s %s/\n", planFileRels[i], path.Dir(f.Path))
 	}
 
 	// Runtime tools are materialized before the install RUN so it can use them.

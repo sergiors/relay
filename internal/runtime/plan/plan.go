@@ -50,8 +50,11 @@ type Spec struct {
 }
 
 // File is a file the builder mirrors into the build context: Path is the
-// absolute destination in the image (e.g. "/relay/bootstrap.py"), and the
-// Dockerfile renders a COPY that writes it there.
+// canonical absolute POSIX destination in the image (e.g. "/relay/bootstrap.py"),
+// and the Dockerfile renders a COPY that writes it there. Runtime validation
+// (internal/runtime/plan_files.go) rejects non-canonical paths and characters
+// active in the Dockerfile parser; accepted paths use a conservative safe
+// character allowlist so staging and COPY parsing agree.
 type File struct {
 	Path    string
 	Content []byte
