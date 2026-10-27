@@ -6,9 +6,9 @@
 //
 // This file is excluded from the default suite by the integration build tag.
 // Running it (`go test -tags=integration ./...`) REQUIRES Redis at REDIS_TEST_ADDR
-// (default localhost:6379, matching compose.dev.yaml); a missing dependency fails
-// the affected tests rather than skipping them. Start the documented dev
-// dependencies with `docker compose -f compose.dev.yaml up -d`.
+// (default localhost:6379); a missing dependency fails the affected tests rather
+// than skipping them. Start Redis and point REDIS_TEST_ADDR at it if it is not
+// on the default address.
 //
 // One test, TestIntegrationReconnectAndResume, additionally boots its own
 // disposable Redis in a Docker container so it can simulate an outage; it

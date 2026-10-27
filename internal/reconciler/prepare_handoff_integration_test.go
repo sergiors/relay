@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"relay/internal/app"
-	"relay/internal/testutil"
 )
 
 // TestReconcileRecordsBuiltIdentityNotPreBuildScan pins the live-reconcile half
@@ -19,7 +18,6 @@ import (
 // mutated tree as current; recording the built value makes the next audit
 // compare against what is really baked and rebuild the drift.
 func TestReconcileRecordsBuiltIdentityNotPreBuildScan(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	writeFnDir(t, root, "drift")
 

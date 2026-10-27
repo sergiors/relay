@@ -15,7 +15,6 @@ import (
 	"relay/internal/runner"
 	"relay/internal/source"
 	"relay/internal/state"
-	"relay/internal/testutil"
 )
 
 // TestReconcileInvalidDesiredWritesFailureAndKeepsRegistry pins the live
@@ -25,7 +24,6 @@ import (
 // untouched and no rebuild is attempted. Removal is reserved for a genuinely
 // missing directory.
 func TestReconcileInvalidDesiredWritesFailureAndKeepsRegistry(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "guarded")
 
@@ -82,7 +80,6 @@ func TestReconcileInvalidDesiredWritesFailureAndKeepsRegistry(t *testing.T) {
 // existing invalid-desired path — recorded failed/degraded with its active
 // generation retained, the live registry untouched, and no rebuild attempted.
 func TestReconcileOverDeepPatternInvalidRetainsActive(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "deep")
 
@@ -147,7 +144,6 @@ func overDeepPatternTemplate() string {
 // entries are dropped, the generation-fenced state row and app_stats are
 // deleted, and the service/schedule hooks converge like any removal.
 func TestReconcileTemplateRemovalRemovesKnownApp(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "known")
 
@@ -212,7 +208,6 @@ func TestReconcileTemplateRemovalRemovesKnownApp(t *testing.T) {
 // never an app cannot cause state or registry churn: reconciling it writes no
 // state row, allocates no transition fencing token, and performs no build.
 func TestReconcileUnknownTemplateLessDirIsNoOp(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := filepath.Join(root, "unrelated")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -252,7 +247,6 @@ func TestReconcileUnknownTemplateLessDirIsNoOp(t *testing.T) {
 // but no registry entry) is still swept once its directory loses template.yaml,
 // so its stale state cannot outlive the definition.
 func TestReconcileAllRemovesFencingTokenOnlyTemplateLessApp(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := filepath.Join(root, "startup-bad")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -308,7 +302,6 @@ func TestReconcileAllRemovesFencingTokenOnlyTemplateLessApp(t *testing.T) {
 // live registry or its fingerprint, and without treating the app as
 // removed.
 func TestReconcileFingerprintFailureRecordsInvalidAndKeepsRegistry(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "unreadable")
 
@@ -353,7 +346,6 @@ func TestReconcileFingerprintFailureRecordsInvalidAndKeepsRegistry(t *testing.T)
 // recording is NOT applied to a genuinely absent directory: removal semantics
 // (registry drop + row delete) still win.
 func TestReconcileGenuinelyMissingDirStillPrunes(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "vanished")
 
@@ -381,7 +373,6 @@ func TestReconcileGenuinelyMissingDirStillPrunes(t *testing.T) {
 // the next reconcile re-verifies it and a real success replaces the recorded
 // failure. The active generation is not left falsely degraded.
 func TestReconcileInvalidThenRestoredIdenticalContentRecovers(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "restored")
 
@@ -427,7 +418,6 @@ func TestReconcileInvalidThenRestoredIdenticalContentRecovers(t *testing.T) {
 // generation is overwritten, the desired fingerprint converges to the success,
 // and the failure is cleared.
 func TestReconcileValidReplacementOverwritesInvalidGeneration(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "recovers")
 

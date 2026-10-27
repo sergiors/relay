@@ -135,7 +135,6 @@ func (c *ir004StartedChild) release() {
 //     database) is refused the exclusive GC lease while A holds it;
 //  3. after A releases and exits cleanly, process B acquires.
 func TestIntegrationDependencyLeaseCrossProcess(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	// Run-unique reference AND run-unique worker identities (advisory locks are
 	// database-wide — per-test schemas do not namespace them). The child

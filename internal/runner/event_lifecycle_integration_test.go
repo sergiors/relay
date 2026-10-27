@@ -26,7 +26,6 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"relay/internal/app"
-	"relay/internal/config"
 	"relay/internal/observability/metrics"
 	"relay/internal/stream"
 	"relay/internal/testutil"
@@ -57,15 +56,12 @@ func newEventEnv(t *testing.T) *eventEnv {
 // newEventEnvWith is newEventEnv with an explicit local buffer capacity
 // (ConsumerConfig.MaxBufferedEvents; 0 applies the stream default of 16) and an
 // optional metrics registry so a test can observe the live buffered_events
-// gauge. It is a test-only setup seam; the production consumer is unchanged.
+// gauge. It is a test-only setup seam; the production consumer is unchanged. The
+// Redis client is the fail-fast one owned by testutil.RequireRedis; its cleanup
+// closes the client after this harness's own key cleanup has run.
 func newEventEnvWith(t *testing.T, maxBufferedEvents int, m *metrics.Registry) *eventEnv {
 	t.Helper()
-	addr := testutil.EnvOr("REDIS_TEST_ADDR", "localhost:6379")
-	redisOpts, err := config.RedisOptions(addr)
-	if err != nil {
-		t.Fatalf("redis options: %v", err)
-	}
-	cli := redis.NewClient(redisOpts)
+	cli := testutil.RequireRedis(t)
 	cctx, cancel := context.WithCancel(context.Background())
 	prefix := fmt.Sprintf("evitest-%d", time.Now().UnixNano())
 	streamName := prefix + "-stream"
@@ -84,7 +80,6 @@ func newEventEnvWith(t *testing.T, maxBufferedEvents int, m *metrics.Registry) *
 	})
 	if err := c.EnsureGroup(cctx); err != nil {
 		cancel()
-		_ = cli.Close()
 		t.Fatalf("ensure group: %v", err)
 	}
 	e := &eventEnv{
@@ -129,7 +124,8 @@ func (e *eventEnv) cleanup() {
 		}
 		cursor = next
 	}
-	_ = e.client.Close()
+	// The client is owned by testutil.RequireRedis, whose cleanup closes it after
+	// this cleanup (t.Cleanup is LIFO).
 }
 
 func (e *eventEnv) start(handler stream.Handler) {
@@ -257,7 +253,6 @@ func pastNextAttempt(attempt int) string {
 //     diagnostic Redis/PEL count (>= 2, including protected reclaims).
 //   - The invocation-state key is cleared after the DLQ + ACK.
 func TestIntegrationEventSuccessAndExhaustionRoutesToDLQ(t *testing.T) {
-	_ = redisAvailable(t)
 	aExec := &countingExecutor{}           // handler A: always succeeds
 	bExec := &countingExecutor{fail: true} // handler B: always fails
 	r := NewWithMetrics([]*PreparedApp{
@@ -363,7 +358,6 @@ func TestIntegrationEventSuccessAndExhaustionRoutesToDLQ(t *testing.T) {
 // invocation — each carrying its own exact app/handler and
 // handler_attempts, while the successful A is never dead-lettered.
 func TestIntegrationMultipleExhaustionsProducePerInvocationDLQEntries(t *testing.T) {
-	_ = redisAvailable(t)
 	aExec := &countingExecutor{}           // A: succeeds, must never be DLQ'd
 	bExec := &countingExecutor{fail: true} // B: exhausts attempt 1
 	cExec := &countingExecutor{fail: true} // C: exhausts attempt 1
@@ -430,7 +424,6 @@ func TestIntegrationMultipleExhaustionsProducePerInvocationDLQEntries(t *testing
 // must re-report exhaustion and route the message to the DLQ — NOT return nil
 // and ACK a message with no DLQ entry, which would silently lose it.
 func TestIntegrationDLQWriteFailureRecoveryReRoutesAfterExhaustion(t *testing.T) {
-	_ = redisAvailable(t)
 	aExec := &countingExecutor{}           // A: succeeds
 	bExec := &countingExecutor{fail: true} // B: exhausts on its first failure (retries:0)
 	r := NewWithMetrics([]*PreparedApp{
@@ -509,7 +502,6 @@ func TestIntegrationDLQWriteFailureRecoveryReRoutesAfterExhaustion(t *testing.T)
 //     identity), a reclaim redelivery must run the handler, ACK the message, and
 //     clear the invocation-state key.
 func TestIntegrationMatchedButUnavailableStaysPendingThenCompletes(t *testing.T) {
-	_ = redisAvailable(t)
 	recovered := &countingExecutor{}
 	// Start with the app registered but unavailable (image not built).
 	r := NewWithMetrics([]*PreparedApp{unavailableMatchFn(t, "broken")}, testutil.DiscardLogger(), nil)
@@ -564,7 +556,6 @@ func TestIntegrationMatchedButUnavailableStaysPendingThenCompletes(t *testing.T)
 // exactly once — it is NOT re-run by the reclaims — while the unavailable
 // invocation remains unresolved, so the message is never ACKed and never DLQ'd.
 func TestIntegrationMixedFanOutAvailableCompletesUnavailableStaysPending(t *testing.T) {
-	_ = redisAvailable(t)
 	availableExec := &countingExecutor{}
 	r := NewWithMetrics([]*PreparedApp{
 		alwaysMatchFn(t, "available", availableExec),
@@ -615,7 +606,6 @@ func TestIntegrationMixedFanOutAvailableCompletesUnavailableStaysPending(t *test
 //     reclaim redelivery must run the handler, ACK the message, and clear the
 //     invocation-state key.
 func TestIntegrationPendingDesiredRuleStaysPendingThenRuns(t *testing.T) {
-	_ = redisAvailable(t)
 	recovered := &countingExecutor{}
 	r := NewWithMetrics(nil, testutil.DiscardLogger(), nil)
 	// Represent the app as pending-only: the desired rules are matchable but not
@@ -712,7 +702,6 @@ func runningValue(deadline time.Time, attempt int) string {
 // real failing EXECUTION, not by the crash: a crash alone claims an attempt but
 // never exhausts (TryStart has no retry budget).
 func TestIntegrationCrashAfterClaimSpendsAttemptWithoutHandlerExecution(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &countingExecutor{fail: true}
 	r := NewWithMetrics([]*PreparedApp{fnWithRetries(t, "beta", 0, exec)}, testutil.DiscardLogger(), nil)
 	e := newEventEnv(t)
@@ -766,7 +755,6 @@ func TestIntegrationCrashAfterClaimSpendsAttemptWithoutHandlerExecution(t *testi
 // DLQ'd, and the handler is never called. Nothing is charged until the claim's
 // deadline actually elapses.
 func TestIntegrationProtectedClaimStaysPendingWithoutAckOrDLQ(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &countingExecutor{}
 	r := NewWithMetrics([]*PreparedApp{fnWithRetries(t, "beta", 0, exec)}, testutil.DiscardLogger(), nil)
 	e := newEventEnv(t)

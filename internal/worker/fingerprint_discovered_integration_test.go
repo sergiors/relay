@@ -23,7 +23,6 @@ import (
 // caller-supplied value must win instead. The resolved selection is also carried
 // on the record so Prepare can stage the exact policy the hash came from.
 func TestFingerprintDiscoveredReusedAcrossStatePhase(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	writeWorkerApp(t, root, "demo", "def handler(e): return 1\n")
 
@@ -98,7 +97,6 @@ func TestFingerprintDiscoveredReusedAcrossStatePhase(t *testing.T) {
 // built generation (that would claim the image serves content it does not); the
 // reconciler's audit detects the drift instead.
 func TestStartupBuiltFingerprintIsReturnedIdentity(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	writeWorkerApp(t, root, "runtime-fn", "def handler(e): return 1\n")
 

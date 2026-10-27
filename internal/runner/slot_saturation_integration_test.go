@@ -57,7 +57,6 @@ func (e *eventEnv) pendingCount(ids []string) int {
 // (TestIntegrationExecutionSaturationDeliversToPELThenDrains) by driving the
 // runner's own semaphore rather than a test handler's.
 func TestIntegrationRunnerSlotSaturationDeliversToPELThenDrains(t *testing.T) {
-	_ = redisAvailable(t)
 	e := newEventEnv(t)
 
 	const n = 4
@@ -150,7 +149,6 @@ func TestIntegrationRunnerSlotSaturationDeliversToPELThenDrains(t *testing.T) {
 // configured capacity. Releasing the execution then lets the reclaim loop deliver
 // the pending backlog, each message executing exactly once.
 func TestIntegrationCumulativePELExceedsLocalBuffer(t *testing.T) {
-	_ = redisAvailable(t)
 	const (
 		buffer = 2
 		n      = 6

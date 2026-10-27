@@ -55,7 +55,6 @@ func newTestStateReconciler(
 	cfgHook func(*Config, *state.State),
 ) (*Reconciler, *runner.Registry, *state.State) {
 	t.Helper()
-	testutil.RequireStateDatabase(t)
 	st := testutil.NewState(t)
 	r, reg := newTestReconciler(t, root, builder, initial, func(cfg *Config) {
 		cfg.State = st

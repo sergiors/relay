@@ -13,7 +13,6 @@ import (
 	"relay/internal/app"
 	"relay/internal/runtime"
 	"relay/internal/state"
-	"relay/internal/testutil"
 )
 
 // TestManagedRuntimeBuildObserverPublishesBuildingOnlyOnActualBuild pins the
@@ -26,7 +25,6 @@ import (
 // and a preparation failure without an active image is unavailable. A nil state
 // handle yields a context without an observer.
 func TestManagedRuntimeBuildObserverPublishesBuildingOnlyOnActualBuild(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 
 	runtimeFn := app.App{

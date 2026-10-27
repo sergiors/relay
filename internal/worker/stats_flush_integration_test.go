@@ -20,7 +20,6 @@ import (
 // though its series still linger in the registry, while live apps' series
 // and global counters survive in BOTH PostgreSQL and the registry.
 func TestStatsFlushSweepsStaleAppSeries(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
 		t.Errorf("state write error: %v", err)
@@ -88,7 +87,6 @@ func TestStatsFlushSweepsStaleAppSeries(t *testing.T) {
 // flush persists that fresh small value (the row was recreated/upserted, not
 // held at a stale value).
 func TestReaddedAppPersistsFreshSeries(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
 		t.Errorf("state write error: %v", err)
@@ -124,7 +122,6 @@ func TestReaddedAppPersistsFreshSeries(t *testing.T) {
 // is idempotent), a subsequent flush sweeps ghost and keeps alpha — the
 // ghost/live behavior resumes.
 func TestSweepSkippedOnStateReadError(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	st := testutil.OpenState(t, dsn)
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
@@ -185,7 +182,6 @@ func TestSweepSkippedOnStateReadError(t *testing.T) {
 // with a healthy context finally sweeps ghost and keeps alpha, proving the
 // preservation is fail-open behavior (not permanent).
 func TestSweepSkippedOnCancelledFlushPreservesSeries(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	// Only alpha has an apps row: ghost's row is gone, so its series are stale
 	// exactly like TestStatsFlushSweepsStaleAppSeries's ghost.
@@ -237,7 +233,6 @@ func TestSweepSkippedOnCancelledFlushPreservesSeries(t *testing.T) {
 // updates go to the Prometheus registry only and the registry reflects them
 // immediately, while NO write reaches PostgreSQL until the flush runs once.
 func TestSnapshotStatsAndFuncSnapshotAreInMemoryOnly(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	m := metrics.New()
 	// Give alpha/beta apps rows so their app_stats survive the flush's
 	// orphan pruning (a app_stats row with no apps row is pruned).
@@ -314,7 +309,6 @@ func TestSnapshotStatsAndFuncSnapshotAreInMemoryOnly(t *testing.T) {
 // interval param exists solely for testability — production uses the
 // statsFlushInterval constant (5s, see TestStatsFlushIntervalConstant).
 func TestStatsLoopFlushesEveryInterval(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
 		t.Errorf("state write error: %v", err)
@@ -376,7 +370,6 @@ func TestStatsLoopFlushesEveryInterval(t *testing.T) {
 // TestFinalStatsFlushPersistsOnShutdown proves finalStatsFlush writes the final
 // registry snapshot on graceful shutdown, and is nil-safe on both arguments.
 func TestFinalStatsFlushPersistsOnShutdown(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	m := metrics.New()
 	st := openTempState(t)
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
@@ -424,7 +417,6 @@ func TestFinalStatsFlushPersistsOnShutdown(t *testing.T) {
 // registry values produce identical DB totals (and refresh updated_at), and a
 // later bump persists the new absolute value without delta accumulation.
 func TestStatsFlushIdempotent(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
 		t.Errorf("state write error: %v", err)
@@ -475,7 +467,6 @@ func TestStatsFlushIdempotent(t *testing.T) {
 // interleaved with concurrent flushes: the persisted global and per-app
 // counters must equal the exact totals with no data race (-race).
 func TestConcurrentIncrementsAndFlushRaceSafe(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("fn-a", t.TempDir())); err != nil {
 		t.Errorf("state write error: %v", err)
@@ -567,7 +558,6 @@ func TestConcurrentIncrementsAndFlushRaceSafe(t *testing.T) {
 // writes the post-reset totals (never resurrecting the pre-reset values), while
 // the Prometheus counters stay monotonic.
 func TestStatsFlusherResetPersistsZero(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
 		t.Errorf("state write error: %v", err)
@@ -621,7 +611,6 @@ func TestStatsFlusherResetPersistsZero(t *testing.T) {
 // running concurrently with ResetStats can never persist a pre-reset total after
 // the reset completes, because flush and ResetStats share the flusher mutex.
 func TestStatsFlusherResetRaceNoResurrection(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
 		t.Errorf("state write error: %v", err)

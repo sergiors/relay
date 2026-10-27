@@ -15,7 +15,6 @@ import (
 
 	"relay/internal/runtime"
 	"relay/internal/state"
-	"relay/internal/testutil"
 	"relay/internal/worker"
 )
 
@@ -83,7 +82,6 @@ func seedStatsState(t *testing.T) (*state.State, Dependencies) {
 // printStats renders the recorded snapshot with tab-aligned labels, Go-duration
 // age formatting, and a relative Updated timestamp.
 func TestPrintStats(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, _ := seedStatsState(t)
 	var w bytes.Buffer
 	printStats(&w, st)
@@ -122,7 +120,6 @@ func TestPrintStats(t *testing.T) {
 // A fresh state DB has no stats row; printStats renders all zeros, "0s" age,
 // and "never" for Updated, and the command exits 0.
 func TestPrintStatsEmptyDB(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, deps := openTempState(t)
 
 	var w bytes.Buffer
@@ -151,7 +148,6 @@ func TestPrintStatsEmptyDB(t *testing.T) {
 // `relay stats` reads the seeded snapshot and exits 0; `relay stats extra` is a
 // usage error exiting 2; `relay stats --help` prints usage to stdout and exits 0.
 func TestStatsCommand(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	_, deps := seedStatsState(t)
 	if _, _, err := runCLIWithDeps(t, deps, "", "stats"); err != nil {
 		t.Fatalf("stats: err = %v, want nil", err)
@@ -177,7 +173,6 @@ func TestStatsCommand(t *testing.T) {
 // A following bare `relay stats` renders zeros for the counters and the
 // preserved gauge value.
 func TestStatsResetCommand(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, deps := seedStatsState(t)
 	st.RecordAppStats(state.AppStats{
 		App:                "alpha",
@@ -243,7 +238,6 @@ func TestStatsResetCommand(t *testing.T) {
 // `relay stats reset` surfaces a worker-reported reset failure instead of
 // silently falling back to the direct state write (which would mask it).
 func TestStatsResetCommandWorkerFailureSurfaces(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, deps := seedStatsState(t)
 	resetter := &fakeStatsResetter{err: errors.New("state unavailable")}
 	startStatsSocket(t, deps.SocketPath, resetter)
@@ -264,7 +258,6 @@ func TestStatsResetCommandWorkerFailureSurfaces(t *testing.T) {
 // to the direct state write. The state DB is left untouched by the CLI itself
 // (the worker owns the persisted reset).
 func TestStatsResetCommandRunningWorker(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, deps := seedStatsState(t)
 	// A worker-owned state DB is a separate handle; the CLI's direct fallback
 	// would write here, so an untouched row proves the socket path was taken.
@@ -294,7 +287,6 @@ func TestStatsResetCommandRunningWorker(t *testing.T) {
 // error and leaves the persisted totals alone. This preserves the live worker
 // as the authority and avoids a second, racing reset.
 func TestStatsResetCommandAmbiguousTimeoutNoFallback(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, deps := seedStatsState(t)
 
 	// A live listener that accepts and then hangs, so the client's read blocks
@@ -336,7 +328,6 @@ func TestStatsResetCommandAmbiguousTimeoutNoFallback(t *testing.T) {
 // `relay stats reset extra` is a usage error exiting 2, and the rejection
 // happens before any state write.
 func TestStatsResetTooManyArgs(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, deps := seedStatsState(t)
 
 	_, _, err := runCLIWithDeps(t, deps, "", "stats", "reset", "extra")

@@ -13,7 +13,6 @@ import (
 	"relay/internal/runtime"
 	"relay/internal/source"
 	"relay/internal/state"
-	"relay/internal/testutil"
 )
 
 // diskIdentityBuilder is a Manager-like Builder: it derives the REAL content
@@ -69,7 +68,6 @@ func (b *diskIdentityBuilder) Execute(context.Context, *runtime.Prepared, string
 // so the recorded identity, the served image, and the source that was really
 // baked stay in agreement across generations.
 func TestReconcileRealBuiltGenerationsTrackSourceAndConverge(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "gen")
 	fn := initialFn("gen", dir)

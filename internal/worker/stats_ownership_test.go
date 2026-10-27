@@ -18,7 +18,6 @@ import (
 // the current registry values, and retries under the new epoch — restarting the
 // persisted totals from zero instead of resurrecting the pre-reset counts.
 func TestStatsFlusherRebasesAfterRemoteReset(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	ctx := context.Background()
 	dsn := testutil.NewStateDSN(t)
 	// Owner identities must be unique per test: PostgreSQL session advisory locks
@@ -71,7 +70,6 @@ func TestStatsFlusherRebasesAfterRemoteReset(t *testing.T) {
 // claim writes — which is the residual race the fence still guards against (for
 // example, after this handle's lock connection is lost).
 func TestStatsFlusherStopsOnOwnershipLost(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	ctx := context.Background()
 	dsn := testutil.NewStateDSN(t)
 
@@ -114,7 +112,6 @@ func TestStatsFlusherStopsOnOwnershipLost(t *testing.T) {
 // point instead of treating its own reset as a concurrent one and rebasing a
 // second time.
 func TestStatsFlusherResetAdoptsEpoch(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	ctx := context.Background()
 	owner := testutil.UniqueName(t, "stats-reset")
 	st := testutil.NewState(t, state.Options{Owner: owner, Instance: "inst-a"})

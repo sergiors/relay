@@ -6,12 +6,11 @@
 //
 // This file is excluded from the default suite by the integration build tag.
 // Running it (`go test -tags=integration ./...`) REQUIRES both a reachable
-// Docker daemon AND Redis at REDIS_TEST_ADDR (default localhost:6379, matching
-// compose.dev.yaml); a missing dependency fails the affected tests rather than
-// skipping them. Start the documented dev dependencies with
-// `docker compose -f compose.dev.yaml up -d`. The Docker daemon is located via
-// client.FromEnv, so DOCKER_HOST, the local socket, and a socket proxy are all
-// respected.
+// Docker daemon AND Redis at REDIS_TEST_ADDR (default localhost:6379); a missing
+// dependency fails the affected tests rather than skipping them. Start Docker
+// and Redis, or point DOCKER_HOST/REDIS_TEST_ADDR at running instances. The
+// Docker daemon is located via client.FromEnv, so DOCKER_HOST, the local socket,
+// and a socket proxy are all respected.
 package worker
 
 import (

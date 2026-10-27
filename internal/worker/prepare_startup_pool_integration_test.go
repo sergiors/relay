@@ -20,7 +20,6 @@ import (
 // while the app carrying a valid token still publishes, so one stale app never
 // blocks its neighbor's convergence.
 func TestPrepareAppsStartupUsesExactPerAppFencingToken(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	writeWorkerApp(t, root, "fence-alpha", "def handler(e): return 1\n")
 	writeWorkerApp(t, root, "fence-beta", "def handler(e): return 2\n")
@@ -106,7 +105,6 @@ func TestPrepareAppsStartupUsesExactPerAppFencingToken(t *testing.T) {
 // record a failure either — a superseded preparation never overwrites a
 // generation it already lost.
 func TestPrepareAppsStartupStaleFencingTokenSuppressesFailureWrite(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	writeWorkerApp(t, root, "fence-gamma", "def handler(e): return 3\n")
 

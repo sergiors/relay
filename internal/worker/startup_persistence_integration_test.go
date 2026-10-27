@@ -20,7 +20,6 @@ import (
 // phase returns an error even though another app's token landed. A partial token
 // map is never treated as success.
 func TestPersistStartupDiscoveryCriticalDiscoveryFailure(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	st := testutil.OpenState(t, dsn)
 	root := t.TempDir()
@@ -60,7 +59,6 @@ func TestPersistStartupDiscoveryCriticalDiscoveryFailure(t *testing.T) {
 // operational write failure is recoverable and does not hide other invalid
 // observations: the remaining issues are recorded, and startup does not abort.
 func TestPersistStartupDiscoveryInvalidWriteIsIsolated(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	st := testutil.OpenState(t, dsn)
 	root := t.TempDir()
@@ -94,7 +92,6 @@ func TestPersistStartupDiscoveryInvalidWriteIsIsolated(t *testing.T) {
 // state observation is not an absent row: the issue write is skipped instead of
 // bypassing the optimistic concurrency guard.
 func TestPersistStartupDiscoveryMissingObservationFailsClosed(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	root := t.TempDir()
 	issues := []app.LoadIssue{invalidIssue(t, root, "broken")}
@@ -118,7 +115,6 @@ func TestPersistStartupDiscoveryMissingObservationFailsClosed(t *testing.T) {
 // worker's pre-read observation for one app, while a second invalid observation
 // is still recorded normally. Stale rejection is recoverable, not an error.
 func TestPersistStartupDiscoveryStaleObservationIsIsolated(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	older := testutil.OpenState(t, dsn)
 	newer := testutil.OpenState(t, dsn)
@@ -174,7 +170,6 @@ func TestPersistStartupDiscoveryStaleObservationIsIsolated(t *testing.T) {
 // nothing, the independent invalid issue is still recorded, and the later
 // discovery failure is propagated as critical.
 func TestPersistStartupDiscoveryRebuildFailureKeepsObservationsConsistent(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	st := testutil.OpenState(t, dsn)
 	root := t.TempDir()
@@ -212,7 +207,6 @@ func TestPersistStartupDiscoveryRebuildFailureKeepsObservationsConsistent(t *tes
 // without the exact token from its discovery write is not prepared at all, while
 // an app that has one is prepared normally.
 func TestPrepareAppsFailsClosedWithoutFencingToken(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	writeWorkerApp(t, root, "alpha", "def handler(e): return 1\n")
 	writeWorkerApp(t, root, "beta", "def handler(e): return 2\n")
@@ -250,7 +244,6 @@ func TestPrepareAppsFailsClosedWithoutFencingToken(t *testing.T) {
 // publication boundary: a prepared app cannot enqueue service convergence
 // without the exact fencing token returned by its discovery write.
 func TestStartupServicePublicationFailsClosedWithoutToken(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := testutil.NewState(t)
 	fn := app.App{Name: "alpha", Template: &app.Template{}}
 	prepared := []*runner.PreparedApp{

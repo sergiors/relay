@@ -13,7 +13,6 @@ import (
 	"relay/internal/config"
 	"relay/internal/observability/metrics"
 	"relay/internal/state"
-	"relay/internal/testutil"
 )
 
 // TestStatsPersistWithMetricsDisabled is the regression for the reported bug:
@@ -21,7 +20,6 @@ import (
 // PostgreSQL. It wires the registry exactly as Run does (setupMetrics with an empty
 // address), runs the unconditional statsLoop, and asserts the persisted totals.
 func TestStatsPersistWithMetricsDisabled(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	reg, srv := setupMetrics(config.Config{}, lifecycleLogger())
 	if srv != nil {
 		t.Fatal("precondition: metrics server must be nil when disabled")
@@ -70,7 +68,6 @@ func TestStatsPersistWithMetricsDisabled(t *testing.T) {
 // the stats flush reads, a single accounted event appears once on /metrics and
 // once in the persisted snapshot (never double-counted).
 func TestMetricsEnabledExposesSingleAccountingRegistry(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("free port: %v", err)
@@ -115,7 +112,6 @@ func TestMetricsEnabledExposesSingleAccountingRegistry(t *testing.T) {
 // the persisted rows zero, while the Prometheus counters stay monotonic (the
 // same semantics as when exposition is enabled, since it is the same registry).
 func TestStatsResetWithMetricsDisabled(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	reg, srv := setupMetrics(config.Config{}, lifecycleLogger())
 	if srv != nil {
 		t.Fatal("precondition: metrics server must be nil when disabled")
@@ -165,7 +161,6 @@ func TestStatsResetWithMetricsDisabled(t *testing.T) {
 // and persists with METRICS_ADDR unset (the registry always exists), so the
 // last interval of telemetry is not lost when HTTP exposition is disabled.
 func TestFinalStatsFlushWithMetricsDisabled(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	reg, srv := setupMetrics(config.Config{}, lifecycleLogger())
 	if srv != nil {
 		t.Fatal("precondition: metrics server must be nil when disabled")
@@ -192,7 +187,6 @@ func TestFinalStatsFlushWithMetricsDisabled(t *testing.T) {
 // when metrics are disabled: a fresh always-present registry is seeded from the
 // persisted totals and the first flush writes them back rather than zeroing.
 func TestStatsRestoreWithMetricsDisabled(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
 		t.Errorf("state write error: %v", err)

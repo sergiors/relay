@@ -9,12 +9,10 @@ import (
 
 	"relay/internal/runner"
 	"relay/internal/state"
-	"relay/internal/testutil"
 )
 
 // discovered -> the state DB records a ready row with handlers.
 func TestReconcileStateDiscoverSuccess(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	writeFnDir(t, root, "brand-new")
 
@@ -43,7 +41,6 @@ func TestReconcileStateDiscoverSuccess(t *testing.T) {
 
 // Build failure retains the prior active state fields but records failed.
 func TestReconcileStateFailureKeepsActiveAndMarksFailed(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "flaky")
 
@@ -89,7 +86,6 @@ func TestReconcileStateFailureKeepsActiveAndMarksFailed(t *testing.T) {
 // outcome (RecordDiscovered seeds empty reconcile fields); the last meaningful
 // reconcile (none yet) is untouched.
 func TestReconcileStateUnchangedDoesNotRecordOutcome(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "stable")
 
@@ -113,7 +109,6 @@ func TestReconcileStateUnchangedDoesNotRecordOutcome(t *testing.T) {
 
 // Removal deletes the state row and handlers.
 func TestReconcileStateRemoved(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "tobe-removed")
 
@@ -136,7 +131,6 @@ func TestReconcileStateRemoved(t *testing.T) {
 // ever prepared) and last_error, while never writing a success/ready outcome and
 // never dropping the previously-loaded registry entry.
 func TestReconcileStateInvalidTemplateRecordsFailureWithoutActiveGeneration(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "guarded")
 
@@ -179,7 +173,6 @@ func TestReconcileStateInvalidTemplateRecordsFailureWithoutActiveGeneration(t *t
 // must remove its apps row, app_stats, and handlers while leaving an
 // unrelated app and the global stats row untouched.
 func TestReconcileStateRemovalCleansAllTables(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	victimDir := writeFnDir(t, root, "victim")
 	bystanderDir := writeFnDir(t, root, "bystander")
@@ -259,7 +252,6 @@ func TestReconcileStateRemovalCleansAllTables(t *testing.T) {
 // ready, its app_stats row keeps its original counters and updated_at, and
 // no removal is recorded.
 func TestReconcileStateFailedBuildDoesNotRemoveStats(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "flaky")
 
@@ -316,7 +308,6 @@ func TestReconcileStateFailedBuildDoesNotRemoveStats(t *testing.T) {
 // and its app_stats survive untouched as ROWS, the prior active generation
 // is retained (degraded), and the registry still serves the previous version.
 func TestReconcileStateInvalidTemplateDoesNotRemove(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "guarded")
 

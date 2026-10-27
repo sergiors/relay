@@ -9,14 +9,12 @@ import (
 
 	"relay/internal/observability/metrics"
 	"relay/internal/state"
-	"relay/internal/testutil"
 )
 
 // TestWireStatusObserverProjectsTransitions pins the worker's state→metrics
 // bridge: discovery moves the one-hot status to preparing, a success to ready,
 // and a removal deletes the app's status series.
 func TestWireStatusObserverProjectsTransitions(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	reg := metrics.New()
 	wireStatusObserver(st, reg)
@@ -56,7 +54,6 @@ func TestWireStatusObserverProjectsTransitions(t *testing.T) {
 // TestWireStatusObserverNilSafe pins that no state handle (or nil registry) is a
 // silent no-op rather than a panic.
 func TestWireStatusObserverNilSafe(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	wireStatusObserver(nil, metrics.New())
 
 	st := openTempState(t)
@@ -72,7 +69,6 @@ func TestWireStatusObserverNilSafe(t *testing.T) {
 // status is a current-state gauge, not a cumulative total, so it must never be
 // reset or baselined. The Prometheus counters stay monotonic too.
 func TestStatsResetDoesNotTouchAppStatus(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	reg := metrics.New()
 	wireStatusObserver(st, reg)

@@ -241,7 +241,6 @@ func openRecoveryReplacementState(t *testing.T, dsn, workerID, instanceID string
 //	      recovery is an idempotent no-op.
 func TestIntegrationStartupRecoveryAdoptsServiceAfterAbruptExit(t *testing.T) {
 	dcli := testutil.RequireDocker(t)
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	logger := testutil.DiscardLogger()
 	ensureRecoveryImage(t, dcli)
@@ -540,7 +539,6 @@ func TestIntegrationStartupRecoveryAdoptsServiceAfterAbruptExit(t *testing.T) {
 // retry counts, which the unit tests pin instead.
 func TestIntegrationStartupRecoveryFinishesInterruptedOrphanSweep(t *testing.T) {
 	dcli := testutil.RequireDocker(t)
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	logger := testutil.DiscardLogger()
 	ensureRecoveryImage(t, dcli)
@@ -685,7 +683,6 @@ func TestIntegrationStartupRecoveryFinishesInterruptedOrphanSweep(t *testing.T) 
 // removal, so a replacement owner's containers are never disturbed.
 func TestIntegrationStartupSweepsSkipRemovalAfterOwnershipLoss(t *testing.T) {
 	dcli := testutil.RequireDocker(t)
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	logger := testutil.DiscardLogger()
 	ensureRecoveryImage(t, dcli)

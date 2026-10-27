@@ -81,11 +81,11 @@ worker; admin commands communicate with it or read persistent state.
 - Focus a test with `go test ./internal/<package> -run '^TestName$'`; add
   `-tags=integration` when needed.
 
-State-backed unit tests can silently skip without `TEST_DATABASE_URL`. CI
-provides PostgreSQL for unit and integration tests, plus Redis and Node 24 for
-integration. Integration tests need the relevant real services: Docker (client
-uses `FromEnv`), Redis (`REDIS_TEST_ADDR`, default `localhost:6379`), and
-PostgreSQL (`TEST_DATABASE_URL`, default CI DSN).
+Integration tests fail rather than skip when required PostgreSQL, Redis, or
+Docker infrastructure is unavailable. CI provides PostgreSQL for unit and
+integration tests, plus Redis and Node 24 for integration. Tests require only
+the relevant services: Docker (client uses `FromEnv`), Redis (`REDIS_TEST_ADDR`,
+default `localhost:6379`), and PostgreSQL (`TEST_DATABASE_URL`, default CI DSN).
 
 For behavior and detailed contracts, consult `README.md`, `docs/*.md`, relevant
 `internal/*/doc.go` files, `Makefile`, and `.github/workflows/tests.yml`. In

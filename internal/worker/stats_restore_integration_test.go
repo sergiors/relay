@@ -21,7 +21,6 @@ import (
 // fresh registry simply stays at zero (the state reader logs the decode error
 // and reports the row unreadable).
 func TestRestoreToleratesCorruptGlobalJSON(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	st := testutil.OpenState(t, dsn)
 	seedCorruptGlobalRow(t, dsn, st.Owner())
@@ -38,7 +37,6 @@ func TestRestoreToleratesCorruptGlobalJSON(t *testing.T) {
 // a corrupt app_stats payload is skipped by the restore sweep without
 // panicking, and it seeds no series.
 func TestRestoreToleratesCorruptAppJSON(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	st := testutil.OpenState(t, dsn)
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("broken", t.TempDir())); err != nil {
@@ -60,7 +58,6 @@ func TestRestoreToleratesCorruptAppJSON(t *testing.T) {
 // restore into a fresh registry, then flush again — the totals must be
 // preserved (never reset) and the pool counters/timestamps must round-trip.
 func TestWorkerFlushReopenRestoreRoundTrip(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 
 	c1 := testutil.OpenState(t, dsn)
@@ -114,7 +111,6 @@ func TestWorkerFlushReopenRestoreRoundTrip(t *testing.T) {
 // bridges the persisted cumulative counters and per-app rows into a fresh
 // process-lifetime registry, so the first snapshot never resets them.
 func TestRestorePersistedStatsSeedsRegistry(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	m := metrics.New()
 	st := openTempState(t)
 
@@ -173,7 +169,6 @@ func TestRestorePersistedStatsSeedsRegistry(t *testing.T) {
 // persisted values keeps them monotonic, and the flush writes back the same
 // totals (never zeroing them).
 func TestRestorePersistedStatsSeedsPoolCounters(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	m := metrics.New()
 	st := openTempState(t)
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
@@ -215,7 +210,6 @@ func TestRestorePersistedStatsSeedsPoolCounters(t *testing.T) {
 // the assertion is that the counters round-trip and the gauges leave no trace in
 // the decoded row.
 func TestFlushPersistsCountersNotLiveGauges(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
 		t.Errorf("state write error: %v", err)
@@ -256,7 +250,6 @@ func TestFlushPersistsCountersNotLiveGauges(t *testing.T) {
 // TestRestorePersistedStatsNilSafe guards the nil-safety contract: a nil
 // registry or nil state handle must never panic.
 func TestRestorePersistedStatsNilSafe(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	restorePersistedStats(nil, st)            // nil registry
 	restorePersistedStats(metrics.New(), nil) // nil state
@@ -267,7 +260,6 @@ func TestRestorePersistedStatsNilSafe(t *testing.T) {
 // regression: statsLoop's immediate first snapshot must not zero the persisted
 // counters when the registry was seeded from them at startup.
 func TestStatsLoopFirstSnapshotPreservesPersistedCounters(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	st.RecordStats(state.Stats{
 		EventsMatchedTotal:  100,
@@ -329,7 +321,6 @@ func TestStatsLoopFirstSnapshotPreservesPersistedCounters(t *testing.T) {
 // restorePersistedStats so an app removed while the worker was down is
 // pruned before its stale app_stats row could be re-seeded into metrics.
 func TestStartupSweepPrunesBeforeSeeding(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 
 	// A real apps root with ONE app dir ("kept"); "stale" has no dir.
@@ -418,7 +409,6 @@ func TestStartupSweepPrunesBeforeSeeding(t *testing.T) {
 // WITHOUT timestamps, and the persisted timestamps must still survive the
 // flush's case-guarded upsert.
 func TestRestoreSeedsAndFlushesTimestamps(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
 		t.Errorf("state write error: %v", err)
@@ -483,7 +473,6 @@ func TestRestoreSeedsAndFlushesTimestamps(t *testing.T) {
 // and unparseable persisted strings restore as 0 ("never observed") and the
 // worker never errors the startup path over a corrupt timestamp column.
 func TestRestoreSkipsInvalidAndEmptyTimestamps(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
 		t.Errorf("state write error: %v", err)

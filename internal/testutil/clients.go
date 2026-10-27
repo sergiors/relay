@@ -2,6 +2,9 @@ package testutil
 
 import (
 	"context"
+	"net/url"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,26 +16,68 @@ import (
 
 // RequireRedis fails the test when the test Redis (REDIS_TEST_ADDR, default
 // localhost:6379) is not reachable, instead of skipping: the integration suites
-// that use it are meaningless without real Redis state. The client is closed via
-// t.Cleanup.
+// that use it are meaningless without real Redis state. REDIS_TEST_ADDR may be
+// a host:port address or a redis:// / rediss:// URL; diagnostics name only the
+// server, never URL credentials. The client is closed via t.Cleanup.
 func RequireRedis(t *testing.T) *redis.Client {
 	t.Helper()
 	addr := EnvOr("REDIS_TEST_ADDR", "localhost:6379")
-	opts, _ := config.RedisOptions(addr)
+	opts, err := config.RedisOptions(addr)
+	if err != nil {
+		t.Fatalf(
+			"redis integration test requires a valid Redis address at %s "+
+				"(from REDIS_TEST_ADDR): %v",
+			redisEndpoint(addr),
+			err,
+		)
+	}
 	cli := redis.NewClient(opts)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := cli.Ping(ctx).Err(); err != nil {
 		_ = cli.Close()
 		t.Fatalf(
-			"redis integration test requires a reachable Redis at %s (ping: %v); "+
-				"start one with `docker compose -f compose.dev.yaml up -d`",
-			addr,
-			err,
+			"redis integration test requires a reachable Redis at %s "+
+				"(from REDIS_TEST_ADDR); start Redis and point "+
+				"REDIS_TEST_ADDR at it (ping: %s)",
+			redisEndpoint(addr),
+			redactEndpointCredentials(err.Error()),
 		)
 	}
-	t.Cleanup(func() { cli.Close() })
+	t.Cleanup(func() { _ = cli.Close() })
 	return cli
+}
+
+// redisEndpoint names the configured Redis server without URL credentials. The
+// documented form is a plain host:port, which is shown as-is.
+func redisEndpoint(addr string) string {
+	if !strings.HasPrefix(addr, "redis://") &&
+		!strings.HasPrefix(addr, "rediss://") {
+		// A malformed plain address with userinfo would otherwise put the
+		// credentials in the failure message; it is not a supported form.
+		if strings.Contains(addr, "@") {
+			return "the configured Redis server"
+		}
+		return addr
+	}
+	u, err := url.Parse(addr)
+	if err != nil || u.Host == "" {
+		return "the configured Redis server"
+	}
+	return u.Host
+}
+
+// endpointUserinfo matches the credentials in any scheme://user:pass@host
+// fragment. Driver errors can quote the endpoint verbatim, so diagnostics must
+// scrub them before printing.
+var endpointUserinfo = regexp.MustCompile(
+	`([a-zA-Z][a-zA-Z0-9+.-]*://)[^\s@]*@`,
+)
+
+// redactEndpointCredentials removes URL userinfo from diagnostic text without
+// disturbing the rest of a driver error.
+func redactEndpointCredentials(text string) string {
+	return endpointUserinfo.ReplaceAllString(text, "$1")
 }
 
 // RequireDocker fails the test immediately when the Docker Engine API daemon
@@ -44,17 +89,23 @@ func RequireDocker(t *testing.T) *client.Client {
 	t.Helper()
 	cli, err := client.New(client.FromEnv)
 	if err != nil {
-		t.Fatalf("docker integration test requires a Docker daemon (client: %v)", err)
+		t.Fatalf(
+			"docker integration test requires a Docker daemon reachable via "+
+				"DOCKER_HOST or the local socket (client: %s)",
+			redactEndpointCredentials(err.Error()),
+		)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, err := cli.Ping(ctx, client.PingOptions{}); err != nil {
+		_ = cli.Close()
 		t.Fatalf(
-			"docker integration test requires a reachable Docker daemon (ping: %v); "+
-				"start one or run `docker compose -f compose.dev.yaml up -d`",
-			err,
+			"docker integration test requires a reachable Docker daemon via "+
+				"DOCKER_HOST or the local socket; start Docker or point DOCKER_HOST "+
+				"at a running daemon (ping: %s)",
+			redactEndpointCredentials(err.Error()),
 		)
 	}
-	t.Cleanup(func() { cli.Close() })
+	t.Cleanup(func() { _ = cli.Close() })
 	return cli
 }

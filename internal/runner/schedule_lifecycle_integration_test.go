@@ -22,7 +22,6 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"relay/internal/app"
-	"relay/internal/config"
 	"relay/internal/runtime"
 	"relay/internal/schedule"
 	"relay/internal/stream"
@@ -137,15 +136,12 @@ type scheduleEnv struct {
 }
 
 // newScheduleEnv builds the harness and wires r.InvokeOccurrence as the
-// consumer's ScheduleRunner.
+// consumer's ScheduleRunner. The Redis client is the fail-fast one owned by
+// testutil.RequireRedis; its cleanup closes the client after this harness's own
+// key cleanup has run.
 func newScheduleEnv(t *testing.T, r *Runner) *scheduleEnv {
 	t.Helper()
-	addr := testutil.EnvOr("REDIS_TEST_ADDR", "localhost:6379")
-	redisOpts, err := config.RedisOptions(addr)
-	if err != nil {
-		t.Fatalf("redis options: %v", err)
-	}
-	cli := redis.NewClient(redisOpts)
+	cli := testutil.RequireRedis(t)
 	cctx, cancel := context.WithCancel(context.Background())
 	prefix := fmt.Sprintf("itest-%d", time.Now().UnixNano())
 	streamName := prefix + "-stream"
@@ -163,7 +159,6 @@ func newScheduleEnv(t *testing.T, r *Runner) *scheduleEnv {
 	c := stream.NewConsumer(cfg)
 	if err := c.EnsureGroup(cctx); err != nil {
 		cancel()
-		_ = cli.Close()
 		t.Fatalf("ensure group: %v", err)
 	}
 	e := &scheduleEnv{
@@ -214,7 +209,8 @@ func (e *scheduleEnv) cleanup() {
 		}
 		cursor = next
 	}
-	_ = e.client.Close()
+	// The client is owned by testutil.RequireRedis, whose cleanup closes it after
+	// this cleanup (t.Cleanup is LIFO).
 }
 
 func (e *scheduleEnv) start() {
@@ -379,23 +375,6 @@ func (e *scheduleEnv) eventually(what string, pred func() bool) {
 	e.t.Fatalf("timed out waiting for %s", what)
 }
 
-// redisAvailable returns a live client or skips the test when Redis is down.
-func redisAvailable(t *testing.T) *redis.Client {
-	t.Helper()
-	addr := testutil.EnvOr("REDIS_TEST_ADDR", "localhost:6379")
-	opts, err := config.RedisOptions(addr)
-	if err != nil {
-		t.Fatalf("redis options: %v", err)
-	}
-	cli := redis.NewClient(opts)
-	if err := cli.Ping(context.Background()).Err(); err != nil {
-		_ = cli.Close()
-		t.Skipf("redis integration test requires a reachable Redis at %s (%v); start `docker compose -f compose.dev.yaml up -d redis`", addr, err)
-	}
-	t.Cleanup(func() { cli.Close() })
-	return cli
-}
-
 // --- tests ---
 
 // TestIntegrationScheduleInvocationStateLifecycle drives a schedule message whose
@@ -405,7 +384,6 @@ func redisAvailable(t *testing.T) *redis.Client {
 // inside the second attempt; and once released, the message is ACKed and its
 // invocation-state key cleared (the clear only runs after a successful ACK).
 func TestIntegrationScheduleInvocationStateLifecycle(t *testing.T) {
-	_ = redisAvailable(t)
 	release := make(chan struct{})
 	exec := &stateAwareExecutor{fail: 1, releaseCall: release}
 	r := registerScheduleFn(t, exec, 1)
@@ -464,7 +442,6 @@ func TestIntegrationScheduleInvocationStateLifecycle(t *testing.T) {
 // next_attempt_at marker under its own key, and neither's marker (or lifecycle)
 // leaks into the other's hash.
 func TestIntegrationScheduleOccurrencesDoNotShareState(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{fail: 1000} // always fails → never ACKs, backoff markers persist
 	r := registerScheduleFn(t, exec, 100)
 	e := newScheduleEnv(t, r)
@@ -514,7 +491,6 @@ func TestIntegrationScheduleOccurrencesDoNotShareState(t *testing.T) {
 // and the stream routes the message to the DLQ — not left pending and not acked
 // silently.
 func TestIntegrationScheduleExhaustionRoutesToDLQ(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{fail: 100} // always fails
 	r := registerScheduleFn(t, exec, 0)    // retries:0 → exhaust on attempt 1
 	e := newScheduleEnv(t, r)
@@ -575,7 +551,6 @@ func (e *scheduleEnv) inDlq(id string) bool {
 // "ok" BEFORE the consumer starts, so a real delivery skips the executor and is
 // ACKed (and its state key cleared), proving the already-complete redelivery path.
 func TestIntegrationScheduleReclaimSkipsCompleted(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 1)
 	e := newScheduleEnv(t, r)
@@ -604,7 +579,6 @@ func TestIntegrationScheduleReclaimSkipsCompleted(t *testing.T) {
 // runner keeps failing leaves the field as a retryable next_attempt_at marker and
 // the message pending (never acked, never DLQ'd) across reclaims.
 func TestIntegrationScheduleRetryFailureLeavesPending(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{fail: 1000}
 	r := registerScheduleFn(t, exec, 100)
 	e := newScheduleEnv(t, r)
@@ -652,7 +626,6 @@ func TestIntegrationScheduleRetryFailureLeavesPending(t *testing.T) {
 // the PEL), never DLQ'd, and the invocation-state key terminal-retained — never
 // retried forever.
 func TestIntegrationScheduleObsoleteAppRemoved(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{fail: 1000} // would never succeed if it ran
 	r := registerScheduleFn(t, exec, 100)
 	e := newScheduleEnv(t, r)
@@ -701,7 +674,6 @@ func TestIntegrationScheduleObsoleteAppRemoved(t *testing.T) {
 // the handler. The occurrence must be treated as obsolete: ACKed, not DLQ'd,
 // never retried forever, and the executor never runs.
 func TestIntegrationScheduleObsoleteScheduleHandlerRemoved(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 100)
 	e := newScheduleEnv(t, r)
@@ -747,7 +719,6 @@ func TestIntegrationScheduleObsoleteScheduleHandlerRemoved(t *testing.T) {
 // occurrence PENDING across reclaim cycles — never ACKed, never DLQ'd. It is a
 // temporary condition, not an obsolete removal.
 func TestIntegrationScheduleUnavailableStaysPending(t *testing.T) {
-	_ = redisAvailable(t)
 	r := NewWithMetrics(
 		[]*PreparedApp{NewUnavailable(app.App{Name: scheduleFnName, Template: &app.Template{Runtime: "node24"}})},
 		testutil.DiscardLogger(), nil)
@@ -826,7 +797,6 @@ func (e *scheduleEnv) descriptorField(msgID string) (string, error) {
 // resolves to a NEW handler. The occurrence is admitted under the NEW handler and
 // its descriptor is pinned with it.
 func TestIntegrationScheduleAdmissionPinsCurrentHandlerBeforeStart(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{}
 	r := NewWithMetrics(
 		[]*PreparedApp{scheduleFnNamed(t, "sched", "jobs.new", exec, time.Second, 0)},
@@ -873,7 +843,6 @@ func TestIntegrationScheduleAdmissionPinsCurrentHandlerBeforeStart(t *testing.T)
 // run the ADMITTED handler and complete — never treat the admitted occurrence as
 // obsolete.
 func TestIntegrationScheduleAdmittedThenScheduleRemovedStillCompletes(t *testing.T) {
-	_ = redisAvailable(t)
 	failing := &firstFailExecutor{failFirst: 1}
 	// retries: 4 so the first failure is retryable (does not exhaust).
 	r := NewWithMetrics(
@@ -996,7 +965,6 @@ type streamScheduleDescriptor struct {
 // rejected before execution and dead-lettered, never run and never ACKed as
 // success.
 func TestIntegrationScheduleForgedTimestampNeverExecutesAndDLQs(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 4)
 	e := newScheduleEnv(t, r)
@@ -1029,7 +997,6 @@ func TestIntegrationScheduleForgedTimestampNeverExecutesAndDLQs(t *testing.T) {
 // TestIntegrationScheduleValidTimestampExecutes pins the complement: a real
 // whole-minute firing of the same schedule executes and is ACKed.
 func TestIntegrationScheduleValidTimestampExecutes(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 4)
 	e := newScheduleEnv(t, r)
@@ -1056,7 +1023,6 @@ func TestIntegrationScheduleValidTimestampExecutes(t *testing.T) {
 // event path, the crash alone did not exhaust: the reclaim's real failing
 // execution is what wrote the terminal marker.
 func TestIntegrationScheduleCrashAfterAdmissionSpendsAttempt(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{fail: 1000} // always fails
 	r := registerScheduleFn(t, exec, 0)     // retries:0 → exhaust on the next attempt
 	e := newScheduleEnv(t, r)
@@ -1121,7 +1087,6 @@ const reservedScheduleRejectionField = "__schedule_rejected"
 // dead-lettered and the message ACKed — even though the current template would
 // have admitted the (valid) occurrence. The handler never executes.
 func TestIntegrationScheduleReservedInvalidRetryCompletesDLQ(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 4)
 	e := newScheduleEnv(t, r)
@@ -1167,7 +1132,6 @@ func TestIntegrationScheduleReservedInvalidRetryCompletesDLQ(t *testing.T) {
 // reserved OBSOLETE rejection is ACKed on the retry — never dead-lettered, never
 // executed — even though the current template would admit the occurrence.
 func TestIntegrationScheduleReservedObsoleteRetryAcks(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 4)
 	e := newScheduleEnv(t, r)
@@ -1198,7 +1162,6 @@ func TestIntegrationScheduleReservedObsoleteRetryAcks(t *testing.T) {
 // invocation-state hash (it survives the terminal ACK's retention), so a retry
 // can never be raced into an admission.
 func TestIntegrationScheduleInvalidOccurrenceReservesRejection(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 4)
 	e := newScheduleEnv(t, r)
@@ -1261,7 +1224,6 @@ func (e *scheduleEnv) staysPending(t *testing.T, id string, window time.Duration
 // idempotently when the app is absent — never left PEL-pending forever, never
 // DLQ'd — and the marker is never overwritten by a reservation.
 func TestIntegrationScheduleLegacyOKWithoutDescriptorAcked(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 4)
 	e := newScheduleEnv(t, r)
@@ -1297,7 +1259,6 @@ func TestIntegrationScheduleLegacyOKWithoutDescriptorAcked(t *testing.T) {
 // (with the exact app/handler and the marker's attempt) and then ACKed. The
 // marker is upgraded to ":dlq", never overwritten by a reservation.
 func TestIntegrationScheduleLegacyExhaustedWithoutDescriptorDLQOnce(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 4)
 	e := newScheduleEnv(t, r)
@@ -1344,7 +1305,6 @@ func TestIntegrationScheduleLegacyExhaustedWithoutDescriptorDLQOnce(t *testing.T
 // idempotent half: an exhausted marker that already carries ":dlq" (its entry was
 // persisted by an earlier delivery) is ACKed with NO duplicate DLQ write.
 func TestIntegrationScheduleLegacyExhaustedDLQAlreadyPersistedAcks(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 4)
 	e := newScheduleEnv(t, r)
@@ -1376,7 +1336,6 @@ func TestIntegrationScheduleLegacyExhaustedDLQAlreadyPersistedAcks(t *testing.T)
 // running marker AND a terminal "ok" marker stays PENDING — never ACKed, never
 // DLQ'd, no reservation written — because the active attempt may still complete.
 func TestIntegrationScheduleLegacyActiveMarkerStaysPending(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 4)
 	e := newScheduleEnv(t, r)
@@ -1436,7 +1395,6 @@ func seedPinnedTerminal(t *testing.T, e *scheduleEnv, id, marker string) {
 // terminal-retained (never left PEL-pending forever), with no reservation
 // overwriting the marker.
 func TestIntegrationSchedulePinnedOKAcked(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 4)
 	e := newScheduleEnv(t, r)
@@ -1464,7 +1422,6 @@ func TestIntegrationSchedulePinnedOKAcked(t *testing.T) {
 // occurrence must be dead-lettered exactly once (correct app/handler/attempt),
 // the marker upgraded to ":dlq", and the message ACKed.
 func TestIntegrationSchedulePinnedExhaustedMissingDLQDLQOnce(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 4)
 	e := newScheduleEnv(t, r)
@@ -1509,7 +1466,6 @@ func TestIntegrationSchedulePinnedExhaustedMissingDLQDLQOnce(t *testing.T) {
 // idempotent half for a pinned descriptor: an exhausted marker that already
 // carries ":dlq" is ACKed with NO duplicate DLQ write.
 func TestIntegrationSchedulePinnedExhaustedDLQAlreadyPersistedAcks(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 4)
 	e := newScheduleEnv(t, r)
@@ -1536,7 +1492,6 @@ func TestIntegrationSchedulePinnedExhaustedDLQAlreadyPersistedAcks(t *testing.T)
 // running marker (the claim may still complete), so an app-absent delivery must
 // keep the message PENDING — never ACK, never DLQ, no reservation.
 func TestIntegrationSchedulePinnedActiveStaysPending(t *testing.T) {
-	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 4)
 	e := newScheduleEnv(t, r)

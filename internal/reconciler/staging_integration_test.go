@@ -21,7 +21,6 @@ import (
 // live sync's transient ".sync-*" directory from recording degraded/unavailable
 // state.
 func TestReconcileAppIgnoresStagingDir(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	writeStageDir(t, root, ".sync-123456")
 
@@ -51,7 +50,6 @@ func TestReconcileAppIgnoresStagingDir(t *testing.T) {
 // records its invalid desired state), but never the staging directory — no
 // registry entry, no state row, no warning.
 func TestReconcileAllIgnoresStagingDirKeepsNeighborAndInvalid(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	writeStageDir(t, root, ".sync-abc")
 	writeFnDir(t, root, "valid")
@@ -95,7 +93,6 @@ func TestReconcileAllIgnoresStagingDirKeepsNeighborAndInvalid(t *testing.T) {
 // reconciled, the earlier stage events on that watch have necessarily been
 // observed, so the absence assertion is deterministic.
 func TestWatcherIgnoresStagingDirEvents(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	realDir := writeFnDir(t, root, "real")
 

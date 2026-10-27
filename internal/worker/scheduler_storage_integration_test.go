@@ -13,7 +13,6 @@ import (
 // shared state handle is installed and the durable retry worker is started; no
 // unavailable marking or bootstrap is used.
 func TestWireSchedulerStorageWithSharedHandle(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := testutil.NewState(t)
 
 	fake := &fakeSchedulerStorage{}

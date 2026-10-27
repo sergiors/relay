@@ -18,7 +18,6 @@ import (
 // resolves the occurrence it finds. It proves the whole chain wires together
 // without a fake store.
 func TestDurableRetryThroughRealStateDB(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	frozen := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
 	dsn := testutil.NewStateDSN(t)
 
@@ -72,7 +71,6 @@ func TestDurableRetryThroughRealStateDB(t *testing.T) {
 // never published. The scheduler's injectable clock stands in for wall time, so
 // the "expired" case uses a clock past the row's real 7-day deadline.
 func TestExpiredRecordIsNotRetryableAfterRestart(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	o := pendingOccurrence("a", "jobs.a")
 	save := func(t *testing.T, path string) {
 		t.Helper()
@@ -90,7 +88,6 @@ func TestExpiredRecordIsNotRetryableAfterRestart(t *testing.T) {
 	}
 
 	t.Run("inside retention remains retryable", func(t *testing.T) {
-		testutil.RequireStateDatabase(t)
 		dsn := testutil.NewStateDSN(t)
 		save(t, dsn)
 		st := testutil.OpenState(t, dsn)
@@ -109,7 +106,6 @@ func TestExpiredRecordIsNotRetryableAfterRestart(t *testing.T) {
 	})
 
 	t.Run("after expiry is cleaned without publishing", func(t *testing.T) {
-		testutil.RequireStateDatabase(t)
 		dsn := testutil.NewStateDSN(t)
 		save(t, dsn)
 		st := testutil.OpenState(t, dsn)

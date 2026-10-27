@@ -20,7 +20,6 @@ import (
 // documented removal path) instead of retaining it as a degraded invalid desired
 // state.
 func TestReconcileUnsupportedEntryRemovesStateRow(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "filed-over")
 
@@ -61,7 +60,6 @@ func TestReconcileUnsupportedEntryRemovesStateRow(t *testing.T) {
 // (a plain file, a dangling link, or an absent path) is a no-op: no registry
 // entry, no state row, no invalid desired write, no build.
 func TestReconcileUnknownUnsupportedEntryDoesNothing(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "stranger"), []byte("noise\n"), 0o644); err != nil {
 		t.Fatalf("write stranger file: %v", err)
@@ -97,7 +95,6 @@ func TestReconcileUnknownUnsupportedEntryDoesNothing(t *testing.T) {
 // watch has reconciled, the earlier unsupported-entry events have necessarily
 // been observed, so the absence assertions are deterministic.
 func TestWatcherIgnoresUnknownFileEvents(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	realDir := writeFnDir(t, root, "real")
 

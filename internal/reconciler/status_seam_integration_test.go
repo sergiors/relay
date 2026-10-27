@@ -22,7 +22,6 @@ import (
 // status callbacks the production worker wires and asserts the persisted status
 // as each boundary runs.
 func TestReconcileServiceStatusPersistedPreparingReconcilingReady(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeServicesDir(t, root, "svc-persist")
 	tmpl := mustParse(servicesTemplate)
@@ -76,7 +75,6 @@ func TestReconcileServiceStatusPersistedPreparingReconcilingReady(t *testing.T) 
 // build leaves a degraded (not unavailable) status when an active image exists,
 // and the ready status is never reached.
 func TestReconcileServiceFailureStatusRetainsGeneration(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeServicesDir(t, root, "svc-fail")
 	tmpl := mustParse(servicesTemplate)
@@ -124,7 +122,6 @@ func TestReconcileServiceFailureStatusRetainsGeneration(t *testing.T) {
 // outcome. The reconciler's callbacks are captured per generation and fired
 // explicitly in the stale-then-current order.
 func TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeServicesDir(t, root, "svc-gen")
 	tmpl := mustParse(servicesTemplate)

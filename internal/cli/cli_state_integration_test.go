@@ -14,14 +14,12 @@ import (
 
 // stateTestDeps is the opt-in real-state fixture: testDeps plus an OpenState
 // that opens a PostgreSQL handle on a fresh per-test schema. It is
-// integration-only: it requires a reachable PostgreSQL (failing, not skipping,
-// when absent) and reuses testutil.NewStateDSN, so every test gets its own
-// schema (dropped on cleanup after the handles opened on it close). Only tests
-// that genuinely read or write state should use it; the default testDeps stays
-// database-free.
+// integration-only: testutil.NewStateDSN creates every test's own schema
+// (dropped on cleanup after the handles opened on it close) and fails, rather
+// than skips, when the database is unreachable. Only tests that genuinely read
+// or write state should use it; the default testDeps stays database-free.
 func stateTestDeps(t *testing.T) Dependencies {
 	t.Helper()
-	testutil.RequireStateDatabase(t)
 	deps := testDeps(t)
 	dsn := testutil.NewStateDSN(t)
 	deps.OpenState = func(ctx context.Context) (*state.State, func(), error) {
@@ -38,7 +36,6 @@ func stateTestDeps(t *testing.T) Dependencies {
 // touch the start lock: with the lock held elsewhere, they still succeed and the
 // lock file is not created or modified by them.
 func TestNonStartCommandsDoNotAcquireLock(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	deps := stateTestDeps(t)
 	held, err := processlock.Acquire(deps.LockPath)
 	if err != nil {

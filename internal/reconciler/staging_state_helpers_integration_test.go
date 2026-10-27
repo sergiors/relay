@@ -24,7 +24,6 @@ func newTestStateReconcilerLogging(
 	logs *testutil.SyncBuffer,
 ) (*Reconciler, *runner.Registry, *state.State) {
 	t.Helper()
-	testutil.RequireStateDatabase(t)
 	st := testutil.NewState(t)
 	reg := &runner.Registry{}
 	reg.Set(initial)

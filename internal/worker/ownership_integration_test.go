@@ -29,7 +29,6 @@ import (
 // and the monitor latches the loss, clears readiness, and cancels the lifecycle.
 // A replacement incarnation of the same worker can then take the identity.
 func TestIntegrationOwnershipMonitorDetectsTerminatedLockBackend(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 
 	owner := testutil.UniqueName(t, "owner-monitor")
@@ -93,7 +92,6 @@ func TestIntegrationOwnershipMonitorDetectsTerminatedLockBackend(t *testing.T) {
 // background-context verification must STILL detect the lost lock and latch it,
 // so the identity-scoped cleanup guards that run later skip their work.
 func TestIntegrationFinalOwnershipVerificationDetectsMissedLoss(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 
 	st := testutil.OpenState(t, dsn, state.Options{Owner: "worker-final", Instance: "inst-1"})
@@ -153,7 +151,6 @@ func TestIntegrationFinalOwnershipVerificationDetectsMissedLoss(t *testing.T) {
 // failed them with "conn busy", which the monitor would misread as a lost lock
 // and use to shut the worker down.
 func TestIntegrationVerifyOwnerLockConcurrentUnderMonitor(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 
 	owner := testutil.UniqueName(t, "owner-stress")

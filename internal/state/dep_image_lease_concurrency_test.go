@@ -32,7 +32,6 @@ import (
 // verify, and release leases on the same handle. Every call must succeed: an
 // overlap on the pinned connection would surface as a "conn busy" error.
 func TestIntegrationOwnerlessDependencyLeaseConcurrentVerify(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := testutil.OpenState(t, testutil.NewStateDSN(t))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -95,7 +94,6 @@ func TestIntegrationOwnerlessDependencyLeaseConcurrentVerify(t *testing.T) {
 // not overlap pgx calls there either, and must not disturb the ownership lock
 // verification path that shares that connection.
 func TestIntegrationOwnerfulDependencyLeaseConcurrentVerify(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	// Advisory locks are database-scoped, so the worker identity must be unique
 	// across concurrently running tests in this database.
@@ -162,7 +160,6 @@ func TestIntegrationOwnerfulDependencyLeaseConcurrentVerify(t *testing.T) {
 // blocked behind a wedged connection), the verifying goroutine must terminate,
 // and every later coordination call on the handle must fail closed.
 func TestIntegrationOwnerlessDependencyLeaseCloseDuringVerify(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

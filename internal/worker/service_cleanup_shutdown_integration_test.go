@@ -171,7 +171,6 @@ func serviceLabels(workerID, appName, serviceName string) map[string]string {
 //	      waits for the in-flight cleanup, and the container is gone.
 func TestIntegrationShutdownServiceCleanupRemovesServiceAndCloseJoinsInFlight(t *testing.T) {
 	dcli := testutil.RequireDocker(t)
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 
 	workerID := testutil.UniqueName(t, "svc-cleanup")
@@ -290,7 +289,6 @@ func TestIntegrationShutdownServiceCleanupRemovesServiceAndCloseJoinsInFlight(t 
 //	      container survives.
 func TestIntegrationShutdownServiceCleanupSkipsAfterFailedOwnershipProof(t *testing.T) {
 	dcli := testutil.RequireDocker(t)
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 
 	workerID := testutil.UniqueName(t, "svc-lost")

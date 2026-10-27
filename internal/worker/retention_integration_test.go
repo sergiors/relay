@@ -36,12 +36,11 @@ func requireAckedTrimMode(t *testing.T, cli *redis.Client) {
 //
 // This file is excluded from the default suite by the integration build tag.
 // Running it (`go test -tags=integration ./...`) REQUIRES Redis at REDIS_TEST_ADDR
-// (default localhost:6379, matching compose.dev.yaml); a missing dependency fails
-// the affected tests rather than skipping them. Start the documented dev
-// dependencies with `docker compose -f compose.dev.yaml up -d`.
+// (default localhost:6379); a missing dependency fails the affected tests rather
+// than skipping them. Start Redis and point REDIS_TEST_ADDR at it if it is not
+// on the default address.
 func TestIntegrationRetentionTrimsOldEntries(t *testing.T) {
 	cli := testutil.RequireRedis(t)
-	t.Cleanup(func() { _ = cli.Close() })
 	requireAckedTrimMode(t, cli)
 
 	stream := fmt.Sprintf("relay:retention-test:%d", time.Now().UnixNano())
@@ -107,7 +106,6 @@ func TestIntegrationRetentionTrimsOldEntries(t *testing.T) {
 // node.
 func TestIntegrationRetentionAckedProtectsPending(t *testing.T) {
 	cli := testutil.RequireRedis(t)
-	t.Cleanup(func() { _ = cli.Close() })
 	requireAckedTrimMode(t, cli)
 
 	ctx := context.Background()
@@ -188,7 +186,6 @@ func TestIntegrationRetentionAckedProtectsPending(t *testing.T) {
 // the entry until that group also acks.
 func TestIntegrationRetentionAckedMultipleGroups(t *testing.T) {
 	cli := testutil.RequireRedis(t)
-	t.Cleanup(func() { _ = cli.Close() })
 	requireAckedTrimMode(t, cli)
 
 	ctx := context.Background()
@@ -281,7 +278,6 @@ func TestIntegrationRetentionAckedMultipleGroups(t *testing.T) {
 // retention.
 func TestIntegrationDLQRetentionTrimsOldEntries(t *testing.T) {
 	cli := testutil.RequireRedis(t)
-	t.Cleanup(func() { _ = cli.Close() })
 
 	ctx := context.Background()
 	source := fmt.Sprintf("relay:dlqretention-src:%d", time.Now().UnixNano())
@@ -345,7 +341,6 @@ func TestIntegrationDLQRetentionTrimsOldEntries(t *testing.T) {
 // XTRIM MINID ~, including the 7.x line that rejects ACKED.
 func TestIntegrationDLQRetentionIgnoresPendingPEL(t *testing.T) {
 	cli := testutil.RequireRedis(t)
-	t.Cleanup(func() { _ = cli.Close() })
 
 	ctx := context.Background()
 	source := fmt.Sprintf("relay:dlqretention-pel-src:%d", time.Now().UnixNano())
@@ -434,7 +429,6 @@ func TestIntegrationDLQRetentionIgnoresPendingPEL(t *testing.T) {
 // no DLQ stream at all).
 func TestIntegrationDLQRetentionMissingStream(t *testing.T) {
 	cli := testutil.RequireRedis(t)
-	t.Cleanup(func() { _ = cli.Close() })
 
 	ctx := context.Background()
 	missing := stream.DLQStreamFor(fmt.Sprintf("relay:dlqretention-missing-src:%d", time.Now().UnixNano()))
@@ -475,7 +469,6 @@ func TestIntegrationDLQRetentionMissingStream(t *testing.T) {
 // DLQ's old node is gone.
 func TestIntegrationDLQRetentionTargetIsolation(t *testing.T) {
 	cli := testutil.RequireRedis(t)
-	t.Cleanup(func() { _ = cli.Close() })
 	requireAckedTrimMode(t, cli)
 
 	ctx := context.Background()

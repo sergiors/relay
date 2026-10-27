@@ -32,7 +32,6 @@ import (
 // This test remains the end-to-end behavior lock (real PEL, real marker shape,
 // real reclaim).
 func TestIntegrationEventShutdownCancellationLeavesRecoverablePending(t *testing.T) {
-	_ = redisAvailable(t)
 	e := newEventEnv(t)
 	id := e.xadd(`{"a":1}`)
 

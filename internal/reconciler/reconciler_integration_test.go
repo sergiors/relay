@@ -7,10 +7,9 @@
 // This file is excluded from the default suite by the integration build tag.
 // Running it (`go test -tags=integration ./...`) REQUIRES a reachable Docker
 // daemon; a missing dependency fails the affected tests rather than skipping
-// them. Start the documented dev dependencies with
-// `docker compose -f compose.dev.yaml up -d`. The daemon is located via
-// client.FromEnv, so DOCKER_HOST, the local socket, and a socket proxy are all
-// respected.
+// them. Start Docker, or point DOCKER_HOST at a running daemon. The daemon is
+// located via client.FromEnv, so DOCKER_HOST, the local socket, and a socket
+// proxy are all respected.
 package reconciler
 
 import (

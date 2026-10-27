@@ -68,8 +68,8 @@ func testDeps(t *testing.T) Dependencies {
 // contract: OpenState must fail loudly with exactly errUnexpectedStateAccess,
 // naming stateTestDeps, and return no handle. The fixture neither opens nor
 // depends on PostgreSQL, so the test passes with or without a reachable server;
-// a regression that makes testDeps need a database fails wherever one is
-// reachable (and visibly skips the no-database suites where none is).
+// a regression that makes testDeps need a database fails the state-backed
+// integration suite, which fails (never skips) without one.
 func TestDefaultFixtureRejectsStateAccess(t *testing.T) {
 	st, _, err := testDeps(t).OpenState(context.Background())
 	if !errors.Is(err, errUnexpectedStateAccess) {
@@ -396,9 +396,9 @@ func TestStartPropagatesWorkerError(t *testing.T) {
 // recreated nor modified. TEST_DATABASE_URL is set to an unreachable address
 // only as a defensive tripwire: the database-free fixture itself does not
 // consult it, and these commands never read state. The state-backed sibling
-// TestNonStartCommandsDoNotAcquireLock covers only state-reading commands, so
-// it skips without PostgreSQL; the default database-free suite keeps a lock
-// regression guard here.
+// TestNonStartCommandsDoNotAcquireLock covers only state-reading commands in
+// the integration suite (where it fails without PostgreSQL); the default
+// database-free suite keeps a lock regression guard here.
 func TestStatelessAdminCommandsDoNotAcquireLockWithoutDatabase(t *testing.T) {
 	t.Setenv("TEST_DATABASE_URL",
 		"postgres://relay:relay@127.0.0.1:1/relay?sslmode=disable")

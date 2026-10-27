@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"relay/internal/app"
-	"relay/internal/testutil"
 )
 
 // seedListState creates a temp state DB holding several reconciled apps whose
@@ -46,7 +45,6 @@ events:
 func TestAppsAliasMatchesAppLsEmptyDB(t *testing.T) {
 	// `app ls` reads the state database, so this needs the real-state fixture
 	// even though the database is fresh and empty.
-	testutil.RequireStateDatabase(t)
 	deps := stateTestDeps(t)
 
 	canonicalOut, canonicalErrOut, canonicalErr := runCLIWithDeps(t, deps, "", "app", "ls")
@@ -68,7 +66,6 @@ func TestAppsAliasMatchesAppLsEmptyDB(t *testing.T) {
 // and that both sort rows by name. Comparing the two live outputs (rather than
 // a copied fixture) keeps the alias honest without duplicating the list format.
 func TestAppsAliasMatchesAppLsPopulatedDB(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	deps := seedListState(t)
 
 	canonicalOut, _, canonicalErr := runCLIWithDeps(t, deps, "", "app", "ls")

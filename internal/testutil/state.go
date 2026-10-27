@@ -6,7 +6,9 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -30,38 +32,31 @@ func TestDatabaseURL() string {
 // database (they prove row locking, claim fencing, and cross-process
 // coordination): a missing dependency fails rather than skips, matching the
 // Redis/Docker integration convention.
+//
+// The diagnostic names the configured server without credentials and never
+// includes driver text: PostgreSQL parse errors can quote the raw DSN, which may
+// carry a password in URL or keyword/value form.
 func RequireStateDatabase(t *testing.T) {
 	t.Helper()
-	db, err := sql.Open("pgx", TestDatabaseURL())
+	dsn := TestDatabaseURL()
+	db, err := sql.Open("pgx", dsn)
 	if err != nil {
-		t.Fatalf("state integration test requires PostgreSQL (open: %v)", err)
+		t.Fatalf(
+			"state integration test requires PostgreSQL at %s (from TEST_DATABASE_URL); "+
+				"check the DSN is valid",
+			databaseEndpoint(dsn),
+		)
 	}
 	defer db.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
 		t.Fatalf(
-			"state integration test requires a reachable PostgreSQL at TEST_DATABASE_URL (ping: %v); "+
-				"start one and point TEST_DATABASE_URL at it",
-			err,
+			"state integration test requires a reachable PostgreSQL at %s (from TEST_DATABASE_URL); "+
+				"start PostgreSQL and point TEST_DATABASE_URL at it",
+			databaseEndpoint(dsn),
 		)
 	}
-}
-
-// stateDatabaseAvailable reports whether PostgreSQL is reachable, so the
-// converted (untagged) state tests can skip instead of failing when a developer
-// runs the default unit suite with no database. CI provisions PostgreSQL for
-// the integration job, where these tests run for real.
-func stateDatabaseAvailable(t *testing.T) bool {
-	t.Helper()
-	db, err := sql.Open("pgx", TestDatabaseURL())
-	if err != nil {
-		return false
-	}
-	defer db.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return db.PingContext(ctx) == nil
 }
 
 // NewStateDSN creates a fresh, uniquely-named schema inside the test database
@@ -74,23 +69,33 @@ func stateDatabaseAvailable(t *testing.T) bool {
 //
 // A caller that only needs an isolated namespace (not a handle) can use the
 // returned DSN with state.Open directly, or the OpenState/NewState helpers.
+//
+// It fails (never skips) when PostgreSQL is unreachable or the schema cannot be
+// created: every caller is an integration test that requires a real database.
+// The schema creation is the availability check, so the fixture does not pay for
+// a separate ping. Diagnostics are sanitized like RequireStateDatabase's.
 func NewStateDSN(t *testing.T) string {
 	t.Helper()
 	base := TestDatabaseURL()
-	if !stateDatabaseAvailable(t) {
-		t.Skipf("state tests require PostgreSQL at TEST_DATABASE_URL (%s); none reachable", base)
-	}
 	schema := uniqueSchemaName()
 
 	admin, err := sql.Open("pgx", base)
 	if err != nil {
-		t.Fatalf("open admin connection: %v", err)
+		t.Fatalf(
+			"state integration test requires PostgreSQL at %s (from TEST_DATABASE_URL); "+
+				"check the DSN is valid",
+			databaseEndpoint(base),
+		)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if _, err := admin.ExecContext(ctx, `CREATE SCHEMA `+quoteIdent(schema)); err != nil {
 		_ = admin.Close()
-		t.Fatalf("create test schema: %v", err)
+		t.Fatalf(
+			"state integration test requires a reachable PostgreSQL at %s (from TEST_DATABASE_URL) "+
+				"with permission to create a test schema; start PostgreSQL and check the DSN",
+			databaseEndpoint(base),
+		)
 	}
 	t.Cleanup(func() {
 		dropCtx, dropCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -137,6 +142,36 @@ func uniqueSchemaName() string {
 		return fmt.Sprintf("relay_t_%d", time.Now().UnixNano())
 	}
 	return "relay_t_" + hex.EncodeToString(b[:])
+}
+
+// databaseEndpoint describes the configured PostgreSQL server without
+// credentials. Only a well-formed postgres:// or postgresql:// URL contributes a
+// host:port; keyword/value and malformed DSNs carry credentials inline, so they
+// get a generic label. It intentionally mirrors the state tests'
+// safeDatabaseEndpoint, which cannot be shared because testutil imports state.
+func databaseEndpoint(dsn string) string {
+	const fallback = "the configured PostgreSQL server"
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return fallback
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "postgres", "postgresql":
+	default:
+		return fallback
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fallback
+	}
+	port := u.Port()
+	if port == "" {
+		port = "5432"
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+		return fallback
+	}
+	return net.JoinHostPort(host, port)
 }
 
 // quoteIdent double-quotes a schema identifier. The names are generated here

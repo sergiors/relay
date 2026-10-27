@@ -74,7 +74,6 @@ func seedStartupInvalid(
 // when the exact persisted invalid identity is on disk, the loader does not parse
 // or warn again; the state phase reuses the existing token and writes nothing.
 func TestStartupParseGateSkipsPersistedInvalidIdentity(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	root := t.TempDir()
 	writeStartupTemplate(t, root, "broken", startupInvalidTemplate)
@@ -138,7 +137,6 @@ func TestStartupParseGateSkipsPersistedInvalidIdentity(t *testing.T) {
 // bytes are not skipped: they are parsed, recorded as a new transition, and a
 // later valid startup correction clears the identity.
 func TestStartupParseGateReparsesChangedInvalidIdentity(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	root := t.TempDir()
 	dir := writeStartupTemplate(t, root, "broken", startupInvalidTemplate)
@@ -228,7 +226,6 @@ func (g *concurrentCorrectionGate) SkipParse(name, identity string) (bool, error
 // the older pre-read observation, so this worker re-parses instead of skipping and
 // the stale invalid write is rejected (leaving the newer valid state intact).
 func TestStartupParseGateStaleObservationDoesNotOverwriteCorrection(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	older := testutil.OpenState(t, dsn)
 	newer := testutil.OpenState(t, dsn)
@@ -356,7 +353,6 @@ func assertCorrectedStartupRow(t *testing.T, detail state.Detail) {
 // view never authorizes a skip: the loader parses normally and reports the issue
 // so the caller can retry/record it.
 func TestStartupParseGateFallsBackWhenStateReadFails(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	root := t.TempDir()
 	writeStartupTemplate(t, root, "broken", startupInvalidTemplate)
@@ -386,7 +382,6 @@ func TestStartupParseGateFallsBackWhenStateReadFails(t *testing.T) {
 // the persisted row is the authority, so a fresh worker handle recognizes the same
 // invalid bytes without re-parsing, re-writing, or allocating a token.
 func TestStartupParseGateRecognizesIdentityAcrossRestart(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	first := testutil.OpenState(t, dsn)
 	root := t.TempDir()

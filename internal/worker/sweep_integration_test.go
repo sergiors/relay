@@ -8,8 +8,6 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	"relay/internal/testutil"
 )
 
 // TestStartupImageKeepSetRetainsRecordedImageAfterRediscovery is the startup
@@ -20,7 +18,6 @@ import (
 // swap may still be serving. It mirrors the gather in sweepStartupImages using a
 // real state handle.
 func TestStartupImageKeepSetRetainsRecordedImageAfterRediscovery(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	root := t.TempDir()
 	dir := filepath.Join(root, "fn")

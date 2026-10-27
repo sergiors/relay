@@ -13,7 +13,6 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/state"
-	"relay/internal/testutil"
 )
 
 // seedFencingToken persists fn's desired generation and returns the exact
@@ -117,7 +116,6 @@ events:
 // inventory carries exactly NAME, RUNTIME, STATUS, UPDATED — the old HANDLERS
 // column (and any workload-count replacement) is deliberately gone.
 func TestAppListColumns(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, _ := seedTestState(t)
 	var w bytes.Buffer
 	if err := printList(&w, st); err != nil {
@@ -156,7 +154,6 @@ func TestAppListColumns(t *testing.T) {
 // public set — preparing, building, reconciling, ready, degraded, unavailable —
 // through the two renderers.
 func TestAppListStatusesConsistentWithInspect(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, _ := openTempState(t)
 	tmpl, err := app.ParseTemplate([]byte("runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"))
 	if err != nil {
@@ -232,7 +229,6 @@ func TestAppListStatusesConsistentWithInspect(t *testing.T) {
 
 // inspect returns full detail including handlers and timeouts.
 func TestAppInspectDetail(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, _ := seedTestState(t)
 	detail, ok := st.GetApp("user-events-python")
 	if !ok {
@@ -265,7 +261,6 @@ func TestAppInspectDetail(t *testing.T) {
 
 // A pending app omits Image/Fingerprint/Prepared.
 func TestAppInspectPendingOmitsActiveFields(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, _ := seedTestState(t)
 	detail, ok := st.GetApp("welcome-email-node")
 	if !ok {
@@ -283,7 +278,6 @@ func TestAppInspectPendingOmitsActiveFields(t *testing.T) {
 // and the Handlers section, using the same wider padding as Handlers for visual
 // grouping. The long label "Handler successes:" drives the value column.
 func TestAppInspectStatsSection(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, _ := seedTestState(t)
 	st.RecordAppStats(state.AppStats{
 		App:                 "user-events-python",
@@ -323,7 +317,6 @@ func TestAppInspectStatsSection(t *testing.T) {
 // An app with no recorded stats still renders a predictable zero Stats
 // section rather than omitting it.
 func TestAppInspectStatsZeroWithoutRow(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, _ := seedTestState(t)
 	detail, ok := st.GetApp("user-events-python")
 	if !ok {
@@ -350,7 +343,6 @@ func TestAppInspectStatsZeroWithoutRow(t *testing.T) {
 // NAMES (values redacted) and secret REFERENCE names, but never a literal env
 // value and never a secret value.
 func TestAppInspectShowsEnvSecretsMappings(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, _ := openTempState(t)
 
 	tmpl, _ := app.ParseTemplate([]byte(`runtime: python3.14
@@ -395,7 +387,6 @@ events:
 // An app with schedules renders a Schedules section after Events, showing
 // the verbatim cron expression, effective timezone, and resolved timeout.
 func TestAppInspectSchedulesSection(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, _ := openTempState(t)
 
 	tmpl, _ := app.ParseTemplate([]byte(`runtime: python3.14
@@ -471,7 +462,6 @@ schedules:
 // Descriptions always use 24-hour time: the 08:30 schedule must not contain
 // AM/PM.
 func TestAppInspectSchedulesNoAMPM(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	out := inspectSchedules(t, `  - name: report
     handler: jobs.report.handler
     cron: "30 8 * * 1-5"
@@ -487,7 +477,6 @@ func TestAppInspectSchedulesNoAMPM(t *testing.T) {
 // The description is independent of the schedule's timezone: two rows that
 // differ only in timezone render the identical description text.
 func TestAppInspectSchedulesTimezoneIndependence(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	out := inspectSchedules(t, `  - name: a
     handler: jobs.a.handler
     cron: "0 0 * * *"
@@ -511,7 +500,6 @@ func TestAppInspectSchedulesTimezoneIndependence(t *testing.T) {
 // (no parentheses) and never fails. The error path is exercised by injecting a
 // descriptor that always fails via the describeCronFunc seam.
 func TestAppInspectSchedulesDescriptionFallback(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	orig := describeCronFunc
 	describeCronFunc = func(string) (string, bool) { return "", false }
 	defer func() { describeCronFunc = orig }()
@@ -533,7 +521,6 @@ func TestAppInspectSchedulesDescriptionFallback(t *testing.T) {
 
 // A template without schedules renders no Schedules: header.
 func TestAppInspectNoSchedulesHeader(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, _ := seedTestState(t)
 	detail, ok := st.GetApp("user-events-python")
 	if !ok {
@@ -550,7 +537,6 @@ func TestAppInspectNoSchedulesHeader(t *testing.T) {
 // after Events when no schedules) and before Environment, showing the effective
 // entrypoint file, port, and replica count (defaults applied).
 func TestAppInspectServicesSection(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	out := inspectServicesWithEnv(t, `  - name: service
     entrypoint: service.js
 `, true)
@@ -570,7 +556,6 @@ func TestAppInspectServicesSection(t *testing.T) {
 
 // Explicit port/replicas override the defaults.
 func TestAppInspectServicesExplicit(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	out := inspectServices(t, `  - name: api
     entrypoint: api.js
     port: 3000
@@ -586,7 +571,6 @@ func TestAppInspectServicesExplicit(t *testing.T) {
 // A configured path renders alongside port/replicas; a host-only service keeps
 // the pre-path rendering with no path token.
 func TestAppInspectServicesPath(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	out := inspectServices(t, `  - name: v2
     entrypoint: v2.js
     host: api.example.com
@@ -609,7 +593,6 @@ func TestAppInspectServicesPath(t *testing.T) {
 
 // Services render after Schedules when both are present.
 func TestAppInspectServicesAfterSchedules(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, _ := openTempState(t)
 
 	tmpl, err := app.ParseTemplate([]byte(`runtime: python3.14
@@ -646,7 +629,6 @@ services:
 
 // A template without services renders no Services: header.
 func TestAppInspectNoServicesHeader(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, _ := seedTestState(t)
 	detail, ok := st.GetApp("user-events-python")
 	if !ok {
@@ -703,7 +685,6 @@ events:
 // integration-tagged here; the state-free argument guards the former
 // TestAppCommandErrors covered moved to app_command_test.go (default suite).
 func TestAppInspectUnknownMessage(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	_, deps := seedTestState(t)
 	for _, tc := range []struct {
 		name string
@@ -722,7 +703,6 @@ func TestAppInspectUnknownMessage(t *testing.T) {
 
 // `relay app ls` renders the table via the command path and exits 0.
 func TestAppLsCommand(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	_, deps := seedTestState(t)
 	out, _, err := runCLIWithDeps(t, deps, "", "app", "ls")
 	if err != nil {
@@ -735,7 +715,6 @@ func TestAppLsCommand(t *testing.T) {
 
 // `relay app inspect NAME` renders the detail via the command path.
 func TestAppInspectCommand(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	_, deps := seedTestState(t)
 	out, _, err := runCLIWithDeps(t, deps, "", "app", "inspect", "user-events-python")
 	if err != nil {
@@ -749,7 +728,6 @@ func TestAppInspectCommand(t *testing.T) {
 // The Stats section renders the four per-app execution-history timestamps
 // as relative ages ("2s ago"-style rows) after the Invocations exhausted line.
 func TestAppInspectStatsTimestamps(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, _ := seedTestState(t)
 	exec := time.Now().Add(-2 * time.Second).UTC()
 	failure := time.Now().Add(-90 * time.Second).UTC()
@@ -796,7 +774,6 @@ func TestAppInspectStatsTimestamps(t *testing.T) {
 // An app whose timestamps were never observed renders "never" instead of
 // an empty relative age.
 func TestAppInspectStatsTimestampsNever(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, _ := seedTestState(t)
 	st.RecordAppStats(state.AppStats{App: "user-events-python", EventsMatchedTotal: 3})
 	detail, ok := st.GetApp("user-events-python")
@@ -827,7 +804,6 @@ func TestAppInspectStatsTimestampsNever(t *testing.T) {
 // service path never publishes building (services have no Relay-owned Dockerfile
 // build), so the persisted building status is exercised on a runtime app.
 func TestAppBuildingStatusAndEmptyRuntimeRendering(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, _ := openTempState(t)
 
 	// A runtime app with a persisted building status (written at the
@@ -910,7 +886,6 @@ events:
 // Services using entrypoint and image sources render with their source kind
 // prefix, so an operator can tell how each service is produced.
 func TestAppInspectServicesSourceKinds(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st, _ := openTempState(t)
 	tmpl, err := app.ParseTemplate([]byte(`runtime: node24
 events:

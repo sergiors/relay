@@ -60,7 +60,6 @@ func writeInvalidTemplate(t *testing.T, dir, data string) {
 // diagnostic, a fresh app is unavailable (nothing ever served), the registry
 // stays empty, and no build is attempted.
 func TestReconcileInvalidSourceFirstObservationPersistsIdentity(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := filepath.Join(root, "broken")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -110,7 +109,6 @@ func TestReconcileInvalidSourceFirstObservationPersistsIdentity(t *testing.T) {
 // state token, changes no field, performs no build, and keeps the previously
 // active runtime in the registry.
 func TestReconcileInvalidSourceUnchangedBytesSkipsWriteAndKeepsActive(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "guarded")
 
@@ -167,7 +165,6 @@ func TestReconcileInvalidSourceUnchangedBytesSkipsWriteAndKeepsActive(t *testing
 // invalid bytes are a new transition: the state token advances and the recorded
 // identity/diagnostic are replaced while the active generation still serves.
 func TestReconcileInvalidSourceChangedBytesAdvanceTransition(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "changing-bad")
 
@@ -208,7 +205,6 @@ func TestReconcileInvalidSourceChangedBytesAdvanceTransition(t *testing.T) {
 // the live rebuild path: a valid correction clears the invalid identity and a
 // successful build replaces the degraded view with ready.
 func TestReconcileInvalidSourceValidCorrectionClearsIdentity(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "recovers")
 
@@ -257,7 +253,6 @@ func TestReconcileInvalidSourceValidCorrectionClearsIdentity(t *testing.T) {
 // invalid identity, clears the prior one so the app stays retryable, and a later
 // successful fingerprint recovers without any edit to the template.
 func TestReconcileInvalidSourceFingerprintFailureClearsIdentityAndRetries(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "retryable")
 
@@ -327,7 +322,6 @@ func TestReconcileInvalidSourceFingerprintFailureClearsIdentityAndRetries(t *tes
 // previously persisted identity, keeps the active runtime, and retries once the
 // file becomes readable again.
 func TestReconcileInvalidSourceReadFailureClearsIdentityAndRetries(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "flaky")
 
@@ -402,7 +396,6 @@ func TestReconcileInvalidSourceReadFailureClearsIdentityAndRetries(t *testing.T)
 // read is retryable (a later readable pass rebuilds the same bytes and replaces
 // the failure view without any edit).
 func TestReconcileUnreadableAppDirRetainsActiveAndRetries(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	skipWithoutPosixPermissions(t)
 
 	root := t.TempDir()
@@ -460,7 +453,6 @@ func TestReconcileUnreadableAppDirRetainsActiveAndRetries(t *testing.T) {
 // the active runtime serving but does not write an invalid state view without
 // concurrency authority.
 func TestReconcileInvalidSourceObservationReadFailureFailsClosed(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	st := testutil.OpenState(t, dsn)
 	root := t.TempDir()
@@ -513,7 +505,6 @@ func TestReconcileInvalidSourceObservationReadFailureFailsClosed(t *testing.T) {
 // the app is a removal (not an invalid desired state) and its row and local
 // transition token disappear.
 func TestReconcileInvalidSourceTemplateDeletionRemovesRow(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := filepath.Join(root, "removed-after-invalid")
 	if err := os.MkdirAll(dir, 0o755); err != nil {

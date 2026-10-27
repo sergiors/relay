@@ -55,10 +55,10 @@ func seedCorruptAppRow(t *testing.T, dsn, worker, name string) {
 }
 
 // openTempState opens a state DB on a fresh isolated schema and registers its
-// close. It requires a reachable PostgreSQL: unit tests must not depend on the
-// database, so only integration-tagged tests call it.
+// close. It fails (never skips) when PostgreSQL is unreachable — testutil.NewState
+// creates the per-test schema as the availability check — while unit tests must
+// not depend on the database, so only integration-tagged tests call it.
 func openTempState(t *testing.T) *state.State {
 	t.Helper()
-	testutil.RequireStateDatabase(t)
 	return testutil.NewState(t)
 }
