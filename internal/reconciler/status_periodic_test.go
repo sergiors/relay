@@ -1,3 +1,5 @@
+//go:build integration
+
 package reconciler
 
 import (
@@ -44,6 +46,7 @@ func readyServicesReconciler(t *testing.T, root, name string) (*Reconciler, app.
 // self-heal. With a converged service pass (a no-op verification completing
 // without corrective work), status and every reconcile timestamp stay ready.
 func TestUnchangedPeriodicPathDoesNotRecordPreparing(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	r, fn, st, _ := readyServicesReconciler(t, root, "svc-unchanged")
 
@@ -77,6 +80,7 @@ func TestUnchangedPeriodicPathDoesNotRecordPreparing(t *testing.T) {
 // periodic pass emits no reconciling transition: the service observer fires
 // only for actual corrective work, so a no-op verification leaves ready intact.
 func TestNoOpPeriodicPassStaysReadyWithoutReconciling(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	r, fn, st, _ := readyServicesReconciler(t, root, "svc-noop")
 
@@ -117,6 +121,7 @@ func (b *statusProbeBuilder) Execute(context.Context, *runtime.Prepared, string,
 // path still writes preparing before the current generation's Prepare runs: a
 // real desired-generation change is not silently treated as a periodic no-op.
 func TestActualDesiredChangeRecordsPreparingBeforePrepare(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeServicesDir(t, root, "svc-change")
 	tmpl := mustParse(servicesTemplate)
@@ -153,6 +158,7 @@ func TestActualDesiredChangeRecordsPreparingBeforePrepare(t *testing.T) {
 // seam) -> ready (at completion). The reconciler writes preparing before Prepare;
 // services have no separate build boundary.
 func TestReconcilingReadyOrderingOnChange(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeServicesDir(t, root, "svc-order")
 	tmpl := mustParse(servicesTemplate)
@@ -203,6 +209,7 @@ func TestReconcilingReadyOrderingOnChange(t *testing.T) {
 // transitions ready -> reconciling -> ready, recording a fresh success while
 // retaining the active image.
 func TestCorrectivePeriodicPassCanReconcile(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	r, fn, st, _ := readyServicesReconciler(t, root, "svc-heal")
 
@@ -236,6 +243,7 @@ func TestCorrectivePeriodicPassCanReconcile(t *testing.T) {
 // the only transitions are the reconciler's preparing -> reconciling -> ready.
 // The status is sampled at every callback boundary.
 func TestServiceLifecycleNeverPublishesBuilding(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	dir := writeServicesDir(t, root, "svc-nobuild")
 	tmpl := mustParse(servicesTemplate)
@@ -287,6 +295,7 @@ func TestServiceLifecycleNeverPublishesBuilding(t *testing.T) {
 // preparing: the skip branch no longer writes preparing, and a no-op
 // verification writes nothing.
 func TestActiveBuildPlusPeriodicTickDoesNotBecomePreparing(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	r, fn, st, fencingToken := readyServicesReconciler(t, root, "svc-building")
 
@@ -320,6 +329,7 @@ func TestActiveBuildPlusPeriodicTickDoesNotBecomePreparing(t *testing.T) {
 // newer desired generation has completed, so a slow stale convergence can never
 // resurrect an outdated ready/reconciling status.
 func TestPeriodicSkipPathStaleCallbacksRemainGuarded(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	r, fn, st, _ := readyServicesReconciler(t, root, "svc-skipgen")
 

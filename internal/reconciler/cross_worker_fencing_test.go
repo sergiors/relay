@@ -1,3 +1,5 @@
+//go:build integration
+
 package reconciler
 
 import (
@@ -41,6 +43,7 @@ type crossWorkerFixture struct {
 
 func newCrossWorkerFixture(t *testing.T, name string) *crossWorkerFixture {
 	t.Helper()
+	testutil.RequireStateDatabase(t)
 
 	root := t.TempDir()
 	dir := writeServicesDir(t, root, name)
@@ -176,6 +179,7 @@ func assertAppStateUnchanged(
 // worker's callbacks must not rewrite state after a newer worker persists it;
 // the PostgreSQL fencing token rejects those stale writes.
 func TestCrossWorkerStaleFencingTokenCannotOverwriteNewerState(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	t.Run("stale success cannot overwrite newer success", func(t *testing.T) {
 		f := newCrossWorkerFixture(t, "shared")
 
@@ -257,6 +261,7 @@ func TestCrossWorkerStaleFencingTokenCannotOverwriteNewerState(t *testing.T) {
 // able to persist success and failure. This prevents a future fix from simply
 // disabling the state writes.
 func TestCrossWorkerCurrentServiceCompletionStillPersists(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	t.Run("current success persists", func(t *testing.T) {
 		f := newCrossWorkerFixture(t, "shared")
 

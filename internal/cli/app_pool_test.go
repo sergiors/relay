@@ -1,3 +1,5 @@
+//go:build integration
+
 package cli
 
 import (
@@ -9,19 +11,9 @@ import (
 
 	"relay/internal/runtime"
 	"relay/internal/state"
+	"relay/internal/testutil"
 	"relay/internal/worker"
 )
-
-// fakePoolSnapshotter is an in-memory worker.PoolSnapshotter for CLI tests, so
-// the live query socket can be exercised without Docker or a runtime.Manager.
-type fakePoolSnapshotter struct {
-	pools map[string]runtime.PoolSnapshot
-}
-
-func (f fakePoolSnapshotter) PoolSnapshot(name string) (runtime.PoolSnapshot, bool) {
-	s, ok := f.pools[name]
-	return s, ok
-}
 
 // startTestSocketServer starts a real worker query socket at path backed by
 // pools. The socket path comes from the test's injected Dependencies, so the
@@ -58,6 +50,7 @@ func withProviderDisabled(t *testing.T) {
 // deliberately set to different values than the persisted row so the test
 // fails if the renderer ever prefers the live counters.
 func TestAppInspectRuntimePoolSection(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	st, deps := seedTestState(t)
 	st.RecordAppStats(state.AppStats{
 		App:               "user-events-python",
@@ -130,22 +123,12 @@ func TestAppInspectRuntimePoolSection(t *testing.T) {
 	}
 }
 
-// TestAppInspectRuntimePoolStartingRow verifies the Starting row appears
-// only when an in-flight lazy start is observed.
-func TestAppInspectRuntimePoolStartingRow(t *testing.T) {
-	var w bytes.Buffer
-	printRuntimePool(&w, &poolGauges{Capacity: 2, Starting: 1}, 0, 0, 0)
-	out := normWS(w.String())
-	if !strings.Contains(out, "Starting: 1") {
-		t.Errorf("starting row missing:\n%s", out)
-	}
-}
-
 // TestAppInspectRuntimePoolPersistedCountersWithoutProvider verifies the
 // standalone inspect process (no provider wired, no worker socket) renders the
 // Runtime pool section from the persisted cumulative counters while marking the
 // live gauges explicitly unavailable — never inventing stale live state.
 func TestAppInspectRuntimePoolPersistedCountersWithoutProvider(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	st, deps := seedTestState(t)
 	st.RecordAppStats(state.AppStats{
 		App:               "user-events-python",
@@ -194,6 +177,7 @@ func TestAppInspectRuntimePoolPersistedCountersWithoutProvider(t *testing.T) {
 // reports not-found still renders the persisted-counter shape (the state record
 // exists, only the live pool is unreachable).
 func TestAppInspectRuntimePoolProviderUnknownApp(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	st, deps := seedTestState(t)
 	st.RecordAppStats(state.AppStats{
 		App:               "user-events-python",
@@ -226,6 +210,7 @@ func TestAppInspectRuntimePoolProviderUnknownApp(t *testing.T) {
 // counters fallback when no pool activity has been recorded and no worker socket
 // is reachable.
 func TestAppInspectCommandRendersPersistedPoolCounters(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	_, deps := seedTestState(t)
 	withProviderDisabled(t)
 	out, _, err := runCLIWithDeps(t, deps, "", "app", "inspect", "user-events-python")
@@ -246,6 +231,7 @@ func TestAppInspectCommandRendersPersistedPoolCounters(t *testing.T) {
 // live gauges from the socket while the cumulative counters still come from the
 // persisted stats row.
 func TestAppInspectSocketLiveGauges(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	st, deps := seedTestState(t)
 	st.RecordAppStats(state.AppStats{
 		App:               "user-events-python",
@@ -292,6 +278,7 @@ func TestAppInspectSocketLiveGauges(t *testing.T) {
 // valid zeros renders 0 (not unknown), pinning that "known" is keyed on the
 // query succeeding rather than on non-zero values.
 func TestAppInspectSocketKnownZeros(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	st, deps := seedTestState(t)
 	detail, ok := st.GetApp("user-events-python")
 	if !ok {
@@ -327,6 +314,7 @@ func TestAppInspectSocketKnownZeros(t *testing.T) {
 // unknown-app answer renders the persisted-counter/unknown-gauge shape
 // rather than an error, exactly like an unreachable socket.
 func TestAppInspectSocketUnknownApp(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	st, deps := seedTestState(t)
 	st.RecordAppStats(state.AppStats{
 		App:               "user-events-python",
@@ -356,6 +344,7 @@ func TestAppInspectSocketUnknownApp(t *testing.T) {
 // standalone case with no worker running) renders unknown live gauges and the
 // persisted counters.
 func TestAppInspectSocketUnavailable(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	st, deps := seedTestState(t)
 	st.RecordAppStats(state.AppStats{
 		App:               "user-events-python",

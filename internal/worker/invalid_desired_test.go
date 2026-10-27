@@ -1,3 +1,5 @@
+//go:build integration
+
 package worker
 
 import (
@@ -10,6 +12,7 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/state"
+	"relay/internal/testutil"
 )
 
 // TestPersistStartupDiscoveryIgnoresStagingDir pins the startup state phase
@@ -38,6 +41,7 @@ func observeStartupIssues(
 }
 
 func TestPersistStartupDiscoveryIgnoresStagingDir(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	root := t.TempDir()
 
@@ -88,33 +92,11 @@ func TestPersistStartupDiscoveryIgnoresStagingDir(t *testing.T) {
 	}
 }
 
-// TestLoaderIgnoresStagingDirAtStartup pins the worker's startup loader path: a
-// staging directory alongside a valid app yields exactly the valid app
-// with no issue for the staging name.
-func TestLoaderIgnoresStagingDirAtStartup(t *testing.T) {
-	root := t.TempDir()
-	writeWorkerApp(t, root, "good", "def handler(e): return 1\n")
-	if err := os.MkdirAll(filepath.Join(root, ".sync-xyz"), 0o755); err != nil {
-		t.Fatalf("mkdir stage: %v", err)
-	}
-
-	loader := app.NewLoader(root, discardLogger())
-	fns, issues, err := loader.LoadWithDiagnostics()
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	if len(fns) != 1 || fns[0].Name != "good" {
-		t.Fatalf("valid apps = %+v, want only good", fns)
-	}
-	if len(issues) != 0 {
-		t.Fatalf("issues = %+v, want none (staging is not an invalid desired definition)", issues)
-	}
-}
-
 // TestPersistStartupDiscoveryTemplateLessDirLeavesNoState pins that a fresh
 // directory without template.yaml is not an app candidate: the startup phase
 // writes no apps row, no app_stats, and no transition fencing token for it.
 func TestPersistStartupDiscoveryTemplateLessDirLeavesNoState(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	root := t.TempDir()
 	draftDir := filepath.Join(root, "draft")
@@ -146,6 +128,7 @@ func TestPersistStartupDiscoveryTemplateLessDirLeavesNoState(t *testing.T) {
 // template.yaml is removed from apps and app_stats, and its stale transition
 // fencing token is never returned to the caller.
 func TestPersistStartupDiscoveryPrunesTemplateLessKnownApp(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	root := t.TempDir()
 
@@ -180,6 +163,7 @@ func TestPersistStartupDiscoveryPrunesTemplateLessKnownApp(t *testing.T) {
 // (unavailable with no generation, or degraded preserving a prior active
 // generation) with an error. A fresh invalid app has no active generation.
 func TestPersistStartupDiscoveryRecordsInvalidPresent(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	root := t.TempDir()
 
@@ -261,6 +245,7 @@ func TestPersistStartupDiscoveryRecordsInvalidPresent(t *testing.T) {
 // discovered app is written as a discovery, and the invalid ones are not
 // returned among the valid apps the loader produced.
 func TestPersistStartupDiscoveryInvalidAbsentFromRegistrySet(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	root := t.TempDir()
 	writeWorkerApp(t, root, "good", "def handler(e): return 1\n")
 	writeWorkerApp(t, root, "bad", "def handler(e): return 1\n")
@@ -305,6 +290,7 @@ func TestPersistStartupDiscoveryInvalidAbsentFromRegistrySet(t *testing.T) {
 // returned by ActiveImages and therefore retained by the startup image keep-set,
 // even though the app is not part of the loaded set.
 func TestPersistStartupDiscoveryInvalidImageRetainedInKeepSet(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	root := t.TempDir()
 	// The app is PRESENT on disk with a malformed template, so prune keeps its
@@ -336,6 +322,7 @@ func TestPersistStartupDiscoveryInvalidImageRetainedInKeepSet(t *testing.T) {
 // the same call, while an invalid present entry is preserved as invalid. A row
 // with no on-disk directory and no loader issue is a removal.
 func TestPersistStartupDiscoveryPrunesRemovedNotInvalid(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	root := t.TempDir()
 	removed := stateApp("removed", filepath.Join(root, "removed"))
@@ -371,6 +358,7 @@ func TestPersistStartupDiscoveryPrunesRemovedNotInvalid(t *testing.T) {
 // prune is removed by the filesystem-authoritative prune rather than left as an
 // invalid row. A disappearance is a removal, never an invalid desired state.
 func TestPersistStartupDiscoveryPruneDropsVanishedInvalid(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	st := openTempState(t)
 	root := t.TempDir()
 

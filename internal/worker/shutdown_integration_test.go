@@ -462,6 +462,7 @@ func writeTestFile(t *testing.T, dir, name, content string) {
 // the final PostgreSQL flush runs within its bound, and the message is recoverable
 // through the normal reclaim path by a second consumer.
 func TestIntegrationGracefulShutdownMidHandler(t *testing.T) {
+	testutil.RequireStateDatabase(t)
 	testutil.RequireRedis(t)
 	dcli := testutil.RequireDocker(t)
 
