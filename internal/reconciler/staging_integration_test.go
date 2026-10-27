@@ -63,7 +63,7 @@ func TestReconcileAllIgnoresStagingDirKeepsNeighborAndInvalid(t *testing.T) {
 	b := &fakeBuilder{}
 	r, reg, st := newTestStateReconcilerLogging(t, root, b, nil, &logs)
 
-	go r.pump()
+	launchSkeletonPump(t, r)
 	r.reconcileAll()
 	waitForPrepare(t, b, 1)
 

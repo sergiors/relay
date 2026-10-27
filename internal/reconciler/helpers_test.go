@@ -34,6 +34,33 @@ func seedCurrent(r *Reconciler, fn app.App) {
 	r.Seed(fn, fp)
 }
 
+// launchSkeletonPump starts the pump goroutine for a skeleton reconciler whose
+// production Start never ran, mirroring Start's loop lifecycle: the wait-group
+// counter is registered BEFORE the launch (each loop defers loops.Done, so an
+// unregistered manual launch can never balance it) and cleanup repeats Start's
+// teardown ordering — close done first, stop any still-pending debounce timers,
+// then join the pump. Use it at most once per Reconciler, and never on one
+// whose Start already ran or whose done is otherwise closed
+// (shutdownSkeletonReconciler owns that exact teardown for pump-less tests).
+func launchSkeletonPump(t *testing.T, r *Reconciler) {
+	t.Helper()
+	r.loops.Add(1)
+	go r.pump()
+	t.Cleanup(func() {
+		close(r.done)
+		// A still-pending debounce timer must not fire a stale dispatch after
+		// the pump was joined; Start stops them between closing done and the
+		// join, so the skeleton teardown keeps that ordering.
+		r.mu.Lock()
+		for name, timer := range r.timers {
+			timer.Stop()
+			delete(r.timers, name)
+		}
+		r.mu.Unlock()
+		r.loops.Wait()
+	})
+}
+
 // newTestReconciler builds a reconciler over a fresh registry seeded from
 // initial, with a tiny debounce and a long interval so tests drive reconciles
 // explicitly. cfgHook (nil-safe) may mutate the Config to wire optional hooks

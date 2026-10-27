@@ -271,7 +271,7 @@ func TestReconcileAllRemovesFencingTokenOnlyTemplateLessApp(t *testing.T) {
 		t.Fatalf("remove template: %v", err)
 	}
 
-	go r.pump()
+	launchSkeletonPump(t, r)
 	r.reconcileAll()
 
 	deadline := time.Now().Add(3 * time.Second)

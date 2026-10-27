@@ -40,7 +40,7 @@ func TestDebounceCoalescesRapidEvents(t *testing.T) {
 	// would be skipped (it was never built though). Instead we drive reconcile
 	// through Enqueue only and count Prepare calls: a single successful prepare
 	// per burst proves coalescing.
-	go r.pump()
+	launchSkeletonPump(t, r)
 
 	// A burst of rapid events for the same app.
 	for i := 0; i < 20; i++ {
@@ -70,7 +70,7 @@ func TestDebounceDistinctAppsIndependent(t *testing.T) {
 
 	b := &fakeBuilder{}
 	r, _ := newTestReconciler(t, root, b, nil, nil)
-	go r.pump()
+	launchSkeletonPump(t, r)
 
 	r.Enqueue("a")
 	r.Enqueue("b")

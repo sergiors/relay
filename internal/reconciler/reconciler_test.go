@@ -286,7 +286,14 @@ func TestReconcileAllDiscoversAndRemoves(t *testing.T) {
 	live := initialFn("live", liveDir)
 	gone := initialFn("gone", goneDir)
 	b := &fakeBuilder{}
-	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{live, gone}, nil)
+	// remove() replaces the registry entry BEFORE invoking this hook, so the
+	// notification is a completion point AFTER the registry drop. A buffered
+	// channel keeps the hook (and thus the pump) from ever blocking, even if a
+	// defect produced more removals than expected.
+	removals := make(chan string, 4)
+	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{live, gone}, func(cfg *Config) {
+		cfg.RemoveApp = func(name string) { removals <- name }
+	})
 
 	// Remove "gone" only from disk; the registry still knows it.
 	if err := os.RemoveAll(goneDir); err != nil {
@@ -297,15 +304,39 @@ func TestReconcileAllDiscoversAndRemoves(t *testing.T) {
 		t.Fatalf("write v2: %v", err)
 	}
 
-	go r.pump()
+	launchSkeletonPump(t, r)
+	// reconcileAll dispatches "live" (the on-disk candidate) and then "gone"
+	// (registry name missing from the on-disk sweep) into the single buffered
+	// queue; the pump serializes them in that order, so live's full reconcile
+	// strictly precedes gone's removal.
 	r.reconcileAll()
 
-	waitForPrepare(t, b, 1)
-	if pf := reg.GetByName("live"); pf == nil || pf.Prepared() == nil {
-		t.Fatal("live should remain registered and prepared")
+	// Receiving the removal proves the whole pass completed: "gone" is the last
+	// queued item, whose remove() runs only after "live" finished processing.
+	select {
+	case name := <-removals:
+		if name != "gone" {
+			t.Fatalf("unexpected app removal %q, want only gone", name)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("reconcileAll never removed gone")
+	}
+
+	if pf := reg.GetByName("live"); pf == nil || pf.Prepared() == nil || pf.Prepared().Image != "img-live" {
+		t.Fatalf("live should remain registered and prepared after its rebuild, got %+v", reg.GetByName("live"))
 	}
 	if reg.GetByName("gone") != nil {
 		t.Fatal("gone (dir vanished) should have been removed by reconcileAll")
+	}
+	if got := b.prepares(); got != 1 {
+		t.Fatalf("prepare calls = %d, want exactly 1 for the changed live app", got)
+	}
+	// gone was the final queued item, so no further removal may ever occur;
+	// buffering keeps any defect observable here instead of blocking the pump.
+	select {
+	case name := <-removals:
+		t.Fatalf("unexpected extra app removal %q", name)
+	default:
 	}
 }
 

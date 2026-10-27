@@ -130,7 +130,7 @@ func TestPeriodicReconcileRemovesKnownOverSymlinkedDirAndKeepsHealthy(t *testing
 		t.Fatalf("write v2: %v", err)
 	}
 
-	go r.pump()
+	launchSkeletonPump(t, r)
 	r.reconcileAll()
 	waitForPrepare(t, b, 1)
 
@@ -242,7 +242,7 @@ func TestPeriodicReconcileUnsupportedEntriesRemoveKnownApps(t *testing.T) {
 		t.Fatalf("write v2: %v", err)
 	}
 
-	go r.pump()
+	launchSkeletonPump(t, r)
 	r.reconcileAll()
 	waitForPrepare(t, b, 1)
 
@@ -330,7 +330,7 @@ func TestPeriodicReconcileKeepsAppWhenTemplateIsSymlinked(t *testing.T) {
 		t.Fatalf("write v2: %v", err)
 	}
 
-	go r.pump()
+	launchSkeletonPump(t, r)
 	r.reconcileAll()
 	waitForPrepare(t, b, 1)
 
