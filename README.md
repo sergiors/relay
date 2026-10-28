@@ -35,6 +35,23 @@ Producer → Redis Stream → Relay → App → Function (handler)
 Functions, schedules, and persistent services are declared within an app and share
 the same deployment model while keeping their execution semantics independent.
 
+## Getting Started
+
+You need Docker Engine and Docker Compose.
+
+```sh
+mkdir relay && cd relay
+curl -fsSLO https://raw.githubusercontent.com/sergiors/relay/main/compose.yaml
+mkdir apps
+docker compose up -d
+docker compose exec relay relay health
+```
+
+The stack publishes unauthenticated Redis and development-credential PostgreSQL
+on host ports, and Relay accesses Docker through a restricted socket proxy.
+Treat Docker Engine access as highly privileged, and do not expose this stack to
+untrusted networks.
+
 ## What you get
 
 - **Event-driven execution** — Redis Streams, declarative matching, retries, reclaim, dead-lettering, and at-least-once delivery.
@@ -159,70 +176,6 @@ Relay is designed around explicit delivery, recovery, and convergence semantics.
 - **Warm container generations converge safely.** Idle stale containers are retired while busy old-generation containers are allowed to drain.
 - **Resource limits are per container.** Increasing app concurrency or service replicas multiplies the possible aggregate resource usage.
 - **Shutdown uses a cleanup budget and strict dependency barriers.** Relay performs ordered graceful teardown under an aggregate deadline that caps each best-effort cleanup step (for example metrics, webhook, service-container cleanup, and the stats flush) by the budget remaining at that point; when a best-effort step misses its bound the timeout is logged, its context is cancelled, and the registry proceeds without waiting for that operation to finish — an uncooperative operation may therefore continue in the background — though every later step is still attempted. Steps that gate a shared dependency (scheduler, reconciler, startup housekeeping, the service coordinator, and the background loops) are quiescence barriers: each has a per-step timeout used only to log and cancel the step, after which the registry waits for the operation to actually exit before advancing. Cancellation requests a stop but does not instantly terminate in-flight work, so those strict joins can extend total shutdown beyond the aggregate deadline — a wedged dependency-holding operation is waited out rather than used to close a resource another operation is still using.
-
-## Quick start
-
-Relay requires:
-
-- Redis
-- access to a Docker Engine
-
-The bundled `compose.yaml` starts Relay with Redis and a Docker socket proxy and mounts the example apps at `/apps`.
-
-```sh
-docker compose up -d
-docker compose ps
-docker compose logs -f relay
-```
-
-Publish an event that matches the `order-confirmation-typescript` example:
-
-```sh
-docker compose exec redis redis-cli XADD events '*' \
-  event '{"type":"order.created","order_id":"ord_42","customer_email":"jane@example.com","total":99.5}'
-```
-
-Then watch Relay execute the matching handler:
-
-```sh
-docker compose logs -f relay
-```
-
-Stop the stack with:
-
-```sh
-docker compose down -v
-```
-
-> **Security warning:** access to the Docker Engine is privileged.
->
-> The example Compose setup exposes the Docker API through a dedicated socket proxy with a restricted endpoint allow-list. Relay still requires mutating Docker operations such as building or pulling images and creating containers, so access should be treated as highly privileged.
-
-### Building from source
-
-Building the Relay binary itself requires Go 1.27:
-
-```sh
-go build -o relay ./cmd
-```
-
-Run it against your own Redis, PostgreSQL, and Docker Engine:
-
-```sh
-REDIS_URI=localhost:6379 \
-REDIS_STREAM=events \
-REDIS_GROUP=relay \
-WORKER_ID=relay-1 \
-DATABASE_URL='postgres://relay:relay@localhost:5432/relay?sslmode=disable' \
-./relay start
-```
-
-Relay reads apps from the fixed `/apps` root. `WORKER_ID` is the worker's
-required stable identity (Redis consumer name, `relay.hostname` label, and stats
-owner). The `DATABASE_URL` database is a
-required, shared state view (operator snapshot, per-worker stats, and the durable
-schedule outbox); see [docs/operations.md](docs/operations.md#state-database) and
-[docs/configuration.md](docs/configuration.md).
 
 ## Apps
 
@@ -427,13 +380,16 @@ a bare `NAME` is a usage error and never reads stdin. Secrets are read from a
 hidden prompt on an interactive terminal, or from all of stdin when `-` is
 given; they are never arguments:
 
+To invoke an app, first place it under `./apps` and provide an event matching
+one of its handlers.
+
 ```sh
-relay app invoke user-events-python '{"event_name":"INSERT"}'
-relay app invoke user-events-python - < event.json
-echo '{"event_name":"INSERT"}' | relay app invoke user-events-python -
+relay app invoke my-app '{"event_name":"INSERT"}'
+relay app invoke my-app - < event.json
+echo '{"event_name":"INSERT"}' | relay app invoke my-app -
 
 # -T keeps stdin a pipe instead of an allocated pseudo-TTY.
-docker compose exec -T relay app invoke user-events-python - < event.json
+docker compose exec -T relay app invoke my-app - < event.json
 
 relay secret set API_KEY                          # hidden prompt (requires a terminal)
 printf '%s' 'value' | relay secret set API_KEY -  # read all of stdin
@@ -457,6 +413,7 @@ See [docs/cli.md](docs/cli.md) for the detailed CLI reference.
 
 | Document                                       | Covers                                                                                 |
 | ---------------------------------------------- | -------------------------------------------------------------------------------------- |
+| [docs/installation.md](docs/installation.md)   | Self-hosted deployment, configuration, and operations                                  |
 | [docs/configuration.md](docs/configuration.md) | Relay environment variables, defaults, and process-level configuration                 |
 | [docs/apps.md](docs/apps.md)                   | App layout, templates, runtimes, environment, secrets, resources, and warm containers  |
 | [docs/events.md](docs/events.md)               | Event matching, dispatch, retries, ACK semantics, invocation state, and DLQ            |
@@ -465,18 +422,10 @@ See [docs/cli.md](docs/cli.md) for the detailed CLI reference.
 | [docs/operations.md](docs/operations.md)       | Lifecycle, state, recovery, metrics, tracing, logs, Git sync, and operational behavior |
 | [docs/cli.md](docs/cli.md)                     | Commands, flags, and prerequisites                                                     |
 
-## Development
+## Contributing
 
-Run the standard validation suite before submitting changes:
-
-```sh
-gofmt -w <changed-go-files>
-go vet ./...
-go test ./...
-go test -race ./...
-```
-
-Integration tests may require Redis and Docker.
+See [development and testing](docs/development.md) for build and validation
+instructions.
 
 ## License
 

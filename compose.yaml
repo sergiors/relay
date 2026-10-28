@@ -1,7 +1,6 @@
 services:
   relay:
-    build: .
-    # image: ghcr.io/sergiors/relay:latest
+    image: ghcr.io/sergiors/relay:latest
     container_name: relay
     stop_grace_period: 3m
 
@@ -39,7 +38,7 @@ services:
       - HOT_RELOAD=1
 
     volumes:
-      - ./examples/apps:/apps:ro
+      - ./apps:/apps:ro
       - relay-data:/var/lib/relay
 
     healthcheck:

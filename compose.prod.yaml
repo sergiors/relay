@@ -1,0 +1,263 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  traefik:
+    image: traefik:v3.7.13
+    restart: unless-stopped
+    logging: *default-logging
+
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=traefik
+
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+
+      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:?Set ACME_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+
+    ports:
+      - "80:80"
+      - "443:443"
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - letsencrypt-data:/letsencrypt
+
+    networks:
+      - edge
+
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    restart: unless-stopped
+    logging: *default-logging
+
+    environment:
+      PING: "1"
+      VERSION: "1"
+      BUILD: "1"
+      IMAGES: "1"
+      CONTAINERS: "1"
+      NETWORKS: "1"
+      POST: "1"
+      DELETE: "1"
+
+      TIMEOUT_CLIENT: 1h
+      TIMEOUT_CONNECT: 10s
+      TIMEOUT_SERVER: 1h
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+    networks:
+      - control
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:2375/_ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  relay:
+    image: ${RELAY_IMAGE:?Set RELAY_IMAGE to a tested release tag or digest}
+    restart: unless-stopped
+    logging: *default-logging
+
+    depends_on:
+      socket-proxy:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+
+    env_file:
+      - .env
+
+    environment:
+      DOCKER_HOST: tcp://socket-proxy:2375
+
+      NETWORKS: relay,traefik
+      WORKER_ID: ${WORKER_ID:?Set WORKER_ID}
+
+      TRAEFIK_NETWORK: traefik
+      TRAEFIK_ENTRYPOINTS: websecure
+      TRAEFIK_CERTRESOLVER: letsencrypt
+
+      METRICS_ADDR: :9090
+
+      OTEL_SERVICE_NAME: relay
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+
+      LOG_LEVEL: INFO
+
+    volumes:
+      - relay-apps:/apps
+      - relay-data:/var/lib/relay
+
+    networks:
+      - runtime
+      - edge
+      - control
+
+    healthcheck:
+      test: ["CMD", "relay", "health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+
+  prometheus:
+    image: prom/prometheus:v3.7.0
+    restart: unless-stopped
+    logging: *default-logging
+
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-otlp-receiver
+
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+    networks:
+      - runtime
+
+  loki:
+    image: grafana/loki:3.7.0
+    restart: unless-stopped
+    logging: *default-logging
+
+    command:
+      - -config.file=/etc/loki/loki.yaml
+
+    volumes:
+      - ./loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+
+    networks:
+      - runtime
+
+  tempo:
+    image: grafana/tempo:${TEMPO_VERSION:?Set TEMPO_VERSION}
+    restart: unless-stopped
+    logging: *default-logging
+
+    command:
+      - -config.file=/etc/tempo.yaml
+
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+
+    networks:
+      - runtime
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:${OTEL_VERSION:?Set OTEL_VERSION}
+    restart: unless-stopped
+    logging: *default-logging
+
+    command:
+      - --config=/etc/otelcol-contrib/config.yaml
+
+    depends_on:
+      - tempo
+      - prometheus
+
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+
+    networks:
+      - runtime
+
+  alloy:
+    image: grafana/alloy:${ALLOY_VERSION:?Set ALLOY_VERSION}
+    restart: unless-stopped
+    logging: *default-logging
+
+    command:
+      - run
+      - --storage.path=/var/lib/alloy
+      - /etc/alloy/config.alloy
+
+    depends_on:
+      - loki
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - alloy-data:/var/lib/alloy
+
+    networks:
+      - runtime
+
+  grafana:
+    image: grafana/grafana:${GRAFANA_VERSION:?Set GRAFANA_VERSION}
+    restart: unless-stopped
+    logging: *default-logging
+
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+
+    environment:
+      GF_SERVER_ROOT_URL: https://${GRAFANA_DOMAIN:?Set GRAFANA_DOMAIN}
+
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:?Set GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD}
+
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+
+    networks:
+      - runtime
+      - edge
+
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=traefik
+
+      - traefik.http.routers.grafana.rule=Host(`${GRAFANA_DOMAIN:?Set GRAFANA_DOMAIN}`)
+      - traefik.http.routers.grafana.entrypoints=websecure
+      - traefik.http.routers.grafana.tls=true
+      - traefik.http.routers.grafana.tls.certresolver=letsencrypt
+
+      - traefik.http.services.grafana.loadbalancer.server.port=3000
+
+volumes:
+  relay-apps:
+  relay-data:
+
+  prometheus-data:
+  loki-data:
+  tempo-data:
+  grafana-data:
+  alloy-data:
+
+  letsencrypt-data:
+
+networks:
+  runtime:
+    name: relay
+
+  edge:
+    name: traefik
+
+  control:
+    internal: true
