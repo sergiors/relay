@@ -171,14 +171,13 @@ const (
 	// configured stream — the number of stream entries not yet delivered to that
 	// group — as reported by XINFO GROUPS (Redis's own lag semantics). A lag
 	// Redis cannot determine is left unobserved rather than reported as zero.
-	// MetricDLQDepth is the current length of the Relay-owned DLQ stream for the
-	// configured stream (XLEN of DLQStreamFor(stream)). Both are unlabeled and
-	// sampled by the same periodic stream-metrics source as the pending backlog.
-	// Their scope is that configured stream/group and its DLQ, which every
-	// process/worker configured with the same stream and group SHARES; neither
-	// is partitioned per worker. Each Registry is process-local, so when more
-	// than one worker shares a stream/group those endpoints report the SAME
-	// underlying observation and must not be summed as if disjoint.
+	// MetricDLQDepth is the APPROXIMATE row count of the durable PostgreSQL DLQ
+	// table, estimated from pg_class.reltuples rather than a COUNT(*) scan; it
+	// may lag recent inserts/deletes and read 0 until the table is analyzed. Both
+	// are unlabeled: the group lag is sampled by the stream-metrics source, and
+	// the DLQ depth by the worker's PostgreSQL sampler. The state database is
+	// shared by every worker configured with it, so per-worker observations report
+	// the same underlying depth and must not be summed as if disjoint.
 	MetricStreamGroupLag      = metricNamespacePrefix + "stream_group_lag_entries"
 	MetricDLQDepth            = metricNamespacePrefix + "dlq_depth"
 	MetricBufferedEvents      = metricNamespacePrefix + "buffered_events"
@@ -285,7 +284,7 @@ const (
 //     consumer re-delivers), not handler retries; MetricFunctionRetries counts
 //     failed handler executions that will be retried. They answer different
 //     questions.
-//   - MetricDLQEntries counts successful Redis DLQ entry WRITES (one per
+//   - MetricDLQEntries counts successful PostgreSQL DLQ entry WRITES (one per
 //     exhausted invocation, plus a placeholder for a malformed message), not
 //     invocations that exhausted their retries; MetricFunctionDLQ counts the
 //     exhaustion commit, which may precede the actual write.
@@ -300,7 +299,7 @@ var metricHelp = map[string]string{
 	MetricEventsUnmatched: "Logical incoming events for which no app rule matched, classified exactly once per logical event across redeliveries/retries. Unmatched events are acknowledged and never retried.",
 
 	MetricRetries:                      "Message reclaims: idle pending entries the stream consumer reclaimed and re-delivered, counted once per reclaim even when the message is not processed (buffer full) or every invocation is skipped as protected. This is a redelivery counter, not handler retries; distinct from function_retries_total, which counts failed handler executions.",
-	MetricDLQEntries:                   "Successful dead-letter writes: entries actually written to the Redis DLQ stream, counted once per successful XADD. One write per exhausted invocation, plus one placeholder write for a malformed message that never reached a handler. A failed DLQ write is not counted, and invocation exhaustion is counted separately by function_dlq_total.",
+	MetricDLQEntries:                   "Successful dead-letter writes: entries actually inserted into the durable PostgreSQL DLQ, counted once per successful idempotent insert. One write per exhausted invocation, plus one placeholder write for a malformed message that never reached a handler. A failed or already-existing row is not counted, and invocation exhaustion is counted separately by function_dlq_total.",
 	MetricHandlerSuccess:               "Successful handler executions across event, schedule, and manual invocations, counted once per handler attempt.",
 	MetricHandlerFailure:               "Failed handler attempts across event, schedule, and manual invocations, counted once per attempt; a failed attempt that will retry is counted here too.",
 	MetricConcurrencyWaits:             "Concurrency slot acquisitions that had to block before executing an invocation, regardless of eventual success; each blocked acquisition counts once per slot (worker-global and per-app).",
@@ -326,7 +325,7 @@ var metricHelp = map[string]string{
 	MetricFunctionHandlerSuccess:          "Successful handler executions attributed to the app, counted once per handler attempt across event, schedule, and manual invocations.",
 	MetricFunctionHandlerFailure:          "Failed handler attempts attributed to the app, counted once per attempt; a failed attempt that will retry is counted here too.",
 	MetricFunctionRetries:                 "Handler retries: failed handler attempts attributed to the app that will be retried according to the rule's retry budget (handler retries, not stream message reclaims).",
-	MetricFunctionDLQ:                     "Invocations attributed to the app that exhausted their retry budget and were marked terminal for the dead-letter queue, counted once per exhausted invocation. This counts the exhaustion COMMIT, not a successful DLQ write: it is incremented when the invocation's terminal exhausted marker is committed, which happens before the message-level DLQ XADD (that write occurs after every exhausted sibling invocation in the same delivery has finished and is counted by dlq_entries_total only on success).",
+	MetricFunctionDLQ:                     "Invocations attributed to the app that exhausted their retry budget and were marked terminal for the dead-letter queue, counted once per exhausted invocation. This counts the exhaustion COMMIT, not a successful DLQ write: it is incremented when the invocation's terminal exhausted marker is committed, which happens before the message-level PostgreSQL insert (that write occurs after every exhausted sibling invocation in the same delivery has finished and is counted by dlq_entries_total only on a new row).",
 	MetricRuntimeContainerAcquires:        "Successful warm-container pool acquires by app and outcome; warm leases an existing idle container, cold starts a fresh container.",
 	MetricRuntimeContainerDiscards:        "Warm-container pool container discards by app and finite teardown reason.",
 	MetricRuntimeContainerWaits:           "Warm-container pool acquires that had to block at the pool's capacity bound, regardless of eventual success.",
@@ -337,7 +336,7 @@ var metricHelp = map[string]string{
 	MetricPendingEntries:        "Current number of pending (delivered but unacknowledged) entries in the Redis consumer group, sampled from XPENDING.",
 	MetricPendingOldestAge:      "Current age in seconds of the oldest pending entry in the Redis consumer group, sampled from XPENDING.",
 	MetricStreamGroupLag:        "Current number of entries in the configured Redis stream not yet delivered to the configured consumer group, sampled from XINFO GROUPS using Redis's own lag semantics. Scope is that configured stream/group, which every process/worker configured with the same stream and group shares; each Registry is process-local, so repeated per-worker observations of the same group are the same underlying value and must not be summed as if disjoint. A lag Redis reports as undeterminable is left at its last observed value rather than reported as zero.",
-	MetricDLQDepth:              "Current number of entries in the Relay-owned dead-letter stream for the configured stream (XLEN of relay:<stream>:dlq), sampled periodically. Scope is that DLQ stream, which every process/worker configured with the same stream shares — it is not partitioned per worker — so each process-local Registry reports the same underlying depth and repeated per-worker observations must not be summed as if disjoint. Not a count of exhausted invocations (function_dlq_total) or of successful DLQ writes (dlq_entries_total).",
+	MetricDLQDepth:              "APPROXIMATE number of rows in the durable PostgreSQL dead-letter table, estimated from pg_class.reltuples rather than an exact COUNT(*). It may lag recent DLQ inserts/deletes and can read 0 until PostgreSQL analyzes the table. Scope is the shared state database, which every worker configured with it uses — it is not partitioned per worker — so each process-local Registry reports the same underlying estimate and repeated per-worker observations must not be summed as if disjoint. Not a count of exhausted invocations (function_dlq_total) or of successful DLQ writes (dlq_entries_total).",
 	MetricBufferedEvents:        "Current number of events held in the stream consumer's local in-flight buffer, set on each acquire and release.",
 	MetricInFlightInvocations:   "Current number of invocations executing in this worker, set on each concurrency-slot acquire and release.",
 	MetricMissingPayload:        "Reclaimed pending entries whose stream body no longer exists (trimmed or deleted before acknowledgement), counted once per entry when its dangling PEL reference is cleared. These entries cannot be processed and are neither handler attempts nor DLQ entries; a nonzero value signals an unsafe trim or an external delete racing Relay.",
@@ -394,17 +393,14 @@ var SchedulerStates = []string{
 // stream consumer issues. Each labels MetricRedisReadErrors by which command
 // failed; pending_gauge is the periodic XPENDING depth sampler, which is
 // instrumented through the same counter but is distinct from a reclaim-path
-// pending read so the two never double count one command. group_lag and
-// dlq_depth are the sampler's XINFO GROUPS and XLEN observations respectively,
-// kept distinct so a failing stream command never looks like a failing DLQ
-// command.
+// pending read so the two never double count one command. group_lag is the
+// sampler's XINFO GROUPS observation.
 const (
 	RedisOpReadGroup    = "read_group"
 	RedisOpPending      = "pending"
 	RedisOpAutoclaim    = "autoclaim"
 	RedisOpPendingGauge = "pending_gauge"
 	RedisOpGroupLag     = "group_lag"
-	RedisOpDLQDepth     = "dlq_depth"
 )
 
 // Service reconcile outcome label values. A pass that changed container state
@@ -763,9 +759,10 @@ func New() *Registry {
 		vec:   buildDuration,
 	}
 
-	// Pending-backlog gauges fed by the stream consumer's XPENDING sampler.
-	// MetricStreamGroupLag (XINFO GROUPS) and MetricDLQDepth (XLEN) are set by
-	// the same periodic sampler/source (see PendingGaugeSource).
+	// Backlog gauges fed by the stream consumer's XPENDING sampler and the
+	// worker's PostgreSQL DLQ depth sampler. MetricStreamGroupLag (XINFO GROUPS)
+	// is set by PendingGaugeSource; MetricDLQDepth is set by the worker's
+	// dlqDepthGauge.
 	for _, name := range []string{
 		MetricPendingEntries,
 		MetricPendingOldestAge,

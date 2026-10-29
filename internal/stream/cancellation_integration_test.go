@@ -54,8 +54,12 @@ func TestIntegrationShutdownCancellationLeavesPendingAndReclaimSucceeds(t *testi
 	if _, ok := envA.pending()[id]; !ok {
 		t.Fatalf("message %s left the PEL on shutdown; want pending (no ACK, no DLQ)", id)
 	}
-	if got := len(envA.dlq()); got != 0 {
-		t.Fatalf("shutdown dead-lettered %d entries; want 0", got)
+	entries, err := envA.dlqStore.ListDLQEntries(context.Background())
+	if err != nil {
+		t.Fatalf("list DLQ entries after shutdown: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("shutdown dead-lettered %d entries; want 0", len(entries))
 	}
 
 	// A fresh consumer in the same group reclaims the now-idle pending message
@@ -136,8 +140,12 @@ func TestIntegrationCancellationAfterClaimKeepsRecoverableMarker(t *testing.T) {
 	if _, ok := envA.pending()[id]; !ok {
 		t.Fatalf("message %s not pending after the canceled delivery", id)
 	}
-	if got := len(envA.dlq()); got != 0 {
-		t.Fatalf("canceled delivery dead-lettered %d entries; want 0", got)
+	entries, listErr := envA.dlqStore.ListDLQEntries(context.Background())
+	if listErr != nil {
+		t.Fatalf("list DLQ entries after the canceled delivery: %v", listErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("canceled delivery dead-lettered %d entries; want 0", len(entries))
 	}
 
 	// A fresh consumer reclaims after the deadline: attempt 2 runs and completes.

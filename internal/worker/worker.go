@@ -546,7 +546,10 @@ func Run(logger *slog.Logger) (runErr error) {
 		prepared, logger, cfg, metricsInstance, secretProvider, rtSocket,
 	)
 
-	consumer := newStreamConsumer(client, logger, cfg, metricsInstance, runWorker)
+	consumer := newStreamConsumer(client, logger, cfg, metricsInstance, st, runWorker)
+	// The durable DLQ lives in PostgreSQL, so its depth gauge is sampled from
+	// the state handle on the consumer's existing periodic gauge refresher.
+	consumer.AddGaugeSource(&dlqDepthGauge{st: st, metrics: metricsInstance, log: logger})
 
 	// Optional metrics and webhook servers bind synchronously; a bind failure is
 	// fatal and each teardown step registers only after a successful Start.
@@ -563,7 +566,7 @@ func Run(logger *slog.Logger) (runErr error) {
 	}
 
 	startBackgroundLoops(
-		ctx, logger, cfg, client, statsFlusher, metricsLoggerDone, shutdown,
+		ctx, logger, cfg, client, st, statsFlusher, metricsLoggerDone, shutdown,
 	)
 
 	sched := newWorkerScheduler(

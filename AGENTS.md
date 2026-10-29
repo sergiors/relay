@@ -22,7 +22,8 @@ worker; admin commands communicate with it or read persistent state.
 - `schedule` owns occurrence identity/publication; `cron` owns timing,
   catch-up, and durable publication retry. `reconciler` owns reload and service
   convergence. `runtime` owns Docker integration; language engines live in
-  `runtime/python` and `runtime/node`. `state` owns PostgreSQL; `observability`
+  `runtime/python` and `runtime/node`. `state` owns PostgreSQL, including the
+  durable dead-letter rows; `observability`
   owns telemetry.
 
 ## Invariants to preserve
@@ -32,10 +33,13 @@ worker; admin commands communicate with it or read persistent state.
   Post-start state-write failures are non-fatal. Staged Docker build contexts
   live under private temp storage, not `/apps` or state storage.
 - Delivery is at-least-once; handlers may run again and should be idempotent.
-  ACK only after every matched invocation is terminal and required DLQ entries
-  are persisted. Claim transitions are atomic and fenced: an ambiguous
-  `TryStart` result must not execute. Rejecting work for capacity before claim
-  must not spend an attempt.
+  ACK only after every matched invocation is terminal and required DLQ rows
+  are committed to PostgreSQL. Claim transitions are atomic and fenced: an
+  ambiguous `TryStart` result must not execute. Rejecting work for capacity
+  before claim must not spend an attempt.
+- DLQ rows are inserted before the source ACK and marked settled only after a
+  confirmed ACK (or reconciliation proves the source delivery is no longer
+  pending). Admin removal and retention delete settled rows only.
 - Unavailable apps and valid pending generations remain matched and pending;
   availability alone must not cause ACK or DLQ. Keep the old active generation
   serving until its replacement is prepared.

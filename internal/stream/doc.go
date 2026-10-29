@@ -33,16 +33,21 @@
 //     its dangling PEL reference is cleared; no handler attempt, retry, or DLQ
 //     entry is fabricated (Redis 7+ reports such entries in XAUTOCLAIM's purged
 //     deleted-id array; older servers return them with nil values).
-//   - Dead-lettering: exhausted or malformed messages are XADD'd to the DLQ
-//     before the original is acknowledged. Each entry's XADD and its
-//     persistence marker are written by ONE atomic Lua script, so a crash or
-//     error between the two can never leave a duplicate or unmarked entry.
-//     Exhaustion is per-invocation: when
-//     every non-complete matched invocation is exhausted, the whole message is
-//     routed to the DLQ and one entry is written PER exhausted invocation (see
-//     ErrInvocationExhausted and HandlerExhaustedError), each carrying its exact
-//     app/handler and handler attempt count. A malformed message that never
-//     reached a handler produces a single entry with the "-" placeholder and an
+//   - Dead-lettering: exhausted or malformed messages are persisted to the
+//     durable PostgreSQL DLQ BEFORE the original is acknowledged. PostgreSQL is
+//     the sole DLQ persistence, admin view, and retention store; Redis remains
+//     the broker and the invocation-state authority. Each entry is inserted
+//     idempotently by a stable ID derived from the logical source delivery
+//     identity (source stream, group, message ID) plus the invocation identity,
+//     so a crash, an ambiguous transaction, or a failed ACK can never duplicate
+//     or lose a row. Exhaustion is per-invocation: when every non-complete
+//     matched invocation is exhausted, the whole message is routed to the DLQ
+//     and one row is written PER exhausted invocation, each carrying its exact
+//     app/handler and handler attempt count. Before a real invocation's row is
+//     written, its retained exhausted marker is re-read from Redis and its
+//     attempt/token identity must still match the runner's attribution, so a
+//     stale claim can never create an entry. A malformed message that never
+//     reached a handler produces a single row with the "-" placeholder and an
 //     explicit handler_attempts of 0. A message whose raw `event` value exceeds
 //     MAX_EVENT_BYTES is checked at extraction time (before decode, schedule
 //     classification, matching, and invocation-state migration) and routed the
@@ -50,22 +55,30 @@
 //     field is a small diagnostic summary (EventOversizedError reports the
 //     measured bytes and configured max) rather than the oversized payload; such
 //     an entry is intentionally non-replayable.
-//   - DLQ idempotency without scanning the DLQ: once an invocation's entry is
-//     successfully appended its marker becomes "exhausted:<attempt>:<token>:dlq"
-//     in the SAME atomic step; the malformed-message placeholder records a
-//     reserved message-scoped field instead of a fabricated handler identity. A
-//     redelivery (after an XACK failure, a crash, or a partially-written
-//     multi-entry DLQ) skips the already-persisted entries and writes only the
-//     missing ones. The original is ACKed only after all required entries are
-//     persisted, so a write failure leaves the message pending.
+//   - DLQ idempotency: the stable row ID is the idempotency key. A redelivery
+//     (after an ACK failure, a crash, or a partially-written multi-entry write)
+//     re-inserts only the missing rows; an already-committed row is left
+//     untouched. The original is ACKed only after every required row is
+//     committed, so a PostgreSQL write failure leaves the message pending.
+//   - DLQ settlement: every row for one logical source delivery shares a
+//     delivery_id and starts UNSETTLED. Only after ackAndRetainTerminal succeeds
+//     does the stream mark that delivery settled. If the process crashes
+//     between the ACK and that update, a bounded worker reconciliation asks
+//     Redis whether the exact source stream/group/message is still pending and
+//     marks settled only once it is gone; Redis errors preserve the rows. Its
+//     bounded pages advance a delivery-ID cursor and wrap, so permanently
+//     pending rows cannot starve later deliveries. Admin removal and retention
+//     delete settled rows only. The payload is private JSONB; event/reason and
+//     broker diagnostic identity bytes are base64 inside it so arbitrary bytes
+//     (including NUL and invalid UTF-8) survive JSONB losslessly.
 //   - Invocation state: per-handler lifecycle is recorded in a Redis hash
 //     (relay:invocation:{stream}:{group}:{msgID}, field "<app>/<handler>" →
 //     "ok" when complete, "running:<deadline_ms>:<attempt>:<token>" while an
 //     attempt is protected, "next_attempt_at:<deadline_ms>:<attempt>:<token>"
-//     while a failed attempt waits out its retry backoff, "exhausted:<attempt>:<token>"
-//     when terminal, or "exhausted:<attempt>:<token>:dlq" when terminal AND its
-//     DLQ entry is persisted; stream/group names are percent-encoded in the key)
-//     so a redelivered message skips handlers that already completed, are still
+//     while a failed attempt waits out its retry backoff, or
+//     "exhausted:<attempt>:<token>" when terminal; stream/group names are
+//     percent-encoded in the key) so a redelivered message skips handlers that
+//     already completed, are still
 //     within an active attempt deadline or retry backoff, or are exhausted; the
 //     message is acknowledged when all matching invocations are complete.
 //     While the message is recoverable the key is PERSISTENT (no TTL); only
@@ -84,9 +97,11 @@
 //     TryStartScheduled), so the handler/timeout/retries it was admitted under
 //     are stable through retry/reclaim/DLQ even if the schedule is later changed
 //     or removed; the descriptor is a sibling field, never an invocation ID, and
-//     it is never a DLQ/attribution key. A malformed-message DLQ placeholder
-//     records its persistence under the reserved "__dlq" field (also never an
-//     invocation ID), since it has no handler to carry a per-invocation marker.
+//     it is never a DLQ/attribution key. The schedule occurrence's event
+//     envelope (occurrence_id/scheduled_at) is stored verbatim in its DLQ row,
+//     preserving occurrence provenance. A legacy ":dlq" suffix on an exhausted
+//     marker is still read as terminal, but no new suffix is written: PostgreSQL
+//     is the DLQ authority.
 //
 // Deadlines are integer Unix MILLISECONDS end to end. An active
 // running/next_attempt_at marker is protected iff now_ms < deadline_ms and
@@ -101,18 +116,18 @@
 // the atomic DLQ append CASes the same exhausted identity; a mismatch is an
 // explicit stale/refused result (false/error), never a silent overwrite.
 // Terminal exhausted markers retain their claim identity
-// ("exhausted:<attempt>:<token>") so the DLQ-persistence step can CAS the
-// same exhausted claim and can never downgrade a newer exhausted marker or a
-// success. Tokens are never logged, used as metric labels, or written to the DLQ.
+// ("exhausted:<attempt>:<token>") so the DLQ-persistence step can validate the
+// exact exhausted claim and can never attribute a row to a newer exhausted
+// marker or a success. Tokens are never logged, used as metric labels, or
+// written to the DLQ.
 //
 // Invocation-state transitions are atomic: every lifecycle write (claim,
-// failure, completion, exhaustion, classification, trace), the DLQ
-// append+marker pair, and the terminal ACK+retention switch are single Lua
-// scripts, so concurrent replicas cannot both
-// start the same invocation, a stale claim can never overwrite a newer claim's
-// or a terminal marker, a DLQ entry can never be appended without its
-// persistence marker (or vice versa), and a message can never leave the PEL
-// while its hash is left unretained.
+// failure, completion, exhaustion, classification, trace) and the terminal
+// ACK+retention switch are single Lua scripts, so concurrent replicas cannot
+// both start the same invocation, a stale claim can never overwrite a newer
+// claim's or a terminal marker, and a message can never leave the PEL while its
+// hash is left unretained. Dead-letter persistence itself is a PostgreSQL
+// idempotent insert before the ACK; it is not part of a Redis script.
 //
 // The per-invocation state machine is:
 //
@@ -121,9 +136,9 @@
 //	running/next_attempt_at --(now_ms >= deadline_ms)--> eligible --> running:<...#<n+1>:<new token>>
 //	running/next_attempt_at --MarkComplete--> ok                (terminal success, CASed on the claim)
 //	running/next_attempt_at --MarkExhausted--> exhausted:<n>:<token>    (terminal, CASed on the claim)
-//	exhausted:<n>:<token> --persistDLQ (atomic append)--> exhausted:<n>:<token>:dlq (terminal, entry persisted, CASed on the exhausted claim)
+//	exhausted:<n>:<token> --validated + PostgreSQL insert--> source ACK (row persisted idempotently)
 //
-// "ok" and the exhausted forms are terminal: TryStart never re-opens them, and
+// "ok" and exhausted are terminal: TryStart never re-opens them, and
 // MarkComplete never downgrades an exhausted marker (success must not resurrect
 // a message already routed to the DLQ). `handler_attempts` is the runner's
 // persisted attempt count, distinct from the Redis stream delivery count.
@@ -179,8 +194,9 @@
 // claim's outcome can never acknowledge or dead-letter a newer claim's message.
 //
 // Key Guarantees:
-//   - A message is acknowledged only after the handler succeeds or the DLQ
-//     write succeeds (at-least-once, never exactly-once)
+//   - A message is acknowledged only after the handler succeeds or every
+//     required DLQ row is committed to PostgreSQL (at-least-once, never
+//     exactly-once)
 //   - A message whose invocation is protected (running on another replica or
 //     waiting out a retry backoff) is left pending, never acknowledged — this
 //     is what prevents the cross-replica ACK hazard where a reclaiming replica
@@ -266,9 +282,9 @@
 // (running/backoff, whether or not a descriptor is pinned) keeps the message
 // pending. A TERMINAL marker completes the admitted invocation's real
 // disposition instead of being cancelled — a "ok" marker is ACKed, and an
-// exhausted marker is dead-lettered (idempotently — an already-":dlq" marker is
-// skipped) and then ACKed — including when a descriptor is pinned (a
-// current-version delivery pinned + claimed, then completed/exhausted but crashed
-// before its ACK/DLQ). A rejection reservation can therefore never leave a
-// terminal disposition stuck or drop a DLQ entry.
+// exhausted marker is dead-lettered (idempotently — PostgreSQL already holds the
+// row, so the insert is a no-op) and then ACKed — including when a descriptor is
+// pinned (a current-version delivery pinned + claimed, then completed/exhausted
+// but crashed before its ACK/DLQ). A rejection reservation can therefore never
+// leave a terminal disposition stuck or drop a DLQ entry.
 package stream

@@ -7,6 +7,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"relay/internal/config"
+	"relay/internal/state"
 	"relay/internal/stream"
 )
 
@@ -18,13 +19,16 @@ import (
 // metricsLoggerDone is the metrics snapshot logger's done channel from
 // startMetricsServer; it is nil when METRICS_ADDR is unset. The stats flush
 // loop always runs because the registry always exists: persistent stats must
-// keep flushing when HTTP exposition is disabled. Stream and DLQ retention
-// loops are started only when their configured windows are positive.
+// keep flushing when HTTP exposition is disabled. Source-stream retention runs
+// only when its configured window is positive; durable DLQ settlement
+// reconciliation always runs, and durable DLQ retention runs only when its
+// window is positive.
 func startBackgroundLoops(
 	ctx context.Context,
 	logger *slog.Logger,
 	cfg config.Config,
 	client *redis.Client,
+	st *state.State,
 	statsFlusher *statsFlusher,
 	metricsLoggerDone <-chan struct{},
 	shutdown *shutdownRegistry,
@@ -61,22 +65,29 @@ func startBackgroundLoops(
 		}()
 	}
 
-	// Optional DLQ retention (cfg.DLQRetention from REDIS_DLQ_RETENTION, default
-	// 7 days; unset/empty/zero/negative behavior is resolved by config.Load): a
-	// separate goroutine age-trims ONLY the Relay-owned DLQ stream derived from
-	// the configured source (stream.DLQStreamFor) with a mode-less
-	// XTRIM MINID ~. The DLQ has no consumer group, PEL, or XACK, so it needs no
-	// ACKED mode and is independent of the main stream's capability. This never
-	// touches the source stream and never affects ACK-before-DLQ ordering.
-	if cfg.DLQRetention > 0 {
+	// Bounded ACK/settlement reconciliation always runs: a crash between a
+	// successful Redis ACK and the PostgreSQL settlement update leaves otherwise
+	// undeletable rows behind, so this cannot be gated on DLQ_RETENTION.
+	if st != nil && client != nil {
+		settlementDone := make(chan struct{})
+		loopDones = append(loopDones, settlementDone)
+		go func() {
+			defer close(settlementDone)
+			dlqSettlementLoop(ctx, st, stream.NewDeliveryInspector(client), logger)
+		}()
+	}
+
+	// Optional durable DLQ retention (cfg.DLQRetention from DLQ_RETENTION,
+	// default 7 days; unset/empty/zero/negative behavior is resolved by
+	// config.Load): a separate goroutine deletes DLQ rows older than the window
+	// from PostgreSQL in bounded batches. It never touches the source stream and
+	// never affects ACK-before-DLQ ordering.
+	if cfg.DLQRetention > 0 && st != nil {
 		dlqRetentionDone := make(chan struct{})
 		loopDones = append(loopDones, dlqRetentionDone)
 		go func() {
 			defer close(dlqRetentionDone)
-			dlqRetentionLoop(
-				ctx, client, stream.DLQStreamFor(cfg.RedisStream),
-				cfg.DLQRetention, logger,
-			)
+			dlqRetentionLoop(ctx, st, cfg.DLQRetention, logger)
 		}()
 	}
 

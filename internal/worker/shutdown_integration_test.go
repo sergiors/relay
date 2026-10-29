@@ -265,6 +265,9 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 		Consumer: cfg.consumerName,
 		Log:      logger,
 		Metrics:  m,
+		// PostgreSQL is the durable DLQ store, wired exactly as production
+		// (newStreamConsumer): exhaustion routes rows there before any ACK.
+		DLQStore: st,
 		// A short XREADGROUP BLOCK (the production default is 5s): go-redis's
 		// blocking read is not interrupted by ctx cancellation, so the read loop
 		// observes shutdown only on the next block expiry. The message still has
@@ -688,5 +691,5 @@ export async function slow(event) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("consumer B did not stop")
 	}
-	_ = env.client.Del(context.Background(), streamName, stream.DLQStreamFor(streamName), invKey).Err()
+	_ = env.client.Del(context.Background(), streamName, invKey).Err()
 }

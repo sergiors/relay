@@ -84,7 +84,8 @@ func attrString(span tracetest.SpanStub, key string) string {
 func processMessageConsumer(store invocationStateStore) *Consumer {
 	return newConsumer(ConsumerConfig{
 		Stream: "s", Group: "g", Consumer: "c",
-		Log: slog.New(slog.DiscardHandler),
+		Log:      slog.New(slog.DiscardHandler),
+		DLQStore: &fakeDLQStore{},
 	}, store)
 }
 

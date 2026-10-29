@@ -17,34 +17,23 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/config"
+	"relay/internal/dlq"
 	"relay/internal/git"
 	"relay/internal/processlock"
 	"relay/internal/runtime"
 	"relay/internal/secrets"
 	"relay/internal/state"
-	"relay/internal/stream"
 	"relay/internal/worker"
 )
 
-// DLQStore is the narrow DLQ view the `relay dlq` commands consume. The
-// Redis-backed *stream.RedisDLQStore satisfies it; tests inject a fake, so the
-// command/presentation layer never touches Redis directly. Close releases
-// whatever the store owns.
-type DLQStore interface {
-	List(ctx context.Context) ([]stream.DLQEntry, error)
-	Get(ctx context.Context, id string) (stream.DLQEntry, bool, error)
-	Delete(ctx context.Context, id string) (bool, error)
-	Close() error
-}
-
-// OpenDLQStore resolves and opens the DLQ store for one `relay dlq` command,
-// returning the store and a cleanup func. It is an app seam so the command
-// tree never reads environment variables or constructs Redis clients itself,
-// and tests (or an embedding host) can inject a fake without mutable globals.
-// Production wires openRedisDLQStore, which follows the same Redis configuration
-// conventions as `relay start` (config.LoadRedisConfig + config.RedisOptions)
-// but needs no PostgreSQL state DSN, because the DLQ is Redis-only.
-type OpenDLQStore func(logger *slog.Logger) (store DLQStore, cleanup func(), err error)
+// OpenDLQStore resolves and opens the durable DLQ store for one `relay dlq`
+// command, returning the store and a cleanup func. The DLQ is persisted in
+// PostgreSQL, so this opener needs DATABASE_URL but never starts or contacts the
+// worker process; it deliberately reuses the same state opener semantics as the
+// other administrative commands. It is an app seam so the command tree never
+// reads environment variables or constructs clients itself, and tests (or an
+// embedding host) can inject a fake without mutable globals.
+type OpenDLQStore func(ctx context.Context, logger *slog.Logger) (store dlq.Store, cleanup func(), err error)
 
 // StartRun is the narrow seam `relay start` delegates to for the long-running
 // Relay lifecycle. It blocks until the runtime stops and returns any
@@ -126,10 +115,9 @@ type Dependencies struct {
 	// Start runs the long-running Relay lifecycle `relay start` delegates to.
 	// Production: worker.Run.
 	Start StartRun
-	// OpenDLQ opens the DLQ store for the `relay dlq` commands. It is called
-	// lazily, only by those commands, so every other command works with no Redis
-	// configured. Production: openRedisDLQStore (config.LoadRedisConfig +
-	// config.RedisOptions + stream.NewRedisDLQStore).
+	// OpenDLQ opens the PostgreSQL DLQ store for the `relay dlq` commands. It is
+	// called lazily, only by those commands, so every other command works with no
+	// DATABASE_URL configured. Production: openPostgresDLQStore.
 	OpenDLQ OpenDLQStore
 }
 
@@ -150,7 +138,7 @@ func DefaultDependencies() Dependencies {
 		GitAppsDir:     app.Dir,
 		SecretsDir:     secrets.SecretsDir,
 		Start:          worker.Run,
-		OpenDLQ:        openRedisDLQStore,
+		OpenDLQ:        openPostgresDLQStore,
 	}
 }
 

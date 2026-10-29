@@ -127,6 +127,34 @@
 //     /apps is authoritative, and the occurrence identity it stores is derived
 //     exactly as on the wire.
 //
+// The dlq table is Relay's SOLE dead-letter persistence, admin read model, and
+// retention store; Redis remains the broker and the invocation-state authority.
+// Unlike the app-state view, DLQ rows are durable work records: the stream layer
+// commits them before acknowledging a source delivery and never rebuilds them
+// from /apps.
+// A row records ONE terminal source delivery's exhaustion of ONE invocation (or
+// one placeholder row for a delivery that never reached a handler). Its primary
+// key is a stable ID derived from the logical source delivery identity (source,
+// source group, source message ID) plus the invocation identity, never from a
+// broker-assigned row ID, so re-persisting the same exhaustion after a crash, an
+// ambiguous transaction, or a failed source ACK is idempotent
+// (INSERT ... ON CONFLICT DO NOTHING). The row payload is a private JSONB object
+// (data): event and reason are byte slices so encoding/json base64-encodes them,
+// which preserves arbitrary malformed bytes (including NUL) that JSONB itself
+// would reject. Only the stable ID, the source delivery identity hash
+// (delivery_id), the nullable settlement marker (settled_at_ms), and
+// created_at_ms are relational columns. Every row from one delivery shares
+// delivery_id; the stream marks them settled only AFTER a confirmed source ACK,
+// and a bounded worker reconciliation settles rows whose source delivery is no
+// longer pending after a crash. Admin removal and retention delete only settled
+// rows, so a delivery that may still be recoverable can never lose its dead
+// letter. created_at_ms and the single (created_at_ms, id) index serve operator
+// listing order and bounded settled retention cleanup; a partial
+// (delivery_id, created_at_ms) index serves unsettled reconciliation. The
+// consumer name and delivery count are diagnostic only. An oversized event is
+// stored only as the bounded diagnostic summary produced by the stream layer,
+// never as its raw payload.
+//
 // Secret values are never stored: only the reference names appear in the
 // snapshot. Literal env values are never stored either: env entries keep the
 // env-var name only, with a fixed redaction marker as the value.

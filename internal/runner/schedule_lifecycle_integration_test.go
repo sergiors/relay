@@ -22,8 +22,10 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"relay/internal/app"
+	"relay/internal/dlq"
 	"relay/internal/runtime"
 	"relay/internal/schedule"
+	"relay/internal/state"
 	"relay/internal/stream"
 	"relay/internal/testutil"
 )
@@ -123,16 +125,17 @@ func (e *stateAwareExecutor) count() int {
 // (with the real runner's InvokeOccurrence wired as ScheduleRunner) on a
 // unixnano-unique stream/group.
 type scheduleEnv struct {
-	t      *testing.T
-	client *redis.Client
-	stream string
-	group  string
-	dlq    string
-	ctx    context.Context
-	cancel func()
-	holder consumerHolder
-	done   chan struct{}
-	errCh  chan error
+	t        *testing.T
+	client   *redis.Client
+	stream   string
+	group    string
+	dlqStore dlq.Store
+	pg       *state.State
+	ctx      context.Context
+	cancel   func()
+	holder   consumerHolder
+	done     chan struct{}
+	errCh    chan error
 }
 
 // newScheduleEnv builds the harness and wires r.InvokeOccurrence as the
@@ -145,6 +148,9 @@ func newScheduleEnv(t *testing.T, r *Runner) *scheduleEnv {
 	cctx, cancel := context.WithCancel(context.Background())
 	prefix := fmt.Sprintf("itest-%d", time.Now().UnixNano())
 	streamName := prefix + "-stream"
+	// The durable DLQ store: fresh per-test PostgreSQL schema, exactly the
+	// production wiring.
+	pg := testutil.NewState(t)
 	cfg := stream.ConsumerConfig{
 		Client:          cli,
 		Stream:          streamName,
@@ -155,6 +161,7 @@ func newScheduleEnv(t *testing.T, r *Runner) *scheduleEnv {
 		ReclaimInterval: 200 * time.Millisecond,
 		Block:           300 * time.Millisecond,
 		ScheduleRunner:  r.InvokeOccurrence,
+		DLQStore:        pg,
 	}
 	c := stream.NewConsumer(cfg)
 	if err := c.EnsureGroup(cctx); err != nil {
@@ -162,14 +169,15 @@ func newScheduleEnv(t *testing.T, r *Runner) *scheduleEnv {
 		t.Fatalf("ensure group: %v", err)
 	}
 	e := &scheduleEnv{
-		t:      t,
-		client: cli,
-		stream: streamName,
-		group:  cfg.Group,
-		dlq:    stream.DLQStreamFor(streamName),
-		ctx:    cctx,
-		cancel: cancel,
-		holder: consumerHolder{c: c},
+		t:        t,
+		client:   cli,
+		stream:   streamName,
+		group:    cfg.Group,
+		dlqStore: pg,
+		pg:       pg,
+		ctx:      cctx,
+		cancel:   cancel,
+		holder:   consumerHolder{c: c},
 	}
 	t.Cleanup(e.cleanup)
 	return e
@@ -190,7 +198,7 @@ func (e *scheduleEnv) cleanup() {
 		}
 	}
 	cctx := context.Background()
-	_ = e.client.Del(cctx, e.stream, e.dlq).Err()
+	_ = e.client.Del(cctx, e.stream).Err()
 	// Best-effort removal of this env's invocation-state keys. The stream/group
 	// names contain no ':' or '%', so percent-encoding is identity for them and a
 	// direct prefix scan is safe and bounded to this env.
@@ -514,29 +522,38 @@ func TestIntegrationScheduleExhaustionRoutesToDLQ(t *testing.T) {
 	// retries:0 exhausts on handler attempt 1, and this is the first delivery, so
 	// handler_attempts and deliveries are both 1.
 	m := e.dlqGet()[id]
-	if m.Values["handler_attempts"] != "1" {
-		t.Errorf("handler_attempts = %v, want 1 (from the invocation retry state)", m.Values["handler_attempts"])
+	if m.HandlerAttempts != 1 {
+		t.Errorf("HandlerAttempts = %d, want 1 (from the invocation retry state)", m.HandlerAttempts)
 	}
 	// The schedule entry names the exact app/handler that exhausted.
-	if m.Values["app"] != scheduleFnName || m.Values["handler"] != scheduleHandler {
-		t.Errorf("function/handler = %v/%v, want %s/%s",
-			m.Values["app"], m.Values["handler"], scheduleFnName, scheduleHandler)
+	if m.App != scheduleFnName || m.Handler != scheduleHandler {
+		t.Errorf("function/handler = %q/%q, want %s/%s",
+			m.App, m.Handler, scheduleFnName, scheduleHandler)
 	}
-	if m.Values["deliveries"] != "1" {
-		t.Errorf("deliveries = %v, want 1 (first delivery)", m.Values["deliveries"])
+	if m.Deliveries != 1 {
+		t.Errorf("Deliveries = %d, want 1 (first delivery)", m.Deliveries)
 	}
+	// The whole delivery's rows are settled once the confirmed ACK lands. The
+	// settlement write follows the ACK on the wire, so it is observed by
+	// polling rather than immediately after the ACK becomes observable.
+	e.eventually("the exhausted occurrence's entry settled after the confirmed ACK", func() bool {
+		m := e.dlqGet()[id]
+		return m.SettledAt != ""
+	})
 }
 
-// dlqGet reads all DLQ entries keyed by original message ID.
-func (e *scheduleEnv) dlqGet() map[string]redis.XMessage {
-	msgs, err := e.client.XRange(context.Background(), e.dlq, "-", "+").Result()
+// dlqGet reads the durable DLQ entries keyed by their source message ID (the
+// first entry per message, so single-invocation schedule occurrences read
+// naturally; dlqEntriesFor covers the multi-entry case).
+func (e *scheduleEnv) dlqGet() map[string]dlq.Entry {
+	out := map[string]dlq.Entry{}
+	entries, err := e.dlqStore.ListDLQEntries(context.Background())
 	if err != nil {
-		return nil
+		e.t.Fatalf("list DLQ entries: %v", err)
 	}
-	out := map[string]redis.XMessage{}
-	for _, m := range msgs {
-		if id, ok := m.Values["original_id"].(string); ok {
-			out[id] = m
+	for _, entry := range entries {
+		if _, ok := out[entry.SourceMessageID]; !ok {
+			out[entry.SourceMessageID] = entry
 		}
 	}
 	return out
@@ -982,15 +999,14 @@ func TestIntegrationScheduleForgedTimestampNeverExecutesAndDLQs(t *testing.T) {
 		t.Fatalf("executor calls = %d, want 0 (a forged timestamp must never execute)", got)
 	}
 	m := e.dlqGet()[id]
-	reason, _ := m.Values["reason"].(string)
 	// The forged :30s instant parses structurally (only a sub-second component
 	// is structurally malformed), so it reaches the runner's semantic validation
 	// and is rejected there as ErrScheduleInvalid because it is not a firing of
 	// the every-minute cron. Both the semantic rejection and a generic invalid
 	// claim are the terminal, non-retryable DLQ path.
-	if !strings.Contains(reason, stream.ErrScheduleInvalid.Error()) &&
-		!strings.Contains(reason, "schedule claim") {
-		t.Fatalf("DLQ reason = %q, want it to name the invalid schedule claim", m.Values["reason"])
+	if !strings.Contains(m.Reason, stream.ErrScheduleInvalid.Error()) &&
+		!strings.Contains(m.Reason, "schedule claim") {
+		t.Fatalf("DLQ reason = %q, want it to name the invalid schedule claim", m.Reason)
 	}
 }
 
@@ -1060,8 +1076,8 @@ func TestIntegrationScheduleCrashAfterAdmissionSpendsAttempt(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected a DLQ entry for %s", id)
 	}
-	if m.Values["handler_attempts"] != "2" {
-		t.Errorf("handler_attempts = %v, want 2 (the claim before the crash consumed attempt 1)", m.Values["handler_attempts"])
+	if m.HandlerAttempts != 2 {
+		t.Errorf("HandlerAttempts = %d, want 2 (the claim before the crash consumed attempt 1)", m.HandlerAttempts)
 	}
 }
 
@@ -1112,19 +1128,13 @@ func TestIntegrationScheduleReservedInvalidRetryCompletesDLQ(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected a DLQ entry for %s", id)
 	}
-	reason, _ := m.Values["reason"].(string)
-	if !strings.Contains(reason, stream.ErrScheduleInvalid.Error()) {
-		t.Fatalf("DLQ reason = %q, want it to name the invalid rejection", reason)
+	if !strings.Contains(m.Reason, stream.ErrScheduleInvalid.Error()) {
+		t.Fatalf("DLQ reason = %q, want it to name the invalid rejection", m.Reason)
 	}
-	// Exactly one entry (no duplicate on the retry).
-	entries := 0
-	for _, msg := range e.dlqGet() {
-		if msg.Values["original_id"] == id {
-			entries++
-		}
-	}
-	if entries != 1 {
-		t.Fatalf("DLQ entries for %s = %d, want 1", id, entries)
+	// Exactly one entry (no duplicate on the retry): the stable identity makes
+	// the PostgreSQL write idempotent.
+	if entries := listDLQEntriesFor(t, e.dlqStore, id); len(entries) != 1 {
+		t.Fatalf("DLQ entries for %s = %d, want 1", id, len(entries))
 	}
 }
 
@@ -1257,7 +1267,8 @@ func TestIntegrationScheduleLegacyOKWithoutDescriptorAcked(t *testing.T) {
 // app-absent legacy exhaustion path: a no-descriptor exhausted marker still owes
 // its per-invocation DLQ entry, so the occurrence is dead-lettered exactly once
 // (with the exact app/handler and the marker's attempt) and then ACKed. The
-// marker is upgraded to ":dlq", never overwritten by a reservation.
+// marker carries no persistence state, so it is left untouched: PostgreSQL
+// idempotency never needs a marker upgrade.
 func TestIntegrationScheduleLegacyExhaustedWithoutDescriptorDLQOnce(t *testing.T) {
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 4)
@@ -1278,33 +1289,30 @@ func TestIntegrationScheduleLegacyExhaustedWithoutDescriptorDLQOnce(t *testing.T
 	if got := exec.count(); got != 0 {
 		t.Fatalf("executor calls = %d, want 0 (a legacy exhausted occurrence must never run)", got)
 	}
-	entries := 0
-	for _, msg := range e.dlqGet() {
-		if msg.Values["original_id"] == id {
-			entries++
-		}
-	}
-	if entries != 1 {
-		t.Fatalf("DLQ entries for %s = %d, want exactly 1", id, entries)
+	if entries := listDLQEntriesFor(t, e.dlqStore, id); len(entries) != 1 {
+		t.Fatalf("DLQ entries for %s = %d, want exactly 1", id, len(entries))
 	}
 	m, ok := e.dlqGet()[id]
 	if !ok {
 		t.Fatalf("expected a DLQ entry for %s", id)
 	}
-	if m.Values["app"] != scheduleFnName || m.Values["handler"] != scheduleHandler {
-		t.Fatalf("DLQ app/handler = (%v,%v), want (%s,%s)",
-			m.Values["app"], m.Values["handler"], scheduleFnName, scheduleHandler)
+	if m.App != scheduleFnName || m.Handler != scheduleHandler {
+		t.Fatalf("DLQ app/handler = (%q,%q), want (%s,%s)",
+			m.App, m.Handler, scheduleFnName, scheduleHandler)
 	}
-	if m.Values["handler_attempts"] != "2" {
-		t.Fatalf("handler_attempts = %v, want 2 (the marker's retained attempt)", m.Values["handler_attempts"])
+	if m.HandlerAttempts != 2 {
+		t.Fatalf("HandlerAttempts = %d, want 2 (the marker's retained attempt)", m.HandlerAttempts)
 	}
-	assertLegacyMarkerUntouched(t, e, id, "exhausted:2:deadbeef:dlq")
+	// The exhausted marker carries no persistence state: it is left verbatim.
+	assertLegacyMarkerUntouched(t, e, id, "exhausted:2:deadbeef")
 }
 
-// TestIntegrationScheduleLegacyExhaustedDLQAlreadyPersistedAcks pins the
-// idempotent half: an exhausted marker that already carries ":dlq" (its entry was
-// persisted by an earlier delivery) is ACKed with NO duplicate DLQ write.
-func TestIntegrationScheduleLegacyExhaustedDLQAlreadyPersistedAcks(t *testing.T) {
+// TestIntegrationScheduleLegacyExhaustedDLQSuffixMarkerIsTerminal pins the
+// read-only legacy suffix: an exhausted marker that still carries ":dlq" (an
+// older Relay's persistence record) parses as the same terminal exhaustion, so
+// the occurrence is dead-lettered exactly once to PostgreSQL (the sole
+// authority) and ACKed. The suffix is never rewritten.
+func TestIntegrationScheduleLegacyExhaustedDLQSuffixMarkerIsTerminal(t *testing.T) {
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 4)
 	e := newScheduleEnv(t, r)
@@ -1316,14 +1324,14 @@ func TestIntegrationScheduleLegacyExhaustedDLQAlreadyPersistedAcks(t *testing.T)
 	r.Registry().Replace(scheduleFnName, nil)
 	e.start()
 
+	e.eventually("legacy exhausted:dlq occurrence DLQ'd", func() bool { return e.inDlq(id) })
 	// Wait for the terminal-retained hash (only a real delivery + ACK produces
 	// it), so the assertion cannot race an undelivered message.
 	e.eventually("legacy exhausted:dlq occurrence acked and terminal-retained", func() bool {
 		return e.isRetained(id)
 	})
-	// The marker already recorded persistence, so no NEW entry is appended.
-	if n, err := e.client.XLen(context.Background(), e.dlq).Result(); err != nil || n != 0 {
-		t.Fatalf("DLQ length = (%d,%v), want 0 (no duplicate write for an already-persisted entry)", n, err)
+	if entries := listDLQEntriesFor(t, e.dlqStore, id); len(entries) != 1 {
+		t.Fatalf("DLQ entries = %d, want exactly 1 (one dead letter per exhaustion)", len(entries))
 	}
 	if got := exec.count(); got != 0 {
 		t.Fatalf("executor calls = %d, want 0", got)
@@ -1407,8 +1415,8 @@ func TestIntegrationSchedulePinnedOKAcked(t *testing.T) {
 	e.eventually("pinned ok occurrence acked and terminal-retained", func() bool {
 		return e.isRetained(id)
 	})
-	if n, err := e.client.XLen(context.Background(), e.dlq).Result(); err != nil || n != 0 {
-		t.Fatalf("DLQ length = (%d,%v), want 0 (a pinned ok is never dead-lettered)", n, err)
+	if entries := listDLQEntriesFor(t, e.dlqStore, id); len(entries) != 0 {
+		t.Fatalf("DLQ entries = %d, want 0 (a pinned ok is never dead-lettered)", len(entries))
 	}
 	if got := exec.count(); got != 0 {
 		t.Fatalf("executor calls = %d, want 0", got)
@@ -1418,9 +1426,9 @@ func TestIntegrationSchedulePinnedOKAcked(t *testing.T) {
 
 // TestIntegrationSchedulePinnedExhaustedMissingDLQDLQOnce pins the descriptor-
 // pinned exhaustion crash window: a descriptor is pinned and the invocation is
-// exhausted, but the DLQ entry was never persisted and the app is now absent. The
+// exhausted, but the DLQ row was never committed and the app is now absent. The
 // occurrence must be dead-lettered exactly once (correct app/handler/attempt),
-// the marker upgraded to ":dlq", and the message ACKed.
+// with the marker left verbatim, and the message ACKed.
 func TestIntegrationSchedulePinnedExhaustedMissingDLQDLQOnce(t *testing.T) {
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 4)
@@ -1439,33 +1447,30 @@ func TestIntegrationSchedulePinnedExhaustedMissingDLQDLQOnce(t *testing.T) {
 	if got := exec.count(); got != 0 {
 		t.Fatalf("executor calls = %d, want 0", got)
 	}
-	entries := 0
-	for _, msg := range e.dlqGet() {
-		if msg.Values["original_id"] == id {
-			entries++
-		}
-	}
-	if entries != 1 {
-		t.Fatalf("DLQ entries for %s = %d, want exactly 1", id, entries)
+	if entries := listDLQEntriesFor(t, e.dlqStore, id); len(entries) != 1 {
+		t.Fatalf("DLQ entries for %s = %d, want exactly 1", id, len(entries))
 	}
 	m, ok := e.dlqGet()[id]
 	if !ok {
 		t.Fatalf("expected a DLQ entry for %s", id)
 	}
-	if m.Values["app"] != scheduleFnName || m.Values["handler"] != scheduleHandler {
-		t.Fatalf("DLQ app/handler = (%v,%v), want (%s,%s)",
-			m.Values["app"], m.Values["handler"], scheduleFnName, scheduleHandler)
+	if m.App != scheduleFnName || m.Handler != scheduleHandler {
+		t.Fatalf("DLQ app/handler = (%q,%q), want (%s,%s)",
+			m.App, m.Handler, scheduleFnName, scheduleHandler)
 	}
-	if m.Values["handler_attempts"] != "2" {
-		t.Fatalf("handler_attempts = %v, want 2 (the marker's retained attempt)", m.Values["handler_attempts"])
+	if m.HandlerAttempts != 2 {
+		t.Fatalf("HandlerAttempts = %d, want 2 (the marker's retained attempt)", m.HandlerAttempts)
 	}
-	assertLegacyMarkerUntouched(t, e, id, "exhausted:2:deadbeef:dlq")
+	// The exhausted marker carries no persistence state: it is left verbatim.
+	assertLegacyMarkerUntouched(t, e, id, "exhausted:2:deadbeef")
 }
 
-// TestIntegrationSchedulePinnedExhaustedDLQAlreadyPersistedAcks pins the
-// idempotent half for a pinned descriptor: an exhausted marker that already
-// carries ":dlq" is ACKed with NO duplicate DLQ write.
-func TestIntegrationSchedulePinnedExhaustedDLQAlreadyPersistedAcks(t *testing.T) {
+// TestIntegrationSchedulePinnedExhaustedDLQSuffixMarkerIsTerminal pins the
+// read-only legacy suffix for a pinned descriptor: an exhausted marker that
+// already carries ":dlq" is the same terminal exhaustion, so the occurrence is
+// dead-lettered exactly once to PostgreSQL and ACKed; the suffix is never
+// rewritten.
+func TestIntegrationSchedulePinnedExhaustedDLQSuffixMarkerIsTerminal(t *testing.T) {
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 4)
 	e := newScheduleEnv(t, r)
@@ -1475,11 +1480,12 @@ func TestIntegrationSchedulePinnedExhaustedDLQAlreadyPersistedAcks(t *testing.T)
 	r.Registry().Replace(scheduleFnName, nil)
 	e.start()
 
+	e.eventually("pinned exhausted:dlq occurrence DLQ'd", func() bool { return e.inDlq(id) })
 	e.eventually("pinned exhausted:dlq occurrence acked and terminal-retained", func() bool {
 		return e.isRetained(id)
 	})
-	if n, err := e.client.XLen(context.Background(), e.dlq).Result(); err != nil || n != 0 {
-		t.Fatalf("DLQ length = (%d,%v), want 0 (no duplicate write)", n, err)
+	if entries := listDLQEntriesFor(t, e.dlqStore, id); len(entries) != 1 {
+		t.Fatalf("DLQ entries = %d, want exactly 1 (one dead letter per exhaustion)", len(entries))
 	}
 	if got := exec.count(); got != 0 {
 		t.Fatalf("executor calls = %d, want 0", got)

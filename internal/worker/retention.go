@@ -36,17 +36,6 @@ type streamTrimmer interface {
 	XTrimMinIDApproxMode(ctx context.Context, key string, minID string, limit int64, mode string) *redis.IntCmd
 }
 
-// dlqTrimmer is the narrow seam the DLQ retention loop needs from Redis: a
-// single approximate MINID trim with NO trim-reference mode. The DLQ has no
-// consumer group, PEL, or XACK flow to protect, so an age-only trim is safe and
-// the mode token (ACKED/KEEPREF) is neither required nor meaningful there.
-// *redis.Client satisfies it. It is deliberately separate from streamTrimmer:
-// keeping the seams distinct means the main trim cannot accidentally lose its
-// ACKED mode, and the DLQ trim cannot accidentally acquire one.
-type dlqTrimmer interface {
-	XTrimMinIDApprox(ctx context.Context, key string, minID string, limit int64) *redis.IntCmd
-}
-
 // retentionTickInterval derives the tick cadence from the retention window
 // (retention/24, clamped to [1m, 1h]) rather than being a second env var, so
 // there is exactly one knob to reason about and the cadence scales with the
@@ -165,8 +154,8 @@ func retentionTick(
 // retention window silently doing nothing is a correctness surprise: the
 // operator asked for trimming and must know it is refused (and why) rather than
 // discovering it from an unbounded stream — or, worse, getting an unsafe trim.
-// The disable is scoped to the MAIN stream only; DLQ retention uses a mode-less
-// trim and is unaffected.
+// The disable is scoped to the MAIN stream only; durable DLQ retention lives in
+// PostgreSQL and is unaffected.
 func logRetentionUnsupported(logger *slog.Logger, stream string, err error) {
 	logger.Error(
 		"Retention: disabled; Redis rejected the ACKED trim mode (requires Redis 8.2+); "+
@@ -238,69 +227,77 @@ func retentionLoop(
 	}
 }
 
-// dlqRetentionTick computes the cutoff (now - retention) and performs one
-// age-only approximate MINID trim of the Relay-owned DLQ stream, logging the
-// outcome. It is the unit of work shared by the initial DLQ trim and every
-// ticker tick, and mirrors retentionTick; now is injectable for deterministic
-// tests.
+// dlqPruneBatch bounds one DLQ retention DELETE. Retention drains a large
+// backlog across cycles instead of issuing one unbounded statement.
+const dlqPruneBatch = 1000
+
+// dlqPruner is the narrow PostgreSQL seam the DLQ retention loop needs: one
+// bounded age-based delete. The worker passes the state handle.
+type dlqPruner interface {
+	PruneDLQEntries(ctx context.Context, cutoff time.Time, limit int) (int, error)
+}
+
+// dlqRetentionTick computes the cutoff (now - retention) and drains older
+// durable DLQ rows in bounded, separately issued DELETEs until a short batch,
+// an error, or ctx cancellation/deadline. It is the unit of work shared by the
+// initial prune and every ticker tick; now is injectable for deterministic tests.
 //
-// Unlike retentionTick there is no mode and therefore no capability signal and
-// no disable path, so this always returns without error: the DLQ has no consumer
-// groups or PEL, so an age-only trim is always safe and any failure is
-// transient. A failure is logged and swallowed — retention is best-effort and
-// must never stop the worker; the caller retries on the next tick. Trimming a
-// missing or empty stream is not an error either: Redis returns 0 removed.
+// PostgreSQL is the sole DLQ persistence, so this never touches Redis and has no
+// mode/capability signal. Any failure is logged and swallowed — retention is
+// best-effort and must never stop the worker; the caller retries on the next
+// tick. An empty table is not an error. The per-tick context is the throughput
+// bound: each statement deletes at most dlqPruneBatch settled rows, and the loop
+// stops immediately when that context is cancelled or its deadline elapses.
 func dlqRetentionTick(
 	ctx context.Context,
-	client dlqTrimmer,
-	stream string,
+	pruner dlqPruner,
 	retention time.Duration,
 	now func() time.Time,
 	logger *slog.Logger,
 ) {
-	cutoffID := retentionCutoffID(now().Add(-retention))
-	n, err := trimDLQStream(ctx, client, stream, cutoffID)
-	if err != nil {
-		logger.Warn("DLQ retention: trim failed; will retry next tick", "stream", stream, "error", err)
-		return
+	cutoff := now().Add(-retention)
+	removed := 0
+	for ctx.Err() == nil {
+		n, err := pruner.PruneDLQEntries(ctx, cutoff, dlqPruneBatch)
+		if err != nil {
+			if ctx.Err() != nil {
+				logger.Debug("DLQ retention: prune interrupted by shutdown",
+					"cutoff", cutoff.UTC(), "removed", removed, "error", err)
+				return
+			}
+			logger.Warn("DLQ retention: prune failed; will retry next tick",
+				"cutoff", cutoff.UTC(), "removed", removed, "error", err)
+			return
+		}
+		removed += n
+		if n < dlqPruneBatch {
+			logger.Debug("DLQ retention: pruned entries", "cutoff", cutoff.UTC(), "removed", removed)
+			return
+		}
 	}
-	logger.Debug("DLQ retention: trimmed stream", "stream", stream, "cutoff", cutoffID, "removed", n)
+	logger.Debug("DLQ retention: prune stopped at tick deadline", "cutoff", cutoff.UTC(), "removed", removed)
 }
 
-// trimDLQStream issues a single approximate age-only MINID trim against the DLQ
-// stream. It is the mode-less analogue of trimStream: no ACKED/KEEPREF token is
-// sent, so it works on every Redis that supports XTRIM MINID ~ (no server-mode
-// capability requirement) and does not depend on any consumer group, PEL, or
-// XACK. LIMIT is omitted (limit==0) for the same reason as the main trim — see
-// trimStream for the approximate-trim granularity note.
-func trimDLQStream(ctx context.Context, client dlqTrimmer, stream, cutoffID string) (int64, error) {
-	return client.XTrimMinIDApprox(ctx, stream, cutoffID, 0).Result()
-}
-
-// dlqRetentionLoop is the periodic DLQ-retention loop. It mirrors retentionLoop
-// in cadence and bounded per-trim context, but trims ONLY the Relay-owned DLQ
-// stream with an age-only approximate MINID trim: it never touches the source
-// stream and never requires the ACKED mode, so a pre-8.2 server that disables
-// main retention does not disable DLQ retention (the DLQ needs no group-aware
-// semantics). It runs in its own goroutine owned by the worker lifecycle and
-// stops when ctx is cancelled. A transient trim failure is logged and retried on
-// the next tick, never fatal.
+// dlqRetentionLoop is the periodic durable-DLQ retention loop. It mirrors
+// retentionLoop in cadence and bounded per-prune context, but deletes only rows
+// from the PostgreSQL DLQ table; it never touches the source stream. It runs in
+// its own goroutine owned by the worker lifecycle and stops when ctx is
+// cancelled. A transient prune failure is logged and retried on the next tick,
+// never fatal.
 func dlqRetentionLoop(
 	ctx context.Context,
-	client dlqTrimmer,
-	stream string,
+	pruner dlqPruner,
 	retention time.Duration,
 	logger *slog.Logger,
 ) {
 	interval := retentionTickInterval(retention)
-	logger.Info("DLQ retention: starting", "stream", stream, "window", retention, "tick", interval)
+	logger.Info("DLQ retention: starting", "window", retention, "tick", interval)
 
-	// Initial trim immediately (bounded) so an already-large DLQ is trimmed
+	// Initial prune immediately (bounded) so an already-large table is trimmed
 	// without waiting a full interval. A transient failure is logged by
-	// dlqRetentionTick and the loop continues; there is no capability check to
-	// perform (no mode).
+	// dlqRetentionTick and the loop continues.
 	initCtx, initCancel := context.WithTimeout(ctx, 30*time.Second)
-	dlqRetentionTick(initCtx, client, stream, retention, time.Now, logger)
+	dlqRetentionTick(initCtx, pruner, retention, time.Now, logger)
 	initCancel()
 
 	ticker := time.NewTicker(interval)
@@ -310,9 +307,9 @@ func dlqRetentionLoop(
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			trimCtx, trimCancel := context.WithTimeout(ctx, 30*time.Second)
-			dlqRetentionTick(trimCtx, client, stream, retention, time.Now, logger)
-			trimCancel()
+			pruneCtx, pruneCancel := context.WithTimeout(ctx, 30*time.Second)
+			dlqRetentionTick(pruneCtx, pruner, retention, time.Now, logger)
+			pruneCancel()
 		}
 	}
 }

@@ -214,14 +214,16 @@ export async function slow(event) {
 	}
 
 	// The canceled event is NOT dead-lettered: the shutdown-cancel disposition is
-	// a pending skip (no retry/exhaustion transition), so no DLQ entry exists for
-	// the original message.
-	dlqMsgs, err := env.client.XRange(context.Background(), stream.DLQStreamFor(streamName), "-", "+").Result()
+	// a pending skip (no retry/exhaustion transition), so no DLQ entry exists
+	// for the original message. The DLQ is the durable PostgreSQL rows the
+	// worker's consumer committed to; the replacement consumer's plain handler
+	// never dead-letters either.
+	entries, err := env.st.ListDLQEntries(context.Background())
 	if err != nil {
-		t.Fatalf("read dead-letter stream: %v", err)
+		t.Fatalf("list DLQ entries: %v", err)
 	}
-	for _, m := range dlqMsgs {
-		if oid, ok := m.Values["original_id"].(string); ok && oid == msgID {
+	for _, entry := range entries {
+		if entry.SourceMessageID == msgID {
 			t.Fatalf("canceled event %s was dead-lettered; want no DLQ entry", msgID)
 		}
 	}
@@ -311,5 +313,5 @@ export async function slow(event) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("consumer B did not stop")
 	}
-	_ = env.client.Del(context.Background(), streamName, stream.DLQStreamFor(streamName), invKey).Err()
+	_ = env.client.Del(context.Background(), streamName, invKey).Err()
 }

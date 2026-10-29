@@ -97,3 +97,29 @@ func startOwnershipTracking(
 	shutdown.register(ownershipBarrierStep(ownershipDone, proof, logger))
 	return proof
 }
+
+// dlqDepthGauge is the periodic PostgreSQL DLQ depth sampler. It replaces the
+// former Redis XLEN observation: the durable DLQ is a PostgreSQL table shared by
+// every worker configured with the same database, so the gauge reports an
+// approximate row count. It deliberately uses pg_class.reltuples, an inexpensive
+// planner estimate, rather than a hot-path COUNT(*) scan. A read failure skips
+// the tick (preserving the previous value) and is logged at Debug; it never
+// fails the consumer.
+type dlqDepthGauge struct {
+	st      *state.State
+	metrics *metrics.Registry
+	log     *slog.Logger
+}
+
+// Refresh implements metrics.GaugeSource.
+func (g *dlqDepthGauge) Refresh(ctx context.Context) {
+	if g == nil || g.st == nil || g.metrics == nil {
+		return
+	}
+	depth, err := g.st.ApproxDLQDepth(ctx)
+	if err != nil {
+		g.log.Debug("Metrics: DLQ depth estimate failed", "error", err)
+		return
+	}
+	g.metrics.SetGauge(metrics.MetricDLQDepth, float64(depth))
+}

@@ -266,8 +266,8 @@ type ScheduleAdmission struct {
 	// marker (or several, under different handler identities) owns the message:
 	// every listed invocation is already exhausted and still owes a per-invocation
 	// DLQ entry. The runner returns a HandlerExhaustedError carrying them, so the
-	// stream persists the missing entries (idempotently — an already-":dlq" marker
-	// is skipped) and then ACKs. It is mutually exclusive with Started, Rejected,
+	// stream validates each marker and persists the missing PostgreSQL rows
+	// idempotently, then ACKs. It is mutually exclusive with Started, Rejected,
 	// and InFlight. A no-descriptor legacy "ok" marker instead yields a ZERO
 	// admission (nothing to do: the completion ACK is the normal success tail).
 	ExhaustedInvocations []ExhaustedInvocation

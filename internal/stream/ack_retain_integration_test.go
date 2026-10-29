@@ -52,7 +52,7 @@ func ackRetainEnv(t *testing.T, cli *redis.Client) (invocationStateStore, string
 	}
 	t.Cleanup(func() {
 		cctx := context.Background()
-		_ = cli.Del(cctx, stream, DLQStreamFor(stream), invocationStateKey(stream, group, id)).Err()
+		_ = cli.Del(cctx, stream, invocationStateKey(stream, group, id)).Err()
 	})
 	return &invocationStore{client: cli}, stream, group, id
 }
@@ -278,7 +278,7 @@ func TestAtomicTerminalAckXACKFailureLeavesPendingPersistentState(t *testing.T) 
 		key := invocationStateKey(stream, group, id)
 		t.Cleanup(func() {
 			cctx := context.Background()
-			_ = inspect.Del(cctx, stream, DLQStreamFor(stream), key).Err()
+			_ = inspect.Del(cctx, stream, key).Err()
 		})
 		seedCompletedHash(t, inspect, key)
 

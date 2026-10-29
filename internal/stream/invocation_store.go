@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -89,12 +88,11 @@ const (
 	// PENDING (never ACK/DLQ) so the in-flight attempt is not cancelled.
 	scheduleRejectionInFlight
 	// scheduleRejectionExhausted means a no-descriptor TERMINAL exhausted marker
-	// ("exhausted:<n>:<token>[:dlq]") owns the message: a legacy/pre-pinning
+	// ("exhausted:<n>:<token>") owns the message: a legacy/pre-pinning
 	// admitted invocation already exhausted and its DLQ disposition is still owed.
-	// The rejection is refused and NO write happens; the caller routes the
-	// invocation(s) in result.markers to the DLQ (idempotently — an already-":dlq"
-	// marker is skipped by the existing persistence check) and the message is then
-	// ACKed. It never overwrites the exhausted marker.
+	// The rejection is refused and NO write happens; the caller validates each
+	// invocation's marker and persists its PostgreSQL DLQ row idempotently, then
+	// ACKs. It never overwrites the exhausted marker.
 	scheduleRejectionExhausted
 	// scheduleRejectionComplete means a no-descriptor TERMINAL "ok" marker owns the
 	// message: a legacy/pre-pinning admitted invocation already succeeded. The
@@ -390,36 +388,21 @@ type invocationStateStore interface {
 	markComplete(ctx context.Context, stream, group, msgID, invocation string, claim InvocationClaim) (bool, error)
 	// markExhausted CASes the caller's claim against the current active marker
 	// and, on a match, writes "exhausted:<attempt>:<token>" (the claim identity
-	// is retained so the later DLQ upgrade can CAS it). It returns false when the
-	// marker is not owned by the claim.
+	// is retained so the later PostgreSQL DLQ write can validate it). It returns
+	// false when the marker is not owned by the claim.
 	markExhausted(ctx context.Context, stream, group, msgID, invocation string, claim InvocationClaim) (bool, error)
-	// persistDLQ atomically appends one DLQ entry to dlqStream and records its
-	// persistence in the message's invocation-state hash, in a single Lua script
-	// (see persistDLQScript), so a crash or error between the append and the
-	// marker can never leave a duplicate or unmarked entry (F-008).
+	// exhaustedClaim reads the invocation's exhausted marker, returning its
+	// retained claim identity (attempt + token) and whether a well-formed
+	// exhausted marker is present. redis.Nil (field absent) and any
+	// non-exhausted marker return ok=false.
 	//
-	// For a real invocation it requires an existing exhausted marker matching the
-	// supplied claim (attempt+token) and upgrades it to ":dlq"; for the
-	// malformed-message placeholder (invocation == "") it records a reserved
-	// message-scoped field instead of inventing a handler identity. wrote reports
-	// whether THIS call appended the entry; wrote=false with err=nil means the
-	// entry was already recorded, so no write happened and no DLQ counter should
-	// be incremented. An error means the outcome is UNKNOWN or refused: nothing
-	// was written, and the caller must NOT ACK the source message.
-	persistDLQ(
-		ctx context.Context,
-		dlqStream string,
-		stream, group, msgID, invocation string,
-		claim InvocationClaim,
-		entry map[string]any,
-	) (wrote bool, err error)
-	// exhaustedState reads the invocation's exhausted marker, returning its
-	// retained claim identity and whether its DLQ entry is already persisted. It
-	// lets routeToDLQ skip an invocation whose entry was already written AND
-	// supply the exact claim identity to the DLQ-upgrade CAS, so a partial
-	// multi-entry write is completed without duplicating the entries that
-	// succeeded and without downgrading a newer state.
-	exhaustedState(ctx context.Context, stream, group, msgID, invocation string) (claim InvocationClaim, dlq bool, ok bool, err error)
+	// It is the validation boundary before a PostgreSQL dead-letter write: the
+	// caller refuses to persist an entry unless the invocation still holds the
+	// exact terminal attempt it attributed. Exhausted markers are terminal and
+	// immutable, so a validated identity cannot be superseded; the token is
+	// checked for well-formedness but is never persisted or logged. A read error
+	// returns (zero, false, err), and the caller leaves the source pending.
+	exhaustedClaim(ctx context.Context, stream, group, msgID, invocation string) (claim InvocationClaim, ok bool, err error)
 	terminal(ctx context.Context, stream, group, msgID, invocation string) (bool, error)
 	// claimClassification atomically claims the one-time event classification
 	// for this message (an atomic Lua HSETNX on a reserved field). It returns
@@ -523,17 +506,6 @@ const scheduleField = "__schedule"
 // the whole hash after the ACK, exactly like every other field.
 const scheduleRejectionField = "__schedule_rejected"
 
-// dlqPlaceholderField is the reserved invocation-state hash field that records
-// that the malformed-message placeholder DLQ entry for this message has already
-// been persisted (see persistDLQScript). A malformed message never reaches a
-// handler, so it has no "<app>/<handler>" invocation to carry a per-invocation
-// persistence marker; this message-scoped field takes its place and is in the
-// SAME per-message hash (already keyed by stream/group/msgID), so no fabricated
-// function or handler identity is invented. Like terminalField,
-// classificationField, traceFieldPrefix, and scheduleField it cannot collide with
-// a real invocation ID (a leading "__" is not a legal app name).
-const dlqPlaceholderField = "__dlq"
-
 // traceField returns the reserved hash field holding invocation's persisted
 // trace lineage.
 func traceField(invocation string) string {
@@ -560,23 +532,22 @@ func traceField(invocation string) string {
 //	                                until <deadline_ms>; <token> is retained so
 //	                                only this claim may write the next state
 //	"exhausted:<attempt>:<token>"               → attempts exhausted; terminal,
-//	                                never eligible, DLQ entry NOT yet persisted;
-//	                                the claim identity is retained so the DLQ
-//	                                upgrade can CAS it
-//	"exhausted:<attempt>:<token>:dlq"           → attempts exhausted AND this
-//	                                invocation's DLQ entry has been persisted;
-//	                                terminal, never eligible, and never re-written
-//	                                to the DLQ
+//	                                never eligible; the claim identity is
+//	                                retained so the stream layer can validate it
+//	                                before persisting the PostgreSQL DLQ entry
+//	"exhausted:<attempt>:<token>:dlq"           → legacy terminal marker (an older
+//	                                Relay recorded DLQ persistence this way). It
+//	                                is still read as exhausted, but no new suffix
+//	                                is written; PostgreSQL is the DLQ authority.
 //	(absent)                                    → eligible to execute
 //
 // "ok" stays bare because attempts/identity are no longer needed after
 // completion. Any value that does not parse under this grammar is treated as
 // eligible.
 //
-// The ":dlq" suffix records per-invocation DLQ persistence without scanning the
-// DLQ stream: routeToDLQ consults it (exhaustedState) to skip an invocation
-// whose entry was already written, which makes retrying a partially-written
-// multi-entry DLQ (after an XACK failure or crash) idempotent.
+// Dead-letter persistence is no longer recorded in this hash. routeToDLQ writes
+// an idempotent PostgreSQL row keyed by the logical source delivery and
+// invocation identity, then acknowledges the source.
 //
 // The hash also carries reserved sibling fields that are never invocation IDs:
 // classificationField (the once-per-event classification claim), terminalField
@@ -646,9 +617,10 @@ func (store *invocationStore) terminal(
 // atomic Lua script, CASed against the caller's claim (attempt + token). It
 // writes "ok" only when the current ACTIVE marker is still owned by that exact
 // claim, and treats an already-"ok" marker as an idempotent success. It
-// deliberately PRESERVES an exhausted marker (":dlq" or not) and refuses a stale
-// claim: success must never downgrade an exhaustion (that would re-open a
-// terminal invocation and could resurrect a message already routed to the DLQ)
+// deliberately PRESERVES an exhausted marker (legacy ":dlq" or not) and
+// refuses a stale claim: success must never downgrade an exhaustion (that would
+// re-open a terminal invocation and could resurrect a message already routed to
+// the DLQ)
 // and a stale owner must never overwrite a newer attempt. It returns false for
 // both refusals (an explicit stale result, never a Redis error). The HSET and
 // PERSIST happen in the same script, so the completed marker keeps the hash
@@ -1082,11 +1054,10 @@ func (store *invocationStore) finishFailure(
 // markExhausted records that the invocation's attempts are exhausted via the
 // atomic markExhausted script, CASed against the caller's claim (attempt +
 // token). It writes the terminal "exhausted:<attempt>:<token>" marker (retaining
-// the claim identity for the later DLQ upgrade) so a redelivery skips it without
-// re-running, but deliberately does NOT add the ":dlq" suffix: the DLQ entry has
-// not been persisted yet. A terminal/already-ok/absent marker, or a stale claim,
-// is a no-op (returns false). It returns false for those refusals (an explicit
-// stale result, never a Redis error).
+// the claim identity for the later PostgreSQL DLQ validation) so a redelivery
+// skips it without re-running. A terminal/already-ok/absent marker, or a stale
+// claim, is a no-op (returns false). It returns false for those refusals (an
+// explicit stale result, never a Redis error).
 func (store *invocationStore) markExhausted(
 	ctx context.Context,
 	stream,
@@ -1111,102 +1082,34 @@ func (store *invocationStore) markExhausted(
 	return ok == 1, nil
 }
 
-// persistDLQ atomically appends one DLQ entry to dlqStream and records its
-// persistence in the message's invocation-state hash via the atomic
-// persistDLQScript (see its contract). For a real invocation it CASes the
-// retained exhausted identity (attempt + token); for the placeholder
-// (invocation == "") it records the message-scoped dlqPlaceholderField. It is
-// called only after the entry's fields are built, so the append and the marker
-// can never diverge.
+// exhaustedClaim reads the invocation's exhausted marker and returns its
+// retained claim identity. A missing field (redis.Nil), a non-exhausted marker,
+// or a malformed value reports ok=false with no error; the caller then refuses
+// to persist a dead-letter entry and leaves the source delivery pending.
 //
-// wrote reports whether this call appended the entry; wrote=false with err=nil
-// means the entry/placeholder was already recorded (a no-op, so no new entry and
-// no DLQ counter increment). A refused store verdict (wrong hash type,
-// terminal-retained hash, or a missing/foreign exhausted marker) and a
-// Redis/transport error both return err != nil: nothing was written and the
-// caller must leave the message pending (no ACK) because persistence is
-// uncertain.
-func (store *invocationStore) persistDLQ(
-	ctx context.Context,
-	dlqStream, stream, group, msgID, invocation string,
-	claim InvocationClaim,
-	entry map[string]any,
-) (bool, error) {
-	attempt, token := "", ""
-	if invocation != "" {
-		attempt = strconv.Itoa(claim.Attempt)
-		token = claim.Token
-	}
-	args := make([]any, 0, 5+2*len(entry))
-	args = append(args, terminalField, invocation, dlqPlaceholderField, attempt, token)
-	args = append(args, flatDLQEntry(entry)...)
-	res, err := persistDLQScript.Run(ctx, store.client,
-		[]string{invocationStateKey(stream, group, msgID), dlqStream},
-		args...,
-	).Int64()
-	if err != nil {
-		return false, err
-	}
-	switch res {
-	case 1:
-		return true, nil
-	case 0:
-		return false, nil
-	default:
-		return false, fmt.Errorf("DLQ persistence refused for invocation %q (state %d)", invocation, res)
-	}
-}
-
-// flatDLQEntry flattens a DLQ entry field map into the ordered key/value ARGV
-// list persistDLQScript forwards to XADD. Keys are sorted so the wire arguments
-// are deterministic (Redis does not care about field order, but a stable order
-// keeps tests and packet captures reproducible).
-func flatDLQEntry(entry map[string]any) []any {
-	keys := make([]string, 0, len(entry))
-	for k := range entry {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	args := make([]any, 0, 2*len(entry))
-	for _, k := range keys {
-		// Stringify every value so the script's XADD always receives bulk
-		// strings, exactly as the former map-based XAdd encoded them.
-		args = append(args, k, fmt.Sprint(entry[k]))
-	}
-	return args
-}
-
-// exhaustedState reads the invocation's exhausted marker, returning its retained
-// claim identity (attempt + token), whether its DLQ entry is already persisted
-// (the ":dlq" suffix), and whether a well-formed exhausted marker was present.
-// redis.Nil (field absent) and any non-exhausted marker return ok=false.
-//
-// It serves routeToDLQ twice: the dlq flag lets it skip an invocation whose
-// entry was already written, and the retained claim identity is the exact CAS
-// key for the subsequent atomic persistDLQ append+upgrade, so a stale/foreign
-// marker can never be appended or upgraded. A read error returns
-// (zero, false, false, err); the caller fails safe by treating the entry as not
-// persisted (a duplicate is allowed under at-least-once, while skipping a
-// required write would lose the entry).
-func (store *invocationStore) exhaustedState(
+// The read is a single HGET. An exhausted marker is terminal: no lifecycle
+// transition can overwrite it, so the validated identity cannot be superseded
+// between validation and the PostgreSQL insert. The token is parsed for
+// well-formedness only and never leaves this package.
+func (store *invocationStore) exhaustedClaim(
 	ctx context.Context,
 	stream,
 	group,
 	msgID,
 	invocation string,
-) (claim InvocationClaim, dlq bool, ok bool, err error) {
+) (InvocationClaim, bool, error) {
 	value, err := store.client.HGet(ctx, invocationStateKey(stream, group, msgID), invocation).Result()
 	if err == redis.Nil {
-		return InvocationClaim{}, false, false, nil
+		return InvocationClaim{}, false, nil
 	}
 	if err != nil {
-		return InvocationClaim{}, false, false, err
+		return InvocationClaim{}, false, err
 	}
-	exClaim, dlq, ok := parseExhaustedValue(value)
+	claim, _, ok := parseExhaustedValue(value)
 	if !ok {
-		return InvocationClaim{}, false, false, nil
+		return InvocationClaim{}, false, nil
 	}
-	return exClaim, dlq, true, nil
+	return claim, true, nil
 }
 
 // ackAndRetainTerminal acknowledges the message and switches its
@@ -1388,18 +1291,6 @@ func nextAttemptValue(deadline time.Time, claim InvocationClaim) string {
 		strconv.Itoa(claim.Attempt) + ":" + claim.Token
 }
 
-// exhaustedValue encodes the terminal exhausted state, retaining the exhausted
-// claim's attempt and token so the later DLQ upgrade can CAS it. With
-// dlqPersisted false it is "exhausted:<attempt>:<token>"; with true it appends
-// the ":dlq" suffix.
-func exhaustedValue(claim InvocationClaim, dlqPersisted bool) string {
-	value := "exhausted:" + strconv.Itoa(claim.Attempt) + ":" + claim.Token
-	if dlqPersisted {
-		value += ":dlq"
-	}
-	return value
-}
-
 // validClaimToken reports whether tok is a well-formed claim token: a non-empty
 // run of lowercase hex digits, matching the Lua parser's [0-9a-f]+ (tokens are
 // generated by newClaimToken). It is strict so a corrupt token can never be
@@ -1417,17 +1308,10 @@ func validClaimToken(tok string) bool {
 	return len(tok) <= 64
 }
 
-// isExhaustedDLQValue reports whether v is a valid "exhausted:<attempt>:<token>:dlq"
-// marker (attempt >= 1, well-formed token), i.e. the invocation's DLQ entry has
-// been persisted. It is strict so a corrupt or near-miss marker can never be
-// mistaken for a persisted entry and cause a required DLQ write to be skipped.
-func isExhaustedDLQValue(v string) bool {
-	_, dlq, ok := parseExhaustedValue(v)
-	return ok && dlq
-}
-
-// parseExhaustedValue parses "exhausted:<attempt>:<token>[:dlq]" into its claim
-// and DLQ-persistence flag. ok=false for any malformed value.
+// parseExhaustedValue parses "exhausted:<attempt>:<token>[:dlq]" into its claim.
+// The optional legacy ":dlq" suffix is still parsed as terminal so an older
+// marker can never be mistaken for an eligible invocation; it is read-only
+// compatibility and no new suffix is written. ok=false for any malformed value.
 func parseExhaustedValue(v string) (claim InvocationClaim, dlq bool, ok bool) {
 	rest, found := strings.CutPrefix(v, "exhausted:")
 	if !found {

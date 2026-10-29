@@ -9,6 +9,7 @@ import (
 	"relay/internal/observability/metrics"
 	"relay/internal/runner"
 	"relay/internal/secrets"
+	"relay/internal/state"
 	"relay/internal/stream"
 )
 
@@ -65,6 +66,7 @@ func newStreamConsumer(
 	logger *slog.Logger,
 	cfg config.Config,
 	metricsInstance *metrics.Registry,
+	st *state.State,
 	runWorker *runner.Runner,
 ) *stream.Consumer {
 	return stream.NewConsumer(stream.ConsumerConfig{
@@ -76,6 +78,9 @@ func newStreamConsumer(
 		Metrics:           metricsInstance,
 		MaxBufferedEvents: cfg.MaxBufferedEvents,
 		MaxEventBytes:     cfg.MaxEventBytes,
+		// PostgreSQL is the durable DLQ store. An entry is written before the
+		// source delivery is acknowledged.
+		DLQStore: st,
 		// Terminal invocation-state retention (cfg.InvocationRetention from
 		// REDIS_INVOCATION_RETENTION, default 48h; unset/empty/zero/negative
 		// behavior is resolved by config.Load). Passed as an explicit pointer so

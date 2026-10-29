@@ -8,18 +8,19 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"relay/internal/app"
+	"relay/internal/dlq"
 	"relay/internal/runner"
 	"relay/internal/runtime"
-	"relay/internal/stream"
 )
 
 // fakeDLQStore is an in-memory DLQStore for CLI tests: it preserves insertion
 // order (the Redis stream order the real store returns) and records deletes, so
 // the command/presentation layer is exercised without Redis.
 type fakeDLQStore struct {
-	entries []stream.DLQEntry
+	entries []dlq.Entry
 	deleted []string
 	// listErr/getErr/deleteErr inject failures.
 	listErr   error
@@ -28,26 +29,26 @@ type fakeDLQStore struct {
 	closed    bool
 }
 
-func (f *fakeDLQStore) List(context.Context) ([]stream.DLQEntry, error) {
+func (f *fakeDLQStore) ListDLQEntries(context.Context) ([]dlq.Entry, error) {
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
-	return append([]stream.DLQEntry(nil), f.entries...), nil
+	return append([]dlq.Entry(nil), f.entries...), nil
 }
 
-func (f *fakeDLQStore) Get(_ context.Context, id string) (stream.DLQEntry, bool, error) {
+func (f *fakeDLQStore) GetDLQEntry(ctx context.Context, id string) (dlq.Entry, bool, error) {
 	if f.getErr != nil {
-		return stream.DLQEntry{}, false, f.getErr
+		return dlq.Entry{}, false, f.getErr
 	}
 	for _, e := range f.entries {
 		if e.ID == id {
 			return e, true, nil
 		}
 	}
-	return stream.DLQEntry{}, false, nil
+	return dlq.Entry{}, false, nil
 }
 
-func (f *fakeDLQStore) Delete(_ context.Context, id string) (bool, error) {
+func (f *fakeDLQStore) DeleteDLQEntry(ctx context.Context, id string) (bool, error) {
 	if f.deleteErr != nil {
 		return false, f.deleteErr
 	}
@@ -61,6 +62,19 @@ func (f *fakeDLQStore) Delete(_ context.Context, id string) (bool, error) {
 	return false, nil
 }
 
+func (f *fakeDLQStore) SaveDLQEntry(_ context.Context, entry dlq.Entry) (bool, error) {
+	f.entries = append(f.entries, entry)
+	return true, nil
+}
+
+func (f *fakeDLQStore) MarkDLQDeliverySettled(_ context.Context, _ string, _ time.Time) error {
+	return nil
+}
+
+func (f *fakeDLQStore) ListUnsettledDLQDeliveries(_ context.Context, _ string, _ int) ([]dlq.DeliveryRef, error) {
+	return nil, nil
+}
+
 func (f *fakeDLQStore) Close() error { f.closed = true; return nil }
 
 // withFakeDLQ returns dependencies whose DLQ opener yields store, so the
@@ -69,19 +83,19 @@ func (f *fakeDLQStore) Close() error { f.closed = true; return nil }
 func withFakeDLQ(t *testing.T, store *fakeDLQStore) Dependencies {
 	t.Helper()
 	deps := testDeps(t)
-	deps.OpenDLQ = func(*slog.Logger) (DLQStore, func(), error) {
+	deps.OpenDLQ = func(context.Context, *slog.Logger) (dlq.Store, func(), error) {
 		return store, func() { _ = store.Close() }, nil
 	}
 	return deps
 }
 
 // dlqTestEntry builds a current-format entry with sensible defaults.
-func dlqTestEntry(id, originalID, function, handler, event, timestamp string) stream.DLQEntry {
-	return stream.DLQEntry{
+func dlqTestEntry(id, originalID, function, handler, event, timestamp string) dlq.Entry {
+	return dlq.Entry{
 		ID:              id,
-		OriginalStream:  "events",
-		OriginalID:      originalID,
-		Group:           "relay",
+		Source:          "events",
+		SourceMessageID: originalID,
+		SourceGroup:     "relay",
 		Consumer:        "worker-1",
 		Event:           event,
 		Reason:          fmt.Sprintf("invocation exhausted: function %q handler %q exhausted after 5 handler attempts", function, handler),
@@ -90,6 +104,7 @@ func dlqTestEntry(id, originalID, function, handler, event, timestamp string) st
 		Deliveries:      9,
 		HandlerAttempts: 5,
 		Timestamp:       timestamp,
+		SettledAt:       timestamp,
 	}
 }
 
@@ -139,7 +154,7 @@ func TestDLQHelpFlagsAndUnknownCommand(t *testing.T) {
 // order with ID, source message, app, handler, attempts, and age, and that
 // two entries from the SAME source message ID are listed as distinct rows.
 func TestDLQListColumnsAndOrder(t *testing.T) {
-	store := &fakeDLQStore{entries: []stream.DLQEntry{
+	store := &fakeDLQStore{entries: []dlq.Entry{
 		dlqTestEntry("1700000000000-0", "1699999999999-0", "alpha", "events.a.handler", `{"a":1}`, "2026-09-23T10:00:00Z"),
 		// Same original_id, different exhausted invocation: a multi-handler
 		// message produces one entry each.
@@ -207,7 +222,7 @@ func TestDLQListTooManyArgs(t *testing.T) {
 // TestDLQInspectFieldsAndPrettyEvent verifies inspect renders every current
 // field and pretty-prints the original JSON event.
 func TestDLQInspectFieldsAndPrettyEvent(t *testing.T) {
-	store := &fakeDLQStore{entries: []stream.DLQEntry{
+	store := &fakeDLQStore{entries: []dlq.Entry{
 		dlqTestEntry("1700000000000-0", "1699999999999-0", "alpha", "events.a.handler", `{"event_name":"INSERT","id":7}`, "2026-09-23T10:00:00Z"),
 	}}
 	deps := withFakeDLQ(t, store)
@@ -246,7 +261,7 @@ func TestDLQInspectFieldsAndPrettyEvent(t *testing.T) {
 // TestDLQInspectNonJSONEventVerbatim verifies a non-JSON event (the "-"
 // placeholder for a malformed message) is rendered verbatim rather than hidden.
 func TestDLQInspectNonJSONEventVerbatim(t *testing.T) {
-	store := &fakeDLQStore{entries: []stream.DLQEntry{
+	store := &fakeDLQStore{entries: []dlq.Entry{
 		dlqTestEntry("1-0", "1-0", "-", "-", "-", "2026-09-23T10:00:00Z"),
 	}}
 	deps := withFakeDLQ(t, store)
@@ -267,7 +282,7 @@ func TestDLQInspectTraceOptional(t *testing.T) {
 
 	withTrace := dlqTestEntry("1-0", "1-0", "alpha", "h", `{}`, "2026-09-23T10:00:00Z")
 	withTrace.Trace = lineage
-	deps := withFakeDLQ(t, &fakeDLQStore{entries: []stream.DLQEntry{withTrace}})
+	deps := withFakeDLQ(t, &fakeDLQStore{entries: []dlq.Entry{withTrace}})
 	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "inspect", "1-0")
 	if err != nil {
 		t.Fatalf("dlq inspect: %v", err)
@@ -277,7 +292,7 @@ func TestDLQInspectTraceOptional(t *testing.T) {
 	}
 
 	withoutTrace := dlqTestEntry("1-0", "1-0", "alpha", "h", `{}`, "2026-09-23T10:00:00Z")
-	deps = withFakeDLQ(t, &fakeDLQStore{entries: []stream.DLQEntry{withoutTrace}})
+	deps = withFakeDLQ(t, &fakeDLQStore{entries: []dlq.Entry{withoutTrace}})
 	out, _, err = runCLIWithDeps(t, deps, "", "dlq", "inspect", "1-0")
 	if err != nil {
 		t.Fatalf("dlq inspect: %v", err)
@@ -307,7 +322,7 @@ func TestDLQInspectTooManyArgs(t *testing.T) {
 // TestDLQRmRemovesExactlyOne verifies rm deletes exactly the named entry (XDEL
 // semantics: one ID) and leaves the others.
 func TestDLQRmRemovesExactlyOne(t *testing.T) {
-	store := &fakeDLQStore{entries: []stream.DLQEntry{
+	store := &fakeDLQStore{entries: []dlq.Entry{
 		dlqTestEntry("1-0", "1-0", "alpha", "h", `{}`, "2026-09-23T10:00:00Z"),
 		dlqTestEntry("2-0", "2-0", "beta", "h", `{}`, "2026-09-23T10:00:00Z"),
 	}}
@@ -328,7 +343,7 @@ func TestDLQRmRemovesExactlyOne(t *testing.T) {
 // TestDLQRmUnknownID verifies rm of an unknown ID is a clear error and removes
 // nothing.
 func TestDLQRmUnknownID(t *testing.T) {
-	store := &fakeDLQStore{entries: []stream.DLQEntry{dlqTestEntry("1-0", "1-0", "a", "h", `{}`, "2026-09-23T10:00:00Z")}}
+	store := &fakeDLQStore{entries: []dlq.Entry{dlqTestEntry("1-0", "1-0", "a", "h", `{}`, "2026-09-23T10:00:00Z")}}
 	deps := withFakeDLQ(t, store)
 
 	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "rm", "9-9")
@@ -385,8 +400,8 @@ func TestDLQNoOpenerConfigured(t *testing.T) {
 	deps := testDeps(t)
 	deps.OpenDLQ = nil
 	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "ls")
-	if err == nil || !strings.Contains(err.Error(), "redis is not configured") {
-		t.Fatalf("err = %v, want a clear no-Redis error", err)
+	if err == nil || !strings.Contains(err.Error(), "PostgreSQL is not configured") {
+		t.Fatalf("err = %v, want a clear unconfigured-store error", err)
 	}
 }
 
@@ -415,6 +430,30 @@ func (r *recordingReplayer) got() (int, []byte, string) {
 	return r.calls, append([]byte(nil), r.event...), r.trace
 }
 
+// TestDLQReplayUnsettledEntryDoesNotExecute verifies the settlement preflight
+// runs before the worker socket/replay: an unsettled source delivery may still
+// be recoverable, so replay must not execute a handler whose entry cannot yet be
+// deleted.
+func TestDLQReplayUnsettledEntryDoesNotExecute(t *testing.T) {
+	entry := dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `{"event_name":"INSERT"}`, "2026-09-23T10:00:00Z")
+	entry.SettledAt = ""
+	store := &fakeDLQStore{entries: []dlq.Entry{entry}}
+	exec := &dlqReplayExecutor{}
+	deps := dlqReplayRunner(t, store, exec)
+
+	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	if err == nil || !strings.Contains(err.Error(), "is not settled") {
+		t.Fatalf("err = %v, want an explicit not-settled error", err)
+	}
+	handlers, _ := exec.got()
+	if len(handlers) != 0 {
+		t.Fatalf("an unsettled entry must not execute: handlers = %v", handlers)
+	}
+	if len(store.entries) != 1 {
+		t.Fatalf("an unsettled entry must be kept: %+v", store.entries)
+	}
+}
+
 // TestDLQReplayForwardsTraceControlPath proves the replay sends the entry's
 // optional trace lineage to the worker as control-path metadata, separate from
 // the event payload (the payload never contains the lineage).
@@ -422,7 +461,7 @@ func TestDLQReplayForwardsTraceControlPath(t *testing.T) {
 	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 	entry := dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `{"event_name":"INSERT"}`, "2026-09-23T10:00:00Z")
 	entry.Trace = lineage
-	store := &fakeDLQStore{entries: []stream.DLQEntry{entry}}
+	store := &fakeDLQStore{entries: []dlq.Entry{entry}}
 	deps := withFakeDLQ(t, store)
 
 	rep := &recordingReplayer{}
@@ -510,7 +549,7 @@ events:
 // only that handler executes, the success line is printed, and the entry is
 // deleted.
 func TestDLQReplayExecutesExactHandlerAndDeletes(t *testing.T) {
-	store := &fakeDLQStore{entries: []stream.DLQEntry{
+	store := &fakeDLQStore{entries: []dlq.Entry{
 		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `{"event_name":"INSERT"}`, "2026-09-23T10:00:00Z"),
 	}}
 	exec := &dlqReplayExecutor{}
@@ -538,7 +577,7 @@ func TestDLQReplayExecutesExactHandlerAndDeletes(t *testing.T) {
 // TestDLQReplayRemovedHandlerKeepsEntry verifies a removed handler fails with a
 // clear error, runs nothing, and keeps the entry.
 func TestDLQReplayRemovedHandlerKeepsEntry(t *testing.T) {
-	store := &fakeDLQStore{entries: []stream.DLQEntry{
+	store := &fakeDLQStore{entries: []dlq.Entry{
 		dlqTestEntry("1-0", "1-0", "user-events", "events.removed.handler", `{}`, "2026-09-23T10:00:00Z"),
 	}}
 	exec := &dlqReplayExecutor{}
@@ -559,7 +598,7 @@ func TestDLQReplayRemovedHandlerKeepsEntry(t *testing.T) {
 // TestDLQReplayFailedHandlerKeepsEntry verifies a handler that executes and
 // fails keeps the entry and returns a nonzero error.
 func TestDLQReplayFailedHandlerKeepsEntry(t *testing.T) {
-	store := &fakeDLQStore{entries: []stream.DLQEntry{
+	store := &fakeDLQStore{entries: []dlq.Entry{
 		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `{}`, "2026-09-23T10:00:00Z"),
 	}}
 	exec := &dlqReplayExecutor{fail: true}
@@ -580,7 +619,7 @@ func TestDLQReplayFailedHandlerKeepsEntry(t *testing.T) {
 // TestDLQReplayUnknownAppKeepsEntry verifies an app no longer in the
 // registry is surfaced and the entry kept.
 func TestDLQReplayUnknownAppKeepsEntry(t *testing.T) {
-	store := &fakeDLQStore{entries: []stream.DLQEntry{
+	store := &fakeDLQStore{entries: []dlq.Entry{
 		dlqTestEntry("1-0", "1-0", "ghost", "events.created.handler", `{}`, "2026-09-23T10:00:00Z"),
 	}}
 	exec := &dlqReplayExecutor{}
@@ -603,7 +642,7 @@ func TestDLQReplayUnknownAppKeepsEntry(t *testing.T) {
 func TestDLQReplayMalformedPlaceholderNotReplayable(t *testing.T) {
 	placeholder := dlqTestEntry("1-0", "1-0", "-", "-", "-", "2026-09-23T10:00:00Z")
 	placeholder.HandlerAttempts = 0
-	store := &fakeDLQStore{entries: []stream.DLQEntry{placeholder}}
+	store := &fakeDLQStore{entries: []dlq.Entry{placeholder}}
 	// No socket server is started: a dial attempt would surface as an
 	// unavailable-worker error, which is exactly what this path must not do.
 	deps := withFakeDLQ(t, store)
@@ -630,7 +669,7 @@ func TestDLQReplayMalformedPlaceholderNotReplayable(t *testing.T) {
 func TestDLQReplayMalformedPlaceholderDoesNotExecute(t *testing.T) {
 	placeholder := dlqTestEntry("1-0", "1-0", "-", "-", "-", "2026-09-23T10:00:00Z")
 	placeholder.HandlerAttempts = 0
-	store := &fakeDLQStore{entries: []stream.DLQEntry{placeholder}}
+	store := &fakeDLQStore{entries: []dlq.Entry{placeholder}}
 	exec := &dlqReplayExecutor{}
 	deps := dlqReplayRunner(t, store, exec)
 
@@ -649,7 +688,7 @@ func TestDLQReplayMalformedPlaceholderDoesNotExecute(t *testing.T) {
 // TestDLQReplayWorkerUnavailableKeepsEntry verifies an unavailable worker is a
 // hard error (no offline fallback) and the entry is kept.
 func TestDLQReplayWorkerUnavailableKeepsEntry(t *testing.T) {
-	store := &fakeDLQStore{entries: []stream.DLQEntry{
+	store := &fakeDLQStore{entries: []dlq.Entry{
 		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `{}`, "2026-09-23T10:00:00Z"),
 	}}
 	// No socket server started at deps.SocketPath.
@@ -664,31 +703,13 @@ func TestDLQReplayWorkerUnavailableKeepsEntry(t *testing.T) {
 	}
 }
 
-// TestOpenRedisDLQStoreNeedsNoDatabaseURL pins that the production `relay dlq`
-// opener is Redis-only: with the Redis variables set and DATABASE_URL absent it
-// still resolves and constructs a store, and it still fails when a required
-// Redis variable is missing.
-func TestOpenRedisDLQStoreNeedsNoDatabaseURL(t *testing.T) {
-	t.Setenv("REDIS_URI", "localhost:6379")
-	t.Setenv("REDIS_STREAM", "events")
-	t.Setenv("REDIS_GROUP", "relay")
-	// No state database configured: the DLQ path must not require it.
+// TestOpenPostgresDLQStoreRequiresDatabaseURL pins that the production
+// `relay dlq` opener selects the PostgreSQL state store and reports a missing
+// DATABASE_URL clearly, without needing Redis or a running worker.
+func TestOpenPostgresDLQStoreRequiresDatabaseURL(t *testing.T) {
 	t.Setenv("DATABASE_URL", "")
-
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	store, cleanup, err := openRedisDLQStore(logger)
-	if err != nil {
-		t.Fatalf("openRedisDLQStore without DATABASE_URL: %v", err)
-	}
-	if store == nil {
-		t.Fatal("expected a non-nil store")
-	}
-	cleanup()
-
-	// Redis configuration validation is preserved: a missing required variable
-	// is still a clear error.
-	t.Setenv("REDIS_URI", "")
-	if _, _, err := openRedisDLQStore(logger); err == nil || !strings.Contains(err.Error(), "REDIS_URI") {
-		t.Fatalf("openRedisDLQStore without REDIS_URI = %v, want an error naming REDIS_URI", err)
+	if _, _, err := openPostgresDLQStore(context.Background(), logger); err == nil || !strings.Contains(err.Error(), "DATABASE_URL") {
+		t.Fatalf("openPostgresDLQStore without DATABASE_URL = %v, want an error naming DATABASE_URL", err)
 	}
 }

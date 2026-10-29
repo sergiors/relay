@@ -27,7 +27,6 @@ func TestRecordRedisReadErrorOperationLabels(t *testing.T) {
 	recordRedisReadError(m, metrics.RedisOpAutoclaim, errors.New("boom"))
 	recordRedisReadError(m, metrics.RedisOpPendingGauge, errors.New("boom"))
 	recordRedisReadError(m, metrics.RedisOpGroupLag, errors.New("boom"))
-	recordRedisReadError(m, metrics.RedisOpDLQDepth, errors.New("boom"))
 
 	if got := m.CounterLabels(metrics.MetricRedisReadErrors, []metrics.Label{{Name: "operation", Value: metrics.RedisOpReadGroup}}); got != 1 {
 		t.Fatalf("read_group = %d, want 1", got)
@@ -43,9 +42,6 @@ func TestRecordRedisReadErrorOperationLabels(t *testing.T) {
 	}
 	if got := m.CounterLabels(metrics.MetricRedisReadErrors, []metrics.Label{{Name: "operation", Value: metrics.RedisOpGroupLag}}); got != 1 {
 		t.Fatalf("group_lag = %d, want 1", got)
-	}
-	if got := m.CounterLabels(metrics.MetricRedisReadErrors, []metrics.Label{{Name: "operation", Value: metrics.RedisOpDLQDepth}}); got != 1 {
-		t.Fatalf("dlq_depth = %d, want 1", got)
 	}
 }
 
@@ -145,12 +141,11 @@ func (f *fakePendingSummarizer) XLen(ctx context.Context, stream string) *redis.
 // the tests need no sleeps or polling.
 func newPendingGaugeTestSource(f *fakePendingSummarizer, m *metrics.Registry) *PendingGaugeSource {
 	return &PendingGaugeSource{
-		client:    f,
-		stream:    "events",
-		group:     "workers",
-		dlqStream: DLQStreamFor("events"),
-		metrics:   m,
-		log:       slog.New(slog.DiscardHandler),
+		client:  f,
+		stream:  "events",
+		group:   "workers",
+		metrics: m,
+		log:     slog.New(slog.DiscardHandler),
 	}
 }
 
@@ -403,61 +398,9 @@ func TestPendingGaugeSourceRefreshGroupLagErrorCountsAndPreserves(t *testing.T) 
 	}
 }
 
-// TestPendingGaugeSourceRefreshRecordsDLQDepth pins that XLEN is issued once for
-// the derived DLQ stream and a successful read records the depth including a
-// true zero.
-func TestPendingGaugeSourceRefreshRecordsDLQDepth(t *testing.T) {
-	m := metrics.New()
-	f := &fakePendingSummarizer{val: &redis.XPending{}, lenVal: 5}
-	src := newPendingGaugeTestSource(f, m)
-
-	src.Refresh(context.Background())
-
-	if f.lenCalls != 1 {
-		t.Fatalf("XLEN calls = %d, want 1", f.lenCalls)
-	}
-	if f.lastLen != "relay:events:dlq" {
-		t.Fatalf("queried stream %q, want relay:events:dlq", f.lastLen)
-	}
-	if got := m.Gauge(metrics.MetricDLQDepth); got != 5 {
-		t.Fatalf("dlq_depth = %v, want 5", got)
-	}
-
-	// An emptied DLQ records a true zero.
-	f.lenVal = 0
-	src.Refresh(context.Background())
-	if got := m.Gauge(metrics.MetricDLQDepth); got != 0 {
-		t.Fatalf("dlq_depth after empty = %v, want 0", got)
-	}
-}
-
-// TestPendingGaugeSourceRefreshDLQErrorCountsAndPreserves pins that an XLEN
-// failure is counted with its own operation label and preserves the prior depth
-// gauge (fail open, no false zero).
-func TestPendingGaugeSourceRefreshDLQErrorCountsAndPreserves(t *testing.T) {
-	m := metrics.New()
-	f := &fakePendingSummarizer{val: &redis.XPending{}, lenVal: 3}
-	src := newPendingGaugeTestSource(f, m)
-	src.Refresh(context.Background())
-	prior := m.Gauge(metrics.MetricDLQDepth)
-	if prior != 3 {
-		t.Fatalf("setup: dlq_depth = %v, want 3", prior)
-	}
-
-	f.lenErr = errors.New("connection refused")
-	src.Refresh(context.Background())
-
-	if got := m.Gauge(metrics.MetricDLQDepth); got != prior {
-		t.Fatalf("dlq_depth after error = %v, want %v (preserved)", got, prior)
-	}
-	labels := []metrics.Label{{Name: "operation", Value: metrics.RedisOpDLQDepth}}
-	if got := m.CounterLabels(metrics.MetricRedisReadErrors, labels); got != 1 {
-		t.Fatalf("dlq_depth read errors = %d, want 1", got)
-	}
-}
-
 // TestPendingGaugeSourceRefreshIssuesOneCommandEach pins the per-tick command
-// budget: one XPENDING, one XINFO GROUPS, and one XLEN per Refresh.
+// budget: one XPENDING and one XINFO GROUPS per Refresh. DLQ depth is sampled
+// separately from PostgreSQL by the worker.
 func TestPendingGaugeSourceRefreshIssuesOneCommandEach(t *testing.T) {
 	m := metrics.New()
 	f := &fakePendingSummarizer{val: &redis.XPending{}, groups: []redis.XInfoGroup{{Name: "workers", Lag: 1}}}
@@ -465,21 +408,20 @@ func TestPendingGaugeSourceRefreshIssuesOneCommandEach(t *testing.T) {
 
 	src.Refresh(context.Background())
 
-	if f.calls != 1 || f.infoCalls != 1 || f.lenCalls != 1 {
-		t.Fatalf("commands per refresh = xpending %d, xinfo %d, xlen %d; want 1/1/1",
-			f.calls, f.infoCalls, f.lenCalls)
+	if f.calls != 1 || f.infoCalls != 1 {
+		t.Fatalf("commands per refresh = xpending %d, xinfo %d; want 1/1",
+			f.calls, f.infoCalls)
 	}
 }
 
-// TestPendingGaugeSourceRefreshExposesStreamGauges pins that the lag and DLQ
-// gauges are visible on the wire through the same exposition handler the worker
-// serves, not only in the Registry's typed getters.
+// TestPendingGaugeSourceRefreshExposesStreamGauges pins that the lag gauge is
+// visible on the wire through the same exposition handler the worker serves,
+// not only in the Registry's typed getters.
 func TestPendingGaugeSourceRefreshExposesStreamGauges(t *testing.T) {
 	m := metrics.New()
 	f := &fakePendingSummarizer{
 		val:    &redis.XPending{},
 		groups: []redis.XInfoGroup{{Name: "workers", Lag: 6}},
-		lenVal: 2,
 	}
 	src := newPendingGaugeTestSource(f, m)
 	src.Refresh(context.Background())
@@ -492,9 +434,6 @@ func TestPendingGaugeSourceRefreshExposesStreamGauges(t *testing.T) {
 	body := rec.Body.String()
 	if !strings.Contains(body, metrics.MetricStreamGroupLag+" 6") {
 		t.Fatalf("exposition missing %q:\n%s", metrics.MetricStreamGroupLag+" 6", body)
-	}
-	if !strings.Contains(body, metrics.MetricDLQDepth+" 2") {
-		t.Fatalf("exposition missing %q:\n%s", metrics.MetricDLQDepth+" 2", body)
 	}
 }
 

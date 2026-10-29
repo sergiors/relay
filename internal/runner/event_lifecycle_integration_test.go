@@ -16,6 +16,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -26,24 +27,28 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"relay/internal/app"
+	"relay/internal/dlq"
 	"relay/internal/observability/metrics"
+	"relay/internal/state"
 	"relay/internal/stream"
 	"relay/internal/testutil"
 )
 
 // eventEnv is a self-contained event-path integration harness: a real consumer
-// (with the real runner's Handle) on a unixnano-unique stream/group.
+// (with the real runner's Handle) on a unixnano-unique stream/group, with the
+// production PostgreSQL DLQ store wired on a fresh per-test schema.
 type eventEnv struct {
-	t      *testing.T
-	client *redis.Client
-	stream string
-	group  string
-	dlq    string
-	ctx    context.Context
-	cancel func()
-	c      *stream.Consumer
-	done   chan struct{}
-	errCh  chan error
+	t        *testing.T
+	client   *redis.Client
+	stream   string
+	group    string
+	dlqStore dlq.Store
+	pg       *state.State
+	ctx      context.Context
+	cancel   func()
+	c        *stream.Consumer
+	done     chan struct{}
+	errCh    chan error
 }
 
 // newEventEnv builds the harness but does not start consuming; the caller wires
@@ -61,11 +66,25 @@ func newEventEnv(t *testing.T) *eventEnv {
 // closes the client after this harness's own key cleanup has run.
 func newEventEnvWith(t *testing.T, maxBufferedEvents int, m *metrics.Registry) *eventEnv {
 	t.Helper()
+	return newEventEnvWithDLQ(t, maxBufferedEvents, m, nil)
+}
+
+// newEventEnvWithDLQ lets a caller decorate the DLQ store the consumer is wired
+// with (e.g. a fail-injecting wrapper). decorate may be nil.
+func newEventEnvWithDLQ(t *testing.T, maxBufferedEvents int, m *metrics.Registry, decorate func(dlq.Store) dlq.Store) *eventEnv {
+	t.Helper()
 	cli := testutil.RequireRedis(t)
 	cctx, cancel := context.WithCancel(context.Background())
 	prefix := fmt.Sprintf("evitest-%d", time.Now().UnixNano())
 	streamName := prefix + "-stream"
 	groupName := prefix + "-group"
+	// The durable DLQ store: fresh per-test PostgreSQL schema, exactly the
+	// production wiring (newStreamConsumer wires the state handle).
+	pg := testutil.NewState(t)
+	dlqStore := dlq.Store(pg)
+	if decorate != nil {
+		dlqStore = decorate(pg)
+	}
 	c := stream.NewConsumer(stream.ConsumerConfig{
 		Client:            cli,
 		Stream:            streamName,
@@ -77,20 +96,22 @@ func newEventEnvWith(t *testing.T, maxBufferedEvents int, m *metrics.Registry) *
 		Block:             300 * time.Millisecond,
 		MaxBufferedEvents: maxBufferedEvents,
 		Metrics:           m,
+		DLQStore:          dlqStore,
 	})
 	if err := c.EnsureGroup(cctx); err != nil {
 		cancel()
 		t.Fatalf("ensure group: %v", err)
 	}
 	e := &eventEnv{
-		t:      t,
-		client: cli,
-		stream: streamName,
-		group:  groupName,
-		dlq:    stream.DLQStreamFor(streamName),
-		ctx:    cctx,
-		cancel: cancel,
-		c:      c,
+		t:        t,
+		client:   cli,
+		stream:   streamName,
+		group:    groupName,
+		dlqStore: dlqStore,
+		pg:       pg,
+		ctx:      cctx,
+		cancel:   cancel,
+		c:        c,
 	}
 	t.Cleanup(e.cleanup)
 	return e
@@ -106,7 +127,7 @@ func (e *eventEnv) cleanup() {
 		}
 	}
 	cctx := context.Background()
-	_ = e.client.Del(cctx, e.stream, e.dlq).Err()
+	_ = e.client.Del(cctx, e.stream).Err()
 	// Best-effort removal of this env's invocation-state keys. The stream/group
 	// names contain no ':' or '%', so a percent-encoding pass would be identity
 	// and a direct prefix scan is safe and bounded to this env.
@@ -171,28 +192,31 @@ func (e *eventEnv) pending(msgID string) (retry int64, ok bool) {
 	return 0, false
 }
 
-// dlqEntry returns the DLQ entry whose original_id is msgID, and whether it
-// exists. When a message produces several entries (one per exhausted
-// invocation) it returns the first; use dlqEntries to inspect them all.
-func (e *eventEnv) dlqEntry(msgID string) (redis.XMessage, bool) {
+// dlqEntry returns the durable DLQ entry whose source message ID is msgID, and
+// whether it exists. When a message produces several entries (one per exhausted
+// invocation) it returns the first in write order; use dlqEntries to inspect
+// them all.
+func (e *eventEnv) dlqEntry(msgID string) (dlq.Entry, bool) {
 	entries := e.dlqEntries(msgID)
 	if len(entries) == 0 {
-		return redis.XMessage{}, false
+		return dlq.Entry{}, false
 	}
 	return entries[0], true
 }
 
-// dlqEntries returns every DLQ entry whose original_id is msgID, in stream
-// order. Per-invocation DLQ means one message can produce several entries.
-func (e *eventEnv) dlqEntries(msgID string) []redis.XMessage {
-	msgs, err := e.client.XRange(context.Background(), e.dlq, "-", "+").Result()
+// dlqEntries returns every DLQ entry whose source message ID is msgID, in write
+// order. Per-invocation DLQ means one message can produce several entries. A
+// store read error fails loudly: the DLQ assertions are meaningless without
+// their rows.
+func (e *eventEnv) dlqEntries(msgID string) []dlq.Entry {
+	entries, err := e.dlqStore.ListDLQEntries(context.Background())
 	if err != nil {
-		return nil
+		e.t.Fatalf("list DLQ entries: %v", err)
 	}
-	var out []redis.XMessage
-	for _, m := range msgs {
-		if id, _ := m.Values["original_id"].(string); id == msgID {
-			out = append(out, m)
+	var out []dlq.Entry
+	for _, entry := range entries {
+		if entry.SourceMessageID == msgID {
+			out = append(out, entry)
 		}
 	}
 	return out
@@ -274,8 +298,8 @@ func TestIntegrationEventSuccessAndExhaustionRoutesToDLQ(t *testing.T) {
 	if _, ok := e.pending(id); !ok {
 		t.Fatalf("message must stay pending while B is unresolved")
 	}
-	if _, ok := e.dlqEntry(id); ok {
-		t.Fatalf("message must not be DLQ'd while B is unresolved")
+	if entries := e.dlqEntries(id); len(entries) != 0 {
+		t.Fatalf("message must not be DLQ'd while B is unresolved, got %d rows", len(entries))
 	}
 	if got := aExec.count(); got != 1 {
 		t.Fatalf("A executions after delivery 1 = %d, want 1", got)
@@ -319,18 +343,18 @@ func TestIntegrationEventSuccessAndExhaustionRoutesToDLQ(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected a DLQ entry for %s", id)
 	}
-	if m.Values["original_stream"] != e.stream {
-		t.Errorf("original_stream = %v, want %v", m.Values["original_stream"], e.stream)
+	if m.Source != e.stream {
+		t.Errorf("Source = %q, want %q", m.Source, e.stream)
 	}
 	// The DLQ entry names the exact exhausted invocation (B), not the message or
 	// a sibling that succeeded.
-	if m.Values["app"] != "beta" || m.Values["handler"] != "index.run" {
-		t.Errorf("function/handler = %v/%v, want beta/index.run", m.Values["app"], m.Values["handler"])
+	if m.App != "beta" || m.Handler != "index.run" {
+		t.Errorf("function/handler = %q/%q, want beta/index.run", m.App, m.Handler)
 	}
 	// handler_attempts is the execution attempt that exhausted (2), attributed
 	// from the invocation retry state.
-	if m.Values["handler_attempts"] != "2" {
-		t.Errorf("handler_attempts = %v, want 2 (B's exhausting execution attempt)", m.Values["handler_attempts"])
+	if m.HandlerAttempts != 2 {
+		t.Errorf("HandlerAttempts = %d, want 2 (B's exhausting execution attempt)", m.HandlerAttempts)
 	}
 	// Exactly one entry: A succeeded and must never be dead-lettered.
 	if entries := e.dlqEntries(id); len(entries) != 1 {
@@ -339,16 +363,20 @@ func TestIntegrationEventSuccessAndExhaustionRoutesToDLQ(t *testing.T) {
 	// deliveries is the diagnostic Redis/PEL count and is >= handler_attempts
 	// (protected reclaims count as deliveries without advancing the handler
 	// attempt).
-	deliveries, err := strconv.Atoi(m.Values["deliveries"].(string))
-	if err != nil {
-		t.Fatalf("deliveries = %v, not an int: %v", m.Values["deliveries"], err)
+	if m.Deliveries < 2 {
+		t.Errorf("Deliveries = %d, want >= 2", m.Deliveries)
 	}
-	if deliveries < 2 {
-		t.Errorf("deliveries = %d, want >= 2", deliveries)
-	}
-	if m.Values["reason"] == "" {
+	if m.Reason == "" {
 		t.Errorf("reason missing")
 	}
+	// Every matched invocation is terminal, so the confirmed ACK settles the
+	// delivery's rows. The settlement write follows the ACK on the wire, so it
+	// is observed by polling (an observed ACK does not yet prove the
+	// PostgreSQL update committed).
+	e.eventually("the DLQ entry settled after the confirmed ACK", func() bool {
+		entry, ok := e.dlqEntry(id)
+		return ok && entry.SettledAt != ""
+	})
 }
 
 // TestIntegrationMultipleExhaustionsProducePerInvocationDLQEntries pins the
@@ -390,11 +418,9 @@ func TestIntegrationMultipleExhaustionsProducePerInvocationDLQEntries(t *testing
 		t.Fatalf("executions alpha=%d beta=%d gamma=%d, want 1/1/1", aExec.count(), bExec.count(), cExec.count())
 	}
 
-	byInv := map[string]redis.XMessage{}
+	byInv := map[string]dlq.Entry{}
 	for _, m := range e.dlqEntries(id) {
-		fn, _ := m.Values["app"].(string)
-		h, _ := m.Values["handler"].(string)
-		byInv[fn+"/"+h] = m
+		byInv[m.App+"/"+m.Handler] = m
 	}
 	if _, ok := byInv["alpha/index.run"]; ok {
 		t.Fatalf("successful alpha must never be dead-lettered: %v", byInv)
@@ -404,13 +430,13 @@ func TestIntegrationMultipleExhaustionsProducePerInvocationDLQEntries(t *testing
 		if !ok {
 			t.Fatalf("missing DLQ entry for exhausted %s (got %v)", inv, byInv)
 		}
-		if m.Values["handler_attempts"] != "1" {
-			t.Errorf("%s handler_attempts = %v, want 1 (retries:0 exhausts on attempt 1)", inv, m.Values["handler_attempts"])
+		if m.HandlerAttempts != 1 {
+			t.Errorf("%s HandlerAttempts = %d, want 1 (retries:0 exhausts on attempt 1)", inv, m.HandlerAttempts)
 		}
-		if m.Values["original_id"] != id {
-			t.Errorf("%s original_id = %v, want %s", inv, m.Values["original_id"], id)
+		if m.SourceMessageID != id {
+			t.Errorf("%s SourceMessageID = %q, want %s", inv, m.SourceMessageID, id)
 		}
-		if m.Values["reason"] == "" {
+		if m.Reason == "" {
 			t.Errorf("%s reason missing", inv)
 		}
 	}
@@ -430,13 +456,14 @@ func TestIntegrationDLQWriteFailureRecoveryReRoutesAfterExhaustion(t *testing.T)
 		fnWithRetries(t, "alpha", 0, aExec),
 		fnWithRetries(t, "beta", 0, bExec),
 	}, testutil.DiscardLogger(), nil)
-	e := newEventEnv(t)
-
-	// Make the DLQ XADD fail by turning the DLQ stream name into a wrong-type
-	// (string) key BEFORE the message is processed.
-	if err := e.client.Set(context.Background(), e.dlq, "not-a-stream", 0).Err(); err != nil {
-		t.Fatalf("set wrong-type DLQ key: %v", err)
-	}
+	// Make the PostgreSQL DLQ insert fail by wiring in a failing store wrapper
+	// BEFORE the message is processed (the production transport, so the row
+	// write and the ACK ordering are exercised for real).
+	failing := &failDLQStore{err: errors.New("injected postgres outage")}
+	e := newEventEnvWithDLQ(t, 0, nil, func(store dlq.Store) dlq.Store {
+		failing.Store = store
+		return failing
+	})
 
 	id := e.xadd(`{"a":1}`)
 	e.start(r.Handle)
@@ -455,12 +482,10 @@ func TestIntegrationDLQWriteFailureRecoveryReRoutesAfterExhaustion(t *testing.T)
 		t.Fatalf("no DLQ entry can exist while the DLQ write is failing")
 	}
 
-	// Now let the DLQ write succeed: remove the wrong-type key. The reclaim loop
+	// Now let the DLQ write succeed: unblock the wrapper. The reclaim loop
 	// redelivers the still-pending message; the redelivery must re-report
 	// exhaustion and route it to the DLQ (the regression).
-	if err := e.client.Del(context.Background(), e.dlq).Err(); err != nil {
-		t.Fatalf("del wrong-type DLQ key: %v", err)
-	}
+	failing.ok.Store(true)
 	e.eventually("message re-routed to DLQ on reclaim", func() bool {
 		_, ok := e.dlqEntry(id)
 		return ok
@@ -484,9 +509,15 @@ func TestIntegrationDLQWriteFailureRecoveryReRoutesAfterExhaustion(t *testing.T)
 	if !ok {
 		t.Fatalf("expected a DLQ entry for %s after recovery", id)
 	}
-	if m.Values["handler_attempts"] != "1" {
-		t.Errorf("handler_attempts = %v, want 1 (persisted exhausted attempt)", m.Values["handler_attempts"])
+	if m.HandlerAttempts != 1 {
+		t.Errorf("HandlerAttempts = %d, want 1 (persisted exhausted attempt)", m.HandlerAttempts)
 	}
+	// The settlement write follows the ACK on the wire, so it is observed by
+	// polling rather than immediately after the ACK becomes observable.
+	e.eventually("the recovered ACK settled the delivery", func() bool {
+		entry, ok := e.dlqEntry(id)
+		return ok && entry.SettledAt != ""
+	})
 }
 
 // TestIntegrationMatchedButUnavailableStaysPendingThenCompletes is the end-to-end
@@ -740,11 +771,11 @@ func TestIntegrationCrashAfterClaimSpendsAttemptWithoutHandlerExecution(t *testi
 	if !ok {
 		t.Fatalf("expected a DLQ entry for %s", id)
 	}
-	if m.Values["handler_attempts"] != "2" {
-		t.Errorf("handler_attempts = %v, want 2 (the claim before the crash consumed attempt 1)", m.Values["handler_attempts"])
+	if m.HandlerAttempts != 2 {
+		t.Errorf("HandlerAttempts = %d, want 2 (the claim before the crash consumed attempt 1)", m.HandlerAttempts)
 	}
-	if m.Values["app"] != "beta" || m.Values["handler"] != "index.run" {
-		t.Errorf("DLQ app/handler = %v/%v, want beta/index.run", m.Values["app"], m.Values["handler"])
+	if m.App != "beta" || m.Handler != "index.run" {
+		t.Errorf("DLQ app/handler = %q/%q, want beta/index.run", m.App, m.Handler)
 	}
 }
 

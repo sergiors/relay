@@ -173,7 +173,7 @@ func TestLoadGitWebhookAddrPassthrough(t *testing.T) {
 
 // TestStreamRetention covers the retention parsing contract via the pure
 // parseRetention helper (shared by REDIS_STREAM_RETENTION and
-// REDIS_DLQ_RETENTION): retention is log-and-disable: empty/whitespace disables
+// DLQ_RETENTION): retention is log-and-disable: empty/whitespace disables
 // retention (0, no log); a valid duration parses; an invalid duration and a
 // zero/negative value log a line naming the variable and return 0 (disabled). A
 // bad value therefore never fails startup.
@@ -249,8 +249,8 @@ func TestLoadRetentionDefaults(t *testing.T) {
 	// tests.
 	t.Setenv("REDIS_STREAM_RETENTION", "")
 	os.Unsetenv("REDIS_STREAM_RETENTION")
-	t.Setenv("REDIS_DLQ_RETENTION", "")
-	os.Unsetenv("REDIS_DLQ_RETENTION")
+	t.Setenv("DLQ_RETENTION", "")
+	os.Unsetenv("DLQ_RETENTION")
 	t.Setenv("REDIS_INVOCATION_RETENTION", "")
 	os.Unsetenv("REDIS_INVOCATION_RETENTION")
 	t.Setenv("STATS_RETENTION", "")
@@ -290,7 +290,7 @@ func TestLoadRetentionDefaults(t *testing.T) {
 func TestLoadRetentionExplicitValues(t *testing.T) {
 	setRequiredEnv(t)
 	t.Setenv("REDIS_STREAM_RETENTION", "24h")
-	t.Setenv("REDIS_DLQ_RETENTION", "168h")
+	t.Setenv("DLQ_RETENTION", "168h")
 	t.Setenv("REDIS_INVOCATION_RETENTION", "12h")
 	cfg := mustLoad(t)
 	if cfg.StreamRetention != 24*time.Hour {
@@ -304,7 +304,7 @@ func TestLoadRetentionExplicitValues(t *testing.T) {
 	}
 
 	t.Setenv("REDIS_STREAM_RETENTION", "90m")
-	t.Setenv("REDIS_DLQ_RETENTION", "90m")
+	t.Setenv("DLQ_RETENTION", "90m")
 	t.Setenv("REDIS_INVOCATION_RETENTION", "90m")
 	cfg = mustLoad(t)
 	if cfg.StreamRetention != 90*time.Minute || cfg.DLQRetention != 90*time.Minute || cfg.InvocationRetention != 90*time.Minute {
@@ -320,7 +320,7 @@ func TestLoadRetentionExplicitDisable(t *testing.T) {
 	for _, value := range []string{"", "0"} {
 		t.Run("stream="+value, func(t *testing.T) {
 			setRequiredEnv(t)
-			unsetRetentionEnv(t, "REDIS_DLQ_RETENTION", "REDIS_INVOCATION_RETENTION")
+			unsetRetentionEnv(t, "DLQ_RETENTION", "REDIS_INVOCATION_RETENTION")
 			t.Setenv("REDIS_STREAM_RETENTION", value)
 			cfg := mustLoad(t)
 			if cfg.StreamRetention != 0 {
@@ -336,7 +336,7 @@ func TestLoadRetentionExplicitDisable(t *testing.T) {
 		t.Run("dlq="+value, func(t *testing.T) {
 			setRequiredEnv(t)
 			unsetRetentionEnv(t, "REDIS_STREAM_RETENTION", "REDIS_INVOCATION_RETENTION")
-			t.Setenv("REDIS_DLQ_RETENTION", value)
+			t.Setenv("DLQ_RETENTION", value)
 			cfg := mustLoad(t)
 			if cfg.DLQRetention != 0 {
 				t.Fatalf("DLQRetention = %v, want 0 (disabled) for %q", cfg.DLQRetention, value)
@@ -350,7 +350,7 @@ func TestLoadRetentionExplicitDisable(t *testing.T) {
 		})
 		t.Run("invocation="+value, func(t *testing.T) {
 			setRequiredEnv(t)
-			unsetRetentionEnv(t, "REDIS_STREAM_RETENTION", "REDIS_DLQ_RETENTION")
+			unsetRetentionEnv(t, "REDIS_STREAM_RETENTION", "DLQ_RETENTION")
 			t.Setenv("REDIS_INVOCATION_RETENTION", value)
 			cfg := mustLoad(t)
 			if cfg.InvocationRetention != 0 {
@@ -381,7 +381,7 @@ func unsetRetentionEnv(t *testing.T, names ...string) {
 // value for any retention variable logs a line naming the variable, disables
 // that retention (0), and never fails Load.
 func TestLoadRetentionMalformedLogsAndDisables(t *testing.T) {
-	for _, variable := range []string{"REDIS_STREAM_RETENTION", "REDIS_DLQ_RETENTION", "REDIS_INVOCATION_RETENTION"} {
+	for _, variable := range []string{"REDIS_STREAM_RETENTION", "DLQ_RETENTION", "REDIS_INVOCATION_RETENTION"} {
 		for _, value := range []string{"bogus", "-5m", "7d"} {
 			t.Run(variable+"="+value, func(t *testing.T) {
 				setRequiredEnv(t)
@@ -395,7 +395,7 @@ func TestLoadRetentionMalformedLogsAndDisables(t *testing.T) {
 				if cfg.StreamRetention != 0 && variable == "REDIS_STREAM_RETENTION" {
 					t.Fatalf("StreamRetention = %v, want 0 (disabled)", cfg.StreamRetention)
 				}
-				if cfg.DLQRetention != 0 && variable == "REDIS_DLQ_RETENTION" {
+				if cfg.DLQRetention != 0 && variable == "DLQ_RETENTION" {
 					t.Fatalf("DLQRetention = %v, want 0 (disabled)", cfg.DLQRetention)
 				}
 				if cfg.InvocationRetention != 0 && variable == "REDIS_INVOCATION_RETENTION" {
@@ -1185,37 +1185,5 @@ func TestLoadDatabaseURL(t *testing.T) {
 	t.Setenv("DATABASE_URL", "")
 	if _, err := LoadDatabaseURL(); err == nil || !strings.Contains(err.Error(), "DATABASE_URL") {
 		t.Fatalf("LoadDatabaseURL with no DATABASE_URL = %v, want an error naming DATABASE_URL", err)
-	}
-}
-
-// TestLoadRedisConfig pins the narrow Redis-only loader the `relay dlq` commands
-// use: it resolves the required REDIS_* variables with the same validation Load
-// applies, but works with NO DATABASE_URL (the DLQ is Redis-only), and still
-// returns a variable-naming error for each missing Redis variable.
-func TestLoadRedisConfig(t *testing.T) {
-	t.Setenv("REDIS_URI", "localhost:6379")
-	t.Setenv("REDIS_STREAM", "events")
-	t.Setenv("REDIS_GROUP", "relay")
-	// The whole point: no state database is configured.
-	t.Setenv("DATABASE_URL", "")
-
-	cfg, err := LoadRedisConfig()
-	if err != nil {
-		t.Fatalf("LoadRedisConfig without DATABASE_URL: %v", err)
-	}
-	if cfg.URI != "localhost:6379" || cfg.Stream != "events" || cfg.Group != "relay" {
-		t.Fatalf("LoadRedisConfig = %+v, want the configured Redis values", cfg)
-	}
-
-	for _, missing := range []string{"REDIS_URI", "REDIS_STREAM", "REDIS_GROUP"} {
-		t.Run("missing "+missing, func(t *testing.T) {
-			t.Setenv("REDIS_URI", "localhost:6379")
-			t.Setenv("REDIS_STREAM", "events")
-			t.Setenv("REDIS_GROUP", "relay")
-			t.Setenv(missing, "")
-			if _, err := LoadRedisConfig(); err == nil || !strings.Contains(err.Error(), missing) {
-				t.Fatalf("LoadRedisConfig with empty %s = %v, want an error naming %s", missing, err, missing)
-			}
-		})
 	}
 }

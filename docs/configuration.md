@@ -41,7 +41,7 @@ provides fencing to prevent stale instances from overwriting statistics (see
 | `GIT_WEBHOOK_ADDR`            | unset         | listen address (`:8081`)                                                           | Empty disables the GitHub webhook. A bind failure is fatal. Starts only when the git source also names a webhook secret.                                                                                                                                                                                                                                                                                        |
 | `NETWORKS`                    | unset         | comma-separated Docker network names                                               | Parsed at startup (trimmed, de-duplicated, declaration order kept). Every name is verified to exist; a missing network fails startup. Applied to execution containers and (as an order-independent set) service containers.                                                                                                                                                                                     |
 | `REDIS_STREAM_RETENTION`      | `24h`         | Go duration (`6h`, `90m`)                                                          | The optional value that **logs and disables** instead of failing. See below.                                                                                                                                                                                                                                                                                                                                    |
-| `REDIS_DLQ_RETENTION`         | `7d` (`168h`) | Go duration (`168h`, `90m`)                                                        | The optional value that **logs and disables** instead of failing. Age-only DLQ trim. See below.                                                                                                                                                                                                                                                                                                                 |
+| `DLQ_RETENTION`               | `7d` (`168h`) | Go duration (`168h`, `90m`)                                                        | The optional value that **logs and disables** instead of failing. Bounded PostgreSQL DLQ retention. See below.                                                                                                                                                                                                                                                                                                  |
 | `REDIS_INVOCATION_RETENTION`  | `48h`         | Go duration (`12h`, `90m`)                                                         | The optional value that **logs and disables** instead of failing. Terminal invocation-state TTL only. See below.                                                                                                                                                                                                                                                                                                |
 | `STATS_RETENTION`             | `7d` (`168h`) | Go duration (`168h`, `90m`)                                                        | The optional value that **logs and disables** instead of failing. Bounds stale stats-owner rows: after a successful flush the worker deletes other workers' `stats`/`app_stats` rows older than this window. An explicitly empty value disables compaction. See below.                                                                                                                                          |
 | `TRAEFIK_NETWORK`             | unset         | Docker network name                                                                | Required only when a service declares `host`; verified on every routed reconcile and joined in addition to `NETWORKS`.                                                                                                                                                                                                                                                                                          |
@@ -52,11 +52,11 @@ provides fencing to prevent stale instances from overwriting statistics (see
 
 `METRICS_ADDR`, `GIT_WEBHOOK_ADDR`, and the `TRAEFIK_*` values are read only by
 the worker. The read-only admin commands resolve only what they need — the state
-DSN via `LoadDatabaseURL` (no `WORKER_ID`, `REDIS_*`, or tuning required) or the
-Redis/DLQ settings via `LoadRedisConfig` — but the process logger is bootstrapped
-from `LOG_LEVEL` before any command runs, so an invalid `LOG_LEVEL` fails every
-command too. `WORKER_ID` and the tuning variables are required only by
-`relay start`.
+DSN via `LoadDatabaseURL` (no `WORKER_ID`, `REDIS_*`, or tuning required), which
+the `relay dlq` commands use too because the durable DLQ lives in PostgreSQL —
+but the process logger is bootstrapped from `LOG_LEVEL` before any command runs,
+so an invalid `LOG_LEVEL` fails every command too. `WORKER_ID` and the tuning
+variables are required only by `relay start`.
 
 `NETWORKS` and `TRAEFIK_NETWORK` name Docker networks Relay attaches containers
 to; Relay **never creates or removes** them (they are infrastructure owned
@@ -354,23 +354,31 @@ with `XTRIM <stream> MINID ~ <cutoff> ACKED`, where `<cutoff>` is
   entries. This disables **only** the main stream trim; DLQ retention below is
   unaffected.
 
-`REDIS_DLQ_RETENTION` (default `7d`, i.e. `168h`) drives the DLQ trim. The
-Relay-owned `relay:<REDIS_STREAM>:dlq` stream has **no consumer group, PEL, or
-XACK flow**, so it is trimmed **age-only**:
+`DLQ_RETENTION` (default `7d`, i.e. `168h`) drives durable DLQ retention. The
+DLQ is a PostgreSQL table, so retention is a bounded `DELETE`, not a broker
+trim:
 
-- A separate goroutine trims **only** that DLQ key with
-  `XTRIM <dlq> MINID ~ <cutoff>` — no `ACKED` (or any) mode token — so it works
-  on every Redis that supports `XTRIM MINID ~` and does not depend on the
-  server's `ACKED` support.
-- The cutoff and derived tick cadence are the same as the main stream
-  (`<now - retention>`, `retention / 24` clamped to `[1m, 1h]`).
+- A separate goroutine deletes **settled** rows older than `<now - retention>` in
+  bounded batches, issuing further bounded DELETEs within the same tick until a
+  short batch, an error, or the tick deadline. So a large backlog drains promptly
+  without one unbounded statement. Unsettled rows are never removed: their source
+  delivery may still be recoverable.
+- The tick cadence matches the source-stream retention
+  (`retention / 24` clamped to `[1m, 1h]`).
 - This is a bounded failure-history window, **not** a per-entry TTL and not a
-  replay guarantee: a DLQ entry older than the window is removed whether or not
-  anyone inspected or replayed it. `relay dlq ls|inspect|replay|rm` still work on
-  what remains.
-- The two trims target disjoint keys: the main trim never touches the DLQ and
-  the DLQ trim never touches the source. Neither changes ACK-before-DLQ
-  ordering.
+  replay guarantee: a settled DLQ row older than the window is removed whether
+  or not anyone inspected or replayed it. `relay dlq ls|inspect|replay|rm` still
+  work on what remains.
+- Retention never touches the source stream and never changes ACK-before-DLQ
+  ordering. A row is settled only after its source ACK is confirmed (or
+  reconciliation proves the delivery is no longer pending), so a recoverable
+  delivery can never lose its dead letter.
+- A fixed one-minute bounded reconciliation independently repairs a crash
+  between a successful Redis ACK and the PostgreSQL settlement update. It asks
+  Redis whether each unsettled source delivery is still in its PEL and preserves
+  the rows on any error. Each pass reads a bounded page strictly after an
+  in-memory delivery-ID cursor and wraps when exhausted, so 100 permanently
+  pending deliveries cannot starve later ACKed rows.
 
 `REDIS_INVOCATION_RETENTION` (default `48h`) is **not a stream trim**: it is the
 TTL applied to a message's per-invocation Redis hash (`relay:invocation:…`) only
@@ -383,21 +391,22 @@ and therefore redeliverable)
 the hash is **persistent with no TTL**, regardless of this value; the window
 starts only once the message is no longer recoverable.
 
-- It bounds terminal bookkeeping (`ok` / `exhausted` / `exhausted:…:dlq`
-  markers, plus the reserved classification/trace/schedule fields and the
-  malformed-message DLQ placeholder field): how long a
-  completed or exhausted invocation stays inspectable after its message left the
-  PEL. It does **not** affect retries or ACK ordering.
+- It bounds terminal bookkeeping (`ok` / `exhausted` markers, plus the reserved
+  classification/trace/schedule fields): how long a completed or exhausted
+  invocation stays inspectable after its message left the PEL. It does **not**
+  affect retries or ACK ordering, and it never gates DLQ durability: every
+  required PostgreSQL row is committed before the ACK that starts this window.
 - The TTL is applied atomically with the reserved terminal marker, and is
   monotonic: a repeated retention (e.g. a redelivery racing the ACK) never
   re-extends it, and a stale in-memory transition can neither mutate the
   terminal state nor remove the TTL.
-- This window is **independent** of `REDIS_DLQ_RETENTION` (which trims DLQ stream
-  entries) and of the scheduler's PostgreSQL outbox, whose 7-day retention is a
-  separate, local mechanism. A dead-lettered entry and the terminal hash for the
-  same message are two different Redis/PostgreSQL objects with their own windows.
+- This window is **independent** of `DLQ_RETENTION` (which deletes durable
+  PostgreSQL DLQ rows) and of the scheduler's PostgreSQL outbox, whose 7-day
+  retention is a separate, local mechanism. A dead-lettered row and the terminal
+  hash for the same message are different PostgreSQL/Redis objects with their
+  own windows.
 
-**Unset vs. explicitly empty.** For all three windows, leaving the variable
+**Unset vs. explicitly empty.** For these retention windows, leaving the variable
 **unset** applies the documented default (`24h` / `168h` / `48h`); setting it to
 an **empty** (or whitespace-only) string (`REDIS_STREAM_RETENTION=`) disables
 that retention (`0`). A malformed value and an explicit `0` or negative value log
@@ -432,11 +441,11 @@ never silently replaced by the `48h` default.
 
 ```bash
 REDIS_STREAM_RETENTION=6h          # trim the source stream (ACKED)
-REDIS_DLQ_RETENTION=168h          # trim the DLQ after 7 days (age-only)
+DLQ_RETENTION=168h                 # prune durable DLQ rows after 7 days
 REDIS_INVOCATION_RETENTION=12h    # expire terminal invocation state after 12h
 STATS_RETENTION=720h              # compact stale stats-owner rows after 30 days
 REDIS_STREAM_RETENTION=          # disable source retention
-REDIS_DLQ_RETENTION=             # disable DLQ retention
+DLQ_RETENTION=                   # disable durable DLQ retention
 REDIS_INVOCATION_RETENTION=       # keep terminal invocation state persistent (no TTL)
 STATS_RETENTION=                  # disable stats-owner compaction
 ```

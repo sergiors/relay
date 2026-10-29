@@ -2,10 +2,11 @@
 
 // This file exercises the raw-event byte cap (MAX_EVENT_BYTES) against a real
 // Redis server: an oversized message is rejected before decode/match/handler and
-// routed to the DLQ with a bounded diagnostic summary (never the payload), the
-// original is acked only after that write, and a failed write leaves the message
-// pending. It is excluded from the default suite by the integration build tag and
-// REQUIRES Redis at REDIS_TEST_ADDR (default localhost:6379).
+// routed to the durable PostgreSQL DLQ with a bounded diagnostic summary (never
+// the payload), the original is acked only after that write, and a failed write
+// leaves the message pending. It is excluded from the default suite by the
+// integration build tag and REQUIRES Redis at REDIS_TEST_ADDR (default
+// localhost:6379) and PostgreSQL at TEST_DATABASE_URL.
 package stream
 
 import (
@@ -17,6 +18,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"relay/internal/dlq"
 	"relay/internal/observability/metrics"
 	"relay/internal/testutil"
 )
@@ -41,7 +43,7 @@ func TestIntegrationOversizedEventRoutesToDLQImmediately(t *testing.T) {
 	})
 
 	testutil.WaitFor(t, 8*time.Second, "oversized message routed to DLQ", func() bool {
-		_, ok := e.dlq()[id]
+		_, ok := e.dlqEntry(id)
 		return ok
 	})
 	testutil.WaitFor(t, 8*time.Second, "oversized message acked", func() bool {
@@ -53,45 +55,42 @@ func TestIntegrationOversizedEventRoutesToDLQImmediately(t *testing.T) {
 	if handlerRan.Load() {
 		t.Fatal("handler should not be invoked for an oversized message")
 	}
-	m, ok := e.dlq()[id]
+	m, ok := e.dlqEntry(id)
 	if !ok {
 		t.Fatalf("expected DLQ entry for oversized message %s", id)
 	}
-	event, _ := m.Values["event"].(string)
 	// The DLQ never stores the oversized payload.
-	if strings.Contains(event, strings.Repeat("a", 32)) {
-		t.Fatalf("DLQ event must not contain the oversized payload: %q", event)
+	if strings.Contains(m.Event, strings.Repeat("a", 32)) {
+		t.Fatalf("DLQ event must not contain the oversized payload: %q", m.Event)
 	}
-	if len(event) > 256 {
-		t.Fatalf("DLQ event summary is not bounded: %d bytes", len(event))
+	if len(m.Event) > 256 {
+		t.Fatalf("DLQ event summary is not bounded: %d bytes", len(m.Event))
 	}
-	if !strings.Contains(event, "event_oversized") || !strings.Contains(event, "event_bytes") {
-		t.Fatalf("DLQ event is not the bounded summary: %q", event)
+	if !strings.Contains(m.Event, "event_oversized") || !strings.Contains(m.Event, "event_bytes") {
+		t.Fatalf("DLQ event is not the bounded summary: %q", m.Event)
 	}
-	reason, _ := m.Values["reason"].(string)
-	if !strings.Contains(reason, "event oversized") {
-		t.Fatalf("DLQ reason = %q, want the stable oversize reason", reason)
+	if !strings.Contains(m.Reason, "event oversized") {
+		t.Fatalf("DLQ reason = %q, want the stable oversize reason", m.Reason)
 	}
 	// No handler invocation to attribute: placeholder app/handler, 0 attempts.
-	if m.Values["app"] != dlqNoHandler || m.Values["handler"] != dlqNoHandler {
-		t.Errorf("oversized DLQ app/handler = %v/%v, want %q placeholder",
-			m.Values["app"], m.Values["handler"], dlqNoHandler)
+	if m.App != dlq.NoHandler || m.Handler != dlq.NoHandler {
+		t.Errorf("oversized DLQ app/handler = %q/%q, want %q placeholder",
+			m.App, m.Handler, dlq.NoHandler)
 	}
-	if m.Values["handler_attempts"] != "0" {
-		t.Errorf("oversized DLQ handler_attempts = %v, want 0", m.Values["handler_attempts"])
+	if m.HandlerAttempts != 0 {
+		t.Errorf("oversized DLQ HandlerAttempts = %d, want 0", m.HandlerAttempts)
 	}
-	if m.Values["deliveries"] != "1" {
-		t.Errorf("oversized DLQ deliveries = %v, want 1", m.Values["deliveries"])
+	if m.Deliveries != 1 {
+		t.Errorf("oversized DLQ Deliveries = %d, want 1", m.Deliveries)
 	}
-
 	// The read model parses the entry and reports it non-replayable, so
 	// `relay dlq replay` refuses it before dialing.
-	entry, err := ParseDLQEntry(m.ID, m.Values)
-	if err != nil {
-		t.Fatalf("ParseDLQEntry: %v", err)
+	if m.Replayable() {
+		t.Fatalf("oversized summary entry must not be replayable: %+v", m)
 	}
-	if entry.Replayable() {
-		t.Fatalf("oversized summary entry must not be replayable: %+v", entry)
+	// The entry became durable before the ACK, so the confirmed ACK settled it.
+	if m.SettledAt == "" {
+		t.Fatalf("oversized entry must be settled after the confirmed ACK")
 	}
 }
 
@@ -108,7 +107,7 @@ func TestIntegrationOversizedCounterIncrementsOnce(t *testing.T) {
 	// Wait for the DLQ entry (which requires the oversize branch to have run)
 	// before asserting the counter, so the assertion cannot race processing.
 	testutil.WaitFor(t, 8*time.Second, "oversized message routed to DLQ", func() bool {
-		_, ok := e.dlq()[id]
+		_, ok := e.dlqEntry(id)
 		return ok
 	})
 	testutil.WaitFor(t, 8*time.Second, "oversized message acked", func() bool {
@@ -122,8 +121,8 @@ func TestIntegrationOversizedCounterIncrementsOnce(t *testing.T) {
 }
 
 // TestIntegrationOversizedDLQWriteFailureLeavesPending pins the required
-// DLQ-before-XACK ordering on the oversize path: when the DLQ XADD fails, the
-// original stays pending; once it succeeds the message is acked.
+// DLQ-before-XACK ordering on the oversize path: when the PostgreSQL DLQ insert
+// fails, the original stays pending; once it succeeds the message is acked.
 func TestIntegrationOversizedDLQWriteFailureLeavesPending(t *testing.T) {
 	testutil.RequireRedis(t)
 	e := newEnv(t, ConsumerConfig{MaxEventBytes: 32})
@@ -145,32 +144,33 @@ func TestIntegrationOversizedDLQWriteFailureLeavesPending(t *testing.T) {
 	}
 	msg := msgs[0].Messages[0]
 
-	// Force the DLQ XADD to fail by making the DLQ stream name a wrong-type key.
-	if r := e.client.Set(context.Background(), e.consumer.dlqStream, "not-a-stream", 0); r.Err() != nil {
-		t.Fatalf("set wrong-type key: %v", r.Err())
-	}
+	// Force the DLQ insert to fail with an injected store wrapper.
+	failing := &failingSaveDLQStore{err: context.DeadlineExceeded}
+	failing.Store = e.dlqStore
+	e.consumer.dlqStore = failing
 	e.consumer.processMessage(context.Background(), msg, 1, func(context.Context, string, map[string]any) error {
 		return nil
 	})
 	if _, ok := e.pending()[id]; !ok {
 		t.Fatalf("oversized message %s must stay pending when the DLQ write fails", id)
 	}
-
-	// Let the DLQ write succeed: delete the wrong-type key and re-process.
-	if err := e.client.Del(context.Background(), e.consumer.dlqStream).Err(); err != nil {
-		t.Fatalf("del wrong-type key: %v", err)
+	if got := len(e.dlqFor(id)); got != 0 {
+		t.Fatalf("DLQ rows after failed save = %d, want 0", got)
 	}
+
+	// Let the DLQ write succeed and re-process.
+	failing.ok.Store(true)
 	e.consumer.processMessage(context.Background(), msg, 1, func(context.Context, string, map[string]any) error {
 		return nil
 	})
 	if _, ok := e.pending()[id]; ok {
 		t.Fatalf("oversized message %s should be acked after a successful DLQ write", id)
 	}
-	m, ok := e.dlq()[id]
+	m, ok := e.dlqEntry(id)
 	if !ok {
 		t.Fatalf("expected DLQ entry after the successful write")
 	}
-	if event, _ := m.Values["event"].(string); !strings.Contains(event, "event_oversized") {
-		t.Fatalf("DLQ event = %q, want the bounded oversize summary", event)
+	if !strings.Contains(m.Event, "event_oversized") {
+		t.Fatalf("DLQ event = %q, want the bounded oversize summary", m.Event)
 	}
 }

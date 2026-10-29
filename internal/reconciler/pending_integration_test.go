@@ -32,6 +32,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"relay/internal/dlq"
 	"relay/internal/runner"
 	"relay/internal/stream"
 	"relay/internal/testutil"
@@ -41,15 +42,15 @@ import (
 // discovery/build loss-window test. It mirrors the runner package's eventEnv but
 // lives here so the reconciler can drive its own reconcileApp.
 type discoveryLossEnv struct {
-	t      *testing.T
-	cli    *redis.Client
-	stream string
-	group  string
-	dlq    string
-	ctx    context.Context
-	cancel func()
-	c      *stream.Consumer
-	done   chan struct{}
+	t        *testing.T
+	cli      *redis.Client
+	stream   string
+	group    string
+	dlqStore dlq.Store
+	ctx      context.Context
+	cancel   func()
+	c        *stream.Consumer
+	done     chan struct{}
 }
 
 // newDiscoveryLossEnv creates a unixnano-unique stream/group on the required
@@ -63,6 +64,9 @@ func newDiscoveryLossEnv(t *testing.T) *discoveryLossEnv {
 	prefix := fmt.Sprintf("rec-loss-%d", time.Now().UnixNano())
 	streamName := prefix + "-stream"
 	groupName := prefix + "-group"
+	// The durable DLQ store: fresh per-test PostgreSQL schema, exactly the
+	// production wiring (the stream consumer commits DLQ rows there).
+	pg := testutil.NewState(t)
 	c := stream.NewConsumer(stream.ConsumerConfig{
 		Client:          cli,
 		Stream:          streamName,
@@ -72,20 +76,21 @@ func newDiscoveryLossEnv(t *testing.T) *discoveryLossEnv {
 		MinPendingIdle:  250 * time.Millisecond,
 		ReclaimInterval: 150 * time.Millisecond,
 		Block:           150 * time.Millisecond,
+		DLQStore:        pg,
 	})
 	if err := c.EnsureGroup(cctx); err != nil {
 		cancel()
 		t.Fatalf("ensure group: %v", err)
 	}
 	e := &discoveryLossEnv{
-		t:      t,
-		cli:    cli,
-		stream: streamName,
-		group:  groupName,
-		dlq:    stream.DLQStreamFor(streamName),
-		ctx:    cctx,
-		cancel: cancel,
-		c:      c,
+		t:        t,
+		cli:      cli,
+		stream:   streamName,
+		group:    groupName,
+		dlqStore: pg,
+		ctx:      cctx,
+		cancel:   cancel,
+		c:        c,
 	}
 	t.Cleanup(e.cleanup)
 	return e
@@ -110,7 +115,7 @@ func (e *discoveryLossEnv) cleanup() {
 		}
 	}
 	ctx := context.Background()
-	_ = e.cli.Del(ctx, e.stream, e.dlq).Err()
+	_ = e.cli.Del(ctx, e.stream).Err()
 	// Best-effort removal of this env's invocation-state keys. The stream/group
 	// names contain no ':' or '%', so a direct prefix scan is safe and bounded to
 	// this env.
@@ -163,14 +168,16 @@ func (e *discoveryLossEnv) pendingRetry(id string) (int64, bool) {
 	return 0, false
 }
 
-// hasDLQFor reports whether any DLQ entry carries the given original_id.
+// hasDLQFor reports whether any durable DLQ entry carries the given source
+// message ID. A store read error fails the test: the assertions below are
+// meaningless without their rows.
 func (e *discoveryLossEnv) hasDLQFor(id string) bool {
-	msgs, err := e.cli.XRange(context.Background(), e.dlq, "-", "+").Result()
+	entries, err := e.dlqStore.ListDLQEntries(context.Background())
 	if err != nil {
-		return false
+		e.t.Fatalf("list DLQ entries: %v", err)
 	}
-	for _, m := range msgs {
-		if orig, _ := m.Values["original_id"].(string); orig == id {
+	for _, entry := range entries {
+		if entry.SourceMessageID == id {
 			return true
 		}
 	}

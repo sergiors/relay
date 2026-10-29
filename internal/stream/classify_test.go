@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"relay/internal/dlq"
 )
 
 func TestClassifyMessage(t *testing.T) {
@@ -50,54 +52,87 @@ func TestClassifyMessage(t *testing.T) {
 	}
 }
 
-func TestDLQPayload(t *testing.T) {
-	// deliveries (Redis/PEL) and handler_attempts (invocation retry state) are
-	// distinct, explicit fields. handler_attempts may exceed or trail deliveries
-	// depending on reclaim/redelivery, so the payload must never alias them. The
-	// exact app/handler identify the exhausted invocation this entry
-	// attributes.
-	p := dlqPayload("events", "1-0", "relay", "worker-1", `{"a":1}`, "boom", "fn", "index.run", 7, 3, "")
-	if p["original_stream"] != "events" || p["original_id"] != "1-0" ||
-		p["group"] != "relay" || p["consumer"] != "worker-1" ||
-		p["event"] != `{"a":1}` || p["reason"] != "boom" ||
-		p["app"] != "fn" || p["handler"] != "index.run" ||
-		p["deliveries"] != int64(7) || p["handler_attempts"] != 3 {
-		t.Fatalf("unexpected payload: %v", p)
+// TestDLQEntryPinsOneEntryPerInvocation verifies the write model one exhausted
+// invocation is persisted with: the identity is the stable (delivery,
+// invocation) pair, the two distinct counts are carried separately
+// (deliveries = source redelivery count, handler_attempts = the exhausting
+// execution attempt), the event payload is carried verbatim, and the optional
+// trace lineage is stamped verbatim when recorded.
+func TestDLQEntryPinsOneEntryPerInvocation(t *testing.T) {
+	deliveryID := dlq.NewDeliveryID("events", "relay", "1760000000000-0")
+	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01|vendor=x"
+	at := time.Date(2026, 10, 26, 8, 30, 0, 0, time.UTC)
+	entry := dlqEntry(deliveryID, "events", "1760000000000-0", "relay", "worker-1",
+		`{"a":1}`, dlqEntrySpec{
+			app:        "fn",
+			handler:    "index.run",
+			attempts:   3,
+			reason:     "invocation exhausted: boom",
+			invocation: "fn/index.run",
+			trace:      lineage,
+		}, 7, at)
+
+	if entry.ID != dlq.NewIDForDelivery(deliveryID, "fn/index.run") {
+		t.Fatalf("entry ID = %q, want the (delivery, invocation) identity", entry.ID)
 	}
-	// The timestamp is generated inside dlqPayload, so parse it and compare the
-	// instant within a small tolerance rather than re-deriving it (a second
-	// boundary between the two time.Now calls would fail spuriously).
-	ts, ok := p["timestamp"].(string)
-	if !ok {
-		t.Fatalf("timestamp field is not a string: %v", p["timestamp"])
+	if entry.DeliveryID != deliveryID {
+		t.Fatalf("DeliveryID = %q, want %q", entry.DeliveryID, deliveryID)
 	}
-	parsed, err := time.Parse(time.RFC3339, ts)
-	if err != nil {
-		t.Fatalf("timestamp %q is not RFC3339: %v", ts, err)
+	if entry.Source != "events" || entry.SourceGroup != "relay" || entry.SourceMessageID != "1760000000000-0" {
+		t.Fatalf("source identity = %q/%q/%q", entry.Source, entry.SourceGroup, entry.SourceMessageID)
 	}
-	if delta := time.Since(parsed); delta < -5*time.Second || delta > 5*time.Second {
-		t.Fatalf("timestamp %q is not near now (delta %s)", ts, delta)
+	if entry.Consumer != "worker-1" {
+		t.Fatalf("Consumer = %q", entry.Consumer)
+	}
+	if entry.Event != `{"a":1}` {
+		t.Fatalf("Event = %q, want the payload verbatim", entry.Event)
+	}
+	if entry.Reason != "invocation exhausted: boom" || entry.App != "fn" || entry.Handler != "index.run" {
+		t.Fatalf("reason/attribution = %q/%q/%q", entry.Reason, entry.App, entry.Handler)
+	}
+	// Two distinct counts: the PEL redelivery count and the exhausting handler
+	// attempt are never aliased.
+	if entry.Deliveries != 7 || entry.HandlerAttempts != 3 {
+		t.Fatalf("deliveries/handler_attempts = %d/%d", entry.Deliveries, entry.HandlerAttempts)
+	}
+	if entry.Trace != lineage {
+		t.Fatalf("Trace = %q, want %q", entry.Trace, lineage)
+	}
+	if entry.Timestamp != at.UTC().Format(time.RFC3339) {
+		t.Fatalf("Timestamp = %q, want %q", entry.Timestamp, at.UTC().Format(time.RFC3339))
+	}
+	if entry.SettledAt != "" {
+		t.Fatalf("a freshly built entry must be unsettled, SettledAt = %q", entry.SettledAt)
 	}
 }
 
-// TestDLQPayloadTraceOptional pins that the compact lineage is OMITTED entirely
-// when empty (so every pre-tracing entry's field shape is unchanged) and present
-// verbatim when supplied.
-func TestDLQPayloadTraceOptional(t *testing.T) {
-	without := dlqPayload("events", "1-0", "relay", "w1", `{"a":1}`, "boom", "fn", "index.run", 7, 3, "")
-	if _, ok := without["trace"]; ok {
-		t.Fatalf("empty lineage must omit the trace field: %v", without)
+// TestDLQEntryPlaceholderIsDistinctAndNonReplayable verifies the malformed/
+// oversized path builds exactly one placeholder entry: an explicit zero handler
+// attempt count (never a fabricated delivery count), the NoHandler app/handler,
+// and an identity distinct from any real invocation of the same delivery.
+func TestDLQEntryPlaceholderIsDistinctAndNonReplayable(t *testing.T) {
+	deliveryID := dlq.NewDeliveryID("events", "relay", "1-0")
+	specs := dlqEntrySpecs(errors.New("decode event: missing 'event' field"))
+	if len(specs) != 1 {
+		t.Fatalf("placeholder specs = %d, want 1", len(specs))
 	}
+	entry := dlqEntry(deliveryID, "events", "1-0", "relay", "worker-1",
+		"-", specs[0], 1, time.Date(2026, 10, 26, 8, 30, 0, 0, time.UTC))
 
-	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-	with := dlqPayload("events", "1-0", "relay", "w1", `{"a":1}`, "boom", "fn", "index.run", 7, 3, lineage)
-	if got, ok := with["trace"].(string); !ok || got != lineage {
-		t.Fatalf("trace = %v, want %q", with["trace"], lineage)
+	if entry.App != dlq.NoHandler || entry.Handler != dlq.NoHandler {
+		t.Fatalf("placeholder app/handler = %q/%q, want %q", entry.App, entry.Handler, dlq.NoHandler)
 	}
-	// Baggage must never be a field of the trace lineage (the field holds the
-	// compact traceparent[|tracestate] form only).
-	if strings.Contains(lineage, "baggage") {
-		t.Fatal("test fixture is wrong")
+	if entry.HandlerAttempts != 0 {
+		t.Fatalf("HandlerAttempts = %d, want an explicit 0 (never the delivery count)", entry.HandlerAttempts)
+	}
+	if entry.ID != dlq.NewIDForDelivery(deliveryID, "") {
+		t.Fatalf("placeholder ID = %q, want the empty-invocation identity", entry.ID)
+	}
+	if entry.ID == dlq.NewIDForDelivery(deliveryID, "fn/h") {
+		t.Fatal("the placeholder must not alias a real invocation's entry")
+	}
+	if entry.Replayable() {
+		t.Fatal("the placeholder must not be replayable")
 	}
 }
 
@@ -184,7 +219,7 @@ func TestDLQEntrySpecs(t *testing.T) {
 		if len(specs) != 1 {
 			t.Fatalf("specs = %d, want 1 placeholder", len(specs))
 		}
-		if specs[0].app != dlqNoHandler || specs[0].handler != dlqNoHandler ||
+		if specs[0].app != dlq.NoHandler || specs[0].handler != dlq.NoHandler ||
 			specs[0].attempts != 0 || specs[0].invocation != "" ||
 			specs[0].reason != "decode event: boom" {
 			t.Fatalf("placeholder spec = %+v", specs[0])
@@ -271,56 +306,6 @@ func TestHandlerExhaustedErrorReasonConsistent(t *testing.T) {
 				t.Fatalf("errors.Is(err, ErrInvocationExhausted) = false, want true")
 			}
 		})
-	}
-}
-
-// TestUnpersistedDLQSpecsIdempotentRetry pins the no-DLQ-scan idempotency: a
-// spec whose invocation marker already records a persisted DLQ entry is skipped,
-// a spec with no marker (or a read error) is kept, and the malformed placeholder
-// is always kept. This is what makes a retry after a partial multi-entry write
-// complete only the missing entries.
-func TestUnpersistedDLQSpecsIdempotentRetry(t *testing.T) {
-	store := newFakeInvocationStore(map[string]string{
-		"fnA/index.run": exhaustedValue(InvocationClaim{Attempt: 2, Token: "aa"}, true),  // already persisted → skip
-		"fnC/index.run": exhaustedValue(InvocationClaim{Attempt: 2, Token: "cc"}, false), // not persisted → keep
-	})
-	c := newConsumer(ConsumerConfig{
-		Stream: "s", Group: "g", Consumer: "c",
-		Log: slog.New(slog.DiscardHandler),
-	}, store)
-
-	specs := []dlqEntrySpec{
-		{app: "fnA", handler: "index.run", attempts: 2, invocation: "fnA/index.run"},
-		{app: "fnB", handler: "index.run", attempts: 5, invocation: "fnB/index.run"}, // absent → keep
-		{app: "fnC", handler: "index.run", attempts: 2, invocation: "fnC/index.run"},
-	}
-	got := c.unpersistedDLQSpecs(context.Background(), "m-0", specs)
-	if len(got) != 2 {
-		t.Fatalf("unpersisted specs = %+v, want fnB and fnC only", got)
-	}
-	if got[0].invocation != "fnB/index.run" || got[1].invocation != "fnC/index.run" {
-		t.Fatalf("unpersisted specs = %+v, want [fnB, fnC]", got)
-	}
-
-	// Once fnC is marked persisted too, only the absent fnB remains.
-	store.fields["fnC/index.run"] = exhaustedValue(InvocationClaim{Attempt: 2, Token: "cc"}, true)
-	got = c.unpersistedDLQSpecs(context.Background(), "m-0", specs)
-	if len(got) != 1 || got[0].invocation != "fnB/index.run" {
-		t.Fatalf("after marking fnC persisted, specs = %+v, want [fnB]", got)
-	}
-
-	// A read error fails safe: every spec is kept so no entry is lost.
-	store.readErr = errors.New("redis down")
-	got = c.unpersistedDLQSpecs(context.Background(), "m-0", specs)
-	if len(got) != len(specs) {
-		t.Fatalf("on read error specs = %d, want all %d kept (fail safe)", len(got), len(specs))
-	}
-
-	// A spec with no invocation (malformed placeholder) is always kept.
-	store.readErr = nil
-	ph := []dlqEntrySpec{{app: dlqNoHandler, handler: dlqNoHandler, reason: "boom"}}
-	if got := c.unpersistedDLQSpecs(context.Background(), "m-0", ph); len(got) != 1 {
-		t.Fatalf("placeholder specs = %+v, want the placeholder kept", got)
 	}
 }
 

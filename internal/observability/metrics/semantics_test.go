@@ -34,7 +34,7 @@ func TestSemanticsHelpExposedExactly(t *testing.T) {
 //
 //   - relay_retries_total is stream MESSAGE reclaims, not handler retries.
 //   - relay_function_retries_total is handler retries.
-//   - relay_dlq_entries_total is successful Redis DLQ entry writes.
+//   - relay_dlq_entries_total is successful PostgreSQL DLQ row inserts.
 //   - relay_function_dlq_total is the exhaustion commit, not a successful write.
 //
 // The wording (not just non-emptiness) is asserted because these distinctions
@@ -54,7 +54,7 @@ func TestSemanticsHelpDistinguishesRetriesAndDLQ(t *testing.T) {
 		},
 		{
 			name:     MetricDLQEntries,
-			mustHave: []string{"Successful dead-letter writes", "XADD", "function_dlq_total"},
+			mustHave: []string{"Successful dead-letter writes", "PostgreSQL DLQ", "function_dlq_total"},
 		},
 		{
 			name:     MetricFunctionDLQ,

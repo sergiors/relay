@@ -67,12 +67,13 @@
 //   - Gauges: relay_pending_entries and relay_pending_oldest_age_seconds
 //     (Redis backlog depth and age sampled by the stream consumer),
 //     relay_stream_group_lag_entries (the configured consumer group's lag, from
-//     XINFO GROUPS) and relay_dlq_depth (the Relay-owned DLQ stream length for
-//     the configured stream, from XLEN) sampled by the same stream-metrics
-//     source; both are scoped to the configured stream/group and its DLQ, which
-//     every process/worker configured with that stream and group shares, and
-//     each Registry is process-local, so observations of the same shared
-//     stream/group/DLQ must not be summed across workers as if disjoint,
+//     XINFO GROUPS) sampled by the stream-metrics source, and relay_dlq_depth
+//     (an APPROXIMATE durable PostgreSQL DLQ row count from pg_class.reltuples,
+//     not an exact COUNT) sampled by the worker's PostgreSQL gauge source. The
+//     estimate may lag writes/deletes and can read 0 before analysis. The DLQ
+//     table is shared by every worker configured with the
+//     same database, and each Registry is process-local, so observations of the
+//     same shared state must not be summed across workers as if disjoint,
 //     relay_buffered_events (the consumer's local in-flight buffer occupancy),
 //     relay_in_flight_invocations (the runner's current executing
 //     invocation count), relay_schedule_outbox_depth and
@@ -113,12 +114,13 @@
 // Retries vs DLQ: relay_retries_total counts stream MESSAGE reclaims
 // (redeliveries), while relay_function_retries_total counts failed handler
 // executions that will be retried ("Handler retries"). relay_dlq_entries_total
-// counts successful DLQ entry WRITES to Redis (one per exhausted invocation,
-// plus a placeholder per malformed message), while relay_function_dlq_total
-// counts invocations that exhausted their retry budget (the exhaustion commit,
-// which may precede the write). The two per-family counters answer different
-// questions and are deliberately not interchangeable. The function_* family
-// counts handler EXECUTION attributed to an app; app lifecycle families
+// counts successful DLQ row INSERTS into PostgreSQL (one per exhausted
+// invocation, plus a placeholder per malformed message), while
+// relay_function_dlq_total counts invocations that exhausted their retry budget
+// (the exhaustion commit, which may precede the write). The two per-family
+// counters answer different questions and are deliberately not interchangeable.
+// The function_* family counts handler EXECUTION attributed to an app; app
+// lifecycle families
 // (relay_app_events_matched_total, relay_app_status) keep the app_ namespace.
 //
 // Cardinality is bounded: labels are limited to app/handler/outcome plus

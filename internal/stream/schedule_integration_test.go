@@ -218,7 +218,7 @@ func TestIntegrationScheduleExhaustionRoutesToDLQ(t *testing.T) {
 	})
 	// The invocation is exhausted, so the message routes to the DLQ (and is acked).
 	testutil.WaitFor(t, 8*time.Second, "schedule message routed to DLQ", func() bool {
-		_, ok := e.dlq()[id]
+		_, ok := e.dlqEntry(id)
 		return ok
 	})
 	testutil.WaitFor(t, 8*time.Second, "schedule message acked (gone from PEL)", func() bool {
@@ -227,13 +227,13 @@ func TestIntegrationScheduleExhaustionRoutesToDLQ(t *testing.T) {
 	})
 	e.stop(t)
 
-	m, ok := e.dlq()[id]
+	m, ok := e.dlqEntry(id)
 	if !ok {
 		t.Fatalf("expected DLQ entry for %s", id)
 	}
 	// The DLQ entry must carry the schedule envelope in its `event` field.
-	if !strings.Contains(fmt.Sprintf("%v", m.Values["event"]), "relay.schedule") {
-		t.Fatalf("DLQ event missing the schedule envelope: %v", m.Values["event"])
+	if !strings.Contains(m.Event, "relay.schedule") {
+		t.Fatalf("DLQ event missing the schedule envelope: %q", m.Event)
 	}
 }
 
@@ -295,7 +295,7 @@ func TestIntegrationScheduleObsoleteIsAckedNotDLQed(t *testing.T) {
 		if _, ok := env.pending()[id]; ok {
 			return false
 		}
-		_, dlqed := env.dlq()[id]
+		_, dlqed := env.dlqEntry(id)
 		return !dlqed
 	})
 	env.stop(t)
@@ -320,7 +320,7 @@ func TestIntegrationInvalidScheduleEnvelopeDLQedNotMatched(t *testing.T) {
 
 	// The invalid claim is routed to the DLQ...
 	testutil.WaitFor(t, 8*time.Second, "invalid schedule claim DLQ'd", func() bool {
-		_, ok := env.dlq()[id]
+		_, ok := env.dlqEntry(id)
 		return ok
 	})
 	// ...and ACKed (gone from the PEL).

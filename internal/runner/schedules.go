@@ -41,9 +41,9 @@ func obsoleteOccurrence(fnName, scheduleName string) error {
 //     ACKed and never DLQ'd.
 //   - an exhausted marker (pinned descriptor OR legacy no-descriptor): the
 //     admitted invocation(s) already exhausted and still owe a per-invocation DLQ
-//     entry, so a typed HandlerExhaustedError is returned — the stream persists
-//     the missing entries (idempotently; an already-":dlq" marker is skipped) and
-//     then ACKs.
+//     entry, so a typed HandlerExhaustedError is returned — the stream validates
+//     each marker and persists the missing PostgreSQL rows idempotently, then
+//     ACKs.
 //   - a pinned descriptor with no terminal marker, terminal-retained, or a "ok"
 //     marker: a pinned no-marker admission stays PENDING; a completed invocation
 //     (or a message already off the PEL) returns nil so the stream ACKs and
@@ -80,8 +80,8 @@ func (r *Runner) rejectAppAbsent(invState stream.InvocationState, fnName, schedu
 		// invocation exhausted before its DLQ write, or a legacy no-descriptor
 		// exhausted marker): the admitted invocation(s) already exhausted and still
 		// owe a per-invocation DLQ entry. Return the typed exhaustion error so the
-		// stream persists the missing entries (idempotently — an already-":dlq"
-		// marker is skipped) and then ACKs. This is never a rejection and never
+		// stream validates each marker, persists the missing PostgreSQL rows
+		// idempotently, and then ACKs. This is never a rejection and never
 		// leaves the disposition stuck.
 		r.log.Warn("Schedule: app absent here; exhausted invocation owed a DLQ entry; routing to DLQ",
 			"app", fnName,

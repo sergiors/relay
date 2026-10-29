@@ -105,7 +105,7 @@ func TestIntegrationBufferedEventsTracksLocalOccupancy(t *testing.T) {
 		waitBufferedEvents(t, m, 1)
 		close(release)
 		testutil.WaitFor(t, 8*time.Second, "DLQ entry", func() bool {
-			_, ok := e.dlq()[id]
+			_, ok := e.dlqEntry(id)
 			return ok
 		})
 		e.waitGone(t, id)

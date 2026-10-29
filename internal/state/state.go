@@ -640,8 +640,9 @@ func (st *State) acquireWorkerLock(ctx context.Context) (*sql.Conn, error) {
 // atomically. stats is the per-worker global counter snapshot (keyed by worker
 // identity so shared-database workers never overwrite each other, with an
 // instance fencing column), app_stats the per-app counterpart (keyed by app name
-// + worker), stats_meta the single-row global reset generation, and
-// schedule_pending the durable schedule-publication outbox.
+// + worker), stats_meta the single-row global reset generation,
+// schedule_pending the durable schedule-publication outbox, and dlq the durable
+// dead-letter store.
 func (st *State) initSchema(ctx context.Context) error {
 	tx, err := st.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -749,6 +750,28 @@ func (st *State) initSchema(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS schedule_pending_due
 			ON schedule_pending (next_attempt_ms, lease_until_ms)`,
+		// dlq is the durable dead-letter store. id is the stable entry identity
+		// (source delivery + invocation); data is the private JSON payload (event
+		// and reason bytes are base64-encoded by encoding/json so arbitrary
+		// malformed bytes, including NUL, survive JSONB). delivery_id groups every
+		// entry from one logical source delivery so the stream can mark the whole
+		// delivery settled only after a confirmed source ACK. settled_at_ms is
+		// NULL until then; unsettled rows are never removed by admin or retention.
+		// created_at_ms is the write time.
+		`CREATE TABLE IF NOT EXISTS dlq (
+			id TEXT PRIMARY KEY,
+			data JSONB NOT NULL,
+			delivery_id TEXT NOT NULL,
+			settled_at_ms BIGINT,
+			created_at_ms BIGINT NOT NULL
+		)`,
+		// One index serves operator listing order and bounded retention cleanup.
+		`CREATE INDEX IF NOT EXISTS dlq_created_at
+			ON dlq (created_at_ms, id)`,
+		// Bounded ACK/settlement reconciliation and post-ACK delivery marking
+		// look up unsettled rows by delivery_id only.
+		`CREATE INDEX IF NOT EXISTS dlq_unsettled
+			ON dlq (delivery_id, created_at_ms) WHERE settled_at_ms IS NULL`,
 	}
 
 	for _, s := range stmts {

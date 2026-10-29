@@ -271,8 +271,8 @@ relay_events_matched_total + relay_events_unmatched_total`, classified exactly
   `relay_handler_invocations_total{outcome,app,handler}`,
   `relay_handler_duration_seconds{app,handler}`.
   `relay_retries_total` counts stream **message reclaims** (redeliveries), not
-  handler retries. `relay_dlq_entries_total` counts successful **DLQ entry
-  writes** (one per exhausted invocation, plus a placeholder per malformed
+  handler retries. `relay_dlq_entries_total` counts successful **DLQ row
+  inserts** (one per exhausted invocation, plus a placeholder per malformed
   message).
 - **Per-app:** `relay_app_events_matched_total{app}`,
   `relay_function_handler_*_total{app}`, `relay_function_retries_total`
@@ -465,13 +465,13 @@ at startup.
   existing stream replays its backlog.
 - Per-invocation state is a Redis hash keyed by message and
   `<app>/<handler>` with forms `ok`, `running:<deadline>`, `
-next_attempt_at:<deadline>`, `exhausted`, and `exhausted:…:dlq`. Every
+next_attempt_at:<deadline>`, and `exhausted:<attempt>:<token>`. Every
   transition is one atomic Lua script; active-claim transitions CAS both attempt
   and claim token, so a stale claim can never overwrite a newer claim or a
-  terminal marker. The DLQ append and its persistence marker are one atomic
-  script as well, so an entry can never be written without its marker (or vice
-  versa); a malformed-message placeholder records a reserved message-scoped field
-  instead of a handler identity. While the message is pending the hash is
+  terminal marker. Dead-letter rows are written idempotently to PostgreSQL before
+  the source ACK; the terminal invocation-state retention TTL is applied only
+  after that ACK succeeds, so an entry can never be lost by an early expiry.
+  While the message is pending the hash is
   **persistent**;
   only after it leaves the PEL (successful XACK or a purged
   missing-payload reference) does it switch to terminal retention with the
@@ -495,10 +495,12 @@ deadline_ms` is protected).
 
 ## DLQ controls
 
-The DLQ stream is `relay:<REDIS_STREAM>:dlq`. `relay dlq ls` lists entries;
-`inspect` shows one entry's metadata and original event; `rm` deletes one;
-`replay` re-executes one entry's exact app/handler once on the running
-worker and deletes it only on success (kept on failure). See [cli.md](cli.md).
+The DLQ is a durable PostgreSQL table. `relay dlq ls` lists entries;
+`inspect` shows one entry's metadata and original event; `rm` deletes one
+**settled** entry; `replay` re-executes one entry's exact app/handler once on the
+running worker and deletes it only on success (kept on failure). See
+[cli.md](cli.md). An unsettled entry is still needed by source-delivery recovery:
+`rm` returns an explicit error for it, and retention never deletes it.
 
 Malformed-message and oversized-event entries are non-replayable placeholders (no
 app/handler to re-execute). An oversized entry's `event` is a bounded diagnostic

@@ -13,6 +13,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"relay/internal/dlq"
 	"relay/internal/observability/metrics"
 	"relay/internal/schedule"
 )
@@ -112,6 +113,13 @@ type ConsumerConfig struct {
 	// empty/0/negative value without NewConsumer defaulting it back to 48h. The
 	// worker always sets it from config; direct callers may leave it nil.
 	InvocationRetention *time.Duration
+	// DLQStore is the durable dead-letter store. It is REQUIRED for exhaustion
+	// or malformed-message routing: the stream writes every required entry before
+	// acknowledging the source, so a nil store leaves the source pending rather
+	// than ACKing a delivery whose dead letters were never persisted. The worker
+	// wires the PostgreSQL state handle; direct callers and tests may supply a
+	// fake. The store is broker-neutral and never touches invocation state.
+	DLQStore dlq.Store
 	// ScheduleRunner, when set, executes messages identified as schedule
 	// occurrences directly against the named app/schedule/handler,
 	// bypassing event matching. msgID is the message's real Redis stream ID, so
@@ -145,7 +153,7 @@ type Consumer struct {
 	count           int64
 	reclaimInterval time.Duration
 	minPendingIdle  time.Duration
-	dlqStream       string
+	dlqStore        dlq.Store
 	log             *slog.Logger
 	metrics         *metrics.Registry
 	metricsInterval time.Duration
@@ -242,7 +250,7 @@ func newConsumer(cfg ConsumerConfig, store invocationStateStore) *Consumer {
 		count:           cfg.Count,
 		reclaimInterval: cfg.ReclaimInterval,
 		minPendingIdle:  cfg.MinPendingIdle,
-		dlqStream:       DLQStreamFor(cfg.Stream),
+		dlqStore:        cfg.DLQStore,
 		log:             cfg.Log,
 		metrics:         cfg.Metrics,
 		metricsInterval: cfg.MetricsInterval,
@@ -262,11 +270,6 @@ func newConsumer(cfg ConsumerConfig, store invocationStateStore) *Consumer {
 	c.healthy.Store(true)
 	c.metrics.SetGauge(metrics.MetricBufferedEvents, 0)
 	return c
-}
-
-// DLQStreamFor returns the Relay-owned DLQ stream derived from source.
-func DLQStreamFor(stream string) string {
-	return "relay:" + stream + ":dlq"
 }
 
 // groupCreator is the narrow Redis view the consumer-group bootstrap needs:

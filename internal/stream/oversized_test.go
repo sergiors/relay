@@ -131,9 +131,9 @@ func TestOversizedEventSummaryBounded(t *testing.T) {
 // TestProcessMessageOversizedRejectsBeforeHandler pins the processing-path
 // contract: an oversized raw event routes non-retryably to the DLQ without
 // invoking the handler, and increments the unlabeled oversize counter exactly
-// once per rejected delivery. The client cannot dial, so routeToDLQ's XADD
-// fails and the message is simply left pending; the disposition and counter are
-// still observed.
+// once per rejected delivery. No DLQ store is configured here, so the required
+// row cannot be persisted and the message is left pending; the disposition and
+// counter are still observed.
 func TestProcessMessageOversizedRejectsBeforeHandler(t *testing.T) {
 	m := metrics.New()
 	store := newFakeInvocationStore(nil)

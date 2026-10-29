@@ -331,36 +331,53 @@ exhausted invocation**, so an external event matching several apps or handlers
 that all exhaust produces one correctly-attributed entry each. Scheduled
 occurrence functions use this shared invocation/DLQ infrastructure.
 
-- The DLQ stream is `relay:<REDIS_STREAM>:dlq` (a Relay-owned `relay:` key). It
-  has no consumer group, PEL, or XACK flow: entries are written once and read
-  only by the admin `relay dlq` commands.
-- Each entry's append and its persistence marker are written by **one atomic
-  script** (atomic append + marker), so the two are never split: there is no
-  app-visible gap in which an entry is written but unmarked, or marked but
-  missing. Entries are written **before** the XACK. If the atomic persistence
-  fails, nothing was written, the original stays pending, and the invocation is
-  re-reported on redelivery, so the message is re-routed rather than
+- The DLQ is a **PostgreSQL table** (`dlq`), Relay's sole durable dead-letter
+  persistence, admin read model, and retention store. It has no broker stream,
+  consumer group, PEL, or XACK flow: rows are inserted before the source ACK and
+  read only by the admin `relay dlq` commands.
+- Each row is inserted **idempotently by a stable ID** derived from the logical
+  source delivery identity (source stream, group, message ID) plus the
+  invocation identity, so a crash, an ambiguous transaction, or a failed source
+  ACK can neither duplicate nor lose a row. A real invocation's retained
+  exhausted marker is validated against the runner's attribution before the
+  insert, so a stale claim can never create an entry. Rows are written **before**
+  the XACK. If persistence fails, the original stays pending and the invocation
+  is re-reported on redelivery, so the message is re-routed rather than
   acknowledged without an entry. See
   [DLQ persistence contract](#dlq-persistence-contract).
-- The DLQ is trimmed **age-only** by `REDIS_DLQ_RETENTION` (default 7 days, an
-  `XTRIM <dlq> MINID ~` with no `ACKED` mode and no group/XACK dependency). This
-  is separate from the source stream's `REDIS_STREAM_RETENTION` ACKED trim and
-  from `REDIS_INVOCATION_RETENTION` (the terminal invocation-state TTL); all
-  three are independent windows. See
+- Rows start **unsettled** and become settled only after the source ACK is
+  confirmed. A bounded worker reconciliation repairs a crash between a successful
+  Redis ACK and the PostgreSQL settlement marker by asking the exact source
+  stream/group whether the delivery is still in its PEL; it pages past a
+  delivery-ID cursor and wraps, so permanently pending rows cannot starve later
+  deliveries, marks settled only when the delivery is no longer pending, and
+  preserves rows on any Redis error. Admin removal of an unsettled entry is
+  refused, and retention deletes only settled rows, so a delivery that may still
+  be recoverable can never lose its dead letter.
+- The DLQ is pruned **age-only** by `DLQ_RETENTION` (default 7 days, a bounded
+  PostgreSQL `DELETE` of **settled** rows only). This is separate from the source
+  stream's `REDIS_STREAM_RETENTION` ACKED trim and from
+  `REDIS_INVOCATION_RETENTION` (the terminal invocation-state TTL); all three are
+  independent windows. See
   [configuration.md](configuration.md#stream-and-dlq-retention).
-- Idempotency without scanning: once an invocation's entry is persisted its
-  marker becomes `exhausted:<attempt>:<token>:dlq` in the same atomic step, so a
-  redelivery skips the entries already written and writes only the missing ones.
-  A malformed-message entry has no handler invocation, so its persistence is
-  recorded under a reserved message-scoped field in the same invocation-state
-  hash instead of a fabricated app/handler identity.
-- Entry fields: `original_stream`, `original_id`, `group`, `consumer`, `event`,
-  `reason`, `app`, `handler`, `deliveries` (diagnostic PEL count),
-  `handler_attempts` (the persisted admitted-claim count; normally the real
-  execution count, but a crash or abandoned claim can advance it without an
-  execution), `timestamp` (RFC 3339), and an
-  optional `trace` lineage. A malformed-message entry uses `-` for
-  `app`/`handler` and `handler_attempts` `0`.
+- Idempotency without scanning: the stable row ID is the idempotency key, so a
+  redelivery re-inserts only the missing rows and leaves already-committed rows
+  untouched. A malformed-message entry has no handler invocation and uses the
+  same stable identity with an empty invocation component.
+- Storage follows the state-package convention: `id TEXT PRIMARY KEY`,
+  `data JSONB NOT NULL` (private payload), plus only the relational
+  `delivery_id`, nullable `settled_at_ms`, and `created_at_ms`. Event and reason
+  bytes are base64-encoded inside the JSON payload, so arbitrary malformed bytes,
+  including NUL, survive JSONB losslessly.
+- Entry fields: `id`, `delivery_id`, `source`, `source_group`,
+  `source_message_id`, `consumer`, `event`, `reason`, `app`, `handler`,
+  `deliveries` (diagnostic source count), `handler_attempts` (the persisted
+  admitted-claim count; normally the real execution count, but a crash or
+  abandoned claim can advance it without an execution), `timestamp` (RFC 3339),
+  `settled_at` (empty while unsettled), and an optional `trace` lineage. A
+  malformed-message entry uses `-` for `app`/`handler` and
+  `handler_attempts` `0`. A schedule occurrence's event envelope
+  (`occurrence_id`, `scheduled_at`) is stored verbatim, preserving provenance.
 - An oversized-event entry is intentionally **summary-only and non-replayable**:
   it carries the same `-` placeholder app/handler (no handler invocation ever
   ran) and its `event` field is a small diagnostic JSON summary
@@ -373,32 +390,40 @@ occurrence functions use this shared invocation/DLQ infrastructure.
 ### DLQ persistence contract
 
 - **Idempotency is per exhausted invocation.** The unit of idempotency is one
-  exhausted invocation, keyed by its invocation-state hash (message +
-  `<app>/<handler>`): while that state is retained, one exhausted invocation
-  yields **at most one** persisted DLQ entry. The malformed-message placeholder
-  is the message-scoped analogue, recorded under a reserved field of the same
-  hash.
-- **Atomic append + marker.** A DLQ entry's append and the marker recording its
-  persistence are written by **one atomic script**, so they are never split:
-  either both take effect or neither does, and there is no app-visible gap in
-  which a marked entry is missing or an entry is left unmarked. The marker is
-  written while the source message is still recoverable, so it stays PERSISTENT
-  (see
-  [Invocation state persistence](#invocation-state-persistence)).
+  exhausted invocation, keyed by a stable ID derived from the logical source
+  delivery identity (source stream, group, message ID) and the invocation
+  identity. Re-persisting the same exhaustion yields **at most one** PostgreSQL
+  row (`INSERT ... ON CONFLICT DO NOTHING`).
+- **Validation before insert.** A real invocation's retained exhausted marker is
+  re-read from Redis and its attempt/token identity must match the runner's
+  attribution; a missing or stale marker refuses the insert and leaves the
+  source pending. The marker remains terminal and PERSISTENT while the source is
+  recoverable, so a validated identity cannot be superseded.
 - **Source XACK follows all required persistence.** The source message is
-  acknowledged only **after** every required DLQ entry has been persisted. If
-  the atomic persistence fails, nothing was written, the original stays pending,
+  acknowledged only **after** every required DLQ row has been committed. If a
+  PostgreSQL insert fails (or its outcome is ambiguous), the source stays pending
   and the invocation is re-reported on redelivery, so the message is re-routed
   rather than acknowledged without its entries.
 - **Failed or crashed XACK after successful persistence.** If the XACK fails or
-  the process crashes after the entry was persisted, the message stays in the
-  PEL and is redelivered; the persisted marker makes the redelivery **skip** that
-  invocation's entry instead of appending it again.
+  the process crashes after the rows were committed, the message stays in the
+  PEL and is redelivered; the redelivery **re-inserts idempotently** and retries
+  the ACK. The terminal Redis retention TTL is applied only after a confirmed
+  XACK, so the exhausted markers cannot expire while the source is recoverable.
+- **Settlement follows a confirmed ACK.** All rows for one source delivery share
+  a `delivery_id`. After `ackAndRetainTerminal` returns successfully, the stream
+  marks that delivery settled; the update never happens before the ACK. If the
+  process crashes between the ACK and that update, a bounded worker
+  reconciliation asks Redis whether the exact source stream/group/message is
+  still pending. It marks settled only when the delivery is gone from the PEL;
+  Redis errors, an unavailable group/stream, or a decode failure preserve the
+  unsettled rows for a later attempt.
+- **Only settled rows are removable.** `relay dlq rm` returns an explicit error
+  for an unsettled entry, and `DLQ_RETENTION` deletes only settled rows. Removal
+  never mutates broker invocation state and never causes execution.
 - **Partial fan-out.** A message matching several apps or handlers writes one
-  entry per exhausted invocation. A redelivery after a partial write (some
-  entries persisted, then an error, crash, or failed XACK) **skips the entries
-  already persisted and retries only the missing ones**, so completed entries are
-  neither duplicated nor lost.
+  row per exhausted invocation. A redelivery after a partial write **skips the
+  rows already committed and retries only the missing ones**, so completed rows
+  are neither duplicated nor lost.
 - **At-least-once, not exactly-once.** These guarantees make DLQ persistence
   idempotent and correctly ordered; they do **not** make source delivery or
   handler processing exactly-once. A handler can still run more than once, so

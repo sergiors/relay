@@ -7,66 +7,53 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"relay/internal/dlq"
 )
 
-// dlqPayload builds the flat field map for ONE DLQ entry, corresponding to one
-// exhausted invocation (or, for a malformed message that never reached a
-// handler, a single entry with placeholder app/handler and an explicit 0
-// handler_attempts). Keeping it flat (no nested JSON) keeps the entry easy to
-// inspect with redis-cli and re-drive by hand.
+// dlqEntry builds ONE broker-neutral dead-letter entry for one exhausted
+// invocation (or, for a message that never reached a handler, the placeholder
+// with NoHandler app/handler and an explicit 0 handler attempt count).
 //
-// Two distinct counts are emitted, deliberately:
+// Two distinct counts are carried, deliberately:
 //
-//   - "deliveries" is the authoritative Redis Stream/PEL delivery count (the
-//     retry counter read from XPENDING and passed through the consumer/reclaim
-//     flow). It counts every message redelivery, including redeliveries that
-//     skipped a protected invocation, so it is >= handler_attempts.
-//   - "handler_attempts" is the handler execution attempt that exhausted this
-//     invocation's per-invocation retry state (TryStart/recordFailure/
-//     MarkExhausted), i.e. the count that actually drove the exhaustion
-//     decision. It comes from the runner's typed exhaustion error; for DLQ
-//     paths with no handler retry state (e.g. a malformed message routed
-//     pre-handler) it is explicitly 0, never fabricated from the delivery
-//     count.
+//   - Deliveries is the source delivery count (the retry counter read from
+//     XPENDING and passed through the consumer/reclaim flow). It counts every
+//     message redelivery, including redeliveries that skipped a protected
+//     invocation, so it is >= HandlerAttempts.
+//   - HandlerAttempts is the handler execution attempt that exhausted this
+//     invocation's per-invocation retry state, i.e. the count that actually
+//     drove the exhaustion decision. It comes from the runner's typed
+//     exhaustion error; a message routed before a handler ran is explicitly 0,
+//     never fabricated from the delivery count.
 //
-// "app" and "handler" identify the exact exhausted invocation so a message
-// matching several apps/handlers produces one precisely-attributed entry
-// each. The malformed-message path has no invocation, so it carries the "-"
-// placeholder for both.
-//
-// trace is the OPTIONAL compact lineage (traceparent[|tracestate]) of the final
-// failed invocation, read from the invocation-state hash at DLQ-write time. It is
-// omitted entirely when absent (a pre-tracing entry, the malformed-message
-// path, or tracing disabled), so every existing entry's field shape is
-// unchanged; baggage is never recorded.
-func dlqPayload(
-	stream, id, group, consumer, event, reason, app, handler string,
-	deliveries int64, handlerAttempts int, trace string,
-) map[string]any {
-	fields := map[string]any{
-		"original_stream":  stream,
-		"original_id":      id,
-		"group":            group,
-		"consumer":         consumer,
-		"event":            event,
-		"reason":           reason,
-		"app":              app,
-		"handler":          handler,
-		"deliveries":       deliveries,
-		"handler_attempts": handlerAttempts,
-		"timestamp":        time.Now().UTC().Format(time.RFC3339),
+// The entry ID is derived from the source delivery identity plus the invocation
+// identity, so writing the same exhaustion again is idempotent by primary key.
+// The event payload is supplied by the caller: an oversized message passes only
+// its bounded diagnostic summary.
+func dlqEntry(
+	deliveryID, source, messageID, group, consumer, event string,
+	spec dlqEntrySpec,
+	deliveries int64,
+	timestamp time.Time,
+) dlq.Entry {
+	return dlq.Entry{
+		ID:              dlq.NewIDForDelivery(deliveryID, spec.invocation),
+		Source:          source,
+		SourceGroup:     group,
+		SourceMessageID: messageID,
+		DeliveryID:      deliveryID,
+		Consumer:        consumer,
+		Event:           event,
+		Reason:          spec.reason,
+		App:             spec.app,
+		Handler:         spec.handler,
+		Deliveries:      deliveries,
+		HandlerAttempts: spec.attempts,
+		Trace:           spec.trace,
+		Timestamp:       timestamp.UTC().Format(time.RFC3339),
 	}
-	if trace != "" {
-		fields["trace"] = trace
-	}
-	return fields
 }
-
-// dlqNoHandler is the app/handler placeholder for a DLQ entry that has no
-// handler invocation to attribute (a malformed message routed pre-handler). It
-// mirrors eventString's "-" fallback so every DLQ entry keeps the same flat,
-// always-present field shape.
-const dlqNoHandler = "-"
 
 // exhaustedInvocationsFromError extracts the exhausted invocation metadata from
 // the runner's terminal exhaustion signal. It returns nil when the error is not
@@ -108,13 +95,6 @@ type dlqEntrySpec struct {
 	// (see dlqTraceFor). Empty for the placeholder or when no lineage was
 	// recorded.
 	trace string
-	// claim is the exhausted claim identity (attempt + token) retained by the
-	// invocation's exhausted marker at DLQ-write time. persistDLQ CASes the
-	// atomic append+upgrade on it, so a stale claim can never append an
-	// unattributable entry or upgrade a newer/foreign marker. It is the zero
-	// claim when there is no well-formed exhausted marker (the placeholder, or a
-	// marker-less invocation).
-	claim InvocationClaim
 }
 
 // dlqEntrySpecs expands the runner's terminal exhaustion error into one DLQ
@@ -128,8 +108,8 @@ func dlqEntrySpecs(reason error) []dlqEntrySpec {
 	invocations := exhaustedInvocationsFromError(reason)
 	if len(invocations) == 0 {
 		return []dlqEntrySpec{{
-			app:     dlqNoHandler,
-			handler: dlqNoHandler,
+			app:     dlq.NoHandler,
+			handler: dlq.NoHandler,
 			reason:  reason.Error(),
 		}}
 	}

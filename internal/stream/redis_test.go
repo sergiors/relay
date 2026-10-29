@@ -34,9 +34,6 @@ func TestNewConsumerDefaults(t *testing.T) {
 	}
 
 	c := NewConsumer(cfg())
-	if got := c.dlqStream; got != "relay:events:dlq" {
-		t.Errorf("dlqStream = %q, want relay:events:dlq", got)
-	}
 
 	// Unset MinPendingIdle -> DefaultReclaimInterval (1m).
 	if got := c.minPendingIdle; got != DefaultReclaimInterval {

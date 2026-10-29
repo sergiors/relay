@@ -15,8 +15,8 @@ import (
 
 // Config holds the worker's environment-resolved settings, assembled by Load at
 // worker startup. The administrative CLI commands do not build a Config; they
-// resolve only the values they need through the narrow LoadDatabaseURL and
-// LoadRedisConfig loaders. Every field maps to a single environment variable,
+// resolve only the values they need through the narrow LoadDatabaseURL loader.
+// Every field maps to a single environment variable,
 // except the always-generated per-process InstanceID (see below). Application
 // code should consume resolved values instead of reading environment variables
 // directly.
@@ -61,13 +61,12 @@ type Config struct {
 	// trims the configured source stream with XTRIM ... ACKED, so entries are
 	// removed only once every consumer group has acknowledged them.
 	StreamRetention time.Duration
-	// DLQRetention is the dead-letter-queue retention window
-	// (REDIS_DLQ_RETENTION). Unset defaults to DefaultDLQRetention (7 days);
-	// an explicitly empty, zero, or negative value disables DLQ retention (0),
-	// and a malformed value logs and disables it. Unlike StreamRetention this
-	// is AGE-ONLY: the worker trims the Relay-owned DLQ stream with
-	// XTRIM ... MINID ~ (no ACKED mode), because the DLQ has no consumer group,
-	// PEL, or XACK flow to protect.
+	// DLQRetention is the durable dead-letter retention window
+	// (DLQ_RETENTION). Unset defaults to DefaultDLQRetention (7 days); an
+	// explicitly empty, zero, or negative value disables DLQ retention (0), and
+	// a malformed value logs and disables it. PostgreSQL is the sole DLQ
+	// persistence: the worker deletes DLQ rows older than this window in
+	// bounded batches. It is independent of the source-stream retention above.
 	DLQRetention time.Duration
 	// InvocationRetention is the TERMINAL invocation-state retention window
 	// (REDIS_INVOCATION_RETENTION). Unset defaults to
@@ -246,13 +245,13 @@ const (
 	// stream: an entry is removed only once every consumer group has
 	// acknowledged it.
 	DefaultStreamRetention = 24 * time.Hour
-	// DefaultDLQRetention is the dead-letter-queue retention window applied when
-	// REDIS_DLQ_RETENTION is UNSET; an explicitly empty value disables it. The
-	// DLQ has no consumer group, so its trim is AGE-ONLY (MINID ~, no ACKED).
-	// Seven days mirrors the schedule outbox's retention, so a dead-lettered
-	// entry outlives the schedule occurrence's PostgreSQL-outbox window. It is
-	// INDEPENDENT of the invocation-state terminal TTL below: a DLQ entry is
-	// stream data, a terminal invocation-state hash is a per-message Redis hash.
+	// DefaultDLQRetention is the durable dead-letter retention window applied
+	// when DLQ_RETENTION is UNSET; an explicitly empty value disables it. The
+	// DLQ is stored in PostgreSQL, so retention is a bounded age-based delete,
+	// never a broker stream trim. Seven days mirrors the schedule outbox's
+	// retention. It is INDEPENDENT of the invocation-state terminal TTL below:
+	// a DLQ row is durable operator data, a terminal invocation-state hash is
+	// per-message Redis state.
 	DefaultDLQRetention = 7 * 24 * time.Hour
 	// DefaultInvocationRetention is the terminal invocation-state retention
 	// window applied when REDIS_INVOCATION_RETENTION is UNSET; an explicitly
@@ -334,7 +333,7 @@ const (
 // list, preserving their opt-in semantics through the caller's non-empty
 // guards. The retention windows are the exception to
 // the "zero when unset" rule: REDIS_STREAM_RETENTION defaults to
-// DefaultStreamRetention (24h), REDIS_DLQ_RETENTION to DefaultDLQRetention (7
+// DefaultStreamRetention (24h), DLQ_RETENTION to DefaultDLQRetention (7
 // days), REDIS_INVOCATION_RETENTION to DefaultInvocationRetention (48h), and
 // STATS_RETENTION to DefaultStatsRetention (7 days) when
 // UNSET, while an explicitly empty value disables the respective retention (0).
@@ -404,7 +403,7 @@ func Load(logger *slog.Logger) (Config, error) {
 	// deliberate — UNSET applies the documented default, while an explicitly
 	// empty value keeps the historical opt-out (disabled).
 	cfg.StreamRetention = retentionEnv(logger, "REDIS_STREAM_RETENTION", DefaultStreamRetention)
-	cfg.DLQRetention = retentionEnv(logger, "REDIS_DLQ_RETENTION", DefaultDLQRetention)
+	cfg.DLQRetention = retentionEnv(logger, "DLQ_RETENTION", DefaultDLQRetention)
 	cfg.InvocationRetention = retentionEnv(logger, "REDIS_INVOCATION_RETENTION", DefaultInvocationRetention)
 	cfg.StatsRetention = retentionEnv(logger, "STATS_RETENTION", DefaultStatsRetention)
 	cfg.MetricsAddr = getEnv("METRICS_ADDR", "")
@@ -499,44 +498,6 @@ func Load(logger *slog.Logger) (Config, error) {
 // the real cause instead of a connection failure.
 func LoadDatabaseURL() (string, error) {
 	return requiredEnv("DATABASE_URL")
-}
-
-// RedisConfig is the narrow Redis-only slice of the deployment configuration the
-// `relay dlq` commands need: the Redis address and the source stream whose
-// Relay-owned DLQ stream (`relay:<stream>:dlq`) is inspected/replayed, plus the
-// consumer group (validated for parity with `relay start`, though the DLQ store
-// itself does not use it). It deliberately carries no PostgreSQL state DSN: the
-// DLQ lives entirely in Redis, so those commands must work in a Redis-only
-// environment.
-type RedisConfig struct {
-	URI    string
-	Stream string
-	Group  string
-}
-
-// LoadRedisConfig resolves just the required Redis variables (REDIS_URI,
-// REDIS_STREAM, REDIS_GROUP) with the SAME validation Load applies to them, but
-// WITHOUT its DATABASE_URL dependency. It exists for the `relay dlq` commands,
-// which read and mutate only the Relay-owned DLQ stream in Redis and never touch
-// the PostgreSQL state database. A missing required Redis variable returns a
-// clear, variable-naming error rather than an empty value, so a misconfigured
-// CLI reports the real cause. The address is returned verbatim for
-// config.RedisOptions to parse (a Redis DSN may carry credentials, so the value
-// is never logged here).
-func LoadRedisConfig() (RedisConfig, error) {
-	uri, err := requiredEnv("REDIS_URI")
-	if err != nil {
-		return RedisConfig{}, err
-	}
-	stream, err := requiredEnv("REDIS_STREAM")
-	if err != nil {
-		return RedisConfig{}, err
-	}
-	group, err := requiredEnv("REDIS_GROUP")
-	if err != nil {
-		return RedisConfig{}, err
-	}
-	return RedisConfig{URI: uri, Stream: stream, Group: group}, nil
 }
 
 // ParseBool parses a boolean environment value using strconv.ParseBool's
@@ -762,7 +723,7 @@ func retentionEnv(logger *slog.Logger, name string, defaultWindow time.Duration)
 // variable must not take down the worker; the operator sees the log line and
 // the disabled behavior. The value carries no credentials, so echoing it in the
 // log line is safe. The same helper serves REDIS_STREAM_RETENTION,
-// REDIS_DLQ_RETENTION, REDIS_INVOCATION_RETENTION, and STATS_RETENTION; only the
+// DLQ_RETENTION, REDIS_INVOCATION_RETENTION, and STATS_RETENTION; only the
 // caller's unset default differs.
 func parseRetention(logger *slog.Logger, name, value string) time.Duration {
 	if strings.TrimSpace(value) == "" {

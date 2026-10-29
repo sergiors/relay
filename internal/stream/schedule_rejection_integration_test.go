@@ -11,9 +11,9 @@
 //     invocation;
 //   - rejection-first: the reserved rejection is durable and every later
 //     admission is refused, with no descriptor and no active claim ever created;
-//   - a reservation written before a crash is completed on the retry (DLQ
-//     placeholder persisted, then terminal ACK), and a duplicate disposition
-//     never appends a second DLQ entry.
+//   - a reservation written before a crash is completed on the retry (the DLQ
+//     row committed to PostgreSQL, then the terminal ACK), and a duplicate
+//     disposition never commits a second DLQ row.
 //
 // The interleavings are deterministic: A is paused by a store wrapper at the
 // exact reservation boundary (channels, no sleeps), so B's admission is
@@ -29,6 +29,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"relay/internal/dlq"
 	"relay/internal/testutil"
 )
 
@@ -76,7 +77,7 @@ func rejectionEnv(t *testing.T, cli *redis.Client) (stream, group, msgID, event 
 	}
 	t.Cleanup(func() {
 		c := context.Background()
-		_ = cli.Del(c, stream, DLQStreamFor(stream)).Err()
+		_ = cli.Del(c, stream).Err()
 		cleanupInvocationKeys(c, cli, prefix)
 	})
 	return stream, group, id, event
@@ -179,9 +180,9 @@ func TestIntegrationScheduleRejectionRaceAdmissionFirstStaysPending(t *testing.T
 	if len(pending) != 1 || pending[0].ID != msgID {
 		t.Fatalf("pending = %+v, want the message still pending (never ACKed)", pending)
 	}
-	if n, err := cli.XLen(ctx, DLQStreamFor(stream)).Result(); err != nil || n != 0 {
-		t.Fatalf("DLQ length = (%d,%v), want 0 (no invalid DLQ)", n, err)
-	}
+	// No DLQ row exists: the race produced no dead letter. There is no store to
+	// assert (this branch never wires one), and with a nil DLQ store the route
+	// refuses to ACK at all, so pending is the observable invariant.
 }
 
 // TestIntegrationScheduleRejectionFirstRefusesAdmission pins the rejection-first
@@ -246,32 +247,38 @@ func TestIntegrationScheduleReservedInvalidDispositionIsIdempotent(t *testing.T)
 	stream, group, msgID, event := rejectionEnv(t, cli)
 	ctx := context.Background()
 	store := &invocationStore{client: cli}
+	// The durable DLQ store the disposition commits to (production wiring).
+	pg := testutil.NewState(t)
 
 	// Simulate the crashed delivery: the INVALID rejection is reserved, but no DLQ
-	// entry was written and the message is still pending.
+	// row was written and the message is still pending.
 	if _, err := store.reserveScheduleRejection(ctx, stream, group, msgID, ScheduleRejectionInvalid); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
 
 	c := NewConsumer(ConsumerConfig{
 		Client: cli, Stream: stream, Group: group, Consumer: "c",
-		Log: testutil.DiscardLogger(),
+		Log:      testutil.DiscardLogger(),
+		DLQStore: pg,
 	})
 	msg := redis.XMessage{ID: msgID, Values: map[string]any{"event": event}}
 
-	// The "retry" completes the disposition.
+	// The "retry" completes the disposition: the DLQ row is committed to
+	// PostgreSQL and only then is the message terminal-ACKed.
 	c.routeToDLQ(ctx, msg, fmt.Errorf("%w: reserved", ErrScheduleInvalid), 1)
 
 	key := invocationStateKey(stream, group, msgID)
-	if n, err := cli.XLen(ctx, c.dlqStream).Result(); err != nil || n != 1 {
-		t.Fatalf("DLQ length = (%d,%v), want exactly 1 entry", n, err)
+	entries := dlqEntriesFor(t, pg, msgID)
+	if len(entries) != 1 {
+		t.Fatalf("DLQ rows = %d, want exactly 1", len(entries))
 	}
-	if n, err := cli.HExists(ctx, key, dlqPlaceholderField).Result(); err != nil || !n {
-		t.Fatalf("placeholder marker = (%v,%v), want present", n, err)
+	if entries[0].App != dlq.NoHandler || entries[0].Handler != dlq.NoHandler {
+		t.Fatalf("placeholder row attribution = %q/%q", entries[0].App, entries[0].Handler)
 	}
 	if n, err := cli.HExists(ctx, key, terminalField).Result(); err != nil || !n {
 		t.Fatalf("terminal marker = (%v,%v), want present (terminal ACK)", n, err)
 	}
+	// A reserved-rejection disposition has no active claim to preserve.
 	if n, err := cli.HExists(ctx, key, "fn/jobs.old").Result(); err != nil || n {
 		t.Fatalf("invocation field present = (%v,%v), want absent (no active claim)", n, err)
 	}
@@ -279,11 +286,16 @@ func TestIntegrationScheduleReservedInvalidDispositionIsIdempotent(t *testing.T)
 	if err != nil || len(pending) != 0 {
 		t.Fatalf("pending = (%+v,%v), want none (ACKed)", pending, err)
 	}
+	// The confirmed ACK settles the placeholder delivery.
+	if entries[0].SettledAt == "" {
+		t.Fatalf("the placeholder row must be settled after the confirmed ACK")
+	}
 
-	// A duplicate disposition must not append a second entry.
+	// A duplicate disposition must not commit a second row (the stable identity
+	// is idempotent in PostgreSQL, with no Redis persistence marker at all).
 	c.routeToDLQ(ctx, msg, fmt.Errorf("%w: reserved", ErrScheduleInvalid), 2)
-	if n, err := cli.XLen(ctx, c.dlqStream).Result(); err != nil || n != 1 {
-		t.Fatalf("DLQ length after duplicate = (%d,%v), want still 1", n, err)
+	if entries := dlqEntriesFor(t, pg, msgID); len(entries) != 1 {
+		t.Fatalf("DLQ rows after duplicate disposition = %d, want still 1", len(entries))
 	}
 }
 
@@ -295,6 +307,7 @@ func TestIntegrationScheduleReservedObsoleteAckedOnRetry(t *testing.T) {
 	stream, group, msgID, _ := rejectionEnv(t, cli)
 	ctx := context.Background()
 	store := &invocationStore{client: cli}
+	pg := testutil.NewState(t)
 	inv := NewInvocationState(ctx, store, stream, group, msgID, testutil.DiscardLogger())
 
 	// A reserved obsolete; a later delivery reports the same kind, so the stream
@@ -316,12 +329,11 @@ func TestIntegrationScheduleReservedObsoleteAckedOnRetry(t *testing.T) {
 	if n, err := cli.HExists(ctx, key, terminalField).Result(); err != nil || !n {
 		t.Fatalf("terminal marker = (%v,%v), want present", n, err)
 	}
-	pending, err := cli.XPendingExt(ctx, &redis.XPendingExtArgs{Stream: stream, Group: group, Start: "-", End: "+", Count: 10}).Result()
-	if err != nil || len(pending) != 0 {
-		t.Fatalf("pending = (%+v,%v), want none (ACKed)", pending, err)
+	if n, err := cli.XPendingExt(ctx, &redis.XPendingExtArgs{Stream: stream, Group: group, Start: "-", End: "+", Count: 10}).Result(); err != nil || len(n) != 0 {
+		t.Fatalf("pending = (%+v,%v), want none (ACKed)", n, err)
 	}
-	if n, err := cli.XLen(ctx, DLQStreamFor(stream)).Result(); err != nil || n != 0 {
-		t.Fatalf("DLQ length = (%d,%v), want 0 (obsolete is never dead-lettered)", n, err)
+	if entries := dlqEntriesFor(t, pg, msgID); len(entries) != 0 {
+		t.Fatalf("DLQ rows = %d, want 0 (obsolete is never dead-lettered)", len(entries))
 	}
 }
 

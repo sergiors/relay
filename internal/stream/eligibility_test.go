@@ -62,22 +62,10 @@ type fakeInvocationStore struct {
 	// Redis: the delivery must then leave the message pending (no handler, no
 	// ACK/DLQ) because the state hash may still carry its old TTL.
 	recoverableErr error
-	// dlqAppends records every DLQ entry the fake's persistDLQ actually wrote
-	// (one per persisted invocation/placeholder), so tests can assert the atomic
-	// append without a real Redis stream.
-	dlqAppends []dlqAppend
 	// rejection models the reserved scheduleRejectionField: a terminal
 	// pre-admission rejection recorded by reserveScheduleRejection. A non-none
 	// value makes the message un-admittable, mirroring the real reservation.
 	rejection ScheduleRejection
-}
-
-// dlqAppend is one DLQ entry the fake persistDLQ appended: the target stream,
-// the invocation ("" for the placeholder), and the entry fields.
-type dlqAppend struct {
-	stream     string
-	invocation string
-	entry      map[string]any
 }
 
 // terminalRetained reports whether the message-level terminal marker is present,
@@ -413,56 +401,16 @@ func (f *fakeInvocationStore) writeExhausted(invocation string, claim Invocation
 	return true
 }
 
-// persistDLQ models persistDLQScript: it atomically records the persistence
-// marker and captures the appended entry in dlqAppends. A real invocation must
-// own a matching exhausted marker (a missing/foreign one is refused with an
-// error, mirroring the script's -1); the placeholder uses the message-scoped
-// dlqPlaceholderField. An already-marked entry/placeholder is a no-op
-// (wrote=false, nil).
-func (f *fakeInvocationStore) persistDLQ(
-	_ context.Context,
-	dlqStream, _, _, _, invocation string,
-	claim InvocationClaim,
-	entry map[string]any,
-) (bool, error) {
+// exhaustedClaim models the Redis HGET seam routeToDLQ validates before a
+// PostgreSQL dead-letter write: it reads the invocation's exhausted marker and
+// returns its retained claim identity, whether a well-formed exhausted marker is
+// present, and a read error (fail closed) exactly like the real store.
+func (f *fakeInvocationStore) exhaustedClaim(_ context.Context, _, _, _, invocation string) (InvocationClaim, bool, error) {
 	if f.readErr != nil {
-		return false, f.readErr
+		return InvocationClaim{}, false, f.readErr
 	}
-	if f.terminalRetained() {
-		return false, fmt.Errorf("persistDLQ: hash is terminal-retained")
-	}
-	if invocation != "" {
-		v, ok := f.fields[invocation]
-		if !ok {
-			return false, fmt.Errorf("persistDLQ: no exhausted marker for %q", invocation)
-		}
-		exClaim, dlq, parsed := parseExhaustedValue(v)
-		if !parsed {
-			return false, fmt.Errorf("persistDLQ: marker for %q is not exhausted", invocation)
-		}
-		if exClaim.Attempt != claim.Attempt || exClaim.Token != claim.Token {
-			return false, fmt.Errorf("persistDLQ: exhausted claim mismatch for %q", invocation)
-		}
-		if dlq {
-			return false, nil
-		}
-		f.fields[invocation] = exhaustedValue(exClaim, true)
-	} else {
-		if _, ok := f.fields[dlqPlaceholderField]; ok {
-			return false, nil
-		}
-		f.fields[dlqPlaceholderField] = "1"
-	}
-	f.dlqAppends = append(f.dlqAppends, dlqAppend{stream: dlqStream, invocation: invocation, entry: entry})
-	return true, nil
-}
-
-func (f *fakeInvocationStore) exhaustedState(_ context.Context, _, _, _, invocation string) (InvocationClaim, bool, bool, error) {
-	if f.readErr != nil {
-		return InvocationClaim{}, false, false, f.readErr
-	}
-	claim, dlq, ok := parseExhaustedValue(f.fields[invocation])
-	return claim, dlq, ok, nil
+	claim, _, ok := parseExhaustedValue(f.fields[invocation])
+	return claim, ok, nil
 }
 
 // claimClassification models the Redis HSETNX claim: the first call sets the
@@ -818,41 +766,23 @@ func TestInvocationStoreTerminalGuards(t *testing.T) {
 		t.Fatalf("marker = %q, want ok (stale failure must not overwrite success)", got)
 	}
 
-	// DLQ suffix is monotonic and CASed on the exhausted identity.
+	// DLQ persistence is idempotent in PostgreSQL by the entry's stable ID, so
+	// the exhausted marker carries NO per-message persistence state to upgrade:
+	// the marker stays exactly "exhausted:<attempt>:<token>" after exhaustion,
+	// and a refusal (foreign identity) is modeled by exhaustedClaim validation at
+	// the routeToDLQ seam (see the DLQ route tests).
 	store3 := newFakeInvocationStore(nil)
 	exClaim := InvocationClaim{Attempt: 3, Token: "aa"}
 	store3.fields["fn/h"] = runningValue(time.Now().Add(time.Hour), exClaim)
 	if ok, err := store3.markExhausted(ctx, "s", "g", "m", "fn/h", exClaim); err != nil || !ok {
 		t.Fatalf("markExhausted = (%v,%v)", ok, err)
 	}
-	// A foreign identity cannot upgrade the marker: the atomic append is refused
-	// (an error, nothing written), so no unattributable entry is appended.
-	entry := map[string]any{"original_id": "m"}
-	if ok, err := store3.persistDLQ(ctx, "dlq", "s", "g", "m", "fn/h", InvocationClaim{Attempt: 3, Token: "bb"}, entry); err == nil || ok {
-		t.Fatalf("persistDLQ with a foreign identity = (%v,%v), want (false,error)", ok, err)
-	}
-	if got := store3.fields["fn/h"]; got != exhaustedValue(exClaim, false) {
-		t.Fatalf("marker = %q, want the un-upgraded exhausted marker", got)
-	}
-	if len(store3.dlqAppends) != 0 {
-		t.Fatalf("a refused persistDLQ must append nothing, got %+v", store3.dlqAppends)
-	}
-	// The owning identity appends once and upgrades it; a second call is
-	// monotonic (wrote=false, no second append).
-	if ok, err := store3.persistDLQ(ctx, "dlq", "s", "g", "m", "fn/h", exClaim, entry); err != nil || !ok {
-		t.Fatalf("persistDLQ = (%v,%v), want (true,nil)", ok, err)
-	}
-	if ok, err := store3.persistDLQ(ctx, "dlq", "s", "g", "m", "fn/h", exClaim, entry); err != nil || ok {
-		t.Fatalf("re persistDLQ = (%v,%v), want (false,nil)", ok, err)
-	}
-	if len(store3.dlqAppends) != 1 {
-		t.Fatalf("dlqAppends = %d, want exactly 1 (monotonic)", len(store3.dlqAppends))
-	}
+	// A re-exhaustion of the same claim is an idempotent no-op (still owned).
 	if ok, err := store3.markExhausted(ctx, "s", "g", "m", "fn/h", exClaim); err != nil || ok {
 		t.Fatalf("re-markExhausted = (%v,%v), want (false,nil) (already exhausted)", ok, err)
 	}
-	if got := store3.fields["fn/h"]; got != exhaustedValue(exClaim, true) {
-		t.Fatalf("marker = %q, want exhausted...:dlq (suffix preserved)", got)
+	if got := store3.fields["fn/h"]; got != exhaustedValue(exClaim, false) {
+		t.Fatalf("marker = %q, want the unchanged exhausted marker", got)
 	}
 }
 

@@ -52,7 +52,9 @@ local function parse_active(v, prefix)
 end
 
 local function parse_exhausted(v)
-  -- "exhausted:<attempt>:<token>[:dlq]" -> attempt, token, dlq
+  -- "exhausted:<attempt>:<token>[:dlq]" -> attempt, token, dlq. The optional
+  -- ":dlq" suffix is a legacy terminal marker: it is still recognized as
+  -- exhausted, but no new suffix is written (PostgreSQL is the DLQ authority).
   local body = string.match(v, '^exhausted:(.*)$')
   if not body then return nil end
   local dlq = false
@@ -466,83 +468,6 @@ if not dl then dl, a, tok = parse_active(v, 'next_attempt_at') end
 if not dl then return 0 end
 if a ~= ARGV[2] or tok ~= ARGV[3] then return 0 end
 redis.call('HSET', KEYS[1], ARGV[1], 'exhausted:'..a..':'..tok)
-redis.call('PERSIST', KEYS[1])
-return 1
-`)
-
-	// persistDLQScript ATOMICALLY appends one DLQ entry to the DLQ stream AND
-	// records its persistence in the message's invocation-state hash, in one
-	// script, so a crash or error between the append and the marker can never
-	// happen (F-008): either both take effect (returns 1) or neither does.
-	//
-	// It serves both DLQ entry kinds:
-	//
-	//   - A real exhausted invocation (ARGV[2] non-empty): the marker must
-	//     ALREADY be a well-formed exhausted marker whose retained identity
-	//     matches the supplied claim (attempt + token). On a match the entry is
-	//     appended and the marker is upgraded to "exhausted:<attempt>:<token>:dlq"
-	//     (the existing convention). An already-":dlq" marker is monotonic and
-	//     written nothing (returns 0). A missing, foreign, or non-exhausted
-	//     marker is REFUSED (returns -1) without writing, so a stale/guessed
-	//     claim can never append an unattributable entry or downgrade a newer
-	//     marker.
-	//   - The malformed-message placeholder (ARGV[2] empty): a message-scoped
-	//     reserved field (ARGV[3]) records that this message's placeholder entry
-	//     has been persisted. It is set in the SAME hash as the invocation
-	//     markers (the hash is already scoped by stream/group/msgID), so it needs
-	//     no fabricated app/handler identity. An already-marked placeholder is a
-	//     no-op (returns 0).
-	//
-	// KEYS[1] = invocation-state hash; KEYS[2] = DLQ stream.
-	// ARGV[1] = terminal marker field,
-	// ARGV[2] = invocation field ("" for the placeholder),
-	// ARGV[3] = placeholder marker field,
-	// ARGV[4] = exhausted attempt (decimal string; "" for the placeholder),
-	// ARGV[5] = exhausted claim token ("" for the placeholder),
-	// ARGV[6..] = flat XADD field/value pairs (an even, non-zero count).
-	// Returns 1 when this call appended the entry, 0 when it was already
-	// recorded (no write), -1 when refused (no write).
-	//
-	// Every validation runs BEFORE the XADD. A Lua error after a successful
-	// write cannot roll that write back, so a wrong-type or terminal-retained
-	// hash and a missing/mismatched exhausted marker must all be rejected before
-	// any write, leaving no partial effect. Within a single script no other
-	// command interleaves, so once the hash type is validated the post-XADD HSET
-	// cannot fail.
-	//
-	// The persistence marker is written while the message is still recoverable
-	// (the XACK may not have run), so it keeps the key PERSISTENT: a redelivery
-	// after a failed XACK must see it to stay idempotent.
-	//
-	// Redis Cluster: this script touches two keys (the invocation-state hash and
-	// the DLQ stream). A clustered deployment would require both to hash to the
-	// same slot (e.g. a shared hash tag); Relay uses a single-node *redis.Client,
-	// so the keys are always co-located.
-	persistDLQScript = redis.NewScript(luaInvocationHelpers + `
-local kt = redis.call('TYPE', KEYS[1])
-if kt['ok'] ~= 'none' and kt['ok'] ~= 'hash' then return -1 end
-if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then return -1 end
-
-local n = #ARGV
-if n <= 5 or (n - 5) % 2 ~= 0 then return -1 end
-
-local invocation = ARGV[2]
-if invocation ~= '' then
-  local v = redis.call('HGET', KEYS[1], invocation)
-  if not v then return -1 end
-  local a, tok, dlq = parse_exhausted(v)
-  if not a then return -1 end
-  if a ~= ARGV[4] or tok ~= ARGV[5] then return -1 end
-  if dlq then return 0 end
-  redis.call('XADD', KEYS[2], '*', unpack(ARGV, 6, n))
-  redis.call('HSET', KEYS[1], invocation, 'exhausted:'..a..':'..tok..':dlq')
-  redis.call('PERSIST', KEYS[1])
-  return 1
-end
-
-if redis.call('HEXISTS', KEYS[1], ARGV[3]) == 1 then return 0 end
-redis.call('XADD', KEYS[2], '*', unpack(ARGV, 6, n))
-redis.call('HSET', KEYS[1], ARGV[3], '1')
 redis.call('PERSIST', KEYS[1])
 return 1
 `)

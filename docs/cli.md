@@ -35,16 +35,16 @@ those operations.
 | `stats reset`                 | no          | no           | optional (socket)      | state DB (write); worker socket when running |
 | `app ls` / `inspect` / `apps` | no          | no           | optional (inspect)     | state DB (read); socket for live pool gauges |
 | `app invoke`                  | no          | no           | **yes**                | worker socket                                |
-| `dlq ls` / `inspect` / `rm`   | yes         | no           | no                     | Redis DLQ stream                             |
-| `dlq replay`                  | yes         | no           | **yes**                | Redis DLQ + worker socket                    |
+| `dlq ls` / `inspect` / `rm`   | no          | no           | no                     | PostgreSQL DLQ (read/write)                  |
+| `dlq replay`                  | no          | no           | **yes**                | PostgreSQL DLQ + worker socket               |
 | `secret ls` / `set` / `rm`    | no          | no           | no                     | local secret files                           |
 | `git *`                       | no          | no           | no                     | local git config/key/checkout + `/apps`      |
 
 Commands that need Redis resolve the Redis configuration with the same required
 `REDIS_*` validation as `relay start`, so a missing `REDIS_URI`,
-`REDIS_STREAM`, or `REDIS_GROUP` is an error for them too. The `dlq` commands
-use `config.LoadRedisConfig` — a Redis-only loader — so they do **not** require
-`DATABASE_URL`: the DLQ lives entirely in Redis.
+`REDIS_STREAM`, or `REDIS_GROUP` is an error for them too. `relay dlq` instead
+requires `DATABASE_URL`: the durable DLQ lives in PostgreSQL, and those commands
+never start or contact the worker unless `replay` needs its socket.
 
 ## relay start
 
@@ -106,7 +106,7 @@ database renders zeroes with `Updated: never`. Backlog gauges are global.
 `Message reclaims` is `relay_retries_total`: stream messages reclaimed and
 re-delivered, **not** handler retries (`relay_function_retries_total`, rendered
 per app by `relay app inspect` as `Handler retries`). `DLQ entries`
-is `relay_dlq_entries_total`: successful writes to the Redis DLQ stream (one per
+is `relay_dlq_entries_total`: successful inserts into the PostgreSQL DLQ (one per
 exhausted invocation, plus a placeholder per malformed message), **not** the
 count of invocations that exhausted their retries (that is
 `relay_function_dlq_total`, rendered per app as `Invocations exhausted`).
@@ -199,18 +199,20 @@ no offline fallback — a worker must be running.
 ## relay dlq
 
 ```
-relay dlq ls
-```
-
-```
 ID                     ORIGINAL               APP                  HANDLER                ATTEMPTS  AGE
-1757...-0              events/1757...-0        welcome-email-node   handler.handler        5         2m ago
+8f0c...                 events/1757...-0        welcome-email-node   handler.handler        5         2m ago
 ```
 
-`ls` lists entries in stream order (ID, source message, failed app/handler,
-handler attempts, age). `inspect ID` shows one entry's fields plus the original
+`ls` lists entries in write order (stable ID, source message, failed
+app/handler, handler attempts, age). Entry IDs are deterministic logical
+identities (source delivery + invocation), so they survive worker restarts and
+redeliveries. `inspect ID` shows one entry's fields plus the original
 event JSON pretty-printed; a non-JSON (malformed placeholder) event is shown
-verbatim. `rm ID` deletes one entry.
+verbatim. `rm ID` deletes one **settled** entry without touching broker
+invocation state or causing execution. An entry whose source delivery may still
+be recoverable is refused with an explicit "not settled" error; it becomes
+removable only after its source ACK is confirmed (or reconciliation proves it is
+no longer pending).
 
 ```
 relay dlq replay ID
@@ -219,9 +221,12 @@ relay dlq replay ID
 Re-executes that entry's exact recorded app/handler once on the running
 worker and deletes the entry **only on success**; the entry is kept on any
 failure (removed handler, failed handler, or unavailable worker). A
-malformed-message placeholder has no handler to re-execute and is not replayable.
+malformed-message placeholder has no handler to re-execute and is not replayable;
+an unsettled entry is rejected before dialing because its source delivery may
+still be recoverable.
 
-These commands need Redis. The DLQ stream is `relay:<REDIS_STREAM>:dlq`.
+These commands need PostgreSQL (`DATABASE_URL`); `replay` additionally needs the
+running worker socket.
 
 ## relay secret
 

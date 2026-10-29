@@ -396,9 +396,9 @@ func (r *Runner) recordFailure(
 		// retries and its terminal exhausted marker is now persisted, so
 		// function_dlq_total and last_dlq_at are stamped HERE — not on every
 		// failure, not again on the later terminal-skip redeliveries of the same
-		// invocation, and not at the message-level DLQ write (which happens later
-		// in the stream layer, only after all exhausted siblings resolve, and
-		// only if the XADD succeeds).
+		// invocation, and not at the message-level PostgreSQL DLQ insert (which
+		// happens later in the stream layer, only after all exhausted siblings
+		// resolve, and only if the row commit succeeds).
 		if !invState.MarkExhausted(invocation, claim) {
 			r.log.Warn("App handler: exhaustion superseded; leaving pending",
 				"app", fnName,

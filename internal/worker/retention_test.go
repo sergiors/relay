@@ -39,52 +39,65 @@ func (s *stubTrimmer) XTrimMinIDApproxMode(ctx context.Context, key string, minI
 	return cmd
 }
 
-// stubDLQTrimmer is a test double for dlqTrimmer. It records every
-// XTrimMinIDApprox call (stream key and cutoff ID, with no mode) and returns a
-// canned result so DLQ-retention tests never need a real Redis.
-type stubDLQTrimmer struct {
-	mu       sync.Mutex
-	streams  []string
-	cutoffID []string
-	val      int64
-	err      error
+// stubDLQPruner is a test double for dlqPruner. It records every bounded
+// PostgreSQL prune (cutoff and limit) and returns a canned result so
+// DLQ-retention tests never need a database.
+type stubDLQPruner struct {
+	mu      sync.Mutex
+	cutoffs []time.Time
+	limits  []int
+	vals    []int
+	val     int
+	err     error
+	onCall  func(int)
 }
 
-func (s *stubDLQTrimmer) XTrimMinIDApprox(ctx context.Context, key string, minID string, limit int64) *redis.IntCmd {
+func (s *stubDLQPruner) PruneDLQEntries(ctx context.Context, cutoff time.Time, limit int) (int, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.streams = append(s.streams, key)
-	s.cutoffID = append(s.cutoffID, minID)
-	cmd := redis.NewIntCmd(ctx)
-	cmd.SetVal(s.val)
+	s.cutoffs = append(s.cutoffs, cutoff)
+	s.limits = append(s.limits, limit)
+	call := len(s.cutoffs)
+	onCall := s.onCall
 	if s.err != nil {
-		cmd.SetErr(s.err)
+		s.mu.Unlock()
+		if onCall != nil {
+			onCall(call)
+		}
+		return 0, s.err
 	}
-	return cmd
+	n := s.val
+	if len(s.vals) >= call {
+		n = s.vals[call-1]
+	}
+	s.mu.Unlock()
+	if onCall != nil {
+		onCall(call)
+	}
+	return n, nil
 }
 
-func (s *stubDLQTrimmer) calls() int {
+func (s *stubDLQPruner) calls() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.streams)
+	return len(s.cutoffs)
 }
 
-func (s *stubDLQTrimmer) lastStream() string {
+func (s *stubDLQPruner) lastCutoff() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.streams) == 0 {
-		return ""
+	if len(s.cutoffs) == 0 {
+		return time.Time{}
 	}
-	return s.streams[len(s.streams)-1]
+	return s.cutoffs[len(s.cutoffs)-1]
 }
 
-func (s *stubDLQTrimmer) lastCutoffID() string {
+func (s *stubDLQPruner) lastLimit() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.cutoffID) == 0 {
-		return ""
+	if len(s.limits) == 0 {
+		return 0
 	}
-	return s.cutoffID[len(s.cutoffID)-1]
+	return s.limits[len(s.limits)-1]
 }
 
 func (s *stubTrimmer) calls() int {
@@ -296,57 +309,88 @@ func TestRetentionLoopDisablesOnUnsupportedMode(t *testing.T) {
 	}
 }
 
-// TestDLQRetentionTickTrimsConfiguredStream verifies dlqRetentionTick issues a
-// mode-less approximate MINID trim against the DLQ stream with the correct
-// (now - retention) cutoff, using an injected now. The mode-less seam pins that
-// the DLQ trim does NOT require ACKED: a pre-8.2 server that disables main
-// retention still age-trims the DLQ.
-func TestDLQRetentionTickTrimsConfiguredStream(t *testing.T) {
-	stub := &stubDLQTrimmer{val: 4}
+// TestDLQRetentionTickPrunesConfiguredWindow verifies dlqRetentionTick issues
+// one bounded PostgreSQL prune with the correct (now - retention) cutoff.
+func TestDLQRetentionTickPrunesConfiguredWindow(t *testing.T) {
+	stub := &stubDLQPruner{val: 4}
 	now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
 	retention := 7 * 24 * time.Hour
-	dlq := "relay:events:dlq"
-	dlqRetentionTick(context.Background(), stub, dlq, retention, func() time.Time { return now }, testutil.DiscardLogger())
+	dlqRetentionTick(context.Background(), stub, retention, func() time.Time { return now }, testutil.DiscardLogger())
 
 	if got := stub.calls(); got != 1 {
-		t.Fatalf("trim calls = %d, want 1", got)
+		t.Fatalf("prune calls = %d, want 1", got)
 	}
-	if got := stub.lastStream(); got != dlq {
-		t.Fatalf("trimmed stream = %q, want %q", got, dlq)
+	wantCutoff := now.Add(-retention)
+	if got := stub.lastCutoff(); !got.Equal(wantCutoff) {
+		t.Fatalf("cutoff = %v, want %v", got, wantCutoff)
 	}
-	wantCutoff := retentionCutoffID(now.Add(-retention))
-	if got := stub.lastCutoffID(); got != wantCutoff {
-		t.Fatalf("cutoff ID = %q, want %q", got, wantCutoff)
+	if got := stub.lastLimit(); got != dlqPruneBatch {
+		t.Fatalf("limit = %d, want %d", got, dlqPruneBatch)
 	}
 }
 
-// TestDLQRetentionTickTransientErrorLoggedAndRetried verifies a transient Redis
-// trim failure is logged and swallowed (the tick never stops the worker), so a
-// subsequent tick retries the trim. Unlike the main stream there is no
-// errTrimModeUnsupported signal: an "ERR syntax error" is a transient/unknown
-// failure here too.
+// TestDLQRetentionTickDrainsMultipleBatches proves one bounded tick keeps issuing
+// separate bounded DELETEs while full batches are returned, so configured
+// retention is not limited to 1,000 rows per hour.
+func TestDLQRetentionTickDrainsMultipleBatches(t *testing.T) {
+	stub := &stubDLQPruner{vals: []int{dlqPruneBatch, dlqPruneBatch, 3}}
+	now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+	retention := 7 * 24 * time.Hour
+	dlqRetentionTick(context.Background(), stub, retention, func() time.Time { return now }, testutil.DiscardLogger())
+
+	if got := stub.calls(); got != 3 {
+		t.Fatalf("prune calls = %d, want 3 (two full batches then a short one)", got)
+	}
+	wantCutoff := now.Add(-retention)
+	if got := stub.lastCutoff(); !got.Equal(wantCutoff) {
+		t.Fatalf("cutoff = %v, want %v", got, wantCutoff)
+	}
+	if got := stub.lastLimit(); got != dlqPruneBatch {
+		t.Fatalf("limit = %d, want %d", got, dlqPruneBatch)
+	}
+}
+
+// TestDLQRetentionTickStopsAtContextCancellation proves the drain never runs
+// past its bounded per-tick context.
+func TestDLQRetentionTickStopsAtContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stub := &stubDLQPruner{
+		vals:   []int{dlqPruneBatch},
+		onCall: func(int) { cancel() },
+	}
+	now := func() time.Time { return time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC) }
+	dlqRetentionTick(ctx, stub, 7*24*time.Hour, now, testutil.DiscardLogger())
+	if got := stub.calls(); got != 1 {
+		t.Fatalf("prune calls = %d, want 1 (cancellation stops the drain)", got)
+	}
+}
+
+// TestDLQRetentionTickTransientErrorLoggedAndRetried verifies a transient prune
+// failure is logged and swallowed (the tick never stops the worker), so a
+// subsequent tick retries.
 func TestDLQRetentionTickTransientErrorLoggedAndRetried(t *testing.T) {
-	stub := &stubDLQTrimmer{err: errors.New("redis down")}
+	stub := &stubDLQPruner{err: errors.New("database down")}
 	now := func() time.Time { return time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC) }
 
 	for i := 0; i < 2; i++ {
-		dlqRetentionTick(context.Background(), stub, "relay:events:dlq", 7*24*time.Hour, now, testutil.DiscardLogger())
+		dlqRetentionTick(context.Background(), stub, 7*24*time.Hour, now, testutil.DiscardLogger())
 	}
 
 	if got := stub.calls(); got != 2 {
-		t.Fatalf("trim calls = %d, want 2 (retried on next tick)", got)
+		t.Fatalf("prune calls = %d, want 2 (retried on next tick)", got)
 	}
 }
 
 // TestDLQRetentionLoopStopsOnCancel verifies the DLQ loop exits promptly when
 // ctx is cancelled, mirroring retentionLoop.
 func TestDLQRetentionLoopStopsOnCancel(t *testing.T) {
-	stub := &stubDLQTrimmer{val: 0}
+	stub := &stubDLQPruner{val: 0}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		dlqRetentionLoop(ctx, stub, "relay:events:dlq", 7*24*time.Hour, testutil.DiscardLogger())
+		dlqRetentionLoop(ctx, stub, 7*24*time.Hour, testutil.DiscardLogger())
 	}()
 	cancel()
 	select {
@@ -356,25 +400,22 @@ func TestDLQRetentionLoopStopsOnCancel(t *testing.T) {
 	}
 }
 
-// TestDLQRetentionLoopDoesNotRequireAckedMode pins the isolation contract: the
-// DLQ loop performs its initial trim and keeps ticking even when Redis would
-// reject ACKED for the main stream. Its seam has no mode at all, so it cannot
-// fall into the main loop's disable path. We assert it makes at least the
-// initial trim (and does not exit as if unsupported).
-func TestDLQRetentionLoopDoesNotRequireAckedMode(t *testing.T) {
-	stub := &stubDLQTrimmer{val: 0}
+// TestDLQRetentionLoopPerformsInitialPrune pins that the DLQ loop prunes
+// promptly at startup and does not require any broker capability.
+func TestDLQRetentionLoopPerformsInitialPrune(t *testing.T) {
+	stub := &stubDLQPruner{val: 0}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		dlqRetentionLoop(ctx, stub, "relay:events:dlq", 30*24*time.Hour, testutil.DiscardLogger())
+		dlqRetentionLoop(ctx, stub, 30*24*time.Hour, testutil.DiscardLogger())
 	}()
 	// Wait for the initial trim, then cancel.
 	deadline := time.After(2 * time.Second)
 	for stub.calls() == 0 {
 		select {
 		case <-deadline:
-			t.Fatal("dlqRetentionLoop did not perform an initial trim")
+			t.Fatal("dlqRetentionLoop did not perform an initial prune")
 		default:
 			time.Sleep(time.Millisecond)
 		}
@@ -384,8 +425,5 @@ func TestDLQRetentionLoopDoesNotRequireAckedMode(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("dlqRetentionLoop did not stop on cancel")
-	}
-	if got := stub.lastStream(); got != "relay:events:dlq" {
-		t.Fatalf("trimmed stream = %q, want relay:events:dlq", got)
 	}
 }

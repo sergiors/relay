@@ -20,8 +20,7 @@ import (
 //	attempt starts  → "running:<deadline_ms>:<n>:<token>"   (TryStart, atomic claim)
 //	completes       → "ok"                                  (MarkComplete, CASed on the claim)
 //	fails (retry)   → "next_attempt_at:<deadline_ms>:<n>:<token>" (RecordFailure, same claim)
-//	exhausted       → "exhausted:<n>:<token>"               (MarkExhausted, CASed on the claim)
-//	DLQ persisted   → "exhausted:<n>:<token>:dlq"           (stream layer's atomic persistDLQ append, CASed on the exhausted claim)
+//	exhausted       → "exhausted:<n>:<token>"               (MarkExhausted, CASed on the claim; the stream layer validates it before the PostgreSQL DLQ write)
 //
 // A crash mid-attempt leaves "running:<deadline_ms>:<n>:<token>", whose deadline
 // simply elapses (the persistent hash keeps the marker; nothing expires out of

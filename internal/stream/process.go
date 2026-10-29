@@ -10,6 +10,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel/codes"
 
+	"relay/internal/dlq"
 	"relay/internal/observability/metrics"
 	"relay/internal/observability/tracing"
 	"relay/internal/schedule"
@@ -436,64 +437,14 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 	return "acked", nil
 }
 
-// unpersistedDLQSpecs filters the DLQ entry specs down to those whose entry has
-// not already been persisted, consulting each invocation's per-invocation
-// persistence marker ("exhausted:<attempt>:<token>:dlq") rather than scanning
-// the DLQ stream. Skipping already-persisted entries is what makes retrying a
-// partially-written multi-entry DLQ (after a failed XACK, a crash, or a partial
-// write) idempotent: the retry writes only the missing entries and never
-// duplicates the ones that succeeded. (The atomic persist script also refuses to
-// rewrite an already-marked entry, so this pre-filter is a round-trip
-// optimization and a metrics guard, not the correctness boundary.)
-//
-// It also returns each retained spec's exact exhausted claim identity (from the
-// marker) so the subsequent atomic DLQ-persistence CASes that identity, never a
-// guessed one. A spec with no well-formed exhausted marker carries a zero claim;
-// the atomic script then refuses it without writing, and the message stays
-// pending rather than appending an unattributable entry (a marker-less exhausted
-// invocation is an anomaly: the runner writes the exhausted marker before it
-// reports exhaustion).
-//
-// A store read error fails safe: the spec is kept so the entry is retried (a
-// duplicate is allowed under at-least-once, while skipping a required write
-// would lose the entry). A spec with no invocation ID (the malformed-message
-// placeholder) is always kept; the atomic script skips it via its reserved
-// message-scoped marker.
-func (c *Consumer) unpersistedDLQSpecs(ctx context.Context, msgID string, specs []dlqEntrySpec) []dlqEntrySpec {
-	out := make([]dlqEntrySpec, 0, len(specs))
-	for _, spec := range specs {
-		if spec.invocation == "" {
-			out = append(out, spec)
-			continue
-		}
-		claim, persisted, ok, err := c.invStateStore.exhaustedState(ctx, c.stream, c.group, msgID, spec.invocation)
-		if err != nil {
-			c.log.Warn("Message: DLQ persistence check failed; rewriting entry",
-				"message_id", msgID, "invocation", spec.invocation, "error", err)
-			out = append(out, spec)
-			continue
-		}
-		if ok {
-			spec.claim = claim
-		}
-		if persisted {
-			c.log.Debug("Message: DLQ entry already persisted; skipping write",
-				"message_id", msgID, "invocation", spec.invocation)
-			continue
-		}
-		out = append(out, spec)
-	}
-	return out
-}
-
 // dlqTraceFor reads the compact trace lineage persisted for one exhausted
 // invocation, to be written into its DLQ entry. It consults the invocation-state
 // hash (the "last failed attempt" reference), which the runner wrote on the
-// final attempt and which survives until the state hash is cleared after the DLQ
-// write + ACK. It is best-effort: a placeholder invocation (empty ID) or a read
-// failure yields "" (an omitted field), never a failed DLQ write. Only the
-// compact traceparent[|tracestate] form is stored, so baggage can never reach
-// the DLQ.
+// final attempt and which survives until the state hash is retained/expired
+// after the source ACK. It is best-effort: a placeholder invocation (empty ID)
+// or a read failure yields "" (an omitted field), never a failed DLQ write. Only
+// the compact traceparent[|tracestate] form is stored, so baggage can never
+// reach the DLQ.
 func (c *Consumer) dlqTraceFor(ctx context.Context, msgID, invocation string) string {
 	if invocation == "" {
 		return ""
@@ -507,13 +458,19 @@ func (c *Consumer) dlqTraceFor(ctx context.Context, msgID, invocation string) st
 	return lineage
 }
 
-// routeToDLQ writes one DLQ entry per exhausted invocation and only then acks
-// the original. Each entry's XADD and its persistence marker are performed by
-// ONE atomic script (invocationStateStore.persistDLQ), so a crash or error
-// between the append and the marker can never leave an unmarked entry that a
-// redelivery would append again (F-008); if the script fails, nothing was
-// written and the original stays pending so the next recovery cycle retries the
-// remaining writes rather than losing the message.
+// routeToDLQ persists one dead-letter entry per exhausted invocation, then
+// acknowledges the source delivery. PostgreSQL is the sole DLQ persistence: each
+// row is written idempotently by its stable ID BEFORE the source ACK, so a crash
+// or an ambiguous ACK can never lose a dead letter.
+//
+// Claim validation precedes every real-invocation write: the exhausted marker is
+// read from Redis and its retained attempt must match the one the runner
+// attributed, with a well-formed retained claim token. Exhausted markers are
+// terminal and immutable, and each attempt has exactly one claim token, so a
+// validated identity cannot be superseded; a missing or mismatched marker
+// refuses the write and leaves the source pending rather than creating a row on
+// a stale claim's behalf. The placeholder path has no invocation and therefore
+// no claim to validate.
 //
 // Per-invocation entries: reason is the runner's terminal *HandlerExhaustedError
 // carrying the exact app/handler and exhausted attempt for every terminal
@@ -521,23 +478,16 @@ func (c *Consumer) dlqTraceFor(ctx context.Context, msgID, invocation string) st
 // precisely-attributed entry each (see dlqEntrySpecs). A reason without that
 // typed metadata (a malformed message routed pre-handler) produces a single
 // placeholder entry with an explicit handler_attempts of 0, never one invented
-// from the delivery count; its persistence uses a reserved message-scoped field
-// instead of a handler identity.
+// from the delivery count.
 //
-// Idempotent retry without scanning the DLQ: each invocation's exhausted marker
-// records whether its entry has already been persisted
-// ("exhausted:<attempt>:<token>:dlq"), and the malformed placeholder records its
-// own reserved marker. On a redelivery after an XACK failure or a crash — or
-// after a partial multi-entry write — invocations whose entry already exists are
-// skipped (by the pre-filter and, defensively, by the atomic script itself), so
-// the retry writes only the missing entries and can never duplicate (or lose)
-// the ones that succeeded. The atomic script CASes the retained exhausted
-// identity, so a stale claim can never append an unattributable entry or
-// downgrade a newer marker.
+// Idempotent retry: the stable ID combines the logical source delivery identity
+// with the invocation identity, so a redelivery after a failed ACK, a crash, or
+// a partially-written multi-entry DLQ inserts only the missing rows. PostgreSQL's
+// ON CONFLICT DO NOTHING is the correctness boundary, not a Redis persistence
+// marker.
 //
-// deliveryAttempts is the authoritative Redis Stream/PEL delivery count passed
-// through the consumer/reclaim flow (the DLQ `deliveries` field, diagnostic
-// only).
+// deliveryAttempts is the authoritative source delivery count passed through the
+// consumer/reclaim flow (the DLQ `deliveries` field, diagnostic only).
 func (c *Consumer) routeToDLQ(
 	ctx context.Context,
 	msg redis.XMessage,
@@ -545,18 +495,9 @@ func (c *Consumer) routeToDLQ(
 	deliveries int64,
 ) {
 	event := eventString(msg)
-	specs := c.unpersistedDLQSpecs(ctx, msg.ID, dlqEntrySpecs(reason))
-	if len(specs) == 0 {
-		// Every invocation's entry was already persisted (a redelivery after an
-		// XACK failure, or a fully-written DLQ whose ACK failed). There is
-		// nothing left to write; fall through to the ACK so the message leaves
-		// the PEL with exactly the entries already written, never duplicated.
-		c.log.Debug("Message: all DLQ entries already persisted; acking without rewrite",
-			"message_id", msg.ID)
-	}
 	// An oversized-event rejection overrides the DLQ `event` field with a
 	// bounded diagnostic summary, so the oversized raw payload is never copied
-	// into the DLQ. Every other path keeps the original raw event verbatim.
+	// into PostgreSQL. Every other path keeps the original raw event verbatim.
 	if errors.Is(reason, ErrEventOversized) {
 		var oversize *EventOversizedError
 		if errors.As(reason, &oversize) {
@@ -566,29 +507,73 @@ func (c *Consumer) routeToDLQ(
 	// One child span around the whole DLQ write+ack operation. It is a child of
 	// the current message span; the payload and reason text are never attached
 	// (the reason may quote handler output).
-	dlqCtx, dlqSpan := redisSpan(ctx, "redis.dlq")
+	dlqCtx, dlqSpan := redisSpan(ctx, "dlq.persist")
 	defer dlqSpan.End()
 	ctx = dlqCtx
+
+	if c.dlqStore == nil {
+		// Without a DLQ store the required row cannot be written, so the source
+		// must stay pending. This is a wiring error, not a reason to ACK and
+		// lose the dead letter.
+		err := fmt.Errorf("DLQ store is not configured")
+		dlqSpan.RecordError(err)
+		dlqSpan.SetStatus(codes.Error, err.Error())
+		c.log.Error("Message: DLQ store is not configured; leaving pending",
+			"message_id", msg.ID,
+			"delivery_attempt", deliveries,
+		)
+		c.noteOutcome(err, 0)
+		return
+	}
+
+	specs := dlqEntrySpecs(reason)
+	deliveryID := dlq.NewDeliveryID(c.stream, c.group, msg.ID)
 	for _, spec := range specs {
+		if spec.invocation != "" {
+			claim, exhausted, err := c.invStateStore.exhaustedClaim(
+				ctx, c.stream, c.group, msg.ID, spec.invocation,
+			)
+			if err != nil {
+				dlqSpan.RecordError(err)
+				dlqSpan.SetStatus(codes.Error, err.Error())
+				c.log.Error("Message: exhausted claim validation failed (leaving pending)",
+					"message_id", msg.ID,
+					"delivery_attempt", deliveries,
+					"invocation", spec.invocation,
+					"error", err,
+				)
+				c.noteOutcome(err, 0)
+				return
+			}
+			// A real invocation must still hold a well-formed exhausted marker
+			// whose retained attempt matches the runner's attribution. The token
+			// is validated as part of parsing but never persisted or logged.
+			if !exhausted || claim.Attempt != spec.attempts {
+				err := fmt.Errorf("exhausted claim not current for invocation %q", spec.invocation)
+				dlqSpan.RecordError(err)
+				dlqSpan.SetStatus(codes.Error, err.Error())
+				c.log.Error("Message: exhausted claim is stale or missing; leaving pending",
+					"message_id", msg.ID,
+					"delivery_attempt", deliveries,
+					"invocation", spec.invocation,
+					"attributed_attempt", spec.attempts,
+					"state_attempt", claim.Attempt,
+					"exhausted", exhausted,
+				)
+				c.noteOutcome(err, 0)
+				return
+			}
+		}
 		// The compact lineage of the final failed invocation, read from the
-		// invocation-state hash just before the entry is written (best-effort:
-		// no lineage yields an omitted field). It is a sibling field, not part
-		// of the lifecycle value, so it survives until the state hash is
-		// cleared after the DLQ write + ACK.
+		// invocation-state hash just before the row is written (best-effort: no
+		// lineage yields an omitted field). It is a sibling field, not part of
+		// the lifecycle value.
 		spec.trace = c.dlqTraceFor(ctx, msg.ID, spec.invocation)
-		entry := dlqPayload(
-			c.stream, msg.ID, c.group, c.consumer,
-			event, spec.reason, spec.app, spec.handler, deliveries, spec.attempts, spec.trace,
+		entry := dlqEntry(
+			deliveryID, c.stream, msg.ID, c.group, c.consumer,
+			event, spec, deliveries, time.Now(),
 		)
-		// One atomic script appends the entry AND records its persistence
-		// (per-invocation ":dlq" marker, or the message-scoped placeholder field
-		// for the malformed-message path), so a crash or error between the two
-		// can never leave a duplicate or unmarked entry. On any failure nothing
-		// was written: leave the message pending so the next recovery cycle
-		// retries the remaining writes rather than losing the message.
-		wrote, err := c.invStateStore.persistDLQ(
-			ctx, c.dlqStream, c.stream, c.group, msg.ID, spec.invocation, spec.claim, entry,
-		)
+		inserted, err := c.dlqStore.SaveDLQEntry(ctx, entry)
 		if err != nil {
 			dlqSpan.RecordError(err)
 			dlqSpan.SetStatus(codes.Error, err.Error())
@@ -596,23 +581,24 @@ func (c *Consumer) routeToDLQ(
 				"message_id", msg.ID,
 				"delivery_attempt", deliveries,
 				"invocation", spec.invocation,
+				"dlq_id", entry.ID,
 				"error", err,
 			)
 			c.noteOutcome(err, 0)
 			return
 		}
-		if !wrote {
-			// The entry/placeholder was already persisted (a concurrent or
-			// replayed delivery won the race). No new entry was appended, so the
-			// DLQ counter is deliberately not incremented.
+		if !inserted {
+			// The row was already committed (a redelivery after a failed ACK, or
+			// a concurrent replica). No new entry was written, so the DLQ counter
+			// is deliberately not incremented.
 			c.log.Debug("Message: DLQ entry already persisted; skipping write",
-				"message_id", msg.ID, "invocation", spec.invocation)
+				"message_id", msg.ID, "invocation", spec.invocation, "dlq_id", entry.ID)
 			continue
 		}
 		c.metrics.Inc(metrics.MetricDLQEntries)
 		c.log.Error("Message: invocation routed to DLQ",
 			"message_id", msg.ID,
-			"dlq_stream", c.dlqStream,
+			"dlq_id", entry.ID,
 			"app", spec.app,
 			"handler", spec.handler,
 			"handler_attempts", spec.attempts,
@@ -627,9 +613,25 @@ func (c *Consumer) routeToDLQ(
 		c.noteOutcome(err, 0)
 		return
 	}
-	// The message is dead-lettered and the original acknowledged, and its
-	// invocation-state hash was switched to terminal retention in the SAME atomic
-	// script. Every DLQ entry was persisted before this call, so a failed
-	// ACK can never lose an entry: the message stays pending (the staged marker
-	// is persistent, no TTL) and a redelivery re-acks idempotently.
+	// Every required row was committed before this call, so a failed or lost ACK
+	// can never lose a dead letter: the source stays pending (or the reply is
+	// lost after a successful XACK) and a redelivery either re-inserts the same
+	// stable rows or observes the already-acked state. The ACK script stages its
+	// persistent terminal marker before XACK and applies the retention TTL only
+	// after XACK succeeds, so terminal Redis state never expires while the
+	// source could still be recovered.
+	//
+	// Settlement is recorded only AFTER the ACK resolves successfully. If this
+	// update is lost (crash between Redis and PostgreSQL), the bounded worker
+	// reconciliation observes the source delivery is no longer pending and marks
+	// it settled then.
+	if err := c.dlqStore.MarkDLQDeliverySettled(ctx, deliveryID, time.Now()); err != nil {
+		dlqSpan.RecordError(err)
+		dlqSpan.SetStatus(codes.Error, err.Error())
+		c.log.Warn("Message: DLQ settlement mark failed; reconciliation will retry",
+			"message_id", msg.ID,
+			"delivery_id", deliveryID,
+			"error", err,
+		)
+	}
 }

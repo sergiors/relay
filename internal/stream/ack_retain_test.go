@@ -55,8 +55,9 @@ func TestProductionAckUsesAtomicAckAndRetain(t *testing.T) {
 			}}
 		})
 		assertAtomicAckOnly(t, store)
-		if len(store.dlqAppends) != 1 {
-			t.Fatalf("DLQ appends = %d, want 1 (the entry must be persisted before the ack)", len(store.dlqAppends))
+		dlqStore, ok := c.dlqStore.(*fakeDLQStore)
+		if !ok || len(dlqStore.entries) != 1 {
+			t.Fatalf("DLQ entries = %d, want 1 (the entry must be persisted before the ack)", len(dlqStore.entries))
 		}
 	})
 
