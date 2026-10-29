@@ -85,7 +85,7 @@ services:
       DOCKER_HOST: tcp://socket-proxy:2375
 
       NETWORKS: relay,traefik
-      WORKER_ID: ${WORKER_ID:?Set WORKER_ID}
+      NODE_ID: ${NODE_ID:?Set NODE_ID}
 
       TRAEFIK_NETWORK: traefik
       TRAEFIK_ENTRYPOINTS: websecure

@@ -52,8 +52,8 @@ type workerConfig struct {
 	group        string
 	consumerName string
 	// instanceID is this process's per-incarnation fencing token (state.Options
-	// .Instance). It is deliberately NOT the worker identity — that is
-	// consumerName, standing in for the production WORKER_ID — so a replacement
+	// .Instance). It is deliberately NOT the node identity — that is
+	// consumerName, standing in for the production NODE_ID — so a replacement
 	// incarnation can reuse consumerName with a different instanceID.
 	instanceID  string
 	fnRoot      string
@@ -79,13 +79,13 @@ type workerEnv struct {
 	stream       string
 	group        string
 	consumerName string
-	// workerID is the worker identity (the production WORKER_ID): the state
-	// handle's owner, the relay.hostname label, and the Redis consumer. It
+	// nodeID is the node identity (the production NODE_ID): the state
+	// handle's owner, the relay.node_id label, and the Redis consumer. It
 	// equals consumerName; it is named separately so a test reads the identity it
 	// asserts against (a replacement incarnation reuses it).
-	workerID string
+	nodeID string
 	// stateDSN is the isolated schema DSN the harness opened, so a test can open
-	// a replacement incarnation of the SAME worker identity.
+	// a replacement incarnation of the SAME node identity.
 	stateDSN string
 	// ready and loss are the readiness state and the once-only ownership-loss
 	// latch the monitor drives; monitorDone closes when the monitor exits.
@@ -106,7 +106,7 @@ type workerEnv struct {
 // (manager, state, consumer) to drive and assert the shutdown path.
 //
 // It also installs the real ownership monitor over the state handle's pinned
-// WORKER_ID lock (startOwnershipMonitor + ownershipLossAction), so both the
+// NODE_ID lock (startOwnershipMonitor + ownershipLossAction), so both the
 // graceful-shutdown and ownership-loss tests exercise the same detection path
 // production does; the monitor is joined before the state handle closes.
 //
@@ -176,14 +176,14 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 		t.Fatalf("load apps: %v", err)
 	}
 
-	st, err := state.Open(context.Background(), state.Options{DSN: cfg.stateDSN, Owner: cfg.consumerName, Instance: cfg.instanceID, Logger: logger})
+	st, err := state.Open(context.Background(), state.Options{DSN: cfg.stateDSN, NodeID: cfg.consumerName, Instance: cfg.instanceID, Logger: logger})
 	if err != nil {
 		t.Fatalf("state open: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
 	// The ownership monitor mirrors the worker: it re-verifies the pinned
-	// WORKER_ID lock through the real State.VerifyOwnerLock and, on a detected
+	// NODE_ID lock through the real State.VerifyOwnerLock and, on a detected
 	// loss, runs the shared once-only action (clear readiness, cancel the
 	// lifecycle) exactly as production does. Readiness is marked ready at the
 	// ready-to-consume boundary below with the SAME live dependency probe
@@ -234,7 +234,7 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	}
 	t.Cleanup(func() { _ = manager.Close() })
 
-	// Conservative startup orphan sweep, hostname-scoped so it never touches the
+	// Conservative startup orphan sweep, nodeID-scoped so it never touches the
 	// real relay container (hostname "relay-relay") or another worker's.
 	sweepCtx, sweepCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	_, _ = manager.SweepOrphanContainers(sweepCtx, cfg.consumerName)
@@ -312,7 +312,7 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	}()
 
 	runWorker := runner.NewWithMetrics(prepared, logger, m)
-	runWorker.SetHostname(cfg.consumerName)
+	runWorker.SetNodeID(cfg.consumerName)
 	runWorker.SetMaxHandlerTimeout(stream.MaxRuleTimeout)
 
 	rec := reconciler.New(
@@ -349,7 +349,7 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 		ctx: ctx, cancel: cancel, consumeDone: consumeDone,
 		buf: buf, m: m, st: st, client: rdb,
 		stream: cfg.stream, group: cfg.group, consumerName: cfg.consumerName,
-		workerID: cfg.consumerName, stateDSN: cfg.stateDSN,
+		nodeID: cfg.consumerName, stateDSN: cfg.stateDSN,
 		ready: ready, loss: loss, monitorDone: monitorDone,
 		metricsDone: metricsDone, statsDone: statsDone,
 	}
@@ -532,8 +532,8 @@ export async function slow(event) {
 	// lives in the request frame and the output prefix — so the identity label
 	// set is the stable wait predicate.)
 	containerID := waitForContainer(t, dcli, map[string]string{
-		"relay.app":      fnName,
-		"relay.hostname": consumerName,
+		"relay.app":     fnName,
+		"relay.node_id": consumerName,
 	})
 	t.Logf("in-flight container %s observed", containerID)
 
@@ -606,8 +606,8 @@ export async function slow(event) {
 	// Docker cleanup completed: the in-flight container is gone (AutoRemove after
 	// the kill, plus the deferred best-effort remove).
 	if !waitForContainerGone(t, dcli, map[string]string{
-		"relay.app":      fnName,
-		"relay.hostname": consumerName,
+		"relay.app":     fnName,
+		"relay.node_id": consumerName,
 	}) {
 		t.Error("in-flight container should have been removed after shutdown")
 	}

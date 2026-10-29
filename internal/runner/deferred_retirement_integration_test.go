@@ -98,7 +98,7 @@ func TestIntegrationDeferredRetirementReDrivenAfterServiceContainerStops(t *test
 				"relay.app":      appName,
 				"relay.service":  appName,
 				"relay.identity": "service.js",
-				"relay.hostname": "test-host",
+				"relay.node_id":  "test-host",
 			},
 		},
 	})

@@ -9,15 +9,15 @@ import (
 )
 
 // ErrOwnerLockLost reports that a State handle no longer holds the exclusive
-// session advisory lock for its worker identity (see Open/acquireWorkerLock). It
+// session advisory lock for its node identity (see Open/acquireNodeLock). It
 // is fail-closed: the caller must treat the identity as no longer owned — stop
 // acting as that worker (stop scheduling, cancel the lifecycle) and must not
 // perform any cleanup scoped to the identity, because a replacement process may
 // already own it.
-var ErrOwnerLockLost = errors.New("worker ownership lock lost")
+var ErrOwnerLockLost = errors.New("node ownership lock lost")
 
-// Ownership-verification defaults. The owner lock is the cross-process guarantee
-// that two workers never share a WORKER_ID; verifying it periodically detects
+// Ownership-verification defaults. The node lock is the cross-process guarantee
+// that two nodes never share a NODE_ID; verifying it periodically detects
 // the residual case where the pinned lock connection is lost while the process
 // keeps running (a terminated backend, a broken link) or the lock is released
 // out from under it. Detection is INTERVAL-BOUNDED, not instantaneous: the check
@@ -38,7 +38,7 @@ const (
 )
 
 // verifyOwnerLockQuery re-checks, server-side and on the pinned lock connection,
-// that this worker identity's session advisory lock is STILL held by this exact
+// that this node identity's session advisory lock is STILL held by this exact
 // backend. pg_backend_pid() is evaluated on the pinned connection, so the
 // subquery is scoped to the backend this check actually ran on; the advisory key
 // is reconstructed from pg_locks' classid/objid (the single-bigint
@@ -55,7 +55,7 @@ const verifyOwnerLockQuery = `
 	       )`
 
 // backendPID reads the PostgreSQL backend PID of conn. It is captured once,
-// immediately after the owner lock is acquired, so VerifyOwnerLock can detect a
+// immediately after the node lock is acquired, so VerifyOwnerLock can detect a
 // silently replaced connection.
 func backendPID(ctx context.Context, conn *sql.Conn) (int, error) {
 	var pid int
@@ -66,7 +66,7 @@ func backendPID(ctx context.Context, conn *sql.Conn) (int, error) {
 }
 
 // VerifyOwnerLock performs ONE ownership check and returns nil while this handle
-// still owns its worker identity's exclusive session advisory lock. It queries
+// still owns its node identity's exclusive session advisory lock. It queries
 // ONLY the pinned lock connection acquired by Open (ownerConn) — never the pool,
 // a replacement connection, or pg_try_advisory_lock, any of which could
 // re-acquire the lock and mask a loss. It fails closed with ErrOwnerLockLost on
@@ -97,7 +97,7 @@ func backendPID(ctx context.Context, conn *sql.Conn) (int, error) {
 // and is therefore never monitored. This method performs a single query and does
 // not itself retry or sleep.
 func (st *State) VerifyOwnerLock(ctx context.Context) error {
-	if st == nil || st.owner == "" {
+	if st == nil || st.nodeID == "" {
 		return nil
 	}
 	// Serialize ALL access to the pinned lock connection: concurrent checks must
@@ -113,14 +113,14 @@ func (st *State) VerifyOwnerLock(ctx context.Context) error {
 		pid  int
 		held bool
 	)
-	if err := conn.QueryRowContext(ctx, verifyOwnerLockQuery, workerLockKey(st.owner)).Scan(&pid, &held); err != nil {
+	if err := conn.QueryRowContext(ctx, verifyOwnerLockQuery, nodeLockKey(st.nodeID)).Scan(&pid, &held); err != nil {
 		return fmt.Errorf("%w: verify on lock connection: %w", ErrOwnerLockLost, err)
 	}
 	if st.ownerPID > 0 && pid != st.ownerPID {
 		return fmt.Errorf("%w: lock-connection backend pid changed from %d to %d", ErrOwnerLockLost, st.ownerPID, pid)
 	}
 	if !held {
-		return fmt.Errorf("%w: session advisory lock for worker %q is no longer held", ErrOwnerLockLost, st.owner)
+		return fmt.Errorf("%w: session advisory lock for node %q is no longer held", ErrOwnerLockLost, st.nodeID)
 	}
 	return nil
 }

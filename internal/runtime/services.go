@@ -1,11 +1,11 @@
 package runtime
 
 import (
-	"maps"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"sort"
 	"strconv"
 	"strings"
@@ -92,10 +92,10 @@ type ServiceSpec struct {
 }
 
 // ServiceContainer is one discovered service container, as stamped on its
-// labels. Hostname is the worker identity that created it (relay.hostname).
+// labels. NodeID is the node identity that created it (relay.node_id).
 // Discovery is deliberately unscoped, but a worker-wired ServiceReconciler
-// compares it to the worker's stable WORKER_ID so it only converges, adopts,
-// and removes its OWN containers: a restart of the same WORKER_ID still
+// compares it to its stable NODE_ID so it only converges, adopts,
+// and removes its OWN containers: a restart of the same NODE_ID still
 // reconciles them, while another worker's service containers on a shared daemon
 // are left untouched.
 type ServiceContainer struct {
@@ -111,10 +111,10 @@ type ServiceContainer struct {
 	SourceRef string
 	Image     string
 	// ImageID is the local content ID of Image, parsed from relay.image_id ("").
-	ImageID  string
-	Hostname string
-	State    container.ContainerState
-	Replica  int
+	ImageID string
+	NodeID  string
+	State   container.ContainerState
+	Replica int
 	// Port is the container's configured internal port, parsed from its
 	// relay.port label. It defaults to 0 when the label is missing/invalid.
 	// The service reconciler uses it to detect a port change (a stale-config
@@ -212,7 +212,7 @@ func sanitizeContainerNamePart(s string) string {
 func serviceContainerName(appName, serviceName string, replica int) string {
 	suffix := "-" + serviceNameHash(appName, serviceName) + "-" + strconv.Itoa(replica)
 	base := "relay-svc-" + appName + "-" + sanitizeContainerNamePart(serviceName)
-	maxBase := max(serviceContainerNameLenCap - len(suffix), 0)
+	maxBase := max(serviceContainerNameLenCap-len(suffix), 0)
 	if len(base) > maxBase {
 		base = strings.TrimRight(base[:maxBase], "-")
 	}
@@ -345,7 +345,7 @@ func EnvHash(env []string) string {
 }
 
 // serviceLabels is the total, greppable label set stamped on every service
-// container: relay.type=service plus relay.app + relay.hostname make a
+// container: relay.type=service plus relay.app + relay.node_id make a
 // service container recognizable to Relay while the strict relay.type guard
 // lets sweeps/reconcilers distinguish the service population from one-shot
 // invocation containers. relay.service is the service IDENTITY (the template's
@@ -362,7 +362,7 @@ func EnvHash(env []string) string {
 // on top, then the relay ownership keys are RE-applied last so Relay's
 // ownership labels are always authoritative: a caller can add labels but never
 // clobber or spoof a relay.* key.
-func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]string {
+func serviceLabels(spec ServiceSpec, nodeID string, replica int) map[string]string {
 	envHash := EnvHash(spec.Env)
 	resourceHash := spec.Resources.OrDefault().Fingerprint()
 	sourceID := ""
@@ -375,7 +375,7 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 		labelService:   spec.Name,
 		labelIdentity:  spec.SourceRef,
 		labelImage:     spec.Image,
-		labelHostname:  hostname,
+		labelNodeID:    nodeID,
 		labelPort:      strconv.Itoa(spec.Port),
 		labelReplica:   strconv.Itoa(replica),
 		labelEnvHash:   envHash,
@@ -396,7 +396,7 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 	labels[labelService] = spec.Name
 	labels[labelIdentity] = spec.SourceRef
 	labels[labelImage] = spec.Image
-	labels[labelHostname] = hostname
+	labels[labelNodeID] = nodeID
 	labels[labelPort] = strconv.Itoa(spec.Port)
 	labels[labelReplica] = strconv.Itoa(replica)
 	labels[labelEnvHash] = envHash
@@ -505,7 +505,7 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 	cfg := &container.Config{
 		Image:  spec.Image,
 		Env:    spec.Env,
-		Labels: serviceLabels(spec, m.hostname, replica),
+		Labels: serviceLabels(spec, m.nodeID, replica),
 		// ExposedPorts is metadata only (informational). Relay does NOT publish a
 		// host port this iteration: no HostConfig.PortBindings.
 		ExposedPorts: network.PortSet{network.MustParsePort(fmt.Sprintf("%d/tcp", spec.Port)): {}},
@@ -654,9 +654,9 @@ type dockerOpAdmitter func(ctx context.Context) (context.Context, func(), error)
 // NOT combined with a non-empty relay.app check: stale containers (a
 // app removed while Relay was down) must still be discovered and returned so
 // the reconciler's cross-app orphan sweep can identify and remove them.
-// Hostname is deliberately NOT part of discovery (services stay reconcilable
+// NodeID is deliberately NOT part of discovery (services stay reconcilable
 // across worker restarts; the worker-wired reconciler applies its own
-// stable-WORKER_ID scope, see ServiceContainer), but it IS included in the
+// stable-NODE_ID scope, see ServiceContainer), but it IS included in the
 // result. Replica is parsed from labelReplica, defaulting to -1 when
 // missing/invalid.
 func (m *Manager) ServiceContainerList(ctx context.Context) ([]ServiceContainer, error) {
@@ -717,7 +717,7 @@ func (m *Manager) serviceContainerList(ctx context.Context, admit dockerOpAdmitt
 			SourceRef: c.Labels[labelIdentity],
 			Image:     c.Labels[labelImage],
 			ImageID:   c.Labels[labelImageID],
-			Hostname:  c.Labels[labelHostname],
+			NodeID:    c.Labels[labelNodeID],
 			State:     c.State,
 			Replica:   replica,
 			Port:      port,

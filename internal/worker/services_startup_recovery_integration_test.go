@@ -1,9 +1,9 @@
 //go:build integration
 
 // This file proves the startup service recovery path against REAL Docker and
-// PostgreSQL: a previous Relay incarnation exits abruptly (its pinned WORKER_ID
+// PostgreSQL: a previous Relay incarnation exits abruptly (its pinned NODE_ID
 // lock backend is terminated server-side while its containers keep running) and
-// a replacement incarnation with the SAME WORKER_ID recovers.
+// a replacement incarnation with the SAME NODE_ID recovers.
 //
 // It is excluded from the default suite by the integration build tag, so
 // running it (`go test -tags=integration ./internal/worker/`) REQUIRES a
@@ -115,9 +115,9 @@ func startRecoveryService(
 
 // createRecoveryExecutionContainer starts a raw managed execution container
 // (the strict relay.type=event/schedule form the startup execution sweep
-// selects) for one worker identity.
+// selects) for one node identity.
 func createRecoveryExecutionContainer(
-	t *testing.T, cli *client.Client, workerID, appName, containerType string,
+	t *testing.T, cli *client.Client, nodeID, appName, containerType string,
 ) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -127,10 +127,10 @@ func createRecoveryExecutionContainer(
 			Image:      recoveryImage,
 			Entrypoint: recoveryServiceEntry(),
 			Labels: map[string]string{
-				"relay.type":     containerType,
-				"relay.hostname": workerID,
-				"relay.app":      appName,
-				"relay.handler":  "index.handler",
+				"relay.type":    containerType,
+				"relay.node_id": nodeID,
+				"relay.app":     appName,
+				"relay.handler": "index.handler",
 			},
 		},
 		// Real Relay execution containers are AutoRemove; a RUNNING abandoned
@@ -139,7 +139,7 @@ func createRecoveryExecutionContainer(
 		HostConfig: &container.HostConfig{AutoRemove: true},
 	})
 	if err != nil {
-		t.Fatalf("create %s execution container for %q: %v", containerType, workerID, err)
+		t.Fatalf("create %s execution container for %q: %v", containerType, nodeID, err)
 	}
 	if _, err := cli.ContainerStart(ctx, created.ID, client.ContainerStartOptions{}); err != nil {
 		t.Fatalf("start %s execution container %s: %v", containerType, created.ID, err)
@@ -203,7 +203,7 @@ func recoveryWaitContainerGone(t *testing.T, cli *client.Client, id string) {
 // polling while PostgreSQL finishes releasing the terminated owner's session
 // advisory lock. It mirrors testutil.OpenState, but a lock that is still being
 // torn down is a transient startup race rather than a test failure.
-func openRecoveryReplacementState(t *testing.T, dsn, workerID, instanceID string) *state.State {
+func openRecoveryReplacementState(t *testing.T, dsn, nodeID, instanceID string) *state.State {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -211,7 +211,7 @@ func openRecoveryReplacementState(t *testing.T, dsn, workerID, instanceID string
 	for {
 		st, err := state.Open(context.Background(), state.Options{
 			DSN:      dsn,
-			Owner:    workerID,
+			NodeID:   nodeID,
 			Instance: instanceID,
 		})
 		if err == nil {
@@ -221,7 +221,7 @@ func openRecoveryReplacementState(t *testing.T, dsn, workerID, instanceID string
 		lastErr = err
 		select {
 		case <-ctx.Done():
-			t.Fatalf("open replacement state for %q: %v", workerID, lastErr)
+			t.Fatalf("open replacement state for %q: %v", nodeID, lastErr)
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
@@ -230,11 +230,11 @@ func openRecoveryReplacementState(t *testing.T, dsn, workerID, instanceID string
 // TestIntegrationStartupRecoveryAdoptsServiceAfterAbruptExit is the end-to-end
 // crash-recovery scenario over real Docker and PostgreSQL:
 //
-//	Given a previous worker incarnation holds WORKER_ID and leaves behind a
+//	Given a previous worker incarnation holds NODE_ID and leaves behind a
 //	      running converged service, an obsolete same-identity service, managed
-//	      execution containers, and services owned by ANOTHER worker identity,
+//	      execution containers, and services owned by ANOTHER node identity,
 //	When  its pinned PostgreSQL lock backend is terminated (an abrupt exit) and
-//	      a replacement with the SAME WORKER_ID runs the startup sequence,
+//	      a replacement with the SAME NODE_ID runs the startup sequence,
 //	Then  the old execution containers are removed, the converged service is
 //	      adopted by the SAME Docker id, the obsolete same-identity service is
 //	      removed, every other identity's container survives, and repeating the
@@ -245,8 +245,8 @@ func TestIntegrationStartupRecoveryAdoptsServiceAfterAbruptExit(t *testing.T) {
 	logger := testutil.DiscardLogger()
 	ensureRecoveryImage(t, dcli)
 
-	workerID := testutil.UniqueName(t, "recov")
-	otherWorkerID := testutil.UniqueName(t, "recov-other")
+	nodeID := testutil.UniqueName(t, "recov")
+	otherNodeID := testutil.UniqueName(t, "recov-other")
 	desiredApp := testutil.UniqueName(t, "recov-desired")
 	removalApp := testutil.UniqueName(t, "recov-remove")
 	obsoleteApp := testutil.UniqueName(t, "recov-obsolete")
@@ -265,8 +265,8 @@ func TestIntegrationStartupRecoveryAdoptsServiceAfterAbruptExit(t *testing.T) {
 			return
 		}
 		for _, c := range list.Items {
-			host := c.Labels["relay.hostname"]
-			if host == workerID || host == otherWorkerID {
+			host := c.Labels["relay.node_id"]
+			if host == nodeID || host == otherNodeID {
 				if _, err := dcli.ContainerRemove(
 					ctx, c.ID, client.ContainerRemoveOptions{Force: true},
 				); err != nil {
@@ -276,16 +276,16 @@ func TestIntegrationStartupRecoveryAdoptsServiceAfterAbruptExit(t *testing.T) {
 		}
 	})
 
-	// Given: the previous incarnation owns the WORKER_ID lock and has left real
+	// Given: the previous incarnation owns the NODE_ID lock and has left real
 	// Docker state behind, as a crash mid-run would.
-	previous := testutil.OpenState(t, dsn, state.Options{Owner: workerID, Instance: "previous"})
+	previous := testutil.OpenState(t, dsn, state.Options{NodeID: nodeID, Instance: "previous"})
 	// The other identity is genuinely ACTIVE: it holds its own PG lock, so the
 	// foreign containers below model a live peer sharing the daemon rather than
 	// a stale label set.
-	otherState := testutil.OpenState(t, dsn, state.Options{Owner: otherWorkerID, Instance: "other"})
+	otherState := testutil.OpenState(t, dsn, state.Options{NodeID: otherNodeID, Instance: "other"})
 	tmpl := recoveryServiceTemplate()
 
-	previousManager, err := runtime.NewManager(logger, nil, workerID)
+	previousManager, err := runtime.NewManager(logger, nil, nodeID)
 	if err != nil {
 		t.Fatalf("previous runtime manager: %v", err)
 	}
@@ -294,22 +294,22 @@ func TestIntegrationStartupRecoveryAdoptsServiceAfterAbruptExit(t *testing.T) {
 	desiredID := startRecoveryService(t, previousManager, desiredApp, tmpl, 0)
 	obsoleteID := startRecoveryService(t, previousManager, obsoleteApp, tmpl, 0)
 
-	otherManager, err := runtime.NewManager(logger, nil, otherWorkerID)
+	otherManager, err := runtime.NewManager(logger, nil, otherNodeID)
 	if err != nil {
 		t.Fatalf("other worker runtime manager: %v", err)
 	}
 	t.Cleanup(func() { _ = otherManager.Close() })
 
-	// Same app as the desired service, but owned by the OTHER worker identity:
+	// Same app as the desired service, but owned by the OTHER node identity:
 	// convergence must never adopt or disturb it.
 	foreignSameAppID := startRecoveryService(t, otherManager, desiredApp, tmpl, 1)
 	// Same ABSENT app as the obsolete service, but owned by the OTHER worker
 	// identity: the orphan sweep must never sweep it.
 	foreignObsoleteID := startRecoveryService(t, otherManager, obsoleteApp, tmpl, 1)
 
-	executionID := createRecoveryExecutionContainer(t, dcli, workerID, executionApp, "event")
-	scheduledID := createRecoveryExecutionContainer(t, dcli, workerID, scheduledApp, "schedule")
-	foreignExecutionID := createRecoveryExecutionContainer(t, dcli, otherWorkerID, executionApp, "event")
+	executionID := createRecoveryExecutionContainer(t, dcli, nodeID, executionApp, "event")
+	scheduledID := createRecoveryExecutionContainer(t, dcli, nodeID, scheduledApp, "schedule")
+	foreignExecutionID := createRecoveryExecutionContainer(t, dcli, otherNodeID, executionApp, "event")
 
 	// Given: the previous incarnation's pinned lock backend is terminated from a
 	// SEPARATE connection. The process is gone without releasing anything; the
@@ -330,14 +330,14 @@ func TestIntegrationStartupRecoveryAdoptsServiceAfterAbruptExit(t *testing.T) {
 		t.Fatalf("terminate previous owner backend: %v", err)
 	}
 
-	// When: a replacement incarnation of the SAME WORKER_ID takes the identity.
-	current := openRecoveryReplacementState(t, dsn, workerID, "current")
+	// When: a replacement incarnation of the SAME NODE_ID takes the identity.
+	current := openRecoveryReplacementState(t, dsn, nodeID, "current")
 	if err := current.VerifyOwnerLock(context.Background()); err != nil {
 		t.Fatalf("replacement VerifyOwnerLock = %v, want nil", err)
 	}
 	proof := ownershipProof{loss: &ownershipLoss{}, verify: current.VerifyOwnerLock}
 
-	currentManager, err := runtime.NewManager(logger, nil, workerID)
+	currentManager, err := runtime.NewManager(logger, nil, nodeID)
 	if err != nil {
 		t.Fatalf("replacement runtime manager: %v", err)
 	}
@@ -345,7 +345,7 @@ func TestIntegrationStartupRecoveryAdoptsServiceAfterAbruptExit(t *testing.T) {
 
 	svcCtrl := reconciler.NewServiceReconciler(
 		currentManager, nil, routing.TraefikConfig{}, logger, reconcileTimeout,
-		reconciler.WithWorkerID(workerID),
+		reconciler.WithNodeID(nodeID),
 	)
 
 	// Startup service housekeeping is asynchronous in production: Run publishes
@@ -383,7 +383,7 @@ func TestIntegrationStartupRecoveryAdoptsServiceAfterAbruptExit(t *testing.T) {
 		_, sweepErr := retryIdentitySnapshotCleanup(
 			sweepCtx, proof, logger, "orphan-sweep",
 			func(stepCtx context.Context) ([]runtime.OrphanContainer, error) {
-				return currentManager.DiscoverOrphanContainers(stepCtx, workerID)
+				return currentManager.DiscoverOrphanContainers(stepCtx, nodeID)
 			},
 			func(stepCtx context.Context, orphans []runtime.OrphanContainer) (int, error) {
 				return currentManager.RemoveOrphanContainers(stepCtx, orphans)
@@ -434,9 +434,9 @@ func TestIntegrationStartupRecoveryAdoptsServiceAfterAbruptExit(t *testing.T) {
 	// The converged service was adopted, not recreated: exactly one container for
 	// the app and this identity, and it is the SAME immutable Docker id.
 	desiredIDs := recoveryContainerIDs(t, dcli, map[string]string{
-		"relay.type":     "service",
-		"relay.hostname": workerID,
-		"relay.app":      desiredApp,
+		"relay.type":    "service",
+		"relay.node_id": nodeID,
+		"relay.app":     desiredApp,
 	})
 	if len(desiredIDs) != 1 || desiredIDs[0] != desiredID {
 		t.Fatalf("desired service containers = %v, want exactly [%s] (same-id adoption)", desiredIDs, desiredID)
@@ -455,10 +455,10 @@ func TestIntegrationStartupRecoveryAdoptsServiceAfterAbruptExit(t *testing.T) {
 	if !recoveryContainerRunning(t, dcli, foreignExecutionID) {
 		t.Fatalf("another worker's execution container %s was swept", foreignExecutionID)
 	}
-	// The other worker identity remains genuinely active: recovering one
+	// The other node identity remains genuinely active: recovering one
 	// identity must not disturb a live peer's own lock.
 	if err := otherState.VerifyOwnerLock(context.Background()); err != nil {
-		t.Fatalf("recovering %q disturbed the other active worker's identity: %v", workerID, err)
+		t.Fatalf("recovering %q disturbed the other active node's identity: %v", nodeID, err)
 	}
 
 	// When: the same recovery runs again, it is an idempotent no-op.
@@ -467,9 +467,9 @@ func TestIntegrationStartupRecoveryAdoptsServiceAfterAbruptExit(t *testing.T) {
 	recoveryWaitContainerGone(t, dcli, scheduledID)
 	recoveryWaitContainerGone(t, dcli, obsoleteID)
 	if ids := recoveryContainerIDs(t, dcli, map[string]string{
-		"relay.type":     "service",
-		"relay.hostname": workerID,
-		"relay.app":      desiredApp,
+		"relay.type":    "service",
+		"relay.node_id": nodeID,
+		"relay.app":     desiredApp,
 	}); len(ids) != 1 || ids[0] != desiredID {
 		t.Fatalf("after repeated recovery desired service containers = %v, want exactly [%s]", ids, desiredID)
 	}
@@ -483,7 +483,7 @@ func TestIntegrationStartupRecoveryAdoptsServiceAfterAbruptExit(t *testing.T) {
 		}
 	}
 
-	// Worker-scoped app removal must remove only this worker's service even
+	// Node-scoped app removal must remove only this worker's service even
 	// when another active worker has a service for the same app.
 	removalServiceID := startRecoveryService(t, currentManager, removalApp, tmpl, 0)
 	foreignRemovalServiceID := startRecoveryService(t, otherManager, removalApp, tmpl, 0)
@@ -498,7 +498,7 @@ func TestIntegrationStartupRecoveryAdoptsServiceAfterAbruptExit(t *testing.T) {
 		svcCtrl.Remove(ctx, removalApp)
 	}); err != nil {
 		cancelRemove()
-		t.Fatalf("run worker-scoped app removal exclusively: %v", err)
+		t.Fatalf("run node-scoped app removal exclusively: %v", err)
 	}
 	if err := services.Wait(removeCtx); err != nil {
 		cancelRemove()
@@ -510,7 +510,7 @@ func TestIntegrationStartupRecoveryAdoptsServiceAfterAbruptExit(t *testing.T) {
 	}
 	recoveryWaitContainerGone(t, dcli, removalServiceID)
 	if !recoveryContainerRunning(t, dcli, foreignRemovalServiceID) {
-		t.Fatalf("another worker's same-app service %s was removed by worker-scoped app removal", foreignRemovalServiceID)
+		t.Fatalf("another worker's same-app service %s was removed by node-scoped app removal", foreignRemovalServiceID)
 	}
 
 	// Ordinary live convergence still runs after recovery: publishing the
@@ -526,9 +526,9 @@ func TestIntegrationStartupRecoveryAdoptsServiceAfterAbruptExit(t *testing.T) {
 
 // TestIntegrationStartupRecoveryFinishesInterruptedOrphanSweep proves that a
 // startup execution-orphan sweep interrupted by a crash is completed by the
-// next replacement of the SAME WORKER_ID:
+// next replacement of the SAME NODE_ID:
 //
-//	Given a worker identity owns TWO abandoned managed execution containers,
+//	Given a node identity owns TWO abandoned managed execution containers,
 //	When  one replacement removes only ONE of them and then loses its pinned
 //	      PostgreSQL backend (an abrupt exit) before touching the other,
 //	Then  a subsequent replacement of the SAME identity discovers and removes
@@ -543,7 +543,7 @@ func TestIntegrationStartupRecoveryFinishesInterruptedOrphanSweep(t *testing.T) 
 	logger := testutil.DiscardLogger()
 	ensureRecoveryImage(t, dcli)
 
-	workerID := testutil.UniqueName(t, "recov-partial")
+	nodeID := testutil.UniqueName(t, "recov-partial")
 	firstApp := testutil.UniqueName(t, "recov-partial-a")
 	secondApp := testutil.UniqueName(t, "recov-partial-b")
 
@@ -556,7 +556,7 @@ func TestIntegrationStartupRecoveryFinishesInterruptedOrphanSweep(t *testing.T) 
 			return
 		}
 		for _, c := range list.Items {
-			if c.Labels["relay.hostname"] != workerID {
+			if c.Labels["relay.node_id"] != nodeID {
 				continue
 			}
 			if _, err := dcli.ContainerRemove(
@@ -569,9 +569,9 @@ func TestIntegrationStartupRecoveryFinishesInterruptedOrphanSweep(t *testing.T) 
 
 	// Given: the previous incarnation owns the identity and leaves two managed
 	// execution containers behind.
-	previous := testutil.OpenState(t, dsn, state.Options{Owner: workerID, Instance: "previous"})
-	firstID := createRecoveryExecutionContainer(t, dcli, workerID, firstApp, "event")
-	secondID := createRecoveryExecutionContainer(t, dcli, workerID, secondApp, "schedule")
+	previous := testutil.OpenState(t, dsn, state.Options{NodeID: nodeID, Instance: "previous"})
+	firstID := createRecoveryExecutionContainer(t, dcli, nodeID, firstApp, "event")
+	secondID := createRecoveryExecutionContainer(t, dcli, nodeID, secondApp, "schedule")
 
 	admin, err := sql.Open("pgx", dsn)
 	if err != nil {
@@ -591,15 +591,15 @@ func TestIntegrationStartupRecoveryFinishesInterruptedOrphanSweep(t *testing.T) 
 
 	// When: the first replacement removes only ONE of the two candidates and
 	// then exits abruptly before it can sweep the other.
-	partial := openRecoveryReplacementState(t, dsn, workerID, "partial")
-	partialManager, err := runtime.NewManager(logger, nil, workerID)
+	partial := openRecoveryReplacementState(t, dsn, nodeID, "partial")
+	partialManager, err := runtime.NewManager(logger, nil, nodeID)
 	if err != nil {
 		t.Fatalf("partial replacement runtime manager: %v", err)
 	}
 	t.Cleanup(func() { _ = partialManager.Close() })
 
 	discoverCtx, cancelDiscover := context.WithTimeout(context.Background(), reconcileTimeout)
-	orphans, err := partialManager.DiscoverOrphanContainers(discoverCtx, workerID)
+	orphans, err := partialManager.DiscoverOrphanContainers(discoverCtx, nodeID)
 	cancelDiscover()
 	if err != nil {
 		t.Fatalf("partial replacement discover orphans: %v", err)
@@ -642,8 +642,8 @@ func TestIntegrationStartupRecoveryFinishesInterruptedOrphanSweep(t *testing.T) 
 	}
 
 	// Then: the next replacement of the SAME identity completes the sweep.
-	final := openRecoveryReplacementState(t, dsn, workerID, "final")
-	finalManager, err := runtime.NewManager(logger, nil, workerID)
+	final := openRecoveryReplacementState(t, dsn, nodeID, "final")
+	finalManager, err := runtime.NewManager(logger, nil, nodeID)
 	if err != nil {
 		t.Fatalf("final replacement runtime manager: %v", err)
 	}
@@ -654,7 +654,7 @@ func TestIntegrationStartupRecoveryFinishesInterruptedOrphanSweep(t *testing.T) 
 	_, sweepErr := retryIdentitySnapshotCleanup(
 		sweepCtx, finalProof, logger, "orphan-sweep",
 		func(stepCtx context.Context) ([]runtime.OrphanContainer, error) {
-			return finalManager.DiscoverOrphanContainers(stepCtx, workerID)
+			return finalManager.DiscoverOrphanContainers(stepCtx, nodeID)
 		},
 		func(stepCtx context.Context, orphans []runtime.OrphanContainer) (int, error) {
 			return finalManager.RemoveOrphanContainers(stepCtx, orphans)
@@ -668,8 +668,8 @@ func TestIntegrationStartupRecoveryFinishesInterruptedOrphanSweep(t *testing.T) 
 
 	for _, containerType := range []string{"event", "schedule"} {
 		if ids := recoveryContainerIDs(t, dcli, map[string]string{
-			"relay.hostname": workerID,
-			"relay.type":     containerType,
+			"relay.node_id": nodeID,
+			"relay.type":    containerType,
 		}); len(ids) != 0 {
 			t.Fatalf("%s execution orphans remain after the completing restart: %v", containerType, ids)
 		}
@@ -678,7 +678,7 @@ func TestIntegrationStartupRecoveryFinishesInterruptedOrphanSweep(t *testing.T) 
 
 // TestIntegrationStartupSweepsSkipRemovalAfterOwnershipLoss proves the
 // startup-path fail-closed contract over real Docker and PostgreSQL: after the
-// pinned WORKER_ID lock is genuinely lost, both startup sweeps still discover
+// pinned NODE_ID lock is genuinely lost, both startup sweeps still discover
 // this identity's candidates but the failed ownership proof suppresses every
 // removal, so a replacement owner's containers are never disturbed.
 func TestIntegrationStartupSweepsSkipRemovalAfterOwnershipLoss(t *testing.T) {
@@ -687,7 +687,7 @@ func TestIntegrationStartupSweepsSkipRemovalAfterOwnershipLoss(t *testing.T) {
 	logger := testutil.DiscardLogger()
 	ensureRecoveryImage(t, dcli)
 
-	workerID := testutil.UniqueName(t, "recov-lost")
+	nodeID := testutil.UniqueName(t, "recov-lost")
 	serviceApp := testutil.UniqueName(t, "recov-lost-svc")
 	executionApp := testutil.UniqueName(t, "recov-lost-exec")
 
@@ -702,7 +702,7 @@ func TestIntegrationStartupSweepsSkipRemovalAfterOwnershipLoss(t *testing.T) {
 			return
 		}
 		for _, c := range list.Items {
-			if c.Labels["relay.hostname"] != workerID {
+			if c.Labels["relay.node_id"] != nodeID {
 				continue
 			}
 			if _, err := dcli.ContainerRemove(
@@ -713,8 +713,8 @@ func TestIntegrationStartupSweepsSkipRemovalAfterOwnershipLoss(t *testing.T) {
 		}
 	})
 
-	st := testutil.OpenState(t, dsn, state.Options{Owner: workerID, Instance: "inst-1"})
-	manager, err := runtime.NewManager(logger, nil, workerID)
+	st := testutil.OpenState(t, dsn, state.Options{NodeID: nodeID, Instance: "inst-1"})
+	manager, err := runtime.NewManager(logger, nil, nodeID)
 	if err != nil {
 		t.Fatalf("runtime manager: %v", err)
 	}
@@ -722,13 +722,13 @@ func TestIntegrationStartupSweepsSkipRemovalAfterOwnershipLoss(t *testing.T) {
 
 	svcCtrl := reconciler.NewServiceReconciler(
 		manager, nil, routing.TraefikConfig{}, logger, reconcileTimeout,
-		reconciler.WithWorkerID(workerID),
+		reconciler.WithNodeID(nodeID),
 	)
 
 	// The service's app is not in liveNames, so it is a sweep candidate; the
 	// execution container is a managed orphan for this identity.
 	serviceID := startRecoveryService(t, manager, serviceApp, recoveryServiceTemplate(), 0)
-	executionID := createRecoveryExecutionContainer(t, dcli, workerID, executionApp, "event")
+	executionID := createRecoveryExecutionContainer(t, dcli, nodeID, executionApp, "event")
 
 	// Given: the pinned lock backend is terminated from a SEPARATE connection.
 	ownerPID := st.OwnerBackendPID()
@@ -751,7 +751,7 @@ func TestIntegrationStartupSweepsSkipRemovalAfterOwnershipLoss(t *testing.T) {
 	serviceProof := ownershipProof{
 		loss:   serviceLoss,
 		verify: st.VerifyOwnerLock,
-		onLost: ownershipLossAction(serviceLoss, nil, logger, workerID, "inst-1", func() {}),
+		onLost: ownershipLossAction(serviceLoss, nil, logger, nodeID, "inst-1", func() {}),
 	}
 	sweepStartupServiceOrphans(context.Background(), svcCtrl, nil, serviceProof, logger)
 
@@ -769,13 +769,13 @@ func TestIntegrationStartupSweepsSkipRemovalAfterOwnershipLoss(t *testing.T) {
 	executionProof := ownershipProof{
 		loss:   executionLoss,
 		verify: st.VerifyOwnerLock,
-		onLost: ownershipLossAction(executionLoss, nil, logger, workerID, "inst-1", func() {}),
+		onLost: ownershipLossAction(executionLoss, nil, logger, nodeID, "inst-1", func() {}),
 	}
 	sweepCtx, cancel := context.WithTimeout(context.Background(), reconcileTimeout)
 	_, sweepErr := retryIdentitySnapshotCleanup(
 		sweepCtx, executionProof, logger, "orphan-sweep",
 		func(stepCtx context.Context) ([]runtime.OrphanContainer, error) {
-			return manager.DiscoverOrphanContainers(stepCtx, workerID)
+			return manager.DiscoverOrphanContainers(stepCtx, nodeID)
 		},
 		func(stepCtx context.Context, orphans []runtime.OrphanContainer) (int, error) {
 			return manager.RemoveOrphanContainers(stepCtx, orphans)

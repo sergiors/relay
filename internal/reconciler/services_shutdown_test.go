@@ -13,8 +13,8 @@ import (
 	"relay/internal/testutil"
 )
 
-// TestShutdownCleanupRemovesOwnContainers: cleanup(hostname) selects exactly the
-// containers whose Hostname == hostname (2 replicas of one app) and stops
+// TestShutdownCleanupRemovesOwnContainers: cleanup(nodeID) selects exactly the
+// containers whose NodeID == nodeID (2 replicas of one app) and stops
 // them all, returning the count.
 func TestShutdownCleanupRemovesOwnContainers(t *testing.T) {
 	f := newFakeDocker()
@@ -34,7 +34,7 @@ func TestShutdownCleanupRemovesOwnContainers(t *testing.T) {
 	}
 
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
-	n, err := c.ShutdownCleanup(context.Background(), defaultFakeHostname)
+	n, err := c.ShutdownCleanup(context.Background(), defaultFakeNodeID)
 	if err != nil {
 		t.Fatalf("shutdown cleanup: %v", err)
 	}
@@ -50,20 +50,20 @@ func TestShutdownCleanupRemovesOwnContainers(t *testing.T) {
 }
 
 // TestShutdownCleanupPreservesOtherWorkers: cleanup("w1") removes only w1's
-// containers; another worker's (w2) and a container without a hostname label
-// (empty Hostname — ownership unknowable) are preserved.
+// containers; another worker's (w2) and a container without a nodeID label
+// (empty NodeID — ownership unknowable) are preserved.
 func TestShutdownCleanupPreservesOtherWorkers(t *testing.T) {
 	f := newFakeDocker()
-	seed := func(id, hostname string) {
+	seed := func(id, nodeID string) {
 		f.ctrs[id] = &fakeContainer{
 			id: id, appName: "fn", entrypoint: "svc.js", image: "img-1",
-			port: 80, replica: 0, state: container.StateRunning, hostname: hostname,
+			port: 80, replica: 0, state: container.StateRunning, nodeID: nodeID,
 		}
 	}
 	seed("w1-a", "w1")
 	seed("w1-b", "w1")
 	seed("w2-a", "w2")
-	seed("none-a", "") // no hostname label: never claimed by any worker
+	seed("none-a", "") // no nodeID label: never claimed by any worker
 
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
 	n, err := c.ShutdownCleanup(context.Background(), "w1")
@@ -88,14 +88,14 @@ func TestShutdownCleanupPreservesOtherWorkers(t *testing.T) {
 	}
 }
 
-// TestShutdownCleanupEmptyHostnameSelectsNothing verifies the defensive guard:
-// an empty hostname matches no container (ownership is unknowable), so nothing
+// TestShutdownCleanupEmptyNodeIDSelectsNothing verifies the defensive guard:
+// an empty nodeID matches no container (ownership is unknowable), so nothing
 // is listed or stopped.
-func TestShutdownCleanupEmptyHostnameSelectsNothing(t *testing.T) {
+func TestShutdownCleanupEmptyNodeIDSelectsNothing(t *testing.T) {
 	f := newFakeDocker()
 	f.ctrs["a"] = &fakeContainer{
 		id: "a", appName: "fn", entrypoint: "svc.js", image: "img-1",
-		port: 80, replica: 0, state: container.StateRunning, hostname: "",
+		port: 80, replica: 0, state: container.StateRunning, nodeID: "",
 	}
 
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
@@ -104,7 +104,7 @@ func TestShutdownCleanupEmptyHostnameSelectsNothing(t *testing.T) {
 		t.Fatalf("shutdown cleanup: %v", err)
 	}
 	if n != 0 {
-		t.Fatalf("removed count = %d, want 0 (empty hostname selects nothing)", n)
+		t.Fatalf("removed count = %d, want 0 (empty nodeID selects nothing)", n)
 	}
 	if got := len(f.stops); got != 0 {
 		t.Fatalf("stops = %v, want none", f.stops)
@@ -121,11 +121,11 @@ func TestShutdownCleanupStopFailureDoesNotBlock(t *testing.T) {
 	f := newFakeDocker()
 	f.ctrs["fail-1"] = &fakeContainer{
 		id: "fail-1", appName: "fn", entrypoint: "svc.js", image: "img-1",
-		port: 80, replica: 0, state: container.StateRunning, hostname: "w1",
+		port: 80, replica: 0, state: container.StateRunning, nodeID: "w1",
 	}
 	f.ctrs["ok-1"] = &fakeContainer{
 		id: "ok-1", appName: "fn", entrypoint: "svc.js", image: "img-1",
-		port: 80, replica: 1, state: container.StateRunning, hostname: "w1",
+		port: 80, replica: 1, state: container.StateRunning, nodeID: "w1",
 	}
 	f.failStopFor = "fail-1"
 
@@ -157,16 +157,16 @@ func TestShutdownCleanupStopFailureDoesNotBlock(t *testing.T) {
 	}
 }
 
-// TestDiscoverShutdownContainersSelectsOwnHostname pins the split discovery half:
-// it returns exactly the containers whose relay.hostname equals the argument
-// (hostname-scoped, empty hostname selects nothing) and stops nothing — the
+// TestDiscoverShutdownContainersSelectsOwnNodeID pins the split discovery half:
+// it returns exactly the containers whose relay.node_id equals the argument
+// (nodeID-scoped, empty nodeID selects nothing) and stops nothing — the
 // caller decides removal.
-func TestDiscoverShutdownContainersSelectsOwnHostname(t *testing.T) {
+func TestDiscoverShutdownContainersSelectsOwnNodeID(t *testing.T) {
 	f := newFakeDocker()
-	seed := func(id, hostname string) {
+	seed := func(id, nodeID string) {
 		f.ctrs[id] = &fakeContainer{
 			id: id, appName: "fn", entrypoint: "svc.js", image: "img-1",
-			port: 80, replica: 0, state: container.StateRunning, hostname: hostname,
+			port: 80, replica: 0, state: container.StateRunning, nodeID: nodeID,
 		}
 	}
 	seed("w1-b", "w1")
@@ -180,7 +180,7 @@ func TestDiscoverShutdownContainersSelectsOwnHostname(t *testing.T) {
 		t.Fatalf("discover: %v", err)
 	}
 	if len(own) != 2 || own[0].ID != "w1-a" || own[1].ID != "w1-b" {
-		t.Fatalf("discovered %+v, want [w1-a w1-b] (own hostname only)", own)
+		t.Fatalf("discovered %+v, want [w1-a w1-b] (own nodeID only)", own)
 	}
 	if len(f.stops) != 0 {
 		t.Fatalf("discovery stopped %v, want none (discovery must not remove)", f.stops)
@@ -188,10 +188,10 @@ func TestDiscoverShutdownContainersSelectsOwnHostname(t *testing.T) {
 
 	none, err := c.DiscoverShutdownContainers(context.Background(), "")
 	if err != nil {
-		t.Fatalf("discover empty hostname: %v", err)
+		t.Fatalf("discover empty nodeID: %v", err)
 	}
 	if len(none) != 0 {
-		t.Fatalf("empty hostname discovered %+v, want none", none)
+		t.Fatalf("empty nodeID discovered %+v, want none", none)
 	}
 }
 
@@ -205,7 +205,7 @@ func TestRemoveShutdownContainersRemovesCapturedOnlyAndPreservesReplacement(t *t
 	for _, id := range []string{"w1-a", "w1-b"} {
 		f.ctrs[id] = &fakeContainer{
 			id: id, appName: "fn", entrypoint: "svc.js", image: "img-1",
-			port: 80, replica: 0, state: container.StateRunning, hostname: "w1",
+			port: 80, replica: 0, state: container.StateRunning, nodeID: "w1",
 		}
 	}
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
@@ -218,11 +218,11 @@ func TestRemoveShutdownContainersRemovesCapturedOnlyAndPreservesReplacement(t *t
 		t.Fatalf("discovered %+v, want 2", own)
 	}
 
-	// A replacement owner reusing WORKER_ID starts a NEW service container after
+	// A replacement owner reusing NODE_ID starts a NEW service container after
 	// the snapshot. It must survive the removal of the captured set.
 	f.ctrs["replacement"] = &fakeContainer{
 		id: "replacement", appName: "fn", entrypoint: "svc.js", image: "img-1",
-		port: 80, replica: 0, state: container.StateRunning, hostname: "w1",
+		port: 80, replica: 0, state: container.StateRunning, nodeID: "w1",
 	}
 
 	if err := c.RemoveShutdownContainers(context.Background(), own); err != nil {

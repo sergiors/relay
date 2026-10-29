@@ -23,7 +23,7 @@ func TestRestartServiceContainerConfirmsRunning(t *testing.T) {
 			body:    `{"Id":"cid-1","State":{"Running":true}}`,
 			onMatch: func() { inspected++ }},
 	)
-	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "h"}
 	if err := m.RestartServiceContainer(context.Background(), "cid-1"); err != nil {
 		t.Fatalf("RestartServiceContainer: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestRestartServiceContainerNonRunningFails(t *testing.T) {
 		dockerRoute{method: http.MethodGet, path: "/containers/cid-1/json",
 			body: `{"Id":"cid-1","State":{"Running":false,"Status":"exited"}}`},
 	)
-	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "h"}
 	err := m.RestartServiceContainer(context.Background(), "cid-1")
 	if err == nil {
 		t.Fatal("a non-running restarted container must fail RestartServiceContainer")
@@ -62,7 +62,7 @@ func TestRestartServiceContainerDaemonErrorSurfaces(t *testing.T) {
 		dockerRoute{method: http.MethodPost, path: "/containers/cid-1/restart",
 			status: http.StatusInternalServerError, body: `{"message":"daemon down"}`},
 	)
-	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "h"}
 	if err := m.RestartServiceContainer(context.Background(), "cid-1"); err == nil {
 		t.Fatal("a daemon restart failure must surface as an error")
 	}

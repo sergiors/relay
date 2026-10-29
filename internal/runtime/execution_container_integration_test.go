@@ -109,7 +109,7 @@ export function run(event) {
 	done := make(chan error, 1)
 	go func() {
 		execCtx := context.WithValue(context.Background(), runMetaKey{},
-			RunMeta{Hostname: "test-host", App: "proc-exit-e2e", Handler: "index.die", Image: prepared.Image})
+			RunMeta{NodeID: "test-host", App: "proc-exit-e2e", Handler: "index.die", Image: prepared.Image})
 		done <- m.Execute(execCtx, prepared, "index.die", []byte(`{"event_name":"INSERT"}`), nil)
 	}()
 	id1 = reusedContainerID(t, ctx, m, "proc-exit-e2e")
@@ -125,7 +125,7 @@ export function run(event) {
 
 	// Next invocation: fresh container.
 	secondCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", App: "proc-exit-e2e", Handler: "index.run", Image: prepared.Image})
+		RunMeta{NodeID: "test-host", App: "proc-exit-e2e", Handler: "index.run", Image: prepared.Image})
 	if err := m.Execute(secondCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute after process exit: %v", err)
 	}
@@ -167,7 +167,7 @@ events:
 	}
 
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", App: "img-change", Image: p1.Image})
+		RunMeta{NodeID: "test-host", App: "img-change", Image: p1.Image})
 	if err := m.Execute(execCtx, p1, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute v1: %v", err)
 	}
@@ -223,7 +223,7 @@ events:
 			t.Fatalf("prepare %s: %v", name, err)
 		}
 		execCtx := context.WithValue(context.Background(), runMetaKey{},
-			RunMeta{Hostname: "test-host", App: name, Image: prepared.Image})
+			RunMeta{NodeID: "test-host", App: name, Image: prepared.Image})
 		if err := m.Execute(execCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 			t.Fatalf("execute %s: %v", name, err)
 		}
@@ -326,7 +326,7 @@ export async function c(event) {
 
 	exec := func(handler, event string) error {
 		execCtx := context.WithValue(context.Background(), runMetaKey{},
-			RunMeta{Hostname: "test-host", App: "concurrent-e2e", Handler: handler, Image: prepared.Image})
+			RunMeta{NodeID: "test-host", App: "concurrent-e2e", Handler: handler, Image: prepared.Image})
 		return m.Execute(execCtx, prepared, handler, []byte(event), nil)
 	}
 
@@ -424,7 +424,7 @@ export async function run(event) {
 		go func() {
 			defer wg.Done()
 			execCtx := context.WithValue(context.Background(), runMetaKey{},
-				RunMeta{Hostname: "test-host", App: "bounded-e2e", Image: prepared.Image})
+				RunMeta{NodeID: "test-host", App: "bounded-e2e", Image: prepared.Image})
 			errCh <- m.Execute(execCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil)
 		}()
 	}
@@ -464,7 +464,7 @@ events:
 		t.Fatalf("prepare: %v", err)
 	}
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", App: "invalidate-e2e", Image: prepared.Image})
+		RunMeta{NodeID: "test-host", App: "invalidate-e2e", Image: prepared.Image})
 	if err := m.Execute(execCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -522,7 +522,7 @@ events:
 	}
 
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", App: "idle-evict-e2e", Image: prepared.Image})
+		RunMeta{NodeID: "test-host", App: "idle-evict-e2e", Image: prepared.Image})
 	if err := m.Execute(execCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -590,7 +590,7 @@ export async function run(event) {
 	}
 
 	v1Ctx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", App: "busy-change", Handler: "index.run", Image: p1.Image})
+		RunMeta{NodeID: "test-host", App: "busy-change", Handler: "index.run", Image: p1.Image})
 	v1Done := make(chan error, 1)
 	go func() {
 		v1Done <- m.Execute(v1Ctx, p1, "index.run", []byte(`{"event_name":"INSERT","blockMs":4000}`), nil)
@@ -613,7 +613,7 @@ export async function run(event) {
 	// container (the draining generation stays within capacity). The old v1
 	// container must not be discarded mid-invocation.
 	v2Ctx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", App: "busy-change", Handler: "index.run", Image: p2.Image})
+		RunMeta{NodeID: "test-host", App: "busy-change", Handler: "index.run", Image: p2.Image})
 	if err := m.Execute(v2Ctx, p2, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute v2 while v1 busy: %v", err)
 	}
@@ -661,7 +661,7 @@ events:
 		t.Fatalf("prepare: %v", err)
 	}
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", App: "remove-fn-e2e", Image: prepared.Image})
+		RunMeta{NodeID: "test-host", App: "remove-fn-e2e", Image: prepared.Image})
 	if err := m.Execute(execCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -729,7 +729,7 @@ export async function slow(event) {
 
 	exec := func(handler string, timeout time.Duration) error {
 		ectx := context.WithValue(context.Background(), runMetaKey{},
-			RunMeta{Hostname: "test-host", App: "pool-metrics-e2e", Handler: handler, Image: prepared.Image})
+			RunMeta{NodeID: "test-host", App: "pool-metrics-e2e", Handler: handler, Image: prepared.Image})
 		if timeout > 0 {
 			var cancelFn context.CancelFunc
 			ectx, cancelFn = context.WithTimeout(ectx, timeout)
@@ -834,7 +834,7 @@ export async function sleep(event) {
 		go func() {
 			defer wg.Done()
 			ectx := context.WithValue(context.Background(), runMetaKey{},
-				RunMeta{Hostname: "test-host", App: "pool-metrics-conc", Handler: "index.sleep", Image: prepared.Image})
+				RunMeta{NodeID: "test-host", App: "pool-metrics-conc", Handler: "index.sleep", Image: prepared.Image})
 			errCh <- m.Execute(ectx, prepared, "index.sleep", []byte(`{"event_name":"INSERT"}`), nil)
 		}()
 	}
@@ -902,7 +902,7 @@ events:
 	}
 	// Warm the pool at 1.
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", App: "prepare-resize-e2e", Image: p1.Image})
+		RunMeta{NodeID: "test-host", App: "prepare-resize-e2e", Image: p1.Image})
 	if err := m.Execute(execCtx, p1, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute at concurrency 1: %v", err)
 	}
@@ -941,7 +941,7 @@ events:
 
 	// Admission opened: the new image's containers now fit up to 3 concurrently.
 	execCtx2 := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", App: "prepare-resize-e2e", Image: p2.Image})
+		RunMeta{NodeID: "test-host", App: "prepare-resize-e2e", Image: p2.Image})
 	if err := m.Execute(execCtx2, p2, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute after re-prepare: %v", err)
 	}
@@ -982,7 +982,7 @@ events:
 	}
 	// Warm the pool and verify the clipped bound, not 15.
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", App: "clip-e2e", Image: p1.Image})
+		RunMeta{NodeID: "test-host", App: "clip-e2e", Image: p1.Image})
 	if err := m.Execute(execCtx, p1, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute at clipped concurrency 8: %v", err)
 	}
@@ -1052,7 +1052,7 @@ export function ok(event) {
 	}
 
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", App: "no-remove-e2e", Handler: "index.ok", Image: prepared.Image})
+		RunMeta{NodeID: "test-host", App: "no-remove-e2e", Handler: "index.ok", Image: prepared.Image})
 	event1 := []byte(`{"event_id":"evt_1","event_name":"INSERT"}`)
 	if err := m.Execute(execCtx, prepared, "index.ok", event1, nil); err != nil {
 		t.Fatalf("execute 1: %v", err)
@@ -1114,7 +1114,7 @@ func TestIntegrationFailedStartRemovesContainer(t *testing.T) {
 		Config: &container.Config{
 			Image: "node:24-alpine",
 			Labels: runLabels(RunMeta{
-				Hostname: "test-host", App: "fail-start-e2e",
+				NodeID: "test-host", App: "fail-start-e2e",
 				Handler: "index.run", Image: "node:24-alpine",
 			}),
 		},
@@ -1171,7 +1171,7 @@ func TestIntegrationRemoveContainerTwiceBenign(t *testing.T) {
 
 // TestIntegrationContainerCreationLabels drives a real execution while
 // verifying the creation-time label set on the reused container: the IDENTITY
-// labels (relay.type, relay.app, relay.hostname, relay.image) are stamped
+// labels (relay.type, relay.app, relay.node_id, relay.image) are stamped
 // from the creating invocation's RunMeta, while the per-invocation labels
 // (relay.handler, relay.message_id, relay.event_id, relay.event_name) are
 // EMPTY — labels are immutable per container and this container outlives
@@ -1213,7 +1213,7 @@ export async function slow(event) {
 			MessageID: "1791234567890-0",
 			EventID:   "evt_777",
 			EventName: "INSERT",
-			Hostname:  "test-host",
+			NodeID:    "test-host",
 			Image:     prepared.Image,
 		})
 	done := make(chan error, 1)
@@ -1252,7 +1252,7 @@ export async function slow(event) {
 		labelMessageID: "",
 		labelEventID:   "",
 		labelEventName: "",
-		labelHostname:  "test-host",
+		labelNodeID:    "test-host",
 		labelImage:     prepared.Image,
 	} {
 		if got := summaryLabels[k]; got != want {
@@ -1321,7 +1321,7 @@ export function ok(event) {
 	}
 
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", App: "fail-e2e", Handler: "index.fail", Image: prepared.Image})
+		RunMeta{NodeID: "test-host", App: "fail-e2e", Handler: "index.fail", Image: prepared.Image})
 	err = m.Execute(execCtx, prepared, "index.fail", []byte(`{"event_name":"INSERT"}`), nil)
 	if err == nil {
 		t.Fatal("expected execute to fail for the erroring handler")
@@ -1343,7 +1343,7 @@ export function ok(event) {
 
 	// The next invocation succeeds on the SAME container.
 	okCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", App: "fail-e2e", Handler: "index.ok", Image: prepared.Image})
+		RunMeta{NodeID: "test-host", App: "fail-e2e", Handler: "index.ok", Image: prepared.Image})
 	if err := m.Execute(okCtx, prepared, "index.ok", []byte(`{"n":1}`), nil); err != nil {
 		t.Fatalf("execute after failure: %v", err)
 	}
@@ -1397,7 +1397,7 @@ export function quick(event) {
 
 	// Timeout the invocation after 1s: the handler sleeps 10s, so the ctx
 	// timeout path must kill and discard the container.
-	timeoutMeta := RunMeta{Hostname: "test-host", App: "timeout-e2e", Handler: "index.sleeper", Image: prepared.Image}
+	timeoutMeta := RunMeta{NodeID: "test-host", App: "timeout-e2e", Handler: "index.sleeper", Image: prepared.Image}
 	invokeCtx, invokeCancel := context.WithTimeout(
 		context.WithValue(context.Background(), runMetaKey{}, timeoutMeta), 1*time.Second)
 	defer invokeCancel()
@@ -1415,7 +1415,7 @@ export function quick(event) {
 	// The next invocation uses a FRESH container (the cache dropped the dead
 	// one) and succeeds.
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", App: "timeout-e2e", Handler: "index.quick", Image: prepared.Image})
+		RunMeta{NodeID: "test-host", App: "timeout-e2e", Handler: "index.quick", Image: prepared.Image})
 	if err := m.Execute(execCtx, prepared, "index.quick", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute after timeout: %v", err)
 	}
@@ -1570,7 +1570,7 @@ export function check(event) {
 			// Run the handler in a goroutine so we can inspect the container
 			// mid-flight while it runs.
 			execCtx := context.WithValue(context.Background(), runMetaKey{},
-				RunMeta{Hostname: "test-host", App: "harden-" + tc.name, Image: prepared.Image})
+				RunMeta{NodeID: "test-host", App: "harden-" + tc.name, Image: prepared.Image})
 			done := make(chan error, 1)
 			go func() {
 				done <- m.Execute(execCtx, prepared, tc.handler, tc.event, nil)

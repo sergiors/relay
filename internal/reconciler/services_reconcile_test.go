@@ -41,7 +41,7 @@ type fakeContainer struct {
 	sourceID  string   // relay.source as stamped at create (spec.SourceMount.Identity); "" = no mount
 	labels    map[string]string
 	networks  []string // spec.Networks passed to StartService (global + routing networks)
-	hostname  string   // the worker identity (relay.hostname) that owns the container
+	nodeID    string   // the node identity (relay.node_id) that owns the container
 }
 
 // effectiveSourceRef returns the container's configured source descriptor,
@@ -62,10 +62,10 @@ func sourceMountIdentity(spec runtime.ServiceSpec) string {
 	return spec.SourceMount.Identity
 }
 
-// defaultFakeHostname is the worker identity containers get when started via
+// defaultFakeNodeID is the node identity containers get when started via
 // StartService; ShutdownCleanup tests create containers for other workers by
 // seeding f.ctrs directly.
-const defaultFakeHostname = "w1"
+const defaultFakeNodeID = "w1"
 
 // fakeDocker is an in-memory Docker for Reconcile unit tests. Containers are
 // keyed by a deterministic id so tests can inspect and manipulate them.
@@ -171,7 +171,7 @@ func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, r
 		sourceID:  sourceMountIdentity(spec),
 		labels:    spec.Labels,
 		networks:  append([]string(nil), spec.Networks...),
-		hostname:  defaultFakeHostname,
+		nodeID:    defaultFakeNodeID,
 	}
 	gate := f.startGate
 	f.mu.Unlock()
@@ -203,7 +203,7 @@ func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceCon
 			State:     c.state,
 			Replica:   c.replica,
 			Port:      c.port,
-			Hostname:  c.hostname,
+			NodeID:    c.nodeID,
 			EnvHash:   c.envHash,
 			Resources: c.resources,
 			Networks:  runtime.NetworksLabel(c.networks...),
@@ -1228,8 +1228,8 @@ func TestReconcileUnchangedIsNoOp(t *testing.T) {
 
 // TestServiceReconcilerAdoptsConvergedContainerSameID pins the captured
 // service-container audit finding: the service reconciler is label-derived and
-// deliberately NOT process- or hostname-scoped, so a FRESH reconciler standing
-// in for a replacement incarnation that reuses WORKER_ID ADOPTS a running,
+// deliberately NOT process- or nodeID-scoped, so a FRESH reconciler standing
+// in for a replacement incarnation that reuses NODE_ID ADOPTS a running,
 // label-converged service container in place — the SAME physical Docker id, with
 // no new start and no stop. This is why the shutdown service cleanup cannot rely
 // on "a replacement only ever creates NEW ids" and instead gates removal on the
@@ -1248,7 +1248,7 @@ func TestServiceReconcilerAdoptsConvergedContainerSameID(t *testing.T) {
 		t.Fatal("incarnation A must have created id-1")
 	}
 
-	// Incarnation B reuses the same WORKER_ID with a FRESH reconciler (empty
+	// Incarnation B reuses the same NODE_ID with a FRESH reconciler (empty
 	// source-apply tracker). It must retain the converged, running id-1 in place.
 	b := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
 	if err := b.Apply(context.Background(), "fn", tmpl, "img-1", nil); err != nil {

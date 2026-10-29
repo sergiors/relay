@@ -83,10 +83,10 @@ func TestMonitorOwnershipDetectsLossOnceAndCancels(t *testing.T) {
 	if lifecycle.Err() == nil {
 		t.Fatal("monitor must cancel the lifecycle on loss")
 	}
-	if ready, reason := ready.Ready(context.Background()); ready || reason != "worker ownership lost" {
+	if ready, reason := ready.Ready(context.Background()); ready || reason != "node ownership lost" {
 		t.Fatalf("readiness after loss = (%v, %q), want not-ready with the loss reason", ready, reason)
 	}
-	if !strings.Contains(logs.String(), "Worker ownership lost") {
+	if !strings.Contains(logs.String(), "Node ownership lost") {
 		t.Fatalf("monitor must log the loss warning; logs:\n%s", logs.String())
 	}
 }
@@ -253,7 +253,7 @@ func TestGuardIdentityCleanupFreshProofFailureLatchesAndSkips(t *testing.T) {
 	if lifecycle.Err() == nil {
 		t.Fatal("a failed fresh proof must cancel the lifecycle")
 	}
-	if r, reason := ready.Ready(context.Background()); r || reason != "worker ownership lost" {
+	if r, reason := ready.Ready(context.Background()); r || reason != "node ownership lost" {
 		t.Fatalf("readiness after a failed proof = (%v, %q), want not-ready with the loss reason", r, reason)
 	}
 }
@@ -431,7 +431,7 @@ func TestOwnershipBarrierValidFinalVerificationPreservesCleanup(t *testing.T) {
 func TestReadinessReportsOwnershipLostDistinctly(t *testing.T) {
 	starting := newReadiness(context.Background())
 	starting.setOwnershipLost()
-	if ready, reason := starting.Ready(context.Background()); ready || reason != "worker ownership lost" {
+	if ready, reason := starting.Ready(context.Background()); ready || reason != "node ownership lost" {
 		t.Fatalf("ownership lost before ready = (%v, %q), want not-ready with the loss reason", ready, reason)
 	}
 
@@ -441,7 +441,7 @@ func TestReadinessReportsOwnershipLostDistinctly(t *testing.T) {
 		t.Fatal("worker must be ready before the loss")
 	}
 	ready.setOwnershipLost()
-	if r, reason := ready.Ready(context.Background()); r || reason != "worker ownership lost" {
+	if r, reason := ready.Ready(context.Background()); r || reason != "node ownership lost" {
 		t.Fatalf("ownership lost after ready = (%v, %q), want not-ready with the loss reason", r, reason)
 	}
 }

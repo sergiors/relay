@@ -23,7 +23,7 @@ At startup Relay:
    warm-container maintenance loop is started;
 4. loads apps from `/apps` and computes each fingerprint once;
 5. runs a conservative orphan sweep (bounded to 30s) removing only stale
-   Relay containers owned by this worker identity (`WORKER_ID`);
+   Relay containers owned by this node identity (`NODE_ID`);
 6. prepares each app's image and starts the reconciler, scheduler, and
    stream consumer.
 
@@ -59,10 +59,10 @@ identity-scoped cleanup runs. A graceful shutdown performs a final bounded stats
 flush (after re-proving the lock). The process lock is held for the whole run and
 released last (the kernel releases it if the process dies).
 
-### Ownership loss
+### Node ownership loss
 
-The exclusive per-`WORKER_ID` PostgreSQL owner lock is the cross-process guarantee
-that two workers never share an identity. The worker re-verifies that lock
+The exclusive per-`NODE_ID` PostgreSQL node lock is the cross-process guarantee
+that two nodes never share an identity. The worker re-verifies that lock
 periodically (every 2s, each check bounded to 1s) **on the same pinned connection
 that holds it**; it never checks out a replacement connection or re-acquires the
 lock, either of which could mask a loss. If the lock connection is lost while the
@@ -73,14 +73,14 @@ connection's backend PID changes or the lock disappears, and verification fails
 Detection is interval-bounded, not instantaneous (normally within about 3s of the
 loss), so a side effect scoped to the identity can still occur in that window. On
 detection the worker cancels its lifecycle, clears readiness immediately (so
-`relay health` stops reporting ready), logs **one** warning with `worker_id` and
+`relay health` stops reporting ready), logs **one** warning with `node_id` and
 `instance_id`, and skips identity-scoped cleanup on the way out: it does not run
 its final stats flush or remove its service containers, and it skips its
 identity-scoped startup orphan sweeps, because a replacement process may already
-own the identity. It then exits with a distinctive ownership-loss error so the
-supervisor treats the exit as abnormal termination rather than a clean signal
-shutdown. Existing per-instance stats fencing remains as defense in depth for the
-window before detection.
+own the identity. It then exits with a distinctive node ownership-loss error so
+the supervisor treats the exit as abnormal termination rather than a clean
+signal shutdown. Existing per-instance stats fencing remains as defense in depth
+for the window before detection.
 
 Because detection is interval-bounded, shutdown does not rely on the monitor
 alone. After the monitor's quiescence barrier joins, one final bounded
@@ -106,7 +106,7 @@ Two path roots:
   - `git/source.json`, `git/checkout` — git sync config and managed checkout;
   - `git/relay-<checkout-base>.sync.lock` — persistent checkout-sibling flock
     file; the lock releases on process exit, but the inert file is retained.
-- **PostgreSQL** — the shared state database (operator state view, per-worker
+- **PostgreSQL** — the shared state database (operator state view, per-node
   stats snapshots, and the durable schedule outbox), addressed by
   `DATABASE_URL`. It is **not** a file under a path root; see below.
 - **`/run/relay`** — ephemeral process state (never persisted):
@@ -145,11 +145,10 @@ apps are never prepared.
 - App reconciliation ownership is tracked separately in `apps.fencing_token`,
   allocated from the global `apps_fencing_token_seq` sequence. Each desired-state
   transition advances it under the per-app advisory lock; callbacks with stale
-  tokens cannot update or recreate the row. The state schema is initialized for
-  the current release and is not migrated across releases. Stop old Relay workers
-  before switching binaries that expect a different schema; the `/apps` tree
-  remains authoritative, but replacing the PostgreSQL state database discards
-  its state view, stats, and schedule outbox.
+  tokens cannot update or recreate the row. The PostgreSQL state schema is
+  initialized automatically. The `/apps` tree remains authoritative, but
+  replacing the PostgreSQL state database discards its state view, stats, and
+  schedule outbox.
 - `status` lifecycle: `preparing` → `building` → `reconciling` → `ready`;
   `degraded` retains a usable previous image, `unavailable` has none. A failed
   reconcile never displaces a still-serving previous generation and never reports
@@ -163,19 +162,19 @@ apps are never prepared.
   restarts, but startup does not reconstruct a runtime from invalid source, even
   when an older active image remains recorded in PostgreSQL.
 - Stats are stored as latest absolute snapshots (no history), **keyed by a stable
-  worker identity** (`WORKER_ID`, required — the same value as the Redis consumer
-  name and the `relay.hostname` label) plus a per-process `instance` fencing
-  token. Two workers sharing one database keep independent rows instead of
-  overwriting each other (each must set a distinct `WORKER_ID`; a second active
-  worker reusing an in-use `WORKER_ID` fails startup on the per-identity
-  PostgreSQL owner lock), same-host
-  workers never collide, a restarted worker resumes its own totals, and a stale
+  node identity** (`NODE_ID`, required — the same value as the Redis consumer
+  name and the `relay.node_id` label) plus a per-process `instance` fencing
+  token. Two nodes sharing one database keep independent rows instead of
+  overwriting each other (each must set a distinct `NODE_ID`; a second active
+  node reusing an in-use `NODE_ID` fails startup on the per-node
+  PostgreSQL node lock), same-host
+  nodes never collide, a restarted node resumes its own totals, and a stale
   process incarnation cannot overwrite a
-  newer one. `relay stats` aggregates across owners, a worker restores only its
-  own row, and `relay stats reset` clears every owner's rows while advancing a
+  newer one. `relay stats` aggregates across nodes, a node restores only its
+  own row, and `relay stats reset` clears every node's rows while advancing a
   shared generation that fences delayed snapshots from every worker. A hard crash
   may lose up to ~5s of telemetry; graceful shutdown flushes once. Prometheus is
-  the time-series source. Stale owner rows are compacted after `STATS_RETENTION`
+  the time-series source. Stale node rows are compacted after `STATS_RETENTION`
   (default 7d).
 - The scheduler's durable publication outbox (`schedule_pending`) lives here too;
   its per-row claims use `FOR UPDATE SKIP LOCKED` and a fencing token so
@@ -232,7 +231,7 @@ lifecycle cancellation that precedes the clear also reports not-ready. In steady
 state the answer reflects live Redis consumer health, a bounded Docker ping, and
 `NETWORKS` verification, so a dependency failing reports unhealthy and recovery
 reports healthy again. A detected ownership loss clears readiness immediately and
-is reported distinctly (`worker ownership lost`) from an ordinary shutdown. Per-app
+is reported distinctly (`node ownership lost`) from an ordinary shutdown. Per-app
 degraded/unavailable/invalid status, PostgreSQL
 (and therefore the scheduler's storage state), optional tracing, and asynchronous
 service convergence/housekeeping do not gate worker health.

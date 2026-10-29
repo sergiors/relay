@@ -12,7 +12,7 @@ import (
 )
 
 // setRequiredEnv sets the required variables (the three REDIS_* plus
-// DATABASE_URL and WORKER_ID) to sentinel values. It is a helper so individual
+// DATABASE_URL and NODE_ID) to sentinel values. It is a helper so individual
 // Load tests only override the variable they are exercising (and clear it where
 // a missing-required-var case is under test).
 func setRequiredEnv(t *testing.T) {
@@ -21,7 +21,7 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("REDIS_STREAM", "stream")
 	t.Setenv("REDIS_GROUP", "group")
 	t.Setenv("DATABASE_URL", "postgres://relay:relay@localhost:5432/relay?sslmode=disable")
-	t.Setenv("WORKER_ID", "test-worker")
+	t.Setenv("NODE_ID", "test-worker")
 }
 
 // testLogger returns a logger writing into an in-memory buffer so tests can
@@ -100,8 +100,8 @@ func TestLoadNetworks(t *testing.T) {
 }
 
 // TestLoadResolvesFields proves Load() resolves every Config field from the
-// environment: the required Redis settings pass through, the required WORKER_ID
-// becomes the worker identity, the optional retention window parses, and the
+// environment: the required Redis settings pass through, the required NODE_ID
+// becomes the node identity, the optional retention window parses, and the
 // optional metrics address stays opt-in (empty when unset, passed through when
 // set).
 func TestLoadResolvesFields(t *testing.T) {
@@ -122,8 +122,8 @@ func TestLoadResolvesFields(t *testing.T) {
 	if cfg.MetricsAddr != ":9090" {
 		t.Fatalf("MetricsAddr = %q, want %q", cfg.MetricsAddr, ":9090")
 	}
-	if cfg.WorkerID != "test-worker" {
-		t.Fatalf("WorkerID = %q, want the WORKER_ID sentinel", cfg.WorkerID)
+	if cfg.NodeID != "test-worker" {
+		t.Fatalf("NodeID = %q, want the NODE_ID sentinel", cfg.NodeID)
 	}
 }
 
@@ -437,7 +437,7 @@ func TestLoadRetentionErrorMentionsVariable(t *testing.T) {
 // failures are surfaced once through the returned error at the process boundary,
 // not duplicated as a fatal slog line.
 func TestLoadReturnsErrorOnMissingVariable(t *testing.T) {
-	for _, missEnv := range []string{"REDIS_URI", "REDIS_STREAM", "REDIS_GROUP", "DATABASE_URL", "WORKER_ID"} {
+	for _, missEnv := range []string{"REDIS_URI", "REDIS_STREAM", "REDIS_GROUP", "DATABASE_URL", "NODE_ID"} {
 		t.Run(missEnv, func(t *testing.T) {
 			setRequiredEnv(t)
 			t.Setenv(missEnv, "")

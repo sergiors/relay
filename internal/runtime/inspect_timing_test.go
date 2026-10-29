@@ -25,7 +25,7 @@ func newLogCapturingManager(t *testing.T, cli *client.Client) (*Manager, *bytes.
 	m := &Manager{
 		log:        slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		cli:        cli,
-		hostname:   "test-host",
+		nodeID:     "test-host",
 		lifecycle:  context.Background(),
 		containers: newContainerCache(),
 	}

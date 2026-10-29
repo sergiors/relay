@@ -277,7 +277,7 @@ func TestIntegrationServiceStartListStop(t *testing.T) {
 			labelService:  "svc",
 			labelIdentity: "app/service.js",
 			labelImage:    image,
-			labelHostname: "test-host",
+			labelNodeID:   "test-host",
 			labelPort:     "3000",
 			labelEnvHash:  EnvHash([]string{"PORT=3000"}),
 		}
@@ -670,7 +670,7 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 	}
 	if labels[labelType] != ContainerTypeService || labels[labelApp] != "svc-network" ||
 		labels[labelIdentity] != "app/service.js" || labels[labelImage] != image ||
-		labels[labelHostname] != "test-host" {
+		labels[labelNodeID] != "test-host" {
 		t.Fatalf("relay ownership labels missing/corrupted on container: %v", labels)
 	}
 	// The container joined the external network.

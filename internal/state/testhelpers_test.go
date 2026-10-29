@@ -149,22 +149,22 @@ func testOpenOrFail(t *testing.T, dsn string) *State {
 	return c
 }
 
-// openUnlockedState opens a State on dsn scoped to a worker identity WITHOUT
-// taking the per-owner startup lock (see Open/acquireWorkerLock). Production
-// handles always take the lock, so two live handles for one owner can no longer
+// openUnlockedState opens a State on dsn scoped to a node identity WITHOUT
+// taking the per-node startup lock (see Open/acquireNodeLock). Production
+// handles always take the lock, so two live handles for one node can no longer
 // coexist; this helper lets tests simulate a second concurrent incarnation of
-// the same owner at the DATABASE layer to exercise the residual stats
+// the same node at the DATABASE layer to exercise the residual stats
 // incarnation fence independently of the process-level exclusivity. It still
 // performs the stats-ownership claim Open performs, so a "new incarnation" can
 // take over the row exactly as a real restart would. The schema is initialized
 // idempotently, so the helper is self-contained.
-func openUnlockedState(t *testing.T, dsn, worker, instance string) *State {
+func openUnlockedState(t *testing.T, dsn, nodeID, instance string) *State {
 	t.Helper()
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatalf("open unlocked state: %v", err)
 	}
-	st := &State{db: db, log: fallbackLogger, owner: worker, instance: instance}
+	st := &State{db: db, log: fallbackLogger, nodeID: nodeID, instance: instance}
 	t.Cleanup(func() { _ = st.Close() })
 	ctx := context.Background()
 	if err := st.initSchema(ctx); err != nil {

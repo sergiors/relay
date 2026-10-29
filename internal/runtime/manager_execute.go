@@ -133,7 +133,7 @@ func (m *Manager) containerOps() containerOps {
 // The context must carry the per-invocation timeout; a timeout discards the
 // container (kill + remove, reason "timeout") and is treated as an invocation
 // failure. The invocation's diagnostic RunMeta is read from ctx (see
-// WithRunMeta); when absent the labels are empty except the hostname fallback
+// WithRunMeta); when absent the labels are empty except the nodeID fallback
 // below, which is harmless (labels are diagnostic-only beyond the sweep
 // predicate).
 //
@@ -165,13 +165,13 @@ func (m *Manager) Execute(
 	ctx, span := startRuntimeSpan(ctx, "runtime.execute", prepared.Name, prepared.Image)
 	defer func() { finishRuntimeSpan(span, retErr) }()
 	meta := RunMetaFrom(ctx)
-	if meta.Hostname == "" {
-		// Fall back to the manager's worker identity so a direct caller that
+	if meta.NodeID == "" {
+		// Fall back to the manager's node identity so a direct caller that
 		// did not inject RunMeta still stamps the container's owner (and so an
 		// orphaned container from this worker is still attributable at sweep
 		// time). The runner always injects the full meta; this is the safety
 		// net for direct/integration callers.
-		meta.Hostname = m.hostname
+		meta.NodeID = m.nodeID
 	}
 	if meta.Image == "" {
 		// Same safety net for the image identity: the owning app image is

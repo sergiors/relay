@@ -57,7 +57,7 @@ func newLifecycleManager(
 	m := &Manager{
 		log:        testutil.DiscardLogger(),
 		cli:        cli,
-		hostname:   "test-host",
+		nodeID:     "test-host",
 		lifecycle:  lifecycle,
 		containers: newContainerCache(),
 		depCoord:   coord,

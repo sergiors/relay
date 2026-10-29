@@ -105,21 +105,21 @@ type Manager struct {
 	// metrics is an optional observability registry. A nil registry disables
 	// all metric recording; every call is a no-op.
 	metrics *metrics.Registry
-	// hostname identifies this worker for container ownership. It is the worker's
-	// stable identity (config.WorkerID), so the relay.hostname container label,
+	// nodeID identifies this worker for container ownership. It is the worker's
+	// stable identity (config.NodeID), so the relay.node_id container label,
 	// the orphan/service cleanup scope, and the stream consumer identity are one
 	// and the same. The startup orphan sweep uses it to distinguish this worker's
 	// stalled containers from those of every other worker sharing the daemon.
-	hostname string
+	nodeID string
 	// selfHostname is the OS hostname of the container THIS process runs in,
 	// used ONLY to locate Relay's own container for HOT_RELOAD source-path
-	// mapping (see daemonSourcePath). It is deliberately separate from hostname:
-	// hostname is the worker's stable ownership identity (WORKER_ID) stamped on
+	// mapping (see daemonSourcePath). It is deliberately separate from nodeID:
+	// nodeID is the node's stable ownership identity (NODE_ID) stamped on
 	// containers, while self-inspection must resolve the actual OCI hostname (the
 	// Docker-assigned container ID by default) to find this process's own
 	// container. It is resolved once at construction from os.Hostname; empty when
 	// unavailable, in which case self-inspection is skipped (it never falls back
-	// to hostname, which would risk inspecting a wrong container).
+	// to nodeID, which would risk inspecting a wrong container).
 	selfHostname string
 	// maxConcurrentInvocations is the worker-global concurrency cap (MAX_CONCURRENT_INVOCATIONS): the
 	// SAME value the runner uses for its global semaphore. It clips every
@@ -521,9 +521,9 @@ func withPing(ping pingFunc) ManagerOption {
 // rather than per event. The client is configured from the environment
 // (DOCKER_HOST / DOCKER_TLS_VERIFY / DOCKER_CERT_PATH) and negotiates the API
 // version automatically. registry is an optional observability registry; a nil registry
-// disables metric recording (every call is a no-op). hostname is this worker's
-// stable container-ownership identity (config.WorkerID); it is stamped as the
-// relay.hostname label on every execution container and gates the startup orphan
+// disables metric recording (every call is a no-op). nodeID is this worker's
+// stable container-ownership identity (config.NodeID); it is stamped as the
+// relay.node_id label on every execution container and gates the startup orphan
 // sweep. Relay's own OCI hostname — used only to locate its container for
 // HOT_RELOAD source-path mapping — is resolved separately from os.Hostname (see
 // the Manager.selfHostname field).
@@ -537,7 +537,7 @@ func withPing(ping pingFunc) ManagerOption {
 func NewManager(
 	logger *slog.Logger,
 	registry *metrics.Registry,
-	hostname string,
+	nodeID string,
 	opts ...ManagerOption,
 ) (*Manager, error) {
 	resolved := resolveManagerOptions(opts)
@@ -571,7 +571,7 @@ func NewManager(
 		log:                      logger,
 		cli:                      cli,
 		metrics:                  registry,
-		hostname:                 hostname,
+		nodeID:                   nodeID,
 		selfHostname:             osHostname(),
 		maxConcurrentInvocations: resolved.maxConcurrentInvocations,
 		maxConcurrentBuilds:      resolved.maxConcurrentBuilds,

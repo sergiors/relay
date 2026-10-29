@@ -23,7 +23,7 @@ import (
 //
 // The required fields name the Redis stream, group, and address the worker
 // consumes, the PostgreSQL state DSN (DATABASE_URL), and the worker's stable
-// identity (WORKER_ID, surfaced as WorkerID); the address values (MetricsAddr,
+// node identity (NODE_ID, surfaced as NodeID); the address values (MetricsAddr,
 // GitWebhookAddr) are empty when disabled, so gating on non-empty keeps them
 // opt-in.
 type Config struct {
@@ -31,26 +31,26 @@ type Config struct {
 	RedisStream string
 	RedisGroup  string
 	// DatabaseURL is the PostgreSQL DSN (DATABASE_URL) of the shared state
-	// database. It is REQUIRED: Relay's operator state view, per-worker stats
+	// database. It is REQUIRED: Relay's operator state view, per-node stats
 	// snapshots, and the durable schedule-publication outbox all live in
 	// PostgreSQL, so the worker refuses to start without it. The value carries
 	// credentials and is never logged. It is consumed by internal/state as the
 	// sole connection identity.
 	DatabaseURL string
-	// WorkerID is the worker's REQUIRED, STABLE identity, resolved verbatim
-	// from WORKER_ID (trimmed) by ParseWorkerID. It is the SAME identity used as
-	// the Redis consumer name, the relay.hostname container-ownership label, and
-	// the stats-owner key, so a restart reuses one identity across all three and
-	// two workers sharing a group, database, or daemon never alias. There is no
-	// default or hostname fallback: a missing or malformed WORKER_ID fails
-	// startup. The value is a bounded token (maxWorkerIDLen; ASCII letters,
+	// NodeID is the worker's REQUIRED, STABLE node identity, resolved verbatim
+	// from NODE_ID (trimmed) by ParseNodeID. It is the SAME identity used as
+	// the Redis consumer name, the relay.node_id container-ownership label, and
+	// the stats node key, so a restart reuses one identity across all three and
+	// two nodes sharing a group, database, or daemon never alias. There is no
+	// default or hostname fallback: a missing or malformed NODE_ID fails
+	// startup. The value is a bounded token (maxNodeIDLen; ASCII letters,
 	// digits, '.', '_', '-') because it becomes a stats row key, a Redis
 	// consumer name, and a container label.
-	WorkerID string
+	NodeID string
 	// InstanceID is the ALWAYS-FRESH process identity for this run
 	// ("instance-<hex>"). It is regenerated on every Load (never configurable)
 	// and stored alongside the owner in the stats row as a fencing value: a
-	// stale process incarnation for the same WorkerID cannot overwrite a newer
+	// stale process incarnation for the same NodeID cannot overwrite a newer
 	// one's snapshots. It is internal coordination state, not operator
 	// configuration.
 	InstanceID string
@@ -82,7 +82,7 @@ type Config struct {
 	// terminal/stale-transition guards are unchanged — only the expiry is
 	// omitted.
 	InvocationRetention time.Duration
-	// StatsRetention is the STALE-OWNER retention window for the per-worker
+	// StatsRetention is the STALE-OWNER retention window for the per-node
 	// statistics rows (STATS_RETENTION). Unset defaults to
 	// DefaultStatsRetention (7 days); an explicitly empty, zero, or negative
 	// value DISABLES stale-owner compaction (0), and a malformed value logs and
@@ -91,7 +91,7 @@ type Config struct {
 	// window is periodically deleted. It is deliberately independent of the
 	// Redis retentions: those trim streams, this compacts operator state. A live
 	// worker's own row is never pruned (the owner is excluded), so disabling it
-	// only risks unbounded growth from many short-lived random WorkerIDs.
+	// only risks unbounded growth from many short-lived random NodeIDs.
 	StatsRetention time.Duration
 	MetricsAddr    string
 	// GitWebhookAddr is the address for the GitHub webhook server
@@ -268,21 +268,21 @@ const (
 	// STATS_RETENTION is UNSET; an explicitly empty value disables compaction.
 	// Seven days matches the DLQ and schedule-outbox windows: a dead worker's
 	// stats row is retained long enough to cover a restart or a short outage,
-	// then compacted so an unbounded stream of short-lived random WorkerIDs
+	// then compacted so an unbounded stream of short-lived random NodeIDs
 	// cannot grow the tables forever. A live worker's row is never pruned.
 	DefaultStatsRetention = 7 * 24 * time.Hour
 )
 
-// Worker identity constants. WORKER_ID is REQUIRED and used verbatim (see
-// ParseWorkerID); the only generated identity is the per-process InstanceID, so
+// Node identity constants. NODE_ID is REQUIRED and used verbatim (see
+// ParseNodeID); the only generated identity is the per-process InstanceID, so
 // its form is prefixed to tell it apart from an operator-supplied value, and the
 // random suffix is 8 bytes of crypto/rand rendered as hex (collision-free for
-// any realistic deployment). maxWorkerIDLen bounds WORKER_ID so it can never be
+// any realistic deployment). maxNodeIDLen bounds NODE_ID so it can never be
 // used to smuggle unbounded data into a stats row key, a Redis consumer name, or
 // a container label.
 const (
 	instanceIDPrefix = "instance-"
-	maxWorkerIDLen   = 128
+	maxNodeIDLen     = 128
 )
 
 // State-database pool defaults. Relay's state workload is low-frequency and
@@ -315,16 +315,16 @@ const (
 //
 // Every failure path RETURNS a clear, variable-naming error rather than logging
 // and exiting, so Load never writes to a process boundary and never calls
-// os.Exit: a missing required variable, an invalid WORKER_ID, an
+// os.Exit: a missing required variable, an invalid NODE_ID, an
 // invalid LOG_LEVEL, or an invalid positive integer/duration tuning knob is
 // returned for worker startup to propagate. The process boundary — printing the
 // error exactly once and choosing the exit code — stays in cmd/main.go.
 //
-// The required variables — the three REDIS_* values, DATABASE_URL, and WORKER_ID
-// — must be non-empty or Load returns an error (see requiredEnv); WORKER_ID is
-// additionally validated by ParseWorkerID. WorkerID is the worker's single
-// stable identity (the Redis consumer name, the relay.hostname
-// container-ownership label, and the stats owner); there is NO hostname or
+// The required variables — the three REDIS_* values, DATABASE_URL, and NODE_ID
+// — must be non-empty or Load returns an error (see requiredEnv); NODE_ID is
+// additionally validated by ParseNodeID. NodeID is the worker's single
+// stable node identity (the Redis consumer name, the relay.node_id
+// container-ownership label, and the stats node key); there is NO hostname or
 // generated fallback. InstanceID is always a fresh random "instance-<hex>" token
 // unique to this process. The optional variables are read with os.Getenv and
 // stay zero/empty when
@@ -366,7 +366,7 @@ func Load(logger *slog.Logger) (Config, error) {
 	cfg.RedisGroup = group
 
 	// The state database DSN is required: PostgreSQL backs the operator state
-	// view, the per-worker stats snapshots, and the durable schedule outbox. A
+	// view, the per-node stats snapshots, and the durable schedule outbox. A
 	// missing value is a startup error naming the variable, never a silent
 	// fallback.
 	databaseURL, err := requiredEnv("DATABASE_URL")
@@ -375,23 +375,23 @@ func Load(logger *slog.Logger) (Config, error) {
 	}
 	cfg.DatabaseURL = databaseURL
 
-	// WORKER_ID is REQUIRED: it is the worker's single stable identity — the
-	// Redis consumer name, the relay.hostname container-ownership label, and the
-	// per-worker stats owner. A missing value is a startup error naming the
-	// variable; a malformed one is rejected by ParseWorkerID. There is no
+	// NODE_ID is REQUIRED: it is the node's single stable identity — the
+	// Redis consumer name, the relay.node_id container-ownership label, and the
+	// stats node key. A missing value is a startup error naming the variable; a
+	// malformed one is rejected by ParseNodeID. There is no
 	// hostname or generated fallback.
-	workerID, err := requiredEnv("WORKER_ID")
+	nodeID, err := requiredEnv("NODE_ID")
 	if err != nil {
 		return Config{}, err
 	}
-	workerID, err = ParseWorkerID(workerID)
+	nodeID, err = ParseNodeID(nodeID)
 	if err != nil {
 		return Config{}, err
 	}
-	cfg.WorkerID = workerID
+	cfg.NodeID = nodeID
 
 	// InstanceID is ALWAYS fresh so a stale process incarnation of the same
-	// WorkerID can never overwrite a newer one's stats snapshots.
+	// NodeID can never overwrite a newer one's stats snapshots.
 	instanceID, err := newIdentityToken(instanceIDPrefix)
 	if err != nil {
 		return Config{}, err
@@ -617,34 +617,34 @@ func ParseOptionalPositiveInt(name, value string) (*int, error) {
 	return &n, nil
 }
 
-// ParseWorkerID validates a WORKER_ID value into the stable worker identity.
-// WORKER_ID is REQUIRED: callers resolve it with requiredEnv before validating,
+// ParseNodeID validates a NODE_ID value into the stable node identity.
+// NODE_ID is REQUIRED: callers resolve it with requiredEnv before validating,
 // so an empty (or whitespace-only) value is an error rather than a generated
-// fallback. The value is trimmed, must be at most maxWorkerIDLen bytes, and may
+// fallback. The value is trimmed, must be at most maxNodeIDLen bytes, and may
 // contain only ASCII letters, digits, '.', '_' and '-'. Any other value is an
-// error naming WORKER_ID (never silently coerced), so a missing or typo'd value
-// fails startup rather than producing an unexpected consumer name or stats owner.
-func ParseWorkerID(value string) (string, error) {
+// error naming NODE_ID (never silently coerced), so a missing or typo'd value
+// fails startup rather than producing an unexpected consumer name or stats node key.
+func ParseNodeID(value string) (string, error) {
 	v := strings.TrimSpace(value)
 	if v == "" {
-		return "", fmt.Errorf("invalid WORKER_ID %q: must not be empty", value)
+		return "", fmt.Errorf("invalid NODE_ID %q: must not be empty", value)
 	}
-	if len(v) > maxWorkerIDLen {
-		return "", fmt.Errorf("invalid WORKER_ID %q: must be at most %d characters", value, maxWorkerIDLen)
+	if len(v) > maxNodeIDLen {
+		return "", fmt.Errorf("invalid NODE_ID %q: must be at most %d characters", value, maxNodeIDLen)
 	}
 	for _, r := range v {
-		if !isWorkerIDChar(r) {
-			return "", fmt.Errorf("invalid WORKER_ID %q: only letters, digits, '.', '_' and '-' are allowed", value)
+		if !isNodeIDChar(r) {
+			return "", fmt.Errorf("invalid NODE_ID %q: only letters, digits, '.', '_' and '-' are allowed", value)
 		}
 	}
 	return v, nil
 }
 
-// isWorkerIDChar reports whether r is a permitted WORKER_ID character. The set
+// isNodeIDChar reports whether r is a permitted NODE_ID character. The set
 // is deliberately conservative (ASCII letters, digits, '.', '_', '-'): the value
 // becomes a stats row key and appears in logs, so whitespace-bearing, ambiguous,
 // or non-ASCII values are rejected.
-func isWorkerIDChar(r rune) bool {
+func isNodeIDChar(r rune) bool {
 	switch {
 	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
 		return true

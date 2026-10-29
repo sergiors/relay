@@ -1395,23 +1395,23 @@ func TestStatsRelationalMetadataColumns(t *testing.T) {
 	c := openTestState(t)
 
 	statsCols := tableColumnSet(t, c, "stats")
-	for _, want := range []string{"worker", "instance", "data", "updated_at"} {
+	for _, want := range []string{"node_id", "instance", "data", "updated_at"} {
 		if !statsCols[want] {
 			t.Errorf("stats missing metadata column %q: %v", want, statsCols)
 		}
 	}
 	if len(statsCols) != 4 {
-		t.Errorf("stats must have exactly worker/instance/data/updated_at, got %v", statsCols)
+		t.Errorf("stats must have exactly node_id/instance/data/updated_at, got %v", statsCols)
 	}
 
 	fnCols := tableColumnSet(t, c, "app_stats")
-	for _, want := range []string{"app_name", "worker", "data", "updated_at"} {
+	for _, want := range []string{"app_name", "node_id", "data", "updated_at"} {
 		if !fnCols[want] {
 			t.Errorf("app_stats missing metadata column %q: %v", want, fnCols)
 		}
 	}
 	if len(fnCols) != 4 {
-		t.Errorf("app_stats must have exactly app_name/worker/data/updated_at, got %v", fnCols)
+		t.Errorf("app_stats must have exactly app_name/node_id/data/updated_at, got %v", fnCols)
 	}
 }
 

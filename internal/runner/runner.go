@@ -115,12 +115,12 @@ type Runner struct {
 	// (fake/in-process executors, an unbounded runtime).
 	warmAdmitterOnce sync.Once
 	warmAdmitter     runtime.WarmAdmitter
-	// hostname is this worker's container-ownership identity, stamped as the
-	// relay.hostname label on every execution container via RunMeta. It is the
+	// nodeID is this worker's container-ownership identity, stamped as the
+	// relay.node_id label on every execution container via RunMeta. It is the
 	// same value as the Redis consumer identity. It must be set (via
-	// SetHostname) before Consume begins; when unset, an empty hostname label is
+	// SetNodeID) before Consume begins; when unset, an empty node label is
 	// emitted, which is diagnostic-only and harmless.
-	hostname string
+	nodeID string
 	// maxHandlerTimeout caps every rule's handler timeout (0 = uncapped), stored
 	// as nanoseconds in an atomic.Int64. It is defense in depth: template
 	// validation enforces the cap at load, and this runtime cap guarantees a
@@ -224,13 +224,14 @@ func NewWithMetrics(prepared []*PreparedApp, logger *slog.Logger, registry *metr
 // apps live without round-tripping through New.
 func (r *Runner) Registry() *Registry { return r.reg }
 
-// SetHostname sets this worker's container-ownership hostname, stamped as the
-// relay.hostname label on every execution container. It must be called before
-// Consume begins processing; it takes effect on the next Handle, so setting it
+// SetNodeID sets this worker's container-ownership node identity, stamped
+// as the relay.node_id label on every execution container. It must be called
+// before Consume begins processing; it takes effect on the next Handle, so
+// setting it
 // right after construction (as internal/worker does) labels every invocation.
 // The constructor guarantees a non-nil Runner.
-func (r *Runner) SetHostname(hostname string) {
-	r.hostname = hostname
+func (r *Runner) SetNodeID(nodeID string) {
+	r.nodeID = nodeID
 }
 
 // SetMaxHandlerTimeout caps every rule's handler timeout to at most timeout. A value
@@ -257,7 +258,7 @@ func (r *Runner) SetSecretProvider(provider secrets.Provider) {
 // invocations. A value of 0 or negative (the zero value) falls back to
 // DefaultMaxConcurrentInvocations (8); a value of 0 must not mean "unbounded". It takes
 // effect on the next Handle. It is wired by the worker right next to
-// SetHostname/SetSecretProvider/SetMaxHandlerTimeout. It immediately stores a
+// SetNodeID/SetSecretProvider/SetMaxHandlerTimeout. It immediately stores a
 // new global semaphore, so a call after construction resizes it.
 func (r *Runner) SetMaxConcurrentInvocations(n int) {
 	if n < 1 {

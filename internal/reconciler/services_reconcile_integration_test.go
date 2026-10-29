@@ -29,11 +29,11 @@ import (
 	"relay/internal/testutil"
 )
 
-// serviceTestHostname is the stable manager identity the service integration
-// tests use. The Manager stamps it as relay.hostname on every service container
+// serviceTestNodeID is the stable manager identity the service integration
+// tests use. The Manager stamps it as relay.node_id on every service container
 // it creates, and cleanup requires that exact label value, so it can never
 // select another worker's container even on a shared daemon.
-const serviceTestHostname = "test-host"
+const serviceTestNodeID = "test-host"
 
 // serviceTestCleanupTimeout bounds the entire service integration cleanup: the
 // container list/stop round trips, app-image listing, image removal, and the
@@ -52,7 +52,7 @@ func TestServicesReconcileIntegration(t *testing.T) {
 	// testutil.UniqueName keeps it within app.ValidName's 63-char cap even
 	// for a long test name. It is also the ownership scope of cleanup.
 	name := testutil.UniqueName(t, "svc-rec")
-	m, err := runtime.NewManager(logger, nil, serviceTestHostname)
+	m, err := runtime.NewManager(logger, nil, serviceTestNodeID)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestServicesReconcileIntegration(t *testing.T) {
 	// partial setup still tears down whatever this test started. The helper
 	// closes the Manager last, after its own Docker cleanup, so the Manager
 	// APIs remain usable for the entire cleanup.
-	registerServiceTestCleanup(t, m, cli, name, serviceTestHostname)
+	registerServiceTestCleanup(t, m, cli, name, serviceTestNodeID)
 
 	// Manager is both the reconcile Builder and the services Docker seam.
 	adapter := dockerManagerAdapter{m}
@@ -153,7 +153,7 @@ func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
 	root := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	name := testutil.UniqueName(t, "svc-env")
-	m, err := runtime.NewManager(logger, nil, serviceTestHostname)
+	m, err := runtime.NewManager(logger, nil, serviceTestNodeID)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
 	// helper selects only this unique app's containers on this manager identity,
 	// removes only its label-classified app images, and closes the Manager last
 	// so its APIs stay usable throughout cleanup.
-	registerServiceTestCleanup(t, m, cli, name, serviceTestHostname)
+	registerServiceTestCleanup(t, m, cli, name, serviceTestNodeID)
 
 	dir := filepath.Join(root, name)
 	if err := os.MkdirAll(filepath.Join(dir, "app"), 0o755); err != nil {
@@ -302,7 +302,7 @@ func assertServiceCounts(t *testing.T, m *runtime.Manager, name string, want int
 //
 // The cleanup selects containers STRICTLY from the labels the daemon returned:
 // relay.type=service proves Relay ownership, while relay.app (this test's unique
-// app) and relay.hostname (this manager's identity) scope it to this test. App
+// app) and relay.node_id (this manager's identity) scope it to this test. App
 // or container names alone are not ownership proof, so another test's or
 // worker's service containers can never be stopped or removed. Images are
 // selected through AppImageTags, which is likewise label-derived (relay.type=app
@@ -323,7 +323,7 @@ func assertServiceCounts(t *testing.T, m *runtime.Manager, name string, want int
 // and leave this cleanup talking to a shut-down Manager. Every failure is
 // reported with t.Errorf: cleanup problems are observable without masking an
 // original test failure or aborting the rest of the cleanup.
-func registerServiceTestCleanup(t *testing.T, m *runtime.Manager, cli *client.Client, name, hostname string) {
+func registerServiceTestCleanup(t *testing.T, m *runtime.Manager, cli *client.Client, name, nodeID string) {
 	t.Helper()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), serviceTestCleanupTimeout)
@@ -341,7 +341,7 @@ func registerServiceTestCleanup(t *testing.T, m *runtime.Manager, cli *client.Cl
 		}
 		var owned []runtime.ServiceContainer
 		for _, ct := range listed {
-			if serviceContainerOwnedBy(ct.Labels, name, hostname) {
+			if serviceContainerOwnedBy(ct.Labels, name, nodeID) {
 				owned = append(owned, ct)
 			}
 		}
@@ -362,7 +362,7 @@ func registerServiceTestCleanup(t *testing.T, m *runtime.Manager, cli *client.Cl
 		}
 		var survivors []runtime.ServiceContainer
 		for _, ct := range remaining {
-			if serviceContainerOwnedBy(ct.Labels, name, hostname) {
+			if serviceContainerOwnedBy(ct.Labels, name, nodeID) {
 				survivors = append(survivors, ct)
 			}
 		}
@@ -392,16 +392,16 @@ func registerServiceTestCleanup(t *testing.T, m *runtime.Manager, cli *client.Cl
 	})
 }
 
-// TestIntegrationShutdownCleanupHostnameScoped proves graceful-shutdown cleanup
-// is hostname-scoped against a real daemon AND that it survives the production
+// TestIntegrationShutdownCleanupNodeScoped proves graceful-shutdown cleanup
+// is nodeID-scoped against a real daemon AND that it survives the production
 // shutdown ordering (the worker cancels its lifecycle before running the ordered
 // teardown steps, so ordinary admission is refused and only the shutdown-only
-// gate is left): two managers with distinct worker identities each start a
+// gate is left): two managers with distinct node identities each start a
 // persistent service container; w1's lifecycle is cancelled, then ShutdownCleanup
 // of w1 removes only w1's container while w2's remains (and the container list
 // structurally contains ONLY relay service containers, so no unrelated container
 // could ever be touched by this path).
-func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
+func TestIntegrationShutdownCleanupNodeScoped(t *testing.T) {
 	testutil.RequireDocker(t)
 
 	dcli, err := client.NewClientWithOpts(client.FromEnv)
@@ -412,8 +412,8 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 
 	var buf strings.Builder
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
-	// Derive per-run worker identities and app names so concurrent runs on
-	// one daemon cannot collide on the hostname-scoped container set.
+	// Derive per-run node identities and app names so concurrent runs on
+	// one daemon cannot collide on the nodeID-scoped container set.
 	stamp := time.Now().UnixNano()
 	w1host, w2host := fmt.Sprintf("relay-it-w1-%d", stamp), fmt.Sprintf("relay-it-w2-%d", stamp)
 	// The worker cancels its lifecycle BEFORE running its ordered shutdown
@@ -435,14 +435,14 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 	// Start one persistent service container per worker (distinct apps, a
 	// long-lived sleep under the shared node:24-alpine image). Unrelated
 	// non-Relay containers cannot appear in ServiceContainerList structurally
-	// (the strict relay.type=service filter), so hostname preservation is the
+	// (the strict relay.type=service filter), so nodeID preservation is the
 	// complete scoping assertion; a plain no-label container sub-assertion is
 	// omitted because no relay-labeled start path exists for one.
 	fn1, fn2 := fmt.Sprintf("int-sc-a-%d", stamp), fmt.Sprintf("int-sc-b-%d", stamp)
 	// A stop-responsive long-lived process: a plain `sleep 600` as PID 1 ignores
 	// SIGTERM, so each StopServiceContainers would pay the daemon's full 10s
 	// grace before SIGKILL. node with a SIGTERM handler exits immediately; the
-	// container is still long-lived and the hostname-scoping assertion is
+	// container is still long-lived and the nodeID-scoping assertion is
 	// unchanged.
 	stopResponsive := []string{"node", "-e", "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000);"}
 	if _, err := m1.StartService(context.Background(), runtime.ServiceSpec{
@@ -467,7 +467,7 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 
 	// Cleanup via the raw client: the managers' clients are closed by their
 	// deferred Close before t.Cleanup runs, and m1's ordinary listing is refused
-	// once its lifecycle is cancelled. Scope strictly to this run's two hostname
+	// once its lifecycle is cancelled. Scope strictly to this run's two nodeID
 	// identities.
 	t.Cleanup(func() {
 		cc, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -477,7 +477,7 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 			return
 		}
 		for _, c := range list.Items {
-			if c.Labels["relay.hostname"] == w1host || c.Labels["relay.hostname"] == w2host {
+			if c.Labels["relay.node_id"] == w1host || c.Labels["relay.node_id"] == w2host {
 				_, _ = dcli.ContainerRemove(cc, c.ID, client.ContainerRemoveOptions{Force: true})
 			}
 		}
@@ -499,7 +499,7 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 
 	// Assert against the daemon directly: m1's own listing is refused once its
 	// lifecycle is cancelled.
-	findByHostname := func(host string) []string {
+	findByNodeID := func(host string) []string {
 		t.Helper()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -509,16 +509,16 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 		}
 		var ids []string
 		for _, c := range list.Items {
-			if c.Labels["relay.hostname"] == host {
+			if c.Labels["relay.node_id"] == host {
 				ids = append(ids, c.ID)
 			}
 		}
 		return ids
 	}
 	testutil.WaitFor(t, 10*time.Second, "w1 container removed by shutdown cleanup", func() bool {
-		return len(findByHostname(w1host)) == 0
+		return len(findByNodeID(w1host)) == 0
 	})
-	if got := findByHostname(w2host); len(got) != 1 || got[0] != id2 {
+	if got := findByNodeID(w2host); len(got) != 1 || got[0] != id2 {
 		t.Fatalf("w2's container must survive ShutdownCleanup of w1, got %v", got)
 	}
 }

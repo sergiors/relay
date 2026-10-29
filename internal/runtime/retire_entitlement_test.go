@@ -316,7 +316,7 @@ func TestStartServiceCarriedEntitlementSharesUnderRetirement(t *testing.T) {
 		dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
 		dockerRoute{method: http.MethodGet, path: "/containers/cid-1/json", body: `{"Id":"cid-1","State":{"Running":true}}`},
 	)
-	m0 = &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
+	m0 = &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "h"}
 	t.Cleanup(func() { _ = m0.Close() })
 
 	carried, err := m0.AcquireImageLease(image)
@@ -361,7 +361,7 @@ func TestStartServiceCarriedLeaseForOtherImageDoesNotBypassRetirement(t *testing
 		dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
 		dockerRoute{method: http.MethodGet, path: "/containers/cid-1/json", body: `{"Id":"cid-1","State":{"Running":true}}`},
 	)
-	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "h"}
 	t.Cleanup(func() { _ = m.Close() })
 
 	carried, err := m.AcquireImageLease(other)
@@ -402,7 +402,7 @@ func TestStartServiceCarriedLeaseForOtherImageAcquiresOwn(t *testing.T) {
 		dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
 		dockerRoute{method: http.MethodGet, path: "/containers/cid-1/json", body: `{"Id":"cid-1","State":{"Running":true}}`},
 	)
-	m0 = &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
+	m0 = &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "h"}
 	t.Cleanup(func() { _ = m0.Close() })
 
 	carried, err := m0.AcquireImageLease(other)

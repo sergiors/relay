@@ -12,7 +12,7 @@ import (
 
 // dependencyImageLockNamespace is the high-order key of the per-dependency-image
 // advisory locks. It partitions them from appLockNamespace (1) and from the
-// single-bigint schema/worker locks, so a dependency reference can never alias
+// single-bigint schema/node locks, so a dependency reference can never alias
 // an app's snapshot lock or a worker's ownership lock. The pair
 // (dependencyImageLockNamespace, dependencyImageLockKey) is the two-int form of
 // the PostgreSQL advisory locks; PostgreSQL stores it in pg_locks with
@@ -526,7 +526,7 @@ func (st *State) dropDependencyLock(lockID dependencyImageLockID, shared bool) {
 // withDependencyCoordConn runs fn on the connection dependency-image
 // coordination uses and reports that connection's backend PID.
 //
-// An ownerful handle reuses the worker's pinned owner-lock connection, so
+// An ownerful handle reuses the worker's pinned node-lock connection, so
 // dependency leases live on the same session whose loss the ownership monitor
 // already treats as fatal; fn runs under ownerMu, so it is serialized with
 // VerifyOwnerLock and Close. An ownerless handle (CLI, tests) lazily pins its own
@@ -552,7 +552,7 @@ func (st *State) withDependencyCoordConn(
 ) error {
 	queryCtx, cancel := context.WithTimeout(ctx, dependencyQueryTimeout)
 	defer cancel()
-	if st.owner != "" {
+	if st.nodeID != "" {
 		st.ownerMu.Lock()
 		defer st.ownerMu.Unlock()
 		if st.ownerConn == nil {

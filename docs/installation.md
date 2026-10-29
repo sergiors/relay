@@ -28,14 +28,14 @@ syntax, `up` may create missing host paths as empty files or directories, so
 check the sources explicitly before starting.
 
 Create `.env` beside `compose.prod.yaml`. Compose requires `RELAY_IMAGE`,
-`WORKER_ID`, `ACME_EMAIL`, `TEMPO_VERSION`, `OTEL_VERSION`, `ALLOY_VERSION`,
+`NODE_ID`, `ACME_EMAIL`, `TEMPO_VERSION`, `OTEL_VERSION`, `ALLOY_VERSION`,
 `GRAFANA_VERSION`, `GRAFANA_DOMAIN`, `GRAFANA_ADMIN_USER`, and
 `GRAFANA_ADMIN_PASSWORD`. The same file must configure Relay's external
 dependencies with `REDIS_URI`, `REDIS_STREAM`, `REDIS_GROUP`, and
 `DATABASE_URL`. Choose values appropriate to your deployment; do not use
 development credentials or an untested Relay image.
 
-`WORKER_ID` must be unique among concurrent workers, stable across restarts,
+`NODE_ID` must be unique among concurrent nodes, stable across restarts,
 and at most 128 characters using only ASCII letters, digits, `.`, `_`, and `-`.
 The Compose file sets `DOCKER_HOST` to its socket proxy, sets
 `NETWORKS=relay,traefik`, and configures Relay's Traefik network, HTTPS
@@ -167,9 +167,8 @@ and be reachable on ports 80 and 443.
 
 ## Updates and Persistence
 
-PostgreSQL initializes its schema automatically but does not migrate it across
-Relay releases. Stop the old worker before switching versions. Set `RELAY_IMAGE`
-to a tested release tag or digest, then update only the Relay service:
+Set `RELAY_IMAGE` to a tested release tag or digest, then update only the Relay
+service:
 
 ```sh
 docker compose -f compose.prod.yaml pull relay
@@ -190,7 +189,7 @@ requirements; do not remove volumes as part of routine updates. See
   Compose syntax. Check bind-mount sources separately with the presence checks
   in [Configuration](#configuration); `config --quiet` does not verify them.
 - If the Relay container does not become healthy, check its logs and verify
-  `WORKER_ID`, Docker Engine access, and Redis/PostgreSQL connectivity.
+  `NODE_ID`, Docker Engine access, and Redis/PostgreSQL connectivity.
 - If the worker fails at startup, verify every network configured in
   `NETWORKS` exists; a missing network is fatal.
 - If apps are missing or stale, check `relay git status` and run `relay git sync`

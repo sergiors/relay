@@ -6,8 +6,8 @@ import (
 )
 
 // AppStats is the per-app operational snapshot persisted as the JSONB
-// payload of an app_stats row, keyed by (app name, worker identity) so each
-// app's payload is attributed independently both per app and per owning worker.
+// payload of an app_stats row, keyed by (app name, node identity) so each
+// app's payload is attributed independently both per app and per owning node.
 //
 // Semantics (see runner.Handle): EventsMatchedTotal counts an app once per
 // logical event for which at least one of its rules matched — a
@@ -100,11 +100,11 @@ func (st *State) RecordAppStatsContext(ctx context.Context, appStats AppStats) {
 			return err
 		}
 		_, err = tx.ExecContext(ctx,
-			`INSERT INTO app_stats (app_name, worker, data, updated_at) VALUES ($1, $2, $3, $4)
-			 ON CONFLICT(app_name, worker) DO UPDATE SET
+			`INSERT INTO app_stats (app_name, node_id, data, updated_at) VALUES ($1, $2, $3, $4)
+			 ON CONFLICT(app_name, node_id) DO UPDATE SET
 			   data       = excluded.data,
 			   updated_at = excluded.updated_at`,
-			appStats.App, st.owner, payload, st.nowString())
+			appStats.App, st.nodeID, payload, st.nowString())
 		return err
 	})
 	if err != nil {
@@ -162,8 +162,8 @@ func (st *State) AppStats(name string) (AppStats, bool) {
 func (st *State) OwnerAppStats() []AppStats {
 	ctx := context.Background()
 	rows, err := st.db.QueryContext(ctx,
-		`SELECT app_name, `+jsonPayloadExpr+`, updated_at FROM app_stats WHERE worker = $1 ORDER BY app_name`,
-		st.owner)
+		`SELECT app_name, `+jsonPayloadExpr+`, updated_at FROM app_stats WHERE node_id = $1 ORDER BY app_name`,
+		st.nodeID)
 	if err != nil {
 		st.log.Warn("State: list app stats failed", "error", err)
 		return nil
@@ -229,9 +229,9 @@ func (st *State) AppNames(ctx context.Context) ([]string, bool) {
 	return out, true
 }
 
-// AllAppStats returns every app_stats row AGGREGATED across worker owners,
+// AllAppStats returns every app_stats row AGGREGATED across node owners,
 // grouped by app and ordered by app name. Counters are summed and Last*At
-// timestamps take the newest observation. It is the cross-worker read used by
+// timestamps take the newest observation. It is the cross-node read used by
 // the CLI/operator view; a worker restoring its own counters uses OwnerAppStats.
 // A row whose JSON is invalid is logged and skipped (its stats are unknowable);
 // it returns nil on a read error, matching the file's non-fatal style.

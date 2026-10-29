@@ -169,17 +169,17 @@
 // Stats persistence model:
 //
 // The stats and app_stats tables store the latest persisted ABSOLUTE
-// snapshot of Relay's operational counters — idempotent, no deltas — PER WORKER.
-// Each row is keyed by the owning worker's STABLE logical identity (config
-// WorkerID, resolved from the required WORKER_ID) so two
-// workers sharing one PostgreSQL database keep independent counter sets instead
+// snapshot of Relay's operational counters — idempotent, no deltas — PER NODE.
+// Each row is keyed by the owning node's STABLE logical identity (config.NodeID,
+// resolved from the required NODE_ID) so two nodes sharing one PostgreSQL
+// database keep independent counter sets instead
 // of last-writer-wins overwriting a single global row, and so same-host workers
-// never collide (two processes must not share a WORKER_ID).
-// Only stable relational metadata is kept as columns: stats.worker,
+// never collide (two processes must not share a NODE_ID).
+// Only stable relational metadata is kept as columns: stats.node_id,
 // stats.instance, and stats.updated_at, and app_stats.app_name,
-// app_stats.worker, and app_stats.updated_at. stats.instance is the owning
+// app_stats.node_id, and app_stats.updated_at. stats.instance is the owning
 // process incarnation (config InstanceID, an always-fresh per-process token):
-// every flush is conditioned on it, so a stale process for the same WorkerID can
+// every flush is conditioned on it, so a stale process for the same NodeID can
 // never overwrite a newer incarnation's snapshot (see RecordStatsSnapshot). The
 // evolving counter/gauge/execution-history payload is a native JSONB object in the
 // data column, marshalled and unmarshalled ONLY through stats_json.go; the worker,
@@ -201,16 +201,16 @@
 // Reads: a worker restoring its own counters at startup reads ONLY its own rows
 // (OwnerStats/OwnerAppStats), so a restart of the same identity continues its
 // totals without double-counting a shared database. CLI and observability reads
-// AGGREGATE across every owner (Stats/AppStats/AllAppStats): cumulative counters
+// AGGREGATE across every node (Stats/AppStats/AllAppStats): cumulative counters
 // are summed, the execution-history timestamps take the maximum, and the
-// shared-backlog gauges come from the FRESHEST owner snapshot (the newest
-// updated_at), so a dead worker's stale gauge can never mask the live value.
-// `relay stats reset` zeroes every owner's rows in place. Two workers
-// deliberately configured with the SAME WORKER_ID cannot coexist: Open takes an
-// exclusive per-owner session advisory lock held for the handle's lifetime, so
+// shared-backlog gauges come from the FRESHEST node snapshot (the newest
+// updated_at), so a dead node's stale gauge can never mask the live value.
+// `relay stats reset` zeroes every node's rows in place. Two workers
+// deliberately configured with the SAME NODE_ID cannot coexist: Open takes an
+// exclusive per-node session advisory lock held for the handle's lifetime, so
 // the second concurrent worker fails to start with a clear error instead of
 // silently fighting over one row (each concurrent worker must set a distinct
-// WORKER_ID).
+// NODE_ID).
 //
 // In addition to the event/handler counters, app_stats carries the
 // CUMULATIVE warm-container pool counters (warm acquires, cold starts,
@@ -230,15 +230,15 @@
 // the fresh registry (restorePersistedStats) so the first snapshot never resets
 // them. Redis event-processing correctness never depends on the stats tables.
 //
-// Stale-owner compaction: a retired WORKER_ID leaves its rows behind, so many
+// Stale-node compaction: a retired NODE_ID leaves its rows behind, so many
 // short-lived identities can accumulate rows. After a
 // successful flush the worker best-effort deletes stats/app_stats rows owned by
-// OTHER workers whose updated_at is older than STATS_RETENTION (default 7 days)
+// OTHER nodes whose updated_at is older than STATS_RETENTION (default 7 days)
 // via PruneStaleStats, throttled to one attempt per retentionTickInterval. A
 // worker never prunes its OWN row, however stale it looks, and a zero/negative
 // retention disables compaction. See docs/configuration.md.
 //
-// `relay stats reset` zeroes the cumulative fields IN PLACE: every worker's
+// `relay stats reset` zeroes the cumulative fields IN PLACE: every node's
 // global row and every app_stats row survive, decoded from their typed JSON
 // payloads, while the live gauges and any known unrelated field are preserved.
 // The reset bumps the shared generation in the same transaction, so a delayed
@@ -276,9 +276,9 @@
 //     across processes without any process-global lock. Schema initialization is
 //     serialized by a transaction-scoped advisory lock so concurrent openers
 //     cannot race CREATE TABLE IF NOT EXISTS. A worker handle additionally holds
-//     a per-owner EXCLUSIVE session advisory lock on a dedicated pinned
+//     a per-node EXCLUSIVE session advisory lock on a dedicated pinned
 //     connection for its whole lifetime: a second process presenting the same
-//     WORKER_ID fails Open with a clear error rather than silently sharing the
+//     NODE_ID fails Open with a clear error rather than silently sharing the
 //     identity (see Open/Close); ownerless CLI/admin handles never take it. The
 //     worker periodically re-verifies that pinned lock with VerifyOwnerLock
 //     (recording the connection's backend PID at open): if the lock connection

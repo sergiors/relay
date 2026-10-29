@@ -23,7 +23,7 @@ import (
 func TestRestoreToleratesCorruptGlobalJSON(t *testing.T) {
 	dsn := testutil.NewStateDSN(t)
 	st := testutil.OpenState(t, dsn)
-	seedCorruptGlobalRow(t, dsn, st.Owner())
+	seedCorruptGlobalRow(t, dsn, st.NodeID())
 
 	m := metrics.New()
 	restorePersistedStats(m, st) // must not panic
@@ -42,7 +42,7 @@ func TestRestoreToleratesCorruptAppJSON(t *testing.T) {
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("broken", t.TempDir())); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
-	seedCorruptAppRow(t, dsn, st.Owner(), "broken")
+	seedCorruptAppRow(t, dsn, st.NodeID(), "broken")
 
 	m := metrics.New()
 	restorePersistedStats(m, st) // must not panic

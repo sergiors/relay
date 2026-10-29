@@ -373,7 +373,7 @@ func TestReplayDLQWritesNoBrokerState(t *testing.T) {
 // (a replay has no source message). The type is the schedule marker because
 // ReplayDLQ reuses InvokeHandler, the single-handler execution primitive whose
 // container type is the schedule one; it remains a managed execution container
-// for the sweep's relay.type + relay.hostname ownership predicate either way.
+// for the sweep's relay.type + relay.node_id ownership predicate either way.
 func TestReplayDLQStampsInvocationMeta(t *testing.T) {
 	exec := &captureExecutor{}
 	r := New([]*PreparedApp{replayFn(t, "fn", exec)}, testutil.DiscardLogger())

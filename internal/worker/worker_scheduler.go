@@ -167,9 +167,9 @@ func wireSchedulerStorage(
 // deliberately opens an independent handle on the same DSN — the smallest
 // clean equivalent — and wires the same status observer so a recovered
 // store's status writes still project onto the app_status gauge. It opens with
-// NO stats owner: the handle exists only for the schedule outbox and never
-// writes stats rows, and an owner without a paired instance is rejected by
-// state.Open.
+// NO stats node identity: the handle exists only for the schedule outbox and
+// never writes stats rows, and an identity without a paired instance is
+// rejected by state.Open.
 func schedulerStorageOpener(dsn string, logger *slog.Logger, metricsInstance *metrics.Registry) cron.OutboxOpener {
 	return func() (cron.Outbox, io.Closer, error) {
 		st, err := state.Open(context.Background(), state.Options{

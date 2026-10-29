@@ -20,10 +20,10 @@ import (
 func TestStatsFlusherRebasesAfterRemoteReset(t *testing.T) {
 	ctx := context.Background()
 	dsn := testutil.NewStateDSN(t)
-	// Owner identities must be unique per test: PostgreSQL session advisory locks
+	// Node identities must be unique per test: PostgreSQL session advisory locks
 	// are database-wide, so per-test schemas do not isolate them.
 	owner := testutil.UniqueName(t, "stats-rebases")
-	st := testutil.OpenState(t, dsn, state.Options{Owner: owner, Instance: "inst-a"})
+	st := testutil.OpenState(t, dsn, state.Options{NodeID: owner, Instance: "inst-a"})
 	// A second, owner-less handle plays the admin process that resets.
 	admin := testutil.OpenState(t, dsn)
 
@@ -60,11 +60,11 @@ func TestStatsFlusherRebasesAfterRemoteReset(t *testing.T) {
 }
 
 // TestStatsFlusherStopsOnOwnershipLost verifies that once another incarnation of
-// the same worker claims the stats row, this flusher latches ownershipLost and
+// the same node claims the stats row, this flusher latches ownershipLost and
 // stops writing entirely, leaving the newer incarnation's snapshot untouched.
 //
-// Two LIVE same-owner handles can no longer coexist: state.Open holds an
-// exclusive per-owner lock, so a competing worker fails to start rather than
+// Two LIVE same-node handles can no longer coexist: state.Open holds an
+// exclusive per-node lock, so a competing node fails to start rather than
 // racing this one. The competing incarnation is therefore simulated at the
 // database layer — a direct instance+payload re-stamp, exactly what a successor's
 // claim writes — which is the residual race the fence still guards against (for
@@ -74,16 +74,16 @@ func TestStatsFlusherStopsOnOwnershipLost(t *testing.T) {
 	dsn := testutil.NewStateDSN(t)
 
 	owner := testutil.UniqueName(t, "stats-lost")
-	stale := testutil.OpenState(t, dsn, state.Options{Owner: owner, Instance: "inst-1"})
+	stale := testutil.OpenState(t, dsn, state.Options{NodeID: owner, Instance: "inst-1"})
 	mStale := metrics.New()
 	mStale.Add(metrics.MetricEventsMatched, 5)
 	fStale := newStatsFlusher(stale, mStale)
 	fStale.flush(ctx)
 
-	// A new process incarnation of the same worker id claims the row.
+	// A new process incarnation of the same node ID claims the row.
 	raw := newRawStateConn(t, dsn)
 	if _, err := raw.ExecContext(ctx,
-		`UPDATE stats SET instance = $2, data = $3, updated_at = $4 WHERE worker = $1`,
+		`UPDATE stats SET instance = $2, data = $3, updated_at = $4 WHERE node_id = $1`,
 		owner, "inst-2", `{"events_matched_total":30}`,
 		time.Now().UTC().Format(time.RFC3339)); err != nil {
 		t.Fatalf("simulate successor claim: %v", err)
@@ -114,7 +114,7 @@ func TestStatsFlusherStopsOnOwnershipLost(t *testing.T) {
 func TestStatsFlusherResetAdoptsEpoch(t *testing.T) {
 	ctx := context.Background()
 	owner := testutil.UniqueName(t, "stats-reset")
-	st := testutil.NewState(t, state.Options{Owner: owner, Instance: "inst-a"})
+	st := testutil.NewState(t, state.Options{NodeID: owner, Instance: "inst-a"})
 	m := metrics.New()
 	m.Add(metrics.MetricEventsMatched, 100)
 

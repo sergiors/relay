@@ -101,9 +101,9 @@
 // The service reconciler (services.go) is part of this package. Service
 // convergence is driven by the Config hooks UpdateServices/RemoveServices (both
 // nil-safe), which the worker wires to a *ServiceReconciler constructed from the
-// runtime Manager's Docker seam. The worker also wires its stable WORKER_ID
-// (WithWorkerID), so that reconciler only converges, adopts, removes, and sweeps
-// containers stamped with its own relay.hostname: a restart of the SAME identity
+// runtime Manager's Docker seam. The worker also wires its stable NODE_ID
+// (WithNodeID), so that reconciler only converges, adopts, removes, and sweeps
+// containers stamped with its own relay.node_id: a restart of the SAME identity
 // still adopts its running services, while another worker's containers on a
 // shared daemon are never touched. A service's source (entrypoint or image) is
 // resolved to a runnable image BEFORE any container action; a source that cannot

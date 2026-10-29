@@ -11,18 +11,18 @@ import (
 	"relay/internal/state"
 )
 
-// errOwnershipLost marks a worker run that ended because the pinned WORKER_ID
+// errOwnershipLost marks a worker run that ended because the pinned NODE_ID
 // lock was detected no longer held (by the periodic monitor or by a fail-closed
 // shutdown verification). Run joins it into its returned error (see the override
 // defer) so the supervisor treats the exit as an abnormal termination rather
 // than a clean signal shutdown. By the time this error surfaces the worker has
 // already cancelled its lifecycle and skipped identity-scoped cleanup; it is a
 // report, not a remedy.
-var errOwnershipLost = errors.New("worker ownership lost")
+var errOwnershipLost = errors.New("node ownership lost")
 
-// ownershipLoss is the once-only latch recording a detected loss of the worker-
+// ownershipLoss is the once-only latch recording a detected loss of the node-
 // ownership lock (the exclusive session advisory lock state.Open takes on
-// WORKER_ID). It is set once by whichever path observes the loss first — the
+// NODE_ID). It is set once by whichever path observes the loss first — the
 // periodic monitor, a fail-closed shutdown verification, or an identity-cleanup
 // guard's fresh proof — through ownershipLossAction, and read by readiness, the
 // deferred error override, and the shutdown guards. It is safe for concurrent
@@ -74,7 +74,7 @@ type ownershipMonitorConfig struct {
 // loss, run through the latch: on the FIRST observation it marks the latch,
 // clears readiness (so a `relay health` query stops reporting ready the moment
 // the loss is known, before the deferred shutdown clear), logs one structured
-// warning carrying the STABLE worker identity and this process's incarnation
+// warning carrying the STABLE node identity and this process's incarnation
 // token, and cancels the lifecycle so background loops, the service
 // coordinator, and rooted builds observe the loss exactly as they would a
 // signal. The periodic monitor and every fail-closed shutdown verification share
@@ -85,7 +85,7 @@ func ownershipLossAction(
 	loss *ownershipLoss,
 	ready *readiness,
 	logger *slog.Logger,
-	worker string,
+	nodeID string,
 	instance string,
 	cancel context.CancelFunc,
 ) func() {
@@ -97,8 +97,8 @@ func ownershipLossAction(
 			ready.setOwnershipLost()
 		}
 		if logger != nil {
-			logger.Warn("Worker ownership lost; shutting down",
-				"worker_id", worker,
+			logger.Warn("Node ownership lost; shutting down",
+				"node_id", nodeID,
 				"instance_id", instance,
 			)
 		}
@@ -197,7 +197,7 @@ func ownershipCheck(ctx context.Context, verify func(context.Context) error, tim
 }
 
 // ownershipProof is the fail-closed, fresh-context ownership proof shared by the
-// paths that act on THIS worker identity (its service containers, its stats
+// paths that act on THIS node identity (its service containers, its stats
 // row) or must report a lost identity. It bundles the once-only latch, the
 // pinned-session verification seam, and the shared once-only loss action, so
 // "is this identity still mine?" has ONE definition: the periodic monitor, the
@@ -244,10 +244,10 @@ func (p ownershipProof) prove(timeout time.Duration) error {
 	return nil
 }
 
-// guardIdentityCleanup wraps a shutdown step that operates on THIS worker
+// guardIdentityCleanup wraps a shutdown step that operates on THIS node
 // identity (its service containers, its stats row) so it is SKIPPED once
 // ownership is lost. Once the lock is gone a replacement process may already own
-// WORKER_ID, so "this worker's" cleanup could remove the new owner's service
+// NODE_ID, so "this node's" cleanup could remove the new owner's service
 // containers or overwrite its stats row. The guard checks the latch AND then
 // runs a fresh bounded ownership proof on the pinned connection IMMEDIATELY
 // before the operation: a loss latched earlier (by the monitor or the final
@@ -280,7 +280,7 @@ func guardIdentityCleanup(
 }
 
 // guardIdentitySnapshotCleanup wraps an identity-scoped cleanup that REMOVES
-// discovered Docker objects (this worker's orphan execution containers, its
+// discovered Docker objects (this node's orphan execution containers, its
 // service containers) in the single-proof ordering that shrinks the takeover
 // race as far as a non-atomic cross-system check can: SNAPSHOT the candidates
 // first, run ONE fresh bounded ownership proof second, and remove exactly the
@@ -291,7 +291,7 @@ func guardIdentityCleanup(
 //
 // The ordering removes one specific race. If discovery ran AFTER a successful
 // proof, ownership could be lost in the proof→discovery gap and a replacement
-// that took over WORKER_ID would have its objects listed and removed. With
+// that took over NODE_ID would have its objects listed and removed. With
 // discovery first, a captured candidate was observed while the lock was still
 // ours, so a replacement that had taken over BEFORE the snapshot cannot have its
 // objects in the set.
@@ -305,9 +305,9 @@ func guardIdentityCleanup(
 //     it creates has a NEW immutable Docker ID. A captured ID therefore can
 //     never name a container the replacement made.
 //   - SERVICE containers (shutdown cleanup, and the startup service-orphan
-//     sweep): a replacement with the SAME WORKER_ID CAN retain/adopt the SAME
-//     physical id. The worker wires reconciler.WithWorkerID, so adoption
-//     requires a matching relay.hostname: the replacement incarnation of this
+//     sweep): a replacement with the SAME NODE_ID CAN retain/adopt the SAME
+//     physical id. The worker wires reconciler.WithNodeID, so adoption
+//     requires a matching relay.node_id: the replacement incarnation of this
 //     identity converges the daemon-listed containers and keeps a running,
 //     label-converged one in place instead of recreating it, while another
 //     worker's containers are filtered out (the exported direct Reconcile API
@@ -315,7 +315,7 @@ func guardIdentityCleanup(
 //     hold.
 //
 // For service containers the safety therefore rests on the FAIL-CLOSED ownership
-// proof, not on id freshness: the WORKER_ID advisory lock is exclusive, so while
+// proof, not on id freshness: the NODE_ID advisory lock is exclusive, so while
 // the proof succeeds no replacement holds the identity and none can be
 // converging/adopting; and if the proof fails or is ambiguous the guard removes
 // nothing and latches the loss. This is NOT atomic fencing: the lock can still

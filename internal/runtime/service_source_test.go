@@ -16,14 +16,14 @@ import (
 )
 
 // newClockManager builds a Manager directly (no Docker) with a scripted client,
-// a worker identity, and a pinned clock, so service-source resolution is
+// a node identity, and a pinned clock, so service-source resolution is
 // deterministic without a daemon or a mutable global.
 func newClockManager(t *testing.T, cli *client.Client, now func() time.Time) *Manager {
 	t.Helper()
 	m := &Manager{
 		log:        testutil.DiscardLogger(),
 		cli:        cli,
-		hostname:   "test-host",
+		nodeID:     "test-host",
 		now:        now,
 		pullChecks: map[string]time.Time{},
 		containers: newContainerCache(),

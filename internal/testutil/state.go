@@ -110,7 +110,7 @@ func NewStateDSN(t *testing.T) string {
 
 // OpenState opens a state handle on the supplied DSN (typically from
 // NewStateDSN) and registers its close. Optional options are applied over an
-// empty Options, so a caller can set the stats Owner identity.
+// empty Options, so a caller can set the stats NodeID identity.
 func OpenState(t *testing.T, dsn string, opts ...state.Options) *state.State {
 	t.Helper()
 	var o state.Options

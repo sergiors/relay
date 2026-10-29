@@ -306,18 +306,18 @@ func TestIntegrationDependencyLeaseClosedHandleFailsClosed(t *testing.T) {
 }
 
 // newOwnerfulStatePair opens two independent OWNERFUL State handles on ONE
-// fresh schema, each with a unique run-unique worker identity — the exact
+// fresh schema, each with a unique run-unique node identity — the exact
 // production connection branch (dependency leases run on each handle's pinned
-// owner-lock connection) and the proof that different WORKER_IDs coexist.
+// node-lock connection) and the proof that different NODE_IDs coexist.
 func newOwnerfulStatePair(t *testing.T) (*state.State, *state.State) {
 	t.Helper()
 	dsn := testutil.NewStateDSN(t)
 	a := testutil.OpenState(t, dsn, state.Options{
-		Owner:    "ir004-own-a-" + ir004RunToken,
+		NodeID:   "ir004-own-a-" + ir004RunToken,
 		Instance: "inst-a-" + ir004RunToken,
 	})
 	b := testutil.OpenState(t, dsn, state.Options{
-		Owner:    "ir004-own-b-" + ir004RunToken,
+		NodeID:   "ir004-own-b-" + ir004RunToken,
 		Instance: "inst-b-" + ir004RunToken,
 	})
 	return a, b
@@ -398,7 +398,7 @@ func TestIntegrationDependencyLeaseBackendLossDetected(t *testing.T) {
 	}
 
 	// The released session's lock is gone from the database: handle B — a
-	// different, still-healthy worker identity — acquires the exclusive view.
+	// different, still-healthy node identity — acquires the exclusive view.
 	if _, ok, err := b.TryAcquireDependencyImageGC(ctx, ref); err != nil || !ok {
 		t.Fatalf("TryAcquireDependencyImageGC after the holding backend was terminated = (%v, %v), want acquired", ok, err)
 	}

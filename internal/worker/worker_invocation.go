@@ -15,7 +15,7 @@ import (
 
 // newWorkerRunner constructs the invocation runner and wires every
 // worker-owned setting before the consumer can dispatch to it: the stable
-// WORKER_ID as the execution-container hostname, the shared secrets provider,
+// NODE_ID as the execution-container node identity, the shared secrets provider,
 // the handler-timeout cap, and the global invocation concurrency bound. It also
 // exposes the live runner to the manual-invocation and DLQ-replay socket
 // commands; both setters are safe to call after the socket exists because the
@@ -30,9 +30,9 @@ func newWorkerRunner(
 	rtSocket *SocketServer,
 ) *runner.Runner {
 	runWorker := runner.NewWithMetrics(prepared, logger, metricsInstance)
-	// Stamp the relay.hostname label (the worker/consumer identity) on every
+	// Stamp the relay.node_id label (the node/consumer identity) on every
 	// execution container, so all invocations carry it.
-	runWorker.SetHostname(cfg.WorkerID)
+	runWorker.SetNodeID(cfg.NodeID)
 	// Wire the shared secrets provider; a missing secret surfaces per-invocation,
 	// never at startup.
 	runWorker.SetSecretProvider(secretProvider)
@@ -73,7 +73,7 @@ func newStreamConsumer(
 		Client:            client,
 		Stream:            cfg.RedisStream,
 		Group:             cfg.RedisGroup,
-		Consumer:          cfg.WorkerID,
+		Consumer:          cfg.NodeID,
 		Log:               logger,
 		Metrics:           metricsInstance,
 		MaxBufferedEvents: cfg.MaxBufferedEvents,

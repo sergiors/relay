@@ -4,7 +4,7 @@
 // from the environment.
 //
 // Startup opens the required PostgreSQL state database first (which takes an
-// exclusive per-WORKER_ID PostgreSQL session advisory lock), then runs an
+// exclusive per-NODE_ID PostgreSQL session advisory lock), then runs an
 // explicit external-dependency preflight (see runExternalPreflight) BEFORE any
 // app is loaded or fingerprinted, and before the runtime socket, services,
 // sweeps, preparation, listener starts, background loops, scheduler, and
@@ -412,7 +412,7 @@ func Run(logger *slog.Logger) (runErr error) {
 	// loss detected by the monitor, the final barrier check, or an
 	// identity-cleanup guard latches and skips identity-scoped work identically.
 	onOwnershipLost := ownershipLossAction(
-		ownership, workerReady, logger, cfg.WorkerID, cfg.InstanceID, stop,
+		ownership, workerReady, logger, cfg.NodeID, cfg.InstanceID, stop,
 	)
 	proof := startOwnershipTracking(
 		ctx, st, ownership, onOwnershipLost, logger, shutdown,
@@ -530,10 +530,10 @@ func Run(logger *slog.Logger) (runErr error) {
 		ctx, logger, cfg, manager, secretProvider, proof, metricsInstance, shutdown,
 	)
 
-	// Remove execution containers a previous process on this worker identity
+	// Remove execution containers a previous process on this node identity
 	// left behind before preparing any app.
 	sweepStartupExecutionOrphans(
-		ctx, startupCtx, logger, manager, cfg.WorkerID, proof,
+		ctx, startupCtx, logger, manager, cfg.NodeID, proof,
 	)
 
 	prepared := prepareAndStartApps(
@@ -619,17 +619,17 @@ func Run(logger *slog.Logger) (runErr error) {
 	workerReady.startReady(consumer, manager, cfg.Networks)
 	logger.Info("Worker ready to consume")
 
-	// Stats rows are keyed by worker identity; the instance id fences a stale
-	// incarnation of the same worker out of the row.
-	logger.Info("Worker stats identity",
-		"worker_id", cfg.WorkerID,
+	// Stats rows are keyed by node identity; the instance id fences a stale
+	// incarnation of the same node out of the row.
+	logger.Info("Node stats identity",
+		"node_id", cfg.NodeID,
 		"instance_id", cfg.InstanceID,
 	)
 
 	logger.Info("Consuming stream",
 		"stream", cfg.RedisStream,
 		"group", cfg.RedisGroup,
-		"consumer", cfg.WorkerID,
+		"consumer", cfg.NodeID,
 	)
 	var consumeErr error
 	if err := consumer.Consume(ctx, runWorker.Handle); err != nil {

@@ -23,7 +23,7 @@ services:
       - REDIS_STREAM=events
       - REDIS_GROUP=relay
 
-      - WORKER_ID=relay
+      - NODE_ID=relay
 
       - DATABASE_URL=postgres://relay:relay@postgres:5432/relay?sslmode=disable
 

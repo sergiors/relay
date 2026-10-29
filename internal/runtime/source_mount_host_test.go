@@ -149,8 +149,8 @@ func TestDaemonSourcePathNonContainerNoInspect(t *testing.T) {
 }
 
 // TestDaemonSourcePathEmptySelfHostnameNoInspect pins that an empty
-// selfHostname skips self-inspection even when the worker ownership identity
-// (hostname/WORKER_ID) is itself ID-like and resolvable on the daemon. The
+// selfHostname skips self-inspection even when the node ownership identity
+// (hostname/NODE_ID) is itself ID-like and resolvable on the daemon. The
 // inspect route is scripted and counted, so a regression that fell back to the
 // ownership identity would both issue a request and remap the path; the empty
 // self hostname must do neither.
@@ -164,9 +164,9 @@ func TestDaemonSourcePathEmptySelfHostnameNoInspect(t *testing.T) {
 			hostname+strings.Repeat("f", 52), hostname),
 		onMatch: func() { inspected++ },
 	})
-	// hostname is the worker's stable ownership identity; selfHostname is left
+	// nodeID is the node's stable ownership identity; selfHostname is left
 	// empty, as when os.Hostname cannot be resolved.
-	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: hostname}
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "node-a"}
 	if got := m.daemonSourcePath(context.Background(), "/apps/myapp"); got != "/apps/myapp" {
 		t.Fatalf("empty selfHostname must keep appDir; got %q", got)
 	}

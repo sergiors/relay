@@ -193,8 +193,8 @@ func loadStartupApps(
 
 	// Seed the fresh registry with THIS worker's persisted cumulative totals so
 	// the first snapshot writes them back instead of zeroing PostgreSQL. Each
-	// worker restores only its own rows (stats are keyed by worker identity), so
-	// two workers sharing the database never double-count. Gauges are NOT
+	// worker restores only its own rows (stats are keyed by node identity), so
+	// two nodes sharing the database never double-count. Gauges are NOT
 	// restored (they are point-in-time snapshots refreshed each interval).
 	_, statsRestoreSpan := tracing.Start(startupCtx, "state.restore_stats")
 	restorePersistedStats(metricsInstance, st)

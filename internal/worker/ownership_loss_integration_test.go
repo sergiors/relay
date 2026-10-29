@@ -1,13 +1,13 @@
 //go:build integration
 
 // This file proves the worker's end-to-end OWNERSHIP-LOSS path against real
-// external services: a real PostgreSQL session advisory lock on WORKER_ID (the
+// external services: a real PostgreSQL session advisory lock on NODE_ID (the
 // pinned lock the monitor verifies), real Docker execution (an in-flight handler
 // container), and real Redis (PEL state, invocation keys). The pinned lock
 // backend is terminated out from under the running worker; the real ownership
 // monitor must latch the loss, clear readiness, and cancel the lifecycle, which
 // cancels the in-flight handler exactly as a signal would. A replacement
-// incarnation of the same WORKER_ID can then take the identity, and the pending
+// incarnation of the same NODE_ID can then take the identity, and the pending
 // message is recoverable through the normal reclaim path.
 //
 // This file is excluded from the default suite by the integration build tag.
@@ -39,14 +39,14 @@ import (
 )
 
 // TestIntegrationOwnershipLossMidHandler is the end-to-end ownership-loss test.
-// A real worker (full wiring: real PostgreSQL WORKER_ID lock + real ownership
+// A real worker (full wiring: real PostgreSQL NODE_ID lock + real ownership
 // monitor, real Consume loop, real Docker execution, real Redis PEL) is running
 // an in-flight handler when its pinned lock backend is terminated from a separate
 // connection. It asserts the loss is detected and acted on exactly as designed:
 // the once-only loss action clears readiness and cancels the lifecycle, the
 // in-flight handler is cancelled (its container removed), the message is left
 // pending (not acked) with no terminal invocation state, a replacement
-// incarnation of the same WORKER_ID reacquires the identity, and the message is
+// incarnation of the same NODE_ID reacquires the identity, and the message is
 // recoverable through the normal reclaim path by a second consumer.
 func TestIntegrationOwnershipLossMidHandler(t *testing.T) {
 	testutil.RequireStateDatabase(t)
@@ -57,7 +57,7 @@ func TestIntegrationOwnershipLossMidHandler(t *testing.T) {
 	prefix := fmt.Sprintf("ownership-itest-%d", time.Now().UnixNano())
 	streamName := prefix + "-stream"
 	groupName := prefix + "-group"
-	// The consumer name is the worker identity: it must be UNIQUE so the startup
+	// The consumer name is the node identity: it must be UNIQUE so the startup
 	// orphan sweep and label filters never touch the real relay container
 	// (hostname "relay-relay").
 	consumerName := prefix + "-consumer"
@@ -117,8 +117,8 @@ export async function slow(event) {
 
 	// Synchronize on the handler actually executing.
 	containerID := waitForContainer(t, dcli, map[string]string{
-		"relay.app":      fnName,
-		"relay.hostname": consumerName,
+		"relay.app":     fnName,
+		"relay.node_id": consumerName,
 	})
 	t.Logf("in-flight container %s observed", containerID)
 
@@ -132,7 +132,7 @@ export async function slow(event) {
 		t.Fatalf("pending entry = %+v, ok=%v; want retry count 1", pe, ok)
 	}
 
-	// Terminate the pinned WORKER_ID lock backend from a SEPARATE connection:
+	// Terminate the pinned NODE_ID lock backend from a SEPARATE connection:
 	// the residual "lock lost while the process runs" case. pg_terminate_backend
 	// kills the session, so the session advisory lock dies with it and the
 	// monitor's next pinned-connection verification fails closed.
@@ -160,7 +160,7 @@ export async function slow(event) {
 	if env.ctx.Err() == nil {
 		t.Fatal("the loss action must cancel the lifecycle")
 	}
-	if ready, reason := env.ready.Ready(context.Background()); ready || reason != "worker ownership lost" {
+	if ready, reason := env.ready.Ready(context.Background()); ready || reason != "node ownership lost" {
 		t.Fatalf("readiness after loss = (%v, %q), want not-ready with the loss reason", ready, reason)
 	}
 
@@ -179,8 +179,8 @@ export async function slow(event) {
 	// The cancelled in-flight handler's container is gone (the cancellation
 	// kills it, plus the deferred best-effort remove / AutoRemove).
 	if !waitForContainerGone(t, dcli, map[string]string{
-		"relay.app":      fnName,
-		"relay.hostname": consumerName,
+		"relay.app":     fnName,
+		"relay.node_id": consumerName,
 	}) {
 		t.Error("in-flight container should have been removed after the ownership loss")
 	}
@@ -231,19 +231,19 @@ export async function slow(event) {
 	// The monitor logged the structured loss line, and the stream layer logged
 	// the shutdown-cancel path (the loss cancels the lifecycle, which the message
 	// loop observes exactly as it observes SIGTERM).
-	if !strings.Contains(env.buf.String(), "Worker ownership lost") {
-		t.Error("expected the structured 'Worker ownership lost' log line")
+	if !strings.Contains(env.buf.String(), "Node ownership lost") {
+		t.Error("expected the structured 'Node ownership lost' log line")
 	}
 	if !strings.Contains(env.buf.String(), "handler canceled during shutdown; leaving pending") {
 		t.Error("expected 'Message ...: handler canceled during shutdown; leaving pending' log line")
 	}
 
-	// A replacement incarnation of the SAME WORKER_ID (a different per-process
+	// A replacement incarnation of the SAME NODE_ID (a different per-process
 	// instance token) can take the identity, because the terminated backend
 	// released the session advisory lock.
 	replacement, err := state.Open(context.Background(), state.Options{
 		DSN:      env.stateDSN,
-		Owner:    env.workerID,
+		NodeID:   env.nodeID,
 		Instance: "replacement-instance",
 		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})

@@ -141,7 +141,7 @@ func fakeOwnerState(t *testing.T, c *fakeLockConnector) *State {
 	if err != nil {
 		t.Fatalf("fake lock conn: %v", err)
 	}
-	st := &State{db: db, log: fallbackLogger, owner: "worker-fake", instance: "inst-fake", ownerPID: c.pid, ownerConn: conn}
+	st := &State{db: db, log: fallbackLogger, nodeID: "worker-fake", instance: "inst-fake", ownerPID: c.pid, ownerConn: conn}
 	t.Cleanup(func() { _ = st.Close() })
 	return st
 }

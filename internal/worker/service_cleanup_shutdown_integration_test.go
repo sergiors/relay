@@ -2,7 +2,7 @@
 
 // This file proves the graceful-shutdown service-cleanup path against REAL
 // services: a real Docker daemon (a live, persistent service container that
-// traps SIGTERM) and real PostgreSQL (the pinned WORKER_ID ownership lock). It
+// traps SIGTERM) and real PostgreSQL (the pinned NODE_ID ownership lock). It
 // is excluded from the default suite by the integration build tag, so running it
 // (`go test -tags=integration ./internal/worker/`) REQUIRES a reachable Docker
 // daemon (client.FromEnv) and PostgreSQL at TEST_DATABASE_URL; a missing
@@ -147,15 +147,15 @@ func cancelledBound() context.Context {
 }
 
 // serviceLabels builds the Relay label set for THIS worker's persistent service
-// container. relay.hostname is the worker identity (WORKER_ID), which is the
+// container. relay.node_id is the node identity (NODE_ID), which is the
 // only label the shutdown cleanup selects on; relay.app/relay.service are
 // stamped for realism and readable failures.
-func serviceLabels(workerID, appName, serviceName string) map[string]string {
+func serviceLabels(nodeID, appName, serviceName string) map[string]string {
 	return map[string]string{
-		"relay.type":     "service",
-		"relay.hostname": workerID,
-		"relay.app":      appName,
-		"relay.service":  serviceName,
+		"relay.type":    "service",
+		"relay.node_id": nodeID,
+		"relay.app":     appName,
+		"relay.service": serviceName,
 	}
 }
 
@@ -173,21 +173,21 @@ func TestIntegrationShutdownServiceCleanupRemovesServiceAndCloseJoinsInFlight(t 
 	dcli := testutil.RequireDocker(t)
 	dsn := testutil.NewStateDSN(t)
 
-	workerID := testutil.UniqueName(t, "svc-cleanup")
-	appName := workerID + "-app"
+	nodeID := testutil.UniqueName(t, "svc-cleanup")
+	appName := nodeID + "-app"
 	const serviceName = "web"
-	labels := serviceLabels(workerID, appName, serviceName)
+	labels := serviceLabels(nodeID, appName, serviceName)
 
-	// The real pinned WORKER_ID lock: the shutdown step's ownership proof reads
+	// The real pinned NODE_ID lock: the shutdown step's ownership proof reads
 	// it, and the manager is rooted at the lifecycle the worker cancels on
 	// shutdown.
-	st := testutil.OpenState(t, dsn, state.Options{Owner: workerID, Instance: "inst-1"})
+	st := testutil.OpenState(t, dsn, state.Options{NodeID: nodeID, Instance: "inst-1"})
 	lifecycle, cancelLifecycle := context.WithCancel(context.Background())
 	defer cancelLifecycle()
 	logger := testutil.DiscardLogger()
 
 	manager, err := runtime.NewManager(
-		logger, nil, workerID, runtime.WithLifecycleContext(lifecycle),
+		logger, nil, nodeID, runtime.WithLifecycleContext(lifecycle),
 	)
 	if err != nil {
 		t.Fatalf("runtime manager: %v", err)
@@ -231,7 +231,7 @@ func TestIntegrationShutdownServiceCleanupRemovesServiceAndCloseJoinsInFlight(t 
 	defer cancelCleanup()
 	cleanupDone := make(chan error, 1)
 	go func() {
-		cleanupDone <- shutdownServices(svcCtrl, workerID, proof, logger)(cleanupCtx)
+		cleanupDone <- shutdownServices(svcCtrl, nodeID, proof, logger)(cleanupCtx)
 	}()
 
 	// The stop is genuinely in flight once the container handles the SIGTERM the
@@ -282,7 +282,7 @@ func TestIntegrationShutdownServiceCleanupRemovesServiceAndCloseJoinsInFlight(t 
 // container, but the failed proof latches the loss and the removal is skipped,
 // so a container a replacement owner might have adopted is never touched.
 //
-//	Given a live service container owned by this worker and a pinned WORKER_ID
+//	Given a live service container owned by this worker and a pinned NODE_ID
 //	      lock whose backend has been terminated,
 //	When  the shutdown service cleanup runs with the lifecycle cancelled,
 //	Then  the proof runs and fails, the loss is latched, and the running
@@ -291,12 +291,12 @@ func TestIntegrationShutdownServiceCleanupSkipsAfterFailedOwnershipProof(t *test
 	dcli := testutil.RequireDocker(t)
 	dsn := testutil.NewStateDSN(t)
 
-	workerID := testutil.UniqueName(t, "svc-lost")
-	appName := workerID + "-app"
+	nodeID := testutil.UniqueName(t, "svc-lost")
+	appName := nodeID + "-app"
 	const serviceName = "web"
-	labels := serviceLabels(workerID, appName, serviceName)
+	labels := serviceLabels(nodeID, appName, serviceName)
 
-	st := testutil.OpenState(t, dsn, state.Options{Owner: workerID, Instance: "inst-1"})
+	st := testutil.OpenState(t, dsn, state.Options{NodeID: nodeID, Instance: "inst-1"})
 	ownerPID := st.OwnerBackendPID()
 	if ownerPID <= 0 {
 		t.Fatalf("owner backend pid = %d, want > 0", ownerPID)
@@ -307,7 +307,7 @@ func TestIntegrationShutdownServiceCleanupSkipsAfterFailedOwnershipProof(t *test
 	logger := testutil.DiscardLogger()
 
 	manager, err := runtime.NewManager(
-		logger, nil, workerID, runtime.WithLifecycleContext(lifecycle),
+		logger, nil, nodeID, runtime.WithLifecycleContext(lifecycle),
 	)
 	if err != nil {
 		t.Fatalf("runtime manager: %v", err)
@@ -347,13 +347,13 @@ func TestIntegrationShutdownServiceCleanupSkipsAfterFailedOwnershipProof(t *test
 			verifyCalls.Add(1)
 			return st.VerifyOwnerLock(ctx)
 		},
-		onLost: ownershipLossAction(loss, nil, logger, workerID, "inst-1", func() {}),
+		onLost: ownershipLossAction(loss, nil, logger, nodeID, "inst-1", func() {}),
 	}
 
 	// When: the shutdown service cleanup runs.
 	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), shutdownServiceTimeout)
 	defer cancelCleanup()
-	if err := shutdownServices(svcCtrl, workerID, proof, logger)(cleanupCtx); err != nil {
+	if err := shutdownServices(svcCtrl, nodeID, proof, logger)(cleanupCtx); err != nil {
 		t.Fatalf("shutdown service cleanup = %v, want nil (removal suppressed, not fatal)", err)
 	}
 

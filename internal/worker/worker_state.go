@@ -16,7 +16,7 @@ import (
 // openWorkerState opens the worker's REQUIRED PostgreSQL state handle and
 // installs the status observer immediately after a successful open, before any
 // discovery or status write, so no persisted lifecycle transition is missed.
-// The open takes an exclusive per-WORKER_ID session advisory lock, which the
+// The open takes an exclusive per-NODE_ID session advisory lock, which the
 // ownership monitor re-verifies on the pinned connection.
 //
 // It is the first fallible resource step Run performs: the state handle is
@@ -34,7 +34,7 @@ func openWorkerState(
 	stateSpanCtx, stateSpan := tracing.Start(startupCtx, "state.initialize")
 	st, err := state.Open(stateSpanCtx, state.Options{
 		DSN:             cfg.DatabaseURL,
-		Owner:           cfg.WorkerID,
+		NodeID:          cfg.NodeID,
 		Instance:        cfg.InstanceID,
 		Logger:          logger,
 		MaxOpenConns:    config.DefaultDatabaseMaxOpenConns,
@@ -67,7 +67,7 @@ func openWorkerState(
 }
 
 // startOwnershipTracking starts the periodic ownership monitor now that the
-// WORKER_ID lock is held (state.Open took it) and registers its quiescence
+// NODE_ID lock is held (state.Open took it) and registers its quiescence
 // barrier, so an early startup failure after this point still joins the monitor
 // (which reads the pinned lock connection) before the state handle closes in a
 // later step.

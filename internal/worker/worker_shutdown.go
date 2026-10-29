@@ -448,7 +448,7 @@ func (r *shutdownRegistry) run(logger *slog.Logger) {
 // guardIdentitySnapshotCleanup): the step SNAPSHOTS the worker's service
 // containers, re-proves the pinned ownership lock, and stops/removes exactly the
 // captured containers — never re-listing after the proof. Because a replacement
-// incarnation with the SAME WORKER_ID can retain/adopt the SAME physical id (the
+// incarnation with the SAME NODE_ID can retain/adopt the SAME physical id (the
 // reconciler is label-derived and identity-scoped, not process-scoped), the
 // protection is the fail-closed
 // ownership proof, not id freshness: a latched loss or a failed/ambiguous proof
@@ -460,13 +460,13 @@ func (r *shutdownRegistry) run(logger *slog.Logger) {
 // reconciler, so no duplicate logging happens here.
 func shutdownServices(
 	svcCtrl *reconciler.ServiceReconciler,
-	hostname string,
+	nodeID string,
 	proof ownershipProof,
 	logger *slog.Logger,
 ) func(context.Context) error {
 	return guardIdentitySnapshotCleanup(proof, logger, shutdownStepServiceCleanup,
 		func(stepCtx context.Context) ([]runtime.ServiceContainer, error) {
-			return svcCtrl.DiscoverShutdownContainers(stepCtx, hostname)
+			return svcCtrl.DiscoverShutdownContainers(stepCtx, nodeID)
 		},
 		func(stepCtx context.Context, own []runtime.ServiceContainer) error {
 			return svcCtrl.RemoveShutdownContainers(stepCtx, own)

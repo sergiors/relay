@@ -338,7 +338,7 @@ func TestResetStatsRollsBackOnCorruptGlobalPayload(t *testing.T) {
 	// Bypass the marshaller to plant an undecodable payload (a well-formed JSON
 	// scalar, which the schema accepts but the typed decoder rejects).
 	if _, err := c.db.ExecContext(context.Background(),
-		`INSERT INTO stats (worker, data, updated_at) VALUES ('corrupt', '"not-an-object"', '2026-01-02T03:04:05Z')`); err != nil {
+		`INSERT INTO stats (node_id, data, updated_at) VALUES ('corrupt', '"not-an-object"', '2026-01-02T03:04:05Z')`); err != nil {
 		t.Fatalf("seed corrupt stats: %v", err)
 	}
 
@@ -358,8 +358,8 @@ func TestResetStatsRollsBackOnCorruptAppPayload(t *testing.T) {
 	c := openTestState(t)
 	c.RecordAppStats(AppStats{App: "good", EventsMatchedTotal: 5})
 	if _, err := c.db.ExecContext(context.Background(),
-		`INSERT INTO app_stats (app_name, worker, data, updated_at) VALUES ('broken', $1, $2, '2020-01-01T00:00:00Z')`,
-		c.owner, `"not-an-object"`); err != nil {
+		`INSERT INTO app_stats (app_name, node_id, data, updated_at) VALUES ('broken', $1, $2, '2020-01-01T00:00:00Z')`,
+		c.nodeID, `"not-an-object"`); err != nil {
 		t.Fatalf("seed corrupt row: %v", err)
 	}
 	c.RecordStats(Stats{EventsMatchedTotal: 9})

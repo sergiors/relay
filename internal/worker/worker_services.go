@@ -23,14 +23,14 @@ import (
 //
 // The service reconciler converges each app's persistent service containers to
 // its template (manager is the Docker seam; secretProvider is the shared
-// secrets resolver). It is wired with THIS worker's stable identity
-// (WithWorkerID), so every service pass, app removal, and orphan sweep only
+// secrets resolver). It is wired with THIS worker's stable node identity
+// (WithNodeID), so every service pass, app removal, and orphan sweep only
 // ever converges, adopts, or removes containers stamped with this worker's
-// relay.hostname: another worker's services on the shared Docker daemon are
-// never touched. Because WORKER_ID is stable across restarts, a replacement
+// relay.node_id: another worker's services on the shared Docker daemon are
+// never touched. Because NODE_ID is stable across restarts, a replacement
 // process still ADOPTS the previous process's converged service containers
 // instead of recreating them. Service containers stop on graceful shutdown: the
-// shutdown tail runs ShutdownCleanup for this worker's identity (cfg.WorkerID).
+// shutdown tail runs ShutdownCleanup for this node's identity (cfg.NodeID).
 // The coordinator runs the per-app Applys asynchronously (bounded workers,
 // latest-desired-state coalescing), so startup never blocks on service
 // convergence (e.g. an external image pull); the startup orphan sweep + image
@@ -65,27 +65,27 @@ func startServiceConvergence(
 		reconcileTimeout,
 		reconciler.WithMetrics(metricsInstance),
 		reconciler.WithNetworks(cfg.Networks),
-		// Scope every service-container operation to this worker's stable
-		// identity (relay.hostname). A same-WORKER_ID restart still adopts its
-		// own running services; a different worker's containers are untouched.
-		reconciler.WithWorkerID(cfg.WorkerID),
+		// Scope every service-container operation to this worker's stable node
+		// identity (relay.node_id). A same-NODE_ID restart still adopts its
+		// own running services; a different node's containers are untouched.
+		reconciler.WithNodeID(cfg.NodeID),
 	)
 	services := reconciler.NewServiceCoordinator(svcCtrl)
 	services.Start(ctx)
 	// Joining the coordinator releases its workers and waiters and drains
 	// in-flight Applys; the join is a strict barrier whose per-step bound is only
-	// the wait-before-diagnostic threshold, while the hostname-scoped container
+	// the wait-before-diagnostic threshold, while the node-scoped container
 	// cleanup that runs right after is a separate bounded best-effort step.
 	shutdown.register(servicesJoinBarrierStep(services.Join))
 	shutdown.register(shutdownStep{
 		name:    shutdownStepServiceCleanup,
 		timeout: shutdownServiceTimeout,
 		// Service cleanup stops and removes THIS worker's service containers
-		// (scoped by WORKER_ID), so it is skipped once ownership is lost: a
+		// (scoped by NODE_ID), so it is skipped once ownership is lost: a
 		// replacement process may already own the identity and its containers.
 		// Unlike execution containers, a replacement presenting the SAME
-		// WORKER_ID CAN adopt the SAME physical service container id (the
-		// reconciler is label-derived and the worker scopes it by relay.hostname,
+		// NODE_ID CAN adopt the SAME physical service container id (the
+		// reconciler is label-derived and the worker scopes it by relay.node_id,
 		// not by process), so the safety here rests on the fail-closed
 		// ownership proof rather than on id freshness. It snapshots the
 		// candidates FIRST, re-proves the lock on the pinned connection SECOND,
@@ -95,7 +95,7 @@ func startServiceConvergence(
 		// whole removal, and a latched or failed proof removes nothing. This is
 		// not atomic fencing; see guardIdentitySnapshotCleanup for the bounded
 		// residual.
-		run: shutdownServices(svcCtrl, cfg.WorkerID, proof, logger),
+		run: shutdownServices(svcCtrl, cfg.NodeID, proof, logger),
 	})
 	return svcCtrl, services
 }

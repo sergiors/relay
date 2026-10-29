@@ -32,7 +32,7 @@ func TestServiceLabelsCarriesServiceIdentityAndOwnership(t *testing.T) {
 		labelService:  "api",
 		labelIdentity: "service.js",
 		labelImage:    "relay-app-user-events:632aca75fa306911",
-		labelHostname: "worker-1",
+		labelNodeID:   "worker-1",
 		labelPort:     "3000",
 		labelReplica:  "2",
 		// No spec.Env -> the hash of an empty env slice (a container created
@@ -249,7 +249,7 @@ func TestStartServiceConfirmsRunningBeforeReturn(t *testing.T) {
 			body:    `{"Id":"cid-1","State":{"Running":true}}`,
 			onMatch: func() { inspected++ }},
 	)
-	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "h"}
 	id, err := m.StartService(context.Background(), ServiceSpec{
 		App:       "fn",
 		Name:      "svc",
@@ -280,7 +280,7 @@ func TestStartServiceNonRunningInspectDiscardsAndFails(t *testing.T) {
 		dockerRoute{method: http.MethodDelete, path: "/containers/cid-1", body: `{}`,
 			onMatch: func() { removed++ }},
 	)
-	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "h"}
 	id, err := m.StartService(context.Background(), ServiceSpec{
 		App:       "fn",
 		Name:      "svc",
@@ -313,7 +313,7 @@ func TestStartServiceInspectErrorDiscardsAndFails(t *testing.T) {
 		dockerRoute{method: http.MethodDelete, path: "/containers/cid-1", body: `{}`,
 			onMatch: func() { removed++ }},
 	)
-	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "h"}
 	if _, err := m.StartService(context.Background(), ServiceSpec{
 		App:       "fn",
 		Name:      "svc",
@@ -341,7 +341,7 @@ func TestStartServiceCreateSendsUniquePhysicalName(t *testing.T) {
 		dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
 		dockerRoute{method: http.MethodGet, path: "/containers/cid-1/json", body: `{"Id":"cid-1","State":{"Running":true}}`},
 	)
-	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "h"}
 	for i := 0; i < 2; i++ {
 		if _, err := m.StartService(context.Background(), ServiceSpec{
 			App:       "fn",
@@ -456,7 +456,7 @@ func TestServiceEntryTranslatesPerRuntime(t *testing.T) {
 
 // TestSweepSkipsServiceContainers verifies sweepSkips (the decision helper
 // SweepOrphanContainers uses for every container) excludes service containers
-// even though they carry relay.app + relay.hostname and would otherwise be
+// even though they carry relay.app + relay.node_id and would otherwise be
 // Relay-owned — a service must never be swept as an orphan.
 func TestSweepSkipsServiceContainers(t *testing.T) {
 	svc := serviceLabels(ServiceSpec{App: "f", Name: "svc", SourceRef: "svc", Image: "img"}, "test-host", 0)
@@ -464,7 +464,7 @@ func TestSweepSkipsServiceContainers(t *testing.T) {
 		t.Error("sweepSkips(service labels) = false, want true (services are persistent, reconciler-owned)")
 	}
 	// A typed invocation container (relay.type=event) must NOT be skipped.
-	exec := runLabels(RunMeta{Type: ContainerTypeEvent, App: "f", Hostname: "test-host"})
+	exec := runLabels(RunMeta{Type: ContainerTypeEvent, App: "f", NodeID: "test-host"})
 	if sweepSkips(exec) {
 		t.Error("sweepSkips(event invocation labels) = true, want false")
 	}
@@ -475,7 +475,7 @@ func TestSweepSkipsServiceContainers(t *testing.T) {
 	// A container carrying relay.app but NO relay.type is strictly NOT
 	// Relay-owned under the new model and must be skipped (backward compat is
 	// not required).
-	if !sweepSkips(map[string]string{labelApp: "f", labelHostname: "h"}) {
+	if !sweepSkips(map[string]string{labelApp: "f", labelNodeID: "h"}) {
 		t.Error("sweepSkips(relay.app but no relay.type) = false, want true")
 	}
 }
@@ -487,10 +487,10 @@ func TestSweepSkipsServiceContainers(t *testing.T) {
 // The client-call path is exercised without a real Docker daemon.
 func TestServiceContainerListParsing(t *testing.T) {
 	c1Labels := `{"relay.type":"service","relay.app":"fn-a","relay.service":"svcname","relay.identity":"svc.js",` +
-		`"relay.image":"img-a","relay.hostname":"h1","relay.port":"3000","relay.replica":"2",` +
+		`"relay.image":"img-a","relay.node_id":"h1","relay.port":"3000","relay.replica":"2",` +
 		`"relay.env_hash":"0123456789abcdef"}`
 	c2Labels := `{"relay.type":"service","relay.app":"fn-a","relay.service":"svcname","relay.identity":"svc.js",` +
-		`"relay.image":"img-a","relay.hostname":"h1","relay.port":"notaport"}`
+		`"relay.image":"img-a","relay.node_id":"h1","relay.port":"notaport"}`
 	body := `[{"Id":"c1","Labels":` + c1Labels + `},` +
 		`{"Id":"c2","Labels":` + c2Labels + `},` +
 		`{"Id":"c3","Labels":{"relay.type":"event","relay.app":"fn-a"}},` +
@@ -511,7 +511,7 @@ func TestServiceContainerListParsing(t *testing.T) {
 	}
 
 	c1 := byID["c1"]
-	if c1.App != "fn-a" || c1.Name != "svcname" || c1.SourceRef != "svc.js" || c1.Image != "img-a" || c1.Hostname != "h1" {
+	if c1.App != "fn-a" || c1.Name != "svcname" || c1.SourceRef != "svc.js" || c1.Image != "img-a" || c1.NodeID != "h1" {
 		t.Errorf("c1 identity = %+v, want the label-derived name + source", c1)
 	}
 	if c1.Replica != 2 {
@@ -585,7 +585,7 @@ func TestServiceLabelsSpecMergedOwnershipWins(t *testing.T) {
 	if got["custom.key"] != "custom-value" {
 		t.Fatalf("custom label missing: %v", got)
 	}
-	if got[labelIdentity] != "service.js" || got[labelHostname] != "worker-1" || got[labelReplica] != "0" {
+	if got[labelIdentity] != "service.js" || got[labelNodeID] != "worker-1" || got[labelReplica] != "0" {
 		t.Fatalf("ownership labels corrupted: %v", got)
 	}
 }
@@ -684,7 +684,7 @@ func captureServiceCreate(t *testing.T, spec ServiceSpec) []byte {
 		// The running gate inspects the started container and requires Running.
 		dockerRoute{method: http.MethodGet, path: "/containers/cid-1/json", body: `{"Id":"cid-1","State":{"Running":true}}`},
 	)
-	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "test-host"}
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "test-host"}
 	if _, err := m.StartService(context.Background(), spec, 0); err != nil {
 		t.Fatalf("StartService: %v", err)
 	}
@@ -792,8 +792,8 @@ func TestStartServiceEntryOnlyForEntrypointSource(t *testing.T) {
 	if len(image.Entrypoint) != 0 {
 		t.Fatalf("image-source Entrypoint = %v, want none (preserve image ENTRYPOINT)", image.Entrypoint)
 	}
-	if image.Labels[labelHostname] != "test-host" {
-		t.Fatalf("relay.hostname = %q, want test-host", image.Labels[labelHostname])
+	if image.Labels[labelNodeID] != "test-host" {
+		t.Fatalf("relay.node_id = %q, want test-host", image.Labels[labelNodeID])
 	}
 }
 
@@ -933,7 +933,7 @@ func TestStartServiceDeletedNetworkCreateFailure(t *testing.T) {
 			onMatch: func() { networkCreates++ },
 		},
 	)
-	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "test-host"}
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "test-host"}
 
 	_, err := m.StartService(context.Background(), ServiceSpec{
 		App:       "fn",

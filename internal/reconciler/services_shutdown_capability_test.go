@@ -63,10 +63,10 @@ func (d *ordinaryOnlyDocker) StopServiceContainers(ctx context.Context, containe
 
 // seedService adds one w-owned service container to a fakeDocker, mirroring how
 // the existing shutdown tests seed other workers' containers directly.
-func seedService(f *fakeDocker, id, hostname string) {
+func seedService(f *fakeDocker, id, nodeID string) {
 	f.ctrs[id] = &fakeContainer{
 		id: id, appName: "fn", entrypoint: "svc.js", image: "img-1",
-		port: 80, replica: 0, state: container.StateRunning, hostname: hostname,
+		port: 80, replica: 0, state: container.StateRunning, nodeID: nodeID,
 	}
 }
 

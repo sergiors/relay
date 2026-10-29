@@ -27,7 +27,7 @@ func TestOpenWorkerStateCancellationCarriesStartupSentinel(t *testing.T) {
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 		config.Config{
 			DatabaseURL: "postgres://relay:relay@127.0.0.1:1/relay?sslmode=disable",
-			WorkerID:    "worker-canceled",
+			NodeID:      "worker-canceled",
 			InstanceID:  "instance-canceled",
 		},
 		metrics.New(),

@@ -73,7 +73,7 @@ export async function env(event) {
 	// secret) via the request-frame path.
 	extraEnv := []string{"GREETING=" + envValue, "TOKEN=" + secretValue}
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", App: "env-boundary-e2e", Handler: "index.env", Image: prepared.Image})
+		RunMeta{NodeID: "test-host", App: "env-boundary-e2e", Handler: "index.env", Image: prepared.Image})
 	done := make(chan error, 1)
 	go func() {
 		done <- m.Execute(execCtx, prepared, "index.env", []byte(`{"event_name":"INSERT","blockMs":2000}`), extraEnv)

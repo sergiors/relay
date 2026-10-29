@@ -29,13 +29,13 @@ func newRawStateConn(t *testing.T, dsn string) *sql.DB {
 }
 
 // seedCorruptGlobalRow writes a wrong-shape global stats payload directly into
-// the state DB, for this handle's worker row.
+// the state DB, for this handle's node row.
 func seedCorruptGlobalRow(t *testing.T, dsn, worker string) {
 	t.Helper()
 	db := newRawStateConn(t, dsn)
 	ctx := context.Background()
 	if _, err := db.ExecContext(ctx,
-		`INSERT INTO stats (worker, data, updated_at) VALUES ($1, $2, $3)`,
+		`INSERT INTO stats (node_id, data, updated_at) VALUES ($1, $2, $3)`,
 		worker, `"not-an-object"`, "2020-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("seed corrupt stats row: %v", err)
 	}
@@ -48,7 +48,7 @@ func seedCorruptAppRow(t *testing.T, dsn, worker, name string) {
 	db := newRawStateConn(t, dsn)
 	ctx := context.Background()
 	if _, err := db.ExecContext(ctx,
-		`INSERT INTO app_stats (app_name, worker, data, updated_at) VALUES ($1, $2, $3, $4)`,
+		`INSERT INTO app_stats (app_name, node_id, data, updated_at) VALUES ($1, $2, $3, $4)`,
 		name, worker, `"not-an-object"`, "2020-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("seed corrupt app_stats row: %v", err)
 	}

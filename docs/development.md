@@ -12,14 +12,14 @@ To run the binary against your own Redis, PostgreSQL, and Docker Engine:
 REDIS_URI=localhost:6379 \
 REDIS_STREAM=events \
 REDIS_GROUP=relay \
-WORKER_ID=relay-1 \
+NODE_ID=relay-1 \
 DATABASE_URL='postgres://relay:relay@localhost:5432/relay?sslmode=disable' \
 ./relay start
 ```
 
-Relay reads apps from the fixed `/apps` root. `WORKER_ID` is the required,
-stable worker identity used as the Redis consumer name, `relay.hostname`
-container label, and stats owner. `DATABASE_URL` is required and points to the
+Relay reads apps from the fixed `/apps` root. `NODE_ID` is the required,
+stable node identity used as the Redis consumer name, `relay.node_id`
+container label, and stats node key. `DATABASE_URL` is required and points to the
 shared state database. See [operations](operations.md#state-database) and
 [configuration](configuration.md) for details.
 

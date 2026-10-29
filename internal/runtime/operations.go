@@ -44,7 +44,7 @@ import (
 //
 // The one narrow exception is beginShutdownCleanup: a shutdown-only
 // authorization available ONLY while the manager is already shutting down and
-// CloseContext has NOT begun. It is what lets the worker's hostname-scoped
+// CloseContext has NOT begun. It is what lets the worker's node-scoped
 // service-container cleanup run after the lifecycle is cancelled (the worker
 // cancels it before running the ordered teardown steps, so ordinary admission
 // is already refused by then) while remaining tracked by the ordinary count,
@@ -187,7 +187,7 @@ func (o *managerOps) begin(ctx context.Context) (context.Context, func(), error)
 }
 
 // beginShutdownCleanup admits one shutdown-only Manager-owned cleanup operation
-// (the worker's hostname-scoped service-container removal during graceful
+// (the worker's node-scoped service-container removal during graceful
 // shutdown), returning its context and a release that MUST be called exactly
 // once.
 //

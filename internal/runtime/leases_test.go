@@ -131,7 +131,7 @@ func TestImageCoordinatorConcurrentShareRelease(t *testing.T) {
 // TestManagerExecuteRetiringImageRejected pins that a direct Execute against a
 // retiring image is rejected with a retryable error rather than racing removal.
 func TestManagerExecuteRetiringImageRejected(t *testing.T) {
-	m := &Manager{hostname: "test-host"}
+	m := &Manager{nodeID: "test-host"}
 	// Commit retirement with no holders, then wait for the (empty) drain is not
 	// needed: acquire must reject immediately.
 	m.leaseCoord().beginRetire("relay-app-a:x")

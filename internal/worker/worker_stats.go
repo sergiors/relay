@@ -22,8 +22,8 @@ const statsFlushInterval = 5 * time.Second
 // THIS worker's cumulative counters persisted in the state database, so the
 // first snapshot never resets them. The registry only knows this process's
 // lifetime, while the PostgreSQL stats rows are cumulative history; seeding
-// bridges them. Only the worker's OWN rows (keyed by its WorkerID identity)
-// are read — never another worker's, so two workers sharing one database never
+// bridges them. Only the node's OWN rows (keyed by its NodeID)
+// are read — never another node's, so two nodes sharing one database never
 // double-count. It is nil-safe on both the registry and the state handle. Gauges
 // are deliberately NOT restored: they are point-in-time backlog snapshots
 // refreshed each snapshot.
@@ -289,7 +289,7 @@ type statsFlusher struct {
 	generation int64
 
 	// ownershipLost records that another process incarnation of the same
-	// WorkerID has claimed this worker's stats row, so this (stale) process must
+	// node identity has claimed this worker's stats row, so this (stale) process must
 	// stop writing. It is terminal for the process: the instance id is fixed at
 	// startup and a stale incarnation can never reclaim the row, so the warning
 	// is logged once and no further writes are attempted.
@@ -390,8 +390,8 @@ func (flusher *statsFlusher) flushLocked(ctx context.Context) {
 			if !flusher.ownershipLost {
 				flusher.ownershipLost = true
 				flusher.log.Warn(
-					"Stats: ownership lost; another process claimed this worker's stats row; stopping stats writes",
-					"worker", flusher.st.Owner(),
+					"Stats: node ownership lost; another process claimed this node's stats row; stopping stats writes",
+					"node_id", flusher.st.NodeID(),
 				)
 			}
 			return

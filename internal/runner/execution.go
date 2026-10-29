@@ -183,7 +183,7 @@ func (r *Runner) invokeOnce(
 		App:       pf.fn.Name,
 		Handler:   handler,
 		MessageID: msgID,
-		Hostname:  r.hostname,
+		NodeID:    r.nodeID,
 		Image:     toImage(pf),
 	})
 	start := time.Now()

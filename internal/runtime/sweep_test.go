@@ -34,31 +34,31 @@ func orphanListJSON(t *testing.T, ctrs ...scriptedContainer) string {
 	return "[" + strings.Join(items, ",") + "]"
 }
 
-// TestDiscoverOrphanContainersStrictHostnameAndTypeFilter pins the discovery
+// TestDiscoverOrphanContainersStrictNodeAndTypeFilter pins the discovery
 // half's predicate: only invocation containers (strict relay.type event or
-// schedule) bearing THIS hostname are returned; service containers, other
-// hostnames, non-Relay containers, and typed-but-hostname-less/untyped Relay
-// containers are all excluded.
-func TestDiscoverOrphanContainersStrictHostnameAndTypeFilter(t *testing.T) {
+// schedule) bearing THIS node identity are returned; service containers,
+// containers owned by other node identities, non-Relay containers, and
+// typed-but-node-less/untyped Relay containers are all excluded.
+func TestDiscoverOrphanContainersStrictNodeAndTypeFilter(t *testing.T) {
 	body := orphanListJSON(t,
 		scriptedContainer{"evt-1", map[string]string{
-			labelType: ContainerTypeEvent, labelApp: "app", labelHostname: "host", labelHandler: "index.hi",
+			labelType: ContainerTypeEvent, labelApp: "app", labelNodeID: "host", labelHandler: "index.hi",
 		}},
 		scriptedContainer{"sch-1", map[string]string{
-			labelType: ContainerTypeSchedule, labelApp: "app", labelHostname: "host", labelHandler: "tick",
+			labelType: ContainerTypeSchedule, labelApp: "app", labelNodeID: "host", labelHandler: "tick",
 		}},
-		// Persistent service on our hostname: reconciler-owned, never swept.
+		// Persistent service on our node identity: reconciler-owned, never swept.
 		scriptedContainer{"svc-1", map[string]string{
-			labelType: ContainerTypeService, labelApp: "app", labelHostname: "host",
+			labelType: ContainerTypeService, labelApp: "app", labelNodeID: "host",
 		}},
 		// Another worker's live/crashed invocation: never ours.
 		scriptedContainer{"other-1", map[string]string{
-			labelType: ContainerTypeEvent, labelApp: "app", labelHostname: "other",
+			labelType: ContainerTypeEvent, labelApp: "app", labelNodeID: "other",
 		}},
 		// Non-Relay container.
 		scriptedContainer{"foreign-1", map[string]string{"app": "whatever"}},
 		// relay.app but NO relay.type: untyped, not Relay-owned.
-		scriptedContainer{"untyped-1", map[string]string{labelApp: "app", labelHostname: "host"}},
+		scriptedContainer{"untyped-1", map[string]string{labelApp: "app", labelNodeID: "host"}},
 	)
 	cli := newScriptedDockerClient(t, dockerRoute{method: http.MethodGet, path: "/containers/json", body: body})
 	m := &Manager{cli: cli, log: testutil.DiscardLogger()}
@@ -88,8 +88,8 @@ func TestDiscoverOrphanContainersStrictHostnameAndTypeFilter(t *testing.T) {
 // container that appears after the snapshot can never be selected.
 func TestRemoveOrphanContainersTargetsCapturedIDsOnly(t *testing.T) {
 	body := orphanListJSON(t,
-		scriptedContainer{"a", map[string]string{labelType: ContainerTypeEvent, labelApp: "app", labelHostname: "host"}},
-		scriptedContainer{"b", map[string]string{labelType: ContainerTypeEvent, labelApp: "app", labelHostname: "host"}},
+		scriptedContainer{"a", map[string]string{labelType: ContainerTypeEvent, labelApp: "app", labelNodeID: "host"}},
+		scriptedContainer{"b", map[string]string{labelType: ContainerTypeEvent, labelApp: "app", labelNodeID: "host"}},
 	)
 
 	var (

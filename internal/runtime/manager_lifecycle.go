@@ -114,7 +114,7 @@ func (m *Manager) Close() error {
 //     — and no ordinary operation (including a pool discard reserved before
 //     close) is still in flight when the cache is torn down. The drain also
 //     joins every shutdown-only cleanup operation admitted through
-//     beginShutdownCleanupOp (the worker's hostname-scoped service-container
+//     beginShutdownCleanupOp (the worker's node-scoped service-container
 //     removal, admitted after the lifecycle was cancelled but before this
 //     call), even when its shutdown step already timed out and the registry
 //     moved on, so the client can never close beneath one. A pool discard that

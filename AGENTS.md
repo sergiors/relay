@@ -52,9 +52,9 @@ worker; admin commands communicate with it or read persistent state.
   global pruning. Keep invocation secret values out of Docker config, labels,
   logs, metrics, traces, and state; service environment is the documented
   exception.
-- `WORKER_ID` is required and is the worker's single stable identity: the Redis
-  consumer name, the `relay.hostname` container-ownership label, and the
-  persisted-stats owner key. It must be unique per concurrent worker and stable
+- `NODE_ID` is required and is the node's single stable identity: the Redis
+  consumer name, the `relay.node_id` container-ownership label, and the
+  persisted-stats node key. It must be unique per concurrent node and stable
   across restarts; there is no hostname or generated fallback. `InstanceID` is a
   fresh per-process fencing token, never configured.
 - Invocation concurrency, runtime image build concurrency, and worker-global

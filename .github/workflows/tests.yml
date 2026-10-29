@@ -37,7 +37,7 @@ jobs:
     env:
       DOCKER_BUILDKIT: 1
       TEST_DATABASE_URL: postgres://relay:relay@localhost:5432/relay?sslmode=disable
-      WORKER_ID: relay-ci
+      NODE_ID: relay-ci
 
     services:
       redis:

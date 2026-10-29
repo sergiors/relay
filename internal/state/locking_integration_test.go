@@ -257,16 +257,16 @@ func TestIntegrationOpenRejectsUnreachableDSN(t *testing.T) {
 	}
 }
 
-// TestIntegrationPerWorkerStatsOwnership proves two workers sharing one database
-// never overwrite each other's stats: each owner has its own row, a worker-scoped
+// TestIntegrationPerNodeStatsOwnership proves two nodes sharing one database
+// never overwrite each other's stats: each owner has its own row, a node-scoped
 // read sees only its own, and the aggregate read sums the counters.
-func TestIntegrationPerWorkerStatsOwnership(t *testing.T) {
+func TestIntegrationPerNodeStatsOwnership(t *testing.T) {
 	requireTestDB(t)
 	dsn := newTestDSN(t)
 	a := testOpenOrFail(t, dsn)
 	b := testOpenOrFail(t, dsn)
-	a.owner = "worker-a"
-	b.owner = "worker-b"
+	a.nodeID = "worker-a"
+	b.nodeID = "worker-b"
 
 	a.RecordStats(Stats{EventsMatchedTotal: 10})
 	b.RecordStats(Stats{EventsMatchedTotal: 25})
@@ -282,40 +282,40 @@ func TestIntegrationPerWorkerStatsOwnership(t *testing.T) {
 	}
 }
 
-// TestIntegrationWorkerLockExclusive proves the per-owner exclusive session
-// advisory lock that Open holds for a worker handle's lifetime. While one handle
-// is open, a second Open presenting the SAME owner — a different incarnation,
+// TestIntegrationNodeLockExclusive proves the per-node exclusive session
+// advisory lock that Open holds for a node handle's lifetime. While one handle
+// is open, a second Open presenting the SAME node — a different incarnation,
 // whether another process on this host or on another host sharing the database —
 // FAILS with a clear error instead of silently sharing the identity, and the
 // refusal does not re-stamp (fence) the live owner's stats row. Closing the live
-// handle releases the lock, so a restart on the same WORKER_ID reopens, restores
+// handle releases the lock, so a restart on the same NODE_ID reopens, restores
 // the totals, and writes again. A DIFFERENT owner opens concurrently throughout,
 // and an ownerless admin handle is never blocked.
-func TestIntegrationWorkerLockExclusive(t *testing.T) {
+func TestIntegrationNodeLockExclusive(t *testing.T) {
 	requireTestDB(t)
 	dsn := newTestDSN(t)
 	ctx := context.Background()
 
-	live := openWithIdentity(t, dsn, "worker-locked", "inst-1")
+	live := openWithIdentity(t, dsn, "node-locked", "inst-1")
 	if _, err := live.RecordStatsSnapshot(ctx, -1, Stats{EventsMatchedTotal: 42}, nil); err != nil {
 		t.Fatalf("live snapshot: %v", err)
 	}
 
 	// A second incarnation of the same owner is refused. The lock is taken BEFORE
 	// the stats claim, so the refusal must leave the live owner's row untouched.
-	_, err := Open(ctx, Options{DSN: dsn, Owner: "worker-locked", Instance: "inst-2"})
+	_, err := Open(ctx, Options{DSN: dsn, NodeID: "node-locked", Instance: "inst-2"})
 	if err == nil {
 		t.Fatal("second Open with the same owner succeeded, want an exclusive-lock error")
 	}
-	if !strings.Contains(err.Error(), "worker-locked") {
-		t.Fatalf("lock error %q must name the worker identity", err)
+	if !strings.Contains(err.Error(), "node-locked") {
+		t.Fatalf("lock error %q must name the node identity", err)
 	}
 	if strings.Contains(err.Error(), dsn) {
 		t.Fatalf("lock error must not leak the DSN: %q", err)
 	}
 	var instance string
 	if err := live.db.QueryRowContext(ctx,
-		`SELECT instance FROM stats WHERE worker = $1`, "worker-locked").Scan(&instance); err != nil {
+		`SELECT instance FROM stats WHERE node_id = $1`, "node-locked").Scan(&instance); err != nil {
 		t.Fatalf("read live instance: %v", err)
 	}
 	if instance != "inst-1" {
@@ -323,14 +323,14 @@ func TestIntegrationWorkerLockExclusive(t *testing.T) {
 	}
 
 	// A DIFFERENT owner opens concurrently, and an ownerless admin handle is
-	// never blocked by a running worker's owner lock.
+	// never blocked by a running worker's node lock.
 	other := openWithIdentity(t, dsn, "worker-other", "inst-other")
 	if _, err := other.RecordStatsSnapshot(ctx, -1, Stats{EventsMatchedTotal: 7}, nil); err != nil {
-		t.Fatalf("other-owner snapshot: %v", err)
+		t.Fatalf("other-node snapshot: %v", err)
 	}
 	admin := testOpenOrFail(t, dsn)
 	if _, ok := admin.Stats(); !ok {
-		t.Fatal("admin read must succeed while an owner lock is held")
+		t.Fatal("admin read must succeed while a node lock is held")
 	}
 
 	// A restart (the live handle closes, releasing its lock) reopens the same
@@ -338,7 +338,7 @@ func TestIntegrationWorkerLockExclusive(t *testing.T) {
 	if err := live.Close(); err != nil {
 		t.Fatalf("close live: %v", err)
 	}
-	restarted := openWithIdentity(t, dsn, "worker-locked", "inst-2")
+	restarted := openWithIdentity(t, dsn, "node-locked", "inst-2")
 	restored, ok := restarted.OwnerStats()
 	if !ok || restored.EventsMatchedTotal != 42 {
 		t.Fatalf("restarted OwnerStats = %+v ok=%v, want 42", restored, ok)

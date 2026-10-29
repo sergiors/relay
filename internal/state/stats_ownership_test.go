@@ -10,24 +10,24 @@ import (
 	"time"
 )
 
-// uniqueWorkerID returns a worker owner identity unique to this test.
+// uniqueNodeID returns a node identity unique to this test.
 // PostgreSQL session advisory locks are database-wide: the per-test schemas do
 // not namespace them, so a fixed owner shared with another test running
 // concurrently in ANY package would make the second Open fail as "already in
 // use".
-func uniqueWorkerID(t *testing.T, prefix string) string {
+func uniqueNodeID(t *testing.T, prefix string) string {
 	t.Helper()
 	return prefix + "-" + randHex(t)
 }
 
-// openWithIdentity opens a state handle on dsn scoped to a worker identity
-// (Owner + Instance) and registers its close. It is the identity-aware companion
+// openWithIdentity opens a state handle on dsn scoped to a node identity
+// (NodeID + Instance) and registers its close. It is the identity-aware companion
 // of testOpenOrFail for the ownership/fencing tests.
-func openWithIdentity(t *testing.T, dsn, worker, instance string) *State {
+func openWithIdentity(t *testing.T, dsn, nodeID, instance string) *State {
 	t.Helper()
-	st, err := Open(context.Background(), Options{DSN: dsn, Owner: worker, Instance: instance})
+	st, err := Open(context.Background(), Options{DSN: dsn, NodeID: nodeID, Instance: instance})
 	if err != nil {
-		t.Fatalf("open with identity (%s/%s): %v", worker, instance, err)
+		t.Fatalf("open with identity (%s/%s): %v", nodeID, instance, err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	return st
@@ -42,20 +42,20 @@ func seedDiscoveredAlpha(t *testing.T, st *State) {
 	}
 }
 
-// TestOpenRejectsUnpairedOwnerInstance pins the identity invariant: a handle
-// either owns stats rows (Owner AND Instance) or does not (neither). A
+// TestOpenRejectsUnpairedNodeInstance pins the identity invariant: a handle
+// either owns stats rows (NodeID AND Instance) or does not (neither). A
 // half-configured identity is rejected before touching the database.
-func TestOpenRejectsUnpairedOwnerInstance(t *testing.T) {
+func TestOpenRejectsUnpairedNodeInstance(t *testing.T) {
 	dsn := newTestDSN(t)
-	if _, err := Open(context.Background(), Options{DSN: dsn, Owner: "worker-a"}); err == nil {
-		t.Fatal("Open with Owner but no Instance succeeded, want error")
+	if _, err := Open(context.Background(), Options{DSN: dsn, NodeID: "worker-a"}); err == nil {
+		t.Fatal("Open with NodeID but no Instance succeeded, want error")
 	}
 	if _, err := Open(context.Background(), Options{DSN: dsn, Instance: "inst-a"}); err == nil {
-		t.Fatal("Open with Instance but no Owner succeeded, want error")
+		t.Fatal("Open with Instance but no NodeID succeeded, want error")
 	}
 	st, err := Open(context.Background(), Options{DSN: dsn})
 	if err != nil {
-		t.Fatalf("Open with neither Owner nor Instance: %v", err)
+		t.Fatalf("Open with neither NodeID nor Instance: %v", err)
 	}
 	_ = st.Close()
 }
@@ -64,8 +64,8 @@ func TestOpenRejectsUnpairedOwnerInstance(t *testing.T) {
 // process incarnation of the SAME worker takes over the row, and the first
 // (now stale) incarnation's flush is rejected with ErrStatsOwnershipLost instead
 // of overwriting the newer snapshot. The two incarnations are simulated with
-// unlocked handles: production Open now takes an exclusive per-owner lock, so two
-// LIVE same-owner handles cannot coexist (see TestIntegrationWorkerLockExclusive);
+// unlocked handles: production Open now takes an exclusive per-node lock, so two
+// LIVE same-node handles cannot coexist (see TestIntegrationNodeLockExclusive);
 // this test isolates the DB-level fence that remains as defense in depth for a
 // handle whose lock connection was lost.
 func TestClaimFencesStaleIncarnation(t *testing.T) {
@@ -76,7 +76,7 @@ func TestClaimFencesStaleIncarnation(t *testing.T) {
 		t.Fatalf("stale snapshot: %v", err)
 	}
 
-	// A restart/new process with the same stable worker id claims the row with a
+	// A restart/new process with the same stable node ID claims the row with a
 	// fresh instance and writes its own absolute snapshot.
 	fresh := openUnlockedState(t, dsn, "worker-a", "inst-2")
 	if _, err := fresh.RecordStatsSnapshot(ctx, -1, Stats{EventsMatchedTotal: 20}, nil); err != nil {
@@ -120,15 +120,15 @@ func TestOwnershipLostSkipsAppStats(t *testing.T) {
 }
 
 // TestRestartSameWorkerKeepsTotalsOnce verifies restart continuity: a restart
-// of the same worker restores its own row and writes the resumed cumulative
+// of the same node restores its own row and writes the resumed cumulative
 // totals back as an ABSOLUTE snapshot, so the aggregate stays exactly once (not
 // doubled) even though a new instance claims the row. The restart closes the
-// prior handle first — as production does — so its exclusive worker lock is
+// prior handle first — as production does — so its exclusive node lock is
 // released and the successor can open.
 func TestRestartSameWorkerKeepsTotalsOnce(t *testing.T) {
 	ctx := context.Background()
 	dsn := newTestDSN(t)
-	owner := uniqueWorkerID(t, "worker-restart")
+	owner := uniqueNodeID(t, "worker-restart")
 	first := openWithIdentity(t, dsn, owner, "inst-1")
 	if _, err := first.RecordStatsSnapshot(ctx, -1, Stats{EventsMatchedTotal: 100}, nil); err != nil {
 		t.Fatalf("first snapshot: %v", err)
@@ -267,14 +267,14 @@ func TestPruneStaleStatsRemovesOtherOwners(t *testing.T) {
 		t.Fatal("live owner row must survive compaction")
 	}
 	if _, ok := live.AppStats("alpha"); ok {
-		t.Fatal("stale owner app_stats row must be pruned")
+		t.Fatal("stale node app_stats row must be pruned")
 	}
 	if s, ok := live.Stats(); !ok || s.EventsMatchedTotal != 2 {
 		t.Fatalf("aggregate = %+v ok=%v, want live 2 only", s, ok)
 	}
 }
 
-// TestPruneStaleStatsRespectsRetention verifies the cutoff: a stale owner newer
+// TestPruneStaleStatsRespectsRetention verifies the cutoff: a stale node newer
 // than the retention window survives, and the same row is removed once the
 // window is shortened past its updated_at.
 func TestPruneStaleStatsRespectsRetention(t *testing.T) {
@@ -360,7 +360,7 @@ func TestPruneStaleStatsDisabled(t *testing.T) {
 }
 
 // TestConcurrentIncarnationsOnlySentinelErrors verifies that concurrent flushes
-// from two incarnations of the same worker are race-safe: every attempt either
+// from two incarnations of the same node are race-safe: every attempt either
 // succeeds (only the current owner can) or is rejected with
 // ErrStatsOwnershipLost, never a hard error, and the surviving row belongs to
 // one of the incarnations. The two incarnations bypass the startup lock to drive

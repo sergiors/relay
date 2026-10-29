@@ -12,41 +12,41 @@ import (
 // import them, and the strict label set is the ownership contract, so the
 // literals are pinned by TestServiceContainerOwnedBy.
 const (
-	testLabelType     = "relay.type"
-	testLabelApp      = "relay.app"
-	testLabelHostname = "relay.hostname"
+	testLabelType   = "relay.type"
+	testLabelApp    = "relay.app"
+	testLabelNodeID = "relay.node_id"
 )
 
 // serviceContainerOwnedBy reports whether labels identify a service container
-// belonging to app on the given manager/worker identity. Ownership is strict and
+// belonging to app on the given manager/node identity. Ownership is strict and
 // label-derived: relay.type must be exactly the Relay service type (the
-// Relay-owned service population), and both relay.app and relay.hostname must
+// Relay-owned service population), and both relay.app and relay.node_id must
 // match. A container with a foreign or missing type, another app, or another
-// worker's identity is never selected, so cleanup cannot stop or remove an
+// node's identity is never selected, so cleanup cannot stop or remove an
 // unrelated container.
-func serviceContainerOwnedBy(labels map[string]string, app, hostname string) bool {
-	if app == "" || hostname == "" {
+func serviceContainerOwnedBy(labels map[string]string, app, nodeID string) bool {
+	if app == "" || nodeID == "" {
 		return false
 	}
 	return labels[testLabelType] == runtime.ContainerTypeService &&
 		labels[testLabelApp] == app &&
-		labels[testLabelHostname] == hostname
+		labels[testLabelNodeID] == nodeID
 }
 
 // TestServiceContainerOwnedBy pins the strict ownership predicate used by the
 // Docker integration cleanup. Matching a returned container by App or name alone
-// is not enough: only the complete relay.type + relay.app + relay.hostname label
+// is not enough: only the complete relay.type + relay.app + relay.node_id label
 // set proves this test owns it.
 func TestServiceContainerOwnedBy(t *testing.T) {
 	const (
-		app      = "svc-env-abc"
-		hostname = "test-host"
+		app    = "svc-env-abc"
+		nodeID = "test-host"
 	)
 	own := map[string]string{
-		testLabelType:     "service",
-		testLabelApp:      app,
-		testLabelHostname: hostname,
-		"relay.service":   "app-service",
+		testLabelType:   "service",
+		testLabelApp:    app,
+		testLabelNodeID: nodeID,
+		"relay.service": "app-service",
 	}
 	with := func(key, value string) map[string]string {
 		labels := maps.Clone(own)
@@ -60,28 +60,28 @@ func TestServiceContainerOwnedBy(t *testing.T) {
 	}
 
 	tests := []struct {
-		name     string
-		labels   map[string]string
-		app      string
-		hostname string
-		want     bool
+		name   string
+		labels map[string]string
+		app    string
+		nodeID string
+		want   bool
 	}{
-		{name: "own service container", labels: own, app: app, hostname: hostname, want: true},
-		{name: "nil labels", labels: nil, app: app, hostname: hostname},
-		{name: "invocation container with same app", labels: with(testLabelType, "event"), app: app, hostname: hostname},
-		{name: "unknown container type", labels: with(testLabelType, "foreign"), app: app, hostname: hostname},
-		{name: "missing container type", labels: without(testLabelType), app: app, hostname: hostname},
-		{name: "same type, different app", labels: with(testLabelApp, "other-app"), app: app, hostname: hostname},
-		{name: "missing app label", labels: without(testLabelApp), app: app, hostname: hostname},
-		{name: "same app, different worker identity", labels: with(testLabelHostname, "other-host"), app: app, hostname: hostname},
-		{name: "missing hostname label", labels: without(testLabelHostname), app: app, hostname: hostname},
-		{name: "empty app argument", labels: with(testLabelApp, ""), app: "", hostname: hostname},
-		{name: "empty hostname argument", labels: with(testLabelHostname, ""), app: app, hostname: ""},
+		{name: "own service container", labels: own, app: app, nodeID: nodeID, want: true},
+		{name: "nil labels", labels: nil, app: app, nodeID: nodeID},
+		{name: "invocation container with same app", labels: with(testLabelType, "event"), app: app, nodeID: nodeID},
+		{name: "unknown container type", labels: with(testLabelType, "foreign"), app: app, nodeID: nodeID},
+		{name: "missing container type", labels: without(testLabelType), app: app, nodeID: nodeID},
+		{name: "same type, different app", labels: with(testLabelApp, "other-app"), app: app, nodeID: nodeID},
+		{name: "missing app label", labels: without(testLabelApp), app: app, nodeID: nodeID},
+		{name: "same app, different node identity", labels: with(testLabelNodeID, "other-host"), app: app, nodeID: nodeID},
+		{name: "missing nodeID label", labels: without(testLabelNodeID), app: app, nodeID: nodeID},
+		{name: "empty app argument", labels: with(testLabelApp, ""), app: "", nodeID: nodeID},
+		{name: "empty nodeID argument", labels: with(testLabelNodeID, ""), app: app, nodeID: ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := serviceContainerOwnedBy(tt.labels, tt.app, tt.hostname); got != tt.want {
-				t.Errorf("serviceContainerOwnedBy(%v, %q, %q) = %t, want %t", tt.labels, tt.app, tt.hostname, got, tt.want)
+			if got := serviceContainerOwnedBy(tt.labels, tt.app, tt.nodeID); got != tt.want {
+				t.Errorf("serviceContainerOwnedBy(%v, %q, %q) = %t, want %t", tt.labels, tt.app, tt.nodeID, got, tt.want)
 			}
 		})
 	}

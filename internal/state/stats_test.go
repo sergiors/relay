@@ -95,14 +95,14 @@ func TestStatsGaugesOwnedByFreshestSnapshot(t *testing.T) {
 	dsn := newTestDSN(t)
 	a := testOpenOrFail(t, dsn)
 	b := testOpenOrFail(t, dsn)
-	a.owner = "worker-a"
-	b.owner = "worker-b"
+	a.nodeID = "worker-a"
+	b.nodeID = "worker-b"
 
 	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	a.nowFn = func() time.Time { return t0 }
 	b.nowFn = func() time.Time { return t0 }
 
-	// The stale owner's row carries a high gauge (its last observation before it
+	// The stale node's row carries a high gauge (its last observation before it
 	// stopped flushing); the fresh owner observed the current lower backlog later.
 	a.RecordStats(Stats{EventsMatchedTotal: 10, PendingEntries: 500, OldestPendingAgeSeconds: 9999})
 	b.nowFn = func() time.Time { return t0.Add(5 * time.Second) }

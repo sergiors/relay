@@ -52,7 +52,7 @@ func newCrossWorkerFixture(t *testing.T, name string) *crossWorkerFixture {
 	// Two handles onto ONE schema model two workers sharing PostgreSQL. The
 	// schema is created by NewStateDSN and dropped on cleanup. Ownerless handles
 	// are sufficient: app rows are shared by name and do not depend on the
-	// per-worker stats ownership.
+	// per-node stats ownership.
 	dsn := testutil.NewStateDSN(t)
 	olderDB := testutil.OpenState(t, dsn)
 	newerDB := testutil.OpenState(t, dsn)

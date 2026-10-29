@@ -292,18 +292,18 @@ events:
 	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-"+appName+":", depRef))
 
 	// Two OWNERFUL State handles on ONE database — the exact production branch:
-	// a worker's State pins its owner-lock connection and every dependency lease
+	// a worker's State pins its node-lock connection and every dependency lease
 	// runs on it (withDependencyCoordConn's owner branch). The two identities
-	// are unique per Manager and per run (different WORKER_IDs stay compatible
+	// are unique per Manager and per run (different NODE_IDs stay compatible
 	// through the shared TEST_DATABASE_URL database; only re-using the SAME
-	// Owner concurrently is refused).
+	// NodeID concurrently is refused).
 	dsn := testutil.NewStateDSN(t)
 	stA := testutil.OpenState(t, dsn, state.Options{
-		Owner:    testutil.UniqueName(t, "ir004-wk-a"),
+		NodeID:   testutil.UniqueName(t, "ir004-wk-a"),
 		Instance: "inst-a-" + time.Now().Format(time.RFC3339Nano),
 	})
 	stB := testutil.OpenState(t, dsn, state.Options{
-		Owner:    testutil.UniqueName(t, "ir004-wk-b"),
+		NodeID:   testutil.UniqueName(t, "ir004-wk-b"),
 		Instance: "inst-b-" + time.Now().Format(time.RFC3339Nano),
 	})
 	coordA := stateDepCoordinator{st: stA}

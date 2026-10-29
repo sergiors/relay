@@ -4,7 +4,7 @@ import "context"
 
 // RunMeta carries the diagnostic metadata attached as Docker labels to every
 // app execution container. It is diagnostic-only: Relay's correctness never
-// depends on these labels beyond the relay.type + relay.hostname ownership
+// depends on these labels beyond the relay.type + relay.node_id ownership
 // predicate used by the sweep.
 //
 // Type classifies the execution population (containerTypeEvent or
@@ -18,7 +18,7 @@ import "context"
 //   - MessageID is the stream message ID (bounded by upstream event data).
 //   - EventID/EventName are low-cardinality event fields carried for the
 //     diagnostic container labels and the invocation output prefix.
-//   - Hostname is the worker identity (the same value as the Redis consumer
+//   - NodeID is the node identity (the same value as the Redis consumer
 //     identity).
 //   - Image is the exact pinned build reference the container runs.
 //
@@ -32,14 +32,14 @@ type RunMeta struct {
 	MessageID string
 	EventID   string
 	EventName string
-	Hostname  string
+	NodeID    string
 	Image     string
 }
 
 // runLabels maps a RunMeta to the Docker label set for an execution container.
 // Every key is always present (empty values become empty labels) so the set is
 // total and stable. Nothing depends on the labels for correctness beyond the
-// relay.type + relay.hostname ownership predicate.
+// relay.type + relay.node_id ownership predicate.
 func runLabels(meta RunMeta) map[string]string {
 	return map[string]string{
 		labelType:      meta.Type,
@@ -48,7 +48,7 @@ func runLabels(meta RunMeta) map[string]string {
 		labelMessageID: meta.MessageID,
 		labelEventID:   meta.EventID,
 		labelEventName: meta.EventName,
-		labelHostname:  meta.Hostname,
+		labelNodeID:    meta.NodeID,
 		labelImage:     meta.Image,
 	}
 }

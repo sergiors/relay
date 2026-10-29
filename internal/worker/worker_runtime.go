@@ -41,7 +41,7 @@ func openRuntimeManager(
 	manager, err := runtime.NewManager(
 		logger,
 		metricsInstance,
-		cfg.WorkerID,
+		cfg.NodeID,
 		runtime.WithWarmContainerIdleTimeout(cfg.WarmContainerIdleTimeout),
 		// The SAME MAX_CONCURRENT_INVOCATIONS the runner's global semaphore uses:
 		// the runtime clips each app's effective per-app

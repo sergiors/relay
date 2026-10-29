@@ -26,7 +26,7 @@ import (
 // SEPARATE connection must make VerifyOwnerLock fail closed with
 // ErrOwnerLockLost — even though the pool itself recovers on a fresh backend
 // (so the failure is the LOST LOCK, not merely an unreachable database) — and a
-// replacement incarnation of the same worker must then be able to take the lock.
+// replacement incarnation of the same node must then be able to take the lock.
 //
 // It also pins that the check does NOT consult a replacement connection: after
 // termination the pool hands out a NEW backend whose pg_backend_pid differs, yet
@@ -37,7 +37,7 @@ func TestIntegrationVerifyOwnerLockDetectsTerminatedBackend(t *testing.T) {
 	dsn := newTestDSN(t)
 	ctx := context.Background()
 
-	owner := uniqueWorkerID(t, "worker-monitor")
+	owner := uniqueNodeID(t, "worker-monitor")
 	live := openWithIdentity(t, dsn, owner, "inst-1")
 	ownerPID := live.OwnerBackendPID()
 	if ownerPID <= 0 {
@@ -77,7 +77,7 @@ func TestIntegrationVerifyOwnerLockDetectsTerminatedBackend(t *testing.T) {
 	}
 
 	// The session advisory lock died with the backend, so a replacement
-	// incarnation of the same WORKER_ID can open and verify.
+	// incarnation of the same NODE_ID can open and verify.
 	replacement := openWithIdentity(t, dsn, owner, "inst-2")
 	if err := replacement.VerifyOwnerLock(ctx); err != nil {
 		t.Fatalf("replacement VerifyOwnerLock = %v, want nil", err)
@@ -95,7 +95,7 @@ func TestIntegrationVerifyOwnerLockDetectsTerminatedBackend(t *testing.T) {
 func TestIntegrationConcurrentVerifyOwnerLockOnPinnedConn(t *testing.T) {
 	requireTestDB(t)
 	dsn := newTestDSN(t)
-	st := openWithIdentity(t, dsn, uniqueWorkerID(t, "worker-stress"), "inst-1")
+	st := openWithIdentity(t, dsn, uniqueNodeID(t, "worker-stress"), "inst-1")
 
 	const (
 		callers = 8
@@ -180,7 +180,7 @@ func TestIntegrationConcurrentVerifyOwnerLockAndClose(t *testing.T) {
 }
 
 // TestOwnerBackendPIDCapture pins the backend-PID capture Open performs right
-// after taking the worker lock: a worker handle records the pinned connection's
+// after taking the node lock: a worker handle records the pinned connection's
 // PostgreSQL backend PID, while an ownerless admin/CLI handle (which never takes
 // the lock) records none.
 func TestOwnerBackendPIDCapture(t *testing.T) {

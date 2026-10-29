@@ -85,8 +85,8 @@ func ir004StartChild(t *testing.T, dsn, ref string) *ir004StartedChild {
 		ir004ChildMarker+"=1",
 		"IR004_LEASE_DSN="+dsn,
 		"IR004_LEASE_REF="+ref,
-		// Process A's own worker identity: unique per run, DIFFERENT from the
-		// parent's (process B) — two ownerful handles never share an Owner, and
+		// Process A's own node identity: unique per run, DIFFERENT from the
+		// parent's (process B) — two ownerful handles never share a NodeID, and
 		// different identities on one database is the production branch.
 		"IR004_LEASE_OWNER=ir004-proc-a-"+ir004RunToken,
 		"IR004_LEASE_INSTANCE=inst-a-"+ir004RunToken,
@@ -125,9 +125,9 @@ func (c *ir004StartedChild) release() {
 
 // TestIntegrationDependencyLeaseCrossProcess proves the cross-process lease
 // contract end to end, on the PRODUCTION connection branch: both processes use
-// OWNERFUL State handles (unique Owner/Instance per process, exactly like two
-// different WORKER_ID instances sharing one DATABASE_URL), so dependency-image
-// coordination runs on each handle's pinned owner-lock connection and the two
+// OWNERFUL State handles (unique NodeID/Instance per process, exactly like two
+// different NODE_ID instances sharing one DATABASE_URL), so dependency-image
+// coordination runs on each handle's pinned node-lock connection and the two
 // identities coexist against the same database:
 //
 //  1. process A (the test binary re-executed) holds a shared use lease;
@@ -136,10 +136,10 @@ func (c *ir004StartedChild) release() {
 //  3. after A releases and exits cleanly, process B acquires.
 func TestIntegrationDependencyLeaseCrossProcess(t *testing.T) {
 	dsn := testutil.NewStateDSN(t)
-	// Run-unique reference AND run-unique worker identities (advisory locks are
+	// Run-unique reference AND run-unique node identities (advisory locks are
 	// database-wide — per-test schemas do not namespace them). The child
 	// receives the EXACT ref via IR004_LEASE_REF, so both processes coordinate
-	// on one lock, each with its own WORKER_ID-like identity.
+	// on one lock, each with its own NODE_ID-like identity.
 	ref := "relay-dep-ir004-cross-process-" + ir004RunToken
 	ownerP := "ir004-proc-b-" + ir004RunToken
 
@@ -148,11 +148,11 @@ func TestIntegrationDependencyLeaseCrossProcess(t *testing.T) {
 		t.Fatalf("child protocol = %q, want 'held' before the parent continues", got)
 	}
 
-	// Process B: a fresh OWNERFUL handle on the SAME database (different worker
+	// Process B: a fresh OWNERFUL handle on the SAME database (different node
 	// identity than process A's) observes process A's hold.
 	stB, err := state.Open(context.Background(), state.Options{
 		DSN:      dsn,
-		Owner:    ownerP,
+		NodeID:   ownerP,
 		Instance: "inst-b-" + ir004RunToken,
 	})
 	if err != nil {
@@ -214,9 +214,9 @@ func TestIntegrationDependencyLeaseChildHelper(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), ir004ChildBound)
 	defer cancel()
 	// OWNERFUL handle, like a production worker: coordination runs on the
-	// pinned owner-lock connection (withDependencyCoordConn's owner branch),
+	// pinned node-lock connection (withDependencyCoordConn's owner branch),
 	// not an ownerless lazily-pinned depConn.
-	st, err := state.Open(ctx, state.Options{DSN: dsn, Owner: worker, Instance: instance})
+	st, err := state.Open(ctx, state.Options{DSN: dsn, NodeID: worker, Instance: instance})
 	if err != nil {
 		t.Fatalf("child state.Open: %v", err)
 	}

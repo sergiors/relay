@@ -137,7 +137,7 @@ func TestManagerShutdownServiceOpsSucceedAfterLifecycleCancelled(t *testing.T) {
 	var listOps, stopOps, removeOps atomic.Int32
 	m = newLifecycleTestManager(t, lifecycle,
 		dockerRoute{method: http.MethodGet, path: "/containers/json",
-			body:    `[{"Id":"svc-1","State":"running","Labels":{"relay.type":"service","relay.app":"a","relay.hostname":"w1"}}]`,
+			body:    `[{"Id":"svc-1","State":"running","Labels":{"relay.type":"service","relay.app":"a","relay.node_id":"w1"}}]`,
 			onMatch: func() { listOps.Store(int32(m.opsCoord().count())) }},
 		dockerRoute{method: http.MethodPost, path: "/stop",
 			onMatch: func() { stopOps.Store(int32(m.opsCoord().count())) }},
@@ -156,7 +156,7 @@ func TestManagerShutdownServiceOpsSucceedAfterLifecycleCancelled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ShutdownServiceContainerList after lifecycle cancel: %v", err)
 	}
-	if len(own) != 1 || own[0].ID != "svc-1" || own[0].Hostname != "w1" {
+	if len(own) != 1 || own[0].ID != "svc-1" || own[0].NodeID != "w1" {
 		t.Fatalf("discovered %+v, want the single svc-1 owned by w1", own)
 	}
 	if n := listOps.Load(); n < 1 {

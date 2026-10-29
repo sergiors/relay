@@ -18,7 +18,7 @@ func TestRunMetadataCarriesAppImageAndHost(t *testing.T) {
 		MessageID: "1791234567890-0",
 		EventID:   "evt_123",
 		EventName: "INSERT",
-		Hostname:  "worker-1",
+		NodeID:    "worker-1",
 		Image:     "relay-app-user-events:632aca75fa306911",
 	}
 	got := runLabels(meta)
@@ -30,7 +30,7 @@ func TestRunMetadataCarriesAppImageAndHost(t *testing.T) {
 		labelMessageID: "1791234567890-0",
 		labelEventID:   "evt_123",
 		labelEventName: "INSERT",
-		labelHostname:  "worker-1",
+		labelNodeID:    "worker-1",
 		labelImage:     "relay-app-user-events:632aca75fa306911",
 	}
 
@@ -61,7 +61,7 @@ func TestRunLabelsEmptyValues(t *testing.T) {
 	}
 	for _, k := range []string{
 		labelType, labelApp, labelHandler, labelMessageID, labelEventID,
-		labelEventName, labelHostname, labelImage,
+		labelEventName, labelNodeID, labelImage,
 	} {
 		if v, ok := got[k]; !ok || v != "" {
 			t.Errorf("expected empty label %q, got %q (present=%v)", k, v, ok)
@@ -77,7 +77,7 @@ func TestRunMetaFromDefaults(t *testing.T) {
 		t.Fatalf("RunMetaFrom(background) = %+v, want zero value", meta)
 	}
 
-	want := RunMeta{App: "f", Hostname: "h"}
+	want := RunMeta{App: "f", NodeID: "h"}
 	ctx := WithRunMeta(context.Background(), want)
 	if got := RunMetaFrom(ctx); got != want {
 		t.Fatalf("RunMetaFrom = %+v, want %+v", got, want)

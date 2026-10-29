@@ -7,28 +7,28 @@ import (
 	"time"
 )
 
-// TestParseWorkerIDValid pins that an operator-supplied WORKER_ID is trimmed and
+// TestParseNodeIDValid pins that an operator-supplied NODE_ID is trimmed and
 // used verbatim.
-func TestParseWorkerIDValid(t *testing.T) {
+func TestParseNodeIDValid(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{"ops-1", "ops-1"},
 		{"  node.a_1  ", "node.a_1"},
 		{"ABC.def-123_", "ABC.def-123_"},
 	} {
-		got, err := ParseWorkerID(tc.in)
+		got, err := ParseNodeID(tc.in)
 		if err != nil {
-			t.Fatalf("ParseWorkerID(%q) error: %v", tc.in, err)
+			t.Fatalf("ParseNodeID(%q) error: %v", tc.in, err)
 		}
 		if got != tc.want {
-			t.Fatalf("ParseWorkerID(%q) = %q, want %q", tc.in, got, tc.want)
+			t.Fatalf("ParseNodeID(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
 }
 
-// TestParseWorkerIDInvalid pins that WORKER_ID is REQUIRED and validated: an
+// TestParseNodeIDInvalid pins that NODE_ID is REQUIRED and validated: an
 // empty/whitespace value and a malformed value fail rather than being silently
 // coerced or replaced with a generated identity.
-func TestParseWorkerIDInvalid(t *testing.T) {
+func TestParseNodeIDInvalid(t *testing.T) {
 	for _, value := range []string{
 		"",
 		"   ",
@@ -36,50 +36,50 @@ func TestParseWorkerIDInvalid(t *testing.T) {
 		"a/b",
 		"café",
 		"a\tb",
-		strings.Repeat("a", maxWorkerIDLen+1),
+		strings.Repeat("a", maxNodeIDLen+1),
 	} {
-		got, err := ParseWorkerID(value)
+		got, err := ParseNodeID(value)
 		if err == nil {
-			t.Fatalf("ParseWorkerID(%q) = %q, want error", value, got)
+			t.Fatalf("ParseNodeID(%q) = %q, want error", value, got)
 		}
-		if !strings.Contains(err.Error(), "WORKER_ID") {
-			t.Fatalf("ParseWorkerID(%q) error = %q, want it to mention WORKER_ID", value, err)
+		if !strings.Contains(err.Error(), "NODE_ID") {
+			t.Fatalf("ParseNodeID(%q) error = %q, want it to mention NODE_ID", value, err)
 		}
 	}
 }
 
-// TestLoadWorkerIdentity pins that Load resolves the REQUIRED stable WorkerID
-// verbatim from WORKER_ID and always generates a fresh InstanceID distinct from
-// the WorkerID, so a stale process incarnation can be fenced out.
-func TestLoadWorkerIdentity(t *testing.T) {
+// TestLoadNodeIdentity pins that Load resolves the REQUIRED stable NodeID
+// verbatim from NODE_ID and always generates a fresh InstanceID distinct from
+// the NodeID, so a stale process incarnation can be fenced out.
+func TestLoadNodeIdentity(t *testing.T) {
 	setRequiredEnv(t)
-	t.Setenv("WORKER_ID", "ops-1")
+	t.Setenv("NODE_ID", "ops-1")
 
 	cfg := mustLoad(t)
-	if cfg.WorkerID != "ops-1" {
-		t.Fatalf("WorkerID = %q, want the pinned WORKER_ID", cfg.WorkerID)
+	if cfg.NodeID != "ops-1" {
+		t.Fatalf("NodeID = %q, want the pinned NODE_ID", cfg.NodeID)
 	}
 	if cfg.InstanceID == "" || !strings.HasPrefix(cfg.InstanceID, instanceIDPrefix) {
 		t.Fatalf("InstanceID = %q, want a fresh %q token", cfg.InstanceID, instanceIDPrefix)
 	}
-	if cfg.InstanceID == cfg.WorkerID {
-		t.Fatal("InstanceID and WorkerID must differ")
+	if cfg.InstanceID == cfg.NodeID {
+		t.Fatal("InstanceID and NodeID must differ")
 	}
-	// A second Load (a new process) keeps the same WorkerID but gets a fresh
+	// A second Load (a new process) keeps the same NodeID but gets a fresh
 	// InstanceID.
 	second := mustLoad(t)
-	if second.WorkerID != cfg.WorkerID {
-		t.Fatalf("WorkerID changed across loads: %q -> %q", cfg.WorkerID, second.WorkerID)
+	if second.NodeID != cfg.NodeID {
+		t.Fatalf("NodeID changed across loads: %q -> %q", cfg.NodeID, second.NodeID)
 	}
 	if second.InstanceID == cfg.InstanceID {
 		t.Fatalf("InstanceID reused across loads: %q", cfg.InstanceID)
 	}
 }
 
-// TestLoadRequiresWorkerID pins that WORKER_ID is REQUIRED with no hostname or
+// TestLoadRequiresNodeID pins that NODE_ID is REQUIRED with no hostname or
 // generated fallback: an unset or empty value fails Load with an error naming
 // the variable, so a worker never starts with an invented identity.
-func TestLoadRequiresWorkerID(t *testing.T) {
+func TestLoadRequiresNodeID(t *testing.T) {
 	for _, unset := range []bool{true, false} {
 		name := "empty"
 		if unset {
@@ -87,18 +87,18 @@ func TestLoadRequiresWorkerID(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			setRequiredEnv(t)
-			t.Setenv("WORKER_ID", "")
+			t.Setenv("NODE_ID", "")
 			if unset {
-				os.Unsetenv("WORKER_ID")
+				os.Unsetenv("NODE_ID")
 			}
 
 			logger, buf := testLogger()
 			_, err := Load(logger)
 			if err == nil {
-				t.Fatal("Load succeeded without WORKER_ID; want an error")
+				t.Fatal("Load succeeded without NODE_ID; want an error")
 			}
-			if !strings.Contains(err.Error(), "WORKER_ID") {
-				t.Fatalf("error %q does not name WORKER_ID", err)
+			if !strings.Contains(err.Error(), "NODE_ID") {
+				t.Fatalf("error %q does not name NODE_ID", err)
 			}
 			if buf.Len() != 0 {
 				t.Fatalf("Load logged %q for a returned config error; want no fatal log", buf.String())

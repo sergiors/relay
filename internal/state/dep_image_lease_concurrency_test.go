@@ -95,10 +95,10 @@ func TestIntegrationOwnerlessDependencyLeaseConcurrentVerify(t *testing.T) {
 // verification path that shares that connection.
 func TestIntegrationOwnerfulDependencyLeaseConcurrentVerify(t *testing.T) {
 	dsn := testutil.NewStateDSN(t)
-	// Advisory locks are database-scoped, so the worker identity must be unique
+	// Advisory locks are database-scoped, so the node identity must be unique
 	// across concurrently running tests in this database.
 	owner := testutil.UniqueName(t, "dep-lease-owner")
-	st := testutil.OpenState(t, dsn, state.Options{Owner: owner, Instance: "inst"})
+	st := testutil.OpenState(t, dsn, state.Options{NodeID: owner, Instance: "inst"})
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 

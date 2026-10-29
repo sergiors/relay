@@ -43,7 +43,7 @@ const (
 	labelMessageID = "relay.message_id"
 	labelEventID   = "relay.event_id"
 	labelEventName = "relay.event_name"
-	labelHostname  = "relay.hostname"
+	labelNodeID    = "relay.node_id"
 	labelImage     = "relay.image"
 
 	// labelService is the persistent service's stable identity: the template's

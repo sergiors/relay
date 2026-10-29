@@ -10,7 +10,7 @@ import (
 )
 
 // ErrStatsOwnershipLost reports that a flush did not own its stats row: another
-// process incarnation of the same worker has claimed it since this handle
+// process incarnation of the same node has claimed it since this handle
 // opened, so the snapshot was deliberately NOT written. The caller should stop
 // writing under this incarnation rather than retry.
 var ErrStatsOwnershipLost = errors.New("stats ownership lost")
@@ -23,8 +23,8 @@ var ErrStatsOwnershipLost = errors.New("stats ownership lost")
 var ErrStatsResetAdvanced = errors.New("stats reset advanced")
 
 // Stats is the current operational snapshot of Relay's runtime, persisted as the
-// JSONB payload of a per-worker row in the stats table (keyed by worker
-// identity). The monotonic counters (events received/matched/unmatched, handler
+// JSONB payload of a per-node row in the stats table (keyed by node identity).
+// The monotonic counters (events received/matched/unmatched, handler
 // success/failure, retries, dlq) survive restarts and always reflect the latest
 // known totals; the gauge fields (pending_entries, oldest_pending_age) are
 // point-in-time snapshots of the backlog and are replaced on every record.
@@ -35,14 +35,14 @@ var ErrStatsResetAdvanced = errors.New("stats reset advanced")
 // redeliveries and retries; schedule occurrences are excluded (they bypass
 // event matching).
 //
-// Ownership: each worker writes only its OWN row (State.owner), so N workers
+// Ownership: each node writes only its OWN row (State.nodeID), so N nodes
 // sharing one PostgreSQL database keep N independent counter sets instead of
-// last-writer-wins overwriting a single global row. A worker's startup restore
+// last-writer-wins overwriting a single global row. A node's startup restore
 // reads only its own row (OwnerStats); CLI and observability reads aggregate
-// across every owner (Stats) via mergeStats.
+// across every node (Stats) via mergeStats.
 //
 // The struct is the source of truth for the payload: JSON (un)marshalling is
-// centralized in stats_json.go and the stable relational metadata — the worker
+// centralized in stats_json.go and the stable relational metadata — the node
 // key and updated_at — stays a column (UpdatedAt is excluded from the payload).
 type Stats struct {
 	EventsReceivedTotal     int64  `json:"events_received_total"`
@@ -86,11 +86,11 @@ func (st *State) RecordStatsContext(ctx context.Context, stats Stats) {
 		return
 	}
 	_, err = st.db.ExecContext(ctx,
-		`INSERT INTO stats (worker, data, updated_at) VALUES ($1, $2, $3)
-		 ON CONFLICT(worker) DO UPDATE SET
+		`INSERT INTO stats (node_id, data, updated_at) VALUES ($1, $2, $3)
+		 ON CONFLICT(node_id) DO UPDATE SET
 		   data       = excluded.data,
 		   updated_at = excluded.updated_at`,
-		st.owner, payload, st.nowString())
+		st.nodeID, payload, st.nowString())
 	if err != nil {
 		st.log.Warn("State: record stats failed", "error", err)
 	}
@@ -133,7 +133,7 @@ func (st *State) RecordStatsContext(ctx context.Context, stats Stats) {
 // Timestamp preservation: the four per-app Last*At fields are execution
 // history, so an empty incoming value PRESERVES the persisted one rather than
 // erasing it. Only THIS worker's stored payloads are read for the merge (the
-// row is keyed by app+worker), so a worker never inherits another worker's
+// row is keyed by app+node), so a worker never inherits another worker's
 // timestamps. Because each row's payload is JSONB, the stored payloads are read
 // once inside the transaction and merged before writing (see
 // mergeAppStatsTimestamps); counters are never merged — they are absolute
@@ -160,7 +160,7 @@ func (st *State) RecordStatsSnapshot(ctx context.Context, generation int64, stat
 		// Prune orphaned app_stats rows first so a removed app's row
 		// is gone before the upserts below could re-create it. The apps table is
 		// shared and authoritative across workers, so an orphan is an orphan for
-		// every owner.
+		// every node.
 		if _, err := tx.ExecContext(ctx,
 			`DELETE FROM app_stats WHERE app_name NOT IN (SELECT name FROM apps)`); err != nil {
 			return err
@@ -175,12 +175,12 @@ func (st *State) RecordStatsSnapshot(ctx context.Context, generation int64, stat
 		// every per-app row share the same updated_at.
 		ts := st.nowString()
 		res, err := tx.ExecContext(ctx,
-			`INSERT INTO stats (worker, instance, data, updated_at) VALUES ($1, $2, $3, $4)
-			 ON CONFLICT(worker) DO UPDATE SET
+			`INSERT INTO stats (node_id, instance, data, updated_at) VALUES ($1, $2, $3, $4)
+			 ON CONFLICT(node_id) DO UPDATE SET
 			   data       = excluded.data,
 			   updated_at = excluded.updated_at
 			 WHERE stats.instance = excluded.instance`,
-			st.owner, st.instance, globalPayload, ts)
+			st.nodeID, st.instance, globalPayload, ts)
 		if err != nil {
 			return err
 		}
@@ -206,13 +206,13 @@ func (st *State) RecordStatsSnapshot(ctx context.Context, generation int64, stat
 			// re-created even though the prune above already removed it. The
 			// SELECT form lets the guard and the upsert stay one statement.
 			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO app_stats (app_name, worker, data, updated_at)
+				`INSERT INTO app_stats (app_name, node_id, data, updated_at)
 				 SELECT $1, $2, $3, $4
 				 WHERE EXISTS (SELECT 1 FROM apps WHERE name = $1)
-				 ON CONFLICT(app_name, worker) DO UPDATE SET
+				 ON CONFLICT(app_name, node_id) DO UPDATE SET
 				   data       = excluded.data,
 				   updated_at = excluded.updated_at`,
-				fs.App, st.owner, payload, ts); err != nil {
+				fs.App, st.nodeID, payload, ts); err != nil {
 				return err
 			}
 		}
@@ -258,7 +258,7 @@ func (st *State) StatsGeneration() (int64, error) {
 // absolute snapshot, self-healing the row.
 func (st *State) storedAppStatsPayloads(ctx context.Context, tx *sql.Tx) (map[string]AppStats, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT app_name, `+jsonPayloadExpr+` FROM app_stats WHERE worker = $1`, st.owner)
+		`SELECT app_name, `+jsonPayloadExpr+` FROM app_stats WHERE node_id = $1`, st.nodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -289,7 +289,7 @@ func (st *State) storedAppStatsPayloads(ctx context.Context, tx *sql.Tx) (map[st
 func (st *State) storedAppStatsTx(ctx context.Context, tx *sql.Tx, name string) AppStats {
 	var data sql.NullString
 	err := tx.QueryRowContext(ctx,
-		`SELECT `+jsonPayloadExpr+` FROM app_stats WHERE app_name = $1 AND worker = $2`, name, st.owner,
+		`SELECT `+jsonPayloadExpr+` FROM app_stats WHERE app_name = $1 AND node_id = $2`, name, st.nodeID,
 	).Scan(&data)
 	if err == sql.ErrNoRows {
 		return AppStats{}
@@ -408,7 +408,7 @@ func bumpGeneration(ctx context.Context, tx *sql.Tx, ts string) (int64, error) {
 }
 
 // PruneStaleStats deletes stats and app_stats rows owned by workers OTHER than
-// this handle (st.owner) whose updated_at is older than retention, bounding the
+// this handle (st.nodeID) whose updated_at is older than retention, bounding the
 // table growth from workers that no longer exist. It returns the total number of
 // rows removed across both tables.
 //
@@ -442,7 +442,7 @@ func (st *State) PruneStaleStats(ctx context.Context, retention time.Duration) (
 		}
 		for _, table := range []string{"stats", "app_stats"} {
 			res, err := tx.ExecContext(ctx,
-				`DELETE FROM `+table+` WHERE worker <> $1 AND updated_at < $2`, st.owner, cutoff)
+				`DELETE FROM `+table+` WHERE node_id <> $1 AND updated_at < $2`, st.nodeID, cutoff)
 			if err != nil {
 				return err
 			}
@@ -466,18 +466,18 @@ func (st *State) PruneStaleStats(ctx context.Context, retention time.Duration) (
 // (creating a row would falsely claim stats were recorded). A corrupt payload is
 // returned as an error so the transaction rolls back.
 func (st *State) resetGlobalStatsTx(ctx context.Context, tx *sql.Tx, ts string) error {
-	rows, err := tx.QueryContext(ctx, `SELECT worker, `+jsonPayloadExpr+` FROM stats`)
+	rows, err := tx.QueryContext(ctx, `SELECT node_id, `+jsonPayloadExpr+` FROM stats`)
 	if err != nil {
 		return err
 	}
 	type globalRow struct {
-		worker string
+		nodeID string
 		data   sql.NullString
 	}
 	var pending []globalRow
 	for rows.Next() {
 		var r globalRow
-		if err := rows.Scan(&r.worker, &r.data); err != nil {
+		if err := rows.Scan(&r.nodeID, &r.data); err != nil {
 			rows.Close()
 			return err
 		}
@@ -511,8 +511,8 @@ func (st *State) resetGlobalStatsTx(ctx context.Context, tx *sql.Tx, ts string) 
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE stats SET data = $1, updated_at = $2 WHERE worker = $3`,
-			payload, ts, r.worker); err != nil {
+			`UPDATE stats SET data = $1, updated_at = $2 WHERE node_id = $3`,
+			payload, ts, r.nodeID); err != nil {
 			return err
 		}
 	}
@@ -528,18 +528,18 @@ func (st *State) resetGlobalStatsTx(ctx context.Context, tx *sql.Tx, ts string) 
 func (st *State) resetAppStatsTx(ctx context.Context, tx *sql.Tx, ts string) error {
 	type row struct {
 		name   string
-		worker string
+		nodeID string
 		data   sql.NullString
 	}
 	rows, err := tx.QueryContext(ctx,
-		`SELECT app_name, worker, `+jsonPayloadExpr+` FROM app_stats`)
+		`SELECT app_name, node_id, `+jsonPayloadExpr+` FROM app_stats`)
 	if err != nil {
 		return err
 	}
 	var pending []row
 	for rows.Next() {
 		var r row
-		if err := rows.Scan(&r.name, &r.worker, &r.data); err != nil {
+		if err := rows.Scan(&r.name, &r.nodeID, &r.data); err != nil {
 			rows.Close()
 			return err
 		}
@@ -573,44 +573,44 @@ func (st *State) resetAppStatsTx(ctx context.Context, tx *sql.Tx, ts string) err
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE app_stats SET data = $1, updated_at = $2 WHERE app_name = $3 AND worker = $4`,
-			payload, ts, r.name, r.worker); err != nil {
+			`UPDATE app_stats SET data = $1, updated_at = $2 WHERE app_name = $3 AND node_id = $4`,
+			payload, ts, r.name, r.nodeID); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// Stats returns the operational snapshot AGGREGATED across every worker owner,
-// or (zero, false) when no row has been recorded yet or the read/decoding fails
-// (which is logged). Cumulative counters are summed across workers; the two
-// backlog gauges (a shared Redis backlog each worker reports) come from the
-// FRESHEST worker snapshot (the newest updated_at), so a dead worker's stale
-// gauge cannot mask the live value; UpdatedAt is the newest. It is the read the
-// CLI and observability use; a worker restoring its own counters uses OwnerStats
-// instead.
+// Stats returns the operational snapshot AGGREGATED across every node's
+// persisted row, or (zero, false) when no row has been recorded yet or the
+// read/decoding fails (which is logged). Cumulative counters are summed across
+// nodes; the two backlog gauges (a shared Redis backlog each worker reports)
+// come from the FRESHEST node snapshot (the newest updated_at), so a dead node's
+// stale gauge cannot mask the live value; UpdatedAt is the newest. It is the
+// read the CLI and observability use; a worker restoring its own counters uses
+// OwnerStats instead.
 func (st *State) Stats() (Stats, bool) {
 	return st.aggregateStats(false, "")
 }
 
-// OwnerStats returns THIS worker's operational snapshot, or (zero, false) when
-// this worker has no row yet. It is the read a worker uses at startup to restore
-// its own counters (never another worker's), so restarts of the same identity
+// OwnerStats returns THIS node's operational snapshot, or (zero, false) when
+// this node has no row yet. It is the read a worker uses at startup to restore
+// its own counters (never another node's), so restarts of the same identity
 // continue its totals without double-counting a shared database.
 func (st *State) OwnerStats() (Stats, bool) {
-	return st.aggregateStats(true, st.owner)
+	return st.aggregateStats(true, st.nodeID)
 }
 
-// aggregateStats reads stats rows and merges them. When byOwner is true only
-// rows for owner are read (the worker-scoped restore); otherwise every row is
-// read and merged (the cross-worker aggregate).
-func (st *State) aggregateStats(byOwner bool, owner string) (Stats, bool) {
+// aggregateStats reads stats rows and merges them. When byNode is true only
+// rows for nodeID are read (the node-scoped restore); otherwise every row is
+// read and merged (the cross-node aggregate).
+func (st *State) aggregateStats(byNode bool, nodeID string) (Stats, bool) {
 	ctx := context.Background()
 	query := `SELECT ` + jsonPayloadExpr + `, updated_at FROM stats`
 	args := []any(nil)
-	if byOwner {
-		query += ` WHERE worker = $1`
-		args = append(args, owner)
+	if byNode {
+		query += ` WHERE node_id = $1`
+		args = append(args, nodeID)
 	}
 	rows, err := st.db.QueryContext(ctx, query, args...)
 	if err != nil {

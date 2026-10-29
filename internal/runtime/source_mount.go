@@ -191,19 +191,19 @@ func (m *Manager) daemonSourcePath(ctx context.Context, appDir string) string {
 // is conservative: any uncertainty yields nil so the caller keeps fn.Dir. A
 // successful resolution is cached; a failure is not.
 //
-// It deliberately does NOT fall back to hostname: hostname is the worker's
-// stable ownership identity (WORKER_ID), not an OCI hostname, and inspecting a
-// Docker object by an unrelated identity could inspect the WRONG container. An
-// empty selfHostname therefore simply skips self-inspection (the mapping is
-// unavailable), never a cross-identity inspect.
+// It deliberately does NOT fall back to the node identity: nodeID is the
+// node's stable ownership identity (NODE_ID), not an OCI hostname, and
+// inspecting a Docker object by an unrelated identity could inspect the WRONG
+// container. An empty selfHostname therefore simply skips self-inspection (the
+// mapping is unavailable), never a cross-identity inspect.
 func (m *Manager) daemonMounts(ctx context.Context) []container.MountPoint {
 	if m == nil || m.cli == nil {
 		return nil
 	}
 	// Locate Relay's own container by its OCI hostname (the Docker-assigned
-	// container ID by default), which is distinct from the worker ownership
-	// identity stamped in hostname. No self hostname means self-inspection is
-	// unavailable.
+	// container ID by default), which is distinct from the node ownership
+	// identity stamped as relay.node_id. No self hostname means self-inspection
+	// is unavailable.
 	self := m.selfHostname
 	if self == "" {
 		return nil

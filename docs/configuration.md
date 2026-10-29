@@ -15,12 +15,12 @@ pinned libraries (see the last section) and are listed separately.
 | `REDIS_URI`    | `host:port`, `redis://[user:password@]host:port`, or `rediss://…` (TLS)  | Redis address or DSN. Missing/empty fails startup.                                                                                                                                                                                                                                                                                                                                                    |
 | `REDIS_STREAM` | stream name                                                              | Stream Relay consumes. Missing/empty fails startup.                                                                                                                                                                                                                                                                                                                                                   |
 | `REDIS_GROUP`  | group name                                                               | Consumer group. Missing/empty fails startup. Created with `MKSTREAM` at position `0` if absent, so a new group over an existing stream replays its backlog.                                                                                                                                                                                                                                           |
-| `DATABASE_URL` | PostgreSQL DSN (`postgres://user:password@host:5432/db?sslmode=disable`) | The shared state database (operator state view, per-worker stats snapshots, and the durable schedule outbox). Missing/empty fails startup; an unreachable database fails startup. The value carries credentials and is never logged.                                                                                                                                                                  |
-| `WORKER_ID`    | stable token, ≤128 chars of ASCII letters/digits/`.`/`_`/`-`             | The worker's **stable identity**. Missing/empty fails startup; a malformed value fails startup. It is the Redis consumer name, the `relay.hostname` container-ownership label, and the persisted-stats owner key, so a restart reuses one identity across all three. It must be unique among concurrently running workers and stable across restarts: the PostgreSQL state owner lock (a per-identity session advisory lock) is held for the worker's lifetime, so a second active worker presenting the same `WORKER_ID` fails startup with a clear error rather than silently sharing one identity. The worker re-verifies this lock periodically and, if it is lost while the process is still running (a terminated backend or broken link), cancels its lifecycle and exits with an ownership-loss error rather than continuing under an identity it no longer owns (see [operations.md](operations.md)). There is **no** hostname or generated fallback. |
+| `DATABASE_URL` | PostgreSQL DSN (`postgres://user:password@host:5432/db?sslmode=disable`) | The shared state database (operator state view, per-node stats snapshots, and the durable schedule outbox). Missing/empty fails startup; an unreachable database fails startup. The value carries credentials and is never logged.                                                                                                                                                                  |
+| `NODE_ID`    | stable token, ≤128 chars of ASCII letters/digits/`.`/`_`/`-`             | Relay's **stable node identity**. Missing/empty fails startup; a malformed value fails startup. It is the Redis consumer name, the `relay.node_id` container-ownership label, and the persisted-stats node key, so a restart reuses one identity across all three. It must be unique among concurrently running nodes and stable across restarts: the PostgreSQL state node lock (a per-node session advisory lock) is held for the Relay process lifetime, so a second active node presenting the same `NODE_ID` fails startup with a clear error rather than silently sharing one identity. The worker re-verifies this lock periodically and, if it is lost while the process is still running (a terminated backend or broken link), cancels its lifecycle and exits with a node ownership-loss error rather than continuing under an identity it no longer owns (see [operations.md](operations.md)). There is **no** hostname or generated fallback. |
 
 The consumer name is **not** configurable: Relay uses the required, stable
-`WORKER_ID`, so replicas sharing `REDIS_GROUP` must each configure a unique
-`WORKER_ID`. The same identity is used for `relay.hostname` container labels
+`NODE_ID`, so replicas sharing `REDIS_GROUP` must each configure a unique
+`NODE_ID`. The same identity is used for `relay.node_id` container labels
 and persisted `stats`/`app_stats` rows, while a fresh per-process `instance_id`
 provides fencing to prevent stale instances from overwriting statistics (see
 [operations.md](operations.md)).
@@ -43,7 +43,7 @@ provides fencing to prevent stale instances from overwriting statistics (see
 | `REDIS_STREAM_RETENTION`      | `24h`         | Go duration (`6h`, `90m`)                                                          | The optional value that **logs and disables** instead of failing. See below.                                                                                                                                                                                                                                                                                                                                    |
 | `DLQ_RETENTION`               | `7d` (`168h`) | Go duration (`168h`, `90m`)                                                        | The optional value that **logs and disables** instead of failing. Bounded PostgreSQL DLQ retention. See below.                                                                                                                                                                                                                                                                                                  |
 | `REDIS_INVOCATION_RETENTION`  | `48h`         | Go duration (`12h`, `90m`)                                                         | The optional value that **logs and disables** instead of failing. Terminal invocation-state TTL only. See below.                                                                                                                                                                                                                                                                                                |
-| `STATS_RETENTION`             | `7d` (`168h`) | Go duration (`168h`, `90m`)                                                        | The optional value that **logs and disables** instead of failing. Bounds stale stats-owner rows: after a successful flush the worker deletes other workers' `stats`/`app_stats` rows older than this window. An explicitly empty value disables compaction. See below.                                                                                                                                          |
+| `STATS_RETENTION`             | `7d` (`168h`) | Go duration (`168h`, `90m`)                                                        | The optional value that **logs and disables** instead of failing. Bounds stale node stats rows: after a successful flush the worker deletes other workers' `stats`/`app_stats` rows older than this window. An explicitly empty value disables compaction. See below.                                                                                                                                          |
 | `TRAEFIK_NETWORK`             | unset         | Docker network name                                                                | Required only when a service declares `host`; verified on every routed reconcile and joined in addition to `NETWORKS`.                                                                                                                                                                                                                                                                                          |
 | `TRAEFIK_ENTRYPOINTS`         | unset         | comma-separated Traefik entrypoint names (`websecure`, `web,websecure`)            | Passed through verbatim into the router label; no default.                                                                                                                                                                                                                                                                                                                                                      |
 | `TRAEFIK_CERTRESOLVER`        | unset         | resolver name (`letsencrypt`)                                                      | When set, adds both `tls=true` and `tls.certresolver`; unset adds neither.                                                                                                                                                                                                                                                                                                                                      |
@@ -52,10 +52,10 @@ provides fencing to prevent stale instances from overwriting statistics (see
 
 `METRICS_ADDR`, `GIT_WEBHOOK_ADDR`, and the `TRAEFIK_*` values are read only by
 the worker. The read-only admin commands resolve only what they need — the state
-DSN via `LoadDatabaseURL` (no `WORKER_ID`, `REDIS_*`, or tuning required), which
+DSN via `LoadDatabaseURL` (no `NODE_ID`, `REDIS_*`, or tuning required), which
 the `relay dlq` commands use too because the durable DLQ lives in PostgreSQL —
 but the process logger is bootstrapped from `LOG_LEVEL` before any command runs,
-so an invalid `LOG_LEVEL` fails every command too. `WORKER_ID` and the tuning
+so an invalid `LOG_LEVEL` fails every command too. `NODE_ID` and the tuning
 variables are required only by `relay start`.
 
 `NETWORKS` and `TRAEFIK_NETWORK` name Docker networks Relay attaches containers
@@ -335,7 +335,7 @@ are **Go durations** parsed with `time.ParseDuration`; there is no day suffix
 (`7d` is **not** valid), so a 7-day override is written `168h`. All are startup
 configuration (restart to change) and none affects ACK, retry, DLQ routing, or
 the scheduler/outbox. (A fourth window, `STATS_RETENTION`, bounds stale
-PostgreSQL stats-owner rows; it is described after the three Redis windows.)
+PostgreSQL node stats rows; it is described after the three Redis windows.)
 
 `REDIS_STREAM_RETENTION` (default `24h`) drives the main stream trim. A single
 goroutine inside `relay start` periodically trims the configured source stream
@@ -414,16 +414,16 @@ a line naming the variable and disable that behavior; **retention values never
 fail startup**.
 
 `STATS_RETENTION` (default `7d`, i.e. `168h`) is **not a Redis trim**: it bounds
-the persisted stats-owner rows in PostgreSQL. A `WORKER_ID` that is retired
+the persisted node stats rows in PostgreSQL. A `NODE_ID` that is retired
 permanently leaves its `stats`/`app_stats` rows behind, so those would otherwise
 accumulate forever. After a successful
-flush the worker deletes rows owned by **other** workers whose `updated_at` is
+flush the worker deletes rows owned by **other** nodes whose `updated_at` is
 older than the window, throttled to one attempt per derived tick (`retention / 24`
 clamped to `[1m, 1h]`).
 
 - A worker never prunes its **own** row, however stale its timestamp looks, so a
   temporarily quiet worker keeps the cumulative totals it will resume writing.
-- Because `WORKER_ID` is stable across restarts, a restarted worker reuses its
+- Because `NODE_ID` is stable across restarts, a restarted worker reuses its
   row; this window still bounds identities that were retired permanently.
 - `STATS_RETENTION` follows the same unset-vs-empty rule: unset applies `168h`,
   and an explicit empty or `0`/negative value disables compaction (no rows are
@@ -443,11 +443,11 @@ never silently replaced by the `48h` default.
 REDIS_STREAM_RETENTION=6h          # trim the source stream (ACKED)
 DLQ_RETENTION=168h                 # prune durable DLQ rows after 7 days
 REDIS_INVOCATION_RETENTION=12h    # expire terminal invocation state after 12h
-STATS_RETENTION=720h              # compact stale stats-owner rows after 30 days
+STATS_RETENTION=720h              # compact stale node stats rows after 30 days
 REDIS_STREAM_RETENTION=          # disable source retention
 DLQ_RETENTION=                   # disable durable DLQ retention
 REDIS_INVOCATION_RETENTION=       # keep terminal invocation state persistent (no TTL)
-STATS_RETENTION=                  # disable stats-owner compaction
+STATS_RETENTION=                  # disable node stats compaction
 ```
 
 ## Environment owned by other libraries

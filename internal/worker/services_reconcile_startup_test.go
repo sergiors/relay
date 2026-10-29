@@ -391,7 +391,7 @@ func TestStartupHousekeepingExcludesLiveUpdates(t *testing.T) {
 
 // svcShutdownDocker is a minimal reconciler.Docker fake for the graceful
 // shutdown cleanup tests: it holds in-memory service containers (with worker
-// hostname identities) and records which containers ShutdownCleanup sent to
+// nodeID identities) and records which containers ShutdownCleanup sent to
 // StopServiceContainers.
 type svcShutdownDocker struct {
 	mu         sync.Mutex
@@ -449,22 +449,22 @@ func (f *svcShutdownDocker) StopServiceContainers(_ context.Context, containers 
 	return f.stopErr
 }
 
-// addService inserts one service container for the given worker hostname.
-func (f *svcShutdownDocker) addService(id, hostname string) {
-	f.addServiceForApp(id, "fn", hostname)
+// addService inserts one service container for the given worker nodeID.
+func (f *svcShutdownDocker) addService(id, nodeID string) {
+	f.addServiceForApp(id, "fn", nodeID)
 }
 
 // addServiceForApp inserts one service container for the given app and worker
-// hostname, so the app-live orphan-sweep predicate is exercisable.
-func (f *svcShutdownDocker) addServiceForApp(id, appName, hostname string) {
+// nodeID, so the app-live orphan-sweep predicate is exercisable.
+func (f *svcShutdownDocker) addServiceForApp(id, appName, nodeID string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.nextID++
 	f.containers[id] = runtime.ServiceContainer{
-		ID:       id,
-		App:      appName,
-		Hostname: hostname,
-		Image:    "img-1",
+		ID:     id,
+		App:    appName,
+		NodeID: nodeID,
+		Image:  "img-1",
 	}
 }
 
@@ -488,13 +488,13 @@ func (f *svcShutdownDocker) remainingCount() int {
 	return len(f.containers)
 }
 
-// TestShutdownCleanupHostnameScopedWorkerSide: the worker-side ShutdownCleanup
+// TestShutdownCleanupNodeScopedWorkerSide: the worker-side ShutdownCleanup
 // path (via shutdownServices with the same shutdownServiceTimeout bound the
 // shutdown registry derives for its step) removes only the containers owned by
-// this worker's hostname, preserves other workers', and returns promptly even
+// this worker's nodeID, preserves other workers', and returns promptly even
 // with an already-cancelled context (the deadline is the caller's
 // responsibility; shutdown continues anyway).
-func TestWorkerShutdownServicesHostnameScopedAndBounded(t *testing.T) {
+func TestWorkerShutdownServicesNodeScopedAndBounded(t *testing.T) {
 	fake := newSvcShutdownDocker()
 	fake.addService("own-1", "relay-worker-a")
 	fake.addService("own-2", "relay-worker-a")
@@ -511,11 +511,11 @@ func TestWorkerShutdownServicesHostnameScopedAndBounded(t *testing.T) {
 	consoleFake := fake // the same fake: shutdownServices already ran the cleanup
 	stopped := consoleFake.stoppedIDs()
 	if len(stopped) != 2 {
-		t.Fatalf("stops = %v, want [own-1 own-2] (own hostname only)", stopped)
+		t.Fatalf("stops = %v, want [own-1 own-2] (own nodeID only)", stopped)
 	}
 	for _, id := range stopped {
 		if id != "own-1" && id != "own-2" {
-			t.Fatalf("stop of foreign container %s; want own hostname only: %v", id, stopped)
+			t.Fatalf("stop of foreign container %s; want own nodeID only: %v", id, stopped)
 		}
 	}
 	if remaining := fake.remainingCount(); remaining != 1 {
@@ -609,7 +609,7 @@ func TestWorkerShutdownServicesSkipsAdoptedContainerAfterOwnershipLoss(t *testin
 			name: "fresh proof fails (ownership lost since the last poll)",
 			proof: ownershipProof{
 				loss:   &ownershipLoss{},
-				verify: func(context.Context) error { return errors.New("worker ownership lost") },
+				verify: func(context.Context) error { return errors.New("node ownership lost") },
 			},
 		},
 		{
@@ -620,8 +620,8 @@ func TestWorkerShutdownServicesSkipsAdoptedContainerAfterOwnershipLoss(t *testin
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := newSvcShutdownDocker()
-			// The container carries THIS worker's hostname, so discovery captures
-			// it; a replacement reusing WORKER_ID would adopt the SAME physical id.
+			// The container carries THIS worker's nodeID, so discovery captures
+			// it; a replacement reusing NODE_ID would adopt the SAME physical id.
 			fake.addService("adopted-1", "relay-worker-a")
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 			svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
@@ -733,7 +733,7 @@ func TestSweepStartupServiceOrphansSkipsRemovalOnOwnershipLoss(t *testing.T) {
 			name: "fresh proof fails after discovery",
 			proof: ownershipProof{
 				loss:   &ownershipLoss{},
-				verify: func(context.Context) error { return errors.New("worker ownership lost") },
+				verify: func(context.Context) error { return errors.New("node ownership lost") },
 			},
 			wantListCalls: 1,
 		},

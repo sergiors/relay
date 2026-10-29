@@ -1,6 +1,6 @@
 //go:build integration
 
-// Orphan-container sweep integration test: hostname/label scoping against a
+// Orphan-container sweep integration test: nodeID/label scoping against a
 // real daemon with this worker, another worker, and an unrelated container.
 package runtime
 
@@ -38,7 +38,7 @@ func createOrphanContainer(t *testing.T, cli *client.Client, ctx context.Context
 }
 
 // TestIntegrationSweepOrphanContainers verifies the startup sweep removes a
-// stalled Relay container owned by the current hostname, leaves another worker's
+// stalled Relay container owned by the current nodeID, leaves another worker's
 // container alone, and never touches an unrelated (non-Relay-labeled) container.
 func TestIntegrationSweepOrphanContainers(t *testing.T) {
 	m, _ := newManager(t)
@@ -47,14 +47,14 @@ func TestIntegrationSweepOrphanContainers(t *testing.T) {
 
 	cli := testutil.RequireDocker(t)
 
-	// Our orphan: relay labels + our hostname, left running (as a crashed prior
+	// Our orphan: relay labels + our nodeID, left running (as a crashed prior
 	// process would leave a mid-invocation container).
 	ours := createOrphanContainer(t, cli, ctx, map[string]string{
-		labelType: ContainerTypeEvent, labelApp: "orphan-fn", labelHostname: "test-host", labelHandler: "index.hi",
+		labelType: ContainerTypeEvent, labelApp: "orphan-fn", labelNodeID: "test-host", labelHandler: "index.hi",
 	})
-	// Another worker's orphan: different hostname, must survive.
+	// Another worker's orphan: different nodeID, must survive.
 	theirs := createOrphanContainer(t, cli, ctx, map[string]string{
-		labelType: ContainerTypeEvent, labelApp: "orphan-fn", labelHostname: "other-host", labelHandler: "index.hi",
+		labelType: ContainerTypeEvent, labelApp: "orphan-fn", labelNodeID: "other-host", labelHandler: "index.hi",
 	})
 	// Unrelated container: no relay labels, must survive.
 	unrelated := createOrphanContainer(t, cli, ctx, map[string]string{"app": "whatever"})
@@ -63,7 +63,7 @@ func TestIntegrationSweepOrphanContainers(t *testing.T) {
 		t.Fatalf("sweep: %v", err)
 	}
 
-	// Our hostname's orphan is gone...
+	// Our nodeID's orphan is gone...
 	list, _ := cli.ContainerList(ctx, client.ContainerListOptions{All: true})
 	for _, c := range list.Items {
 		if c.ID == ours {

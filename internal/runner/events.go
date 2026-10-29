@@ -714,7 +714,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					MessageID: msgID,
 					EventID:   eventID,
 					EventName: eventName,
-					Hostname:  r.hostname,
+					NodeID:    r.nodeID,
 					Image:     toImage(pf),
 				})
 				start := time.Now()

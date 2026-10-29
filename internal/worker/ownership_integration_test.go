@@ -1,6 +1,6 @@
 //go:build integration
 
-// This file proves the worker ownership monitor against a real PostgreSQL
+// This file proves the node ownership monitor against a real PostgreSQL
 // server. It is excluded from the default suite by the integration build tag and
 // REQUIRES a reachable PostgreSQL at TEST_DATABASE_URL (the CI service
 // container). A missing dependency FAILS rather than skips, matching the
@@ -24,7 +24,7 @@ import (
 
 // TestIntegrationOwnershipMonitorDetectsTerminatedLockBackend proves the
 // end-to-end detection path over a real server: the monitor polls a worker state
-// handle's pinned WORKER_ID lock, the pinned backend is terminated from a
+// handle's pinned NODE_ID lock, the pinned backend is terminated from a
 // separate connection (the residual "lock lost while the process runs" case),
 // and the monitor latches the loss, clears readiness, and cancels the lifecycle.
 // A replacement incarnation of the same worker can then take the identity.
@@ -32,7 +32,7 @@ func TestIntegrationOwnershipMonitorDetectsTerminatedLockBackend(t *testing.T) {
 	dsn := testutil.NewStateDSN(t)
 
 	owner := testutil.UniqueName(t, "owner-monitor")
-	st := testutil.OpenState(t, dsn, state.Options{Owner: owner, Instance: "inst-1"})
+	st := testutil.OpenState(t, dsn, state.Options{NodeID: owner, Instance: "inst-1"})
 	ownerPID := st.OwnerBackendPID()
 	if ownerPID <= 0 {
 		t.Fatalf("owner backend pid = %d, want > 0", ownerPID)
@@ -72,13 +72,13 @@ func TestIntegrationOwnershipMonitorDetectsTerminatedLockBackend(t *testing.T) {
 	if lifecycle.Err() == nil {
 		t.Fatal("monitor must cancel the lifecycle on loss")
 	}
-	if ready, reason := ready.Ready(context.Background()); ready || reason != "worker ownership lost" {
+	if ready, reason := ready.Ready(context.Background()); ready || reason != "node ownership lost" {
 		t.Fatalf("readiness after loss = (%v, %q), want not-ready with the loss reason", ready, reason)
 	}
 
 	// The session advisory lock died with the backend, so a replacement
-	// incarnation of the same WORKER_ID can open and verify.
-	replacement := testutil.OpenState(t, dsn, state.Options{Owner: owner, Instance: "inst-2"})
+	// incarnation of the same NODE_ID can open and verify.
+	replacement := testutil.OpenState(t, dsn, state.Options{NodeID: owner, Instance: "inst-2"})
 	if err := replacement.VerifyOwnerLock(context.Background()); err != nil {
 		t.Fatalf("replacement VerifyOwnerLock = %v, want nil", err)
 	}
@@ -94,7 +94,7 @@ func TestIntegrationOwnershipMonitorDetectsTerminatedLockBackend(t *testing.T) {
 func TestIntegrationFinalOwnershipVerificationDetectsMissedLoss(t *testing.T) {
 	dsn := testutil.NewStateDSN(t)
 
-	st := testutil.OpenState(t, dsn, state.Options{Owner: "worker-final", Instance: "inst-1"})
+	st := testutil.OpenState(t, dsn, state.Options{NodeID: "worker-final", Instance: "inst-1"})
 	ownerPID := st.OwnerBackendPID()
 	if ownerPID <= 0 {
 		t.Fatalf("owner backend pid = %d, want > 0", ownerPID)
@@ -136,7 +136,7 @@ func TestIntegrationFinalOwnershipVerificationDetectsMissedLoss(t *testing.T) {
 	if !loss.isLost() {
 		t.Fatal("the final verification must latch a loss the cancelled-lifecycle monitor missed")
 	}
-	if r, reason := ready.Ready(context.Background()); r || reason != "worker ownership lost" {
+	if r, reason := ready.Ready(context.Background()); r || reason != "node ownership lost" {
 		t.Fatalf("readiness after the final verification = (%v, %q), want not-ready with the loss reason", r, reason)
 	}
 }
@@ -154,7 +154,7 @@ func TestIntegrationVerifyOwnerLockConcurrentUnderMonitor(t *testing.T) {
 	dsn := testutil.NewStateDSN(t)
 
 	owner := testutil.UniqueName(t, "owner-stress")
-	st := testutil.OpenState(t, dsn, state.Options{Owner: owner, Instance: "inst-1"})
+	st := testutil.OpenState(t, dsn, state.Options{NodeID: owner, Instance: "inst-1"})
 
 	lifecycle, cancel := context.WithCancel(context.Background())
 	defer cancel()

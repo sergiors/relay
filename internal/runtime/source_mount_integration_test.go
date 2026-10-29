@@ -1049,7 +1049,7 @@ func TestIntegrationSourceMountBusyGenerationAdvanceDrains(t *testing.T) {
 
 	// Start the v1 invocation and hold it busy on the gate.
 	v1Ctx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", App: fn.Name, Handler: "index.run", Image: first.Image})
+		RunMeta{NodeID: "test-host", App: fn.Name, Handler: "index.run", Image: first.Image})
 	v1Done := make(chan error, 1)
 	go func() { v1Done <- m.Execute(v1Ctx, first, "index.run", []byte(`{"event_id":"1"}`), nil) }()
 
@@ -1081,7 +1081,7 @@ func TestIntegrationSourceMountBusyGenerationAdvanceDrains(t *testing.T) {
 	// The advanced generation's invocation runs on its own container while the
 	// busy v1 drains; the old container is never discarded mid-invocation.
 	v2Ctx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", App: fn.Name, Handler: "index.run", Image: second.Image})
+		RunMeta{NodeID: "test-host", App: fn.Name, Handler: "index.run", Image: second.Image})
 	if err := m.Execute(v2Ctx, second, "index.run", []byte(`{"event_id":"2"}`), nil); err != nil {
 		t.Fatalf("execute v2 while v1 busy: %v", err)
 	}
@@ -1158,7 +1158,7 @@ func TestIntegrationSourceMountWarmBoundBackpressuresBusyGeneration(t *testing.T
 
 	// Start the v1 invocation and hold it busy on the gate.
 	v1Ctx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", App: fn.Name, Handler: "index.run", Image: first.Image})
+		RunMeta{NodeID: "test-host", App: fn.Name, Handler: "index.run", Image: first.Image})
 	v1Done := make(chan error, 1)
 	go func() { v1Done <- m.Execute(v1Ctx, first, "index.run", []byte(`{"event_id":"1"}`), nil) }()
 
@@ -1198,7 +1198,7 @@ func TestIntegrationSourceMountWarmBoundBackpressuresBusyGeneration(t *testing.T
 		}
 		defer permit.Release()
 		execCtx := context.WithValue(context.Background(), runMetaKey{},
-			RunMeta{Hostname: "test-host", App: fn.Name, Handler: "index.run", Image: second.Image})
+			RunMeta{NodeID: "test-host", App: fn.Name, Handler: "index.run", Image: second.Image})
 		v2Done <- m.Execute(WithWarmPermit(execCtx, permit), second, "index.run", []byte(`{"event_id":"2"}`), nil)
 	}()
 

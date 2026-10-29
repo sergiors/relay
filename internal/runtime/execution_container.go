@@ -107,7 +107,7 @@ type executionContainer struct {
 	// Manager's Docker client. A zero value is the detached historical behavior.
 	ops containerOps
 	// meta is the creation-time RunMeta stamped as labels. Identity fields
-	// (Type/App/Hostname/Image) are set; per-invocation fields
+	// (Type/App/NodeID/Image) are set; per-invocation fields
 	// (Handler/MessageID/EventID/EventName) are left EMPTY because
 	// container labels are immutable at creation while this container
 	// outlives individual invocations — per-invocation attribution moves to

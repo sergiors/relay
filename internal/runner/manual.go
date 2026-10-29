@@ -152,7 +152,7 @@ func (r *Runner) InvokeApp(
 			// container carries its owner and identity labels. The type is the
 			// event one-shot type: a manual invocation runs an event rule against
 			// an operator-supplied event, so it belongs to the same execution
-			// population (and is swept by hostname if the worker dies mid-call).
+			// population (and is swept by node identity if the worker dies mid-call).
 			// MessageID is empty: there is no stream message.
 			invokeCtx = runtime.WithRunMeta(invokeCtx, runtime.RunMeta{
 				Type:      runtime.ContainerTypeEvent,
@@ -160,7 +160,7 @@ func (r *Runner) InvokeApp(
 				Handler:   rule.Handler,
 				EventID:   eventID,
 				EventName: eventName,
-				Hostname:  r.hostname,
+				NodeID:    r.nodeID,
 				Image:     toImage(pf),
 			})
 

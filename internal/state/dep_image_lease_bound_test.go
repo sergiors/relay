@@ -172,7 +172,7 @@ func TestDependencyCoordQueryContextIsCappedByCaller(t *testing.T) {
 	// is sufficient — the helper only requires ownerConn to be non-nil to use the
 	// ownerful path.
 	st := &State{
-		owner:     "dep-bound-worker",
+		nodeID:    "dep-bound-worker",
 		ownerConn: new(sql.Conn),
 		ownerPID:  4242,
 		log:       fallbackLogger,

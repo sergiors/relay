@@ -34,7 +34,7 @@ func writeFile(t *testing.T, dir, name, content string) {
 
 // newManager returns a Manager wired to a logger that writes into the returned
 // buffer, capturing Relay operational logs for assertions. The manager owns
-// hostname "test-host" so container-ownership tests are deterministic. Close is
+// nodeID "test-host" so container-ownership tests are deterministic. Close is
 // registered as cleanup: Manager.Close discards the per-app reused
 // execution containers it may have started.
 //

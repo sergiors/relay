@@ -15,7 +15,7 @@ import (
 )
 
 // sweepStartupExecutionOrphans removes execution containers a previous Relay
-// process on THIS worker identity left behind (a crash mid-invocation), before
+// process on THIS node identity left behind (a crash mid-invocation), before
 // any app is prepared or any container is created. It is label- and
 // identity-scoped, so other workers' and non-Relay containers are untouched.
 //
@@ -26,7 +26,7 @@ import (
 // Each attempt SNAPSHOTS this identity's candidates FIRST, runs ONE fresh
 // bounded ownership proof, then force-removes exactly the captured IDs. A
 // latched loss or a failed/ambiguous proof removes nothing: a replacement
-// process may already own WORKER_ID and its containers must not be disturbed.
+// process may already own NODE_ID and its containers must not be disturbed.
 // Execution containers are never adopted by a replacement (the runtime pool is
 // in-process, so a replacement always creates new ids), which is what makes
 // capturing the ids before the proof safe. The bounded residual race after a
@@ -36,7 +36,7 @@ func sweepStartupExecutionOrphans(
 	startupCtx context.Context,
 	logger *slog.Logger,
 	manager *runtime.Manager,
-	workerID string,
+	nodeID string,
 	proof ownershipProof,
 ) {
 	orphanCtx, orphanSpan := tracing.Start(startupCtx, "orphan.sweep")
@@ -44,7 +44,7 @@ func sweepStartupExecutionOrphans(
 	sweepResult, sweepErr := retryIdentitySnapshotCleanup(
 		sweepCtx, proof, logger, "orphan-sweep",
 		func(stepCtx context.Context) ([]runtime.OrphanContainer, error) {
-			return manager.DiscoverOrphanContainers(stepCtx, workerID)
+			return manager.DiscoverOrphanContainers(stepCtx, nodeID)
 		},
 		func(
 			stepCtx context.Context,
@@ -267,7 +267,7 @@ func liveAppNames(apps []app.App, issues []app.LoadIssue) map[string]bool {
 // counts are logged once per sweep (the reconciler's own per-pass log remains
 // the authoritative removal detail), so startup gains a summary rather than
 // per-container success spam. The reconciler itself is worker-wired with
-// WithWorkerID, so discovery only ever captures THIS worker's service
+// WithNodeID, so discovery only ever captures THIS worker's service
 // containers.
 func sweepStartupServiceOrphans(
 	hctx context.Context, svcCtrl *reconciler.ServiceReconciler, liveNames map[string]bool,
@@ -472,9 +472,9 @@ func prepareAndStartApps(
 			exclusive: services.RunExclusive,
 			sweep: func(hctx context.Context) {
 				// The service-orphan sweep is identity-scoped: it lists and stops
-				// stale service containers for THIS worker's identity on the
+				// stale service containers for THIS node's identity on the
 				// shared daemon (the ServiceReconciler is wired with
-				// WithWorkerID, so another worker's service containers are never
+				// WithNodeID, so another worker's service containers are never
 				// captured). Like the orphan execution sweep it must run in the
 				// snapshot-first, proof-second, remove-third order
 				// (guardIdentitySnapshotCleanup) so discovery never follows the
