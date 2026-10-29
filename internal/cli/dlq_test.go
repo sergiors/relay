@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"relay/internal/dlq"
 	"relay/internal/runner"
 	"relay/internal/runtime"
+	"relay/internal/schedule"
 )
 
 // fakeDLQStore is an in-memory DLQStore for CLI tests: it preserves insertion
@@ -711,5 +713,225 @@ func TestOpenPostgresDLQStoreRequiresDatabaseURL(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	if _, _, err := openPostgresDLQStore(context.Background(), logger); err == nil || !strings.Contains(err.Error(), "DATABASE_URL") {
 		t.Fatalf("openPostgresDLQStore without DATABASE_URL = %v, want an error naming DATABASE_URL", err)
+	}
+}
+
+// scheduleReplayOccurrence is the exhausted schedule occurrence the replay tests
+// work with: exactly what an exhausted schedule invocation dead-letters (the
+// envelope's app/schedule/handler and the scheduled instant).
+func scheduleReplayOccurrence() schedule.Occurrence {
+	return schedule.Occurrence{
+		App:         "user-events",
+		Schedule:    "cleanup",
+		Handler:     "events.created.handler",
+		ScheduledAt: time.Date(2026, 10, 1, 8, 0, 0, 0, time.UTC),
+	}
+}
+
+// scheduleReplayEnvelope returns the exact stream body the DLQ stores for the
+// exhausted schedule invocation: the occurrence's envelope, not its handler
+// payload (see stream's schedule exhaustion path).
+func scheduleReplayEnvelope(t *testing.T) string {
+	t.Helper()
+	envelope, err := scheduleReplayOccurrence().Envelope()
+	if err != nil {
+		t.Fatalf("schedule envelope: %v", err)
+	}
+	return string(envelope)
+}
+
+// TestDLQReplayScheduleEnvelopeInspectedAsStoredEnvelope verifies `dlq inspect`
+// keeps showing the FULL stored schedule envelope — with the coordination fields
+// (app, schedule, handler, occurrence_id) an operator needs to identify the
+// dead-lettered occurrence — and leaves the entry untouched.
+func TestDLQReplayScheduleEnvelopeInspectedAsStoredEnvelope(t *testing.T) {
+	store := &fakeDLQStore{entries: []dlq.Entry{
+		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", scheduleReplayEnvelope(t), "2026-10-01T08:05:00Z"),
+	}}
+	deps := withFakeDLQ(t, store)
+
+	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "inspect", "1-0")
+	if err != nil {
+		t.Fatalf("dlq inspect: %v", err)
+	}
+	for _, want := range []string{
+		`"app": "user-events"`,
+		`"handler": "events.created.handler"`,
+		`"schedule": "cleanup"`,
+		`"occurrence_id": "schedule:user-events:cleanup:2026-10-01T08:00:00Z"`,
+		`"scheduled_at": "2026-10-01T08:00:00Z"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("inspect must show the stored schedule envelope; missing %q\n%s", want, out)
+		}
+	}
+	if len(store.entries) != 1 || store.entries[0].Event != scheduleReplayEnvelope(t) {
+		t.Fatalf("inspect must keep the entry's stored event verbatim: %+v", store.entries)
+	}
+}
+
+// TestDLQReplayScheduleEnvelopeExecutesHandlerPayload verifies the full-stack
+// replay of an exhausted schedule invocation: the real runner, reached over the
+// real worker socket, executes exactly the recorded handler with
+// Occurrence.Payload() — the bytes the LIVE schedule path would have handed it —
+// never the stored envelope, and the successful replay deletes the entry.
+func TestDLQReplayScheduleEnvelopeExecutesHandlerPayload(t *testing.T) {
+	store := &fakeDLQStore{entries: []dlq.Entry{
+		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", scheduleReplayEnvelope(t), "2026-10-01T08:05:00Z"),
+	}}
+	exec := &dlqReplayExecutor{}
+	deps := dlqReplayRunner(t, store, exec)
+
+	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	if err != nil {
+		t.Fatalf("dlq replay: %v", err)
+	}
+	if strings.TrimSpace(out) != "Replayed handler successfully" {
+		t.Fatalf("stdout = %q", out)
+	}
+	handlers, payloads := exec.got()
+	if len(handlers) != 1 || handlers[0] != "events.created.handler" {
+		t.Fatalf("executed handlers = %v, want exactly [events.created.handler]", handlers)
+	}
+	if string(payloads[0]) != string(scheduleReplayOccurrence().Payload()) {
+		t.Fatalf(
+			"replayed payload = %q, want exactly Occurrence.Payload() %q",
+			payloads[0], scheduleReplayOccurrence().Payload(),
+		)
+	}
+	if strings.Contains(string(payloads[0]), "occurrence_id") {
+		t.Fatalf("replay leaked the envelope's coordination fields into the handler payload: %q", payloads[0])
+	}
+	if len(store.entries) != 0 {
+		t.Fatalf("a successful schedule replay must delete the entry: %+v", store.entries)
+	}
+}
+
+// TestDLQReplayScheduleEnvelopeForwardsTrace verifies the schedule replay still
+// carries the entry's optional trace lineage to the worker as control-path
+// metadata, separate from (and alongside) the converted handler payload.
+func TestDLQReplayScheduleEnvelopeForwardsTrace(t *testing.T) {
+	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	entry := dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", scheduleReplayEnvelope(t), "2026-10-01T08:05:00Z")
+	entry.Trace = lineage
+	store := &fakeDLQStore{entries: []dlq.Entry{entry}}
+	deps := withFakeDLQ(t, store)
+	rep := &recordingReplayer{}
+	startTestSocketWithReplayer(t, deps.SocketPath, rep)
+
+	if _, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0"); err != nil {
+		t.Fatalf("dlq replay: %v", err)
+	}
+	calls, event, trace := rep.got()
+	if calls != 1 {
+		t.Fatalf("replayer calls = %d, want 1", calls)
+	}
+	if trace != lineage {
+		t.Fatalf("forwarded trace = %q, want %q", trace, lineage)
+	}
+	if string(event) != string(scheduleReplayOccurrence().Payload()) {
+		t.Fatalf(
+			"forwarded event = %q, want the handler payload %q",
+			event, scheduleReplayOccurrence().Payload(),
+		)
+	}
+}
+
+// TestDLQReplayMalformedScheduleEnvelopeKeepsEntryPreDial verifies a stored
+// envelope that carries the schedule marker but is incomplete fails with an
+// explicit error BEFORE anything is dialed or executed, and the entry is kept.
+func TestDLQReplayMalformedScheduleEnvelopeKeepsEntryPreDial(t *testing.T) {
+	var envelope map[string]any
+	if err := json.Unmarshal([]byte(scheduleReplayEnvelope(t)), &envelope); err != nil {
+		t.Fatalf("unmarshal schedule envelope: %v", err)
+	}
+	delete(envelope, "handler")
+	malformed, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("marshal malformed envelope: %v", err)
+	}
+	store := &fakeDLQStore{entries: []dlq.Entry{
+		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", string(malformed), "2026-10-01T08:05:00Z"),
+	}}
+	// A wired replayer records ANY worker-side call, so it doubles as proof the
+	// socket seam was never reached.
+	deps := withFakeDLQ(t, store)
+	rep := &recordingReplayer{}
+	startTestSocketWithReplayer(t, deps.SocketPath, rep)
+
+	_, _, err = runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	if err == nil {
+		t.Fatal("a malformed schedule envelope must not be replayed")
+	}
+	if !strings.Contains(err.Error(), "replay 1-0") || !strings.Contains(err.Error(), "schedule claim") {
+		t.Fatalf("err = %v, want a schedule-claim replay error for 1-0", err)
+	}
+	if calls, _, _ := rep.got(); calls != 0 {
+		t.Fatalf("a malformed schedule claim must fail before the replayer: calls = %d", calls)
+	}
+	if len(store.entries) != 1 {
+		t.Fatalf("a malformed schedule claim must keep the entry: %+v", store.entries)
+	}
+}
+
+// TestDLQReplayNonObjectEventKeepsEntryPreDial verifies a replayable entry whose
+// stored event is JSON but not an object is rejected before the worker (no
+// misleading socket-unavailable error), executes nothing, and keeps the entry.
+func TestDLQReplayNonObjectEventKeepsEntryPreDial(t *testing.T) {
+	store := &fakeDLQStore{entries: []dlq.Entry{
+		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `[1,2,3]`, "2026-10-01T08:05:00Z"),
+	}}
+	deps := withFakeDLQ(t, store)
+	rep := &recordingReplayer{}
+	startTestSocketWithReplayer(t, deps.SocketPath, rep)
+
+	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	if err == nil {
+		t.Fatal("a non-object event must not be replayed")
+	}
+	if !strings.Contains(err.Error(), "replay 1-0") || !strings.Contains(err.Error(), "replay payload") {
+		t.Fatalf("err = %v, want an explicit pre-dial replay error naming 1-0", err)
+	}
+	if strings.Contains(err.Error(), "invocation unavailable") {
+		t.Fatalf("err = %v, must not report a misleading worker unavailability", err)
+	}
+	if calls, _, _ := rep.got(); calls != 0 {
+		t.Fatalf("a non-object event must fail before the replayer: calls = %d", calls)
+	}
+	if len(store.entries) != 1 {
+		t.Fatalf("a non-object event must keep the entry: %+v", store.entries)
+	}
+}
+
+// TestDLQReplayOrdinaryEventPayloadByteForByte proves the ordinary replay path
+// is unchanged by the schedule conversion: the executor receives exactly the
+// compacted stored event — no re-encoding with normalized field order. (The
+// socket wire itself compacts JSON — the client embeds the event as
+// json.RawMessage — a pre-existing behavior outside replay's control; but a
+// re-marshal would also SORT the keys, so requiring the compacted event in its
+// original key order pins that replay passes the stored bytes through.)
+func TestDLQReplayOrdinaryEventPayloadByteForByte(t *testing.T) {
+	// Non-lexicographic key order plus whitespace: a re-marshal would collapse
+	// this to {"entry_name":"INSERT","zzz":1}, re-sorted.
+	const stored = "{\n  \"zzz\": 1,\n  \"entry_name\": \"INSERT\"\n}"
+	const wireCompacted = `{"zzz":1,"entry_name":"INSERT"}`
+	store := &fakeDLQStore{entries: []dlq.Entry{
+		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", stored, "2026-10-01T08:05:00Z"),
+	}}
+	exec := &dlqReplayExecutor{}
+	deps := dlqReplayRunner(t, store, exec)
+
+	if _, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0"); err != nil {
+		t.Fatalf("dlq replay: %v", err)
+	}
+	_, payloads := exec.got()
+	if len(payloads) != 1 || string(payloads[0]) != wireCompacted {
+		t.Fatalf(
+			"replayed payload = %q, want the stored event compacted but byte-preserving on the wire %q",
+			payloads, wireCompacted,
+		)
+	}
+	if len(store.entries) != 0 {
+		t.Fatalf("a successful ordinary replay must delete the entry: %+v", store.entries)
 	}
 }

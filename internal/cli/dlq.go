@@ -12,6 +12,7 @@ import (
 	"github.com/urfave/cli/v3"
 
 	"relay/internal/dlq"
+	"relay/internal/schedule"
 	"relay/internal/worker"
 )
 
@@ -249,6 +250,12 @@ func dlqInspect(ctx context.Context, w io.Writer, store dlq.Store, id string) er
 // is not JSON, so replay would otherwise attempt to encode invalid JSON and
 // report a misleading socket-unavailability error. The entry is kept for
 // inspection or removal.
+//
+// The stored event is the source body, which for a schedule occurrence is its
+// envelope rather than the payload the handler received. schedule.ReplayPayload
+// maps it back to Occurrence.Payload() before dialing and leaves a valid
+// ordinary event byte-for-byte unchanged; an invalid or non-object payload, or
+// a malformed schedule claim, is an explicit pre-dial error.
 func dlqReplay(ctx context.Context, w io.Writer, store dlq.Store, socketPath, id string) error {
 	entry, ok, err := store.GetDLQEntry(ctx, id)
 	if err != nil {
@@ -268,7 +275,14 @@ func dlqReplay(ctx context.Context, w io.Writer, store dlq.Store, socketPath, id
 		return fmt.Errorf("DLQ entry %q is not settled: source delivery may still be recoverable", id)
 	}
 
-	if err := worker.ReplayDLQ(ctx, socketPath, entry.App, entry.Handler, []byte(entry.Event), entry.Trace); err != nil {
+	// Replay the payload the handler actually received, not necessarily the
+	// stored body. The stored envelope itself stays untouched for inspection.
+	payload, err := schedule.ReplayPayload([]byte(entry.Event))
+	if err != nil {
+		return fmt.Errorf("replay %s: %w", id, err)
+	}
+
+	if err := worker.ReplayDLQ(ctx, socketPath, entry.App, entry.Handler, payload, entry.Trace); err != nil {
 		return fmt.Errorf("replay %s: %w", id, err)
 	}
 
