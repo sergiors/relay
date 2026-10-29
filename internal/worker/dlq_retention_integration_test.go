@@ -105,6 +105,54 @@ func TestIntegrationDLQRetentionTickPrunesSettledPreservesUnsettled(t *testing.T
 	}
 }
 
+// TestIntegrationDLQRetentionTickSkipsRowWithActiveReplayClaim proves the
+// worker's retention loop cannot remove a row under an in-flight replay: an
+// actively claimed row is skipped even when its lease window and retention
+// window are both long past, and it becomes prunable as soon as its claim is
+// released (the same protection the state store enforces directly).
+func TestIntegrationDLQRetentionTickSkipsRowWithActiveReplayClaim(t *testing.T) {
+	testutil.RequireStateDatabase(t)
+	st := testutil.NewState(t)
+	oldSettled, recentSettled, unsettled := pruneFixture(t, st)
+	ctx := context.Background()
+
+	// Given: a replay claim is actively held on the settled old row (exactly
+	// what `relay dlq replay` leaves behind while its handler runs).
+	claim, err := st.ClaimDLQReplay(ctx, oldSettled.ID, dlq.ReplayLease)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if claim.Token <= 0 {
+		t.Fatalf("claim token = %d, want the positive fencing token", claim.Token)
+	}
+
+	// When retention long past every row's window runs...
+	later := time.Now().Add(2 * time.Hour)
+	dlqRetentionTick(ctx, st, time.Hour, func() time.Time { return later }, testutil.DiscardLogger())
+
+	// ...the unclaimed settled row is pruned, and ONLY the active replay claim
+	// is what preserves the claimed row (both would otherwise be prunable).
+	if _, ok, _ := st.GetDLQEntry(ctx, recentSettled.ID); ok {
+		t.Fatal("the unclaimed settled row past its window must be pruned")
+	}
+	if _, ok, _ := st.GetDLQEntry(ctx, oldSettled.ID); !ok {
+		t.Fatal("the actively claimed row must survive retention")
+	}
+	if _, ok, _ := st.GetDLQEntry(ctx, unsettled.ID); !ok {
+		t.Fatal("an unsettled row is never removed by retention")
+	}
+
+	// Once the claim is released (definitive-failure recovery), the row returns
+	// to retention's disposal: the same tick prunes it now.
+	if err := st.ReleaseDLQReplay(ctx, oldSettled.ID, claim.Token); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	dlqRetentionTick(ctx, st, time.Hour, func() time.Time { return later }, testutil.DiscardLogger())
+	if _, ok, _ := st.GetDLQEntry(ctx, oldSettled.ID); ok {
+		t.Fatal("the released row must prune once its claim is gone")
+	}
+}
+
 // TestIntegrationDLQDepthGaugeReportsApproximateRowCount pins the periodic
 // depth gauge against real PostgreSQL: Refresh records the planner's approximate
 // row estimate (pg_class.reltuples), never an exact COUNT, and an unreachable

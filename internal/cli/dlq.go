@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -237,71 +238,125 @@ func dlqInspect(ctx context.Context, w io.Writer, store dlq.Store, id string) er
 	return nil
 }
 
-// dlqReplay reads one entry, replays its exact stored app/handler/event
-// through the running worker socket, and — only when the execution succeeds —
-// deletes exactly that entry. Any failure (unknown ID, a non-replayable entry,
-// an unavailable worker, a removed app/handler, or a failed handler)
-// returns a concise error and leaves the entry in place. It never consults event
-// matching or writes broker state: the worker's ReplayDLQ executes exactly the
-// recorded handler once, with no invocation-state identity.
+// dlqReplay admits, executes, and settles one fenced replay.
 //
-// A non-replayable entry is rejected before dialing: a malformed-message or
-// oversized-event placeholder has no app/handler to re-execute and an event that
-// is not JSON, so replay would otherwise attempt to encode invalid JSON and
-// report a misleading socket-unavailability error. The entry is kept for
-// inspection or removal.
+// Admission is a PostgreSQL claim committed BEFORE the worker is contacted: only
+// a settled entry is eligible, a monotonic fencing token is incremented, and a
+// lease in database time is stamped (dlq.ReplayLease). A concurrent replay sees
+// the unexpired lease, gets an explicit replay-in-progress error, and never
+// dials, so two CLIs cannot both execute the same entry. The claim never spans
+// execution: no database transaction is held while the handler runs.
+//
+// The claim is released early only when the outcome is known to have left no
+// running handler: a pre-dial/model error, a worker-reported failure (including
+// handler failure, unknown app, or removed handler), or a request that never
+// reached the worker. An ambiguous outcome — a lost/malformed response, a read
+// or write failure after send, or client cancellation — retains the lease until
+// it expires; this deliberately favors not starting a second execution over
+// immediate retry. Expiry is the recovery path for a crashed claimant.
+//
+// On success the delete is one fenced conditional statement requiring the entry
+// to still be settled, to still carry this claim's token, and to have an
+// unexpired lease at database time. A stale claimant can therefore never delete a
+// row that was re-claimed; it reports that the entry was retained.
+//
+// Replay is at-least-once, not exactly-once: a handler may finish after the CLI
+// disconnects (the worker's replay context is not cancelled by the disconnect) or
+// after the lease expires, so the same entry can be executed again. Handlers must
+// stay idempotent.
+//
+// A non-replayable entry is rejected after admission and its claim released: a
+// malformed-message or oversized-event placeholder has no app/handler to
+// re-execute and an event that is not JSON, so replay would otherwise attempt to
+// encode invalid JSON and report a misleading socket-unavailability error. The
+// entry is kept for inspection or removal.
 //
 // The stored event is the source body, which for a schedule occurrence is its
 // envelope rather than the payload the handler received. schedule.ReplayPayload
 // maps it back to Occurrence.Payload() before dialing and leaves a valid
 // ordinary event byte-for-byte unchanged; an invalid or non-object payload, or
-// a malformed schedule claim, is an explicit pre-dial error.
+// a malformed schedule claim, is an explicit pre-dial error and releases the
+// claim.
 func dlqReplay(ctx context.Context, w io.Writer, store dlq.Store, socketPath, id string) error {
-	entry, ok, err := store.GetDLQEntry(ctx, id)
+	claim, err := store.ClaimDLQReplay(ctx, id, dlq.ReplayLease)
 	if err != nil {
-		return err
+		switch {
+		case errors.Is(err, dlq.ErrEntryNotFound):
+			return fmt.Errorf("unknown DLQ entry %q", id)
+		case errors.Is(err, dlq.ErrEntryUnsettled):
+			// An unsettled entry's source delivery may still be recoverable.
+			// Replaying it would execute a handler whose dead letter cannot yet
+			// be removed, and the later delete would be refused after the side
+			// effect had already happened.
+			return fmt.Errorf("DLQ entry %q is not settled: source delivery may still be recoverable", id)
+		case errors.Is(err, dlq.ErrReplayInProgress):
+			return fmt.Errorf("DLQ entry %q replay is already in progress; retry after the claim lease expires", id)
+		default:
+			return fmt.Errorf("replay %s: %w", id, err)
+		}
 	}
-	if !ok {
-		return fmt.Errorf("unknown DLQ entry %q", id)
-	}
+	entry := claim.Entry
 	if !entry.Replayable() {
-		return fmt.Errorf("DLQ entry %q is not replayable: no app/handler to re-execute (malformed-message placeholder or oversized-event summary)", id)
-	}
-	// An unsettled entry's source delivery may still be recoverable. Replaying it
-	// would execute a handler whose dead letter cannot yet be removed, and the
-	// later delete would be refused after the side effect had already happened.
-	// Reject before dialing the worker.
-	if entry.SettledAt == "" {
-		return fmt.Errorf("DLQ entry %q is not settled: source delivery may still be recoverable", id)
+		return releaseReplayClaim(ctx, store, id, claim.Token,
+			fmt.Errorf("DLQ entry %q is not replayable: no app/handler to re-execute (malformed-message placeholder or oversized-event summary)", id))
 	}
 
 	// Replay the payload the handler actually received, not necessarily the
 	// stored body. The stored envelope itself stays untouched for inspection.
 	payload, err := schedule.ReplayPayload([]byte(entry.Event))
 	if err != nil {
-		return fmt.Errorf("replay %s: %w", id, err)
+		return releaseReplayClaim(ctx, store, id, claim.Token,
+			fmt.Errorf("replay %s: %w", id, err))
 	}
 
 	if err := worker.ReplayDLQ(ctx, socketPath, entry.App, entry.Handler, payload, entry.Trace); err != nil {
-		return fmt.Errorf("replay %s: %w", id, err)
+		replayErr := fmt.Errorf("replay %s: %w", id, err)
+		// A definitive worker answer means no handler is still running. A
+		// request that never started is equally safe to release. Everything
+		// else (lost response, I/O failure after send, cancellation) may have
+		// executed and retains the lease until expiry.
+		if errors.Is(err, worker.ErrInvokeFailed) || errors.Is(err, worker.ErrInvokeNotStarted) {
+			return releaseReplayClaim(ctx, store, id, claim.Token, replayErr)
+		}
+		return replayErr
 	}
 
-	// The handler succeeded: delete exactly this entry. A delete failure is
-	// surfaced (the replay DID run, so the operator must know the entry lingers;
-	// re-running would repeat the execution).
-	if _, err := store.DeleteDLQEntry(ctx, id); err != nil {
-		return err
+	// The handler succeeded: delete exactly this entry with the fenced claim.
+	// A failure here means the replay DID run, so the operator must know the
+	// entry lingers; re-running would repeat the execution.
+	if err := store.DeleteDLQReplay(ctx, id, claim.Token); err != nil {
+		return fmt.Errorf("replay %s: handler succeeded but the DLQ entry was retained: %w", id, err)
 	}
 	fmt.Fprintln(w, "Replayed handler successfully")
 	return nil
 }
 
-// dlqRm deletes exactly one entry by its stable ID. An unknown ID is a clear
-// error; a successful removal prints a concise confirmation.
+// releaseReplayClaim releases a claim for an outcome known not to have left a
+// running handler, preserving the replay error as the primary cause. A release
+// failure is joined rather than hidden: the claim then stays until its lease
+// expires, which is safe but delays the next attempt.
+func releaseReplayClaim(ctx context.Context, store dlq.Store, id string, token int64, cause error) error {
+	if err := store.ReleaseDLQReplay(ctx, id, token); err != nil {
+		return errors.Join(cause, fmt.Errorf("release DLQ replay claim: %w", err))
+	}
+	return cause
+}
+
+// dlqRm deletes exactly one settled entry by its stable ID. An unknown ID is a
+// clear error; an entry with an active replay claim is refused, because the
+// replay may still be executing. A successful removal prints a concise
+// confirmation.
 func dlqRm(ctx context.Context, w io.Writer, store dlq.Store, id string) error {
 	deleted, err := store.DeleteDLQEntry(ctx, id)
 	if err != nil {
-		return err
+		switch {
+		case errors.Is(err, dlq.ErrEntryUnsettled):
+			return fmt.Errorf("DLQ entry %q is not settled: source delivery may still be recoverable", id)
+		case errors.Is(err, dlq.ErrReplayInProgress):
+			return fmt.Errorf("DLQ entry %q has an active replay claim; retry after it expires", id)
+		default:
+			return err
+		}
 	}
 	if !deleted {
 		return fmt.Errorf("unknown DLQ entry %q", id)

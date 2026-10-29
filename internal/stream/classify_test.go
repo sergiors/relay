@@ -309,42 +309,25 @@ func TestHandlerExhaustedErrorReasonConsistent(t *testing.T) {
 	}
 }
 
-// TestExhaustedValueGrammar pins the two exhausted marker forms and that only
-// the ":dlq" form reports persisted.
+// TestExhaustedValueGrammar pins the exhausted marker form.
 func TestExhaustedValueGrammar(t *testing.T) {
-	if v := exhaustedValue(InvocationClaim{Attempt: 3, Token: "ab12"}, false); v != "exhausted:3:ab12" {
-		t.Fatalf("exhaustedValue(3,false) = %q", v)
+	if v := exhaustedValue(InvocationClaim{Attempt: 3, Token: "ab12"}); v != "exhausted:3:ab12" {
+		t.Fatalf("exhaustedValue(3) = %q", v)
 	}
-	if v := exhaustedValue(InvocationClaim{Attempt: 3, Token: "ab12"}, true); v != "exhausted:3:ab12:dlq" {
-		t.Fatalf("exhaustedValue(3,true) = %q", v)
+	kind, _, n, ok := parseInvocationState("exhausted:3:ab12")
+	if !ok || kind != kindExhausted || n != 3 {
+		t.Fatalf("parseInvocationState(exhausted:3:ab12) = kind %v n %d ok %v", kind, n, ok)
 	}
-	// Both parse to kindExhausted with the attempt count; only the suffixed form
-	// reports persisted.
-	for _, tc := range []struct {
-		v         string
-		attempts  int
-		persisted bool
-	}{
-		{"exhausted:3:ab12", 3, false},
-		{"exhausted:3:ab12:dlq", 3, true},
-	} {
-		kind, _, n, ok := parseInvocationState(tc.v)
-		if !ok || kind != kindExhausted || n != tc.attempts {
-			t.Fatalf("parseInvocationState(%q) = kind %v n %d ok %v", tc.v, kind, n, ok)
-		}
-		if got := isExhaustedDLQValue(tc.v); got != tc.persisted {
-			t.Fatalf("isExhaustedDLQValue(%q) = %v, want %v", tc.v, got, tc.persisted)
-		}
-	}
-	// A malformed suffixed marker does not parse (a missing/short token, a
-	// non-numeric attempt, or a non-hex token).
+	// A malformed marker does not parse: a missing/short token, a non-numeric
+	// attempt, or a trailing legacy suffix (no compatibility is provided).
 	for _, v := range []string{
-		"exhausted::dlq",
-		"exhausted:0:ab12:dlq",
-		"exhausted:abc:ab12:dlq",
-		"exhausted:3::dlq",
-		"exhausted:3:ZZZZ:dlq",
-		"exhausted:3:ab12:extra:dlq",
+		"exhausted:",
+		"exhausted:0:ab12",
+		"exhausted:abc:ab12",
+		"exhausted:3:",
+		"exhausted:3:ZZZZ",
+		"exhausted:3:ab12:dlq",
+		"exhausted:3:ab12:extra",
 	} {
 		if _, _, _, ok := parseInvocationState(v); ok {
 			t.Errorf("parseInvocationState(%q) ok = true, want false", v)

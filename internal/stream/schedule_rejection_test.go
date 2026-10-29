@@ -326,7 +326,7 @@ func TestReserveScheduleRejectionAdmittedElsewhereStaysPending(t *testing.T) {
 func TestReserveScheduleRejectionAdmittedMarkerNoDescriptor(t *testing.T) {
 	active := runningValue(time.Now().Add(time.Hour), InvocationClaim{Attempt: 1, Token: "ab"})
 	pending := nextAttemptValue(time.Now().Add(time.Hour), InvocationClaim{Attempt: 1, Token: "ab"})
-	exhausted := exhaustedValue(InvocationClaim{Attempt: 2, Token: "ab"}, false)
+	exhausted := exhaustedValue(InvocationClaim{Attempt: 2, Token: "ab"})
 
 	t.Run("active running", func(t *testing.T) {
 		assertReserveInFlight(t, map[string]string{"fn/jobs.old": active})
@@ -369,22 +369,6 @@ func TestReserveScheduleRejectionAdmittedMarkerNoDescriptor(t *testing.T) {
 			t.Fatalf("exhausted invocation = %+v, want fn/jobs.old attempt 2", got)
 		}
 		assertMarkerUntouched(t, store, "fn/jobs.old", exhausted)
-	})
-	t.Run("exhausted dlq persisted still reported", func(t *testing.T) {
-		// The :dlq marker is still reported; the stream's persistence check skips
-		// the write and ACKs, so this is idempotent, not a duplicate.
-		marker := exhaustedValue(InvocationClaim{Attempt: 2, Token: "ab"}, true)
-		store := newFakeInvocationStore(map[string]string{"fn/jobs.old": marker})
-		p := consumerForStore(t, store)
-
-		adm, err := p.ReserveScheduleRejection(ScheduleRejectionObsolete)
-		if err != nil {
-			t.Fatalf("ReserveScheduleRejection: %v", err)
-		}
-		if len(adm.ExhaustedInvocations) != 1 || adm.ExhaustedInvocations[0].Attempts != 2 {
-			t.Fatalf("admission = %+v, want the :dlq invocation reported", adm)
-		}
-		assertMarkerUntouched(t, store, "fn/jobs.old", marker)
 	})
 }
 

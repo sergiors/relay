@@ -4,6 +4,43 @@ import (
 	"testing"
 )
 
+// The exact identity digests for one reference delivery. They pin the hash
+// DOMAIN the persisted entry IDs derive from: the domain carries no version
+// suffix ("relay.dlq.delivery", "relay.dlq.entry" — an earlier draft of the
+// grammar did), so any change here silently re-keys every row stored in
+// PostgreSQL and must be a deliberate, migration-considered break.
+const (
+	referenceDeliveryID    = "213ea9d4f19c2af47eda3e3731264a88a44a47ce1137b9822daf2b07b20a72a5"
+	referenceEntryID       = "e72b85ed11b370680c24fdf7451f1863fd7e70989a3f868394f081c2f7ed3e48"
+	referencePlaceholderID = "1a56f0d00fb5b16ff04f918a72ccda2cb614249ca18c74f244d5558736f08e95"
+)
+
+// TestPersistedIdentityDomainsAreVersionlessPinned pins the exact persisted
+// identity digests for one reference delivery: the constructor stays its own
+// pure function of the length-prefixed inputs over the version-less domain, and
+// the domain is not the (removed) versioned draft grammar.
+func TestPersistedIdentityDomainsAreVersionlessPinned(t *testing.T) {
+	if got := NewDeliveryID("events", "relay", "1760000000000-0"); got != referenceDeliveryID {
+		t.Fatalf(
+			"NewDeliveryID = %q, want the pinned versionless domain digest %q (the persisted-identity domain changed; every stored entry ID re-keys)",
+			got, referenceDeliveryID,
+		)
+	}
+
+	delivery := referenceDeliveryID
+	if got := NewIDForDelivery(delivery, "fn/h"); got != referenceEntryID {
+		t.Fatalf("NewIDForDelivery(fn/h) = %q, want the pinned digest %q", got, referenceEntryID)
+	}
+	if got := NewIDForDelivery(delivery, ""); got != referencePlaceholderID {
+		t.Fatalf("NewIDForDelivery(\"\") = %q, want the pinned placeholder digest %q", got, referencePlaceholderID)
+	}
+
+	// NewID agrees with the two-step construction it wraps.
+	if got := NewID("events", "relay", "1760000000000-0", "fn/h"); got != referenceEntryID {
+		t.Fatalf("NewID(...) = %q, want the pinned digest %q", got, referenceEntryID)
+	}
+}
+
 // TestNewDeliveryIDIsDeterministic verifies the delivery identity is a pure
 // function of (source, group, message ID): repeated invocations agree, and any
 // input difference produces a different identity — including message IDs that

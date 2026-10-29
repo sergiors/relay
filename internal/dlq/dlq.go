@@ -17,6 +17,12 @@
 // is what makes admin removal and retention safe. Only operator-facing metadata
 // that has no behavioural role (the consumer name, delivery count) is carried
 // through.
+//
+// Replay admission is broker-neutral too: a Store leases one settled entry under
+// a monotonic fence so at most one replay can start at a time. The lease is
+// time-bounded because an execution can outlive the caller or its outcome can be
+// ambiguous; expiry is the only recovery and a stale claimant cannot delete a
+// re-claimed row. Replay remains at-least-once, never exactly-once.
 package dlq
 
 import (
@@ -34,11 +40,34 @@ import (
 // handler ran). It mirrors the stream layer's "-" fallback for a missing event.
 const NoHandler = "-"
 
-// ErrEntryUnsettled is returned by an admin removal when the entry's source
-// delivery has not been acknowledged yet. Such an entry is still needed by
-// delivery recovery and must never be deleted administratively; retention
-// likewise removes only settled entries.
+// ErrEntryUnsettled is returned by an admin removal or replay admission when the
+// entry's source delivery has not been acknowledged yet. Such an entry is still
+// needed by delivery recovery and must never be deleted administratively or
+// replayed; retention likewise removes only settled entries.
 var ErrEntryUnsettled = errors.New("DLQ entry is not settled")
+
+// ErrEntryNotFound reports that no DLQ entry has the requested ID.
+var ErrEntryNotFound = errors.New("DLQ entry not found")
+
+// ErrReplayInProgress reports that a replay lease currently held by another
+// claimant has not expired. A concurrent replay is refused before it contacts
+// the worker, so it can never start a second execution of the same entry.
+var ErrReplayInProgress = errors.New("DLQ replay already in progress")
+
+// ErrReplayClaimLost reports that a replay's success delete matched no row: its
+// lease expired and was re-claimed, or the entry was removed by an operator.
+// The handler did run, but this claimant must not delete the row a newer
+// claimant owns. The entry is retained.
+var ErrReplayClaimLost = errors.New("DLQ replay claim is no longer held")
+
+// ReplayLease is how long a replay admission claim is held before another
+// claimant may take it over. It deliberately exceeds the worker's longest
+// control-socket invocation bound (the largest app timeout plus container
+// start/model-load margin, currently seven minutes) plus the client exchange
+// margin, so a legitimate handler can finish before the lease expires. It is
+// still bounded: a claimant that dies or loses contact must not block replay
+// forever, and expiry is the only recovery once an outcome is ambiguous.
+const ReplayLease = 10 * time.Minute
 
 // DeliveryRef identifies one logical source delivery whose DLQ rows exist but
 // are not yet known to be settled. It is the bounded reconciliation input: the
@@ -109,6 +138,17 @@ func (e Entry) Replayable() bool {
 		e.Handler != "" && e.Handler != NoHandler
 }
 
+// ReplayClaim is the fenced, time-bounded admission granted for one manual
+// replay. Token is the monotonic fencing generation of this claim; every later
+// release/delete must present it, so a claimant whose lease expired and was
+// re-claimed can never affect the newer claimant's row. LeaseUntil is computed
+// from database time.
+type ReplayClaim struct {
+	Entry      Entry
+	Token      int64
+	LeaseUntil time.Time
+}
+
 // Store is the dead-letter persistence boundary shared by the stream processor
 // and the operator CLI. It is broker-neutral: callers have already validated
 // their own claim state, and an implementation neither reads nor mutates broker
@@ -137,9 +177,32 @@ type Store interface {
 	GetDLQEntry(ctx context.Context, id string) (entry Entry, ok bool, err error)
 	// DeleteDLQEntry removes exactly the one settled entry with id, reporting
 	// whether it existed. It returns ErrEntryUnsettled when the row exists but
-	// its source delivery may still be recoverable. It never touches broker
-	// invocation state and never causes execution.
+	// its source delivery may still be recoverable, and ErrReplayInProgress
+	// when a replay claim is still active. It never touches broker invocation
+	// state and never causes execution.
 	DeleteDLQEntry(ctx context.Context, id string) (deleted bool, err error)
+
+	// ClaimDLQReplay atomically claims one SETTLED entry for replay and returns
+	// it with a fresh monotonic fencing token and a lease expiry in database
+	// time. The claim is committed before the caller contacts the worker. Only
+	// one claimant can hold an entry: an active unexpired lease yields
+	// ErrReplayInProgress, a missing row ErrEntryNotFound, and an unsettled row
+	// ErrEntryUnsettled. An ambiguous database outcome fails closed; the lease
+	// expires and recovery is by expiry, never by guessing whether the claim
+	// committed.
+	ClaimDLQReplay(ctx context.Context, id string, lease time.Duration) (ReplayClaim, error)
+	// ReleaseDLQReplay releases an active claim only when token is still the
+	// current fencing generation, making the entry immediately claimable again.
+	// A stale or already released claim is a no-op: the newer claimant owns the
+	// row. It is used only for outcomes known not to have left a running
+	// handler (worker-reported failure or a request that never started).
+	ReleaseDLQReplay(ctx context.Context, id string, token int64) error
+	// DeleteDLQReplay removes the entry after a successful replay in ONE fenced
+	// conditional statement: it matches only a settled row whose current claim
+	// token is token AND whose lease has not expired at database time. It
+	// returns ErrReplayClaimLost when no row matched, so a stale claimant can
+	// never delete a row that has been re-claimed.
+	DeleteDLQReplay(ctx context.Context, id string, token int64) error
 }
 
 // NewDeliveryID derives the stable identity of one logical source delivery from
@@ -148,7 +211,7 @@ type Store interface {
 // after the source ACK.
 func NewDeliveryID(source, group, messageID string) string {
 	h := sha256.New()
-	_, _ = h.Write([]byte("relay.dlq.delivery.v1"))
+	_, _ = h.Write([]byte("relay.dlq.delivery"))
 	writeField(h, source)
 	writeField(h, group)
 	writeField(h, messageID)
@@ -178,7 +241,7 @@ func NewID(source, group, messageID, invocation string) string {
 // identity once and reuse it for every row plus the post-ACK settlement mark.
 func NewIDForDelivery(deliveryID, invocation string) string {
 	h := sha256.New()
-	_, _ = h.Write([]byte("relay.dlq.entry.v1"))
+	_, _ = h.Write([]byte("relay.dlq.entry"))
 	writeField(h, deliveryID)
 	if invocation == "" {
 		_, _ = h.Write([]byte{0})

@@ -757,13 +757,18 @@ func (st *State) initSchema(ctx context.Context) error {
 		// entry from one logical source delivery so the stream can mark the whole
 		// delivery settled only after a confirmed source ACK. settled_at_ms is
 		// NULL until then; unsettled rows are never removed by admin or retention.
-		// created_at_ms is the write time.
+		// created_at_ms is the write time. replay_claim_token is the monotonic
+		// replay fencing generation and replay_lease_until_ms the lease expiry in
+		// database-time milliseconds (0 when unclaimed); they admit at most one
+		// replay at a time without a transaction spanning execution.
 		`CREATE TABLE IF NOT EXISTS dlq (
 			id TEXT PRIMARY KEY,
 			data JSONB NOT NULL,
 			delivery_id TEXT NOT NULL,
 			settled_at_ms BIGINT,
-			created_at_ms BIGINT NOT NULL
+			created_at_ms BIGINT NOT NULL,
+			replay_claim_token BIGINT NOT NULL DEFAULT 0,
+			replay_lease_until_ms BIGINT NOT NULL DEFAULT 0
 		)`,
 		// One index serves operator listing order and bounded retention cleanup.
 		`CREATE INDEX IF NOT EXISTS dlq_created_at

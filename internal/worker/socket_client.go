@@ -192,17 +192,34 @@ func InvokeApp(ctx context.Context, path, name string, event json.RawMessage) (i
 //
 // ctx bounds the CLI side (a cancelled ctx, e.g. Ctrl-C, closes the connection
 // so the command aborts promptly). A missing/unresponsive worker, or a worker
-// whose runner is not wired yet, reports ErrInvokeUnavailable. The worker's
-// unknown-app / app-unavailable / handler-not-found / handler-failure
+// whose runner is not wired yet, reports ErrInvokeUnavailable; a failed dial or
+// an explicit no-invoker answer also wraps ErrInvokeNotStarted. A request write
+// failure, response read failure, or cancellation reports only
+// ErrInvokeUnavailable because the handler may already have started. The
+// worker's unknown-app / app-unavailable / handler-not-found / handler-failure
 // answers report ErrInvokeFailed with the worker's message, so the CLI surfaces
 // the real cause (including a failed handler's reason) rather than masking it.
 func ReplayDLQ(ctx context.Context, path, name, handler string, event []byte, trace string) error {
 	dialer := net.Dialer{Timeout: runtimeStateDialTimeout}
 	conn, err := dialer.DialContext(ctx, "unix", path)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrInvokeUnavailable, err)
+		// A failed dial means no connection exists, so no request byte was sent
+		// and no handler can have started.
+		return fmt.Errorf("%w: %w: %v", ErrInvokeUnavailable, ErrInvokeNotStarted, err)
 	}
 	defer conn.Close()
+	return replayDLQConn(ctx, conn, name, handler, event, trace)
+}
+
+// replayDLQConn performs one replay exchange over an established connection. It
+// is split from ReplayDLQ so the post-dial error classification is testable.
+//
+// Only a parsed worker response can prove that no handler started. Every I/O
+// failure on this path is ambiguous: a write may have delivered a complete
+// request before failing, and a read failure or cancellation may happen after
+// execution began. Those errors therefore keep the plain ErrInvokeUnavailable
+// classification so a caller holding a replay lease retains it until expiry.
+func replayDLQConn(ctx context.Context, conn net.Conn, name, handler string, event []byte, trace string) error {
 	// A replay can legitimately run a handler up to the rule timeout, which can
 	// exceed the short query deadline, so the client deadline is the worker-side
 	// invocation bound plus the short exchange margin. The worker enforces its
@@ -231,7 +248,9 @@ func ReplayDLQ(ctx context.Context, path, name, handler string, event []byte, tr
 	}
 	if resp.Error != "" {
 		if resp.Error == errCodeInvokeUnavailable {
-			return fmt.Errorf("%w: %s", ErrInvokeUnavailable, messageOr(resp.Message, resp.Error))
+			// The server sends this only when it has no replayer, before any
+			// handler dispatch.
+			return fmt.Errorf("%w: %w: %s", ErrInvokeUnavailable, ErrInvokeNotStarted, messageOr(resp.Message, resp.Error))
 		}
 		return fmt.Errorf("%w: %s", ErrInvokeFailed, messageOr(resp.Message, resp.Error))
 	}

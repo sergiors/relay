@@ -4,11 +4,18 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"relay/internal/dlq"
 )
+
+// dbNowMillis is the database's current time as integer Unix milliseconds. All
+// replay-claim comparisons use it so claim and expiry decisions are made by one
+// authoritative clock, never the CLI's or a worker's. PostgreSQL's now() is the
+// statement (or transaction) start time.
+const dbNowMillis = `(EXTRACT(EPOCH FROM now()) * 1000)::bigint`
 
 // persistedDLQEntry is the private JSON representation stored in dlq.data.
 // Event, Reason, and the broker diagnostic identity fields are byte slices so
@@ -248,22 +255,42 @@ func (st *State) GetDLQEntry(ctx context.Context, id string) (dlq.Entry, bool, e
 
 // DeleteDLQEntry removes exactly the one SETTLED entry with id and reports
 // whether it existed. An unsettled entry is still needed by delivery recovery,
-// so it is refused with ErrEntryUnsettled and left in place. This method never
+// so it is refused with ErrEntryUnsettled and left in place. An entry with an
+// active replay claim is refused with ErrReplayInProgress: the replay may still
+// be executing, and deleting its row would strand the claimant's fenced
+// success delete. The row lock serializes this check against ClaimDLQReplay, so
+// a claim cannot appear between the check and the delete. This method never
 // touches broker invocation state and never causes execution.
 func (st *State) DeleteDLQEntry(ctx context.Context, id string) (bool, error) {
-	var settled sql.NullInt64
-	err := st.db.QueryRowContext(ctx,
-		`SELECT settled_at_ms FROM dlq WHERE id = $1`, id).Scan(&settled)
-	if err == sql.ErrNoRows {
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("delete DLQ entry %s: begin: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var (
+		settledAt  sql.NullInt64
+		leaseUntil int64
+		nowMs      int64
+	)
+	err = tx.QueryRowContext(ctx, `
+		SELECT settled_at_ms, replay_lease_until_ms, `+dbNowMillis+`
+		FROM dlq
+		WHERE id = $1
+		FOR UPDATE`, id).Scan(&settledAt, &leaseUntil, &nowMs)
+	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("delete DLQ entry %s: %w", id, err)
 	}
-	if !settled.Valid {
+	if !settledAt.Valid {
 		return false, fmt.Errorf("delete DLQ entry %s: %w", id, dlq.ErrEntryUnsettled)
 	}
-	res, err := st.db.ExecContext(ctx,
+	if leaseUntil > nowMs {
+		return false, fmt.Errorf("delete DLQ entry %s: %w", id, dlq.ErrReplayInProgress)
+	}
+	res, err := tx.ExecContext(ctx,
 		`DELETE FROM dlq WHERE id = $1 AND settled_at_ms IS NOT NULL`, id)
 	if err != nil {
 		return false, fmt.Errorf("delete DLQ entry %s: %w", id, err)
@@ -272,15 +299,150 @@ func (st *State) DeleteDLQEntry(ctx context.Context, id string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("delete DLQ entry %s: rows affected: %w", id, err)
 	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("delete DLQ entry %s: commit: %w", id, err)
+	}
 	return n > 0, nil
+}
+
+// ClaimDLQReplay atomically admits one replay of a settled entry. It locks the
+// row, classifies it (missing / unsettled / actively claimed), increments the
+// monotonic replay fencing token, and stamps a lease expiry in database time.
+// The transaction commits BEFORE the caller contacts the worker, so the claim is
+// durable without ever spanning an execution.
+//
+// A concurrent claimant sees the unexpired lease and gets ErrReplayInProgress
+// without dialing the worker, so two CLI invocations can never both execute the
+// same entry. An expired lease is claimable again: expiry is how a crashed or
+// disconnected claimant recovers. Any database/commit error is returned
+// unchanged and the caller must not contact the worker: the claim may or may not
+// have committed, and waiting for the lease to expire is the only safe
+// recovery.
+func (st *State) ClaimDLQReplay(ctx context.Context, id string, lease time.Duration) (dlq.ReplayClaim, error) {
+	if lease <= 0 {
+		return dlq.ReplayClaim{}, fmt.Errorf("claim DLQ replay %s: lease must be positive", id)
+	}
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		return dlq.ReplayClaim{}, fmt.Errorf("claim DLQ replay %s: begin: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var (
+		settledAt      sql.NullInt64
+		currentToken   int64
+		currentLeaseMs int64
+		nowMs          int64
+	)
+	err = tx.QueryRowContext(ctx, `
+		SELECT settled_at_ms, replay_claim_token, replay_lease_until_ms, `+dbNowMillis+`
+		FROM dlq
+		WHERE id = $1
+		FOR UPDATE`, id).Scan(&settledAt, &currentToken, &currentLeaseMs, &nowMs)
+	if errors.Is(err, sql.ErrNoRows) {
+		return dlq.ReplayClaim{}, fmt.Errorf("claim DLQ replay %s: %w", id, dlq.ErrEntryNotFound)
+	}
+	if err != nil {
+		return dlq.ReplayClaim{}, fmt.Errorf("claim DLQ replay %s: %w", id, err)
+	}
+	if !settledAt.Valid {
+		return dlq.ReplayClaim{}, fmt.Errorf("claim DLQ replay %s: %w", id, dlq.ErrEntryUnsettled)
+	}
+	if currentLeaseMs > nowMs {
+		return dlq.ReplayClaim{}, fmt.Errorf("claim DLQ replay %s: %w", id, dlq.ErrReplayInProgress)
+	}
+
+	token := currentToken + 1
+	leaseUntilMs := nowMs + lease.Milliseconds()
+	var (
+		data         string
+		deliveryID   string
+		createdAtMs  int64
+		claimedToken int64
+		claimedUntil int64
+	)
+	err = tx.QueryRowContext(ctx, `
+		UPDATE dlq
+		SET replay_claim_token = $2, replay_lease_until_ms = $3
+		WHERE id = $1
+		RETURNING data::text, delivery_id, settled_at_ms, created_at_ms,
+			replay_claim_token, replay_lease_until_ms`,
+		id, token, leaseUntilMs,
+	).Scan(&data, &deliveryID, &settledAt, &createdAtMs, &claimedToken, &claimedUntil)
+	if err != nil {
+		return dlq.ReplayClaim{}, fmt.Errorf("claim DLQ replay %s: update: %w", id, err)
+	}
+	entry, err := unmarshalDLQData(id, data)
+	if err != nil {
+		return dlq.ReplayClaim{}, err
+	}
+	entry.DeliveryID = deliveryID
+	entry.Timestamp = time.UnixMilli(createdAtMs).UTC().Format(time.RFC3339)
+	if settledAt.Valid {
+		entry.SettledAt = time.UnixMilli(settledAt.Int64).UTC().Format(time.RFC3339)
+	}
+	if err := tx.Commit(); err != nil {
+		return dlq.ReplayClaim{}, fmt.Errorf("claim DLQ replay %s: commit: %w", id, err)
+	}
+	return dlq.ReplayClaim{
+		Entry:      entry,
+		Token:      claimedToken,
+		LeaseUntil: time.UnixMilli(claimedUntil).UTC(),
+	}, nil
+}
+
+// ReleaseDLQReplay releases a replay claim only if token is still current, so a
+// superseded claimant cannot clear a newer claimant's lease. Releasing makes the
+// entry immediately claimable again. A stale or already released claim matches
+// no row and is a no-op; the lease it might otherwise have held is already
+// expired or owned by someone else.
+func (st *State) ReleaseDLQReplay(ctx context.Context, id string, token int64) error {
+	if _, err := st.db.ExecContext(ctx, `
+		UPDATE dlq
+		SET replay_lease_until_ms = 0
+		WHERE id = $1 AND replay_claim_token = $2`, id, token); err != nil {
+		return fmt.Errorf("release DLQ replay %s: %w", id, err)
+	}
+	return nil
+}
+
+// DeleteDLQReplay removes an entry after a successful replay in ONE fenced
+// conditional statement. It matches only a settled row whose current claim token
+// is token AND whose lease is still unexpired at database time, so a claimant
+// whose lease expired and was re-claimed (or whose row was recreated) cannot
+// delete the row a newer claimant owns. A zero-row result is reported as
+// ErrReplayClaimLost; the handler did run, so the entry is retained for the
+// operator rather than guessed away. An execution error is returned unchanged
+// and fails closed: the row is left for retention or a later operator action.
+func (st *State) DeleteDLQReplay(ctx context.Context, id string, token int64) error {
+	res, err := st.db.ExecContext(ctx, `
+		DELETE FROM dlq
+		WHERE id = $1
+			AND settled_at_ms IS NOT NULL
+			AND replay_claim_token = $2
+			AND replay_lease_until_ms > `+dbNowMillis,
+		id, token)
+	if err != nil {
+		return fmt.Errorf("delete DLQ replay %s: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("delete DLQ replay %s: rows affected: %w", id, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("delete DLQ replay %s: %w", id, dlq.ErrReplayClaimLost)
+	}
+	return nil
 }
 
 // PruneDLQEntries removes up to limit SETTLED entries whose write time is at or
 // before cutoff and returns how many were deleted. Unsettled entries are never
 // removed: their source delivery may still be recoverable and the row may be
-// required by recovery. Each call is one bounded DELETE, so a large backlog
-// drains across cycles instead of in one unbounded statement. A non-positive
-// limit is a no-op.
+// required by recovery. Entries with an active replay claim are skipped too, so
+// retention cannot delete the row out from under an in-flight replay; the lease
+// expiry (or a later cycle) makes them eligible. Each call is one bounded
+// DELETE, so a large backlog drains across cycles instead of in one unbounded
+// statement. A non-positive limit is a no-op.
 func (st *State) PruneDLQEntries(ctx context.Context, cutoff time.Time, limit int) (int, error) {
 	if limit <= 0 {
 		return 0, nil
@@ -289,10 +451,14 @@ func (st *State) PruneDLQEntries(ctx context.Context, cutoff time.Time, limit in
 		DELETE FROM dlq
 		WHERE id IN (
 			SELECT id FROM dlq
-			WHERE settled_at_ms IS NOT NULL AND created_at_ms <= $1
+			WHERE settled_at_ms IS NOT NULL
+				AND replay_lease_until_ms <= `+dbNowMillis+`
+				AND created_at_ms <= $1
 			ORDER BY created_at_ms, id
 			LIMIT $2
-		)`,
+		)
+			AND settled_at_ms IS NOT NULL
+			AND replay_lease_until_ms <= `+dbNowMillis,
 		cutoff.UTC().UnixMilli(), limit)
 	if err != nil {
 		return 0, fmt.Errorf("prune DLQ entries: %w", err)

@@ -115,19 +115,6 @@ func TestParseInvocationStateValueGrammar(t *testing.T) {
 		t.Fatalf("exhausted:5 = kind %v n %d ok %v", kind, n, ok)
 	}
 
-	// exhausted with the persisted-DLQ suffix parses identically (same kind and
-	// attempt count); the suffix records only DLQ persistence, not a distinct
-	// lifecycle state.
-	if kind, _, n, ok := parseInvocationState("exhausted:5:ef56:dlq"); !ok || kind != kindExhausted || n != 5 {
-		t.Fatalf("exhausted:5:dlq = kind %v n %d ok %v", kind, n, ok)
-	}
-	if !isExhaustedDLQValue("exhausted:5:ef56:dlq") {
-		t.Fatalf("isExhaustedDLQValue(exhausted:5:ef56:dlq) = false, want true")
-	}
-	if isExhaustedDLQValue("exhausted:5:ef56") {
-		t.Fatalf("isExhaustedDLQValue(exhausted:5:ef56) = true, want false")
-	}
-
 	// Unparseable values → eligible (ok=false). A marker missing the mandatory
 	// "<attempt>:<token>" part also does not parse.
 	for _, v := range []string{
@@ -152,7 +139,8 @@ func TestParseInvocationStateValueGrammar(t *testing.T) {
 		"exhausted:5",
 		"exhausted:abc:ab12",
 		"exhausted:5:",
-		"exhausted:05:ab12", // non-canonical attempt (leading zero)
+		"exhausted:05:ab12",    // non-canonical attempt (leading zero)
+		"exhausted:5:ef56:dlq", // removed legacy suffix is not accepted
 		"bogus",
 	} {
 		if _, _, _, ok := parseInvocationState(v); ok {
@@ -169,11 +157,8 @@ func TestNextAttemptAndExhaustedValueRoundTrip(t *testing.T) {
 		t.Fatalf("nextAttemptValue = %q", v)
 	}
 	claim := InvocationClaim{Attempt: 5, Token: "ef56"}
-	if v := exhaustedValue(claim, false); v != "exhausted:5:ef56" {
-		t.Fatalf("exhaustedValue(5, false) = %q, want exhausted:5:ef56", v)
-	}
-	if v := exhaustedValue(claim, true); v != "exhausted:5:ef56:dlq" {
-		t.Fatalf("exhaustedValue(5, true) = %q, want exhausted:5:ef56:dlq", v)
+	if v := exhaustedValue(claim); v != "exhausted:5:ef56" {
+		t.Fatalf("exhaustedValue(5) = %q, want exhausted:5:ef56", v)
 	}
 }
 

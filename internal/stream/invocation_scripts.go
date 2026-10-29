@@ -52,19 +52,12 @@ local function parse_active(v, prefix)
 end
 
 local function parse_exhausted(v)
-  -- "exhausted:<attempt>:<token>[:dlq]" -> attempt, token, dlq. The optional
-  -- ":dlq" suffix is a legacy terminal marker: it is still recognized as
-  -- exhausted, but no new suffix is written (PostgreSQL is the DLQ authority).
+  -- "exhausted:<attempt>:<token>" -> attempt, token.
   local body = string.match(v, '^exhausted:(.*)$')
   if not body then return nil end
-  local dlq = false
-  if string.sub(body, -4) == ':dlq' then
-    dlq = true
-    body = string.sub(body, 1, #body - 4)
-  end
   local a, tok = string.match(body, '^([1-9]%d*):([0-9a-f]+)$')
   if not a then return nil end
-  return a, tok, dlq
+  return a, tok
 end
 `
 
@@ -270,7 +263,7 @@ return {0, na, '0', pinned or proposed}
 	//     happens; the caller keeps the message PENDING.
 	//   - a TERMINAL invocation marker exists with no descriptor: a legacy/
 	//     pre-pinning admitted invocation already reached success ("ok") or
-	//     exhaustion ("exhausted:<n>:<token>[:dlq]"). The rejection is REFUSED and
+	//     exhaustion ("exhausted:<n>:<token>"). The rejection is REFUSED and
 	//     NO write happens, because a reservation would cancel the owed disposition
 	//     and silently drop a DLQ entry. Instead the scan reports the terminal
 	//     outcome so the caller completes it: "exhausted" returns each exhausted

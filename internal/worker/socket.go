@@ -127,6 +127,21 @@ var ErrRuntimeStatsFailed = errors.New("runtime stats reset failed")
 // run through the live runtime pool).
 var ErrInvokeUnavailable = errors.New("app invocation unavailable")
 
+// ErrInvokeNotStarted reports that a control-socket invocation or DLQ replay
+// definitively did not begin executing a handler: the dial failed (no
+// connection exists, so no request was sent), or the worker explicitly answered
+// that it has no invoker. It wraps ErrInvokeUnavailable, so existing callers keep
+// their classification. A DLQ replay uses it to release its admission claim
+// because no handler can have run.
+//
+// A request write/encode failure is deliberately NOT classified here. A net.Conn
+// write can return an error after delivering some or even all request bytes, so
+// the worker may have received a complete frame and started the handler; that
+// outcome is ambiguous. The same applies to a response read/decode failure or
+// client cancellation, so all of those report only ErrInvokeUnavailable and the
+// replay claim must be retained.
+var ErrInvokeNotStarted = errors.New("app invocation did not start")
+
 // ErrInvokeFailed reports that the worker attempted the manual invocation but at
 // least one matching handler failed, or the invocation could not start (an
 // unknown/unavailable app, or a concurrency slot timeout). The worker's

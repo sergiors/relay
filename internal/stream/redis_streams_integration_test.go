@@ -1229,8 +1229,8 @@ func TestIntegrationPerInvocationDLQPartialWriteResumes(t *testing.T) {
 	// only the seeded write knows) and fnB is exhausted but unpersisted.
 	seeded := e.seedDLQEntry(t, id, "fnA/h", `{"a":1}`, "seeded fnA exhaustion", 1, 1)
 	if err := e.client.HSet(context.Background(), key,
-		"fnA/h", exhaustedValue(InvocationClaim{Attempt: 1, Token: "aa"}, false),
-		"fnB/h", exhaustedValue(InvocationClaim{Attempt: 1, Token: "bb"}, false),
+		"fnA/h", exhaustedValue(InvocationClaim{Attempt: 1, Token: "aa"}),
+		"fnB/h", exhaustedValue(InvocationClaim{Attempt: 1, Token: "bb"}),
 	).Err(); err != nil {
 		t.Fatalf("seed invocation state: %v", err)
 	}
@@ -1288,8 +1288,8 @@ func TestIntegrationPerInvocationDLQXACKFailureRetryIsIdempotent(t *testing.T) {
 	seedA := e.seedDLQEntry(t, id, "fnA/h", `{"a":1}`, "fnA exhausted", 2, 1)
 	seedB := e.seedDLQEntry(t, id, "fnB/h", `{"a":1}`, "fnB exhausted", 2, 1)
 	if err := e.client.HSet(context.Background(), key,
-		"fnA/h", exhaustedValue(InvocationClaim{Attempt: 1, Token: "aa"}, false),
-		"fnB/h", exhaustedValue(InvocationClaim{Attempt: 1, Token: "bb"}, false),
+		"fnA/h", exhaustedValue(InvocationClaim{Attempt: 1, Token: "aa"}),
+		"fnB/h", exhaustedValue(InvocationClaim{Attempt: 1, Token: "bb"}),
 	).Err(); err != nil {
 		t.Fatalf("seed invocation state: %v", err)
 	}
@@ -2131,7 +2131,7 @@ func TestIntegrationExhaustedSkipsWithoutRerun(t *testing.T) {
 	key := invocationStateKey(e.stream, e.group, id)
 
 	// Pre-write an exhausted marker.
-	if err := e.client.HSet(context.Background(), key, "fn/h", exhaustedValue(InvocationClaim{Attempt: 5, Token: "aabbccdd"}, false)).Err(); err != nil {
+	if err := e.client.HSet(context.Background(), key, "fn/h", exhaustedValue(InvocationClaim{Attempt: 5, Token: "aabbccdd"})).Err(); err != nil {
 		t.Fatalf("hset exhausted marker: %v", err)
 	}
 

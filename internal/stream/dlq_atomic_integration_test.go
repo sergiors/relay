@@ -68,7 +68,7 @@ func TestIntegrationDLQRefusesStaleOrMissingClaimPinsNoRowNoACK(t *testing.T) {
 		t.Fatalf("TryStart = (%v,%v), want a started claim", started, err)
 	}
 	if err := e.client.HSet(context.Background(), key, "fn/h",
-		exhaustedValue(InvocationClaim{Attempt: 2, Token: "bb"}, false)).Err(); err != nil {
+		exhaustedValue(InvocationClaim{Attempt: 2, Token: "bb"})).Err(); err != nil {
 		t.Fatalf("rewrite marker as a newer exhaustion: %v", err)
 	}
 	routeToDLQForOne(t, e.consumer, id, "fn", "h", 1)
@@ -157,7 +157,7 @@ func TestIntegrationDLQConcurrentExactlyOneWinner(t *testing.T) {
 	key := invocationStateKey(e.stream, e.group, id)
 
 	if err := e.client.HSet(context.Background(), key,
-		"fn/h", exhaustedValue(InvocationClaim{Attempt: 1, Token: "aa"}, false)).Err(); err != nil {
+		"fn/h", exhaustedValue(InvocationClaim{Attempt: 1, Token: "aa"})).Err(); err != nil {
 		t.Fatalf("seed exhausted marker: %v", err)
 	}
 

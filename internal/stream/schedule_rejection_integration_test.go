@@ -369,12 +369,8 @@ func TestIntegrationReserveScheduleRejectionAdmittedMarkerWithoutDescriptor(t *t
 			want:   want{outcome: scheduleRejectionComplete},
 		},
 		"exhausted": {
-			fields: map[string]string{"fn/jobs.old": exhaustedValue(InvocationClaim{Attempt: 2, Token: "ab"}, false)},
+			fields: map[string]string{"fn/jobs.old": exhaustedValue(InvocationClaim{Attempt: 2, Token: "ab"})},
 			want:   want{outcome: scheduleRejectionExhausted, markers: 1, inv: "fn/jobs.old", attempt: 2},
-		},
-		"exhausted dlq": {
-			fields: map[string]string{"fn/jobs.old": exhaustedValue(InvocationClaim{Attempt: 3, Token: "ab"}, true)},
-			want:   want{outcome: scheduleRejectionExhausted, markers: 1, inv: "fn/jobs.old", attempt: 3},
 		},
 		"active wins over terminal": {
 			fields: map[string]string{"fn/jobs.old": active, "fn/jobs.new": "ok"},
@@ -439,7 +435,7 @@ func TestIntegrationReserveScheduleRejectionPinnedMarker(t *testing.T) {
 	}{
 		"active":    {runningValue(time.Now().Add(time.Hour), InvocationClaim{Attempt: 1, Token: "ab"}), scheduleMarkerActive, 0},
 		"complete":  {"ok", scheduleMarkerComplete, 0},
-		"exhausted": {exhaustedValue(InvocationClaim{Attempt: 2, Token: "ab"}, false), scheduleMarkerExhausted, 1},
+		"exhausted": {exhaustedValue(InvocationClaim{Attempt: 2, Token: "ab"}), scheduleMarkerExhausted, 1},
 		"no marker": {"", scheduleMarkerNone, 0},
 	}
 	for name, tc := range cases {

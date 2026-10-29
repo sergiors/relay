@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"relay/internal/app"
+	"relay/internal/dlq"
 	"relay/internal/processlock"
 	"relay/internal/runner"
 	"relay/internal/runtime"
@@ -921,7 +922,8 @@ func TestRuntimeSocketReplayDLQErrorCodes(t *testing.T) {
 }
 
 // TestRuntimeSocketReplayDLQNoReplayer verifies a socket without a wired
-// replayer answers invoke_unavailable (there is no offline fallback).
+// replayer answers invoke_unavailable (there is no offline fallback), which is a
+// definitive no-start because the worker refused before dispatch.
 func TestRuntimeSocketReplayDLQNoReplayer(t *testing.T) {
 	path := testSocketPath(t)
 	startTestSocket(t, path, nil)
@@ -929,6 +931,24 @@ func TestRuntimeSocketReplayDLQNoReplayer(t *testing.T) {
 	err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{}`), "")
 	if !errors.Is(err, ErrInvokeUnavailable) {
 		t.Fatalf("error = %v, want ErrInvokeUnavailable", err)
+	}
+	if !errors.Is(err, ErrInvokeNotStarted) {
+		t.Fatalf("no-replayer answer = %v, want ErrInvokeNotStarted", err)
+	}
+}
+
+// TestInvokeTimeoutPinnedBelowReplayLease pins the constants the replay-claim
+// contract leans on: the worker-side invocation bound stays app.MaxTimeout plus
+// the two-minute container-start margin (seven minutes today), and the store's
+// replay lease outlives that bound plus the short exchange margin, so a
+// legitimate in-flight handler can always finish inside its claimant's lease.
+func TestInvokeTimeoutPinnedBelowReplayLease(t *testing.T) {
+	if want := app.MaxTimeout + 2*time.Minute; invokeTimeout != want {
+		t.Fatalf("invokeTimeout = %v, want app.MaxTimeout + 2m = %v", invokeTimeout, want)
+	}
+	if dlq.ReplayLease <= invokeTimeout+runtimeStateRequestTimeout {
+		t.Fatalf("replay lease %v must exceed the invocation bound %v plus the exchange margin %v",
+			dlq.ReplayLease, invokeTimeout, runtimeStateRequestTimeout)
 	}
 }
 
@@ -1047,11 +1067,44 @@ func TestRuntimeSocketReplayDLQMalformed(t *testing.T) {
 }
 
 // TestReplayDLQNoSocket verifies the standalone no-worker case reports
-// ErrInvokeUnavailable (there is no offline fallback for a replay).
+// ErrInvokeUnavailable (there is no offline fallback for a replay) and is
+// definitively not-started: no connection existed, so no request was sent.
 func TestReplayDLQNoSocket(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.sock")
-	if err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{}`), ""); !errors.Is(err, ErrInvokeUnavailable) {
+	err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{}`), "")
+	if !errors.Is(err, ErrInvokeUnavailable) {
 		t.Fatalf("error = %v, want ErrInvokeUnavailable", err)
+	}
+	if !errors.Is(err, ErrInvokeNotStarted) {
+		t.Fatalf("dial failure = %v, want ErrInvokeNotStarted", err)
+	}
+}
+
+// ambiguousWriteConn models a post-dial write failure. A real net.Conn can fail
+// after some or all request bytes reached the peer, so the exchange must keep the
+// ambiguous ErrInvokeUnavailable classification and never release a replay claim.
+type ambiguousWriteConn struct{}
+
+func (ambiguousWriteConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (ambiguousWriteConn) Write([]byte) (int, error)        { return 0, errors.New("write: broken pipe") }
+func (ambiguousWriteConn) Close() error                     { return nil }
+func (ambiguousWriteConn) LocalAddr() net.Addr              { return nil }
+func (ambiguousWriteConn) RemoteAddr() net.Addr             { return nil }
+func (ambiguousWriteConn) SetDeadline(time.Time) error      { return nil }
+func (ambiguousWriteConn) SetReadDeadline(time.Time) error  { return nil }
+func (ambiguousWriteConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestReplayDLQWriteFailureIsAmbiguous pins that a request write failure is NOT
+// classified as not-started. The worker may have received a complete frame and
+// begun execution before the write error surfaced, so the CLI must retain its
+// replay lease until expiry rather than release it for a concurrent replay.
+func TestReplayDLQWriteFailureIsAmbiguous(t *testing.T) {
+	err := replayDLQConn(context.Background(), ambiguousWriteConn{}, "fn", "index.run", []byte(`{}`), "")
+	if !errors.Is(err, ErrInvokeUnavailable) {
+		t.Fatalf("error = %v, want ErrInvokeUnavailable", err)
+	}
+	if errors.Is(err, ErrInvokeNotStarted) {
+		t.Fatalf("write failure = %v, must not be classified as not-started", err)
 	}
 }
 

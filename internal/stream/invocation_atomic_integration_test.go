@@ -467,14 +467,14 @@ func TestIntegrationAtomicTerminalExhaustionAndDLQ(t *testing.T) {
 	if ok, err := store.markExhausted(ctx, stream, group, msgID, "fn/h", claim); err != nil || !ok {
 		t.Fatalf("markExhausted = (%v,%v)", ok, err)
 	}
-	if got := marker(t, cli, stream, group, msgID, "fn/h"); got != exhaustedValue(claim, false) {
+	if got := marker(t, cli, stream, group, msgID, "fn/h"); got != exhaustedValue(claim) {
 		t.Fatalf("marker = %q, want the exhausted marker retaining the claim", got)
 	}
 	// Success must not downgrade the exhausted marker.
 	if ok, err := store.markComplete(ctx, stream, group, msgID, "fn/h", claim); err != nil || ok {
 		t.Fatalf("markComplete on exhausted = (%v,%v), want (false,nil)", ok, err)
 	}
-	if got := marker(t, cli, stream, group, msgID, "fn/h"); got != exhaustedValue(claim, false) {
+	if got := marker(t, cli, stream, group, msgID, "fn/h"); got != exhaustedValue(claim) {
 		t.Fatalf("marker = %q, want the exhausted marker preserved", got)
 	}
 	// TryStart reports it terminal (the retained attempt, no wait, no new claim).

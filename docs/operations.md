@@ -502,6 +502,14 @@ running worker and deletes it only on success (kept on failure). See
 [cli.md](cli.md). An unsettled entry is still needed by source-delivery recovery:
 `rm` returns an explicit error for it, and retention never deletes it.
 
+Replay admission is a fenced PostgreSQL lease: `replay` claims a settled entry
+before dialing, so a concurrent replay is refused rather than executed twice.
+The claim is released on a definitive failure, retained on an ambiguous exchange
+or client cancellation until it expires, and the success delete requires the same
+token and an unexpired lease. `rm` refuses an active claim and retention skips it.
+Replay is at-least-once: work that finishes after a disconnect or after lease
+expiry can be replayed again, so handlers must be idempotent.
+
 Malformed-message and oversized-event entries are non-replayable placeholders (no
 app/handler to re-execute). An oversized entry's `event` is a bounded diagnostic
 summary, never the oversized payload; use `inspect`/`rm` on it.

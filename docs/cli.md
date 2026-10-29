@@ -212,7 +212,8 @@ verbatim. `rm ID` deletes one **settled** entry without touching broker
 invocation state or causing execution. An entry whose source delivery may still
 be recoverable is refused with an explicit "not settled" error; it becomes
 removable only after its source ACK is confirmed (or reconciliation proves it is
-no longer pending).
+no longer pending). An entry with an active replay claim is likewise refused until
+the claim is released or its lease expires.
 
 ```
 relay dlq replay ID
@@ -224,6 +225,24 @@ failure (removed handler, failed handler, or unavailable worker). A
 malformed-message placeholder has no handler to re-execute and is not replayable;
 an unsettled entry is rejected before dialing because its source delivery may
 still be recoverable.
+
+Replay is admitted by a PostgreSQL claim committed before the worker is
+contacted: a monotonic fencing token and a ten-minute lease in database time. A
+concurrent replay of the same entry fails with an explicit "replay is already in
+progress" error and never dials the worker. The claim is released when the
+worker definitively reports a failure, or when the request provably never
+started (a failed dial or an explicit no-invoker answer); an ambiguous outcome
+(request write failure, lost or malformed response, I/O failure, or Ctrl-C)
+retains the lease until it expires, and expiry is the recovery path for a
+crashed claimant. `rm` refuses an entry with an active claim, and retention
+skips it, so neither can remove a row under a running replay. The success delete
+is conditional on the entry still being settled, still carrying this claim's
+token, and still leased.
+
+Replay remains **at-least-once**, never exactly-once: a handler can finish after
+the CLI disconnects (the worker does not cancel execution on disconnect) or after
+the lease expires, and the entry can then be replayed again. Keep handlers
+idempotent.
 
 These commands need PostgreSQL (`DATABASE_URL`); `replay` additionally needs the
 running worker socket.

@@ -99,9 +99,7 @@
 //     or removed; the descriptor is a sibling field, never an invocation ID, and
 //     it is never a DLQ/attribution key. The schedule occurrence's event
 //     envelope (occurrence_id/scheduled_at) is stored verbatim in its DLQ row,
-//     preserving occurrence provenance. A legacy ":dlq" suffix on an exhausted
-//     marker is still read as terminal, but no new suffix is written: PostgreSQL
-//     is the DLQ authority.
+//     preserving occurrence provenance.
 //
 // Deadlines are integer Unix MILLISECONDS end to end. An active
 // running/next_attempt_at marker is protected iff now_ms < deadline_ms and

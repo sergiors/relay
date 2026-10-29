@@ -38,7 +38,7 @@ const scheduleHandler = "jobs.cleanup.handler"
 //
 //	"running:<deadline_ms>:<attempt>:<token>"
 //	"next_attempt_at:<deadline_ms>:<attempt>:<token>"
-//	"exhausted:<attempt>:<token>[:dlq]"
+//	"exhausted:<attempt>:<token>"
 //
 // It returns 0 for a marker it cannot parse, so a test can assert the exact
 // attempt in the value grammar.
@@ -53,7 +53,7 @@ func markerAttempt(v string) int {
 		rest = strings.TrimPrefix(v, "next_attempt_at:")
 		_, rest, _ = strings.Cut(rest, ":")
 	case strings.HasPrefix(v, "exhausted:"):
-		// <attempt>:<token>[:dlq]
+		// <attempt>:<token>
 		rest = strings.TrimPrefix(v, "exhausted:")
 		attempt, _, _ := strings.Cut(rest, ":")
 		n, err := strconv.Atoi(attempt)
@@ -1307,36 +1307,45 @@ func TestIntegrationScheduleLegacyExhaustedWithoutDescriptorDLQOnce(t *testing.T
 	assertLegacyMarkerUntouched(t, e, id, "exhausted:2:deadbeef")
 }
 
-// TestIntegrationScheduleLegacyExhaustedDLQSuffixMarkerIsTerminal pins the
-// read-only legacy suffix: an exhausted marker that still carries ":dlq" (an
-// older Relay's persistence record) parses as the same terminal exhaustion, so
-// the occurrence is dead-lettered exactly once to PostgreSQL (the sole
-// authority) and ACKed. The suffix is never rewritten.
-func TestIntegrationScheduleLegacyExhaustedDLQSuffixMarkerIsTerminal(t *testing.T) {
+// TestIntegrationScheduleRemovedSuffixMarkerIsEligible pins the end-to-end
+// consequence of dropping the read-only legacy exhaustion suffix: an occurrence
+// whose invocation hash still carries the OLD ":dlq" persistence record is NOT
+// read as the terminal exhaustion (no hidden legacy read path); the delivery is
+// eligible again, so the handler executes and the run then completes normally —
+// the occurrence is ACKed, terminal-retained, and never dead-lettered (the
+// marker was consumed by the fresh run).
+func TestIntegrationScheduleRemovedSuffixMarkerIsEligible(t *testing.T) {
 	exec := &stateAwareExecutor{}
 	r := registerScheduleFn(t, exec, 4)
 	e := newScheduleEnv(t, r)
-	o := scheduleOcc(time.Date(2026, 9, 5, 10, 0, 0, 0, time.UTC))
+	o := scheduleOcc(time.Date(2026, 9, 6, 9, 0, 0, 0, time.UTC))
 	id := e.xadd(o)
 	if err := e.hsetState(id, "exhausted:2:deadbeef:dlq"); err != nil {
-		t.Fatalf("seed exhausted:dlq marker: %v", err)
+		t.Fatalf("seed removed-suffix exhausted marker: %v", err)
 	}
-	r.Registry().Replace(scheduleFnName, nil)
 	e.start()
 
-	e.eventually("legacy exhausted:dlq occurrence DLQ'd", func() bool { return e.inDlq(id) })
-	// Wait for the terminal-retained hash (only a real delivery + ACK produces
-	// it), so the assertion cannot race an undelivered message.
-	e.eventually("legacy exhausted:dlq occurrence acked and terminal-retained", func() bool {
-		return e.isRetained(id)
+	// The occurrence RUNS (the marker is eligible, not the legacy terminal).
+	e.eventually("removed-suffix occurrence executed", func() bool { return exec.count() > 0 })
+	if got := exec.count(); got != 1 {
+		t.Fatalf("executor calls = %d so far, want 1", got)
+	}
+	// The fresh run completes: acked, terminal-retained, never DLQ'd.
+	e.eventually("removed-suffix occurrence acked and terminal-retained", func() bool {
+		_, ok := e.pending(id)
+		return !ok && e.isRetained(id)
 	})
-	if entries := listDLQEntriesFor(t, e.dlqStore, id); len(entries) != 1 {
-		t.Fatalf("DLQ entries = %d, want exactly 1 (one dead letter per exhaustion)", len(entries))
+	e.eventually("removed-suffix occurrence never DLQ'd", func() bool { return !e.inDlq(id) })
+	if got := exec.count(); got != 1 {
+		t.Fatalf("executor calls = %d, want exactly 1 (the legacy value was not a terminal skip)", got)
 	}
-	if got := exec.count(); got != 0 {
-		t.Fatalf("executor calls = %d, want 0", got)
+	field, err := e.stateField(id)
+	if err != nil {
+		t.Fatalf("read terminal marker: %v", err)
 	}
-	assertLegacyMarkerUntouched(t, e, id, "exhausted:2:deadbeef:dlq")
+	if field != "ok" {
+		t.Fatalf("terminal marker = %q, want the consumed fresh success (not the legacy value)", field)
+	}
 }
 
 // TestIntegrationScheduleLegacyActiveMarkerStaysPending pins the active-wins
@@ -1463,34 +1472,6 @@ func TestIntegrationSchedulePinnedExhaustedMissingDLQDLQOnce(t *testing.T) {
 	}
 	// The exhausted marker carries no persistence state: it is left verbatim.
 	assertLegacyMarkerUntouched(t, e, id, "exhausted:2:deadbeef")
-}
-
-// TestIntegrationSchedulePinnedExhaustedDLQSuffixMarkerIsTerminal pins the
-// read-only legacy suffix for a pinned descriptor: an exhausted marker that
-// already carries ":dlq" is the same terminal exhaustion, so the occurrence is
-// dead-lettered exactly once to PostgreSQL and ACKed; the suffix is never
-// rewritten.
-func TestIntegrationSchedulePinnedExhaustedDLQSuffixMarkerIsTerminal(t *testing.T) {
-	exec := &stateAwareExecutor{}
-	r := registerScheduleFn(t, exec, 4)
-	e := newScheduleEnv(t, r)
-	o := scheduleOcc(time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC))
-	id := e.xadd(o)
-	seedPinnedTerminal(t, e, id, "exhausted:2:deadbeef:dlq")
-	r.Registry().Replace(scheduleFnName, nil)
-	e.start()
-
-	e.eventually("pinned exhausted:dlq occurrence DLQ'd", func() bool { return e.inDlq(id) })
-	e.eventually("pinned exhausted:dlq occurrence acked and terminal-retained", func() bool {
-		return e.isRetained(id)
-	})
-	if entries := listDLQEntriesFor(t, e.dlqStore, id); len(entries) != 1 {
-		t.Fatalf("DLQ entries = %d, want exactly 1 (one dead letter per exhaustion)", len(entries))
-	}
-	if got := exec.count(); got != 0 {
-		t.Fatalf("executor calls = %d, want 0", got)
-	}
-	assertLegacyMarkerUntouched(t, e, id, "exhausted:2:deadbeef:dlq")
 }
 
 // TestIntegrationSchedulePinnedActiveStaysPending pins the descriptor-pinned

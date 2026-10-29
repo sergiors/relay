@@ -18,9 +18,16 @@ import (
 	"relay/internal/schedule"
 )
 
-// fakeDLQStore is an in-memory DLQStore for CLI tests: it preserves insertion
+// fakeDLQStore is an in-memory dlq.Store for CLI tests: it preserves insertion
 // order (the Redis stream order the real store returns) and records deletes, so
 // the command/presentation layer is exercised without Redis.
+//
+// The replay-admission seam is modeled as one claimant per entry with a
+// monotonic fencing token: a second claim while one is held is refused
+// (ErrReplayInProgress), only the CURRENT token may release or success-delete,
+// and a stale token's release/delete are no-ops. The lease clock and expiry
+// semantics themselves belong to the state package's real-PostgreSQL coverage;
+// the fake holds a claim until it is released or superseded.
 type fakeDLQStore struct {
 	entries []dlq.Entry
 	deleted []string
@@ -29,16 +36,35 @@ type fakeDLQStore struct {
 	getErr    error
 	deleteErr error
 	closed    bool
+
+	// mu guards the replay-claim model: the concurrent-admission tests drive
+	// two CLI commands against one store instance.
+	mu        sync.Mutex
+	claimGen  map[string]int64 // per-entry fencing generations ever allocated
+	heldClaim map[string]int64 // per-entry currently held token (absent = unclaimed)
+	releases  []replayRelease  // recorded release calls, in call order
+}
+
+// replayRelease records one ReleaseDLQReplay call (the entry ID and the token
+// the caller presented), so tests can prove which outcomes release a claim and
+// which token was presented.
+type replayRelease struct {
+	id    string
+	token int64
 }
 
 func (f *fakeDLQStore) ListDLQEntries(context.Context) ([]dlq.Entry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
 	return append([]dlq.Entry(nil), f.entries...), nil
 }
 
-func (f *fakeDLQStore) GetDLQEntry(ctx context.Context, id string) (dlq.Entry, bool, error) {
+func (f *fakeDLQStore) GetDLQEntry(_ context.Context, id string) (dlq.Entry, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.getErr != nil {
 		return dlq.Entry{}, false, f.getErr
 	}
@@ -50,9 +76,16 @@ func (f *fakeDLQStore) GetDLQEntry(ctx context.Context, id string) (dlq.Entry, b
 	return dlq.Entry{}, false, nil
 }
 
-func (f *fakeDLQStore) DeleteDLQEntry(ctx context.Context, id string) (bool, error) {
+// DeleteDLQEntry mirrors the production removal boundary: an entry with an
+// active replay claim is refused, because the replay may still be executing.
+func (f *fakeDLQStore) DeleteDLQEntry(_ context.Context, id string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.deleteErr != nil {
 		return false, f.deleteErr
+	}
+	if f.heldClaim[id] > 0 {
+		return false, fmt.Errorf("delete %s: %w", id, dlq.ErrReplayInProgress)
 	}
 	for i, e := range f.entries {
 		if e.ID == id {
@@ -64,7 +97,71 @@ func (f *fakeDLQStore) DeleteDLQEntry(ctx context.Context, id string) (bool, err
 	return false, nil
 }
 
+// ClaimDLQReplay models the production admission seam: a settled entry is
+// claimable exactly once at a time, the fencing generation is monotonic, and a
+// held claim refuses later claimants before any worker dial.
+func (f *fakeDLQStore) ClaimDLQReplay(_ context.Context, id string, lease time.Duration) (dlq.ReplayClaim, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.getErr != nil {
+		return dlq.ReplayClaim{}, f.getErr
+	}
+	for _, e := range f.entries {
+		if e.ID != id {
+			continue
+		}
+		if e.SettledAt == "" {
+			return dlq.ReplayClaim{}, fmt.Errorf("claim %s: %w", id, dlq.ErrEntryUnsettled)
+		}
+		if f.heldClaim[id] > 0 {
+			return dlq.ReplayClaim{}, fmt.Errorf("claim %s: %w", id, dlq.ErrReplayInProgress)
+		}
+		if f.claimGen == nil {
+			f.claimGen, f.heldClaim = map[string]int64{}, map[string]int64{}
+		}
+		f.claimGen[id]++
+		f.heldClaim[id] = f.claimGen[id]
+		return dlq.ReplayClaim{Entry: e, Token: f.claimGen[id], LeaseUntil: time.Now().Add(lease)}, nil
+	}
+	return dlq.ReplayClaim{}, fmt.Errorf("claim %s: %w", id, dlq.ErrEntryNotFound)
+}
+
+// ReleaseDLQReplay records the release and takes the claim down only when the
+// presented token is still the current claimant's (a stale release is a no-op).
+func (f *fakeDLQStore) ReleaseDLQReplay(_ context.Context, id string, token int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.releases = append(f.releases, replayRelease{id: id, token: token})
+	if f.heldClaim[id] == token {
+		delete(f.heldClaim, id)
+	}
+	return nil
+}
+
+// DeleteDLQReplay models the fenced success delete: only the entry currently
+// held under the presented token is removed; any other token fails closed with
+// ErrReplayClaimLost and the entry is retained.
+func (f *fakeDLQStore) DeleteDLQReplay(_ context.Context, id string, token int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.heldClaim[id] != token {
+		return fmt.Errorf("delete %s: %w", id, dlq.ErrReplayClaimLost)
+	}
+	for i, e := range f.entries {
+		if e.ID == id {
+			f.entries = append(f.entries[:i], f.entries[i+1:]...)
+			f.deleted = append(f.deleted, id)
+			delete(f.heldClaim, id)
+			return nil
+		}
+	}
+	return fmt.Errorf("delete %s: %w", id, dlq.ErrReplayClaimLost)
+}
+
+// SaveDLQEntry appends the entry (the fixture seed seam).
 func (f *fakeDLQStore) SaveDLQEntry(_ context.Context, entry dlq.Entry) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.entries = append(f.entries, entry)
 	return true, nil
 }
@@ -78,6 +175,39 @@ func (f *fakeDLQStore) ListUnsettledDLQDeliveries(_ context.Context, _ string, _
 }
 
 func (f *fakeDLQStore) Close() error { f.closed = true; return nil }
+
+// releasedTokensFor returns the tokens presented to ReleaseDLQReplay for id, in
+// call order.
+func (f *fakeDLQStore) releasedTokensFor(id string) []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var tokens []int64
+	for _, r := range f.releases {
+		if r.id == id {
+			tokens = append(tokens, r.token)
+		}
+	}
+	return tokens
+}
+
+// heldToken returns the claim token currently held for id (false when the
+// entry is unclaimed).
+func (f *fakeDLQStore) heldToken(id string) (int64, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	token, ok := f.heldClaim[id]
+	return token, ok
+}
+
+// supersedeClaim models the held claim's lease expiring while its handler is
+// still running and a newer claimant immediately re-claiming: the fencing
+// generation is incremented and the new claimant holds the row.
+func (f *fakeDLQStore) supersedeClaim(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.claimGen[id]++
+	f.heldClaim[id] = f.claimGen[id]
+}
 
 // withFakeDLQ returns dependencies whose DLQ opener yields store, so the
 // command tree uses the fake instead of Redis. It captures whether the store
@@ -409,20 +539,30 @@ func TestDLQNoOpenerConfigured(t *testing.T) {
 
 // recordingReplayer captures the DLQ-replay arguments the CLI forwards over the
 // socket, so a test can prove the entry's optional trace lineage travels on the
-// control path (separately from the event payload).
+// control path (separately from the event payload). onReplay, when non-nil,
+// runs synchronously inside the replay exchange (mid-execution): it is the hook
+// concurrent-admission tests use to interleave a competing store operation at
+// exactly the moment the handler is running.
 type recordingReplayer struct {
-	mu    sync.Mutex
-	calls int
-	trace string
-	event []byte
+	mu       sync.Mutex
+	calls    int
+	trace    string
+	event    []byte
+	onReplay func()
 }
 
 func (r *recordingReplayer) ReplayDLQ(_ context.Context, _, _ string, event []byte, trace string) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.calls++
 	r.event = append([]byte(nil), event...)
 	r.trace = trace
+	if r.onReplay != nil {
+		hook := r.onReplay
+		r.mu.Unlock()
+		hook()
+		r.mu.Lock()
+	}
+	defer r.mu.Unlock()
 	return nil
 }
 
@@ -522,10 +662,23 @@ func (e *dlqReplayExecutor) got() ([]string, [][]byte) {
 // the full end-to-end replay path without Docker.
 func dlqReplayRunner(t *testing.T, store *fakeDLQStore, exec *dlqReplayExecutor) Dependencies {
 	t.Helper()
-	deps := withFakeDLQ(t, store)
+	return dlqReplayRunnerWithExecutor(t, store, exec)
+}
 
-	// Two matching event rules: a replay must run only the recorded handler, not
-	// every matching rule.
+// dlqReplayRunnerWithExecutor is dlqReplayRunner with a caller-supplied
+// runner.Executor, so scenarios can substitute behavior like a handler that
+// blocks mid-execution while other operations race the held replay claim.
+func dlqReplayRunnerWithExecutor(t *testing.T, store *fakeDLQStore, exec runner.Executor) Dependencies {
+	t.Helper()
+	return dlqReplayRunnerOn(t, withFakeDLQ(t, store), exec)
+}
+
+// dlqReplayRunnerOn wires the caller-built dependencies (deeper tests override
+// deps.OpenDLQ afterwards) with the real runner over exec at deps.SocketPath.
+// Two matching event rules: a replay must run only the recorded handler, not
+// every matching rule.
+func dlqReplayRunnerOn(t *testing.T, deps Dependencies, exec runner.Executor) Dependencies {
+	t.Helper()
 	tmpl, err := app.ParseTemplate([]byte(`runtime: node24
 events:
   - handler: events.created.handler

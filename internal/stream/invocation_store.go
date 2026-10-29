@@ -535,10 +535,6 @@ func traceField(invocation string) string {
 //	                                never eligible; the claim identity is
 //	                                retained so the stream layer can validate it
 //	                                before persisting the PostgreSQL DLQ entry
-//	"exhausted:<attempt>:<token>:dlq"           → legacy terminal marker (an older
-//	                                Relay recorded DLQ persistence this way). It
-//	                                is still read as exhausted, but no new suffix
-//	                                is written; PostgreSQL is the DLQ authority.
 //	(absent)                                    → eligible to execute
 //
 // "ok" stays bare because attempts/identity are no longer needed after
@@ -617,10 +613,9 @@ func (store *invocationStore) terminal(
 // atomic Lua script, CASed against the caller's claim (attempt + token). It
 // writes "ok" only when the current ACTIVE marker is still owned by that exact
 // claim, and treats an already-"ok" marker as an idempotent success. It
-// deliberately PRESERVES an exhausted marker (legacy ":dlq" or not) and
-// refuses a stale claim: success must never downgrade an exhaustion (that would
-// re-open a terminal invocation and could resurrect a message already routed to
-// the DLQ)
+// deliberately PRESERVES an exhausted marker and refuses a stale claim: success
+// must never downgrade an exhaustion (that would re-open a terminal invocation
+// and could resurrect a message already routed to the DLQ)
 // and a stale owner must never overwrite a newer attempt. It returns false for
 // both refusals (an explicit stale result, never a Redis error). The HSET and
 // PERSIST happen in the same script, so the completed marker keeps the hash
@@ -1105,7 +1100,7 @@ func (store *invocationStore) exhaustedClaim(
 	if err != nil {
 		return InvocationClaim{}, false, err
 	}
-	claim, _, ok := parseExhaustedValue(value)
+	claim, ok := parseExhaustedValue(value)
 	if !ok {
 		return InvocationClaim{}, false, nil
 	}
@@ -1308,31 +1303,25 @@ func validClaimToken(tok string) bool {
 	return len(tok) <= 64
 }
 
-// parseExhaustedValue parses "exhausted:<attempt>:<token>[:dlq]" into its claim.
-// The optional legacy ":dlq" suffix is still parsed as terminal so an older
-// marker can never be mistaken for an eligible invocation; it is read-only
-// compatibility and no new suffix is written. ok=false for any malformed value.
-func parseExhaustedValue(v string) (claim InvocationClaim, dlq bool, ok bool) {
+// parseExhaustedValue parses "exhausted:<attempt>:<token>" into its claim.
+// ok=false for any malformed value.
+func parseExhaustedValue(v string) (claim InvocationClaim, ok bool) {
 	rest, found := strings.CutPrefix(v, "exhausted:")
 	if !found {
-		return InvocationClaim{}, false, false
-	}
-	if suffix, trimmed := strings.CutSuffix(rest, ":dlq"); trimmed {
-		rest = suffix
-		dlq = true
+		return InvocationClaim{}, false
 	}
 	attemptStr, token, found := strings.Cut(rest, ":")
 	if !found {
-		return InvocationClaim{}, false, false
+		return InvocationClaim{}, false
 	}
 	if !canonicalUint(attemptStr) {
-		return InvocationClaim{}, false, false
+		return InvocationClaim{}, false
 	}
 	n, err := strconv.Atoi(attemptStr)
 	if err != nil || n < 1 || !validClaimToken(token) {
-		return InvocationClaim{}, false, false
+		return InvocationClaim{}, false
 	}
-	return InvocationClaim{Attempt: n, Token: token}, dlq, true
+	return InvocationClaim{Attempt: n, Token: token}, true
 }
 
 // parseActiveValue parses "<deadline_ms>:<attempt>:<token>" (the suffix after a
@@ -1402,7 +1391,7 @@ func parseInvocationState(v string) (kind invocationKind, deadline time.Time, at
 		}
 		return kindNextAttempt, dl, claim.Attempt, true
 	case strings.HasPrefix(v, "exhausted:"):
-		claim, _, ok := parseExhaustedValue(v)
+		claim, ok := parseExhaustedValue(v)
 		if !ok {
 			return kindEligible, time.Time{}, 0, false
 		}

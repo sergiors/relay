@@ -345,6 +345,15 @@ occurrence functions use this shared invocation/DLQ infrastructure.
   is re-reported on redelivery, so the message is re-routed rather than
   acknowledged without an entry. See
   [DLQ persistence contract](#dlq-persistence-contract).
+- Delivery identity is scoped to one Relay deployment's state database. The
+  source, group, and message ID are opaque logical coordinates, not a promise
+  that broker-assigned IDs are globally unique. Workers in one deployment must
+  share the database; separate deployments must not. A future broker adapter
+  must supply a deterministic delivery identity that includes enough broker and
+  resource scope to avoid reusing coordinates across recreated streams/topics.
+  The Redis adapter treats stream and group names as that scope; destructive
+  recreation with reused names and message IDs is unsupported. Use a new stream
+  or group name rather than reusing old coordinates.
 - Rows start **unsettled** and become settled only after the source ACK is
   confirmed. A bounded worker reconciliation repairs a crash between a successful
   Redis ACK and the PostgreSQL settlement marker by asking the exact source
@@ -354,9 +363,22 @@ occurrence functions use this shared invocation/DLQ infrastructure.
   preserves rows on any Redis error. Admin removal of an unsettled entry is
   refused, and retention deletes only settled rows, so a delivery that may still
   be recoverable can never lose its dead letter.
+- **Replay admission is a fenced lease.** `relay dlq replay` atomically claims
+  one settled row, increments a monotonic fencing token, and stamps a ten-minute
+  lease in database time before contacting the worker. A concurrent replay gets
+  an explicit replay-in-progress error and never dials. A definitive
+  worker-reported failure, a failed dial, or an explicit no-invoker answer
+  releases the claim; a request write failure, lost or malformed response, other
+  I/O failure, or client cancellation retains it until expiry, which is also how
+  a crashed claimant recovers. The success delete is one conditional statement
+  requiring the settled state, the same token, and an unexpired lease, so a stale
+  claimant cannot remove a re-claimed row. Admin removal and retention both skip
+  an active claim. Replay is **at-least-once**: the worker does not cancel
+  execution on disconnect, and work that outlives the lease can be replayed
+  again.
 - The DLQ is pruned **age-only** by `DLQ_RETENTION` (default 7 days, a bounded
-  PostgreSQL `DELETE` of **settled** rows only). This is separate from the source
-  stream's `REDIS_STREAM_RETENTION` ACKED trim and from
+  PostgreSQL `DELETE` of **settled** rows with no active replay claim). This is
+  separate from the source stream's `REDIS_STREAM_RETENTION` ACKED trim and from
   `REDIS_INVOCATION_RETENTION` (the terminal invocation-state TTL); all three are
   independent windows. See
   [configuration.md](configuration.md#stream-and-dlq-retention).
@@ -366,9 +388,11 @@ occurrence functions use this shared invocation/DLQ infrastructure.
   same stable identity with an empty invocation component.
 - Storage follows the state-package convention: `id TEXT PRIMARY KEY`,
   `data JSONB NOT NULL` (private payload), plus only the relational
-  `delivery_id`, nullable `settled_at_ms`, and `created_at_ms`. Event and reason
-  bytes are base64-encoded inside the JSON payload, so arbitrary malformed bytes,
-  including NUL, survive JSONB losslessly.
+  `delivery_id`, nullable `settled_at_ms`, `created_at_ms`, and the replay
+  admission columns `replay_claim_token` and `replay_lease_until_ms` (part of the
+  fresh schema; there is no migration or existing-database compatibility).
+  Event and reason bytes are base64-encoded inside the JSON payload, so arbitrary
+  malformed bytes, including NUL, survive JSONB losslessly.
 - Entry fields: `id`, `delivery_id`, `source`, `source_group`,
   `source_message_id`, `consumer`, `event`, `reason`, `app`, `handler`,
   `deliveries` (diagnostic source count), `handler_attempts` (the persisted

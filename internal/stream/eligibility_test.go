@@ -397,7 +397,7 @@ func (f *fakeInvocationStore) writeExhausted(invocation string, claim Invocation
 	if active != claim.Attempt || activeToken(v) != claim.Token {
 		return false
 	}
-	f.fields[invocation] = exhaustedValue(claim, false)
+	f.fields[invocation] = exhaustedValue(claim)
 	return true
 }
 
@@ -409,7 +409,7 @@ func (f *fakeInvocationStore) exhaustedClaim(_ context.Context, _, _, _, invocat
 	if f.readErr != nil {
 		return InvocationClaim{}, false, f.readErr
 	}
-	claim, _, ok := parseExhaustedValue(f.fields[invocation])
+	claim, ok := parseExhaustedValue(f.fields[invocation])
 	return claim, ok, nil
 }
 
@@ -529,8 +529,7 @@ func TestInvocationTryStartEligibilityMatrix(t *testing.T) {
 		wantWaitPos bool // true => wait must be > 0
 	}{
 		{"complete is terminal", "ok", false, 0, false},
-		{"exhausted is terminal", exhaustedValue(InvocationClaim{Attempt: 5, Token: "ab"}, false), false, 5, false},
-		{"exhausted+dlq is terminal", exhaustedValue(InvocationClaim{Attempt: 5, Token: "ab"}, true), false, 5, false},
+		{"exhausted is terminal", exhaustedValue(InvocationClaim{Attempt: 5, Token: "ab"}), false, 5, false},
 		{"unparseable is eligible", "running:notanumber", true, 1, false},
 		{"absent is eligible", "", true, 1, false},
 	}
@@ -676,7 +675,7 @@ func TestInvocationTryStartNeverExhaustsAcrossRepeatedElapsedClaims(t *testing.T
 	if !p.IsTerminal("fn/h") {
 		t.Fatal("invocation should be terminal after MarkExhausted")
 	}
-	if _, _, ok := parseExhaustedValue(store.fields["fn/h"]); !ok {
+	if _, ok := parseExhaustedValue(store.fields["fn/h"]); !ok {
 		t.Fatalf("marker = %q, want an exhausted marker", store.fields["fn/h"])
 	}
 }
@@ -753,7 +752,7 @@ func TestInvocationStoreTerminalGuards(t *testing.T) {
 	if ok, err := store.markComplete(ctx, "s", "g", "m", "fn/h", claim); err != nil || ok {
 		t.Fatalf("markComplete on exhausted = (%v,%v), want (false,nil)", ok, err)
 	}
-	if got := store.fields["fn/h"]; got != exhaustedValue(claim, false) {
+	if got := store.fields["fn/h"]; got != exhaustedValue(claim) {
 		t.Fatalf("marker = %q, want exhausted (success must not downgrade)", got)
 	}
 
@@ -781,7 +780,7 @@ func TestInvocationStoreTerminalGuards(t *testing.T) {
 	if ok, err := store3.markExhausted(ctx, "s", "g", "m", "fn/h", exClaim); err != nil || ok {
 		t.Fatalf("re-markExhausted = (%v,%v), want (false,nil) (already exhausted)", ok, err)
 	}
-	if got := store3.fields["fn/h"]; got != exhaustedValue(exClaim, false) {
+	if got := store3.fields["fn/h"]; got != exhaustedValue(exClaim) {
 		t.Fatalf("marker = %q, want the unchanged exhausted marker", got)
 	}
 }

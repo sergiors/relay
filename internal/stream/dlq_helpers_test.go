@@ -27,25 +27,10 @@ func dlqEntriesFor(t *testing.T, store dlq.Store, msgID string) []dlq.Entry {
 	return out
 }
 
-// exhaustedValue renders a persisted exhausted marker
-// ("exhausted:<attempt>:<token>") for tests that pin the terminal grammar, plus
-// the optional read-only legacy ":dlq" suffix an older Relay still parses as
-// terminal. Production never writes the suffix; PostgreSQL persistence is
-// idempotent by the entry's stable ID instead.
-func exhaustedValue(claim InvocationClaim, persisted bool) string {
-	value := "exhausted:" + strconv.Itoa(claim.Attempt) + ":" + claim.Token
-	if persisted {
-		value += ":dlq"
-	}
-	return value
-}
-
-// isExhaustedDLQValue reports whether v carries the legacy ":dlq" suffix
-// (an exhausted marker parsed by parseExhaustedValue as terminal, but no longer
-// written by production).
-func isExhaustedDLQValue(v string) bool {
-	_, persisted, ok := parseExhaustedValue(v)
-	return ok && persisted
+// exhaustedValue renders an exhausted marker ("exhausted:<attempt>:<token>")
+// for tests that pin the terminal grammar.
+func exhaustedValue(claim InvocationClaim) string {
+	return "exhausted:" + strconv.Itoa(claim.Attempt) + ":" + claim.Token
 }
 
 // fakeDLQStore is an in-memory broker-neutral dlq.Store for processMessage
@@ -126,4 +111,16 @@ func (f *fakeDLQStore) DeleteDLQEntry(_ context.Context, id string) (bool, error
 		}
 	}
 	return false, nil
+}
+
+// The stream processor never replays, so the replay-admission surface is
+// present only to satisfy dlq.Store.
+func (f *fakeDLQStore) ClaimDLQReplay(context.Context, string, time.Duration) (dlq.ReplayClaim, error) {
+	return dlq.ReplayClaim{}, dlq.ErrEntryNotFound
+}
+
+func (f *fakeDLQStore) ReleaseDLQReplay(context.Context, string, int64) error { return nil }
+
+func (f *fakeDLQStore) DeleteDLQReplay(context.Context, string, int64) error {
+	return dlq.ErrReplayClaimLost
 }
