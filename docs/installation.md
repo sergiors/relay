@@ -144,12 +144,16 @@ docker compose -f compose.prod.yaml exec -it relay relay secret set API_KEY
 docker compose -f compose.prod.yaml exec -T relay relay secret ls
 ```
 
-For a dead-letter entry, copy its exact ID from `relay dlq ls`. Run
-`docker compose -f compose.prod.yaml exec -T relay relay dlq inspect ID` to
-inspect it, or `docker compose -f compose.prod.yaml exec -T relay relay dlq replay ID`
-to retry it; replace `ID` with the listed entry ID. Replay requires a running
-worker and removes the entry only on success. See [CLI](cli.md) for the complete
-command reference.
+For a dead-letter entry, copy the ID shown by `relay dlq ls` (its first 10
+characters are enough when unique) or use any unique prefix of at least 10
+characters. Run
+`docker compose -f compose.prod.yaml exec -T relay relay dlq inspect ID_OR_PREFIX`
+to inspect it, or
+`docker compose -f compose.prod.yaml exec -T relay relay dlq replay ID_OR_PREFIX`
+to retry it. An ambiguous prefix is rejected with the matching IDs; add
+characters until it resolves to one entry. Replay requires a running worker and
+removes the entry only on success. See [CLI](cli.md) for the complete command
+reference.
 
 ## Observability
 

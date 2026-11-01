@@ -199,24 +199,30 @@ no offline fallback — a worker must be running.
 ## relay dlq
 
 ```
-ID                     ORIGINAL               APP                  HANDLER                ATTEMPTS  AGE
-8f0c...                 events/1757...-0        welcome-email-node   handler.handler        5         2m ago
+ID          APP                  HANDLER           ATTEMPTS  AGE
+8f0c1a2b3d  welcome-email-node   handler.handler   5         2m ago
 ```
 
-`ls` lists entries in write order (stable ID, source message, failed
-app/handler, handler attempts, age). Entry IDs are deterministic logical
-identities (source delivery + invocation), so they survive worker restarts and
-redeliveries. `inspect ID` shows one entry's fields plus the original
-event JSON pretty-printed; a non-JSON (malformed placeholder) event is shown
-verbatim. `rm ID` deletes one **settled** entry without touching broker
-invocation state or causing execution. An entry whose source delivery may still
-be recoverable is refused with an explicit "not settled" error; it becomes
-removable only after its source ACK is confirmed (or reconciliation proves it is
-no longer pending). An entry with an active replay claim is likewise refused until
-the claim is released or its lease expires.
+`ls` lists entries in write order: the first 10 characters of the stable entry
+ID, the failed app/handler, handler attempts, and age. Entry IDs are
+deterministic logical identities (source delivery + invocation), so they survive
+worker restarts and redeliveries. `inspect`, `replay`, and `rm` accept either the
+full 64-character ID or a unique prefix of at least 10 lowercase hexadecimal
+characters; the ID shown by `ls` is therefore enough to copy. A prefix that
+matches no entry is an error, and an ambiguous prefix is rejected with the
+matching IDs, so add characters until it is unique.
+
+`inspect ID` shows one entry's fields plus the original event JSON
+pretty-printed; a non-JSON (malformed placeholder) event is shown verbatim.
+`rm ID` deletes one **settled** entry without touching broker invocation state
+or causing execution. An entry whose source delivery may still be recoverable is
+refused with an explicit "not settled" error; it becomes removable only after its
+source ACK is confirmed (or reconciliation proves it is no longer pending). An
+entry with an active replay claim is likewise refused until the claim is released
+or its lease expires.
 
 ```
-relay dlq replay ID
+relay dlq replay ID_OR_PREFIX
 ```
 
 Re-executes that entry's exact recorded app/handler once on the running

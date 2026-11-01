@@ -236,6 +236,66 @@ func (st *State) ListDLQEntries(ctx context.Context) ([]dlq.Entry, error) {
 	return entries, nil
 }
 
+// dlqIDHexLength is the full length of a stable entry ID: dlq.NewID renders a
+// SHA-256 digest as lowercase hexadecimal.
+const dlqIDHexLength = 64
+
+// validateDLQIDPrefix enforces the grammar the prefix range query relies on.
+// A wildcard or punctuation character would broaden or shift the range, so it
+// must be rejected here even though the CLI also validates user input. The CLI
+// additionally requires at least ten characters so a prefix can always be
+// copied from `relay dlq ls`.
+func validateDLQIDPrefix(prefix string) error {
+	if prefix == "" {
+		return fmt.Errorf("empty prefix")
+	}
+	if len(prefix) > dlqIDHexLength {
+		return fmt.Errorf("prefix %q is longer than %d characters", prefix, dlqIDHexLength)
+	}
+	for i := 0; i < len(prefix); i++ {
+		c := prefix[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return fmt.Errorf("prefix %q is not lowercase hexadecimal", prefix)
+		}
+	}
+	return nil
+}
+
+// FindDLQEntryIDsByPrefix returns up to two entry IDs matching the given
+// lowercase hexadecimal prefix. Two matches are sufficient to detect
+// ambiguity without loading entry payloads.
+func (st *State) FindDLQEntryIDsByPrefix(
+	ctx context.Context,
+	prefix string,
+) ([]string, error) {
+	if err := validateDLQIDPrefix(prefix); err != nil {
+		return nil, fmt.Errorf("find DLQ entry IDs by prefix: %w", err)
+	}
+
+	rows, err := st.db.QueryContext(ctx, `
+		SELECT id
+		FROM dlq
+		WHERE id COLLATE "C" LIKE $1
+		LIMIT 2`, prefix+"%")
+	if err != nil {
+		return nil, fmt.Errorf("find DLQ entry IDs by prefix: %w", err)
+	}
+	defer rows.Close()
+
+	ids := make([]string, 0, 2)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("find DLQ entry IDs by prefix: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("find DLQ entry IDs by prefix: %w", err)
+	}
+	return ids, rows.Err()
+}
+
 // GetDLQEntry returns the entry with the exact ID, or ok=false when it does not
 // exist.
 func (st *State) GetDLQEntry(ctx context.Context, id string) (dlq.Entry, bool, error) {

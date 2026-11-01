@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/urfave/cli/v3"
@@ -16,6 +17,28 @@ import (
 	"relay/internal/schedule"
 	"relay/internal/worker"
 )
+
+const (
+	// dlqIDLength is the full stable entry ID length: SHA-256 rendered as
+	// lowercase hexadecimal by dlq.NewID.
+	dlqIDLength = 64
+	// dlqIDShortLength is how many leading ID characters `dlq ls` shows and
+	// the minimum prefix length accepted by inspect, replay, and rm, so an
+	// operator can copy the visible ID directly.
+	dlqIDShortLength = 10
+)
+
+// dlqIDPrefixFinder is the narrow administrative capability of a DLQ store to
+// resolve a short entry-ID prefix. It is deliberately separate from dlq.Store:
+// the stream processor never needs prefix lookup, so keeping it narrow avoids
+// forcing every store implementation and fake to grow an admin method.
+type dlqIDPrefixFinder interface {
+	// FindDLQEntryIDsByPrefix returns up to two candidate entry IDs from an
+	// index range starting at prefix, in ascending ID order. The range is
+	// evaluated under the database collation, so callers must verify that each
+	// candidate byte-starts with prefix before acting on it.
+	FindDLQEntryIDsByPrefix(ctx context.Context, prefix string) ([]string, error)
+}
 
 // openPostgresDLQStore is the production OpenDLQStore: it opens the same
 // PostgreSQL state handle the other administrative commands use. The DLQ is a
@@ -37,6 +60,10 @@ func openPostgresDLQStore(ctx context.Context, _ *slog.Logger) (dlq.Store, func(
 // restarts and redeliveries. It is a pure grouping command, so it uses the shared
 // namespaceAction: a bare `relay dlq` shows the subcommand help, and an unknown
 // first token is a friendly Docker-style usage error naming the full path.
+//
+// ls prints only the first dlqIDShortLength characters of each ID; the admin
+// commands accept that visible prefix (or any longer unique prefix) as well as
+// the full ID.
 //
 // PostgreSQL access stays behind the broker-neutral dlq.Store seam and the
 // injected OpenDLQStore opener; the presentation helpers
@@ -60,14 +87,16 @@ func dlqCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 }
 
 // dlqLsCommand builds `relay dlq ls`: a concise table of the DLQ entries in
-// write order, one row per entry. The row shows the entry ID, the original
-// message identity, the exact failed app/handler and its handler attempt count,
-// and the entry's age.
+// write order, one row per entry. The row shows the first dlqIDShortLength
+// characters of the entry ID, the exact failed app/handler and its handler
+// attempt count, and the entry's age; the short ID can be passed directly to
+// inspect, replay, or rm as a prefix.
 func dlqLsCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
-		Name:        "ls",
-		Usage:       "List DLQ entries",
-		Description: "List every DLQ entry in write order: entry ID, source message, failed app/handler, handler attempts, and age.",
+		Name:  "ls",
+		Usage: "List DLQ entries",
+		Description: "List every DLQ entry in write order: short entry ID, " +
+			"failed app/handler, handler attempts, and age.",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.Args().Present() {
 				return cli.Exit("dlq ls: too many arguments", 2)
@@ -79,15 +108,18 @@ func dlqLsCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	}
 }
 
-// dlqInspectCommand builds `relay dlq inspect ID`: the exact current fields of
-// one entry, followed by the original event JSON pretty-printed. An unknown ID
-// is a clear error.
+// dlqInspectCommand builds `relay dlq inspect ID|PREFIX`: the exact current
+// fields of one entry, followed by the original event JSON pretty-printed. A
+// unique prefix of at least dlqIDShortLength characters is accepted. An unknown
+// or ambiguous ID is a clear error.
 func dlqInspectCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
-		Name:        "inspect",
-		Usage:       "Show one DLQ entry",
-		UsageText:   "relay dlq inspect ID",
-		Description: "Show a single DLQ entry's metadata and its original event JSON, pretty-printed.",
+		Name:      "inspect",
+		Usage:     "Show one DLQ entry",
+		UsageText: "relay dlq inspect ID|PREFIX",
+		Description: "Show a single DLQ entry's metadata and its original event " +
+			"JSON, pretty-printed. Accepts the full ID or a unique prefix of at " +
+			"least 10 characters.",
 		Arguments: []cli.Argument{
 			&cli.StringArgs{Name: "id", Min: 1, Max: 1},
 		},
@@ -103,19 +135,22 @@ func dlqInspectCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	}
 }
 
-// dlqReplayCommand builds `relay dlq replay ID`: it reads the entry's exact
-// stored app, handler, and event, asks the running worker over its query
+// dlqReplayCommand builds `relay dlq replay ID|PREFIX`: it reads the entry's
+// exact stored app, handler, and event, asks the running worker over its query
 // socket to execute exactly that one handler once against the live runtime, and
-// deletes only that DLQ entry after the execution succeeds. On any failure — a
-// removed app/handler, a failed handler, or an unavailable worker — the
-// entry is retained and a concise error is returned.
+// deletes only that DLQ entry after the execution succeeds. A unique prefix of
+// at least dlqIDShortLength characters is accepted. On any failure — a removed
+// app/handler, a failed handler, or an unavailable worker — the entry is
+// retained and a concise error is returned.
 func dlqReplayCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:      "replay",
 		Usage:     "Replay one DLQ entry",
-		UsageText: "relay dlq replay ID",
-		Description: "Re-execute one DLQ entry's exact app and handler once on the " +
-			"running worker, then delete the entry on success. The entry is kept on failure.",
+		UsageText: "relay dlq replay ID|PREFIX",
+		Description: "Re-execute one DLQ entry's exact app and handler once on " +
+			"the running worker, then delete the entry on success. The entry is " +
+			"kept on failure. Accepts the full ID or a unique prefix of at " +
+			"least 10 characters.",
 		Arguments: []cli.Argument{
 			&cli.StringArgs{Name: "id", Min: 1, Max: 1},
 		},
@@ -131,16 +166,19 @@ func dlqReplayCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	}
 }
 
-// dlqRmCommand builds `relay dlq rm ID`: it deletes exactly one durable entry by
-// its stable ID and leaves every other entry in place. It never touches broker
+// dlqRmCommand builds `relay dlq rm ID|PREFIX`: it deletes exactly one durable
+// entry by its stable ID and leaves every other entry in place. A unique prefix
+// of at least dlqIDShortLength characters is accepted. It never touches broker
 // invocation state and never causes execution; if the source delivery is still
-// pending, a redelivery may recreate the row. An unknown ID is a clear error.
+// pending, a redelivery may recreate the row. An unknown or ambiguous ID is a
+// clear error.
 func dlqRmCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
-		Name:        "rm",
-		Usage:       "Remove one DLQ entry",
-		UsageText:   "relay dlq rm ID",
-		Description: "Delete exactly one DLQ entry by its stable ID.",
+		Name:      "rm",
+		Usage:     "Remove one DLQ entry",
+		UsageText: "relay dlq rm ID|PREFIX",
+		Description: "Delete exactly one DLQ entry by its stable ID. " +
+			"Accepts the full ID or a unique prefix of at least 10 characters.",
 		Arguments: []cli.Argument{
 			&cli.StringArgs{Name: "id", Min: 1, Max: 1},
 		},
@@ -179,6 +217,7 @@ func withDLQStore(ctx context.Context, logger *slog.Logger, deps Dependencies, f
 // dlqList renders the ls table. It is separated from the command plumbing so
 // tests can invoke it against a fake store directly. Rows are rendered in the
 // order the store returns them (write order), which is the natural DLQ order.
+// Only the short ID prefix is shown; inspect still renders the full ID.
 func dlqList(ctx context.Context, w io.Writer, store dlq.Store) error {
 	entries, err := store.ListDLQEntries(ctx)
 	if err != nil {
@@ -186,11 +225,10 @@ func dlqList(ctx context.Context, w io.Writer, store dlq.Store) error {
 	}
 
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tORIGINAL\tAPP\tHANDLER\tATTEMPTS\tAGE")
+	fmt.Fprintln(tw, "ID\tAPP\tHANDLER\tATTEMPTS\tAGE")
 	for _, e := range entries {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\n",
-			e.ID,
-			originalRef(e),
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n",
+			shortDLQID(e.ID),
 			e.App,
 			e.Handler,
 			e.HandlerAttempts,
@@ -202,11 +240,16 @@ func dlqList(ctx context.Context, w io.Writer, store dlq.Store) error {
 
 // dlqInspect renders one entry's exact current fields, followed by the original
 // event JSON pretty-printed. It is separated from the command plumbing so tests
-// can invoke it against a fake store directly. An unknown ID returns a clear
-// error. The event is printed verbatim when it is not valid JSON (the malformed
-// placeholder "-", for instance) rather than hiding it, so an operator sees
-// exactly what was dead-lettered.
+// can invoke it against a fake store directly. The supplied ID may be a unique
+// prefix; it is resolved before the exact-ID lookup. An unknown ID returns a
+// clear error. The event is printed verbatim when it is not valid JSON (the
+// malformed placeholder "-", for instance) rather than hiding it, so an
+// operator sees exactly what was dead-lettered.
 func dlqInspect(ctx context.Context, w io.Writer, store dlq.Store, id string) error {
+	id, err := resolveDLQID(ctx, store, id)
+	if err != nil {
+		return err
+	}
 	entry, ok, err := store.GetDLQEntry(ctx, id)
 	if err != nil {
 		return err
@@ -278,6 +321,10 @@ func dlqInspect(ctx context.Context, w io.Writer, store dlq.Store, id string) er
 // a malformed schedule claim, is an explicit pre-dial error and releases the
 // claim.
 func dlqReplay(ctx context.Context, w io.Writer, store dlq.Store, socketPath, id string) error {
+	id, err := resolveDLQID(ctx, store, id)
+	if err != nil {
+		return err
+	}
 	claim, err := store.ClaimDLQReplay(ctx, id, dlq.ReplayLease)
 	if err != nil {
 		switch {
@@ -342,11 +389,16 @@ func releaseReplayClaim(ctx context.Context, store dlq.Store, id string, token i
 	return cause
 }
 
-// dlqRm deletes exactly one settled entry by its stable ID. An unknown ID is a
-// clear error; an entry with an active replay claim is refused, because the
-// replay may still be executing. A successful removal prints a concise
+// dlqRm deletes exactly one settled entry by its stable ID. The supplied ID may
+// be a unique prefix; it is resolved before the exact-ID delete. An unknown ID
+// is a clear error; an entry with an active replay claim is refused, because
+// the replay may still be executing. A successful removal prints a concise
 // confirmation.
 func dlqRm(ctx context.Context, w io.Writer, store dlq.Store, id string) error {
+	id, err := resolveDLQID(ctx, store, id)
+	if err != nil {
+		return err
+	}
 	deleted, err := store.DeleteDLQEntry(ctx, id)
 	if err != nil {
 		switch {
@@ -365,10 +417,88 @@ func dlqRm(ctx context.Context, w io.Writer, store dlq.Store, id string) error {
 	return nil
 }
 
-// originalRef renders the entry's source-message identity for the concise ls
-// row: "source/id".
-func originalRef(e dlq.Entry) string {
-	return e.Source + "/" + e.SourceMessageID
+// resolveDLQID validates a user-supplied entry identifier and returns the full
+// stable ID used by the exact-ID store operations. A full-length ID is used
+// as-is; a shorter prefix must match exactly one stored entry. Candidates are
+// byte-verified before use, so a collation-widened range can never resolve to a
+// non-matching entry. No match, ambiguity, and malformed input are reported
+// before any replay or removal is attempted.
+func resolveDLQID(ctx context.Context, store dlq.Store, input string) (string, error) {
+	if err := validateDLQID(input); err != nil {
+		return "", err
+	}
+	if len(input) == dlqIDLength {
+		return input, nil
+	}
+
+	finder, ok := store.(dlqIDPrefixFinder)
+	if !ok {
+		return "", fmt.Errorf("DLQ entry prefix lookup is not supported by this store")
+	}
+	ids, err := finder.FindDLQEntryIDsByPrefix(ctx, input)
+	if err != nil {
+		return "", err
+	}
+
+	// The store's range is evaluated under the database collation. Verify every
+	// candidate byte-starts with the requested prefix before it can reach an
+	// exact-ID operation. If any candidate fails, the two-row limit may also
+	// have hidden a real match behind it, so refuse the whole result rather than
+	// guess which entry the operator meant. No-match is safer than a wrong
+	// deletion or replay.
+	matches := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if strings.HasPrefix(id, input) {
+			matches = append(matches, id)
+		}
+	}
+	if len(matches) != len(ids) {
+		return "", fmt.Errorf(
+			"no DLQ entry safely matches ID prefix %q; use the full 64-character ID",
+			input)
+	}
+
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("no DLQ entry matches ID prefix %q", input)
+	case 1:
+		return matches[0], nil
+	default:
+		return "", fmt.Errorf(
+			"ambiguous DLQ entry ID prefix %q: matches %s and %s; use more characters",
+			input, matches[0], matches[1])
+	}
+}
+
+// validateDLQID enforces the entry-identifier grammar: 10 to 64 lowercase
+// hexadecimal characters. The minimum is the prefix length shown by `dlq ls`,
+// and only the canonical lowercase form is accepted so the ID is literal and
+// unambiguous.
+func validateDLQID(id string) error {
+	if len(id) < dlqIDShortLength || len(id) > dlqIDLength {
+		return fmt.Errorf(
+			"invalid DLQ entry ID %q: use %d to %d lowercase hexadecimal "+
+				"characters or a unique prefix",
+			id, dlqIDShortLength, dlqIDLength)
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return fmt.Errorf(
+				"invalid DLQ entry ID %q: use only lowercase hexadecimal characters (0-9, a-f)",
+				id)
+		}
+	}
+	return nil
+}
+
+// shortDLQID returns the visible ls prefix. Stored IDs are full-length, but a
+// guard keeps a malformed short fixture from panicking the listing.
+func shortDLQID(id string) string {
+	if len(id) <= dlqIDShortLength {
+		return id
+	}
+	return id[:dlqIDShortLength]
 }
 
 // prettyEvent renders the original event as indented JSON. A payload that is not

@@ -152,7 +152,7 @@ func garbageResponseListener(t *testing.T, path string) {
 // execute twice. The first replay then completes and deletes the entry.
 func TestDLQReplayConcurrentSecondClaimRejectedBeforeExecution(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `{"event_name":"INSERT"}`, "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", `{"event_name":"INSERT"}`, "2026-09-23T10:00:00Z"),
 	}}
 	exec := newBlockingReplayExecutor()
 	deps := dlqReplayRunnerWithExecutor(t, store, exec)
@@ -163,17 +163,17 @@ func TestDLQReplayConcurrentSecondClaimRejectedBeforeExecution(t *testing.T) {
 	firstDone := make(chan error, 1)
 	firstOut := make(chan string, 1)
 	go func() {
-		out, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+		out, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
 		firstOut <- out
 		firstDone <- err
 	}()
 	exec.waitEntered(t)
-	if _, ok := store.heldToken("1-0"); !ok {
+	if _, ok := store.heldToken(dlqUnitID); !ok {
 		t.Fatal("a claim must be held while the handler is executing")
 	}
 
 	// When: a second CLI replays the same entry concurrently.
-	_, _, secondErr := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	_, _, secondErr := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
 
 	// Then: the second claimant is refused without dialing — the exact handler
 	// still executes exactly once.
@@ -183,7 +183,7 @@ func TestDLQReplayConcurrentSecondClaimRejectedBeforeExecution(t *testing.T) {
 	if got := exec.count(); got != 1 {
 		t.Fatalf("executed handlers = %d, want exactly 1 (the second claimant never executed)", got)
 	}
-	if _, ok := store.heldToken("1-0"); !ok {
+	if _, ok := store.heldToken(dlqUnitID); !ok {
 		t.Fatal("the refused claimant must leave the first claimant's claim held")
 	}
 
@@ -215,13 +215,13 @@ func TestDLQReplayConcurrentSecondClaimRejectedBeforeExecution(t *testing.T) {
 // is retained and the CLI says so.
 func TestDLQReplaySuccessDeleteRequiresCurrentClaimToken(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `{"event_name":"INSERT"}`, "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", `{"event_name":"INSERT"}`, "2026-09-23T10:00:00Z"),
 	}}
-	rep := &recordingReplayer{onReplay: func() { store.supersedeClaim("1-0") }}
+	rep := &recordingReplayer{onReplay: func() { store.supersedeClaim(dlqUnitID) }}
 	deps := withFakeDLQ(t, store)
 	startTestSocketWithReplayer(t, deps.SocketPath, rep)
 
-	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
 	if err == nil {
 		t.Fatal("a superseded claim must not delete the entry on success")
 	}
@@ -247,23 +247,23 @@ func TestDLQReplaySuccessDeleteRequiresCurrentClaimToken(t *testing.T) {
 // immediately (no lease-expiry wait).
 func TestDLQReplayDefiniteWorkerFailureReleasesClaim(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `{"event_name":"INSERT"}`, "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", `{"event_name":"INSERT"}`, "2026-09-23T10:00:00Z"),
 	}}
 	exec := &dlqReplayExecutor{fail: true}
 	deps := dlqReplayRunner(t, store, exec)
 
-	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
 	if err == nil || !strings.Contains(err.Error(), "handler boom") {
 		t.Fatalf("err = %v, want the handler failure surfaced", err)
 	}
-	if got := store.releasedTokensFor("1-0"); len(got) != 1 || got[0] != 1 {
+	if got := store.releasedTokensFor(dlqUnitID); len(got) != 1 || got[0] != 1 {
 		t.Fatalf("released tokens = %v, want exactly the held token [1]", got)
 	}
 	if len(store.entries) != 1 {
 		t.Fatalf("a failed handler must keep the entry: %+v", store.entries)
 	}
 	// Release makes the entry re-admittable without any expiry wait.
-	if _, err := store.ClaimDLQReplay(context.Background(), "1-0", time.Minute); err != nil {
+	if _, err := store.ClaimDLQReplay(context.Background(), dlqUnitID, time.Minute); err != nil {
 		t.Fatalf("re-claim after release: %v, want immediate admittance", err)
 	}
 }
@@ -274,16 +274,16 @@ func TestDLQReplayDefiniteWorkerFailureReleasesClaim(t *testing.T) {
 // re-replayable once a worker exists.
 func TestDLQReplayNotStartedReleasesClaim(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `{}`, "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", `{}`, "2026-09-23T10:00:00Z"),
 	}}
 	// No socket server is started at deps.SocketPath: the dial fails.
 	deps := withFakeDLQ(t, store)
 
-	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
-	if err == nil || !strings.Contains(err.Error(), "replay 1-0") {
+	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
+	if err == nil || !strings.Contains(err.Error(), "replay "+dlqUnitID) {
 		t.Fatalf("err = %v, want the unavailable-worker replay error", err)
 	}
-	if got := store.releasedTokensFor("1-0"); len(got) != 1 || got[0] != 1 {
+	if got := store.releasedTokensFor(dlqUnitID); len(got) != 1 || got[0] != 1 {
 		t.Fatalf("released tokens = %v, want a release of the claim token [1]", got)
 	}
 	if len(store.entries) != 1 {
@@ -296,16 +296,16 @@ func TestDLQReplayNotStartedReleasesClaim(t *testing.T) {
 // other definite not-started outcome: the claim is released and the entry kept.
 func TestDLQReplayNoReplayerAnswerReleasesClaim(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `{}`, "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", `{}`, "2026-09-23T10:00:00Z"),
 	}}
 	deps := withFakeDLQ(t, store)
 	startTestSocketWithReplayer(t, deps.SocketPath, nil) // the socket is up but serves no replayer
 
-	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
-	if err == nil || !strings.Contains(err.Error(), "replay 1-0") {
+	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
+	if err == nil || !strings.Contains(err.Error(), "replay "+dlqUnitID) {
 		t.Fatalf("err = %v, want the unavailable-replayer replay error", err)
 	}
-	if got := store.releasedTokensFor("1-0"); len(got) != 1 || got[0] != 1 {
+	if got := store.releasedTokensFor(dlqUnitID); len(got) != 1 || got[0] != 1 {
 		t.Fatalf("released tokens = %v, want a release of the claim token [1]", got)
 	}
 	if len(store.entries) != 1 {
@@ -320,26 +320,26 @@ func TestDLQReplayNoReplayerAnswerReleasesClaim(t *testing.T) {
 // first may be running.
 func TestDLQReplayMalformedResponseRetainsClaim(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `{}`, "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", `{}`, "2026-09-23T10:00:00Z"),
 	}}
 	deps := withFakeDLQ(t, store)
 	garbageResponseListener(t, deps.SocketPath)
 
-	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
-	if err == nil || !strings.Contains(err.Error(), "replay 1-0") {
+	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
+	if err == nil || !strings.Contains(err.Error(), "replay "+dlqUnitID) {
 		t.Fatalf("err = %v, want the replay exchange error", err)
 	}
-	if got := store.releasedTokensFor("1-0"); len(got) != 0 {
+	if got := store.releasedTokensFor(dlqUnitID); len(got) != 0 {
 		t.Fatalf("an ambiguous exchange must not release the claim: released %v", got)
 	}
 	if len(store.entries) != 1 {
 		t.Fatalf("an ambiguous exchange must keep the entry: %+v", store.entries)
 	}
-	if _, ok := store.heldToken("1-0"); !ok {
+	if _, ok := store.heldToken(dlqUnitID); !ok {
 		t.Fatal("the claim must still be held after an ambiguous exchange")
 	}
 	// The retained claim blocks a retry until the lease expires.
-	_, _, retryErr := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	_, _, retryErr := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
 	if retryErr == nil || !strings.Contains(retryErr.Error(), "replay is already in progress") {
 		t.Fatalf("retry err = %v, want the replay-in-progress refusal while held", retryErr)
 	}
@@ -353,7 +353,7 @@ func TestDLQReplayMalformedResponseRetainsClaim(t *testing.T) {
 // leak-free.
 func TestDLQReplayClientCancelRetainsClaimButHandlerStillExecutes(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `{"event_name":"INSERT"}`, "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", `{"event_name":"INSERT"}`, "2026-09-23T10:00:00Z"),
 	}}
 	exec := newBlockingReplayExecutor()
 	deps := dlqReplayRunnerWithExecutor(t, store, exec)
@@ -362,7 +362,7 @@ func TestDLQReplayClientCancelRetainsClaimButHandlerStillExecutes(t *testing.T) 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := runCLIContext(t, ctx, deps, "", "dlq", "replay", "1-0")
+		_, _, err := runCLIContext(t, ctx, deps, "", "dlq", "replay", dlqUnitID)
 		done <- err
 	}()
 	exec.waitEntered(t)
@@ -396,13 +396,13 @@ func TestDLQReplayClientCancelRetainsClaimButHandlerStillExecutes(t *testing.T) 
 
 	// The ambiguous outcome retains the claim: no release, entry kept, retry
 	// blocked.
-	if got := store.releasedTokensFor("1-0"); len(got) != 0 {
+	if got := store.releasedTokensFor(dlqUnitID); len(got) != 0 {
 		t.Fatalf("a client-cancelled replay must not release the claim: released %v", got)
 	}
 	if len(store.entries) != 1 {
 		t.Fatalf("a client-cancelled replay must keep the entry: %+v", store.entries)
 	}
-	if _, ok := store.heldToken("1-0"); !ok {
+	if _, ok := store.heldToken(dlqUnitID); !ok {
 		t.Fatal("the claim must still be held while the ambiguous execution may run")
 	}
 
@@ -416,18 +416,18 @@ func TestDLQReplayClientCancelRetainsClaimButHandlerStillExecutes(t *testing.T) 
 // executing) and that a released claim makes the entry removable again.
 func TestDLQReplayRmRefusesActiveClaimAndFreesAfterRelease(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `{}`, "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", `{}`, "2026-09-23T10:00:00Z"),
 	}}
 	deps := withFakeDLQ(t, store)
 
 	// Given: a concurrent replay holds the claim (what an in-flight
 	// `relay dlq replay` leaves behind).
-	claim, err := store.ClaimDLQReplay(context.Background(), "1-0", time.Minute)
+	claim, err := store.ClaimDLQReplay(context.Background(), dlqUnitID, time.Minute)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 
-	_, _, err = runCLIWithDeps(t, deps, "", "dlq", "rm", "1-0")
+	_, _, err = runCLIWithDeps(t, deps, "", "dlq", "rm", dlqUnitID)
 	if err == nil || !strings.Contains(err.Error(), "has an active replay claim") {
 		t.Fatalf("rm err = %v, want the active-claim refusal", err)
 	}
@@ -436,10 +436,10 @@ func TestDLQReplayRmRefusesActiveClaimAndFreesAfterRelease(t *testing.T) {
 	}
 
 	// When the claim is released, the entry is removable again.
-	if err := store.ReleaseDLQReplay(context.Background(), "1-0", claim.Token); err != nil {
+	if err := store.ReleaseDLQReplay(context.Background(), dlqUnitID, claim.Token); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "rm", "1-0")
+	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "rm", dlqUnitID)
 	if err != nil || strings.TrimSpace(out) != "DLQ entry removed" {
 		t.Fatalf("rm after release = (%q, %v), want removal", out, err)
 	}
@@ -452,16 +452,16 @@ func TestDLQReplayRmRefusesActiveClaimAndFreesAfterRelease(t *testing.T) {
 // guard for a non-replayable entry happens AFTER the claim (so it can be
 // released) and the entry is kept for inspection or removal.
 func TestDLQReplayNonReplayablePlaceholderReleasesClaim(t *testing.T) {
-	placeholder := dlqTestEntry("1-0", "1-0", "-", "-", "-", "2026-09-23T10:00:00Z")
+	placeholder := dlqTestEntry(dlqUnitID, dlqUnitID, "-", "-", "-", "2026-09-23T10:00:00Z")
 	placeholder.HandlerAttempts = 0
 	store := &fakeDLQStore{entries: []dlq.Entry{placeholder}}
 	deps := withFakeDLQ(t, store)
 
-	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
 	if err == nil || !strings.Contains(err.Error(), "is not replayable") {
 		t.Fatalf("err = %v, want the non-replayable error", err)
 	}
-	if got := store.releasedTokensFor("1-0"); len(got) != 1 || got[0] != 1 {
+	if got := store.releasedTokensFor(dlqUnitID); len(got) != 1 || got[0] != 1 {
 		t.Fatalf("released tokens = %v, want the rejected claim released [1]", got)
 	}
 	if len(store.entries) != 1 {

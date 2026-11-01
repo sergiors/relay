@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -76,23 +77,29 @@ func (f *fakeDLQStore) GetDLQEntry(_ context.Context, id string) (dlq.Entry, boo
 	return dlq.Entry{}, false, nil
 }
 
-// DeleteDLQEntry mirrors the production removal boundary: an entry with an
-// active replay claim is refused, because the replay may still be executing.
+// DeleteDLQEntry mirrors the production removal boundary: an UNSETTLED entry
+// (its source delivery may still be recoverable) is refused with
+// ErrEntryUnsettled, an entry with an active replay claim is refused with
+// ErrReplayInProgress, and anything else is removed exactly by its full ID.
 func (f *fakeDLQStore) DeleteDLQEntry(_ context.Context, id string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.deleteErr != nil {
 		return false, f.deleteErr
 	}
-	if f.heldClaim[id] > 0 {
-		return false, fmt.Errorf("delete %s: %w", id, dlq.ErrReplayInProgress)
-	}
 	for i, e := range f.entries {
-		if e.ID == id {
-			f.entries = append(f.entries[:i], f.entries[i+1:]...)
-			f.deleted = append(f.deleted, id)
-			return true, nil
+		if e.ID != id {
+			continue
 		}
+		if e.SettledAt == "" {
+			return false, fmt.Errorf("delete %s: %w", id, dlq.ErrEntryUnsettled)
+		}
+		if f.heldClaim[id] > 0 {
+			return false, fmt.Errorf("delete %s: %w", id, dlq.ErrReplayInProgress)
+		}
+		f.entries = append(f.entries[:i], f.entries[i+1:]...)
+		f.deleted = append(f.deleted, id)
+		return true, nil
 	}
 	return false, nil
 }
@@ -174,6 +181,25 @@ func (f *fakeDLQStore) ListUnsettledDLQDeliveries(_ context.Context, _ string, _
 	return nil, nil
 }
 
+// FindDLQEntryIDsByPrefix mirrors the production store's narrow prefix
+// capability: at most two ascending entry IDs beginning with prefix, without
+// loading any payload. The CLI consumes only zero, one, or two of them.
+func (f *fakeDLQStore) FindDLQEntryIDsByPrefix(_ context.Context, prefix string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var ids []string
+	for _, e := range f.entries {
+		if strings.HasPrefix(e.ID, prefix) {
+			ids = append(ids, e.ID)
+		}
+	}
+	slices.Sort(ids)
+	if len(ids) > 2 {
+		ids = ids[:2]
+	}
+	return ids, nil
+}
+
 func (f *fakeDLQStore) Close() error { f.closed = true; return nil }
 
 // releasedTokensFor returns the tokens presented to ReleaseDLQReplay for id, in
@@ -209,16 +235,29 @@ func (f *fakeDLQStore) supersedeClaim(id string) {
 	f.heldClaim[id] = f.claimGen[id]
 }
 
-// withFakeDLQ returns dependencies whose DLQ opener yields store, so the
-// command tree uses the fake instead of Redis. It captures whether the store
-// was closed by the command.
-func withFakeDLQ(t *testing.T, store *fakeDLQStore) Dependencies {
+// withFakeDLQStore returns dependencies whose DLQ opener yields the given
+// store, so any fake implementation (the plain in-memory store or one that
+// overrides the prefix lookup) can drive the command tree. It closes the store
+// after the command.
+func withFakeDLQStore(t *testing.T, store dlq.Store) Dependencies {
 	t.Helper()
 	deps := testDeps(t)
 	deps.OpenDLQ = func(context.Context, *slog.Logger) (dlq.Store, func(), error) {
-		return store, func() { _ = store.Close() }, nil
+		// dlq.Store has no Close (the opener's cleanup owns closing); fakes
+		// that model one (recording it for assertions) are closed when present.
+		return store, func() {
+			if closer, ok := store.(interface{ Close() error }); ok {
+				_ = closer.Close()
+			}
+		}, nil
 	}
 	return deps
+}
+
+// withFakeDLQ is withFakeDLQStore for the plain in-memory fake.
+func withFakeDLQ(t *testing.T, store *fakeDLQStore) Dependencies {
+	t.Helper()
+	return withFakeDLQStore(t, store)
 }
 
 // dlqTestEntry builds a current-format entry with sensible defaults.
@@ -239,6 +278,57 @@ func dlqTestEntry(id, originalID, function, handler, event, timestamp string) dl
 		SettledAt:       timestamp,
 	}
 }
+
+// dlqHexID builds a deterministic full-length (dlqIDLength, 64-character)
+// lowercase hexadecimal entry ID out of lowercase-hex fragments: the fragments
+// are joined and the remainder is zero-padded to 64. It gives tests control
+// over the leading prefix — the characters `relay dlq ls` shows and the admin
+// commands accept as a prefix — while every produced ID keeps the exact shape a
+// real dlq.NewID value has. It never returns invalid hex or a non-64 length.
+func dlqHexID(parts ...string) string {
+	id := strings.Join(parts, "")
+	if !dlqHexOnly(id) || len(id) > dlqIDLength {
+		return ""
+	}
+	return id + strings.Repeat("0", dlqIDLength-len(id))
+}
+
+// dlqHexOnly reports whether s consists solely of lowercase hex characters.
+func dlqHexOnly(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// Deterministic full-length entry-ID fixtures for the CLI unit tests. Real IDs
+// come from dlq.NewID (SHA-256 rendered lowercase hex); the fake stores used
+// here constrain only the same shape, so tests build fixed IDs with controlled
+// leading prefixes via dlqHexID.
+var (
+	// dlqUnitID is the full-length ID of the single entry most CLI unit
+	// fixtures seed.
+	dlqUnitID = dlqHexID("deadc0de01")
+
+	// dlqUnitSecondID is a second, differently-prefixed entry ID.
+	dlqUnitSecondID = dlqHexID("deadc0de02")
+
+	// dlqMissingID is a well-formed full-length ID that no fixture stores, so
+	// exact-ID lookups exercise the unknown-entry path.
+	dlqMissingID = dlqHexID("ff00cc11ff")
+
+	// dlqSharedPrefix is the ten-character visible prefix two DISTINCT
+	// fixtures share, so prefix inputs can be made deliberately ambiguous.
+	dlqSharedPrefix = "cafebabef0"
+
+	// dlqSharedIDOne and dlqSharedIDTwo are distinct full-length IDs sharing
+	// dlqSharedPrefix, in ascending identity order.
+	dlqSharedIDOne = dlqHexID(dlqSharedPrefix, "1")
+	dlqSharedIDTwo = dlqHexID(dlqSharedPrefix, "2")
+)
 
 // TestDLQBareShowsHelp verifies a bare `relay dlq` shows the subcommand help
 // listing every subcommand and exits 0 (the namespace contract).
@@ -283,15 +373,16 @@ func TestDLQHelpFlagsAndUnknownCommand(t *testing.T) {
 }
 
 // TestDLQListColumnsAndOrder verifies ls renders one row per entry in stream
-// order with ID, source message, app, handler, attempts, and age, and that
-// two entries from the SAME source message ID are listed as distinct rows.
+// order with the SHORT (first dlqIDShortLength) entry ID, app, handler,
+// attempts, and age — no ORIGINAL column and never the full ID — and that two
+// entries from the SAME source message ID are listed as distinct rows.
 func TestDLQListColumnsAndOrder(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1700000000000-0", "1699999999999-0", "alpha", "events.a.handler", `{"a":1}`, "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqUnitID, "1699999999999-0", "alpha", "events.a.handler", `{"a":1}`, "2026-09-23T10:00:00Z"),
 		// Same original_id, different exhausted invocation: a multi-handler
 		// message produces one entry each.
-		dlqTestEntry("1700000000000-1", "1699999999999-0", "alpha", "events.b.handler", `{"a":1}`, "2026-09-23T10:00:00Z"),
-		dlqTestEntry("1700000000001-0", "1699999999998-0", "beta", "index.run", `{"b":2}`, "2026-09-23T09:00:00Z"),
+		dlqTestEntry(dlqUnitSecondID, "1699999999999-0", "alpha", "events.b.handler", `{"a":1}`, "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqMissingID, "1699999999998-0", "beta", "index.run", `{"b":2}`, "2026-09-23T09:00:00Z"),
 	}}
 	deps := withFakeDLQ(t, store)
 
@@ -303,26 +394,26 @@ func TestDLQListColumnsAndOrder(t *testing.T) {
 	if len(lines) != 4 {
 		t.Fatalf("expected header + 3 rows, got %d:\n%s", len(lines), out)
 	}
-	hdr := lines[0]
-	for _, col := range []string{"ID", "ORIGINAL", "APP", "HANDLER", "ATTEMPTS", "AGE"} {
-		if !strings.Contains(hdr, col) {
-			t.Fatalf("header missing %q: %q", col, hdr)
+	if got := normWS(lines[0]); got != "ID APP HANDLER ATTEMPTS AGE" {
+		t.Fatalf("header = %q, want exactly \"ID APP HANDLER ATTEMPTS AGE\"", got)
+	}
+	// Stream order is preserved (not sorted by anything else), and every row
+	// shows exactly the ten-character visible prefix, never the full ID or the
+	// original source message.
+	for i, id := range []string{dlqUnitID, dlqUnitSecondID, dlqMissingID} {
+		if !strings.HasPrefix(lines[i+1], id[:dlqIDShortLength]) {
+			t.Fatalf("row %d wrong: %q (want it to start with %q)", i+1, lines[i+1], id[:dlqIDShortLength])
+		}
+		if strings.Contains(out, id) {
+			t.Fatalf("ls must never print the full entry ID %q:\n%s", id, out)
 		}
 	}
-	// Stream order is preserved (not sorted by anything else).
-	if !strings.HasPrefix(lines[1], "1700000000000-0") {
-		t.Fatalf("row 1 wrong: %q", lines[1])
+	if strings.Contains(out, "1699999999999-0") {
+		t.Fatalf("ls has no ORIGINAL column; the original source ID leaked:\n%s", out)
 	}
-	if !strings.HasPrefix(lines[2], "1700000000000-1") {
-		t.Fatalf("row 2 wrong: %q", lines[2])
-	}
-	if !strings.HasPrefix(lines[3], "1700000000001-0") {
-		t.Fatalf("row 3 wrong: %q", lines[3])
-	}
-	// Both same-source rows render their exact app/handler and attempts.
+	// Both same-source rows still render their exact app/handler and attempts.
 	for _, row := range []string{lines[1], lines[2]} {
-		if !strings.Contains(row, "events/1699999999999-0") ||
-			!strings.Contains(row, "alpha") || !strings.Contains(row, "5") {
+		if !strings.Contains(row, "alpha") || !strings.Contains(row, "5") {
 			t.Fatalf("same-source row missing metadata: %q", row)
 		}
 	}
@@ -338,7 +429,7 @@ func TestDLQListEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dlq ls empty: %v", err)
 	}
-	if got := normWS(out); got != "ID ORIGINAL APP HANDLER ATTEMPTS AGE" {
+	if got := normWS(out); got != "ID APP HANDLER ATTEMPTS AGE" {
 		t.Fatalf("empty ls = %q", got)
 	}
 }
@@ -355,17 +446,17 @@ func TestDLQListTooManyArgs(t *testing.T) {
 // field and pretty-prints the original JSON event.
 func TestDLQInspectFieldsAndPrettyEvent(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1700000000000-0", "1699999999999-0", "alpha", "events.a.handler", `{"event_name":"INSERT","id":7}`, "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqUnitID, "1699999999999-0", "alpha", "events.a.handler", `{"event_name":"INSERT","id":7}`, "2026-09-23T10:00:00Z"),
 	}}
 	deps := withFakeDLQ(t, store)
 
-	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "inspect", "1700000000000-0")
+	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "inspect", dlqUnitID)
 	if err != nil {
 		t.Fatalf("dlq inspect: %v", err)
 	}
 	flat := normWS(out)
 	for _, want := range []string{
-		"ID: 1700000000000-0",
+		"ID: " + dlqUnitID,
 		"Original stream: events",
 		"Original ID: 1699999999999-0",
 		"Group: relay",
@@ -394,11 +485,11 @@ func TestDLQInspectFieldsAndPrettyEvent(t *testing.T) {
 // placeholder for a malformed message) is rendered verbatim rather than hidden.
 func TestDLQInspectNonJSONEventVerbatim(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "-", "-", "-", "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "-", "-", "-", "2026-09-23T10:00:00Z"),
 	}}
 	deps := withFakeDLQ(t, store)
 
-	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "inspect", "1-0")
+	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "inspect", dlqUnitID)
 	if err != nil {
 		t.Fatalf("dlq inspect: %v", err)
 	}
@@ -412,10 +503,10 @@ func TestDLQInspectNonJSONEventVerbatim(t *testing.T) {
 func TestDLQInspectTraceOptional(t *testing.T) {
 	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 
-	withTrace := dlqTestEntry("1-0", "1-0", "alpha", "h", `{}`, "2026-09-23T10:00:00Z")
+	withTrace := dlqTestEntry(dlqUnitID, dlqUnitID, "alpha", "h", `{}`, "2026-09-23T10:00:00Z")
 	withTrace.Trace = lineage
 	deps := withFakeDLQ(t, &fakeDLQStore{entries: []dlq.Entry{withTrace}})
-	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "inspect", "1-0")
+	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "inspect", dlqUnitID)
 	if err != nil {
 		t.Fatalf("dlq inspect: %v", err)
 	}
@@ -423,9 +514,9 @@ func TestDLQInspectTraceOptional(t *testing.T) {
 		t.Fatalf("inspect output missing the trace lineage:\n%s", out)
 	}
 
-	withoutTrace := dlqTestEntry("1-0", "1-0", "alpha", "h", `{}`, "2026-09-23T10:00:00Z")
+	withoutTrace := dlqTestEntry(dlqUnitID, dlqUnitID, "alpha", "h", `{}`, "2026-09-23T10:00:00Z")
 	deps = withFakeDLQ(t, &fakeDLQStore{entries: []dlq.Entry{withoutTrace}})
-	out, _, err = runCLIWithDeps(t, deps, "", "dlq", "inspect", "1-0")
+	out, _, err = runCLIWithDeps(t, deps, "", "dlq", "inspect", dlqUnitID)
 	if err != nil {
 		t.Fatalf("dlq inspect: %v", err)
 	}
@@ -437,15 +528,15 @@ func TestDLQInspectTraceOptional(t *testing.T) {
 // TestDLQInspectUnknownID verifies an unknown ID is a clear error.
 func TestDLQInspectUnknownID(t *testing.T) {
 	deps := withFakeDLQ(t, &fakeDLQStore{})
-	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "inspect", "nope")
-	if err == nil || !strings.Contains(err.Error(), `unknown DLQ entry "nope"`) {
+	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "inspect", dlqMissingID)
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("unknown DLQ entry %q", dlqMissingID)) {
 		t.Fatalf("err = %v, want unknown-entry error", err)
 	}
 }
 
 // TestDLQInspectTooManyArgs verifies extra positional arguments are a usage error.
 func TestDLQInspectTooManyArgs(t *testing.T) {
-	_, _, err := runCLI(t, "", "dlq", "inspect", "1-0", "extra")
+	_, _, err := runCLI(t, "", "dlq", "inspect", dlqMissingID, "extra")
 	if err == nil || !strings.Contains(err.Error(), "dlq inspect: too many arguments") {
 		t.Fatalf("err = %v, want too-many-arguments", err)
 	}
@@ -455,19 +546,19 @@ func TestDLQInspectTooManyArgs(t *testing.T) {
 // semantics: one ID) and leaves the others.
 func TestDLQRmRemovesExactlyOne(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "alpha", "h", `{}`, "2026-09-23T10:00:00Z"),
-		dlqTestEntry("2-0", "2-0", "beta", "h", `{}`, "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "alpha", "h", `{}`, "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqUnitSecondID, dlqUnitSecondID, "beta", "h", `{}`, "2026-09-23T10:00:00Z"),
 	}}
 	deps := withFakeDLQ(t, store)
 
-	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "rm", "1-0")
+	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "rm", dlqUnitID)
 	if err != nil {
 		t.Fatalf("dlq rm: %v", err)
 	}
 	if strings.TrimSpace(out) != "DLQ entry removed" {
 		t.Fatalf("rm output = %q", out)
 	}
-	if len(store.entries) != 1 || store.entries[0].ID != "2-0" {
+	if len(store.entries) != 1 || store.entries[0].ID != dlqUnitSecondID {
 		t.Fatalf("rm must remove exactly one entry: %+v", store.entries)
 	}
 }
@@ -475,11 +566,11 @@ func TestDLQRmRemovesExactlyOne(t *testing.T) {
 // TestDLQRmUnknownID verifies rm of an unknown ID is a clear error and removes
 // nothing.
 func TestDLQRmUnknownID(t *testing.T) {
-	store := &fakeDLQStore{entries: []dlq.Entry{dlqTestEntry("1-0", "1-0", "a", "h", `{}`, "2026-09-23T10:00:00Z")}}
+	store := &fakeDLQStore{entries: []dlq.Entry{dlqTestEntry(dlqUnitID, dlqUnitID, "a", "h", `{}`, "2026-09-23T10:00:00Z")}}
 	deps := withFakeDLQ(t, store)
 
-	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "rm", "9-9")
-	if err == nil || !strings.Contains(err.Error(), `unknown DLQ entry "9-9"`) {
+	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "rm", dlqMissingID)
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("unknown DLQ entry %q", dlqMissingID)) {
 		t.Fatalf("err = %v, want unknown-entry error", err)
 	}
 	if len(store.entries) != 1 {
@@ -489,7 +580,7 @@ func TestDLQRmUnknownID(t *testing.T) {
 
 // TestDLQRmTooManyArgs verifies extra positional arguments are a usage error.
 func TestDLQRmTooManyArgs(t *testing.T) {
-	_, _, err := runCLI(t, "", "dlq", "rm", "1-0", "extra")
+	_, _, err := runCLI(t, "", "dlq", "rm", dlqMissingID, "extra")
 	if err == nil || !strings.Contains(err.Error(), "dlq rm: too many arguments") {
 		t.Fatalf("err = %v, want too-many-arguments", err)
 	}
@@ -512,15 +603,15 @@ func TestDLQCommandsCloseStore(t *testing.T) {
 // dialing the worker.
 func TestDLQReplayUnknownID(t *testing.T) {
 	deps := withFakeDLQ(t, &fakeDLQStore{})
-	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "nope")
-	if err == nil || !strings.Contains(err.Error(), `unknown DLQ entry "nope"`) {
+	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqMissingID)
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("unknown DLQ entry %q", dlqMissingID)) {
 		t.Fatalf("err = %v, want unknown-entry error", err)
 	}
 }
 
 // TestDLQReplayTooManyArgs verifies extra positional arguments are a usage error.
 func TestDLQReplayTooManyArgs(t *testing.T) {
-	_, _, err := runCLI(t, "", "dlq", "replay", "1-0", "extra")
+	_, _, err := runCLI(t, "", "dlq", "replay", dlqMissingID, "extra")
 	if err == nil || !strings.Contains(err.Error(), "dlq replay: too many arguments") {
 		t.Fatalf("err = %v, want too-many-arguments", err)
 	}
@@ -577,13 +668,13 @@ func (r *recordingReplayer) got() (int, []byte, string) {
 // be recoverable, so replay must not execute a handler whose entry cannot yet be
 // deleted.
 func TestDLQReplayUnsettledEntryDoesNotExecute(t *testing.T) {
-	entry := dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `{"event_name":"INSERT"}`, "2026-09-23T10:00:00Z")
+	entry := dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", `{"event_name":"INSERT"}`, "2026-09-23T10:00:00Z")
 	entry.SettledAt = ""
 	store := &fakeDLQStore{entries: []dlq.Entry{entry}}
 	exec := &dlqReplayExecutor{}
 	deps := dlqReplayRunner(t, store, exec)
 
-	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
 	if err == nil || !strings.Contains(err.Error(), "is not settled") {
 		t.Fatalf("err = %v, want an explicit not-settled error", err)
 	}
@@ -601,7 +692,7 @@ func TestDLQReplayUnsettledEntryDoesNotExecute(t *testing.T) {
 // the event payload (the payload never contains the lineage).
 func TestDLQReplayForwardsTraceControlPath(t *testing.T) {
 	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-	entry := dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `{"event_name":"INSERT"}`, "2026-09-23T10:00:00Z")
+	entry := dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", `{"event_name":"INSERT"}`, "2026-09-23T10:00:00Z")
 	entry.Trace = lineage
 	store := &fakeDLQStore{entries: []dlq.Entry{entry}}
 	deps := withFakeDLQ(t, store)
@@ -609,7 +700,7 @@ func TestDLQReplayForwardsTraceControlPath(t *testing.T) {
 	rep := &recordingReplayer{}
 	startTestSocketWithReplayer(t, deps.SocketPath, rep)
 
-	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
 	if err != nil {
 		t.Fatalf("dlq replay: %v", err)
 	}
@@ -705,12 +796,12 @@ events:
 // deleted.
 func TestDLQReplayExecutesExactHandlerAndDeletes(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `{"event_name":"INSERT"}`, "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", `{"event_name":"INSERT"}`, "2026-09-23T10:00:00Z"),
 	}}
 	exec := &dlqReplayExecutor{}
 	deps := dlqReplayRunner(t, store, exec)
 
-	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
 	if err != nil {
 		t.Fatalf("dlq replay: %v", err)
 	}
@@ -733,13 +824,13 @@ func TestDLQReplayExecutesExactHandlerAndDeletes(t *testing.T) {
 // clear error, runs nothing, and keeps the entry.
 func TestDLQReplayRemovedHandlerKeepsEntry(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "user-events", "events.removed.handler", `{}`, "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.removed.handler", `{}`, "2026-09-23T10:00:00Z"),
 	}}
 	exec := &dlqReplayExecutor{}
 	deps := dlqReplayRunner(t, store, exec)
 
-	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
-	if err == nil || !strings.Contains(err.Error(), "replay 1-0") {
+	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
+	if err == nil || !strings.Contains(err.Error(), "replay "+dlqUnitID) {
 		t.Fatalf("err = %v, want a replay error", err)
 	}
 	if hs, _ := exec.got(); len(hs) != 0 {
@@ -754,12 +845,12 @@ func TestDLQReplayRemovedHandlerKeepsEntry(t *testing.T) {
 // fails keeps the entry and returns a nonzero error.
 func TestDLQReplayFailedHandlerKeepsEntry(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `{}`, "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", `{}`, "2026-09-23T10:00:00Z"),
 	}}
 	exec := &dlqReplayExecutor{fail: true}
 	deps := dlqReplayRunner(t, store, exec)
 
-	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
 	if err == nil || !strings.Contains(err.Error(), "handler boom") {
 		t.Fatalf("err = %v, want the handler failure surfaced", err)
 	}
@@ -775,12 +866,12 @@ func TestDLQReplayFailedHandlerKeepsEntry(t *testing.T) {
 // registry is surfaced and the entry kept.
 func TestDLQReplayUnknownAppKeepsEntry(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "ghost", "events.created.handler", `{}`, "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "ghost", "events.created.handler", `{}`, "2026-09-23T10:00:00Z"),
 	}}
 	exec := &dlqReplayExecutor{}
 	deps := dlqReplayRunner(t, store, exec)
 
-	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
 	if err == nil || !strings.Contains(err.Error(), "ghost") {
 		t.Fatalf("err = %v, want it to name the unknown function", err)
 	}
@@ -795,18 +886,18 @@ func TestDLQReplayUnknownAppKeepsEntry(t *testing.T) {
 // reports a misleading socket-unavailability, no invalid JSON is encoded, and
 // the entry is kept.
 func TestDLQReplayMalformedPlaceholderNotReplayable(t *testing.T) {
-	placeholder := dlqTestEntry("1-0", "1-0", "-", "-", "-", "2026-09-23T10:00:00Z")
+	placeholder := dlqTestEntry(dlqUnitID, dlqUnitID, "-", "-", "-", "2026-09-23T10:00:00Z")
 	placeholder.HandlerAttempts = 0
 	store := &fakeDLQStore{entries: []dlq.Entry{placeholder}}
 	// No socket server is started: a dial attempt would surface as an
 	// unavailable-worker error, which is exactly what this path must not do.
 	deps := withFakeDLQ(t, store)
 
-	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
 	if err == nil {
 		t.Fatal("a malformed-message placeholder must not be replayable")
 	}
-	if !strings.Contains(err.Error(), `DLQ entry "1-0" is not replayable`) {
+	if !strings.Contains(err.Error(), fmt.Sprintf("DLQ entry %q is not replayable", dlqUnitID)) {
 		t.Fatalf("err = %v, want a concise non-replayable error", err)
 	}
 	if strings.Contains(err.Error(), "invocation unavailable") ||
@@ -822,13 +913,13 @@ func TestDLQReplayMalformedPlaceholderNotReplayable(t *testing.T) {
 // the live worker seam: even with a wired replayer, a placeholder entry never
 // reaches it and the entry stays.
 func TestDLQReplayMalformedPlaceholderDoesNotExecute(t *testing.T) {
-	placeholder := dlqTestEntry("1-0", "1-0", "-", "-", "-", "2026-09-23T10:00:00Z")
+	placeholder := dlqTestEntry(dlqUnitID, dlqUnitID, "-", "-", "-", "2026-09-23T10:00:00Z")
 	placeholder.HandlerAttempts = 0
 	store := &fakeDLQStore{entries: []dlq.Entry{placeholder}}
 	exec := &dlqReplayExecutor{}
 	deps := dlqReplayRunner(t, store, exec)
 
-	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
 	if err == nil || !strings.Contains(err.Error(), "is not replayable") {
 		t.Fatalf("err = %v, want a non-replayable error", err)
 	}
@@ -844,13 +935,13 @@ func TestDLQReplayMalformedPlaceholderDoesNotExecute(t *testing.T) {
 // hard error (no offline fallback) and the entry is kept.
 func TestDLQReplayWorkerUnavailableKeepsEntry(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `{}`, "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", `{}`, "2026-09-23T10:00:00Z"),
 	}}
 	// No socket server started at deps.SocketPath.
 	deps := withFakeDLQ(t, store)
 
-	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
-	if err == nil || !strings.Contains(err.Error(), "replay 1-0") {
+	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
+	if err == nil || !strings.Contains(err.Error(), "replay "+dlqUnitID) {
 		t.Fatalf("err = %v, want a replay error", err)
 	}
 	if len(store.entries) != 1 {
@@ -899,11 +990,11 @@ func scheduleReplayEnvelope(t *testing.T) string {
 // dead-lettered occurrence — and leaves the entry untouched.
 func TestDLQReplayScheduleEnvelopeInspectedAsStoredEnvelope(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", scheduleReplayEnvelope(t), "2026-10-01T08:05:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", scheduleReplayEnvelope(t), "2026-10-01T08:05:00Z"),
 	}}
 	deps := withFakeDLQ(t, store)
 
-	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "inspect", "1-0")
+	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "inspect", dlqUnitID)
 	if err != nil {
 		t.Fatalf("dlq inspect: %v", err)
 	}
@@ -930,12 +1021,12 @@ func TestDLQReplayScheduleEnvelopeInspectedAsStoredEnvelope(t *testing.T) {
 // never the stored envelope, and the successful replay deletes the entry.
 func TestDLQReplayScheduleEnvelopeExecutesHandlerPayload(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", scheduleReplayEnvelope(t), "2026-10-01T08:05:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", scheduleReplayEnvelope(t), "2026-10-01T08:05:00Z"),
 	}}
 	exec := &dlqReplayExecutor{}
 	deps := dlqReplayRunner(t, store, exec)
 
-	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
 	if err != nil {
 		t.Fatalf("dlq replay: %v", err)
 	}
@@ -965,14 +1056,14 @@ func TestDLQReplayScheduleEnvelopeExecutesHandlerPayload(t *testing.T) {
 // metadata, separate from (and alongside) the converted handler payload.
 func TestDLQReplayScheduleEnvelopeForwardsTrace(t *testing.T) {
 	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-	entry := dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", scheduleReplayEnvelope(t), "2026-10-01T08:05:00Z")
+	entry := dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", scheduleReplayEnvelope(t), "2026-10-01T08:05:00Z")
 	entry.Trace = lineage
 	store := &fakeDLQStore{entries: []dlq.Entry{entry}}
 	deps := withFakeDLQ(t, store)
 	rep := &recordingReplayer{}
 	startTestSocketWithReplayer(t, deps.SocketPath, rep)
 
-	if _, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0"); err != nil {
+	if _, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID); err != nil {
 		t.Fatalf("dlq replay: %v", err)
 	}
 	calls, event, trace := rep.got()
@@ -1004,7 +1095,7 @@ func TestDLQReplayMalformedScheduleEnvelopeKeepsEntryPreDial(t *testing.T) {
 		t.Fatalf("marshal malformed envelope: %v", err)
 	}
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", string(malformed), "2026-10-01T08:05:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", string(malformed), "2026-10-01T08:05:00Z"),
 	}}
 	// A wired replayer records ANY worker-side call, so it doubles as proof the
 	// socket seam was never reached.
@@ -1012,12 +1103,12 @@ func TestDLQReplayMalformedScheduleEnvelopeKeepsEntryPreDial(t *testing.T) {
 	rep := &recordingReplayer{}
 	startTestSocketWithReplayer(t, deps.SocketPath, rep)
 
-	_, _, err = runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	_, _, err = runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
 	if err == nil {
 		t.Fatal("a malformed schedule envelope must not be replayed")
 	}
-	if !strings.Contains(err.Error(), "replay 1-0") || !strings.Contains(err.Error(), "schedule claim") {
-		t.Fatalf("err = %v, want a schedule-claim replay error for 1-0", err)
+	if !strings.Contains(err.Error(), "replay "+dlqUnitID) || !strings.Contains(err.Error(), "schedule claim") {
+		t.Fatalf("err = %v, want a schedule-claim replay error naming the resolved entry", err)
 	}
 	if calls, _, _ := rep.got(); calls != 0 {
 		t.Fatalf("a malformed schedule claim must fail before the replayer: calls = %d", calls)
@@ -1032,18 +1123,18 @@ func TestDLQReplayMalformedScheduleEnvelopeKeepsEntryPreDial(t *testing.T) {
 // misleading socket-unavailable error), executes nothing, and keeps the entry.
 func TestDLQReplayNonObjectEventKeepsEntryPreDial(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `[1,2,3]`, "2026-10-01T08:05:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", `[1,2,3]`, "2026-10-01T08:05:00Z"),
 	}}
 	deps := withFakeDLQ(t, store)
 	rep := &recordingReplayer{}
 	startTestSocketWithReplayer(t, deps.SocketPath, rep)
 
-	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
 	if err == nil {
 		t.Fatal("a non-object event must not be replayed")
 	}
-	if !strings.Contains(err.Error(), "replay 1-0") || !strings.Contains(err.Error(), "replay payload") {
-		t.Fatalf("err = %v, want an explicit pre-dial replay error naming 1-0", err)
+	if !strings.Contains(err.Error(), "replay "+dlqUnitID) || !strings.Contains(err.Error(), "replay payload") {
+		t.Fatalf("err = %v, want an explicit pre-dial replay error naming the resolved entry", err)
 	}
 	if strings.Contains(err.Error(), "invocation unavailable") {
 		t.Fatalf("err = %v, must not report a misleading worker unavailability", err)
@@ -1069,12 +1160,12 @@ func TestDLQReplayOrdinaryEventPayloadByteForByte(t *testing.T) {
 	const stored = "{\n  \"zzz\": 1,\n  \"entry_name\": \"INSERT\"\n}"
 	const wireCompacted = `{"zzz":1,"entry_name":"INSERT"}`
 	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", stored, "2026-10-01T08:05:00Z"),
+		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", stored, "2026-10-01T08:05:00Z"),
 	}}
 	exec := &dlqReplayExecutor{}
 	deps := dlqReplayRunner(t, store, exec)
 
-	if _, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0"); err != nil {
+	if _, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID); err != nil {
 		t.Fatalf("dlq replay: %v", err)
 	}
 	_, payloads := exec.got()
