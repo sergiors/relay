@@ -37,6 +37,7 @@ provides fencing to prevent stale instances from overwriting statistics (see
 | `MAX_EVENT_BYTES`             | `256KiB`      | human-readable binary size (`256B`, `256KiB`, `1MiB`; bare integer bytes accepted) | Fails startup on zero/negative/malformed/decimal-unit/above-1MiB. Byte length of a message's raw `event` value; over-limit messages are non-retryably dead-lettered with a bounded summary.                                                                                                                                                                                                                     |
 | `WARM_CONTAINER_IDLE_TIMEOUT` | `5m`          | positive Go duration (`90s`, `10m`, `1h30m`)                                       | Fails startup.                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `HOT_RELOAD`                  | `false`       | boolean (`1`, `t`, `true`, `0`, `f`, `false`; trimmed)                             | Fails startup on an unparseable value. `false` bakes the source into the immutable runtime image; `true` source-mounts the live app directory from `/apps` read-only into containers for runtimes with a mountable dependency layout (Python and Node), so a source-only edit reuses the app and dependency images, managed services restart in place, and pooled execution containers are recycled. See below. |
+| `PYTHON_ZUVLOOP`              | `false`       | boolean (`1`, `t`, `true`, `0`, `f`, `false`; trimmed)                             | Fails startup on an unparseable value. Python event and schedule handler invocations run on the pinned zuvloop event loop instead of the standard asyncio loop; the package is installed only into an app image that serves those handlers. Services are unaffected. See below.                                                                                                                                      |
 | `METRICS_ADDR`                | unset         | listen address (`:9090`)                                                           | Empty disables the Prometheus endpoint. A bind failure is fatal at startup.                                                                                                                                                                                                                                                                                                                                     |
 | `GIT_WEBHOOK_ADDR`            | unset         | listen address (`:8081`)                                                           | Empty disables the GitHub webhook. A bind failure is fatal. Starts only when the git source also names a webhook secret.                                                                                                                                                                                                                                                                                        |
 | `NETWORKS`                    | unset         | comma-separated Docker network names                                               | Parsed at startup (trimmed, de-duplicated, declaration order kept). Every name is verified to exist; a missing network fails startup. Applied to execution containers and (as an order-independent set) service containers.                                                                                                                                                                                     |
@@ -299,6 +300,53 @@ Operational caveats:
   deliberately omits. Enable `HOT_RELOAD` only for app directories you are
   willing to expose to the handler process and its container.
 - `HOT_RELOAD` does not add anything to the application environment.
+
+### Python event loop
+
+`PYTHON_ZUVLOOP` (default `false`) selects the event loop used by Python
+**event and scheduled job** invocations. It is a worker-global setting; there is
+no per-app or per-template override.
+
+- **Disabled** (unset, empty, or any false value such as `0`, `f`, or `false`)
+  keeps the standard asyncio loop. Nothing extra is installed into the image.
+- **Enabled** (any true value such as `1`, `t`, or `true`) makes an app image
+  that declares at least one event or schedule handler install the pinned
+  `zuvloop==0.0.17` release through Relay's managed
+  `uv pip install --system --no-cache` build step. The invocation bootstrap then
+  selects the loop once, at process startup, with
+  `asyncio.run(runtime_loop(), loop_factory=zuvloop.new_event_loop)`.
+- **Scope is invocation handlers only.** A service-only Python app gets no extra
+  install and no bootstrap change. In an app with both invocation handlers and
+  `entrypoint` services, the package is present in the shared image, but each
+  service keeps its existing `python -m …` command, startup, and event loop;
+  services are never switched to zuvloop.
+- **Python 3.14 and Linux `amd64`/`arm64`.** The managed runtime is `python3.14`
+  (zuvloop requires Python 3.14+), and zuvloop publishes prebuilt wheels for
+  Linux `amd64` and `arm64`. A build for another target architecture fails the
+  managed install rather than silently omitting the package.
+- **Failure is fatal, with no fallback.** If the enabled image cannot resolve or
+  install the pinned package at build time, or cannot import it or initialize
+  the loop at container startup, the app build or container startup fails.
+  Relay never falls back to the standard asyncio loop.
+- **Startup configuration and shared daemons.** Changing it requires a worker
+  restart. Enabled Python invocation images use a distinct mode-scoped
+  app-image tag; disabled/default and service-only identities are unchanged.
+  This prevents enabled and disabled builds from retagging the same reference on
+  a shared Docker daemon. Within one mode, the `relay.bootstrap` image label
+  (which covers the injected bootstrap and managed install commands) still
+  detects stale bootstrap/tool changes and forces a rebuild. Under `HOT_RELOAD`,
+  the rendered mode-specific managed install is already part of the app-image
+  identity, so the two modes are distinct there as well. The content-addressed
+  dependency image is unchanged: zuvloop is installed in the app image, never
+  the shared dependency layer. Configure the same `PYTHON_ZUVLOOP` value on every
+  Relay worker sharing a Docker daemon: the setting is per-worker global, and the
+  tag separates modes rather than reconciling conflicting policies within a
+  mode.
+
+```bash
+PYTHON_ZUVLOOP=1 relay start   # Python event/schedule handlers use zuvloop
+PYTHON_ZUVLOOP=0 relay start   # standard asyncio (default)
+```
 
 ### Event size limit
 

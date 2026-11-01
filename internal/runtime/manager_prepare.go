@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
@@ -128,8 +130,17 @@ func (m *Manager) MaxConcurrentBuilds() int {
 
 // Prepared is an app whose image has been built.
 type Prepared struct {
-	Name        string
-	Image       string
+	Name string
+	// Image is the mutable app image reference Prepare resolved and admitted.
+	// A baked-source image normally embeds Fingerprint, but a Python invocation
+	// image built with PYTHON_ZUVLOOP uses a mode-scoped tag: two workers sharing
+	// a daemon must not retag one reference and silently flip a warm handler
+	// between loops. Image is therefore not a function of Fingerprint alone.
+	Image string
+	// Fingerprint is the real app-source content identity — never a mode-scoped
+	// image tag. The reconciler compares and persists it, and it remains the
+	// HOT_RELOAD generation identity even when Image is derived from non-source
+	// build inputs.
 	Fingerprint string
 	// Env are the runtime environment variables the app's engine requires
 	// (e.g. PYTHONDONTWRITEBYTECODE for Python). They are applied to every
@@ -414,6 +425,15 @@ func (m *Manager) prepare(
 	mountSource := m.sourceMount && spec.MountableSource
 	spec.SourceMounted = mountSource
 
+	// pythonZuvloop is the resolved PYTHON_ZUVLOOP decision passed to the
+	// engine. Like SourceMounted it is a per-preparation value stamped on the
+	// plan's spec copy. It is set only for the Python engine, and that engine
+	// applies it only when templateHandlers below is non-empty (an event or
+	// schedule handler exists); Node never sees a loop-selection input.
+	if spec.Engine == plan.EnginePython {
+		spec.PythonZuvloop = m.pythonZuvloop
+	}
+
 	// sourceHostPath is the path the Docker daemon must be given for the live
 	// source bind. Under the bundled Compose layout Relay runs in a container
 	// whose /apps is a host bind mount, so fn.Dir (/apps/foo) is NOT
@@ -430,7 +450,8 @@ func (m *Manager) prepare(
 		return nil, fmt.Errorf("app %q: %w", fn.Name, err)
 	}
 
-	planResult, err := eng.Plan(spec, fn.Dir, templateHandlers(fn))
+	handlers := templateHandlers(fn)
+	planResult, err := eng.Plan(spec, fn.Dir, handlers)
 	if err != nil {
 		return nil, fmt.Errorf("app %q: plan: %w", fn.Name, err)
 	}
@@ -496,20 +517,34 @@ func (m *Manager) prepare(
 		depRef = depImageRef(depFingerprint)
 	}
 
-	// The app image reference. For the historical baked-source image it embeds
-	// the source fingerprint, so every source version is a distinct image. Under
-	// HOT_RELOAD the live source is bind-mounted instead of baked, so the tag
-	// is derived from the non-source inputs (runtime, dependency, bootstrap) and
-	// a source-only change reuses the same image; the reconciler advances the
-	// warm/service generation from the source fingerprint instead (see
-	// Prepared.Fingerprint).
+	// The app image reference. For a baked-source image the tag embeds the
+	// source fingerprint, so every source version is a distinct image. A Python
+	// invocation image built with PYTHON_ZUVLOOP instead uses a mode-scoped
+	// digest: its bootstrap and managed install differ from the standard-asyncio
+	// image, and two workers sharing a Docker daemon must not alternately retag
+	// one mutable reference (Execute resolves the tag's current content, so a
+	// warm handler could silently switch loops). Service-only apps and the
+	// disabled/default mode keep ImageRef(name, fp) unchanged.
+	//
+	// Under HOT_RELOAD the live source is bind-mounted instead of baked, so the
+	// tag is derived from the non-source inputs (runtime, dependency, bootstrap,
+	// and the rendered mode-specific install) and a source-only change reuses
+	// the same image; the reconciler advances the warm/service generation from
+	// the source fingerprint instead (see Prepared.Fingerprint).
 	imageFingerprint := fp
-	if mountSource {
+	switch {
+	case mountSource:
 		rendered, rerr := renderDockerfileWithSource(planResult, false)
 		if rerr != nil {
 			return nil, fmt.Errorf("app %q: render dockerfile: %w", fn.Name, rerr)
 		}
 		imageFingerprint = sourceMountImageFingerprint(spec.Name, depRef, rendered)
+	case spec.Engine == plan.EnginePython && spec.PythonZuvloop && len(handlers) > 0:
+		// The engine's exact gate: only an enabled Python app that actually
+		// serves event/schedule handlers has the zuvloop bootstrap and install.
+		// Mode-scoping here, rather than in the engine, keeps Prepared.Fingerprint
+		// the real source identity while making the two builds distinct images.
+		imageFingerprint = zuvloopImageFingerprint(fp)
 	}
 	image := ImageRef(fn.Name, imageFingerprint)
 
@@ -678,9 +713,10 @@ func (m *Manager) prepare(
 		}
 		// The app image inherits every layer of the dependency image, so
 		// its Dockerfile's FROM is the dependency reference rather than the raw
-		// base image. The engine moved the install into Deps, so the app
-		// image carries no install RUN of its own — only UserSetup/User/Env/
-		// Entrypoint on top of the dependency layer. The dependency image was
+		// base image. User dependency installs live in Deps; managed
+		// BuildPlan.Install steps (e.g. OTel, zuvloop) still run in the app
+		// image, along with UserSetup/User/Env/Entrypoint, on top of the
+		// dependency layer. The dependency image was
 		// built with the runtime's external tools (e.g. uv), so the app
 		// image inherits them via FROM and does not need to materialize them
 		// again.
@@ -818,6 +854,24 @@ func (m *Manager) prepare(
 	leaseTransferred = true
 	prepared.Dependency = depRef
 	return prepared, nil
+}
+
+// zuvloopImageFingerprint derives the baked-source app image identity for a
+// Python invocation image built with PYTHON_ZUVLOOP. The standard mode keeps
+// ImageRef(name, sourceFingerprint); only the enabled invocation image needs a
+// distinct tag, because its bootstrap and managed install differ from the
+// standard-asyncio image and two workers with different settings can share one
+// Docker daemon. Hashing the FULL source fingerprint with a fixed discriminator
+// happens before ImageRef's 16-character truncation, so the mode distinction
+// survives the short tag. It is deterministic: the same source and mode always
+// produce the same reference, while enabling or disabling the setting produces
+// two immutable tags instead of one reference retagged back and forth.
+func zuvloopImageFingerprint(sourceFingerprint string) string {
+	h := sha256.New()
+	_, _ = h.Write([]byte("relay-python-zuvloop"))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(sourceFingerprint))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // templateHandlers returns the app's handler MODULE parts (the portion of

@@ -117,6 +117,17 @@ app directory; Node mounts at `/app/src` so the dependency image's
 `/app/node_modules` stays available. See
 [configuration.md](configuration.md#hot-reload).
 
+For Python only, the worker-global `PYTHON_ZUVLOOP` setting (default `false`)
+selects the event loop used by **event and schedule handler** invocations. When
+enabled, an app image that declares at least one such handler installs the pinned
+`zuvloop==0.0.17` package through Relay's managed uv build step and its
+invocation bootstrap uses `asyncio.run(..., loop_factory=zuvloop.new_event_loop)`;
+when disabled, the standard asyncio loop is used and nothing extra is installed.
+It has no per-app override, does not change Node, and never changes a managed
+service's command, startup, or event loop. A service-only Python app installs
+nothing extra. See
+[configuration.md](configuration.md#python-event-loop).
+
 ### Handlers
 
 `handler` has the form `module.function`, split at the **last** dot:
@@ -318,6 +329,11 @@ new request no longer carries is restored to its pre-Relay value (or removed), s
 a rotated or removed secret never leaks into a later invocation.
 
 For Python, the warm process also owns **one event loop for its whole lifetime**.
+By default that is the standard asyncio loop; when the worker-global
+`PYTHON_ZUVLOOP` is enabled the bootstrap selects the pinned zuvloop event loop
+once at process startup instead (see
+[configuration.md](configuration.md#python-event-loop)). Managed `entrypoint`
+services are outside this process and keep their own command and event loop.
 Synchronous handlers are called inline on that loop while it is running, and an
 async handler (or any handler that returns an awaitable) is awaited on it.
 Because that loop is already running, a synchronous handler must not call

@@ -19,14 +19,16 @@ Process-model notes (intended semantics, not a bug):
   - A malformed request line is a fatal protocol failure: the process exits
     nonzero so Relay discards the container.
   - EOF on stdin means Relay is done with the container; exit 0 cleanly.
-  - The whole process owns ONE event loop, created once by asyncio.run() and
-    alive until the container exits. Requests are read and processed on that
-    loop, one at a time (see runtime_loop). Sync handlers are called inline on
-    the loop; an async handler (or any awaitable the handler returns) is awaited
-    on that SAME loop. Module-level asyncio resources (a lock, a queue, an HTTP
-    client session) therefore bind to one stable loop and stay usable across
-    invocations; relay never runs a per-invocation loop, so a warm resource is
-    not "attached to a different event loop" on its second use.
+  - The whole process owns ONE event loop, created once by asyncio.run() (with
+    zuvloop's loop factory when the image was built with PYTHON_ZUVLOOP for an
+    app that serves event or schedule handlers) and alive until the container
+    exits. Requests are read and processed on that loop, one at a time (see
+    runtime_loop). Sync handlers are called inline on the loop; an async handler
+    (or any awaitable the handler returns) is awaited on that SAME loop.
+    Module-level asyncio resources (a lock, a queue, an HTTP client session)
+    therefore bind to one stable loop and stay usable across invocations; relay
+    never runs a per-invocation loop, so a warm resource is not "attached to a
+    different event loop" on its second use.
   - sys.modules caches imported modules, so module-level state (a cache dict,
     a client, a connection) persists across invocations. Per-request env is
     applied EXACTLY per invocation: a key absent from the new frame is restored
@@ -59,6 +61,16 @@ import inspect
 import json
 import os
 import sys
+
+# Build-time event-loop selector. The Python engine replaces this exact line
+# (with `import zuvloop` and `ZUVLOOP_ENABLED = True`) when the worker-global
+# PYTHON_ZUVLOOP setting applies to this image: the app declares at least one
+# event or schedule handler and the image installed the pinned zuvloop package.
+# A disabled image keeps this line verbatim, never imports zuvloop, and runs the
+# standard asyncio loop. The import/loop initialization deliberately has no
+# fallback: if an enabled image cannot import the package or create the loop,
+# the container must fail startup rather than silently run a different loop.
+ZUVLOOP_ENABLED = False
 
 # OpenTelemetry API: installed into the runtime image next to uv. Import is
 # guarded so running the bootstrap outside the image (or in a minimal test
@@ -320,8 +332,14 @@ async def runtime_loop():
 def main():
     # ONE loop for the whole process lifetime: module-level asyncio resources
     # stay bound to it across invocations instead of being orphaned by a
-    # per-invocation loop.
-    asyncio.run(runtime_loop())
+    # per-invocation loop. The loop type is selected once, here at process
+    # startup. The enabled branch requires the module installed by the engine's
+    # managed build step; an import or loop-initialization failure propagates
+    # and fails container startup, never falling back to the standard loop.
+    if ZUVLOOP_ENABLED:
+        asyncio.run(runtime_loop(), loop_factory=zuvloop.new_event_loop)
+    else:
+        asyncio.run(runtime_loop())
 
 
 if __name__ == "__main__":

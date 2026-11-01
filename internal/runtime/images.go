@@ -21,8 +21,9 @@ import (
 const relayRepoPrefix = "relay-app-"
 
 // tagPrefixLen is the number of hex fingerprint characters used as the docker
-// tag. The full fingerprint is a 64-hex SHA-256 over the app directory;
-// that remains authoritative everywhere it is persisted (PostgreSQL, Prepared). The
+// tag. The standard source fingerprint is a 64-hex SHA-256 over the app
+// directory (a mode-scoped derived identity has the same size); the full value
+// remains authoritative everywhere it is persisted (PostgreSQL, Prepared). The
 // tag prefix is an opaque, collision-safe short handle: 16 hex chars = 64 bits,
 // and a birthday collision at the app-version counts Relay deals with (a
 // handful per app, tens of apps) is astronomically unlikely. Git's
@@ -31,11 +32,11 @@ const relayRepoPrefix = "relay-app-"
 // a validated name (name ≤ 63 chars, "relay-app-" prefix, ":<16hex>" suffix → ≤
 // ~89 chars < 128). A full-fingerprint tag would add nothing but length: the
 // fingerprint still uniquely determines the tag, so equality on the tag is
-// equality on the source.
+// equality on the fingerprint (and, for the standard identity, on the source).
 const tagPrefixLen = 16
 
-// ImageRef maps a validated app name and its content fingerprint to the
-// docker image reference for that exact source version. No sanitizing is needed
+// ImageRef maps a validated app name and its image-identity fingerprint to the
+// docker image reference for that exact image version. No sanitizing is needed
 // for the name: app names are validated at load time (internal/app) to
 // be [a-z0-9][a-z0-9._-]* and not end in '.', so they are already legal docker
 // repository names. The reference always carries the short fingerprint tag, so
@@ -43,6 +44,11 @@ const tagPrefixLen = 16
 // be built, reused, and retired independently without ever clobbering a sibling
 // version. The "relay-app-" prefix namespaces all of Relay's images so they never
 // collide with unrelated images on the same daemon.
+//
+// A caller may pass a DERIVED fingerprint when a build mode changes the image
+// under the same source (PYTHON_ZUVLOOP): the tag then distinguishes those two
+// immutable images, while the source identity Relay persists stays the app's
+// real content fingerprint.
 //
 // Defensive on short input: fingerprints are always 64 chars in practice, but a
 // caller (or a truncated persisted value) passing fewer hex chars must not panic;

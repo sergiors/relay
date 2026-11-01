@@ -37,6 +37,15 @@ type Spec struct {
 	// for runtime TypeScript transpilation instead of transpiling at build time).
 	// A false value means the historical baked-source image, byte-for-byte.
 	SourceMounted bool
+	// PythonZuvloop is the RESOLVED worker-global PYTHON_ZUVLOOP decision for a
+	// Python preparation. It is set by the caller (runtime.Manager.prepare) on
+	// the plan's value copy and is ignored by every other engine. The Python
+	// engine uses it only together with a non-empty handler list: an app with
+	// at least one event or schedule handler gets the zuvloop loop factory and
+	// its managed install, while a service-only app keeps the standard asyncio
+	// bootstrap and installs nothing extra. It never changes a managed service's
+	// command or event loop.
+	PythonZuvloop bool
 	// RuntimeTools are the external tools this runtime requires in every image
 	// it builds (e.g. a pinned binary such as uv or pnpm). A RuntimeTool is an
 	// external dependency of the runtime, not a Dockerfile concept; the builder

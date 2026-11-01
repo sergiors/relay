@@ -9,9 +9,16 @@
 // pip, so both the classic requirements.txt path and a native uv project use the
 // same fast, locked installer and land in the system site-packages the runtime
 // entrypoint already uses.
+//
+// The optional, worker-global PYTHON_ZUVLOOP setting is also build knowledge:
+// for an app image that serves event or schedule handlers the engine injects a
+// bootstrap variant and a managed install of the pinned zuvloop package, so the
+// warm invocation process selects that loop once at startup. It is never applied
+// to a service-only image, and services keep their own command and loop.
 package python
 
 import (
+	"bytes"
 	_ "embed"
 	"fmt"
 	"io/fs"
@@ -24,8 +31,33 @@ import (
 //go:embed bootstrap.py
 var bootstrap []byte
 
-// Bootstrap exposes the embedded bootstrap so tests can verify its content.
+// The embedded bootstrap is the standard-asyncio variant. When PYTHON_ZUVLOOP
+// applies to an image, bootstrapFor replaces the exact build-time marker line
+// with an import of the pinned package and an enabled flag; the bootstrap's
+// main() then selects the loop once at process startup. A marker that is
+// missing or ambiguous is an error rather than a silently unmodified bootstrap.
+const (
+	zuvloopBootstrapMarker  = "\nZUVLOOP_ENABLED = False\n"
+	zuvloopBootstrapEnabled = "\nimport zuvloop\n\nZUVLOOP_ENABLED = True\n"
+)
+
+// Bootstrap exposes the embedded standard-asyncio bootstrap so tests can verify
+// its content and run it as a live process.
 var Bootstrap = bootstrap
+
+// bootstrapFor returns the bootstrap content for the resolved loop mode. The
+// disabled variant is the embedded file byte-for-byte; the enabled variant
+// imports zuvloop at module load (so a missing package fails process startup)
+// and calls asyncio.run with zuvloop's loop factory. It never falls back.
+func bootstrapFor(zuvloop bool) ([]byte, error) {
+	if !zuvloop {
+		return bootstrap, nil
+	}
+	if bytes.Count(bootstrap, []byte(zuvloopBootstrapMarker)) != 1 {
+		return nil, fmt.Errorf("python bootstrap: expected exactly one %q marker", zuvloopBootstrapMarker)
+	}
+	return bytes.Replace(bootstrap, []byte(zuvloopBootstrapMarker), []byte(zuvloopBootstrapEnabled), 1), nil
+}
 
 type Engine struct{}
 
@@ -61,9 +93,16 @@ const (
 // it and Relay never downgrades it.
 const otelAPIFloor = "opentelemetry-api>=1.16,<2"
 
-// install commands (run inside the dependency image, after uv has been copied
-// in). The dependency installs land in the SYSTEM site-packages (--system) so
-// the existing `python -u /relay/bootstrap.py` entrypoint sees the packages; no
+// zuvloopVersion is the exact pinned release installed when PYTHON_ZUVLOOP
+// applies to a Python app image. zuvloop requires Python 3.14+, which is the
+// managed python3.14 runtime, and publishes prebuilt Linux amd64/arm64 wheels.
+// The pin is exact (no range) so an image cannot change loop behavior when a
+// new release appears.
+const zuvloopVersion = "0.0.17"
+
+// install commands (run after uv has been copied into the image being built).
+// Dependency installs land in the SYSTEM site-packages (--system) so the
+// existing `python -u /relay/bootstrap.py` entrypoint sees the packages; no
 // project-local .venv is created, keeping runtime execution and the dependency
 // image's FROM-inheritance unchanged.
 const (
@@ -80,6 +119,16 @@ const (
 	// it is covered by the relay.bootstrap label, so images pick it up on the
 	// next reconcile.
 	otelInstall = "uv pip install --system --no-cache '" + otelAPIFloor + "'"
+
+	// zuvloopPackage is the exact package spec installed for PYTHON_ZUVLOOP,
+	// and zuvloopInstall is its managed uv install. Like otelInstall it runs in
+	// the app image (never the shared dependency layer), so the dependency
+	// image identity is unchanged whether the loop is enabled or not, and only
+	// an image that actually serves event/schedule handlers pays for the
+	// install. The spec is single-quoted like otelInstall (the pin is exact,
+	// but the quoting keeps the managed-install form consistent).
+	zuvloopPackage = "zuvloop==" + zuvloopVersion
+	zuvloopInstall = "uv pip install --system --no-cache '" + zuvloopPackage + "'"
 
 	// nativeInstall exports the locked dependency set from the native uv project
 	// and installs it, without re-resolving: `--locked` asserts the committed
@@ -127,14 +176,25 @@ const (
 //     deterministically. Commit the lock (or use requirements.txt).
 //   - none: no dependency layer.
 //
-// handlers is the app's handler MODULE parts, an input only the Node engine
-// needs (to transpile TypeScript at build time). Python handlers are resolved by
-// the runtime bootstrap exactly as before, so the list is intentionally unused
-// here; the parameter exists so both engines share one Plan signature.
-func (Engine) Plan(spec plan.Spec, fnDir string, _ []string) (plan.BuildPlan, error) {
+// handlers is the app's handler MODULE parts, collected from its event rules and
+// cron schedules. The Node engine uses it to transpile TypeScript at build time.
+// The Python engine uses only its EMPTINESS: a non-empty list means this image
+// will serve at least one event or schedule invocation, so PYTHON_ZUVLOOP may
+// apply. A service-only app therefore keeps the standard asyncio bootstrap and
+// installs nothing extra even when the worker-global setting is enabled.
+func (Engine) Plan(spec plan.Spec, fnDir string, handlers []string) (plan.BuildPlan, error) {
+	// The loop mode is a build input, not a runtime environment probe: enabling
+	// it changes the injected bootstrap and adds the managed install, both of
+	// which participate in the relay.bootstrap label. A service-only app has no
+	// invocation handlers, so it stays byte-identical to the disabled mode.
+	zuvloop := spec.PythonZuvloop && len(handlers) > 0
+	bootstrapContent, err := bootstrapFor(zuvloop)
+	if err != nil {
+		return plan.BuildPlan{}, err
+	}
 	files := []plan.File{{
 		Path:    "/relay/bootstrap.py",
-		Content: bootstrap,
+		Content: bootstrapContent,
 		Mode:    fs.FileMode(0o644),
 	}}
 
@@ -151,12 +211,20 @@ func (Engine) Plan(spec plan.Spec, fnDir string, _ []string) (plan.BuildPlan, er
 	// user SDK that pinned its own matching API is not disturbed (see
 	// otelAPIFloor). uv is available: the no-deps app image copies it as a
 	// tool, and a deps app image inherits it from the dependency base.
+	install := []string{otelInstall}
+	if zuvloop {
+		// The pinned zuvloop package joins the same app-image managed-install
+		// path. Keeping it out of Deps leaves the dependency fingerprint and
+		// the shared dependency layer unchanged; a service-only image and a
+		// disabled worker install nothing extra.
+		install = append(install, zuvloopInstall)
+	}
 	return plan.BuildPlan{
 		BaseImage:    spec.BaseImage,
 		WorkDir:      workDir,
 		Files:        files,
 		Deps:         deps,
-		Install:      []string{otelInstall},
+		Install:      install,
 		RuntimeTools: spec.RuntimeTools,
 		UserSetup:    userSetup,
 		User:         userID,

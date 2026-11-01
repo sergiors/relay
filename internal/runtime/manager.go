@@ -235,6 +235,15 @@ type Manager struct {
 	// without the lock: it is startup configuration and is NOT hot-reloadable.
 	// False (the default) preserves the historical baked-source behavior exactly.
 	sourceMount bool
+	// pythonZuvloop is the worker-global PYTHON_ZUVLOOP switch. It is set once
+	// at construction (WithPythonZuvloop; the worker wires config's resolved
+	// value) and read without the lock: it is startup configuration and is NOT
+	// hot-reloadable. It is threaded ONLY into a Python preparation (as
+	// plan.Spec.PythonZuvloop), where the engine applies it to the invocation
+	// bootstrap and managed install when the app declares event or schedule
+	// handlers. It never affects Node, managed services, or dependency-image
+	// identity. False (the default) is the standard asyncio loop.
+	pythonZuvloop bool
 	// mounts records, per app, the live source mount published by a successful
 	// Prepare (see setSourceMount). It is read at execution-container create and
 	// by ResolveServiceImage, and cleared on removal or when an app stops being
@@ -397,6 +406,9 @@ type managerOptions struct {
 	// sourceMount is the worker-global HOT_RELOAD switch (WithSourceMount).
 	// False preserves the historical baked-source behavior.
 	sourceMount bool
+	// pythonZuvloop is the worker-global PYTHON_ZUVLOOP switch
+	// (WithPythonZuvloop). False preserves the standard asyncio loop.
+	pythonZuvloop bool
 	// depCoord is the cross-process dependency-image coordination authority
 	// (WithDependencyImageCoordinator). Nil means no coordination: a preparation
 	// that must build from a dependency image and dependency GC fail closed.
@@ -490,6 +502,23 @@ func WithSourceMount(enabled bool) ManagerOption {
 	return func(o *managerOptions) { o.sourceMount = enabled }
 }
 
+// WithPythonZuvloop enables or disables the worker-global PYTHON_ZUVLOOP
+// behavior: Python event and schedule handler invocations run on the zuvloop
+// event loop instead of the standard asyncio loop, and the pinned zuvloop
+// package is installed into the app image through the managed uv install path.
+// It is applied only by the Python engine and only to an app that declares at
+// least one event or schedule handler: a service-only image installs nothing
+// extra and keeps its existing command, startup, and event loop unchanged. The
+// worker wires config's resolved value; a direct NewManager caller that omits
+// it keeps the historical asyncio behavior (false). It is startup
+// configuration: changing it requires a worker restart. An enabled invocation
+// image uses a distinct mode-scoped app-image tag, so enabled and disabled
+// builds cannot retag one reference; the bootstrap label still covers stale
+// bootstrap/tool changes within a mode.
+func WithPythonZuvloop(enabled bool) ManagerOption {
+	return func(o *managerOptions) { o.pythonZuvloop = enabled }
+}
+
 // WithDeferredMaintenance makes NewManager return WITHOUT starting the
 // warm-container maintenance loop; the caller must start it explicitly with
 // StartMaintenance once its own startup prerequisites hold. It exists for the
@@ -581,6 +610,7 @@ func NewManager(
 		maintDone:                make(chan struct{}),
 		now:                      resolved.now,
 		sourceMount:              resolved.sourceMount,
+		pythonZuvloop:            resolved.pythonZuvloop,
 		pullChecks:               map[string]time.Time{},
 		depCoord:                 resolved.depCoord,
 	}

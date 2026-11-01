@@ -212,6 +212,18 @@ type Config struct {
 	// resolves and validates it. False (the default) preserves the historical
 	// baked-source behavior exactly.
 	HotReload bool
+	// PythonZuvloop is the optional PYTHON_ZUVLOOP value (default false):
+	// whether Python event and schedule handler invocations run on the zuvloop
+	// event loop instead of the standard asyncio loop. It is a plain boolean and
+	// is parsed with strconv.ParseBool's accepted forms (see ParseBool); an
+	// unparseable value is a returned configuration error naming PYTHON_ZUVLOOP
+	// rather than being silently coerced. It is GLOBAL and Python-only: it
+	// applies to the invocation bootstrap of python3.14 apps that declare at
+	// least one event or schedule handler, installs the pinned zuvloop package
+	// into that app image only when it applies, and never changes a managed
+	// service's command, startup, or event loop. False (the default) preserves
+	// the standard asyncio behavior exactly and installs nothing extra.
+	PythonZuvloop bool
 }
 
 // Default max-concurrency, max-build-concurrency, and max-buffered-events
@@ -485,6 +497,12 @@ func Load(logger *slog.Logger) (Config, error) {
 		return Config{}, err
 	}
 	cfg.HotReload = hotReload
+
+	pythonZuvloop, err := ParseBool("PYTHON_ZUVLOOP", getEnv("PYTHON_ZUVLOOP", "false"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.PythonZuvloop = pythonZuvloop
 
 	return cfg, nil
 }

@@ -78,6 +78,14 @@ func openRuntimeManager(
 		// the runtime's internal source-mount mechanism. Startup
 		// configuration; a change requires a worker restart.
 		runtime.WithSourceMount(cfg.HotReload),
+		// PYTHON_ZUVLOOP: run Python event and schedule handler
+		// invocations on the zuvloop event loop instead of the standard
+		// asyncio loop, installing the pinned package into the app image
+		// through the managed uv path. It is Python-only and applies only
+		// to an app with event/schedule handlers; managed services and
+		// service-only images keep their existing startup and loop. Startup
+		// configuration; a change requires a worker restart.
+		runtime.WithPythonZuvloop(cfg.PythonZuvloop),
 		// Root Dockerfile builds in the WORKER LIFECYCLE (lifecycle), not the
 		// startup-span context: they get an independent 10m bound
 		// (runtime.buildTimeout) but are still cancelled when Relay shuts

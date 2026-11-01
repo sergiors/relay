@@ -1187,3 +1187,82 @@ func TestLoadDatabaseURL(t *testing.T) {
 		t.Fatalf("LoadDatabaseURL with no DATABASE_URL = %v, want an error naming DATABASE_URL", err)
 	}
 }
+
+// TestLoadPythonZuvloopDefault pins that PYTHON_ZUVLOOP is opt-in by default
+// (the standard asyncio loop): the variable truly UNSET and an explicitly
+// EMPTY value both resolve to false, so no image installs an extra package.
+func TestLoadPythonZuvloopDefault(t *testing.T) {
+	setRequiredEnv(t)
+
+	t.Setenv("PYTHON_ZUVLOOP", "")
+	os.Unsetenv("PYTHON_ZUVLOOP")
+	if cfg := mustLoad(t); cfg.PythonZuvloop {
+		t.Fatalf("PythonZuvloop = true, want false when unset")
+	}
+
+	t.Setenv("PYTHON_ZUVLOOP", "")
+	if cfg := mustLoad(t); cfg.PythonZuvloop {
+		t.Fatalf("PythonZuvloop = true, want false when empty")
+	}
+}
+
+// TestLoadPythonZuvloopExplicit pins that PYTHON_ZUVLOOP resolves through Load
+// for every strconv.ParseBool accepted form, including the compose-style "1"
+// and the case variants of true/false, matching the documented boolean row.
+func TestLoadPythonZuvloopExplicit(t *testing.T) {
+	tests := []struct {
+		value string
+		want  bool
+	}{
+		{"1", true},
+		{"0", false},
+		{"t", true},
+		{"T", true},
+		{"TRUE", true},
+		{"true", true},
+		{"True", true},
+		{"f", false},
+		{"F", false},
+		{"FALSE", false},
+		{"false", false},
+		{"False", false},
+		{" 1 ", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("PYTHON_ZUVLOOP", tt.value)
+			cfg := mustLoad(t)
+			if cfg.PythonZuvloop != tt.want {
+				t.Fatalf("PythonZuvloop = %v, want %v for %q", cfg.PythonZuvloop, tt.want, tt.value)
+			}
+		})
+	}
+}
+
+// TestLoadInvalidPythonZuvloopReturnsError pins the invalid PYTHON_ZUVLOOP
+// contract: Load RETURNS an error naming the variable and its boolean
+// requirement, and logs nothing, so a typo fails startup instead of silently
+// coercing.
+func TestLoadInvalidPythonZuvloopReturnsError(t *testing.T) {
+	for _, value := range []string{"yes", "2", "-1", "on", "off"} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("PYTHON_ZUVLOOP", value)
+
+			logger, buf := testLogger()
+			_, err := Load(logger)
+			if err == nil {
+				t.Fatalf("Load returned nil error for invalid PYTHON_ZUVLOOP=%q; want an error", value)
+			}
+			for _, want := range []string{"PYTHON_ZUVLOOP", "boolean"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not mention %q", err, want)
+				}
+			}
+			if buf.Len() != 0 {
+				t.Fatalf("Load logged %q for a returned config error; want no fatal log", buf.String())
+			}
+		})
+	}
+}
