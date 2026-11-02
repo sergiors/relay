@@ -135,12 +135,13 @@ func (e *discoveryLossEnv) cleanup() {
 	}
 }
 
-// xadd writes an event to this env's stream and returns its ID.
+// xadd writes an event to this env's stream (the producer shape: the payload
+// travels in `value`) and returns its ID.
 func (e *discoveryLossEnv) xadd(event string) string {
 	e.t.Helper()
 	id, err := e.cli.XAdd(context.Background(), &redis.XAddArgs{
 		Stream: e.stream,
-		Values: map[string]any{"event": event},
+		Values: map[string]any{"value": event},
 	}).Result()
 	if err != nil {
 		e.t.Fatalf("xadd: %v", err)

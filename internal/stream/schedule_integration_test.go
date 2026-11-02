@@ -32,24 +32,12 @@ func schOcc() schedule.Occurrence {
 	}
 }
 
-// schEnvelope returns the stream message body (single "event" field) carrying the
-// occurrence's envelope, exactly as the publisher writes it.
-func schEnvelope(t *testing.T, o schedule.Occurrence) string {
-	t.Helper()
-	env, err := o.Envelope()
-	if err != nil {
-		t.Fatalf("Envelope: %v", err)
-	}
-	return string(env)
-}
-
-// scriptedRunner records each schedule invocation it receives and, under a
-// configurable script, fails the first N calls and/or reports exhaustion.
+// scriptedRunner records each schedule invocation it receives and fails the
+// first N calls with a configurable retryable error.
 type scriptedRunner struct {
 	mu      sync.Mutex
 	calls   []scheduleOccCall
 	failErr error
-	exhaust bool
 }
 
 type scheduleOccCall struct {
@@ -63,11 +51,7 @@ func (r *scriptedRunner) Run(ctx context.Context, msgID string, occ schedule.Occ
 	r.mu.Lock()
 	r.calls = append(r.calls, scheduleOccCall{fn: occ.App, schedule: occ.Schedule, handler: occ.Handler, payload: append([]byte(nil), payload...)})
 	failErr := r.failErr
-	exhaust := r.exhaust
 	r.mu.Unlock()
-	if exhaust {
-		return ErrInvocationExhausted
-	}
 	return failErr
 }
 
@@ -96,7 +80,7 @@ func TestIntegrationScheduleRoutedToRunnerAndAcked(t *testing.T) {
 	e := newEnv(t, ConsumerConfig{ScheduleRunner: rr.Run})
 	o := schOcc()
 
-	id := e.xadd(t, schEnvelope(t, o))
+	id := e.xaddSchedule(t, o)
 	normalCalls := &atomic.Int64{}
 	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
 		normalCalls.Add(1)
@@ -178,7 +162,7 @@ func TestIntegrationScheduleReclaimRetriesThenAcks(t *testing.T) {
 		ReclaimInterval: 200 * time.Millisecond,
 	})
 	o := schOcc()
-	id := e.xadd(t, schEnvelope(t, o))
+	id := e.xaddSchedule(t, o)
 
 	e.start(func(ctx context.Context, msgID string, ev map[string]any) error { return nil })
 
@@ -201,20 +185,43 @@ func TestIntegrationScheduleReclaimRetriesThenAcks(t *testing.T) {
 	}
 }
 
-// A schedule message whose ScheduleRunner reports exhaustion routes to the DLQ and
-// is acked, exactly like a normal exhausted event.
+// A schedule message whose ScheduleRunner reports exhaustion exactly as the
+// production runner does — the typed error, attributed to the occurrence's
+// invocation, with the exhausted marker written to the invocation state — routes
+// to the DLQ and is acked, exactly like a normal exhausted event. The DLQ row
+// then carries the raw envelope (diagnostic) beside the live handler payload
+// (replay payload).
 func TestIntegrationScheduleExhaustionRoutesToDLQ(t *testing.T) {
 	testutil.RequireRedis(t)
-	rr := &scriptedRunner{exhaust: true}
-	e := newEnv(t, ConsumerConfig{ScheduleRunner: rr.Run})
 	o := schOcc()
-	id := e.xadd(t, schEnvelope(t, o))
-
+	e := newEnv(t, ConsumerConfig{
+		ScheduleRunner: func(ctx context.Context, msgID string, occ schedule.Occurrence, payload []byte) error {
+			if occ.ID() != o.ID() {
+				return nil
+			}
+			if string(payload) != string(o.Payload()) {
+				t.Errorf("runner payload = %q, want the live handler payload", payload)
+			}
+			p, ok := invocationStateFromCtx(t, ctx)
+			if !ok {
+				return fmt.Errorf("no invocation state in ctx")
+			}
+			started, claim, _, _ := p.TryStart(o.App+"/"+o.Handler, time.Hour)
+			if !started {
+				return ErrInvocationNotEligible
+			}
+			// The production runner marks the invocation exhausted in the
+			// invocation state before returning the typed error, so DLQ claim
+			// validation sees a current exhausted marker.
+			p.MarkExhausted(o.App+"/"+o.Handler, claim)
+			return &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
+				{App: occ.App, Handler: occ.Handler, Attempts: claim.Attempt, Err: ErrInvocationExhausted},
+			}}
+		},
+	})
+	id := e.xaddSchedule(t, o)
 	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
 		return nil
-	})
-	testutil.WaitFor(t, 8*time.Second, "schedule runner invoked", func() bool {
-		return rr.count() >= 1
 	})
 	// The invocation is exhausted, so the message routes to the DLQ (and is acked).
 	testutil.WaitFor(t, 8*time.Second, "schedule message routed to DLQ", func() bool {
@@ -231,9 +238,23 @@ func TestIntegrationScheduleExhaustionRoutesToDLQ(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected DLQ entry for %s", id)
 	}
-	// The DLQ entry must carry the schedule envelope in its `event` field.
+	// The DLQ entry must carry the schedule envelope in its `event` (diagnostic)
+	// field and the exact live handler payload as its replay payload.
 	if !strings.Contains(m.Event, "relay.schedule") {
 		t.Fatalf("DLQ event missing the schedule envelope: %q", m.Event)
+	}
+	if string(m.ReplayPayload) != string(o.Payload()) {
+		t.Fatalf("DLQ ReplayPayload = %q, want Occurrence.Payload() %q",
+			m.ReplayPayload, o.Payload())
+	}
+	if m.App != o.App || m.Handler != o.Handler {
+		t.Fatalf("DLQ attribution = %q/%q, want %q/%q", m.App, m.Handler, o.App, o.Handler)
+	}
+	if m.HandlerAttempts != 1 {
+		t.Fatalf("DLQ HandlerAttempts = %d, want the exhausted attempt 1", m.HandlerAttempts)
+	}
+	if !m.Replayable() {
+		t.Fatalf("an exhausted schedule entry must be replayable: %+v", m)
 	}
 }
 
@@ -250,7 +271,7 @@ func TestIntegrationScheduleNotEligibleLeavesPending(t *testing.T) {
 		MinPendingIdle:  300 * time.Millisecond,
 		ReclaimInterval: 200 * time.Millisecond,
 	})
-	id := env.xadd(t, schEnvelope(t, neo))
+	id := env.xaddSchedule(t, neo)
 	env.start(func(ctx context.Context, msgID string, ev map[string]any) error { return nil })
 
 	// The message must stay pending across the reclaim grace window (never acked,
@@ -281,7 +302,7 @@ func TestIntegrationScheduleObsoleteIsAckedNotDLQed(t *testing.T) {
 		MinPendingIdle:  300 * time.Millisecond,
 		ReclaimInterval: 200 * time.Millisecond,
 	})
-	id := env.xadd(t, schEnvelope(t, schOcc()))
+	id := env.xaddSchedule(t, schOcc())
 	env.start(func(ctx context.Context, msgID string, ev map[string]any) error { return nil })
 
 	// The obsolete occurrence is acknowledged: it disappears from the PEL.

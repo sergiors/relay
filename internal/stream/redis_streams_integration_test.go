@@ -41,6 +41,7 @@ import (
 	"relay/internal/config"
 	"relay/internal/dlq"
 	"relay/internal/observability/metrics"
+	"relay/internal/schedule"
 	"relay/internal/state"
 	"relay/internal/testutil"
 )
@@ -179,14 +180,36 @@ func (e *testEnv) stop(t *testing.T) {
 	}
 }
 
+// xadd appends a raw JSON event value to this env's stream (the external
+// producer shape: the payload travels in `value`) and returns its ID.
 func (e *testEnv) xadd(t *testing.T, event string) string {
 	t.Helper()
 	id, err := e.client.XAdd(context.Background(), &redis.XAddArgs{
 		Stream: e.stream,
-		Values: map[string]any{"event": event},
+		Values: map[string]any{"value": event},
 	}).Result()
 	if err != nil {
 		t.Fatalf("xadd: %v", err)
+	}
+	return id
+}
+
+// xaddSchedule appends a schedule occurrence message in the exact transport
+// shape the publisher writes: the envelope JSON as the only field, `value`
+// (beside the optional trace fields, which this helper does not write). It
+// returns the entry ID.
+func (e *testEnv) xaddSchedule(t *testing.T, occ schedule.Occurrence) string {
+	t.Helper()
+	value, err := occ.Envelope()
+	if err != nil {
+		t.Fatalf("schedule envelope: %v", err)
+	}
+	id, err := e.client.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: e.stream,
+		Values: map[string]any{"value": string(value)},
+	}).Result()
+	if err != nil {
+		t.Fatalf("xaddSchedule: %v", err)
 	}
 	return id
 }
@@ -1350,7 +1373,7 @@ func TestIntegrationPlaceholderDLQXACKFailureRetryIsIdempotent(t *testing.T) {
 
 	// Simulate a prior delivery that committed the placeholder row before its
 	// XACK failed.
-	seeded := e.seedDLQEntry(t, id, "", "-", "decode event: missing 'event' field", 1, 0)
+	seeded := e.seedDLQEntry(t, id, "", "-", "decode envelope value: missing 'value' field", 1, 0)
 
 	handlerRan := false
 	e.consumer.processMessage(context.Background(), msg, 2, func(context.Context, string, map[string]any) error {
@@ -1507,7 +1530,7 @@ func TestIntegrationReconnectAndResume(t *testing.T) {
 
 	// Consume an event before the outage.
 	firstID, err := rc.XAdd(context.Background(),
-		&redis.XAddArgs{Stream: stream, Values: map[string]any{"event": `{"a":1}`}}).Result()
+		&redis.XAddArgs{Stream: stream, Values: map[string]any{"value": `{"a":1}`}}).Result()
 	if err != nil {
 		t.Fatalf("xadd: %v", err)
 	}
@@ -1552,7 +1575,7 @@ func TestIntegrationReconnectAndResume(t *testing.T) {
 	testutil.WaitFor(t, 8*time.Second, "consumer healthy after recovery", func() bool { return consumer.Healthy() })
 
 	secondID, err := rc.XAdd(context.Background(),
-		&redis.XAddArgs{Stream: stream, Values: map[string]any{"event": `{"b":2}`}}).Result()
+		&redis.XAddArgs{Stream: stream, Values: map[string]any{"value": `{"b":2}`}}).Result()
 	if err != nil {
 		t.Fatalf("xadd after recovery: %v", err)
 	}

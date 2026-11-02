@@ -62,7 +62,7 @@ func rejectionEnv(t *testing.T, cli *redis.Client) (stream, group, msgID, event 
 	stream = prefix + "-stream"
 	group = prefix + "-group"
 	event = `{"source":"relay.schedule","app":"fn","schedule":"cleanup","handler":"jobs.old","scheduled_at":"2026-07-01T08:00:00Z"}`
-	id, err := cli.XAdd(ctx, &redis.XAddArgs{Stream: stream, Values: map[string]any{"event": event}}).Result()
+	id, err := cli.XAdd(ctx, &redis.XAddArgs{Stream: stream, Values: map[string]any{"value": event}}).Result()
 	if err != nil {
 		t.Fatalf("xadd: %v", err)
 	}
@@ -261,11 +261,12 @@ func TestIntegrationScheduleReservedInvalidDispositionIsIdempotent(t *testing.T)
 		Log:      testutil.DiscardLogger(),
 		DLQStore: pg,
 	})
-	msg := redis.XMessage{ID: msgID, Values: map[string]any{"event": event}}
+	msg := redis.XMessage{ID: msgID, Values: map[string]any{"value": event}}
 
 	// The "retry" completes the disposition: the DLQ row is committed to
-	// PostgreSQL and only then is the message terminal-ACKed.
-	c.routeToDLQ(ctx, msg, fmt.Errorf("%w: reserved", ErrScheduleInvalid), 1)
+	// PostgreSQL and only then is the message terminal-ACKed. A reserved
+	// invalid-rejection disposition has no handler payload (nil replay payload).
+	c.routeToDLQ(ctx, msg, fmt.Errorf("%w: reserved", ErrScheduleInvalid), 1, nil)
 
 	key := invocationStateKey(stream, group, msgID)
 	entries := dlqEntriesFor(t, pg, msgID)
@@ -274,6 +275,14 @@ func TestIntegrationScheduleReservedInvalidDispositionIsIdempotent(t *testing.T)
 	}
 	if entries[0].App != dlq.NoHandler || entries[0].Handler != dlq.NoHandler {
 		t.Fatalf("placeholder row attribution = %q/%q", entries[0].App, entries[0].Handler)
+	}
+	// A semantically invalid claim has no logical handler payload: the row must
+	// be non-replayable (no stored payload), never re-executed.
+	if entries[0].ReplayPayload != nil {
+		t.Fatalf("reserved-invalid row ReplayPayload = %q, want nil", entries[0].ReplayPayload)
+	}
+	if entries[0].Replayable() {
+		t.Fatalf("a reserved-invalid row must not be replayable: %+v", entries[0])
 	}
 	if n, err := cli.HExists(ctx, key, terminalField).Result(); err != nil || !n {
 		t.Fatalf("terminal marker = (%v,%v), want present (terminal ACK)", n, err)
@@ -293,7 +302,7 @@ func TestIntegrationScheduleReservedInvalidDispositionIsIdempotent(t *testing.T)
 
 	// A duplicate disposition must not commit a second row (the stable identity
 	// is idempotent in PostgreSQL, with no Redis persistence marker at all).
-	c.routeToDLQ(ctx, msg, fmt.Errorf("%w: reserved", ErrScheduleInvalid), 2)
+	c.routeToDLQ(ctx, msg, fmt.Errorf("%w: reserved", ErrScheduleInvalid), 2, nil)
 	if entries := dlqEntriesFor(t, pg, msgID); len(entries) != 1 {
 		t.Fatalf("DLQ rows after duplicate disposition = %d, want still 1", len(entries))
 	}

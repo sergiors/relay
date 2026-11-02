@@ -54,21 +54,22 @@ func dedupKey(o Occurrence) string {
 // nor a divergent entry — exactly the invariant a "no key-without-entry window"
 // guarantees.
 //
-// The stream entry always carries the untouched "event" envelope beside the
-// optional flat trace-context fields (traceparent/tracestate/baggage). A field
-// is written only when its argument is non-empty, so a publish with tracing
-// disabled (or no recording span) writes exactly the same entry as before.
+// The stream entry carries only the untouched schedule envelope as `value`,
+// beside the optional flat trace-context fields (traceparent/tracestate/
+// baggage). A field is written only when its argument is non-empty, so a
+// publish with tracing disabled writes no trace fields.
 //
 // KEYS[1] = dedup key, KEYS[2] = relay stream;
-// ARGV[1] = occurrence ID (key value), ARGV[2] = TTL ms, ARGV[3] = envelope JSON,
-// ARGV[4..6] = traceparent, tracestate, baggage (empty string = absent).
+// ARGV[1] = occurrence ID (dedup marker value), ARGV[2] = TTL ms,
+// ARGV[3] = envelope JSON (`value`), ARGV[4..6] = traceparent, tracestate,
+// baggage (empty string = absent).
 // Returns 1 = published, 0 = duplicate, or an error if the XADD failed.
 var publishScript = redis.NewScript(`
 if redis.call('EXISTS', KEYS[1]) == 1 then
   return 0
 end
 redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
-local fields = {'event', ARGV[3]}
+local fields = {'value', ARGV[3]}
 local traceKeys = {'traceparent', 'tracestate', 'baggage'}
 for i = 1, 3 do
   if ARGV[3 + i] ~= nil and ARGV[3 + i] ~= '' then
@@ -132,12 +133,12 @@ func NewPublisher(
 //
 // A `schedule.publish.attempt` span wraps ONE attempt, and the current W3C trace
 // context is injected as flat message metadata (traceparent/tracestate/baggage)
-// beside the untouched event payload, so the consumer's stream.message span
-// continues the same trace. Callers that retry a single logical occurrence (the
-// cron scheduler's bounded publication recovery) start a `schedule.publish`
-// logical span around the whole retry loop; these attempt spans are its
-// children, so every attempt of one occurrence shares one trace. With tracing
-// disabled the carrier is nil and the entry is identical to before.
+// beside the envelope `value`, so the consumer's stream.message span continues
+// the same trace. Callers that retry a single logical occurrence (the cron
+// scheduler's bounded publication recovery) start a `schedule.publish` logical
+// span around the whole retry loop; these attempt spans are its children, so
+// every attempt of one occurrence shares one trace. With tracing disabled the
+// carrier is nil and the entry carries only `value`.
 func (p *SchedulePublisher) PublishOccurrence(ctx context.Context, o Occurrence) (published bool, err error) {
 	ctx, span := tracing.Start(ctx, "schedule.publish.attempt",
 		trace.WithAttributes(

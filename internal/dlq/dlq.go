@@ -106,6 +106,12 @@ type Entry struct {
 	// oversized message carries only a bounded diagnostic summary (never the
 	// oversized payload).
 	Event string
+	// ReplayPayload is the exact JSON payload the handler received for this
+	// entry, produced by the same envelope decoder as live delivery. It is
+	// nil for an entry that can never be replayed (a malformed-message
+	// placeholder, an oversized-event summary, or a semantically invalid
+	// schedule claim).
+	ReplayPayload []byte
 	// Reason is the human-readable exhaustion reason.
 	Reason string
 	// App and Handler identify the exact exhausted invocation; both are
@@ -225,7 +231,8 @@ func NewDeliveryID(source, group, messageID string) string {
 // For a schedule occurrence, messageID is the source delivery identity of that
 // occurrence and the stored event remains the occurrence envelope
 // (occurrence_id/scheduled_at), so its provenance is preserved without making
-// the DLQ identity broker- or schedule-specific.
+// the DLQ identity broker- or schedule-specific. Its ReplayPayload is the
+// handler-facing Occurrence.Payload(), stored separately.
 //
 // The inputs are length-prefixed before hashing so arbitrary source names, group
 // names, message IDs, and invocation IDs can never alias one another. The

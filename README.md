@@ -104,6 +104,14 @@ A stream message carrying an external event may match one or more handlers
 across one or more apps. Relay only acknowledges it after every matched
 invocation reaches a terminal state.
 
+Entries carry their payload in `value`, with an optional `format` marker; every
+other entry field is ignored.
+Relay accepts raw JSON, normalized Debezium changes (from the Redis sink's
+`extended` message format, reading only `value`; schema-enabled or schemaless,
+`mongodb` and `postgresql`), and its own schedule envelopes; an explicit
+`format=raw` marker forces raw JSON. See [events](docs/events.md) for the
+envelope rules, Debezium normalization, and tombstone handling.
+
 ### Schedules
 
 Each schedule is a trigger. A firing creates a uniquely identified occurrence
@@ -196,8 +204,8 @@ resources:
 events:
   - handler: handler.handler
     pattern:
-      event_name: [INSERT]
-      table_name: [users]
+      recordType: [INSERT]
+      collectionName: [users]
     timeout: 10s
     retries: 2
 ```
@@ -385,9 +393,9 @@ To invoke an app, first place it under `./apps` and provide an event matching
 one of its handlers.
 
 ```sh
-relay app invoke my-app '{"event_name":"INSERT"}'
+relay app invoke my-app '{"recordType":"INSERT"}'
 relay app invoke my-app - < event.json
-echo '{"event_name":"INSERT"}' | relay app invoke my-app -
+echo '{"recordType":"INSERT"}' | relay app invoke my-app -
 
 # -T keeps stdin a pipe instead of an allocated pseudo-TTY.
 docker compose exec -T relay app invoke my-app - < event.json

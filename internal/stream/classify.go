@@ -9,6 +9,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"relay/internal/dlq"
+	"relay/internal/envelope"
 )
 
 // dlqEntry builds ONE broker-neutral dead-letter entry for one exhausted
@@ -29,10 +30,12 @@ import (
 //
 // The entry ID is derived from the source delivery identity plus the invocation
 // identity, so writing the same exhaustion again is idempotent by primary key.
-// The event payload is supplied by the caller: an oversized message passes only
-// its bounded diagnostic summary.
+// The Event payload is supplied by the caller: an oversized message passes only
+// its bounded diagnostic summary. ReplayPayload is the decoded logical handler
+// payload, and is nil for a message that can never be replayed.
 func dlqEntry(
 	deliveryID, source, messageID, group, consumer, event string,
+	replayPayload []byte,
 	spec dlqEntrySpec,
 	deliveries int64,
 	timestamp time.Time,
@@ -45,6 +48,7 @@ func dlqEntry(
 		DeliveryID:      deliveryID,
 		Consumer:        consumer,
 		Event:           event,
+		ReplayPayload:   replayPayload,
 		Reason:          spec.reason,
 		App:             spec.app,
 		Handler:         spec.handler,
@@ -136,90 +140,85 @@ func dlqEntrySpecs(reason error) []dlqEntrySpec {
 	return specs
 }
 
-// eventString extracts the raw "event" field value from a message as a string,
+// valueString extracts the raw "value" field value from a message as a string,
 // falling back to "-" when it cannot be represented. Used for the DLQ "event"
 // field (the original payload). Since a non-retryable message may be missing
 // the field or contain a non-string, this must not fail.
-func eventString(msg redis.XMessage) string {
-	if raw, err := extractEventString(msg); err == nil {
+func valueString(msg redis.XMessage) string {
+	if raw, err := extractValueString(msg); err == nil {
 		return raw
 	}
 	return "-"
 }
 
-// extractEventString extracts the raw "event" field value as a string. It is
+// extractValueString extracts the raw "value" field value as a string. It is
 // the single field-presence/type validation seam: processMessage uses it once
-// and then either applies the byte cap or hands the string to decodeEvent, so
+// and then applies the byte cap or hands the string to the envelope decoder, so
 // the field extraction is never duplicated or reparsed.
-func extractEventString(msg redis.XMessage) (string, error) {
-	raw, ok := msg.Values["event"]
+func extractValueString(msg redis.XMessage) (string, error) {
+	raw, ok := msg.Values["value"]
 	if !ok {
-		return "", fmt.Errorf("missing 'event' field")
+		return "", fmt.Errorf("missing 'value' field")
 	}
 	rawStr, ok := raw.(string)
 	if !ok {
-		return "", fmt.Errorf("'event' field is not a string")
+		return "", fmt.Errorf("'value' field is not a string")
 	}
 	return rawStr, nil
 }
 
-// decodeEvent decodes an already-extracted raw event string into a JSON object.
-// It is the single decode seam, so processMessage applies the byte cap and
-// decodes without a second extraction path. Unmarshal into a map rejects JSON
-// that is not an object (arrays, scalars), which is the desired non-retryable
-// classification.
-func decodeEvent(rawStr string) (map[string]any, error) {
-	var event map[string]any
-	if err := json.Unmarshal([]byte(rawStr), &event); err != nil {
-		return nil, fmt.Errorf("decode event: %w", err)
+// extractOptionalString extracts an optional transport field. A missing field
+// is the empty string; a present non-string field is malformed input.
+func extractOptionalString(msg redis.XMessage, field string) (string, error) {
+	raw, ok := msg.Values[field]
+	if !ok {
+		return "", nil
 	}
-	if event == nil {
-		// "null" decodes into a nil map without error; it is not a usable object.
-		return nil, fmt.Errorf("'event' decodes to null")
+	rawStr, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("%q field is not a string", field)
 	}
-	return event, nil
+	return rawStr, nil
 }
 
-// classifyMessage extracts and decodes the "event" field. Any error indicates the
-// message is malformed and can never be processed successfully (non-retryable).
-// It is the single-message convenience form of extractEventString + decodeEvent,
-// kept for the existing tests and any caller that does not need the raw string.
-func classifyMessage(msg redis.XMessage) (map[string]any, error) {
-	rawStr, err := extractEventString(msg)
-	if err != nil {
-		return nil, err
-	}
-	return decodeEvent(rawStr)
-}
-
-// extractAndDecodeEvent is the single extraction+decode seam the processing path
-// uses: it extracts the raw event string once, applies the raw-byte cap
-// (len(raw) is the Go string byte length), and only then decodes. A raw value
-// over maxBytes returns an *EventOversizedError without decoding or matching, so
-// the oversized payload is neither parsed nor fanned out to handlers. maxBytes
-// is always positive (the consumer resolves a default; zero never means
-// unlimited). Missing/non-string/malformed values keep the ordinary
+// extractAndDecodeEnvelope is the single extraction+decode seam the processing
+// path uses: it extracts the raw value string once, applies the raw-byte cap
+// (len(raw) is the Go string byte length), and only then decodes the envelope.
+// Every other entry field is ignored; only `value` is the body and only
+// `format` (when present) changes decoding. A raw value over maxBytes returns
+// an *EventOversizedError without decoding or
+// matching, so the oversized payload is neither parsed nor fanned out to
+// handlers. maxBytes is always positive (the consumer resolves a default; zero
+// never means unlimited). Missing/non-string/malformed values keep the ordinary
 // non-retryable (malformed) error behavior.
-func extractAndDecodeEvent(msg redis.XMessage, maxBytes int) (map[string]any, error) {
-	rawStr, err := extractEventString(msg)
+func extractAndDecodeEnvelope(
+	msg redis.XMessage,
+	maxBytes int,
+) (envelope.Result, error) {
+	rawStr, err := extractValueString(msg)
 	if err != nil {
-		return nil, err
+		return envelope.Result{}, err
 	}
 	if n := len(rawStr); n > maxBytes {
-		return nil, &EventOversizedError{Bytes: n, MaxBytes: maxBytes}
+		return envelope.Result{}, &EventOversizedError{
+			Bytes: n, MaxBytes: maxBytes,
+		}
 	}
-	return decodeEvent(rawStr)
+	format, err := extractOptionalString(msg, "format")
+	if err != nil {
+		return envelope.Result{}, err
+	}
+	return envelope.Decode(format, []byte(rawStr))
 }
 
 // ErrEventOversized is the stable, non-retryable rejection reason for a message
-// whose raw `event` value exceeds the configured byte cap. It is the sentinel
-// the DLQ `reason` is built around (see EventOversizedError) and is used by
-// tests to assert the oversize path distinct from an ordinary malformed decode
-// failure.
+// whose raw `value` exceeds the configured byte cap. It is the sentinel the DLQ
+// `reason` is built around (see EventOversizedError) and is used by tests to
+// assert the oversize path distinct from an ordinary malformed decode failure.
 var ErrEventOversized = errors.New("event oversized")
 
-// EventOversizedError is the rejection returned when a message's raw `event`
-// value is longer than the configured cap. It wraps ErrEventOversized, so
+// EventOversizedError is the rejection returned when a message's raw `value` is
+// longer than the configured cap. It wraps ErrEventOversized, so
 // errors.Is(err, ErrEventOversized) is the predicate. Its message reports the
 // measured byte length and the configured maximum, never the payload itself.
 type EventOversizedError struct {
@@ -228,7 +227,7 @@ type EventOversizedError struct {
 }
 
 func (e *EventOversizedError) Error() string {
-	return fmt.Sprintf("%s: raw event value is %d bytes, exceeds MAX_EVENT_BYTES %d",
+	return fmt.Sprintf("%s: raw value is %d bytes, exceeds MAX_EVENT_BYTES %d",
 		ErrEventOversized, e.Bytes, e.MaxBytes)
 }
 
@@ -250,5 +249,7 @@ func oversizedEventSummary(n, maxBytes int) string {
 	}); err == nil {
 		return string(b)
 	}
-	return fmt.Sprintf(`{"relay_summary":%q,"event_bytes":%d,"max_event_bytes":%d}`, marker, n, maxBytes)
+	return fmt.Sprintf(
+		`{"relay_summary":%q,"event_bytes":%d,"max_event_bytes":%d}`,
+		marker, n, maxBytes)
 }

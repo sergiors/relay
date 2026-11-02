@@ -37,7 +37,7 @@ func ackRetainEnv(t *testing.T, cli *redis.Client) (invocationStateStore, string
 	}
 	id, err := cli.XAdd(ctx, &redis.XAddArgs{
 		Stream: stream,
-		Values: map[string]any{"event": `{"a":1}`},
+		Values: map[string]any{"value": `{"a":1}`},
 	}).Result()
 	if err != nil {
 		t.Fatalf("xadd: %v", err)
@@ -266,7 +266,7 @@ func TestAtomicTerminalAckXACKFailureLeavesPendingPersistentState(t *testing.T) 
 		if err := inspect.XGroupCreateMkStream(ctx, stream, group, "0").Err(); err != nil {
 			t.Fatalf("xgroup create: %v", err)
 		}
-		id, err := inspect.XAdd(ctx, &redis.XAddArgs{Stream: stream, Values: map[string]any{"event": `{"a":1}`}}).Result()
+		id, err := inspect.XAdd(ctx, &redis.XAddArgs{Stream: stream, Values: map[string]any{"value": `{"a":1}`}}).Result()
 		if err != nil {
 			t.Fatalf("xadd: %v", err)
 		}

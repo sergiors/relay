@@ -254,7 +254,9 @@ func (e *scheduleEnv) stop(t *testing.T) {
 // has a callable handler if a stray non-schedule message is ever read.
 func noopHandler(_ context.Context, _ string, _ map[string]any) error { return nil }
 
-// xadd writes a schedule envelope to this env's stream and returns its ID.
+// xadd writes a schedule occurrence to this env's stream in the exact transport
+// shape the publisher writes — the envelope JSON as the only field, `value` —
+// and returns its ID.
 func (e *scheduleEnv) xadd(occ schedule.Occurrence) string {
 	e.t.Helper()
 	env, err := occ.Envelope()
@@ -263,7 +265,7 @@ func (e *scheduleEnv) xadd(occ schedule.Occurrence) string {
 	}
 	id, err := e.client.XAdd(context.Background(), &redis.XAddArgs{
 		Stream: e.stream,
-		Values: map[string]any{"event": string(env)},
+		Values: map[string]any{"value": string(env)},
 	}).Result()
 	if err != nil {
 		e.t.Fatalf("xadd: %v", err)

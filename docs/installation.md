@@ -108,9 +108,10 @@ not configure `GIT_WEBHOOK_ADDR` or expose/route the webhook endpoint. It does
 not provide automatic external webhook access as configured.
 
 For example, the `welcome-email-node` app uses the `node24` runtime and matches
-`INSERT` events for the `users` table. Its handler reads `event.new_image` and
-logs a welcome-email message. See [apps](apps.md), [events](events.md), and
-[services](services.md) for app behavior and configuration.
+`INSERT` events for the `users` table, exposed as `collectionName`. Its handler
+reads `event.newImage` and logs a welcome-email message. See [apps](apps.md),
+[events](events.md), and [services](services.md) for app behavior and
+configuration.
 
 ## Manage Relay
 
@@ -124,7 +125,7 @@ your Git-sourced applications, otherwise supply a matching event for your app.
 docker compose -f compose.prod.yaml exec -T relay relay app ls
 docker compose -f compose.prod.yaml exec -T relay relay app inspect my-app
 docker compose -f compose.prod.yaml exec -T relay relay app invoke my-app - <<'EOF'
-{"event_name":"INSERT","table_name":"users","new_image":{"email":"alice@example.com"}}
+{"recordType":"INSERT","collectionName":"users","newImage":{"email":"alice@example.com"}}
 EOF
 docker compose -f compose.prod.yaml exec -T relay relay stats
 docker compose -f compose.prod.yaml exec -T relay relay dlq ls

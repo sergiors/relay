@@ -960,7 +960,7 @@ func TestIntegrationAtomicStoreFailureKeepsMessagePendingAndSkipsHandler(t *test
 
 	if _, err := cli.XAdd(ctx, &redis.XAddArgs{
 		Stream: streamName,
-		Values: map[string]any{"event": `{"a":1}`},
+		Values: map[string]any{"value": `{"a":1}`},
 	}).Result(); err != nil {
 		t.Fatalf("xadd: %v", err)
 	}

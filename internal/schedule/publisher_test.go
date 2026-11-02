@@ -332,8 +332,11 @@ func TestIntegrationPublishFailureThenRetryPublishesOnce(t *testing.T) {
 }
 
 // A publish with a trace context writes the W3C fields as flat stream metadata
-// beside the untouched event envelope, so a consumer can continue the trace; a
-// publish with no trace context writes exactly the event field and nothing else.
+// beside the occurrence's `value`, so a consumer can continue the trace; a
+// publish with no trace context writes exactly `value` carrying the untouched
+// envelope and nothing else. The entry the script writes is the exact shape the
+// stream envelope decoder expects: the untouched envelope as the sole body
+// field `value`, with no stream key and no coordination fields.
 func TestIntegrationPublishWritesTraceFieldsBesideEvent(t *testing.T) {
 	cli := testutil.RequireRedis(t)
 	e := newPTestEnv(t, cli)
@@ -358,8 +361,11 @@ func TestIntegrationPublishWritesTraceFieldsBesideEvent(t *testing.T) {
 	}
 	values := entries[0].Values
 	env, _ := tracedID.Envelope()
-	if values["event"] != string(env) {
-		t.Errorf("event = %v, want the untouched envelope", values["event"])
+	if values["value"] != string(env) {
+		t.Errorf("value = %v, want the untouched envelope", values["value"])
+	}
+	if _, ok := values["key"]; ok {
+		t.Errorf("traced entry carries a `key` field %v; the transport is value-only", values["key"])
 	}
 	if values["traceparent"] == "" || values["traceparent"] == traceparent {
 		// The injected traceparent belongs to the schedule.publish child and must
@@ -367,7 +373,7 @@ func TestIntegrationPublishWritesTraceFieldsBesideEvent(t *testing.T) {
 		t.Errorf("traceparent = %v, want the injected schedule.publish traceparent", values["traceparent"])
 	}
 
-	// A second, untraced occurrence writes only the event field.
+	// A second, untraced occurrence writes only the value field.
 	plain := newUniqueOccurrence(e.prefix)
 	plain.ScheduledAt = plain.ScheduledAt.Add(time.Minute)
 	if _, err := p.PublishOccurrence(ctx, plain); err != nil {
@@ -379,7 +385,13 @@ func TestIntegrationPublishWritesTraceFieldsBesideEvent(t *testing.T) {
 	}
 	plainValues := entries[1].Values
 	if len(plainValues) != 1 {
-		t.Errorf("untraced entry has fields %v, want only event", plainValues)
+		t.Errorf("untraced entry has fields %v, want only value", plainValues)
+	}
+	if plainValues["value"] == "" {
+		t.Errorf("untraced value = %v, want the occurrence envelope", plainValues["value"])
+	}
+	if _, ok := plainValues["key"]; ok {
+		t.Error("untraced entry carries a `key` field; the transport is value-only")
 	}
 	if _, ok := plainValues["traceparent"]; ok {
 		t.Error("untraced entry carries a traceparent field")

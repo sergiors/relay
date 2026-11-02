@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -30,7 +29,7 @@ func TestProcessMessageMakeRecoverableFailureLeavesPending(t *testing.T) {
 		dispatched = true
 		return nil
 	}
-	msg := redis.XMessage{ID: "1-0", Values: map[string]any{"event": `{"event_name":"X"}`}}
+	msg := redis.XMessage{ID: "1-0", Values: map[string]any{"value": `{"event_name":"X"}`}}
 	c.processMessage(context.Background(), msg, 1, handler)
 
 	if dispatched {
@@ -55,16 +54,7 @@ func TestProcessMessageMakeRecoverableFailureLeavesPending(t *testing.T) {
 // branch threads that pending outcome through to the message span.
 func TestProcessScheduleMessageMakeRecoverableFailureLeavesPending(t *testing.T) {
 	rec := withSpanRecorder(t)
-	occ := schedule.Occurrence{
-		App:         "courses",
-		Schedule:    "cleanup",
-		Handler:     "jobs.cleanup.handler",
-		ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC),
-	}
-	envelope, err := occ.Envelope()
-	if err != nil {
-		t.Fatalf("Envelope: %v", err)
-	}
+	occ := validScheduleOccurrence()
 
 	store := newFakeInvocationStore(map[string]string{"courses/jobs.cleanup.handler": "ok"})
 	store.recoverableErr = errors.New("redis down")
@@ -77,8 +67,9 @@ func TestProcessScheduleMessageMakeRecoverableFailureLeavesPending(t *testing.T)
 	}
 
 	// Direct call: the pending outcome and non-nil error are what stop the
-	// caller from ACKing or dead-lettering.
-	outcome, err := c.processScheduleMessage(context.Background(), "9-0", 1, occ)
+	// caller from ACKing or dead-lettering. rawValue is the transport value a
+	// live delivery passes; a direct caller may pass "".
+	outcome, err := c.processScheduleMessage(context.Background(), "9-0", 1, occ, "")
 	if outcome != "pending" {
 		t.Fatalf("processScheduleMessage outcome = %q, want pending", outcome)
 	}
@@ -91,7 +82,7 @@ func TestProcessScheduleMessageMakeRecoverableFailureLeavesPending(t *testing.T)
 
 	// Through processMessage: the schedule branch records the pending outcome on
 	// the message span and never ACKs (no retainTerminal).
-	msg := redis.XMessage{ID: "9-0", Values: map[string]any{"event": string(envelope)}}
+	msg := redis.XMessage{ID: "9-0", Values: scheduleMessageValues(t, occ)}
 	c.processMessage(context.Background(), msg, 1, func(context.Context, string, map[string]any) error { return nil })
 	if calls != 0 {
 		t.Fatalf("schedule runner calls after processMessage = %d, want 0", calls)
@@ -113,16 +104,16 @@ func TestProcessScheduleMessageMakeRecoverableFailureLeavesPending(t *testing.T)
 // which performs its OWN makeRecoverable exactly once — the generic
 // preparation in processMessage must not run on top of it (a double migration
 // or a wasted event-handler context). Every other classified message keeps the
-// generic preparation exactly once: ordinary events, valid schedule envelopes
-// without a runner (the safe fallback), and never invalid claims (which are
-// dead-lettered unprepared).
+// generic preparation exactly once; a valid schedule claim without a runner
+// stays pending unprepared (a wiring fallback, not a matching fallback), and an
+// invalid claim is dead-lettered unprepared.
 func TestProcessMessageMakeRecoverableCalledExactlyOnce(t *testing.T) {
-	valid := validEnvelope(t)
+	validOcc := validScheduleOccurrence()
 	storeFields := map[string]string{"courses/jobs.cleanup.handler": "ok", "fn/h": "ok"}
 
 	tests := []struct {
 		name         string
-		body         string
+		values       func(t *testing.T) map[string]any
 		runner       bool
 		migrations   int
 		handlerCalls int
@@ -131,7 +122,7 @@ func TestProcessMessageMakeRecoverableCalledExactlyOnce(t *testing.T) {
 	}{
 		{
 			name:         "routed valid schedule with runner migrates once on the schedule path",
-			body:         envelopeBody(t, valid),
+			values:       func(t *testing.T) map[string]any { return scheduleMessageValues(t, validOcc) },
 			runner:       true,
 			migrations:   1,
 			handlerCalls: 0,
@@ -140,7 +131,7 @@ func TestProcessMessageMakeRecoverableCalledExactlyOnce(t *testing.T) {
 		},
 		{
 			name:         "ordinary event migrates once on the generic path even with a runner",
-			body:         `{"event_name":"X"}`,
+			values:       func(*testing.T) map[string]any { return map[string]any{"value": `{"event_name":"X"}`} },
 			runner:       true,
 			migrations:   1,
 			handlerCalls: 1,
@@ -148,16 +139,23 @@ func TestProcessMessageMakeRecoverableCalledExactlyOnce(t *testing.T) {
 			outcome:      "pending",
 		},
 		{
-			name:         "valid schedule without runner falls back to the generic path once",
-			body:         envelopeBody(t, valid),
+			// The wiring fallback: without a ScheduleRunner the message stays
+			// pending and is never prepared for (or matched to) event handling.
+			name:         "valid schedule without runner stays pending unprepared",
+			values:       func(t *testing.T) map[string]any { return scheduleMessageValues(t, validOcc) },
 			runner:       false,
-			migrations:   1,
-			handlerCalls: 1,
+			migrations:   0,
+			handlerCalls: 0,
 			schedCalls:   0,
 			outcome:      "pending",
 		},
 		{
-			name:         "invalid schedule claim is never prepared",
+			name: "invalid schedule claim is never prepared",
+			values: func(t *testing.T) map[string]any {
+				invalid := cloneMap(validEnvelope(t))
+				delete(invalid, "occurrence_id") // structurally invalid
+				return map[string]any{"value": envelopeBody(t, invalid)}
+			},
 			runner:       true,
 			migrations:   0,
 			handlerCalls: 0,
@@ -165,10 +163,6 @@ func TestProcessMessageMakeRecoverableCalledExactlyOnce(t *testing.T) {
 			outcome:      "dlq",
 		},
 	}
-	// Make the last case structurally invalid before rendering it.
-	invalid := cloneMap(valid)
-	delete(invalid, "occurrence_id")
-	tests[3].body = envelopeBody(t, invalid)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -190,7 +184,7 @@ func TestProcessMessageMakeRecoverableCalledExactlyOnce(t *testing.T) {
 					return errRetryableClaimTest
 				}
 			}
-			msg := redis.XMessage{ID: "1-0", Values: map[string]any{"event": tt.body}}
+			msg := redis.XMessage{ID: "1-0", Values: tt.values(t)}
 			c.processMessage(context.Background(), msg, 1, retryable)
 
 			if store.recoverableCalls != tt.migrations {

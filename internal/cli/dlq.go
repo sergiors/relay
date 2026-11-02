@@ -14,7 +14,6 @@ import (
 	"github.com/urfave/cli/v3"
 
 	"relay/internal/dlq"
-	"relay/internal/schedule"
 	"relay/internal/worker"
 )
 
@@ -109,17 +108,17 @@ func dlqLsCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 }
 
 // dlqInspectCommand builds `relay dlq inspect ID|PREFIX`: the exact current
-// fields of one entry, followed by the original event JSON pretty-printed. A
-// unique prefix of at least dlqIDShortLength characters is accepted. An unknown
-// or ambiguous ID is a clear error.
+// fields of one entry, followed by the original transport `value` pretty-printed.
+// A unique prefix of at least dlqIDShortLength characters is accepted. An
+// unknown or ambiguous ID is a clear error.
 func dlqInspectCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:      "inspect",
 		Usage:     "Show one DLQ entry",
 		UsageText: "relay dlq inspect ID|PREFIX",
-		Description: "Show a single DLQ entry's metadata and its original event " +
-			"JSON, pretty-printed. Accepts the full ID or a unique prefix of at " +
-			"least 10 characters.",
+		Description: "Show a single DLQ entry's metadata and its original " +
+			"transport value, pretty-printed. Accepts the full ID or a unique " +
+			"prefix of at least 10 characters.",
 		Arguments: []cli.Argument{
 			&cli.StringArgs{Name: "id", Min: 1, Max: 1},
 		},
@@ -136,12 +135,12 @@ func dlqInspectCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 }
 
 // dlqReplayCommand builds `relay dlq replay ID|PREFIX`: it reads the entry's
-// exact stored app, handler, and event, asks the running worker over its query
-// socket to execute exactly that one handler once against the live runtime, and
-// deletes only that DLQ entry after the execution succeeds. A unique prefix of
-// at least dlqIDShortLength characters is accepted. On any failure — a removed
-// app/handler, a failed handler, or an unavailable worker — the entry is
-// retained and a concise error is returned.
+// exact stored app, handler, and replay payload, asks the running worker over
+// its query socket to execute exactly that one handler once against the live
+// runtime, and deletes only that DLQ entry after the execution succeeds. A
+// unique prefix of at least dlqIDShortLength characters is accepted. On any
+// failure — a removed app/handler, a failed handler, or an unavailable worker —
+// the entry is retained and a concise error is returned.
 func dlqReplayCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:      "replay",
@@ -238,13 +237,14 @@ func dlqList(ctx context.Context, w io.Writer, store dlq.Store) error {
 	return tw.Flush()
 }
 
-// dlqInspect renders one entry's exact current fields, followed by the original
-// event JSON pretty-printed. It is separated from the command plumbing so tests
-// can invoke it against a fake store directly. The supplied ID may be a unique
-// prefix; it is resolved before the exact-ID lookup. An unknown ID returns a
-// clear error. The event is printed verbatim when it is not valid JSON (the
-// malformed placeholder "-", for instance) rather than hiding it, so an
-// operator sees exactly what was dead-lettered.
+// dlqInspect renders one entry's operator-facing metadata plus the original
+// diagnostic transport `value`, pretty-printed. The stored logical
+// ReplayPayload is intentionally not displayed. It is separated from the command
+// plumbing so tests can invoke it against a fake store directly. The supplied ID
+// may be a unique prefix; it is resolved before the exact-ID lookup. An unknown
+// ID returns a clear error. The value is printed verbatim when it is not valid
+// JSON (the malformed placeholder "-", for instance) rather than hiding it, so
+// an operator sees exactly what was dead-lettered.
 func dlqInspect(ctx context.Context, w io.Writer, store dlq.Store, id string) error {
 	id, err := resolveDLQID(ctx, store, id)
 	if err != nil {
@@ -310,16 +310,13 @@ func dlqInspect(ctx context.Context, w io.Writer, store dlq.Store, id string) er
 //
 // A non-replayable entry is rejected after admission and its claim released: a
 // malformed-message or oversized-event placeholder has no app/handler to
-// re-execute and an event that is not JSON, so replay would otherwise attempt to
-// encode invalid JSON and report a misleading socket-unavailability error. The
-// entry is kept for inspection or removal.
+// re-execute. The entry is kept for inspection or removal.
 //
-// The stored event is the source body, which for a schedule occurrence is its
-// envelope rather than the payload the handler received. schedule.ReplayPayload
-// maps it back to Occurrence.Payload() before dialing and leaves a valid
-// ordinary event byte-for-byte unchanged; an invalid or non-object payload, or
-// a malformed schedule claim, is an explicit pre-dial error and releases the
-// claim.
+// The handler is handed the entry's stored ReplayPayload, the exact logical
+// payload produced by the same envelope decoder as live delivery (raw JSON,
+// normalized Debezium event, or Occurrence.Payload for a schedule). There is no
+// fallback to the diagnostic Event body: an entry with no stored payload is an
+// explicit pre-dial error and releases the claim.
 func dlqReplay(ctx context.Context, w io.Writer, store dlq.Store, socketPath, id string) error {
 	id, err := resolveDLQID(ctx, store, id)
 	if err != nil {
@@ -347,14 +344,16 @@ func dlqReplay(ctx context.Context, w io.Writer, store dlq.Store, socketPath, id
 		return releaseReplayClaim(ctx, store, id, claim.Token,
 			fmt.Errorf("DLQ entry %q is not replayable: no app/handler to re-execute (malformed-message placeholder or oversized-event summary)", id))
 	}
-
-	// Replay the payload the handler actually received, not necessarily the
-	// stored body. The stored envelope itself stays untouched for inspection.
-	payload, err := schedule.ReplayPayload([]byte(entry.Event))
-	if err != nil {
+	// Replay exactly the logical handler payload stored when the entry was
+	// dead-lettered. It already reflects the envelope decoder's schedule
+	// payload and Debezium normalization, so the diagnostic Event body is never
+	// re-derived here. An entry without a stored payload must be refused before
+	// dialing the worker.
+	if len(entry.ReplayPayload) == 0 {
 		return releaseReplayClaim(ctx, store, id, claim.Token,
-			fmt.Errorf("replay %s: %w", id, err))
+			fmt.Errorf("DLQ entry %q is not replayable: no stored handler payload", id))
 	}
+	payload := entry.ReplayPayload
 
 	if err := worker.ReplayDLQ(ctx, socketPath, entry.App, entry.Handler, payload, entry.Trace); err != nil {
 		replayErr := fmt.Errorf("replay %s: %w", id, err)
@@ -501,9 +500,10 @@ func shortDLQID(id string) string {
 	return id[:dlqIDShortLength]
 }
 
-// prettyEvent renders the original event as indented JSON. A payload that is not
-// valid JSON (including the "-" placeholder for a malformed message) is rendered
-// verbatim, so inspect never hides or mangles what was dead-lettered.
+// prettyEvent renders the original transport value as indented JSON. A value
+// that is not valid JSON (including the "-" placeholder for a malformed
+// message) is rendered verbatim, so inspect never hides or mangles what was
+// dead-lettered.
 func prettyEvent(event string) string {
 	var buf bytes.Buffer
 	if err := json.Indent(&buf, []byte(event), "", "  "); err != nil {

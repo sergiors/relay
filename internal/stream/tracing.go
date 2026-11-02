@@ -13,10 +13,10 @@ import (
 
 // traceCarrierFromMessage maps a stream message's flat Redis metadata fields to
 // a W3C trace-context carrier. The fields are the exact header names
-// (traceparent/tracestate/baggage) written by the publisher beside the event
-// payload; an ordinary event message (XADDed by an external producer) has none,
-// so this returns nil and the message span is a root span. It only READS those
-// named fields and never touches the "event" payload.
+// (traceparent/tracestate/baggage) written by the publisher beside the `value`;
+// an ordinary event message (XADDed by an external producer) has none, so this
+// returns nil and the message span is a root span. It only READS those named
+// fields and never touches the payload.
 func traceCarrierFromMessage(values map[string]any) map[string]string {
 	var carrier map[string]string
 	for _, key := range []string{tracing.TraceparentKey, tracing.TracestateKey, tracing.BaggageKey} {
@@ -32,7 +32,7 @@ func traceCarrierFromMessage(values map[string]any) map[string]string {
 
 // messageSpan starts a processing span for one stream message. The attributes
 // are deliberately low-cardinality: the stream and group (configuration), the
-// delivery attempt, and the operation. The message id and the event payload are
+// delivery attempt, and the operation. The message id and the payload are
 // deliberately NOT attached (the id is unbounded per message; the payload may
 // carry secrets).
 func (c *Consumer) messageSpan(

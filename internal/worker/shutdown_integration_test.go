@@ -355,12 +355,13 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	}
 }
 
-// xadd appends an event to the stream and returns the message ID.
+// xadd appends an event to the stream (the producer shape: the payload travels
+// in `value`) and returns the message ID.
 func xadd(t *testing.T, cli *redis.Client, stream, event string) string {
 	t.Helper()
 	id, err := cli.XAdd(context.Background(), &redis.XAddArgs{
 		Stream: stream,
-		Values: map[string]any{"event": event},
+		Values: map[string]any{"value": event},
 	}).Result()
 	if err != nil {
 		t.Fatalf("xadd: %v", err)

@@ -102,7 +102,9 @@ handler itself. When gocron determines an occurrence is due, the worker attempts
 an atomic **publish-if-new** into the same Relay event stream: a single Lua
 script checks a dedup key and writes the stream entry in one step, so exactly one
 worker wins and publishes one stream entry per logical occurrence. Every other
-worker's simultaneous evaluation of the same tick is a clean no-op.
+worker's simultaneous evaluation of the same tick is a clean no-op. The entry
+carries the schedule envelope as its `value`; trace metadata, when present, is
+written as separate flat fields beside it.
 
 - Dedup keys live under `relay:schedule:<occurrence_id>` with a **14-day TTL**,
   written on the first successful publish and **never refreshed**. They are
@@ -113,7 +115,9 @@ worker's simultaneous evaluation of the same tick is a clean no-op.
   [Publication recovery](#publication-recovery)), so the original key still
   protects every retry the outbox can make.
 - Once the occurrence entry exists, the consumer group delivers it to one worker.
-  It takes the schedule-specific dispatch path, not ordinary event
+  The envelope decoder recognizes `source: relay.schedule`, validates the claim,
+  and cross-checks its `occurrence_id` against the derived occurrence identity.
+  It then takes the schedule-specific dispatch path, not ordinary event
   classification/pattern matching; PEL / `XAUTOCLAIM` recovery, invocation state,
   retries, exhaustion, and DLQ are shared with external event work.
 - A duplicate publication is a successful no-op.
@@ -316,7 +320,10 @@ consistent, never who sent it.
   marker is an ordinary external event and is untouched.
 - **Identity.** `occurrence_id` must equal the id derived from
   `app`/schedule/`scheduled_at`; identity is derived and cross-checked, never
-  trusted from the wire. A mismatch is invalid and dead-lettered.
+  trusted from the wire, so a schedule entry cannot be redirected to a different
+  occurrence. A mismatch is invalid and dead-lettered. `format=raw` takes
+  precedence and forces the entry to be decoded as raw JSON instead of a
+  schedule claim.
 - **Firing.** For a schedule whose name still exists, `scheduled_at` must be a
   real firing of the schedule's **current** cron in its effective timezone
   (including DST), computed with the same parser gocron uses. A timestamp that
@@ -333,7 +340,8 @@ Dispositions stay distinct:
   terminal, never retried and never dead-lettered.
 - **Unavailable** (app configured but not runnable): retryable, left pending.
 - **Invalid** (the name exists but the claim is not a real firing, or its cron
-  is unparseable): non-retryable, dead-lettered.
+  is unparseable): non-retryable, dead-lettered without a replay payload (no
+  handler payload ran).
 - **Handler failure**: the ordinary per-invocation retry/exhaustion lifecycle.
 
 ## The guarantee

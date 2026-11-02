@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 
 	"relay/internal/dlq"
+	"relay/internal/envelope"
 	"relay/internal/observability/metrics"
 	"relay/internal/observability/tracing"
 	"relay/internal/schedule"
@@ -44,8 +45,8 @@ func (c *Consumer) processMessage(
 	// and is set to a more specific terminal value where one applies.
 	//
 	// W3C trace context carried as flat message metadata (traceparent/
-	// tracestate/baggage, written beside the untouched event payload by the
-	// schedule publisher or any trace-aware producer) is extracted FIRST, so the
+	// tracestate/baggage, written beside the `value` by the schedule publisher
+	// or any trace-aware producer) is extracted FIRST, so the
 	// message span becomes a child of the publishing span (remote parent) and
 	// the whole stream → dispatch → function.invoke chain shares one trace. An
 	// ordinary external event (no metadata fields) is unaffected: extraction is
@@ -60,8 +61,9 @@ func (c *Consumer) processMessage(
 	ctx = spanCtx
 
 	// Register the panic boundary before any handler work so a panic in the
-	// handler handoff (or in classifyMessage, which is pure JSON parsing and
-	// practically cannot panic) is caught. The delivery is treated as failed:
+	// handler handoff (or in extractAndDecodeEnvelope, which is pure JSON
+	// parsing and practically cannot panic) is caught. The delivery is treated
+	// as failed:
 	// leave pending, no ACK, no counters; a later reclaim retries it. A
 	// panicking non-handler code path is a bug to fix, and it stays visible
 	// (logged every cycle). One edge to know: a panic AFTER a successful DLQ
@@ -78,10 +80,10 @@ func (c *Consumer) processMessage(
 	}()
 	// Defensive guard: a message with no body can never be classified. It is
 	// data loss (the entry was trimmed or XDEL'd), not a malformed payload, so
-	// it must NOT fall through to classifyMessage and be dead-lettered as a
-	// malformed message. The reclaim path clears these before this point; this
-	// guard keeps any other caller (or a future one) from silently treating it
-	// as successful processing.
+	// it must NOT fall through to extractAndDecodeEnvelope and be dead-lettered
+	// as a malformed message. The reclaim path clears these before this point;
+	// this guard keeps any other caller (or a future one) from silently treating
+	// it as successful processing.
 	if msg.Values == nil {
 		outcome = "missing"
 		spanErr = fmt.Errorf("message body no longer exists")
@@ -90,7 +92,7 @@ func (c *Consumer) processMessage(
 		c.clearMissingValueEntry(ctx, msg, missingPayloadUnknownDeliveries, true)
 		return
 	}
-	event, err := extractAndDecodeEvent(msg, c.maxEventBytes)
+	decoded, err := extractAndDecodeEnvelope(msg, c.maxEventBytes)
 	if err != nil {
 		var oversize *EventOversizedError
 		if errors.As(err, &oversize) {
@@ -110,7 +112,7 @@ func (c *Consumer) processMessage(
 				"error", err,
 			)
 			outcome, spanErr = "dlq", err
-			c.routeToDLQ(ctx, msg, err, deliveryNum)
+			c.routeToDLQ(ctx, msg, err, deliveryNum, nil)
 			return
 		}
 		// A malformed message can never succeed, so it goes straight to the DLQ on
@@ -121,53 +123,45 @@ func (c *Consumer) processMessage(
 			"error", err,
 		)
 		outcome, spanErr = "dlq", err
-		c.routeToDLQ(ctx, msg, err, deliveryNum)
+		c.routeToDLQ(ctx, msg, err, deliveryNum, nil)
 		return
 	}
 
-	// Classify the decoded event against the schedule envelope. Three outcomes:
-	//
-	//   - NotScheduleEnvelope: an ordinary external event, handled below exactly
-	//     as before.
-	//   - ValidScheduleEnvelope: a well-formed schedule occurrence; when a
-	//     ScheduleRunner is wired it is routed to it, bypassing event matching
-	//     entirely. A nil ScheduleRunner falls back to treating it as a normal
-	//     event (the safe fallback for tests/unwired consumers).
-	//   - InvalidScheduleEnvelope: the event deliberately claims schedule
-	//     identity (source==relay.schedule) but is structurally incomplete,
-	//     malformed, or carries a mismatched occurrence_id. It must NEVER fall
-	//     through to event matching and be executed/ACKed as unmatched: it can
-	//     never succeed, so it is dead-lettered as a non-retryable failure,
-	//     exactly like a malformed event body. This holds whether or not a
-	//     ScheduleRunner is wired: a malformed claim is malformed either way.
-	//
-	// Classification happens BEFORE any invocation-state migration, like the
-	// malformed-message path: an invalid claim is non-retryable and needs no
-	// recoverable state, so it is dead-lettered directly. A valid occurrence
-	// with a wired ScheduleRunner is dispatched before the generic migration
-	// because the schedule path owns that setup itself.
-	occ, envelopeKind, envelopeErr := schedule.ClassifyScheduleEnvelope(event)
-	if envelopeKind == schedule.InvalidScheduleEnvelope {
-		c.log.Error("Message: invalid schedule claim; routing to DLQ",
+	// Envelope decoding has already separated the three message kinds. A
+	// confirmed tombstone is acknowledged without execution or event matching.
+	// A schedule occurrence is dispatched directly and can never fall through to
+	// ordinary matching, even when no ScheduleRunner is wired.
+	switch decoded.Kind {
+	case envelope.KindTombstone:
+		c.log.Debug("Message: confirmed tombstone; acknowledging",
 			"message_id", msg.ID,
 			"delivery_attempt", deliveryNum,
-			"error", envelopeErr,
 		)
-		outcome, spanErr = "dlq", envelopeErr
-		c.routeToDLQ(ctx, msg, envelopeErr, deliveryNum)
+		if err := c.acknowledgeMessage(ctx, msg.ID); err != nil {
+			c.log.Warn("Message: ack failed", "message_id", msg.ID, "error", err)
+			c.noteOutcome(err, 0)
+			outcome, spanErr = "pending", err
+			return
+		}
+		outcome = "acked"
+		return
+	case envelope.KindSchedule:
+		if c.scheduleRunner == nil {
+			err := fmt.Errorf(
+				"schedule message received but ScheduleRunner is not configured")
+			c.log.Error(
+				"Message: schedule dispatch is not configured; leaving pending",
+				"message_id", msg.ID,
+				"delivery_attempt", deliveryNum,
+			)
+			outcome, spanErr = "pending", err
+			return
+		}
+		outcome, spanErr = c.processScheduleMessage(
+			ctx, msg.ID, deliveryNum, decoded.Occurrence, valueString(msg))
 		return
 	}
-
-	// A valid schedule occurrence with a wired ScheduleRunner bypasses event
-	// matching entirely. Dispatch it before the generic invocation-state setup
-	// below: processScheduleMessage owns its own migration and handler context,
-	// so doing both here would migrate twice and build an unused event handler
-	// context. A valid envelope without a runner falls through to ordinary
-	// event handling (the safe fallback for unwired consumers).
-	if envelopeKind == schedule.ValidScheduleEnvelope && c.scheduleRunner != nil {
-		outcome, spanErr = c.processScheduleMessage(ctx, msg.ID, deliveryNum, occ)
-		return
-	}
+	event := decoded.Event
 
 	// The message decoded successfully and is about to be handed to the handler.
 	// Event classification (received/matched/unmatched) is NOT counted here: it
@@ -244,7 +238,7 @@ func (c *Consumer) processMessage(
 				"reason", err,
 			)
 			outcome, spanErr = "dlq", err
-			c.routeToDLQ(ctx, msg, err, deliveryNum)
+			c.routeToDLQ(ctx, msg, err, deliveryNum, decoded.Payload)
 			return
 		}
 		c.log.Warn("Message: retryable failure; leaving pending for a later reclaim",
@@ -277,6 +271,21 @@ func (c *Consumer) processMessage(
 	// fatal.
 }
 
+// acknowledgeMessage performs the single atomic source ACK and terminal
+// invocation-state retention for a message that needs no handler dispatch, such
+// as a confirmed tombstone.
+func (c *Consumer) acknowledgeMessage(ctx context.Context, msgID string) error {
+	ackCtx, ackSpan := redisSpan(ctx, "redis.ack")
+	_, err := c.invStateStore.ackAndRetainTerminal(
+		ackCtx, c.stream, c.group, msgID, c.invocationRetention)
+	if err != nil {
+		ackSpan.RecordError(err)
+		ackSpan.SetStatus(codes.Error, err.Error())
+	}
+	ackSpan.End()
+	return err
+}
+
 // processScheduleMessage routes a schedule-occurrence message directly to the
 // ScheduleRunner (which validates the occurrence against the current template,
 // resolves the app's current timeout from the registry, and executes it),
@@ -290,14 +299,16 @@ func (c *Consumer) processMessage(
 // span, so the schedule path is traced identically to the event path. It owns
 // its own invocation-state migration and handler context, so a direct caller
 // stays self-contained; processMessage dispatches it before its generic event
-// setup.
+// setup. rawValue is the original transport `value`, preserved into a
+// dead-lettered entry's diagnostic body; a direct caller may pass "" to have the
+// occurrence envelope reconstructed.
 //
 // Schedule occurrences are deliberately NOT counted in the event-classification
 // counters (received/matched/unmatched): they bypass event matching, so they
 // have no meaningful matched/unmatched class and would otherwise break the
 // partition invariant. Schedule activity is accounted by the schedule
 // publication counters and the per-app handler counters.
-func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, deliveryNum int64, occ schedule.Occurrence) (string, error) {
+func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, deliveryNum int64, occ schedule.Occurrence, rawValue string) (string, error) {
 	c.log.Debug("Schedule: executing occurrence",
 		"app", occ.App,
 		"schedule", occ.Schedule,
@@ -391,11 +402,10 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 				"delivery_attempt", deliveryNum,
 				"reason", err,
 			)
-			if envelope, eerr := occ.Envelope(); eerr == nil {
-				c.routeToDLQ(ctx, redis.XMessage{ID: msgID, Values: map[string]any{"event": string(envelope)}}, err, deliveryNum)
-			} else {
-				c.routeToDLQ(ctx, redis.XMessage{ID: msgID}, err, deliveryNum)
-			}
+			// A semantically invalid claim has no handler payload that ran, so
+			// the entry is non-replayable (nil replay payload).
+			c.routeToDLQ(ctx,
+				scheduleDLQMessage(msgID, occ, rawValue), err, deliveryNum, nil)
 			return "dlq", err
 		}
 		// A terminal message: the schedule invocation is exhausted, so the message
@@ -406,13 +416,10 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 				"delivery_attempt", deliveryNum,
 				"reason", err,
 			)
-			// Rebuild the message with its envelope so the DLQ entry carries the
-			// schedule body (mirroring a normal event's `event` field).
-			if envelope, eerr := occ.Envelope(); eerr == nil {
-				c.routeToDLQ(ctx, redis.XMessage{ID: msgID, Values: map[string]any{"event": string(envelope)}}, err, deliveryNum)
-			} else {
-				c.routeToDLQ(ctx, redis.XMessage{ID: msgID}, err, deliveryNum)
-			}
+			// The handler payload the schedule path actually handed the runner
+			// is Occurrence.Payload(), never the coordination envelope.
+			c.routeToDLQ(ctx,
+				scheduleDLQMessage(msgID, occ, rawValue), err, deliveryNum, occ.Payload())
 			return "dlq", err
 		}
 		// A retryable failure: leave pending for a later reclaim. The
@@ -435,6 +442,31 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 	// script, exactly like processMessage, so no post-ACK orphan window
 	// exists.
 	return "acked", nil
+}
+
+// scheduleDLQMessage rebuilds the synthetic stream message routeToDLQ records
+// for a failed schedule occurrence. It mirrors the transport shape the publisher
+// writes: `value` preserves the original raw envelope, so the DLQ `event` stays
+// the dead-lettered body. When the caller has no original value (a direct
+// internal call), the occurrence envelope is reconstructed; if even that fails,
+// only the source message ID is retained and the DLQ `event` falls back to the
+// malformed placeholder.
+func scheduleDLQMessage(
+	msgID string,
+	occ schedule.Occurrence,
+	rawValue string,
+) redis.XMessage {
+	value := rawValue
+	if value == "" {
+		if envelope, err := occ.Envelope(); err == nil {
+			value = string(envelope)
+		}
+	}
+	msg := redis.XMessage{ID: msgID}
+	if value != "" {
+		msg.Values = map[string]any{"value": value}
+	}
+	return msg
 }
 
 // dlqTraceFor reads the compact trace lineage persisted for one exhausted
@@ -488,16 +520,22 @@ func (c *Consumer) dlqTraceFor(ctx context.Context, msgID, invocation string) st
 //
 // deliveryAttempts is the authoritative source delivery count passed through the
 // consumer/reclaim flow (the DLQ `deliveries` field, diagnostic only).
+//
+// replayPayload is the exact logical handler payload produced by the envelope
+// decoder (raw JSON, normalized Debezium event, or Occurrence.Payload for a
+// schedule). It is stored separately from the diagnostic `event` body so replay
+// never has to re-derive it, and is nil for an entry that can never be replayed.
 func (c *Consumer) routeToDLQ(
 	ctx context.Context,
 	msg redis.XMessage,
 	reason error,
 	deliveries int64,
+	replayPayload []byte,
 ) {
-	event := eventString(msg)
+	event := valueString(msg)
 	// An oversized-event rejection overrides the DLQ `event` field with a
 	// bounded diagnostic summary, so the oversized raw payload is never copied
-	// into PostgreSQL. Every other path keeps the original raw event verbatim.
+	// into PostgreSQL. Every other path keeps the original raw value verbatim.
 	if errors.Is(reason, ErrEventOversized) {
 		var oversize *EventOversizedError
 		if errors.As(reason, &oversize) {
@@ -571,7 +609,7 @@ func (c *Consumer) routeToDLQ(
 		spec.trace = c.dlqTraceFor(ctx, msg.ID, spec.invocation)
 		entry := dlqEntry(
 			deliveryID, c.stream, msg.ID, c.group, c.consumer,
-			event, spec, deliveries, time.Now(),
+			event, replayPayload, spec, deliveries, time.Now(),
 		)
 		inserted, err := c.dlqStore.SaveDLQEntry(ctx, entry)
 		if err != nil {

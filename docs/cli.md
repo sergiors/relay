@@ -168,9 +168,9 @@ worker's live runtime pool**, without publishing to the stream. Supply the event
 as a positional JSON object, or use `-` to read it from stdin:
 
 ```sh
-relay app invoke user-events-python '{"event_name":"INSERT"}'
+relay app invoke user-events-python '{"recordType":"INSERT","collectionName":"users"}'
 relay app invoke user-events-python - < event.json
-echo '{"event_name":"INSERT"}' | relay app invoke user-events-python -
+echo '{"recordType":"INSERT","collectionName":"users"}' | relay app invoke user-events-python -
 ```
 
 A bare `relay app invoke NAME` is a usage error; stdin is never read implicitly,
@@ -212,14 +212,16 @@ characters; the ID shown by `ls` is therefore enough to copy. A prefix that
 matches no entry is an error, and an ambiguous prefix is rejected with the
 matching IDs, so add characters until it is unique.
 
-`inspect ID` shows one entry's fields plus the original event JSON
-pretty-printed; a non-JSON (malformed placeholder) event is shown verbatim.
-`rm ID` deletes one **settled** entry without touching broker invocation state
-or causing execution. An entry whose source delivery may still be recoverable is
-refused with an explicit "not settled" error; it becomes removable only after its
-source ACK is confirmed (or reconciliation proves it is no longer pending). An
-entry with an active replay claim is likewise refused until the claim is released
-or its lease expires.
+`inspect ID` shows one entry's operator-facing metadata plus the dead-lettered
+transport `value` (the original diagnostic body) pretty-printed; a non-JSON
+(malformed placeholder) value is shown verbatim. The entry also stores the exact
+logical handler payload (`replay_payload`) used by replay, kept separately and
+not shown by `inspect`. `rm ID` deletes one **settled** entry without touching
+broker invocation state or causing execution. An entry whose source delivery may
+still be recoverable is refused with an explicit "not settled" error; it becomes
+removable only after its source ACK is confirmed (or reconciliation proves it is
+no longer pending). An entry with an active replay claim is likewise refused
+until the claim is released or its lease expires.
 
 ```
 relay dlq replay ID_OR_PREFIX
@@ -227,10 +229,13 @@ relay dlq replay ID_OR_PREFIX
 
 Re-executes that entry's exact recorded app/handler once on the running
 worker and deletes the entry **only on success**; the entry is kept on any
-failure (removed handler, failed handler, or unavailable worker). A
-malformed-message placeholder has no handler to re-execute and is not replayable;
-an unsettled entry is rejected before dialing because its source delivery may
-still be recoverable.
+failure (removed handler, failed handler, or unavailable worker). Replay hands
+the handler the entry's stored `replay_payload` — the same logical payload the
+envelope decoder produced for live delivery — never the diagnostic transport
+`value`. A malformed-message placeholder has no handler to re-execute and is not
+replayable; an entry without a stored replay payload is rejected before the
+worker is contacted. An unsettled entry is rejected before dialing because its
+source delivery may still be recoverable.
 
 Replay is admitted by a PostgreSQL claim committed before the worker is
 contacted: a monotonic fencing token and a ten-minute lease in database time. A

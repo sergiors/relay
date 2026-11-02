@@ -27,7 +27,7 @@ func TestProductionAckUsesAtomicAckAndRetain(t *testing.T) {
 	t.Run("event success", func(t *testing.T) {
 		store := newFakeInvocationStore(nil)
 		c := processMessageConsumer(store)
-		msg := redis.XMessage{ID: "1-0", Values: map[string]any{"event": `{"event_name":"X"}`}}
+		msg := redis.XMessage{ID: "1-0", Values: map[string]any{"value": `{"event_name":"X"}`}}
 		c.processMessage(context.Background(), msg, 1, func(context.Context, string, map[string]any) error {
 			return nil
 		})
@@ -37,7 +37,7 @@ func TestProductionAckUsesAtomicAckAndRetain(t *testing.T) {
 	t.Run("event exhaustion via DLQ", func(t *testing.T) {
 		store := newFakeInvocationStore(nil)
 		c := processMessageConsumer(store)
-		msg := redis.XMessage{ID: "1-0", Values: map[string]any{"event": `{"event_name":"X"}`}}
+		msg := redis.XMessage{ID: "1-0", Values: map[string]any{"value": `{"event_name":"X"}`}}
 		c.processMessage(context.Background(), msg, 1, func(ctx context.Context, _ string, _ map[string]any) error {
 			p, ok := InvocationStateFrom(ctx)
 			if !ok {
@@ -59,6 +59,15 @@ func TestProductionAckUsesAtomicAckAndRetain(t *testing.T) {
 		if !ok || len(dlqStore.entries) != 1 {
 			t.Fatalf("DLQ entries = %d, want 1 (the entry must be persisted before the ack)", len(dlqStore.entries))
 		}
+		entry := dlqStore.entries[0]
+		if entry.App != "fn" || entry.Handler != "h" {
+			t.Fatalf("DLQ attribution = %q/%q, want fn/h", entry.App, entry.Handler)
+		}
+		// The exhausted event stores the exact logical handler payload beside
+		// its diagnostic body, so replay ships what the handler received.
+		if string(entry.ReplayPayload) != `{"event_name":"X"}` {
+			t.Fatalf("DLQ ReplayPayload = %q, want the decoded handler payload", entry.ReplayPayload)
+		}
 	})
 
 	t.Run("malformed message via DLQ", func(t *testing.T) {
@@ -77,6 +86,20 @@ func TestProductionAckUsesAtomicAckAndRetain(t *testing.T) {
 		// A body-less message takes the missing-payload branch with ack=true.
 		c.processMessage(context.Background(), redis.XMessage{ID: "1-0"}, 1,
 			func(context.Context, string, map[string]any) error { return nil })
+		assertAtomicAckOnly(t, store)
+	})
+
+	t.Run("tombstone ack", func(t *testing.T) {
+		store := newFakeInvocationStore(nil)
+		c := processMessageConsumer(store)
+		// A tombstone entry carries only the null-value sentinel in `value`
+		// and is acknowledged without any handler dispatch.
+		msg := redis.XMessage{ID: "1-0", Values: map[string]any{
+			"value": "default",
+		}}
+		c.processMessage(context.Background(), msg, 1, func(context.Context, string, map[string]any) error {
+			return nil
+		})
 		assertAtomicAckOnly(t, store)
 	})
 
@@ -140,7 +163,8 @@ func assertAtomicAckOnly(t *testing.T, store *fakeInvocationStore) {
 }
 
 // scheduleMessage builds a stream message carrying a valid schedule occurrence
-// envelope, so processMessage classifies it as a schedule claim.
+// in the exact transport field the publisher writes (`value` alone), so
+// processMessage classifies it as a schedule claim.
 func scheduleMessage(t *testing.T) redis.XMessage {
 	t.Helper()
 	occ := schedule.Occurrence{
@@ -149,9 +173,5 @@ func scheduleMessage(t *testing.T) redis.XMessage {
 		Handler:     "jobs.cleanup.handler",
 		ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC),
 	}
-	envelope, err := occ.Envelope()
-	if err != nil {
-		t.Fatalf("Envelope: %v", err)
-	}
-	return redis.XMessage{ID: "9-0", Values: map[string]any{"event": string(envelope)}}
+	return redis.XMessage{ID: "9-0", Values: scheduleMessageValues(t, occ)}
 }

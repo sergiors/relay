@@ -35,7 +35,7 @@ func TestIntegrationDeliveryInspectorPendingSemantics(t *testing.T) {
 
 	inspector := NewDeliveryInspector(cli)
 	add := func() string {
-		res, err := cli.XAdd(ctx, &redis.XAddArgs{Stream: streamName, Values: map[string]any{"event": `{"a":1}`}}).Result()
+		res, err := cli.XAdd(ctx, &redis.XAddArgs{Stream: streamName, Values: map[string]any{"value": `{"a":1}`}}).Result()
 		if err != nil {
 			t.Fatalf("xadd: %v", err)
 		}

@@ -69,6 +69,9 @@ func TestDLQEntrySaveAndGetRoundTripsLosslessly(t *testing.T) {
 	entry.Consumer = "\xffworker"
 	entry.App = "fn"
 	entry.Handler = "index.run"
+	// The replay payload is the exact logical handler payload the stream
+	// decoded; it survives the same lossless encoding (including NUL bytes).
+	entry.ReplayPayload = []byte(`{"c":"customers"}` + lossyBytes)
 
 	inserted, err := c.SaveDLQEntry(ctx, entry)
 	if err != nil || !inserted {
@@ -89,6 +92,10 @@ func TestDLQEntrySaveAndGetRoundTripsLosslessly(t *testing.T) {
 	// losslessly out of JSONB.
 	if got.Event != entry.Event {
 		t.Fatalf("Event round-trip mismatch: got %q want %q", got.Event, entry.Event)
+	}
+	if string(got.ReplayPayload) != string(entry.ReplayPayload) {
+		t.Fatalf("ReplayPayload round-trip mismatch: got %q want %q",
+			got.ReplayPayload, entry.ReplayPayload)
 	}
 	if got.Reason != entry.Reason {
 		t.Fatalf("Reason round-trip mismatch: got %q want %q", got.Reason, entry.Reason)
@@ -111,7 +118,7 @@ func TestDLQEntrySaveAndGetRoundTripsLosslessly(t *testing.T) {
 	}
 
 	// The placeholder identity is distinct and replayable-free.
-	placeholder := dlqEntryFor(deliveryID, "", "-", "decode event: missing 'event' field", at)
+	placeholder := dlqEntryFor(deliveryID, "", "-", "decode envelope value: missing 'value' field", at)
 	if inserted, err := c.SaveDLQEntry(ctx, placeholder); err != nil || !inserted {
 		t.Fatalf("SaveDLQEntry placeholder = (%v,%v)", inserted, err)
 	}
@@ -124,6 +131,11 @@ func TestDLQEntrySaveAndGetRoundTripsLosslessly(t *testing.T) {
 	}
 	if got2.Replayable() {
 		t.Fatalf("placeholder must not be replayable: %+v", got2)
+	}
+	// A placeholder stores no replay payload (it decoded nothing): the field is
+	// omitted and never substituted with the Event body.
+	if got2.ReplayPayload != nil {
+		t.Fatalf("placeholder ReplayPayload = %q, want nil", got2.ReplayPayload)
 	}
 
 	// The lossy identity also flows through the reconciliation listing, which

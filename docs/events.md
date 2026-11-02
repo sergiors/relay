@@ -1,40 +1,122 @@
 # Events
 
-Relay consumes external events from the configured Redis Stream with a consumer
-group. Each external-event entry carries an `event` field whose value is a JSON
-**object**; Relay classifies it against every loaded app's event rules, matches
-that object against their patterns, and runs the matching handlers. Schedule
-occurrences use the same stream and consumer group but a separate schedule
-dispatch path: they resolve/adopt the configured handler directly and bypass
-ordinary event classification and pattern matching (see
-[schedules.md](schedules.md)).
+Relay consumes events from the configured Redis Stream with a consumer group.
+Each stream entry carries its payload in a `value` field (a JSON **object**) and
+may carry an optional `format` marker. Every other entry field is ignored.
+Relay decodes the envelope into one of three kinds before any matching:
+
+- a raw JSON event;
+- a validated schedule occurrence (see [schedules.md](schedules.md));
+- a confirmed Debezium tombstone, acknowledged without execution.
+
+Decoded Debezium changes are normalized into a stable handler shape with exactly
+`collectionName`, `recordType`, `newImage`, and `oldImage`. Ordinary events then
+pass through event classification and pattern matching. Schedule occurrences use
+the same stream and consumer group but a separate schedule dispatch path: they
+resolve/adopt the configured handler directly and bypass ordinary event
+classification and pattern matching.
 
 ```
-Producer → Redis Stream → Relay (classify + pattern-match external event)
-→ matching handler → one-shot function → shared invocation lifecycle → XACK
+Producer → Redis Stream → Relay (decode envelope + match external event)
+→ matching handler → one-shot function → invocation lifecycle → XACK
 ```
 
-An external-event message that decodes successfully is classified `matched` or
-`unmatched` **before any execution**; an unmatched event is acknowledged and
-never retried. A malformed external-event message (missing `event`, not a string,
-not a JSON object) can never succeed and is routed straight to the DLQ on first
-encounter without running a handler, then acknowledged.
+An event that decodes successfully is classified `matched` or `unmatched`
+**before any execution**; an unmatched event is acknowledged and never retried.
+A malformed message (missing `value`, a non-string `value` or `format`, an
+unknown `format` marker, a `value` that is not a JSON object, or a recognized
+schedule/Debezium claim that fails validation) can never succeed and is routed
+straight to the DLQ on first encounter without running a handler, then
+acknowledged.
 
-A message whose raw `event` value exceeds `MAX_EVENT_BYTES` (default 256 KiB) is
-also non-retryable and routed straight to the DLQ before decode, matching, or a
+## Envelope formats
+
+### Raw JSON (`format` absent or `format=raw`)
+
+A `value` that is a JSON object with no recognized schedule or Debezium
+structure is a raw JSON event. An explicit `format=raw` marker takes precedence
+over structure recognition and forces this path, including for a Debezium
+tombstone or a schedule claim. Use it for an application event that
+intentionally carries a Debezium-like `source.connector` but is not a Debezium
+change. An unknown `format` value is non-retryable; a present non-string
+`format` is equally malformed.
+
+### Schedule
+
+A `value` object with `source: relay.schedule` claims schedule identity and can
+never fall through to event matching. The derived occurrence identity is carried
+as `occurrence_id` inside the envelope and is cross-checked against the
+app/schedule/`scheduled_at` fields. A structurally malformed claim or a
+mismatched `occurrence_id` is non-retryably dead-lettered.
+
+### Debezium
+
+Relay consumes Debezium Server's Redis sink in **extended** message format
+(`debezium.sink.redis.message.format=extended`), because Relay consumes the
+change from the named `value` field. Relay reads `value` and ignores unrelated
+stream fields. Debezium's `compact` format does not provide this named field, so
+extended format is required.
+
+A schema-enabled `{schema, payload}` wrapper with an object `schema` claims
+Debezium structure when `payload` has a `source` object naming a `connector` and
+a CDC marker (`op`, or both `before` and `after`). The wrapper is the additional
+evidence, so a missing `collection`/`table` still claims and is rejected during
+validation. A schemaless record needs that `source.connector`, a CDC marker, and
+either a `collection`/`table` location or another known Debezium source field
+(such as `version`, `name`, `ts_ms`, `db`, or `schema`). A wrapper without an
+object `schema` only claims if its payload satisfies the schemaless rule.
+
+Once claimed, a missing, empty, or non-string `op`, an unsupported connector, a
+missing or ill-typed collection/table, or an invalid non-null image is
+non-retryable and never falls back to raw matching; a missing image remains
+`null`. A raw object with only `op`, a `source` object without a connector, or a
+connector/location without a CDC marker remains raw; an explicit `format=raw`
+always forces raw.
+
+Relay supports the `mongodb` and `postgresql` connectors, reading
+`source.collection` or `source.table` respectively, and maps:
+
+| `op`     | `recordType` |
+| -------- | ------------ |
+| `c`, `r` | `INSERT`     |
+| `u`      | `UPDATE`     |
+| `d`      | `DELETE`     |
+
+A snapshot read (`r`) is an existing captured row, so it is normalized to
+`INSERT`. `after` becomes `newImage` and `before` becomes `oldImage`; each must
+be a JSON object or `null`, and an unknown `op` or unsupported connector is
+non-retryable rather than matching as a raw event. For MongoDB, `before`/`after`
+are JSON strings and are decoded strictly; Extended JSON `{"$oid":"..."}`
+wrappers are recursively unwrapped to their string, while other BSON wrappers
+(`$date`, `$numberDecimal`, `$binary`, and so on) are left untouched.
+
+A Debezium tombstone is ignored (acknowledged without execution) only when there
+is no `format=raw` marker and `value` is exactly the default null-value
+sentinel, `default` (the default for `debezium.sink.redis.null.value`). A custom
+`null.value` marker is not recognized as a tombstone and follows normal
+decoding. `format=raw` takes precedence, so the literal `default` is decoded as
+a non-object value and is non-retryable. Relay never synthesizes a DELETE from
+a tombstone.
+
+### Size limit
+
+A message whose raw `value` exceeds `MAX_EVENT_BYTES` (default 256 KiB) is also
+non-retryable and routed straight to the DLQ before decode, matching, or a
 handler runs. Because the cap is checked on the raw value, this applies to any
-message kind — ordinary external events and schedule-claim payloads alike. The
-check is a Relay-boundary guard: Redis and go-redis have already materialized the
-entry before Relay can inspect it, so it is not transport-level protection
-against a huge entry, and metadata/RESP overhead is outside the setting.
+message kind — ordinary events, Debezium changes, and schedule claims alike.
+The check is a Relay-boundary guard: Redis and go-redis have already
+materialized the entry before Relay can inspect it, so it is not
+transport-level protection against a huge entry, and metadata/RESP overhead is
+outside the setting.
 
 ## Publishing an event
 
 Any producer can append to the stream. With `redis-cli` against the configured
-stream:
+stream, write the event body in `value`; Relay ignores unrelated entry fields:
 
 ```sh
-redis-cli XADD events '*' event '{"event_name":"INSERT","table_name":"users"}'
+redis-cli XADD events '*' \
+  value '{"recordType":"INSERT","collectionName":"users","newImage":{"email":"alice@example.com"}}'
 ```
 
 Relay never assumes where events originate; it only reads the stream.
@@ -53,8 +135,8 @@ Rules live under `events` in `template.yaml`:
 events:
   - handler: events.created.handler
     pattern:
-      event_name: [INSERT]
-      table_name: [users]
+      recordType: [INSERT]
+      collectionName: [users]
     timeout: 20s
     retries: 2
 ```
@@ -67,10 +149,10 @@ A pattern is a tree of field conditions. Each field's condition is an
 - a single-operator map — `id: [{prefix: "user_"}]`, `score: [{gt: 70}]`,
   `deleted_at: [{exists: false}]`;
 - a nested map — a group of child fields, ANDed with each other:
-  `new_image: {status: [COMPLETED]}`.
+  `newImage: {status: [COMPLETED]}`.
 
-A bare map value is shorthand for a single-element list, so `new_image:
-{status: [COMPLETED]}` and `new_image: [{status: [COMPLETED]}]` are equivalent.
+A bare map value is shorthand for a single-element list, so `newImage:
+{status: [COMPLETED]}` and `newImage: [{status: [COMPLETED]}]` are equivalent.
 A list element may itself be a nested map, which lets one field carry several
 alternative sub-objects:
 
@@ -118,7 +200,7 @@ expression string:
 
 ```yaml
 pattern:
-  new_image:
+  newImage:
     created_at:
       - gt: "now()-5m"
 ```
@@ -136,9 +218,9 @@ pattern:
   with `{lt: "now()"}` is not a range.
 
 `exists` checks key presence only — `null`, `false`, `0`, `""`, `{}`, `[]` all
-count as present. It works recursively: `new_image: [{exists: true}]` checks the
-top-level key; `new_image: {name: [{exists: true}]}` checks `name` inside
-`new_image`. A nested `exists: true` fails when a parent is missing; a nested
+count as present. It works recursively: `newImage: [{exists: true}]` checks the
+top-level key; `newImage: {name: [{exists: true}]}` checks `name` inside
+`newImage`. A nested `exists: true` fails when a parent is missing; a nested
 `exists: false` matches when the nested key is absent, including when the parent
 map itself is missing.
 
@@ -169,7 +251,7 @@ there is no environment variable or template key that changes them.
   depth: a field's OR-alternative list (`status: [A, B]`) and a single-key
   operator map (`id: [{prefix: "x"}]`) do not consume a level, and
   siblings/alternatives do not accumulate. A nested-map alternative introduces its
-  child fields at the next level, so `new_image: [{status: [COMPLETED]}]` puts
+  child fields at the next level, so `newImage: [{status: [COMPLETED]}]` puts
   `status` at level 2. A **composite literal container** — a list or map used as
   an equality value, e.g. `tags: [[1, 2]]` — consumes one level per container
   nesting, so a deeply nested composite cannot bypass the cap.
@@ -193,7 +275,7 @@ matches, and is indexed exactly as before. A valid nested pattern:
 
 ```yaml
 pattern:
-  new_image:
+  newImage:
     status: [COMPLETED]
     metadata:
       source: [{prefix: "sync_"}]
@@ -391,17 +473,23 @@ occurrence functions use this shared invocation/DLQ infrastructure.
   `delivery_id`, nullable `settled_at_ms`, `created_at_ms`, and the replay
   admission columns `replay_claim_token` and `replay_lease_until_ms` (part of the
   fresh schema; there is no migration or existing-database compatibility).
-  Event and reason bytes are base64-encoded inside the JSON payload, so arbitrary
-  malformed bytes, including NUL, survive JSONB losslessly.
+  Event, replay-payload, and reason bytes are base64-encoded inside the JSON
+  payload, so arbitrary malformed bytes, including NUL, survive JSONB losslessly.
 - Entry fields: `id`, `delivery_id`, `source`, `source_group`,
-  `source_message_id`, `consumer`, `event`, `reason`, `app`, `handler`,
-  `deliveries` (diagnostic source count), `handler_attempts` (the persisted
-  admitted-claim count; normally the real execution count, but a crash or
-  abandoned claim can advance it without an execution), `timestamp` (RFC 3339),
-  `settled_at` (empty while unsettled), and an optional `trace` lineage. A
-  malformed-message entry uses `-` for `app`/`handler` and
-  `handler_attempts` `0`. A schedule occurrence's event envelope
-  (`occurrence_id`, `scheduled_at`) is stored verbatim, preserving provenance.
+  `source_message_id`, `consumer`, `event` (the original transport `value`,
+  diagnostic), `replay_payload` (the exact logical handler payload produced by
+  the envelope decoder), `reason`, `app`, `handler`, `deliveries` (diagnostic
+  source count), `handler_attempts` (the persisted admitted-claim count; normally
+  the real execution count, but a crash or abandoned claim can advance it without
+  an execution), `timestamp` (RFC 3339), `settled_at` (empty while unsettled),
+  and an optional `trace` lineage. A malformed-message entry uses `-` for
+  `app`/`handler` and `handler_attempts` `0`. A semantically invalid schedule
+  claim has no handler payload that ran and is likewise stored without a
+  `replay_payload`. A schedule occurrence's transport `value` (its envelope with
+  `occurrence_id`/`scheduled_at`) is stored verbatim, preserving provenance,
+  while its `replay_payload` is `Occurrence.Payload()`. `relay dlq replay`
+  always hands the handler `replay_payload`; an entry without one is rejected
+  before the worker is contacted.
 - An oversized-event entry is intentionally **summary-only and non-replayable**:
   it carries the same `-` placeholder app/handler (no handler invocation ever
   ran) and its `event` field is a small diagnostic JSON summary

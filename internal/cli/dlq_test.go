@@ -260,9 +260,12 @@ func withFakeDLQ(t *testing.T, store *fakeDLQStore) Dependencies {
 	return withFakeDLQStore(t, store)
 }
 
-// dlqTestEntry builds a current-format entry with sensible defaults.
+// dlqTestEntry builds a current-format entry with sensible defaults. A real
+// invocation carries the entry's stored replay payload (the exact logical
+// handler payload the stream persisted when dead-lettering); the "-" malformed
+// placeholder carries none and is never replayable.
 func dlqTestEntry(id, originalID, function, handler, event, timestamp string) dlq.Entry {
-	return dlq.Entry{
+	entry := dlq.Entry{
 		ID:              id,
 		Source:          "events",
 		SourceMessageID: originalID,
@@ -277,6 +280,10 @@ func dlqTestEntry(id, originalID, function, handler, event, timestamp string) dl
 		Timestamp:       timestamp,
 		SettledAt:       timestamp,
 	}
+	if function != "-" && handler != "-" {
+		entry.ReplayPayload = []byte(event)
+	}
+	return entry
 }
 
 // dlqHexID builds a deterministic full-length (dlqIDLength, 64-character)
@@ -1014,15 +1021,18 @@ func TestDLQReplayScheduleEnvelopeInspectedAsStoredEnvelope(t *testing.T) {
 	}
 }
 
-// TestDLQReplayScheduleEnvelopeExecutesHandlerPayload verifies the full-stack
-// replay of an exhausted schedule invocation: the real runner, reached over the
-// real worker socket, executes exactly the recorded handler with
-// Occurrence.Payload() — the bytes the LIVE schedule path would have handed it —
-// never the stored envelope, and the successful replay deletes the entry.
-func TestDLQReplayScheduleEnvelopeExecutesHandlerPayload(t *testing.T) {
-	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", scheduleReplayEnvelope(t), "2026-10-01T08:05:00Z"),
-	}}
+// TestDLQReplayScheduleStoredPayloadExecutesHandlerPayload verifies the
+// full-stack replay of an exhausted schedule invocation: the DLQ row carries
+// the coordination envelope in its diagnostic Event body (what the stream
+// dead-lettered) and Occurrence.Payload() — the bytes the LIVE schedule path
+// handed the runner — as its stored replay payload. The real runner, reached
+// over the real worker socket, executes exactly the recorded handler exactly
+// once with the stored payload, and the successful replay deletes the entry.
+func TestDLQReplayScheduleStoredPayloadExecutesHandlerPayload(t *testing.T) {
+	entry := dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler",
+		scheduleReplayEnvelope(t), "2026-10-01T08:05:00Z")
+	entry.ReplayPayload = scheduleReplayOccurrence().Payload()
+	store := &fakeDLQStore{entries: []dlq.Entry{entry}}
 	exec := &dlqReplayExecutor{}
 	deps := dlqReplayRunner(t, store, exec)
 
@@ -1051,12 +1061,15 @@ func TestDLQReplayScheduleEnvelopeExecutesHandlerPayload(t *testing.T) {
 	}
 }
 
-// TestDLQReplayScheduleEnvelopeForwardsTrace verifies the schedule replay still
-// carries the entry's optional trace lineage to the worker as control-path
-// metadata, separate from (and alongside) the converted handler payload.
-func TestDLQReplayScheduleEnvelopeForwardsTrace(t *testing.T) {
+// TestDLQReplayScheduleStoredPayloadForwardsTrace verifies the schedule
+// replay still carries the entry's optional trace lineage to the worker as
+// control-path metadata, separate from (and alongside) the stored handler
+// payload.
+func TestDLQReplayScheduleStoredPayloadForwardsTrace(t *testing.T) {
 	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-	entry := dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", scheduleReplayEnvelope(t), "2026-10-01T08:05:00Z")
+	entry := dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler",
+		scheduleReplayEnvelope(t), "2026-10-01T08:05:00Z")
+	entry.ReplayPayload = scheduleReplayOccurrence().Payload()
 	entry.Trace = lineage
 	store := &fakeDLQStore{entries: []dlq.Entry{entry}}
 	deps := withFakeDLQ(t, store)
@@ -1081,10 +1094,12 @@ func TestDLQReplayScheduleEnvelopeForwardsTrace(t *testing.T) {
 	}
 }
 
-// TestDLQReplayMalformedScheduleEnvelopeKeepsEntryPreDial verifies a stored
-// envelope that carries the schedule marker but is incomplete fails with an
-// explicit error BEFORE anything is dialed or executed, and the entry is kept.
-func TestDLQReplayMalformedScheduleEnvelopeKeepsEntryPreDial(t *testing.T) {
+// TestDLQReplayScheduleClaimWithoutPayloadKeepsEntryPreDial verifies a
+// malformed schedule claim — the kind whose dead-lettering produced NO handler
+// payload (the stream routes it non-retryably to the DLQ with a nil replay
+// payload) — is refused with an explicit error BEFORE anything is dialed or
+// executed, and the entry is kept for inspection.
+func TestDLQReplayScheduleClaimWithoutPayloadKeepsEntryPreDial(t *testing.T) {
 	var envelope map[string]any
 	if err := json.Unmarshal([]byte(scheduleReplayEnvelope(t)), &envelope); err != nil {
 		t.Fatalf("unmarshal schedule envelope: %v", err)
@@ -1094,9 +1109,10 @@ func TestDLQReplayMalformedScheduleEnvelopeKeepsEntryPreDial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal malformed envelope: %v", err)
 	}
-	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", string(malformed), "2026-10-01T08:05:00Z"),
-	}}
+	entry := dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler",
+		string(malformed), "2026-10-01T08:05:00Z")
+	entry.ReplayPayload = nil // the malformed claim never produced a payload
+	store := &fakeDLQStore{entries: []dlq.Entry{entry}}
 	// A wired replayer records ANY worker-side call, so it doubles as proof the
 	// socket seam was never reached.
 	deps := withFakeDLQ(t, store)
@@ -1105,63 +1121,66 @@ func TestDLQReplayMalformedScheduleEnvelopeKeepsEntryPreDial(t *testing.T) {
 
 	_, _, err = runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
 	if err == nil {
-		t.Fatal("a malformed schedule envelope must not be replayed")
+		t.Fatal("a schedule claim with no stored payload must not be replayed")
 	}
-	if !strings.Contains(err.Error(), "replay "+dlqUnitID) || !strings.Contains(err.Error(), "schedule claim") {
-		t.Fatalf("err = %v, want a schedule-claim replay error naming the resolved entry", err)
+	if !strings.Contains(err.Error(), fmt.Sprintf("DLQ entry %q is not replayable", dlqUnitID)) ||
+		!strings.Contains(err.Error(), "no stored handler payload") {
+		t.Fatalf("err = %v, want the no-stored-payload replay error naming the resolved entry", err)
 	}
 	if calls, _, _ := rep.got(); calls != 0 {
-		t.Fatalf("a malformed schedule claim must fail before the replayer: calls = %d", calls)
+		t.Fatalf("a payload-less claim must fail before the replayer: calls = %d", calls)
 	}
 	if len(store.entries) != 1 {
-		t.Fatalf("a malformed schedule claim must keep the entry: %+v", store.entries)
+		t.Fatalf("a payload-less claim must keep the entry: %+v", store.entries)
 	}
 }
 
-// TestDLQReplayNonObjectEventKeepsEntryPreDial verifies a replayable entry whose
-// stored event is JSON but not an object is rejected before the worker (no
-// misleading socket-unavailable error), executes nothing, and keeps the entry.
-func TestDLQReplayNonObjectEventKeepsEntryPreDial(t *testing.T) {
-	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", `[1,2,3]`, "2026-10-01T08:05:00Z"),
-	}}
+// TestDLQReplayNonReplayablePayloadlessEventKeepsEntryPreDial verifies an
+// entry with a real app/handler but no stored replay payload (a malformed body
+// that never reached a handler) is rejected before the worker (no misleading
+// socket-unavailable error), executes nothing, and keeps the entry.
+func TestDLQReplayNonReplayablePayloadlessEventKeepsEntryPreDial(t *testing.T) {
+	entry := dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", `[1,2,3]`, "2026-10-01T08:05:00Z")
+	entry.ReplayPayload = nil
+	store := &fakeDLQStore{entries: []dlq.Entry{entry}}
 	deps := withFakeDLQ(t, store)
 	rep := &recordingReplayer{}
 	startTestSocketWithReplayer(t, deps.SocketPath, rep)
 
 	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID)
 	if err == nil {
-		t.Fatal("a non-object event must not be replayed")
+		t.Fatal("an entry with no stored handler payload must not be replayed")
 	}
-	if !strings.Contains(err.Error(), "replay "+dlqUnitID) || !strings.Contains(err.Error(), "replay payload") {
+	if !strings.Contains(err.Error(), fmt.Sprintf("DLQ entry %q is not replayable", dlqUnitID)) ||
+		!strings.Contains(err.Error(), "no stored handler payload") {
 		t.Fatalf("err = %v, want an explicit pre-dial replay error naming the resolved entry", err)
 	}
 	if strings.Contains(err.Error(), "invocation unavailable") {
 		t.Fatalf("err = %v, must not report a misleading worker unavailability", err)
 	}
 	if calls, _, _ := rep.got(); calls != 0 {
-		t.Fatalf("a non-object event must fail before the replayer: calls = %d", calls)
+		t.Fatalf("a payload-less event must fail before the replayer: calls = %d", calls)
 	}
 	if len(store.entries) != 1 {
-		t.Fatalf("a non-object event must keep the entry: %+v", store.entries)
+		t.Fatalf("a payload-less event must keep the entry: %+v", store.entries)
 	}
 }
 
-// TestDLQReplayOrdinaryEventPayloadByteForByte proves the ordinary replay path
-// is unchanged by the schedule conversion: the executor receives exactly the
-// compacted stored event — no re-encoding with normalized field order. (The
-// socket wire itself compacts JSON — the client embeds the event as
-// json.RawMessage — a pre-existing behavior outside replay's control; but a
-// re-marshal would also SORT the keys, so requiring the compacted event in its
-// original key order pins that replay passes the stored bytes through.)
-func TestDLQReplayOrdinaryEventPayloadByteForByte(t *testing.T) {
-	// Non-lexicographic key order plus whitespace: a re-marshal would collapse
-	// this to {"entry_name":"INSERT","zzz":1}, re-sorted.
-	const stored = "{\n  \"zzz\": 1,\n  \"entry_name\": \"INSERT\"\n}"
-	const wireCompacted = `{"zzz":1,"entry_name":"INSERT"}`
-	store := &fakeDLQStore{entries: []dlq.Entry{
-		dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", stored, "2026-10-01T08:05:00Z"),
-	}}
+// TestDLQReplayOrdinaryEventShipsStoredCanonicalPayload proves the ordinary
+// replay path forwards the STORED replay payload — the canonical JSON the live
+// runner handed the handler — and never the diagnostic Event body: key order,
+// whitespace, and formatting of the dead-lettered body never reach the wire.
+// (The socket passes the payload through as a raw message; the executor
+// therefore receives exactly the stored bytes.)
+func TestDLQReplayOrdinaryEventShipsStoredCanonicalPayload(t *testing.T) {
+	// The Event body has whitespace and non-lexicographic key order — none of
+	// that is the handler's logical payload. The stream stored the canonical
+	// re-encoding of the decoded event (sorted keys, compact).
+	const storedBody = "{\n  \"zzz\": 1,\n  \"entry_name\": \"INSERT\"\n}"
+	const canonical = `{"entry_name":"INSERT","zzz":1}`
+	entry := dlqTestEntry(dlqUnitID, dlqUnitID, "user-events", "events.created.handler", storedBody, "2026-10-01T08:05:00Z")
+	entry.ReplayPayload = []byte(canonical)
+	store := &fakeDLQStore{entries: []dlq.Entry{entry}}
 	exec := &dlqReplayExecutor{}
 	deps := dlqReplayRunner(t, store, exec)
 
@@ -1169,11 +1188,14 @@ func TestDLQReplayOrdinaryEventPayloadByteForByte(t *testing.T) {
 		t.Fatalf("dlq replay: %v", err)
 	}
 	_, payloads := exec.got()
-	if len(payloads) != 1 || string(payloads[0]) != wireCompacted {
+	if len(payloads) != 1 || string(payloads[0]) != canonical {
 		t.Fatalf(
-			"replayed payload = %q, want the stored event compacted but byte-preserving on the wire %q",
-			payloads, wireCompacted,
+			"replayed payload = %q, want the stored canonical payload %q",
+			payloads, canonical,
 		)
+	}
+	if strings.Contains(string(payloads[0]), "\n") {
+		t.Fatalf("the diagnostic Event body leaked onto the wire: %q", payloads[0])
 	}
 	if len(store.entries) != 0 {
 		t.Fatalf("a successful ordinary replay must delete the entry: %+v", store.entries)

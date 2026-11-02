@@ -106,7 +106,7 @@ func TestProcessMessageEmitsStreamSpanWithContext(t *testing.T) {
 		span.End()
 		return errors.New("retryable failure")
 	}
-	msg := redis.XMessage{ID: "1-0", Values: map[string]any{"event": `{"event_name":"X"}`}}
+	msg := redis.XMessage{ID: "1-0", Values: map[string]any{"value": `{"event_name":"X"}`}}
 	c.processMessage(context.Background(), msg, 1, handler)
 
 	streamSpan := spanByName(t, rec, "stream.message")
@@ -158,7 +158,7 @@ func TestProcessMessageExtractsTraceMetadataAsRemoteParent(t *testing.T) {
 		return errors.New("retryable failure")
 	}
 	msg := redis.XMessage{ID: "1-0", Values: map[string]any{
-		"event":       payload,
+		"value":       payload,
 		"traceparent": remoteTraceparent,
 		"tracestate":  "vendor=opaque",
 		"baggage":     "k=v",
@@ -192,7 +192,7 @@ func TestProcessMessageExtractsTraceMetadataAsRemoteParent(t *testing.T) {
 // TestProcessMessageWithoutTraceMetadataIsRoot proves an ordinary external event
 // (no trace fields) yields a root stream.message span: extraction is a no-op and
 // no remote parent is attached. This is the default path for non-schedule
-// producers (e.g. a raw `redis-cli XADD ... event '...'`).
+// producers (e.g. a raw `redis-cli XADD ... value '...'`).
 func TestProcessMessageWithoutTraceMetadataIsRoot(t *testing.T) {
 	rec := withSpanRecorder(t)
 	c := processMessageConsumer(newFakeInvocationStore(nil))
@@ -200,7 +200,7 @@ func TestProcessMessageWithoutTraceMetadataIsRoot(t *testing.T) {
 	handler := func(context.Context, string, map[string]any) error {
 		return errors.New("retryable failure")
 	}
-	msg := redis.XMessage{ID: "1-0", Values: map[string]any{"event": `{"event_name":"X"}`}}
+	msg := redis.XMessage{ID: "1-0", Values: map[string]any{"value": `{"event_name":"X"}`}}
 	c.processMessage(context.Background(), msg, 1, handler)
 
 	streamSpan := spanByName(t, rec, "stream.message")
@@ -211,11 +211,11 @@ func TestProcessMessageWithoutTraceMetadataIsRoot(t *testing.T) {
 
 // TestTraceCarrierFromMessageIgnoresNonStringAndEmpty proves the field mapper
 // only takes non-empty string values under the exact W3C keys, so a malformed or
-// unrelated field can never fabricate a carrier (and the "event" payload is
+// unrelated field can never fabricate a carrier (and the "value" payload is
 // never consulted).
 func TestTraceCarrierFromMessageIgnoresNonStringAndEmpty(t *testing.T) {
 	got := traceCarrierFromMessage(map[string]any{
-		"event":       `{"event_name":"X"}`,
+		"value":       `{"event_name":"X"}`,
 		"traceparent": 123, // non-string
 		"tracestate":  "",  // empty
 		"unrelated":   "x",
@@ -225,14 +225,14 @@ func TestTraceCarrierFromMessageIgnoresNonStringAndEmpty(t *testing.T) {
 	}
 
 	got = traceCarrierFromMessage(map[string]any{
-		"event":       `{"event_name":"X"}`,
+		"value":       `{"event_name":"X"}`,
 		"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
 	})
 	if got == nil || got[tracing.TraceparentKey] == "" {
 		t.Fatalf("traceCarrierFromMessage = %v, want the traceparent field", got)
 	}
-	if _, ok := got["event"]; ok {
-		t.Error("traceCarrierFromMessage copied the event payload into the carrier")
+	if _, ok := got["value"]; ok {
+		t.Error("traceCarrierFromMessage copied the value payload into the carrier")
 	}
 }
 
@@ -252,7 +252,7 @@ func TestProcessMessageDisabledTracingStillProcesses(t *testing.T) {
 		called = true
 		return errors.New("retryable failure")
 	}
-	msg := redis.XMessage{ID: "1-0", Values: map[string]any{"event": `{"event_name":"X"}`}}
+	msg := redis.XMessage{ID: "1-0", Values: map[string]any{"value": `{"event_name":"X"}`}}
 	c.processMessage(context.Background(), msg, 1, handler)
 	if !called {
 		t.Fatal("handler was not called with tracing disabled")
@@ -272,7 +272,7 @@ func TestProcessMessageRedeliveryDistinctSpansSameUpstreamTrace(t *testing.T) {
 	const remoteTraceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 	remoteTraceID, _ := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
 	msg := redis.XMessage{ID: "1-0", Values: map[string]any{
-		"event":       `{"event_name":"X"}`,
+		"value":       `{"event_name":"X"}`,
 		"traceparent": remoteTraceparent,
 	}}
 	handler := func(context.Context, string, map[string]any) error {
@@ -319,10 +319,6 @@ func TestScheduleRedeliveryDistinctSpansSameUpstreamTrace(t *testing.T) {
 		Handler:     "jobs.cleanup.handler",
 		ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC),
 	}
-	envelope, err := occ.Envelope()
-	if err != nil {
-		t.Fatalf("Envelope: %v", err)
-	}
 	calls := 0
 	c := processMessageConsumer(newFakeInvocationStore(nil))
 	c.scheduleRunner = func(context.Context, string, schedule.Occurrence, []byte) error {
@@ -332,10 +328,9 @@ func TestScheduleRedeliveryDistinctSpansSameUpstreamTrace(t *testing.T) {
 
 	const remoteTraceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 	remoteTraceID, _ := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
-	msg := redis.XMessage{ID: "9-0", Values: map[string]any{
-		"event":       string(envelope),
-		"traceparent": remoteTraceparent,
-	}}
+	values := scheduleMessageValues(t, occ)
+	values["traceparent"] = remoteTraceparent
+	msg := redis.XMessage{ID: "9-0", Values: values}
 	handler := func(context.Context, string, map[string]any) error { return nil }
 
 	c.processMessage(context.Background(), msg, 1, handler)

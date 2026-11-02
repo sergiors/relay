@@ -45,7 +45,8 @@ secrets: # optional, reference names only
 events: # rules that consume stream events
   - handler: events.created.handler
     pattern:
-      event_name: [INSERT]
+      recordType: [INSERT]
+      collectionName: [users]
     timeout: 6s # optional, default 6s, max 5m
     retries: 4 # optional, additional attempts, default 4, max 100
 

@@ -1,4 +1,4 @@
 def handler(event):
-    user = event.get("old_image", {})
+    user = event.get("oldImage", {})
 
     print(f"User deleted: {user.get('id', 'unknown')}")

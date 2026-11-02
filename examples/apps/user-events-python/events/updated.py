@@ -1,4 +1,4 @@
 def handler(event):
-    user = event["new_image"]
+    user = event["newImage"]
 
     print(f"User updated: {user['id']}")

@@ -333,7 +333,7 @@ type FieldCondition struct {
 // Operator matches per the operator's semantics (prefix/suffix/exists/range), and
 // Nested is a nested condition group (its children AND) resolved against the
 // parent object value. Nested is produced when a nested map appears as a list
-// element (`new_image: [{status: [COMPLETED]}]`).
+// element (`newImage: [{status: [COMPLETED]}]`).
 type Alternative struct {
 	Literal  *Literal
 	Operator ValueMatcher
@@ -1226,7 +1226,7 @@ func validateHandler(handler string) error {
 //
 // A bare map is also accepted as shorthand for a single-element nested group,
 // which preserves the established nested-object syntax
-// (`new_image: {status: [COMPLETED]}`). Because the old field-level operator
+// (`newImage: {status: [COMPLETED]}`). Because the old field-level operator
 // map (`status: {prefix: [x]}`) is REMOVED, a map may not name an operator: an
 // operator-like key at map level is rejected with a message showing the list
 // form, so an old template or an operator typo never silently becomes a nested
@@ -1234,7 +1234,7 @@ func validateHandler(handler string) error {
 // FieldCondition.match treats no alternatives and no children as true, so a
 // permissive parse would widen a mistake into a match-all predicate.
 //
-// path is the dotted field path (e.g. "new_image.cnpj") carried into errors so
+// path is the dotted field path (e.g. "newImage.cnpj") carried into errors so
 // the author can locate the offending value; nested fields append their name.
 //
 // now is the temporal clock for `now()`-relative comparison operators, passed

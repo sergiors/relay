@@ -62,7 +62,7 @@ func TestIntegrationRetentionTrimsOldEntries(t *testing.T) {
 		if _, err := cli.XAdd(context.Background(), &redis.XAddArgs{
 			Stream: stream,
 			ID:     fmt.Sprintf("%d-%d", oldMillis, i+1),
-			Values: map[string]any{"event": "old"},
+			Values: map[string]any{"value": "old"},
 		}).Result(); err != nil {
 			t.Fatalf("xadd old %d: %v", i, err)
 		}
@@ -70,7 +70,7 @@ func TestIntegrationRetentionTrimsOldEntries(t *testing.T) {
 	if _, err := cli.XAdd(context.Background(), &redis.XAddArgs{
 		Stream: stream,
 		ID:     fmt.Sprintf("%d-1", recentMillis),
-		Values: map[string]any{"event": "recent"},
+		Values: map[string]any{"value": "recent"},
 	}).Result(); err != nil {
 		t.Fatalf("xadd recent: %v", err)
 	}
@@ -122,20 +122,20 @@ func TestIntegrationRetentionAckedProtectsPending(t *testing.T) {
 	var ackedIDs, pendingIDs []string
 	for i := 0; i < nodeSize; i++ {
 		id := fmt.Sprintf("%d-%d", ackedMillis, i+1)
-		if _, err := cli.XAdd(ctx, &redis.XAddArgs{Stream: stream, ID: id, Values: map[string]any{"event": "acked"}}).Result(); err != nil {
+		if _, err := cli.XAdd(ctx, &redis.XAddArgs{Stream: stream, ID: id, Values: map[string]any{"value": "acked"}}).Result(); err != nil {
 			t.Fatalf("xadd acked %d: %v", i, err)
 		}
 		ackedIDs = append(ackedIDs, id)
 	}
 	for i := 0; i < nodeSize; i++ {
 		id := fmt.Sprintf("%d-%d", pendingMillis, i+1)
-		if _, err := cli.XAdd(ctx, &redis.XAddArgs{Stream: stream, ID: id, Values: map[string]any{"event": "pending"}}).Result(); err != nil {
+		if _, err := cli.XAdd(ctx, &redis.XAddArgs{Stream: stream, ID: id, Values: map[string]any{"value": "pending"}}).Result(); err != nil {
 			t.Fatalf("xadd pending %d: %v", i, err)
 		}
 		pendingIDs = append(pendingIDs, id)
 	}
 	recentID := fmt.Sprintf("%d-1", recentMillis)
-	if _, err := cli.XAdd(ctx, &redis.XAddArgs{Stream: stream, ID: recentID, Values: map[string]any{"event": "recent"}}).Result(); err != nil {
+	if _, err := cli.XAdd(ctx, &redis.XAddArgs{Stream: stream, ID: recentID, Values: map[string]any{"value": "recent"}}).Result(); err != nil {
 		t.Fatalf("xadd recent: %v", err)
 	}
 
@@ -202,13 +202,13 @@ func TestIntegrationRetentionAckedMultipleGroups(t *testing.T) {
 	var oldIDs []string
 	for i := 0; i < nodeSize; i++ {
 		id := fmt.Sprintf("%d-%d", oldMillis, i+1)
-		if _, err := cli.XAdd(ctx, &redis.XAddArgs{Stream: stream, ID: id, Values: map[string]any{"event": "old"}}).Result(); err != nil {
+		if _, err := cli.XAdd(ctx, &redis.XAddArgs{Stream: stream, ID: id, Values: map[string]any{"value": "old"}}).Result(); err != nil {
 			t.Fatalf("xadd old %d: %v", i, err)
 		}
 		oldIDs = append(oldIDs, id)
 	}
 	recentID := fmt.Sprintf("%d-1", recentMillis)
-	if _, err := cli.XAdd(ctx, &redis.XAddArgs{Stream: stream, ID: recentID, Values: map[string]any{"event": "recent"}}).Result(); err != nil {
+	if _, err := cli.XAdd(ctx, &redis.XAddArgs{Stream: stream, ID: recentID, Values: map[string]any{"value": "recent"}}).Result(); err != nil {
 		t.Fatalf("xadd recent: %v", err)
 	}
 

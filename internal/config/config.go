@@ -138,14 +138,14 @@ type Config struct {
 	// backlog stays in Redis when full. It is always positive after Load.
 	MaxBufferedEvents int
 	// MaxEventBytes is the MAX_EVENT_BYTES value (default 256KiB, hard max
-	// 1MiB): the maximum byte length of a message's raw `event` field. The
+	// 1MiB): the maximum byte length of a message's raw `value` field. The
 	// environment value accepts a human-readable binary size (B/KiB/MiB/GiB)
 	// or a bare integer byte count for backwards compatibility (see
-	// ParseMaxEventBytes). A message whose raw event value exceeds it is
-	// rejected before JSON decode, schedule classification, event matching,
+	// ParseMaxEventBytes). A message whose raw value exceeds it is
+	// rejected before JSON decode, envelope classification, event matching,
 	// and handler execution, and is routed to the DLQ with a bounded
-	// diagnostic summary instead of the payload. It bounds the RAW event
-	// value only — not the whole Redis entry or its RESP/response overhead,
+	// diagnostic summary instead of the payload. It bounds the RAW value
+	// only — not the whole Redis entry or its RESP/response overhead,
 	// which Redis and go-redis have already materialized before Relay can
 	// inspect it. It is always positive after Load: zero is rejected, never
 	// read as "unlimited".
@@ -239,8 +239,8 @@ const (
 	DefaultMaxConcurrentBuilds = 2
 	DefaultMaxWarmContainers   = 8
 	DefaultMaxBufferedEvents   = 16
-	// DefaultMaxEventBytes is the byte cap applied to a message's raw `event`
-	// value when MAX_EVENT_BYTES is unset/empty. MaxEventBytesLimit is the hard
+	// DefaultMaxEventBytes is the byte cap applied to a message's raw `value`
+	// when MAX_EVENT_BYTES is unset/empty. MaxEventBytesLimit is the hard
 	// ceiling: a configured or default value above it is rejected, so the cap
 	// can never be lifted into an unbounded read/parse.
 	DefaultMaxEventBytes = 256 << 10
@@ -534,7 +534,7 @@ func ParseBool(name, value string) (bool, error) {
 }
 
 // ParseMaxEventBytes parses the MAX_EVENT_BYTES value: the maximum byte length
-// of a message's raw `event` field. Callers resolve the default at the getEnv
+// of a message's raw `value` field. Callers resolve the default at the getEnv
 // call site. It accepts a human-readable binary size (B, KiB, MiB, or GiB; e.g.
 // "256KiB", "1MiB") or a bare positive integer byte count for backwards
 // compatibility (e.g. "262144"), up to MaxEventBytesLimit (surrounding

@@ -13,18 +13,18 @@ import (
 	"relay/internal/observability/metrics"
 )
 
-// TestExtractAndDecodeEventByteCap pins the single extraction+decode seam's byte
-// cap: a raw event value exactly at the limit decodes, one byte over is rejected
+// TestExtractEnvelopeByteCap pins the single extraction+decode seam's byte
+// cap: a raw value exactly at the limit decodes, one byte over is rejected
 // as an *EventOversizedError BEFORE any JSON decode (so the decoder never sees
 // the oversized payload), and the error carries the measured/configured byte
 // counts without quoting the payload.
-func TestExtractAndDecodeEventByteCap(t *testing.T) {
+func TestExtractEnvelopeByteCap(t *testing.T) {
 	const maxBytes = 64
 	exact := `{"x":"` + strings.Repeat("a", maxBytes-8) + `"}`
 	if len(exact) != maxBytes {
 		t.Fatalf("fixture length = %d, want %d", len(exact), maxBytes)
 	}
-	if _, err := extractAndDecodeEvent(redis.XMessage{ID: "1-0", Values: map[string]any{"event": exact}}, maxBytes); err != nil {
+	if _, err := extractAndDecodeEnvelope(redis.XMessage{ID: "1-0", Values: map[string]any{"value": exact}}, maxBytes); err != nil {
 		t.Fatalf("exact-limit event rejected: %v", err)
 	}
 
@@ -32,8 +32,8 @@ func TestExtractAndDecodeEventByteCap(t *testing.T) {
 	if len(over) != maxBytes+1 {
 		t.Fatalf("oversized fixture length = %d, want %d", len(over), maxBytes+1)
 	}
-	msg := redis.XMessage{ID: "1-0", Values: map[string]any{"event": over}}
-	_, err := extractAndDecodeEvent(msg, maxBytes)
+	msg := redis.XMessage{ID: "1-0", Values: map[string]any{"value": over}}
+	_, err := extractAndDecodeEnvelope(msg, maxBytes)
 	var oversize *EventOversizedError
 	if !errors.As(err, &oversize) {
 		t.Fatalf("err = %v, want *EventOversizedError", err)
@@ -52,52 +52,49 @@ func TestExtractAndDecodeEventByteCap(t *testing.T) {
 	}
 }
 
-// TestExtractAndDecodeEventOversizeSkipsDecoder pins that the byte cap is
-// applied BEFORE decode even when the oversized value is malformed JSON: the
-// returned error is the oversize rejection, never a decode error, proving the
-// decoder is not invoked for an over-limit payload.
-func TestExtractAndDecodeEventOversizeSkipsDecoder(t *testing.T) {
+// TestExtractEnvelopeOversizeSkipsDecoder pins that the byte cap is applied
+// BEFORE decode even when the oversized value is malformed JSON: the returned
+// error is the oversize rejection, never a decode error, proving the decoder is
+// not invoked for an over-limit payload.
+func TestExtractEnvelopeOversizeSkipsDecoder(t *testing.T) {
 	const maxBytes = 16
 	over := "{" + strings.Repeat("x", maxBytes+8) // not valid JSON, and over the cap
-	msg := redis.XMessage{ID: "1-0", Values: map[string]any{"event": over}}
+	msg := redis.XMessage{ID: "1-0", Values: map[string]any{"value": over}}
 
-	_, err := extractAndDecodeEvent(msg, maxBytes)
+	_, err := extractAndDecodeEnvelope(msg, maxBytes)
 	var oversize *EventOversizedError
 	if !errors.As(err, &oversize) {
 		t.Fatalf("err = %v, want the oversize rejection (decoder must be skipped)", err)
 	}
-	if strings.Contains(err.Error(), "decode event") {
+	if strings.Contains(err.Error(), "decode envelope") {
 		t.Fatalf("error %q must not be a decode error", err)
 	}
 }
 
-// TestExtractAndDecodeEventPreservesMalformedBehavior pins that a
-// missing/non-string/malformed event keeps the ordinary malformed error (never
-// the oversize rejection), so the cap changes nothing for under-limit messages.
-func TestExtractAndDecodeEventPreservesMalformedBehavior(t *testing.T) {
+// TestExtractEnvelopePreservesMalformedBehavior pins that a missing/non-string/
+// malformed value keeps the ordinary malformed error (never the oversize
+// rejection), so the cap changes nothing for under-limit messages.
+func TestExtractEnvelopePreservesMalformedBehavior(t *testing.T) {
 	const maxBytes = 256
 	for _, tc := range []struct {
 		name   string
 		values map[string]any
 		want   string
 	}{
-		{"missing", map[string]any{}, "missing 'event' field"},
-		{"non-string", map[string]any{"event": 42}, "'event' field is not a string"},
-		{"invalid JSON", map[string]any{"event": `{oops`}, "decode event:"},
-		{"null", map[string]any{"event": `null`}, "'event' decodes to null"},
+		{"missing", map[string]any{}, "missing 'value' field"},
+		{"non-string", map[string]any{"value": 42}, "'value' field is not a string"},
+		{"invalid JSON", map[string]any{"value": `{oops`}, "decode envelope value:"},
+		{"null", map[string]any{"value": `null`}, "envelope value is not a JSON object"},
+		{"array", map[string]any{"value": `[1,2,3]`}, "decode envelope value:"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := extractAndDecodeEvent(redis.XMessage{ID: "1-0", Values: tc.values}, maxBytes)
+			_, err := extractAndDecodeEnvelope(redis.XMessage{ID: "1-0", Values: tc.values}, maxBytes)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("err = %v, want it to contain %q", err, tc.want)
 			}
 			var oversize *EventOversizedError
 			if errors.As(err, &oversize) {
 				t.Fatalf("malformed error %v must not be an oversize error", err)
-			}
-			// classifyMessage (the convenience wrapper) keeps identical behavior.
-			if _, cerr := classifyMessage(redis.XMessage{ID: "1-0", Values: tc.values}); cerr == nil || !strings.Contains(cerr.Error(), tc.want) {
-				t.Fatalf("classifyMessage err = %v, want it to contain %q", cerr, tc.want)
 			}
 		})
 	}
@@ -154,7 +151,7 @@ func TestProcessMessageOversizedRejectsBeforeHandler(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			handlerRan := false
 			c.processMessage(context.Background(),
-				redis.XMessage{ID: "m-0", Values: map[string]any{"event": payload}}, 1,
+				redis.XMessage{ID: "m-0", Values: map[string]any{"value": payload}}, 1,
 				func(context.Context, string, map[string]any) error {
 					handlerRan = true
 					return nil

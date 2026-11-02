@@ -12,44 +12,97 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"relay/internal/dlq"
+	"relay/internal/envelope"
 )
 
-func TestClassifyMessage(t *testing.T) {
-	validEvent := `{"event_id":"1","status":"COMPLETED"}`
-	tests := []struct {
-		name       string
-		values     map[string]any
-		wantErr    bool
-		wantReason string // required when wantErr; a stable fragment of the error text
-	}{
-		{"missing event field", map[string]any{}, true, "missing 'event' field"},
-		{"event not a string", map[string]any{"event": 42}, true, "'event' field is not a string"},
-		{"event invalid JSON", map[string]any{"event": `{oops`}, true, "decode event:"},
-		{"event array JSON", map[string]any{"event": `[1,2,3]`}, true, "decode event:"},
-		{"event scalar JSON", map[string]any{"event": `"hello"`}, true, "decode event:"},
-		{"event null JSON", map[string]any{"event": `null`}, true, "'event' decodes to null"},
-		{"event valid object", map[string]any{"event": validEvent}, false, ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			event, err := classifyMessage(redis.XMessage{ID: "1-0", Values: tt.values})
-			if tt.wantErr {
-				if err == nil {
-					t.Fatalf("expected error, got nil")
-				}
-				if !strings.Contains(err.Error(), tt.wantReason) {
-					t.Fatalf("error = %q, want it to contain %q", err.Error(), tt.wantReason)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if event["event_id"] != "1" {
-				t.Fatalf("unexpected decoded event: %v", event)
-			}
-		})
-	}
+// TestExtractEnvelopeValueAndDecodeSeam pins the field-level extraction rules
+// the processing path's single seam relies on (the JSON-level decode contract
+// itself lives in internal/envelope):
+//
+//   - `value` is required and must be a string; it is the only body field;
+//   - optional `format` defaults to empty when absent and rejects a
+//     non-string;
+//   - every other entry field (the sink's `key`, UPPERCASE headers, unknown
+//     names) is ignored and can change neither extraction nor decoding;
+//   - the decode produces the ordinary event for a raw object, and the exact
+//     null-value sentinel is recognized as a tombstone from `value` alone.
+func TestExtractEnvelopeValueAndDecodeSeam(t *testing.T) {
+	t.Run("value required and string-typed", func(t *testing.T) {
+		_, err := extractValueString(redis.XMessage{ID: "1-0", Values: map[string]any{}})
+		if err == nil || !strings.Contains(err.Error(), "missing 'value' field") {
+			t.Fatalf("err = %v, want the missing-field error", err)
+		}
+		_, err = extractValueString(redis.XMessage{ID: "1-0", Values: map[string]any{"value": 42}})
+		if err == nil || !strings.Contains(err.Error(), "'value' field is not a string") {
+			t.Fatalf("err = %v, want the type error", err)
+		}
+	})
+
+	t.Run("optional format", func(t *testing.T) {
+		msg := redis.XMessage{ID: "1-0", Values: map[string]any{
+			"key": `{"payload":{"id":1}}`, "value": `{"a":1}`, "format": "raw"}}
+		format, err := extractOptionalString(msg, "format")
+		if err != nil || format != "raw" {
+			t.Fatalf("format = (%q,%v), want raw", format, err)
+		}
+		bad := redis.XMessage{ID: "1-0", Values: map[string]any{"format": 123}}
+		if _, err := extractOptionalString(bad, "format"); err == nil ||
+			!strings.Contains(err.Error(), `"format" field is not a string`) {
+			t.Fatalf("err = %v, want the non-string format error", err)
+		}
+		absent, err := extractOptionalString(
+			redis.XMessage{ID: "1-0", Values: map[string]any{"value": `{"a":1}`}}, "format")
+		if err != nil || absent != "" {
+			t.Fatalf("absent format = (%q,%v), want \"\",nil", absent, err)
+		}
+	})
+
+	// The value is the only field the seam consumes: a sink-record `key`, an
+	// unknown field, and a header ride along ignored, and the tombstone
+	// sentinel is recognized with no key present.
+	t.Run("additional fields ignored; value-only extraction", func(t *testing.T) {
+		res, err := extractAndDecodeEnvelope(redis.XMessage{ID: "1-0", Values: map[string]any{
+			"key": `{"payload":{"id":1}}`, "HEADERKEY": "headervalue",
+			"unknown_field": "x", "value": `{"a":1}`}}, 256)
+		if err != nil {
+			t.Fatalf("extractAndDecodeEnvelope: %v", err)
+		}
+		if res.Kind != envelope.KindEvent || len(res.Event) != 1 || res.Event["a"] != float64(1) {
+			t.Fatalf("res = %+v, want the raw event from value alone", res)
+		}
+
+		tb, err := extractAndDecodeEnvelope(redis.XMessage{ID: "1-0", Values: map[string]any{
+			"key": `{"payload":{"id":7}}`, "value": "default"}}, 256)
+		if err != nil {
+			t.Fatalf("tombstone extractAndDecodeEnvelope: %v", err)
+		}
+		if tb.Kind != envelope.KindTombstone {
+			t.Fatalf("tombstone Kind = %v, want KindTombstone from the value sentinel alone", tb.Kind)
+		}
+	})
+
+	t.Run("missing value field", func(t *testing.T) {
+		_, err := extractAndDecodeEnvelope(
+			redis.XMessage{ID: "1-0", Values: map[string]any{"not_value": "x"}}, 256)
+		if err == nil || !strings.Contains(err.Error(), "missing 'value' field") {
+			t.Fatalf("err = %v, want the missing-field error", err)
+		}
+		var oversize *EventOversizedError
+		if errors.As(err, &oversize) {
+			t.Fatalf("a malformed error %v must not be an oversize error", err)
+		}
+	})
+
+	t.Run("raw object decodes", func(t *testing.T) {
+		res, err := extractAndDecodeEnvelope(
+			redis.XMessage{ID: "1-0", Values: map[string]any{"value": `{"a":1}`}}, 256)
+		if err != nil {
+			t.Fatalf("extractAndDecodeEnvelope: %v", err)
+		}
+		if res.Kind != envelope.KindEvent || res.Event["a"] != float64(1) {
+			t.Fatalf("res = %+v, want the decoded raw event", res)
+		}
+	})
 }
 
 // TestDLQEntryPinsOneEntryPerInvocation verifies the write model one exhausted
@@ -63,7 +116,7 @@ func TestDLQEntryPinsOneEntryPerInvocation(t *testing.T) {
 	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01|vendor=x"
 	at := time.Date(2026, 10, 26, 8, 30, 0, 0, time.UTC)
 	entry := dlqEntry(deliveryID, "events", "1760000000000-0", "relay", "worker-1",
-		`{"a":1}`, dlqEntrySpec{
+		`{"a":1}`, []byte(`{"a":1}`), dlqEntrySpec{
 			app:        "fn",
 			handler:    "index.run",
 			attempts:   3,
@@ -86,6 +139,9 @@ func TestDLQEntryPinsOneEntryPerInvocation(t *testing.T) {
 	}
 	if entry.Event != `{"a":1}` {
 		t.Fatalf("Event = %q, want the payload verbatim", entry.Event)
+	}
+	if string(entry.ReplayPayload) != `{"a":1}` {
+		t.Fatalf("ReplayPayload = %q, want the logical handler payload", entry.ReplayPayload)
 	}
 	if entry.Reason != "invocation exhausted: boom" || entry.App != "fn" || entry.Handler != "index.run" {
 		t.Fatalf("reason/attribution = %q/%q/%q", entry.Reason, entry.App, entry.Handler)
@@ -112,18 +168,21 @@ func TestDLQEntryPinsOneEntryPerInvocation(t *testing.T) {
 // and an identity distinct from any real invocation of the same delivery.
 func TestDLQEntryPlaceholderIsDistinctAndNonReplayable(t *testing.T) {
 	deliveryID := dlq.NewDeliveryID("events", "relay", "1-0")
-	specs := dlqEntrySpecs(errors.New("decode event: missing 'event' field"))
+	specs := dlqEntrySpecs(errors.New("decode envelope value: missing 'value' field"))
 	if len(specs) != 1 {
 		t.Fatalf("placeholder specs = %d, want 1", len(specs))
 	}
 	entry := dlqEntry(deliveryID, "events", "1-0", "relay", "worker-1",
-		"-", specs[0], 1, time.Date(2026, 10, 26, 8, 30, 0, 0, time.UTC))
+		"-", nil, specs[0], 1, time.Date(2026, 10, 26, 8, 30, 0, 0, time.UTC))
 
 	if entry.App != dlq.NoHandler || entry.Handler != dlq.NoHandler {
 		t.Fatalf("placeholder app/handler = %q/%q, want %q", entry.App, entry.Handler, dlq.NoHandler)
 	}
 	if entry.HandlerAttempts != 0 {
 		t.Fatalf("HandlerAttempts = %d, want an explicit 0 (never the delivery count)", entry.HandlerAttempts)
+	}
+	if entry.ReplayPayload != nil {
+		t.Fatalf("ReplayPayload = %q, want nil for a message that never reached a handler", entry.ReplayPayload)
 	}
 	if entry.ID != dlq.NewIDForDelivery(deliveryID, "") {
 		t.Fatalf("placeholder ID = %q, want the empty-invocation identity", entry.ID)
@@ -165,7 +224,7 @@ func TestExhaustedInvocationsFromError(t *testing.T) {
 		{"missing identity dropped", &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
 			{Handler: "h", Attempts: 2},
 		}}, nil},
-		{"plain errors.New", errors.New("decode event: boom"), nil},
+		{"plain errors.New", errors.New("decode envelope value: boom"), nil},
 		{"nil", nil, nil},
 	}
 	for _, tt := range tests {
@@ -215,13 +274,13 @@ func TestDLQEntrySpecs(t *testing.T) {
 	})
 
 	t.Run("malformed placeholder", func(t *testing.T) {
-		specs := dlqEntrySpecs(errors.New("decode event: boom"))
+		specs := dlqEntrySpecs(errors.New("decode envelope value: boom"))
 		if len(specs) != 1 {
 			t.Fatalf("specs = %d, want 1 placeholder", len(specs))
 		}
 		if specs[0].app != dlq.NoHandler || specs[0].handler != dlq.NoHandler ||
 			specs[0].attempts != 0 || specs[0].invocation != "" ||
-			specs[0].reason != "decode event: boom" {
+			specs[0].reason != "decode envelope value: boom" {
 			t.Fatalf("placeholder spec = %+v", specs[0])
 		}
 	})
@@ -335,16 +394,17 @@ func TestExhaustedValueGrammar(t *testing.T) {
 	}
 }
 
-// eventString never fails even when the event field is missing or non-string
-// (used when building DLQ entries for malformed messages).
-func TestEventStringFallback(t *testing.T) {
-	if got := eventString(redis.XMessage{ID: "1-0", Values: map[string]any{"event": `{"a":1}`}}); got != `{"a":1}` {
-		t.Fatalf("expected raw event string, got %q", got)
+// valueString never fails even when the value field is missing or non-string
+// (used when building DLQ entries for malformed messages). The fallback is the
+// "-" placeholder, matching the DLQ identity's malformed-body convention.
+func TestValueStringFallback(t *testing.T) {
+	if got := valueString(redis.XMessage{ID: "1-0", Values: map[string]any{"value": `{"a":1}`}}); got != `{"a":1}` {
+		t.Fatalf("expected raw value string, got %q", got)
 	}
-	if got := eventString(redis.XMessage{ID: "1-0", Values: map[string]any{}}); got != "-" {
+	if got := valueString(redis.XMessage{ID: "1-0", Values: map[string]any{}}); got != "-" {
 		t.Fatalf("expected fallback '-', got %q", got)
 	}
-	if got := eventString(redis.XMessage{ID: "1-0", Values: map[string]any{"event": 7}}); got != "-" {
+	if got := valueString(redis.XMessage{ID: "1-0", Values: map[string]any{"value": 7}}); got != "-" {
 		t.Fatalf("expected fallback '-' for non-string, got %q", got)
 	}
 }

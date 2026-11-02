@@ -34,7 +34,7 @@ provides fencing to prevent stale instances from overwriting statistics (see
 | `MAX_CONCURRENT_BUILDS`       | `2`           | positive integer                                                                   | Fails startup. Bounds concurrent dependency-image and app-image builds **per worker**; non-build preparation does not consume a slot.                                                                                                                                                                                                                                                                            |
 | `MAX_WARM_CONTAINERS`         | `8`           | positive integer                                                                   | Fails startup. Hard per-worker bound on warm **execution** containers across all apps (idle + busy); when saturated every idle container is LRU-evicted, and if all are busy the invocation stays pending. See below.                                                                                                                                                                                           |
 | `MAX_BUFFERED_EVENTS`         | `16`          | positive integer                                                                   | Fails startup. Per-worker bound on messages read from Redis and held locally, including deliveries waiting on execution capacity. It is **not** a bound on the Redis consumer-group PEL. See below.                                                                                                                                                                                                             |
-| `MAX_EVENT_BYTES`             | `256KiB`      | human-readable binary size (`256B`, `256KiB`, `1MiB`; bare integer bytes accepted) | Fails startup on zero/negative/malformed/decimal-unit/above-1MiB. Byte length of a message's raw `event` value; over-limit messages are non-retryably dead-lettered with a bounded summary.                                                                                                                                                                                                                     |
+| `MAX_EVENT_BYTES`             | `256KiB`      | human-readable binary size (`256B`, `256KiB`, `1MiB`; bare integer bytes accepted) | Fails startup on zero/negative/malformed/decimal-unit/above-1MiB. Byte length of a message's raw `value`; over-limit messages are non-retryably dead-lettered with a bounded summary.                                                                                                                                                                                                                     |
 | `WARM_CONTAINER_IDLE_TIMEOUT` | `5m`          | positive Go duration (`90s`, `10m`, `1h30m`)                                       | Fails startup.                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `HOT_RELOAD`                  | `false`       | boolean (`1`, `t`, `true`, `0`, `f`, `false`; trimmed)                             | Fails startup on an unparseable value. `false` bakes the source into the immutable runtime image; `true` source-mounts the live app directory from `/apps` read-only into containers for runtimes with a mountable dependency layout (Python and Node), so a source-only edit reuses the app and dependency images, managed services restart in place, and pooled execution containers are recycled. See below. |
 | `PYTHON_ZUVLOOP`              | `false`       | boolean (`1`, `t`, `true`, `0`, `f`, `false`; trimmed)                             | Fails startup on an unparseable value. Python event and schedule handler invocations run on the pinned zuvloop event loop instead of the standard asyncio loop; the package is installed only into an app image that serves those handlers. Services are unaffected. See below.                                                                                                                                      |
@@ -350,7 +350,7 @@ PYTHON_ZUVLOOP=0 relay start   # standard asyncio (default)
 
 ### Event size limit
 
-`MAX_EVENT_BYTES` caps the byte length of a message's raw `event` **value**, not
+`MAX_EVENT_BYTES` caps the byte length of a message's raw `value`, not
 the whole Redis entry: the entry and the go-redis response have already been
 materialized before Relay can inspect the value, so this is a pre-decode
 guard at the Relay boundary, not transport-level protection. The value is a
@@ -363,8 +363,8 @@ Decimal suffixes (`KB`/`MB`/`GB`) are rejected so a size is never ambiguous, and
 zero is **not** "unlimited": it is rejected, so the cap is always a real bound.
 The default applies when the variable is unset or empty.
 
-A delivered message whose raw `event` value exceeds the cap is rejected before
-JSON decode, schedule classification, event matching, invocation-state
+A delivered message whose raw `value` exceeds the cap is rejected before
+JSON decode, envelope classification, event matching, invocation-state
 migration, and handler execution; it is routed non-retryably to the DLQ and the
 message is left pending if the DLQ write fails, exactly like a malformed
 message. See [events.md](events.md) for the DLQ summary semantics. Changing this

@@ -10,16 +10,22 @@
 //     Redis stream/group problem short-circuits startup; the group is not
 //     created lazily right before Consume. An embedder uses it before Consume.
 //   - Consumption: an XREADGROUP loop that hands each decoded event to a Handler
+//   - Envelope decoding: each entry carries its payload in `value`, with an
+//     optional `format=raw` marker; every other field is ignored. The
+//     internal/envelope package decodes raw JSON, schedule envelopes, and
+//     Debezium changes (normalized to collectionName/recordType/newImage/
+//     oldImage) before this package classifies or matches anything. A confirmed
+//     Debezium tombstone is acknowledged without execution.
 //   - Schedule occurrences: messages whose decode is recognized as a schedule
 //     envelope (see internal/schedule) ride this same consumer-group / PEL /
 //     XAUTOCLAIM / retry / DLQ machinery but bypass event matching: when a
 //     ScheduleRunner is wired they validate the occurrence against the current
 //     template and invoke the named app/schedule directly. A message that claims
 //     schedule identity (source=="relay.schedule") but is structurally
-//     incomplete, malformed, or carries a mismatched occurrence_id is NEVER
-//     treated as an ordinary event: it is dead-lettered as a non-retryable
-//     failure, so a malformed claim can neither fall through to pattern matching
-//     nor be ACKed as unmatched.
+//     incomplete, malformed, or carries an occurrence_id that does not match the
+//     derived identity is NEVER treated as an ordinary event: it is
+//     dead-lettered as a non-retryable failure, so a malformed claim can neither
+//     fall through to pattern matching nor be ACKed as unmatched.
 //   - Recovery: XAUTOCLAIM reclaims idle pending messages, with retry counts
 //     sourced from XPENDING so delivery counts survive restarts. Reclaim is
 //     message-ownership recovery only; whether a reclaimed message's invocation
@@ -48,13 +54,15 @@
 //     attempt/token identity must still match the runner's attribution, so a
 //     stale claim can never create an entry. A malformed message that never
 //     reached a handler produces a single row with the "-" placeholder and an
-//     explicit handler_attempts of 0. A message whose raw `event` value exceeds
-//     MAX_EVENT_BYTES is checked at extraction time (before decode, schedule
+//     explicit handler_attempts of 0. A message whose raw `value` exceeds
+//     MAX_EVENT_BYTES is checked at extraction time (before decode, envelope
 //     classification, matching, and invocation-state migration) and routed the
 //     same non-retryable way with the same "-" placeholder, but its DLQ `event`
 //     field is a small diagnostic summary (EventOversizedError reports the
 //     measured bytes and configured max) rather than the oversized payload; such
-//     an entry is intentionally non-replayable.
+//     an entry is intentionally non-replayable. Each row also stores the exact
+//     logical handler payload (ReplayPayload), separate from the diagnostic
+//     `event` body, so replay never re-derives it.
 //   - DLQ idempotency: the stable row ID is the idempotency key. A redelivery
 //     (after an ACK failure, a crash, or a partially-written multi-entry write)
 //     re-inserts only the missing rows; an already-committed row is left
@@ -68,9 +76,10 @@
 //     marks settled only once it is gone; Redis errors preserve the rows. Its
 //     bounded pages advance a delivery-ID cursor and wrap, so permanently
 //     pending rows cannot starve later deliveries. Admin removal and retention
-//     delete settled rows only. The payload is private JSONB; event/reason and
-//     broker diagnostic identity bytes are base64 inside it so arbitrary bytes
-//     (including NUL and invalid UTF-8) survive JSONB losslessly.
+//     delete settled rows only. The payload is private JSONB;
+//     event/replay-payload/reason and broker diagnostic identity bytes are
+//     base64 inside it so arbitrary bytes (including NUL and invalid UTF-8)
+//     survive JSONB losslessly.
 //   - Invocation state: per-handler lifecycle is recorded in a Redis hash
 //     (relay:invocation:{stream}:{group}:{msgID}, field "<app>/<handler>" →
 //     "ok" when complete, "running:<deadline_ms>:<attempt>:<token>" while an
@@ -97,9 +106,10 @@
 //     TryStartScheduled), so the handler/timeout/retries it was admitted under
 //     are stable through retry/reclaim/DLQ even if the schedule is later changed
 //     or removed; the descriptor is a sibling field, never an invocation ID, and
-//     it is never a DLQ/attribution key. The schedule occurrence's event
-//     envelope (occurrence_id/scheduled_at) is stored verbatim in its DLQ row,
-//     preserving occurrence provenance.
+//     it is never a DLQ/attribution key. The schedule occurrence's `value` (its
+//     envelope with occurrence_id/scheduled_at) is stored verbatim in its DLQ
+//     row, preserving occurrence provenance, while the replay payload is
+//     Occurrence.Payload().
 //
 // Deadlines are integer Unix MILLISECONDS end to end. An active
 // running/next_attempt_at marker is protected iff now_ms < deadline_ms and

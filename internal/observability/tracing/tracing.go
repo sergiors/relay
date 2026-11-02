@@ -71,8 +71,8 @@ const tracerName = "relay"
 // boundary in Relay names the same fields without re-deriving the convention:
 //
 //   - a Redis stream message carries them as flat, optional fields next to the
-//     untouched "event" payload (Redis stream entries are a flat string map,
-//     and flat fields stay directly inspectable with redis-cli), and
+//     `value` payload (Redis stream entries are a flat string map, and flat
+//     fields stay directly inspectable with redis-cli), and
 //   - the execution-container invocation frame carries them nested under the
 //     single optional "trace" JSON object (see runtime.invokeRequest).
 //

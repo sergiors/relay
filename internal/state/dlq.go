@@ -18,11 +18,11 @@ import (
 const dbNowMillis = `(EXTRACT(EPOCH FROM now()) * 1000)::bigint`
 
 // persistedDLQEntry is the private JSON representation stored in dlq.data.
-// Event, Reason, and the broker diagnostic identity fields are byte slices so
-// encoding/json base64-encodes them: JSONB rejects U+0000, and encoding/json
-// silently replaces invalid UTF-8 in plain strings. A dead-lettered payload,
-// handler error, or arbitrary Redis source/group/message name must therefore be
-// preserved as bytes. Decoding restores the exact bytes.
+// Event, ReplayPayload, Reason, and the broker diagnostic identity fields are
+// byte slices so encoding/json base64-encodes them: JSONB rejects U+0000, and
+// encoding/json silently replaces invalid UTF-8 in plain strings. A
+// dead-lettered payload, handler error, or arbitrary Redis source/group/message
+// name must therefore be preserved as bytes. Decoding restores the exact bytes.
 type persistedDLQEntry struct {
 	Source          []byte `json:"source"`
 	SourceGroup     []byte `json:"source_group"`
@@ -31,6 +31,7 @@ type persistedDLQEntry struct {
 	App             string `json:"app"`
 	Handler         string `json:"handler"`
 	Event           []byte `json:"event"`
+	ReplayPayload   []byte `json:"replay_payload,omitempty"`
 	Reason          []byte `json:"reason"`
 	Deliveries      int64  `json:"deliveries"`
 	HandlerAttempts int    `json:"handler_attempts"`
@@ -49,6 +50,7 @@ func marshalDLQData(entry dlq.Entry) (string, error) {
 		App:             entry.App,
 		Handler:         entry.Handler,
 		Event:           []byte(entry.Event),
+		ReplayPayload:   entry.ReplayPayload,
 		Reason:          []byte(entry.Reason),
 		Deliveries:      entry.Deliveries,
 		HandlerAttempts: entry.HandlerAttempts,
@@ -73,6 +75,7 @@ func unmarshalDLQData(id, text string) (dlq.Entry, error) {
 		SourceMessageID: string(payload.SourceMessageID),
 		Consumer:        string(payload.Consumer),
 		Event:           string(payload.Event),
+		ReplayPayload:   payload.ReplayPayload,
 		Reason:          string(payload.Reason),
 		App:             payload.App,
 		Handler:         payload.Handler,

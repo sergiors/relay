@@ -202,6 +202,7 @@ func TestIntegrationDLQReplayAndAmbiguityViaPrefix(t *testing.T) {
 		DeliveryID:      dlq.NewDeliveryID("events-test", "relay-test", "1769199999995-0"),
 		Consumer:        "worker-1",
 		Event:           `{"event_name":"INSERT"}`,
+		ReplayPayload:   []byte(`{"event_name":"INSERT"}`),
 		Reason:          "invocation exhausted",
 		App:             "user-events",
 		Handler:         "events.created.handler",
@@ -250,8 +251,10 @@ func TestIntegrationDLQReplayAndAmbiguityViaPrefix(t *testing.T) {
 	if strings.TrimSpace(out) != "Replayed handler successfully" {
 		t.Fatalf("stdout = %q", out)
 	}
-	if handlers, _ := exec.got(); len(handlers) != 1 || handlers[0] != "events.created.handler" {
+	if handlers, payloads := exec.got(); len(handlers) != 1 || handlers[0] != "events.created.handler" {
 		t.Fatalf("executed handlers = %v, want exactly the recorded handler", handlers)
+	} else if string(payloads[0]) != `{"event_name":"INSERT"}` {
+		t.Fatalf("executed payload = %q, want the stored replay payload", payloads[0])
 	}
 	if _, ok, err := st.GetDLQEntry(ctx, replayable.ID); err != nil || ok {
 		t.Fatalf("the successful prefix replay must delete its row: (ok=%v, err=%v)", ok, err)

@@ -25,13 +25,15 @@ import (
 )
 
 // routeToDLQForOne runs c.routeToDLQ for msgID with the runner's typed
-// exhaustion error carrying exactly one attributed invocation.
+// exhaustion error carrying exactly one attributed invocation. The replay
+// payload is the decoded logical handler payload of the event (for a raw
+// object, the canonical JSON of its map).
 func routeToDLQForOne(t *testing.T, c *Consumer, msgID, app, handler string, attempts int) {
 	t.Helper()
-	c.routeToDLQ(context.Background(), redis.XMessage{ID: msgID, Values: map[string]any{"event": `{"a":1}`}},
+	c.routeToDLQ(context.Background(), redis.XMessage{ID: msgID, Values: map[string]any{"value": `{"a":1}`}},
 		&HandlerExhaustedError{Invocations: []ExhaustedInvocation{
 			{App: app, Handler: handler, Attempts: attempts, Err: ErrInvocationExhausted},
-		}}, 1)
+		}}, 1, []byte(`{"a":1}`))
 }
 
 // TestIntegrationDLQRefusesStaleOrMissingClaimPinsNoRowNoACK pins the claim

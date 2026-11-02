@@ -86,7 +86,7 @@ func (e *settlementEnv) seed(t *testing.T, cased string, ack bool) dlq.Entry {
 		source, group, msgID = e.streamName+"-missing", "no-such-group", "1-0"
 	} else {
 		res, err := e.cli.XAdd(ctx, &redis.XAddArgs{
-			Stream: source, Values: map[string]any{"event": `{"case":"` + cased + `"}`},
+			Stream: source, Values: map[string]any{"value": `{"case":"` + cased + `"}`},
 		}).Result()
 		if err != nil {
 			t.Fatalf("xadd %s: %v", cased, err)

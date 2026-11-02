@@ -17,7 +17,9 @@ worker; admin commands communicate with it or read persistent state.
   readiness, control socket, and dependency wiring.
 - `config` resolves configuration. `app` owns discovery, validation, model,
   and fingerprinting; source selection policy is separate in `source`. `event`
-  matches patterns; `runner` dispatches and manages attempts; `stream` owns
+  matches patterns; `envelope` decodes the transport payload (raw JSON,
+  normalized Debezium, schedule claims, tombstones) before matching or
+  execution; `runner` dispatches and manages attempts; `stream` owns
   consumption, recovery, invocation state, ACK, and DLQ.
 - `schedule` owns occurrence identity/publication; `cron` owns timing,
   catch-up, and durable publication retry. `reconciler` owns reload and service

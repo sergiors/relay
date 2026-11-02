@@ -50,7 +50,7 @@ const devEventJSON = `{
   "event_id": "evt_123",
   "event_name": "INSERT",
   "table_name": "users",
-  "new_image": {"id": "user_123", "name": "John Doe", "email": "john@example.com"}
+  "newImage": {"id": "user_123", "name": "John Doe", "email": "john@example.com"}
 }`
 
 func TestIntegrationPythonEndToEnd(t *testing.T) {
@@ -247,29 +247,29 @@ func TestIntegrationRealUserEventsPythonEndToEnd(t *testing.T) {
 		t.Fatalf("prepare: %v", err)
 	}
 
-	// INSERT -> events.created.handler uses new_image.id.
+	// INSERT -> events.created.handler uses newImage.id.
 	if err := m.Execute(ctx, prepared, "events.created.handler", []byte(devEventJSON), nil); err != nil {
 		t.Fatalf("execute events.created.handler: %v", err)
 	}
 
-	// MODIFY -> events.updated.handler uses new_image.id.
+	// MODIFY -> events.updated.handler uses newImage.id.
 	modifiedJSON := []byte(`{
 	  "event_id": "evt_124",
 	  "event_name": "MODIFY",
 	  "table_name": "users",
-	  "new_image": {"id": "user_123", "name": "John Doe", "email": "john@example.com"}
+	  "newImage": {"id": "user_123", "name": "John Doe", "email": "john@example.com"}
 	}`)
 	if err := m.Execute(ctx, prepared, "events.updated.handler", modifiedJSON, nil); err != nil {
 		t.Fatalf("execute events.updated.handler: %v", err)
 	}
 
-	// REMOVE -> events.deleted.handler uses old_image.id; craft a payload with
-	// old_image containing the id.
+	// REMOVE -> events.deleted.handler uses oldImage.id; craft a payload with
+	// oldImage containing the id.
 	deletedJSON := []byte(`{
 	  "event_id": "evt_125",
 	  "event_name": "REMOVE",
 	  "table_name": "users",
-	  "old_image": {"id": "user_123", "name": "John Doe", "email": "john@example.com"}
+	  "oldImage": {"id": "user_123", "name": "John Doe", "email": "john@example.com"}
 	}`)
 	if err := m.Execute(ctx, prepared, "events.deleted.handler", deletedJSON, nil); err != nil {
 		t.Fatalf("execute events.deleted.handler: %v", err)

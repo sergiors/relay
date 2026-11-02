@@ -159,12 +159,13 @@ func (e *eventEnv) start(handler stream.Handler) {
 	}()
 }
 
-// xadd writes an event to this env's stream and returns its ID.
+// xadd writes an event to this env's stream (the external producer shape: the
+// payload travels in `value`) and returns its ID.
 func (e *eventEnv) xadd(event string) string {
 	e.t.Helper()
 	id, err := e.client.XAdd(context.Background(), &redis.XAddArgs{
 		Stream: e.stream,
-		Values: map[string]any{"event": event},
+		Values: map[string]any{"value": event},
 	}).Result()
 	if err != nil {
 		e.t.Fatalf("xadd: %v", err)

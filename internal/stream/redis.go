@@ -41,8 +41,8 @@ const (
 	// buffer so the backlog stays in the Redis stream when the buffer is full
 	// (backpressure).
 	DefaultMaxBufferedEvents = 16
-	// DefaultMaxEventBytes is the byte cap applied to a message's raw `event`
-	// value when ConsumerConfig.MaxEventBytes is not set (a direct test
+	// DefaultMaxEventBytes is the byte cap applied to a message's raw `value`
+	// when ConsumerConfig.MaxEventBytes is not set (a direct test
 	// construction). It mirrors config.DefaultMaxEventBytes; a leaf package
 	// cannot import config, so the default lives here too. A value above
 	// config.MaxEventBytesLimit is never accepted from the environment.
@@ -92,12 +92,12 @@ type ConsumerConfig struct {
 	// Consume stops reading (backpressure) so the backlog stays in Redis.
 	// Defaults to DefaultMaxBufferedEvents (16) if zero or negative.
 	MaxBufferedEvents int
-	// MaxEventBytes is the maximum byte length of a message's raw `event`
-	// field value. A delivered message whose raw event value exceeds it is
-	// rejected BEFORE JSON decode, schedule classification, event matching,
+	// MaxEventBytes is the maximum byte length of a message's raw `value`
+	// field. A delivered message whose raw value exceeds it is
+	// rejected BEFORE JSON decode, envelope classification, event matching,
 	// invocation-state migration, and handler execution, then routed to the DLQ
 	// with a bounded diagnostic summary (never the oversized payload). It
-	// bounds the raw event value only; the Redis entry and go-redis response
+	// bounds the raw value only; the Redis entry and go-redis response
 	// have already been materialized before the consumer sees them. Defaults to
 	// DefaultMaxEventBytes (262144) if zero or negative — zero must not mean
 	// "unlimited".
@@ -131,10 +131,10 @@ type ConsumerConfig struct {
 	// runner resolves the schedule by its stable name, so a handler change under
 	// the same schedule is picked up on delivery. The stream layer stays the same
 	// consumer-group/PEL/recovery machinery for both message kinds. It is wired
-	// by the worker to runner.InvokeOccurrence. A nil value means a WELL-FORMED
-	// schedule message is treated as a normal event (the safe fallback for tests
-	// that do not wire it); a structurally INVALID schedule claim is dead-lettered
-	// regardless, never executed as an ordinary event.
+	// by the worker to runner.InvokeOccurrence. A nil value leaves a schedule
+	// message pending (never ACKed and never matched as an ordinary event); only
+	// the worker wires the runner. A structurally INVALID schedule claim is
+	// dead-lettered regardless.
 	ScheduleRunner func(ctx context.Context, msgID string, occ schedule.Occurrence, payload []byte) error
 	// backoffTable and backoffJitter override the retry backoff for tests. They
 	// are unexported so production always uses the fixed defaults.
@@ -167,9 +167,10 @@ type Consumer struct {
 	buffer   *bufferSemaphore
 	capacity int
 	// scheduleRunner is the ScheduleRunner seam (see ConsumerConfig). When nil,
-	// well-formed schedule-occurrence messages are treated as normal events.
+	// a schedule message is left pending rather than falling through to event
+	// matching; only the worker wires the runner.
 	scheduleRunner func(ctx context.Context, msgID string, occ schedule.Occurrence, payload []byte) error
-	// maxEventBytes caps the raw `event` value length (see
+	// maxEventBytes caps the raw `value` length (see
 	// ConsumerConfig.MaxEventBytes). It is always positive.
 	maxEventBytes int
 	// invocationRetention is the resolved terminal invocation-state window

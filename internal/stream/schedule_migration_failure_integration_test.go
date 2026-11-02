@@ -44,7 +44,7 @@ func TestIntegrationScheduleMigrationFailureStaysInPELWithoutRunnerCallOrDLQ(t *
 	store := &failingMigrationStore{invocationStateStore: e.consumer.invStateStore}
 	e.consumer.invStateStore = store
 
-	id := e.xadd(t, schEnvelope(t, schOcc()))
+	id := e.xaddSchedule(t, schOcc())
 	// XREADGROUP (not the consumer loop) puts the entry in the real PEL so the
 	// later inspection reflects exactly this delivery.
 	msg := e.readOneIntoPEL(t)

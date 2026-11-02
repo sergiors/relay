@@ -77,6 +77,11 @@ func TestIntegrationOversizedEventRoutesToDLQImmediately(t *testing.T) {
 		t.Errorf("oversized DLQ app/handler = %q/%q, want %q placeholder",
 			m.App, m.Handler, dlq.NoHandler)
 	}
+	// An oversized message was never decoded, so it has no handler payload to
+	// replay: the row stores none and the read model reports it non-replayable.
+	if m.ReplayPayload != nil {
+		t.Errorf("oversized DLQ ReplayPayload = %q, want nil", m.ReplayPayload)
+	}
 	if m.HandlerAttempts != 0 {
 		t.Errorf("oversized DLQ HandlerAttempts = %d, want 0", m.HandlerAttempts)
 	}

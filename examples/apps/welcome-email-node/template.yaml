@@ -4,5 +4,5 @@ concurrency: 2
 events:
   - handler: handler.handler
     pattern:
-      event_name: [INSERT]
-      table_name: [users]
+      recordType: [INSERT]
+      collectionName: [users]
