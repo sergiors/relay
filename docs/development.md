@@ -20,7 +20,7 @@ DATABASE_URL='postgres://relay:relay@localhost:5432/relay?sslmode=disable' \
 Relay reads apps from the fixed `/apps` root. `NODE_ID` is the required,
 stable node identity used as the Redis consumer name, `relay.node_id`
 container label, and stats node key. `DATABASE_URL` is required and points to the
-shared state database. See [operations](operations.md#state-database) and
+shared state database. See [operations](operations.md#state-paths-and-persistence) and
 [configuration](configuration.md) for details.
 
 Run formatting, static analysis, and tests with the repository's Makefile:

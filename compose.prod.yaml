@@ -5,68 +5,6 @@ x-logging: &default-logging
     max-file: "3"
 
 services:
-  traefik:
-    image: traefik:v3.7.13
-    restart: unless-stopped
-    logging: *default-logging
-
-    command:
-      - --providers.docker=true
-      - --providers.docker.exposedbydefault=false
-      - --providers.docker.network=traefik
-
-      - --entrypoints.web.address=:80
-      - --entrypoints.web.http.redirections.entrypoint.to=websecure
-      - --entrypoints.web.http.redirections.entrypoint.scheme=https
-      - --entrypoints.websecure.address=:443
-
-      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:?Set ACME_EMAIL}
-      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
-      - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
-      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
-
-    ports:
-      - "80:80"
-      - "443:443"
-
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - letsencrypt-data:/letsencrypt
-
-    networks:
-      - edge
-
-  socket-proxy:
-    image: tecnativa/docker-socket-proxy:latest
-    restart: unless-stopped
-    logging: *default-logging
-
-    environment:
-      PING: "1"
-      VERSION: "1"
-      BUILD: "1"
-      IMAGES: "1"
-      CONTAINERS: "1"
-      NETWORKS: "1"
-      POST: "1"
-      DELETE: "1"
-
-      TIMEOUT_CLIENT: 1h
-      TIMEOUT_CONNECT: 10s
-      TIMEOUT_SERVER: 1h
-
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-
-    networks:
-      - control
-
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:2375/_ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
   relay:
     image: ${RELAY_IMAGE:?Set RELAY_IMAGE to a tested release tag or digest}
     restart: unless-stopped
@@ -114,6 +52,68 @@ services:
       timeout: 3s
       retries: 3
       start_period: 20s
+
+  traefik:
+    image: traefik:v3.7.13
+    restart: unless-stopped
+    logging: *default-logging
+
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=traefik
+
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+
+      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:?Set ACME_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+
+    ports:
+      - 80:80
+      - 443:443
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - letsencrypt-data:/letsencrypt
+
+    networks:
+      - edge
+
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    restart: unless-stopped
+    logging: *default-logging
+
+    environment:
+      PING: "1"
+      VERSION: "1"
+      BUILD: "1"
+      IMAGES: "1"
+      CONTAINERS: "1"
+      NETWORKS: "1"
+      POST: "1"
+      DELETE: "1"
+
+      TIMEOUT_CLIENT: 1h
+      TIMEOUT_CONNECT: 10s
+      TIMEOUT_SERVER: 1h
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+    networks:
+      - control
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:2375/_ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   prometheus:
     image: prom/prometheus:v3.7.0

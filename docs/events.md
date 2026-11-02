@@ -1,155 +1,99 @@
 # Events
 
-Relay consumes events from the configured Redis Stream with a consumer group.
-Each stream entry carries its payload in a `value` field (a JSON **object**) and
-may carry an optional `format` marker. Every other entry field is ignored.
-Relay decodes the envelope into one of three kinds before any matching:
+Relay reads messages from the configured Redis Stream. Put the JSON object in
+`value`; unrelated fields do not affect envelope decoding or event matching.
+`format=raw` is optional and forces a message to be treated as a raw event.
+Trace context fields (`traceparent`, `tracestate`, and `baggage`) are used for
+distributed tracing when tracing is enabled.
 
-- a raw JSON event;
-- a validated schedule occurrence (see [schedules.md](schedules.md));
-- a confirmed Debezium tombstone, acknowledged without execution.
+Decoded external events are matched against app rules. Every matching handler
+runs as a one-shot function. Schedule occurrences use the same stream, but are
+dispatched directly to their configured handler; they do not use event matching.
+See [Schedules](schedules.md).
 
-Decoded Debezium changes are normalized into a stable handler shape with exactly
-`collectionName`, `recordType`, `newImage`, and `oldImage`. Ordinary events then
-pass through event classification and pattern matching. Schedule occurrences use
-the same stream and consumer group but a separate schedule dispatch path: they
-resolve/adopt the configured handler directly and bypass ordinary event
-classification and pattern matching.
+## Event formats
 
-```
-Producer → Redis Stream → Relay (decode envelope + match external event)
-→ matching handler → one-shot function → invocation lifecycle → XACK
-```
+### Raw JSON
 
-An event that decodes successfully is classified `matched` or `unmatched`
-**before any execution**; an unmatched event is acknowledged and never retried.
-A malformed message (missing `value`, a non-string `value` or `format`, an
-unknown `format` marker, a `value` that is not a JSON object, or a recognized
-schedule/Debezium claim that fails validation) can never succeed and is routed
-straight to the DLQ on first encounter without running a handler, then
-acknowledged.
-
-## Envelope formats
-
-### Raw JSON (`format` absent or `format=raw`)
-
-A `value` that is a JSON object with no recognized schedule or Debezium
-structure is a raw JSON event. An explicit `format=raw` marker takes precedence
-over structure recognition and forces this path, including for a Debezium
-tombstone or a schedule claim. Use it for an application event that
-intentionally carries a Debezium-like `source.connector` but is not a Debezium
-change. An unknown `format` value is non-retryable; a present non-string
-`format` is equally malformed.
-
-### Schedule
-
-A `value` object with `source: relay.schedule` claims schedule identity and can
-never fall through to event matching. The derived occurrence identity is carried
-as `occurrence_id` inside the envelope and is cross-checked against the
-app/schedule/`scheduled_at` fields. A structurally malformed claim or a
-mismatched `occurrence_id` is non-retryably dead-lettered.
-
-### Debezium
-
-Relay consumes Debezium Server's Redis sink in **extended** message format
-(`debezium.sink.redis.message.format=extended`), because Relay consumes the
-change from the named `value` field. Relay reads `value` and ignores unrelated
-stream fields. Debezium's `compact` format does not provide this named field, so
-extended format is required.
-
-A schema-enabled `{schema, payload}` wrapper with an object `schema` claims
-Debezium structure when `payload` has a `source` object naming a `connector` and
-a CDC marker (`op`, or both `before` and `after`). The wrapper is the additional
-evidence, so a missing `collection`/`table` still claims and is rejected during
-validation. A schemaless record needs that `source.connector`, a CDC marker, and
-either a `collection`/`table` location or another known Debezium source field
-(such as `version`, `name`, `ts_ms`, `db`, or `schema`). A wrapper without an
-object `schema` only claims if its payload satisfies the schemaless rule.
-
-Once claimed, a missing, empty, or non-string `op`, an unsupported connector, a
-missing or ill-typed collection/table, or an invalid non-null image is
-non-retryable and never falls back to raw matching; a missing image remains
-`null`. A raw object with only `op`, a `source` object without a connector, or a
-connector/location without a CDC marker remains raw; an explicit `format=raw`
-always forces raw.
-
-Relay supports the `mongodb` and `postgresql` connectors, reading
-`source.collection` or `source.table` respectively, and maps:
-
-| `op`     | `recordType` |
-| -------- | ------------ |
-| `c`, `r` | `INSERT`     |
-| `u`      | `UPDATE`     |
-| `d`      | `DELETE`     |
-
-A snapshot read (`r`) is an existing captured row, so it is normalized to
-`INSERT`. `after` becomes `newImage` and `before` becomes `oldImage`; each must
-be a JSON object or `null`, and an unknown `op` or unsupported connector is
-non-retryable rather than matching as a raw event. For MongoDB, `before`/`after`
-may be JSON strings or objects and are decoded without float conversion.
-Extended JSON is normalized recursively, but only an exact single-key wrapper
-is converted:
-
-- `$oid` becomes its canonical 24-character lowercase hex string.
-- `$date` becomes an RFC3339 UTC timestamp (`RFC3339Nano`). Integer Unix
-  milliseconds, ISO-8601 strings with offsets, and
-  `{"$numberLong":"..."}` are accepted; malformed or out-of-range dates, and
-  strings with precision beyond nanoseconds, are non-retryable.
-- `$numberInt` and `$numberLong` become range-checked signed integers, never
-  `float64`. `$numberDouble` becomes a JSON number when finite; `NaN` and
-  infinities keep their wrapper because JSON cannot carry them.
-- `$numberDecimal` and `$binary` keep their Extended JSON wrappers exactly.
-  Decimals are never converted to `float64`, and binary data is not flattened.
-  `$timestamp` keeps its wrapper and retains its `t`/`i` information, though
-  safe numeric values in those fields may be normalized to exact integer types.
-
-Objects with extra keys are ordinary application values, not wrappers. A
-malformed `$oid` or numeric wrapper is preserved rather than guessed. Plain JSON
-numbers in MongoDB images are decoded without `float64` rounding: safe integers
-become Go integer values, finite decimals become `float64`, and values outside
-those ranges retain their exact JSON number. An image that is not an object (or
-`null`) is still rejected.
-
-A Debezium tombstone is ignored (acknowledged without execution) only when there
-is no `format=raw` marker and `value` is exactly the default null-value
-sentinel, `default` (the default for `debezium.sink.redis.null.value`). A custom
-`null.value` marker is not recognized as a tombstone and follows normal
-decoding. `format=raw` takes precedence, so the literal `default` is decoded as
-a non-object value and is non-retryable. Relay never synthesizes a DELETE from
-a tombstone.
-
-### Size limit
-
-A message whose raw `value` exceeds `MAX_EVENT_BYTES` (default 256 KiB) is also
-non-retryable and routed straight to the DLQ before decode, matching, or a
-handler runs. Because the cap is checked on the raw value, this applies to any
-message kind — ordinary events, Debezium changes, and schedule claims alike.
-The check is a Relay-boundary guard: Redis and go-redis have already
-materialized the entry before Relay can inspect it, so it is not
-transport-level protection against a huge entry, and metadata/RESP overhead is
-outside the setting.
-
-## Publishing an event
-
-Any producer can append to the stream. With `redis-cli` against the configured
-stream, write the event body in `value`; Relay ignores unrelated entry fields:
+An ordinary JSON object in `value` is delivered to matching rules without
+normalization. For example:
 
 ```sh
-redis-cli XADD events '*' \
-  value '{"recordType":"INSERT","collectionName":"users","newImage":{"email":"alice@example.com"}}'
+redis-cli XADD events '*' value '{"type":"course.completed","studentId":"123"}'
 ```
 
-Relay never assumes where events originate; it only reads the stream.
+Use `format=raw` when an object intentionally resembles a Debezium or schedule
+envelope:
 
-Events may also be created by `relay app invoke` (manual, synchronous, not
-part of the stream lifecycle — see [cli.md](cli.md)). Relay also publishes its
-own schedule occurrences to this stream; those are not external events and do
-not pass through the classification and pattern-matching flow described here
-(see [schedules.md](schedules.md)).
+```sh
+redis-cli XADD events '*' format raw value '{"source":"custom","op":"c"}'
+```
 
-## Pattern syntax
+The value must be a JSON object. Missing or non-string `value` fields,
+non-string or unknown `format` markers, invalid JSON, and invalid recognized
+envelopes are sent to the DLQ without running a handler.
 
-Rules live under `events` in `template.yaml`:
+### Debezium CDC
+
+Use Debezium Server's Redis sink in `extended` format:
+`debezium.sink.redis.message.format=extended`. Relay reads the change from
+`value`; compact format is not supported. MongoDB and PostgreSQL records may use
+schema-enabled or schemaless JSON.
+
+Relay normalizes supported changes to exactly this handler event:
+
+```json
+{
+  "collectionName": "users",
+  "recordType": "UPDATE",
+  "newImage": {},
+  "oldImage": null
+}
+```
+
+`source.collection` (MongoDB) or `source.table` (PostgreSQL) supplies
+`collectionName`. Operations `c`, `u`, and `d` become `INSERT`, `UPDATE`, and
+`DELETE`. Snapshot operation `r` becomes `INSERT`; it represents an existing
+captured row, not a new database write. Each document image is an object or
+`null`; a missing image remains `null`. Invalid recognized changes are
+dead-lettered rather than treated as raw events.
+
+MongoDB Extended JSON values are normalized recursively before matching and
+execution:
+
+- A canonical `$oid` becomes a string; other forms remain wrapped.
+- `$date` becomes an RFC3339 UTC timestamp.
+- Supported numeric wrappers become JSON numbers without silently losing
+  precision.
+- Decimal and binary values retain their Extended JSON representation. A
+  `$timestamp` wrapper is retained while its safe numeric `t`/`i` values may be
+  normalized.
+
+Only exact single-key Extended JSON wrappers are converted; objects with
+additional fields remain application data. Malformed, out-of-range, or
+sub-nanosecond dates are rejected. Decimal values are not converted to floating
+point; invalid numeric wrappers remain wrapped. PostgreSQL images are not subject
+to MongoDB-specific normalization. Values too large for a safe numeric
+conversion remain exact, but numeric matching operators may not match those
+values.
+
+A Debezium tombstone is acknowledged without execution when `value` is exactly
+the default null-value sentinel `default`. `format=raw` takes precedence, and
+custom null-value sentinels are not recognized.
+
+### Schedule envelopes
+
+Relay publishes schedule occurrences to the stream. Their envelopes carry
+`source: relay.schedule`, an app and schedule name, the scheduled instant, and a
+deterministic `occurrence_id`. Relay validates the envelope and dispatches it to
+the current or already-admitted handler for that schedule. Invalid claims are
+dead-lettered and never matched as ordinary events. The handler receives only
+`{"source":"relay.schedule","scheduled_at":"…"}`. See
+[Schedules](schedules.md) for identity and recovery behavior.
+
+## Event matching
+
+Declare event rules in an app's `template.yaml`:
 
 ```yaml
 events:
@@ -161,424 +105,78 @@ events:
     retries: 2
 ```
 
-A pattern is a tree of field conditions. Each field's condition is an
-**ordered list of alternatives (OR)**. A list element is one of:
-
-- a bare scalar literal — equality: `status: [COMPLETED, FAILED]` matches either
-  value;
-- a single-operator map — `id: [{prefix: "user_"}]`, `score: [{gt: 70}]`,
-  `deleted_at: [{exists: false}]`;
-- a nested map — a group of child fields, ANDed with each other:
-  `newImage: {status: [COMPLETED]}`.
-
-A bare map value is shorthand for a single-element list, so `newImage:
-{status: [COMPLETED]}` and `newImage: [{status: [COMPLETED]}]` are equivalent.
-A list element may itself be a nested map, which lets one field carry several
-alternative sub-objects:
-
-```yaml
-pattern:
-  result: [{ status: [OK] }, { status: [DEGRADED] }]
-```
-
-The following are rejected as parse errors, never silently widened:
-
-- a scalar as a whole field condition (`status: COMPLETED`): every condition is
-  a list — write `status: [COMPLETED]`;
-- an empty list, an empty map, or a null condition;
-- an operator used as a nested field name, and an unknown or misspelled
-  operator-like key (`{prefix: 12}`, `{prefx: "x"}`).
-
-### Operators
-
-| Operator              | Semantics                                                            |
-| --------------------- | -------------------------------------------------------------------- |
-| `prefix`              | String value starts with the given prefix (non-strings never match). |
-| `suffix`              | String value ends with the given suffix (non-strings never match).   |
-| `exists`              | Key presence only; takes a boolean, not a list.                      |
-| `gt` `gte` `lt` `lte` | Numeric threshold, or `now()`-relative cutoff for RFC3339 strings.   |
-
-Each operator takes a **single scalar operand**. Multiple prefixes, suffixes, or
-thresholds for one field are separate alternatives:
-
-```yaml
-id:
-  - prefix: "user_"
-  - prefix: "org_"
-amount:
-  - lt: 10
-  - gte: 1000
-```
-
-There is no `equals` operator: a bare literal is equality. An unknown or
-misspelled operator-like key is rejected rather than silently widening the rule.
-
-### Comparison operators
-
-`gt`/`gte`/`lt`/`lte` take a number (compared numerically) or a `now()`-relative
-expression string:
+A pattern is a tree of field conditions. Alternatives in a field's list are
+**OR**; sibling fields and nested conditions are **AND**. A bare value means
+equality, and nested maps match object fields:
 
 ```yaml
 pattern:
   newImage:
-    created_at:
-      - gt: "now()-5m"
+    status: [COMPLETED, VERIFIED]
+    certificate: [{exists: false}]
+    completed_at: [{gt: "now()-5m"}]
 ```
 
-- Only the exact `now()` / `now()±duration` syntax is temporal (`now()`,
-  `now()-5m`, `now()+10m`, compound forms like `now()-1h30m`). The cutoff is
-  evaluated as a UTC instant **at match time**, never at template load.
-- The event value must be an RFC3339 string; offsets are respected and values
-  are compared as instants, not lexicographically. A missing, `null`,
-  non-string, or invalid-RFC3339 value never matches a temporal comparison.
-- A literal timestamp such as `gt: "2026-09-12T10:00:00Z"` is **not** accepted;
-  only `now()`-syntax is valid for string operands. The old bare `now`-style
-  syntax is a validation error.
-- Multiple alternatives on the same field are OR, so `{gte: "now()-1h"}` together
-  with `{lt: "now()"}` is not a range.
+Supported operators:
 
-`exists` checks key presence only — `null`, `false`, `0`, `""`, `{}`, `[]` all
-count as present. It works recursively: `newImage: [{exists: true}]` checks the
-top-level key; `newImage: {name: [{exists: true}]}` checks `name` inside
-`newImage`. A nested `exists: true` fails when a parent is missing; a nested
-`exists: false` matches when the nested key is absent, including when the parent
-map itself is missing.
+| Operator | Meaning |
+| --- | --- |
+| `prefix`, `suffix` | String prefix or suffix |
+| `exists` | Whether the field is present; `null` counts as present |
+| `gt`, `gte`, `lt`, `lte` | Numeric comparison or comparison with a `now()`-relative time |
 
-### Combining conditions
+Temporal operands use `now()` or `now()±duration`, such as `now()-5m`. The
+cutoff is evaluated at match time. Event values must be valid RFC3339 strings;
+offsets are compared as instants. Missing, null, or invalid date values do not
+match. Use `exists: false` to match an absent field; a present `null` field does
+not count as absent. See [Apps](apps.md) for the complete template reference.
 
-- Alternatives within one field's list are **OR**.
-- Different fields (siblings) and nested children are **AND**.
-- A missing event field fails that field's value conditions (but `exists: false`
-  can match absence).
-- Extra event fields are ignored.
-- Each rule's pattern is evaluated independently: multiple rules may match the
-  same event and there is no deduplication, so every matching rule runs. Event
-  handler names are unique within an app, so each matching rule is a
-  distinct handler invocation.
+Unknown operators and invalid pattern structures fail template validation.
+Patterns are limited to depth 8 and a canonical JSON size of 4096 Unicode code
+points.
 
-Example: `status: [COMPLETED, FAILED]` matches either value; an `id` field
-with `- prefix: "user_"` matches `user_123` but not `123`.
+Every rule is evaluated independently. Multiple rules may match one event, and
+each matching handler runs once for that delivery. Unmatched events are
+acknowledged without retry.
 
-### Pattern limits
+## Execution, retries, and delivery
 
-Each `pattern` is bounded by two **fixed limits**. They are not configurable:
-there is no environment variable or template key that changes them.
+Handlers receive the decoded event as JSON on stdin. For one message, Relay runs
+matching handlers sequentially; separate messages may run concurrently, subject
+to worker and app concurrency limits.
 
-- **Structural depth 8.** Depth counts field nesting plus nested
-  composite-literal containers. Each top-level pattern field is level 1 and each
-  nested child field is one level deeper, so a pattern whose deepest field is at
-  level 8 is accepted and one at level 9 is rejected. The grammar wrappers add no
-  depth: a field's OR-alternative list (`status: [A, B]`) and a single-key
-  operator map (`id: [{prefix: "x"}]`) do not consume a level, and
-  siblings/alternatives do not accumulate. A nested-map alternative introduces its
-  child fields at the next level, so `newImage: [{status: [COMPLETED]}]` puts
-  `status` at level 2. A **composite literal container** — a list or map used as
-  an equality value, e.g. `tags: [[1, 2]]` — consumes one level per container
-  nesting, so a deeply nested composite cannot bypass the cap.
-- **Size 4096 Unicode characters.** The size is measured per `pattern` (never the
-  whole template, never the sum across a rule's patterns) as the number of
-  Unicode **code points** in that pattern subtree's canonical compact JSON
-  serialization: `encoding/json`'s compact form with object keys sorted. JSON
-  punctuation, quotes, and escaping all count, including `encoding/json`'s
-  HTML-sensitive escapes (`<` becomes `\u003c`). Because it is a code-point count,
-  each multibyte character contributes exactly one code point rather than its
-  UTF-8 byte length; the total serialized pattern, JSON syntax included, must
-  still be <= 4096. Non-finite YAML floats (`.nan`/`.inf`), which JSON cannot
-  represent, are measured as the four-character literal `null`. A mapping with
-  non-string keys has no JSON encoding and can never match a JSON object, so it is
-  rejected as a parse error rather than measured.
+Delivery is **at least once**, not exactly once. A handler may run again after a
+crash, so handlers that cause side effects should be idempotent. Relay
+acknowledges a message only after every matched invocation is terminal: it
+succeeded or was dead-lettered after exhausting its retry budget.
 
-Both limits are enforced once when the template is parsed: an over-limit pattern
-fails `template.yaml` validation with an error naming the rule (and, for depth,
-the offending field path) and the exceeded limit. An accepted pattern parses,
-matches, and is indexed exactly as before. A valid nested pattern:
+`retries` is the number of additional attempts (default `4`, maximum `100`).
+Backoff is fixed at 1m, 2m, 5m, then 10m for later retries. Events remain
+pending while an app is unavailable, a handler is running or in backoff, or
+execution capacity is unavailable. Capacity rejections do not consume a retry.
+Pending messages are reclaimed for recovery after about one minute; reclaim is a
+recovery backstop, not the retry timer. See [Configuration](configuration.md)
+for concurrency and buffer limits.
 
-```yaml
-pattern:
-  newImage:
-    status: [COMPLETED]
-    metadata:
-      source: [{prefix: "sync_"}]
-```
+## Size limit
 
-## Dispatch and concurrency
-
-For each delivered external-event message, Relay evaluates every loaded app (in
-sorted name order) and each app's rules in declaration order:
-
-- **Per message, matching invocations run one at a time.** The runner iterates
-  apps and rules in a single loop and executes each matching handler in
-  turn.
-- **Across messages, invocations run concurrently.** Distinct events (and
-  distinct workers) execute simultaneously, bounded by the worker-global
-  `MAX_CONCURRENT_INVOCATIONS` and the per-app effective concurrency
-  (`min(concurrency, MAX_CONCURRENT_INVOCATIONS)`).
-- A failure in one matching handler does **not** prevent the remaining matched
-  handlers of that message from running. Each matching invocation gets its own
-  independent attempt and outcome.
-
-A matched event handler runs as a one-shot function in an isolated container,
-with `RELAY_HANDLER` set and the external event JSON on stdin; exit code `0` is
-success, anything else is failure. Container stdout/stderr is forwarded verbatim
-(prefixed per handler) at every log level. A schedule-triggered function
-invocation uses the same one-shot runtime and outcome machinery but receives an
-occurrence payload and is selected by schedule dispatch, not event pattern
-matching.
-
-## Delivery, retry, and ACK
-
-Delivery is **at-least-once**, never exactly-once. A handler can run more than
-once, so handlers must be idempotent.
-
-- A message is acknowledged (XACK) only after **every** matching invocation is
-  terminal: each succeeded, or was exhausted and routed to the DLQ.
-- A failing invocation is retried per its rule's `retries` (default `4`, so `5`
-  total attempts; maximum `100`, so at most `101` total attempts) with a fixed
-  backoff — 1m, 2m, 5m, then 10m capped — recorded
-  as a `next_attempt_at` deadline in per-invocation state. A redelivery before
-  that deadline skips the invocation without executing it.
-- The persisted attempt count is the number of **admitted claims** (`TryStart`),
-  which normally equals the real handler execution count but can exceed it in the
-  crash-before-execute window described
-  [below](#where-the-attempt-count-advances). It drives exhaustion; the Redis PEL
-  delivery count is diagnostic only and is not the retry driver.
-- If a matched invocation cannot run because its app is unavailable, the
-  message stays pending (no handler attempt counted) and is never DLQ'd for
-  unavailability alone.
-- If no concurrency slot frees within a bounded wait, the message stays pending
-  and a later reclaim replays it — no retry is charged for a merely-blocked
-  invocation.
-- Recovery (`XAUTOCLAIM`) reclaims messages idle beyond `MinPendingIdle`
-  (default `1m`) as a message-level backstop; whether an individual invocation
-  executes is decided per-invocation from its state. Retry timing is therefore
-  quantized by the reclaim cadence.
-- A `TryStart` claim error fails **closed**: the handler is not executed and the
-  message stays pending, because running a duplicate could race a replica that
-  won the same claim.
-
-### Where the attempt count advances
-
-The **claim is the attempt boundary**, not the handler start. The runner
-persists the attempt (via `TryStart`, atomically with the running deadline and a
-fresh claim token) only **after** both the concurrency slot and the warm-container
-budget have been admitted, and every later transition — retry, completion,
-exhaustion — is compare-and-set on that claim. This makes the capacity gates
-strictly non-charging:
-
-- A **congestion/backpressure** rejection before the claim (no concurrency slot
-  within the bounded wait, or a saturated warm-container budget) records no
-  attempt and charges no retry or DLQ: the message stays pending and is replayed.
-- A **lifecycle cancellation** (worker shutdown) changes no **persisted**
-  retry/exhaustion state. If it lands before the claim, no attempt is claimed at
-  all; if it lands after a confirmed claim, that claimed attempt is spent exactly
-  like a crash in the same window (see below), but **no** retry backoff and
-  **no** exhausted/DLQ marker is written. The stream leaves the message pending
-  regardless, so repeated shutdowns cannot consume the retry budget or
-  dead-letter work. This is narrower than "the failure is not charged": failure
-  **telemetry** is separate from persisted invocation state, and a post-claim
-  execution that reports an error on a canceled delivery is still counted by
-  `handler_failure_total`, the labeled invocation-outcome and per-app failure
-  counters, and the `last_failure_at` app timestamp. The runner records the
-  execution failure before its cancellation guard suppresses the persisted
-  transition, so the counter moves even though no retry/exhaustion state does.
-- A crash **after** a confirmed claim but **before** the handler actually starts
-  leaves the persisted running marker behind. Its deadline simply elapses (the
-  message is never lost and the invocation is not permanently locked), after which
-  a reclaim claims the **next** attempt. The unexecuted attempt is therefore
-  consumed, and repeated lost claims raise the persisted count further. The
-  configured retry budget bounds normal failing executions, not guaranteed
-  user-code runs: it does **not** cap admitted claims across repeated crashes, so
-  the persisted count can exceed `1 + retries` before any real failure. This is
-  the accepted at-least-once trade-off (a bounded exposure of at most one attempt
-  per crash); closing it would require a two-phase claim/execute handshake that
-  at-least-once delivery does not provide. The same accounting applies to the
-  narrow create-time warm-budget race, which happens after the claim like any
-  other crash in that window.
-
-  `TryStart` **claims but does not exhaust**: it has no retry budget and never
-  writes a terminal marker, so a crash **alone** never dead-letters a message — it
-  only advances the persisted attempt count. The invocation becomes terminal (and
-  the message routable to the DLQ) only when a **later** delivery actually runs the
-  handler and it fails with the persisted count already at or above
-  `1 + retries`. In other words, repeated lost claims can make the next **real**
-  failure exhaust with a larger persisted attempt count; the failure is what
-  triggers the DLQ.
-
-### Invocation state persistence
-
-Per-message invocation state is a Redis hash keyed by message and
-`<app>/<handler>`. While the message is still pending (recoverable — it can
-be redelivered from the PEL) that hash is **persistent with no TTL**, so however
-long a message sits pending its `running`/`next_attempt_at`/terminal markers are
-still there when a reclaim reads them. Only after the message has left the PEL —
-a successful XACK on the success, obsolete-schedule, or DLQ path, or a purged
-missing-payload PEL reference — is the hash switched to **terminal retention**:
-a reserved marker plus the configured `REDIS_INVOCATION_RETENTION` TTL (default
-`48h`; empty/`0`/negative disables the expiry while still writing the marker, so
-the hash stays persistent). For every path that ACKs, the XACK and that retention
-switch are performed by **one atomic Lua script**, so a crash or error can never
-leave a hash whose message already left the PEL without a marker/TTL; a failed
-ACK stages only a persistent marker (no TTL), so a still-pending message's state
-never expires (the terminal marker is nonetheless present, and a redelivery just
-re-acks). Once retained, every lifecycle transition
-from a stale in-memory delivery is inert, so it can neither mutate the retained
-state nor remove the retention TTL. A hash whose retention never runs is simply
-leaked, never prematurely expired.
+`MAX_EVENT_BYTES` (default `256KiB`, maximum `1MiB`) limits the raw `value` size.
+Oversized messages are dead-lettered before decoding or execution, with a bounded
+diagnostic summary instead of the full payload. The setting limits the message
+body after Redis has delivered it; it does not limit Redis entry overhead. See
+[Configuration](configuration.md#event-size-limit).
 
 ## Dead-letter queue
 
-When **all** non-complete invocations dispatched for a message are exhausted,
-the message is dead-lettered and then acknowledged. One entry is written **per
-exhausted invocation**, so an external event matching several apps or handlers
-that all exhaust produces one correctly-attributed entry each. Scheduled
-occurrence functions use this shared invocation/DLQ infrastructure.
+Relay stores dead letters durably in PostgreSQL before acknowledging their
+source message. A row is written per exhausted invocation; malformed messages
+use a non-replayable placeholder. Rows remain unsettled until the source ACK is
+confirmed, and only settled rows can be removed or expired.
 
-- The DLQ is a **PostgreSQL table** (`dlq`), Relay's sole durable dead-letter
-  persistence, admin read model, and retention store. It has no broker stream,
-  consumer group, PEL, or XACK flow: rows are inserted before the source ACK and
-  read only by the admin `relay dlq` commands.
-- Each row is inserted **idempotently by a stable ID** derived from the logical
-  source delivery identity (source stream, group, message ID) plus the
-  invocation identity, so a crash, an ambiguous transaction, or a failed source
-  ACK can neither duplicate nor lose a row. A real invocation's retained
-  exhausted marker is validated against the runner's attribution before the
-  insert, so a stale claim can never create an entry. Rows are written **before**
-  the XACK. If persistence fails, the original stays pending and the invocation
-  is re-reported on redelivery, so the message is re-routed rather than
-  acknowledged without an entry. See
-  [DLQ persistence contract](#dlq-persistence-contract).
-- Delivery identity is scoped to one Relay deployment's state database. The
-  source, group, and message ID are opaque logical coordinates, not a promise
-  that broker-assigned IDs are globally unique. Workers in one deployment must
-  share the database; separate deployments must not. A future broker adapter
-  must supply a deterministic delivery identity that includes enough broker and
-  resource scope to avoid reusing coordinates across recreated streams/topics.
-  The Redis adapter treats stream and group names as that scope; destructive
-  recreation with reused names and message IDs is unsupported. Use a new stream
-  or group name rather than reusing old coordinates.
-- Rows start **unsettled** and become settled only after the source ACK is
-  confirmed. A bounded worker reconciliation repairs a crash between a successful
-  Redis ACK and the PostgreSQL settlement marker by asking the exact source
-  stream/group whether the delivery is still in its PEL; it pages past a
-  delivery-ID cursor and wraps, so permanently pending rows cannot starve later
-  deliveries, marks settled only when the delivery is no longer pending, and
-  preserves rows on any Redis error. Admin removal of an unsettled entry is
-  refused, and retention deletes only settled rows, so a delivery that may still
-  be recoverable can never lose its dead letter.
-- **Replay admission is a fenced lease.** `relay dlq replay` atomically claims
-  one settled row, increments a monotonic fencing token, and stamps a ten-minute
-  lease in database time before contacting the worker. A concurrent replay gets
-  an explicit replay-in-progress error and never dials. A definitive
-  worker-reported failure, a failed dial, or an explicit no-invoker answer
-  releases the claim; a request write failure, lost or malformed response, other
-  I/O failure, or client cancellation retains it until expiry, which is also how
-  a crashed claimant recovers. The success delete is one conditional statement
-  requiring the settled state, the same token, and an unexpired lease, so a stale
-  claimant cannot remove a re-claimed row. Admin removal and retention both skip
-  an active claim. Replay is **at-least-once**: the worker does not cancel
-  execution on disconnect, and work that outlives the lease can be replayed
-  again.
-- The DLQ is pruned **age-only** by `DLQ_RETENTION` (default 7 days, a bounded
-  PostgreSQL `DELETE` of **settled** rows with no active replay claim). This is
-  separate from the source stream's `REDIS_STREAM_RETENTION` ACKED trim and from
-  `REDIS_INVOCATION_RETENTION` (the terminal invocation-state TTL); all three are
-  independent windows. See
-  [configuration.md](configuration.md#stream-and-dlq-retention).
-- Idempotency without scanning: the stable row ID is the idempotency key, so a
-  redelivery re-inserts only the missing rows and leaves already-committed rows
-  untouched. A malformed-message entry has no handler invocation and uses the
-  same stable identity with an empty invocation component.
-- Storage follows the state-package convention: `id TEXT PRIMARY KEY`,
-  `data JSONB NOT NULL` (private payload), plus only the relational
-  `delivery_id`, nullable `settled_at_ms`, `created_at_ms`, and the replay
-  admission columns `replay_claim_token` and `replay_lease_until_ms` (part of the
-  fresh schema; there is no migration or existing-database compatibility).
-  Event, replay-payload, and reason bytes are base64-encoded inside the JSON
-  payload, so arbitrary malformed bytes, including NUL, survive JSONB losslessly.
-- Entry fields: `id`, `delivery_id`, `source`, `source_group`,
-  `source_message_id`, `consumer`, `event` (the original transport `value`,
-  diagnostic), `replay_payload` (the exact logical handler payload produced by
-  the envelope decoder), `reason`, `app`, `handler`, `deliveries` (diagnostic
-  source count), `handler_attempts` (the persisted admitted-claim count; normally
-  the real execution count, but a crash or abandoned claim can advance it without
-  an execution), `timestamp` (RFC 3339), `settled_at` (empty while unsettled),
-  and an optional `trace` lineage. A malformed-message entry uses `-` for
-  `app`/`handler` and `handler_attempts` `0`. A semantically invalid schedule
-  claim has no handler payload that ran and is likewise stored without a
-  `replay_payload`. A schedule occurrence's transport `value` (its envelope with
-  `occurrence_id`/`scheduled_at`) is stored verbatim, preserving provenance,
-  while its `replay_payload` is `Occurrence.Payload()`. `relay dlq replay`
-  always hands the handler `replay_payload`; an entry without one is rejected
-  before the worker is contacted.
-- An oversized-event entry is intentionally **summary-only and non-replayable**:
-  it carries the same `-` placeholder app/handler (no handler invocation ever
-  ran) and its `event` field is a small diagnostic JSON summary
-  (`relay_summary`, `event_bytes`, `max_event_bytes`) instead of the oversized
-  payload. Relay deliberately does not parse the huge payload for an `event_id`.
-  `relay dlq replay` rejects it as non-replayable; use `inspect` to read the
-  summary and `rm` to remove it. Oversized rejections are counted by the
-  unlabeled `relay_events_oversized_total`.
-
-### DLQ persistence contract
-
-- **Idempotency is per exhausted invocation.** The unit of idempotency is one
-  exhausted invocation, keyed by a stable ID derived from the logical source
-  delivery identity (source stream, group, message ID) and the invocation
-  identity. Re-persisting the same exhaustion yields **at most one** PostgreSQL
-  row (`INSERT ... ON CONFLICT DO NOTHING`).
-- **Validation before insert.** A real invocation's retained exhausted marker is
-  re-read from Redis and its attempt/token identity must match the runner's
-  attribution; a missing or stale marker refuses the insert and leaves the
-  source pending. The marker remains terminal and PERSISTENT while the source is
-  recoverable, so a validated identity cannot be superseded.
-- **Source XACK follows all required persistence.** The source message is
-  acknowledged only **after** every required DLQ row has been committed. If a
-  PostgreSQL insert fails (or its outcome is ambiguous), the source stays pending
-  and the invocation is re-reported on redelivery, so the message is re-routed
-  rather than acknowledged without its entries.
-- **Failed or crashed XACK after successful persistence.** If the XACK fails or
-  the process crashes after the rows were committed, the message stays in the
-  PEL and is redelivered; the redelivery **re-inserts idempotently** and retries
-  the ACK. The terminal Redis retention TTL is applied only after a confirmed
-  XACK, so the exhausted markers cannot expire while the source is recoverable.
-- **Settlement follows a confirmed ACK.** All rows for one source delivery share
-  a `delivery_id`. After `ackAndRetainTerminal` returns successfully, the stream
-  marks that delivery settled; the update never happens before the ACK. If the
-  process crashes between the ACK and that update, a bounded worker
-  reconciliation asks Redis whether the exact source stream/group/message is
-  still pending. It marks settled only when the delivery is gone from the PEL;
-  Redis errors, an unavailable group/stream, or a decode failure preserve the
-  unsettled rows for a later attempt.
-- **Only settled rows are removable.** `relay dlq rm` returns an explicit error
-  for an unsettled entry, and `DLQ_RETENTION` deletes only settled rows. Removal
-  never mutates broker invocation state and never causes execution.
-- **Partial fan-out.** A message matching several apps or handlers writes one
-  row per exhausted invocation. A redelivery after a partial write **skips the
-  rows already committed and retries only the missing ones**, so completed rows
-  are neither duplicated nor lost.
-- **At-least-once, not exactly-once.** These guarantees make DLQ persistence
-  idempotent and correctly ordered; they do **not** make source delivery or
-  handler processing exactly-once. A handler can still run more than once, so
-  handlers must be idempotent (see
-  [Delivery, retry, and ACK](#delivery-retry-and-ack)).
-
-Manage the DLQ with `relay dlq ls` / `inspect` / `replay` / `rm` — see
-[cli.md](cli.md).
-
-## Guarantees summary
-
-- External events are classified and matched including apps that are currently
-  unavailable; schedule occurrences bypass that matching and dispatch by
-  schedule name to the configured/admitted handler.
-- Unmatched external events and malformed external-event messages are
-  acknowledged (malformed ones only after a DLQ entry is persisted).
-- No message is acknowledged while any invocation is protected, running, or
-  unresolved.
-- A reclaimed PEL entry whose stream body no longer exists is data loss, not
-  success: it is counted in `missing_payload_total` and its dangling reference
-  cleared — never a fabricated payload or DLQ entry. Relay's own `ACKED`
-  retention never trims an unacknowledged entry, so a nonzero value points at an
-  external unsafe trim or a manual delete racing the worker.
-
-Retry/exhaustion/backoff and the reclaim interval are fixed internals, not
-environment variables.
+Inspection preserves the original Redis `value`. Replay uses the separately
+stored `replay_payload`, which is the exact logical handler input: normalized
+Debezium event, unchanged raw event, or schedule handler payload. Invalid and
+oversized messages have no replay payload. Replay is also at least once; keep
+handlers idempotent. See [CLI](cli.md#relay-dlq) for inspection, replay, and
+removal commands, and [Operations](operations.md#dlq-controls) for recovery
+guarantees.

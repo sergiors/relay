@@ -61,130 +61,39 @@ untrusted networks.
 - **Resource controls** — per-container memory, CPU, and PID limits.
 - **Configuration and secrets** — environment values and secret references shared across apps, schedules, and services.
 - **Observability** — persisted statistics, Prometheus metrics, structured logs, and OpenTelemetry tracing.
-- **Operations** — health checks, manual invocation, DLQ inspection/replay, Git synchronization, and ordered teardown in which an aggregate deadline caps best-effort cleanup while dependency barriers have their own per-step bound.
+- **Operations** — health checks, manual invocation, DLQ inspection/replay, and Git synchronization. Dependency barriers may extend graceful shutdown while in-flight work finishes.
 - **One runtime process** — `relay start` runs in the foreground and leaves supervision to Docker, systemd, Kubernetes, or another process manager.
 
 ## How it works
 
-Relay has two workload types: **functions** (ephemeral, one-shot executions)
-and **services** (persistent, long-lived workloads). External events and
-schedules are distinct function triggers:
+Relay supports event-driven **functions**, scheduled functions, and persistent
+**services**. Event messages contain a JSON object in Redis Stream `value`; Relay
+matches decoded events against app patterns and runs every matching handler.
+Schedule occurrences use a separate dispatch path and bypass event matching.
+Services are long-running containers reconciled to their app configuration.
 
-```text
-Functions    External event → classify and pattern-match → handler → one-shot function
-             Schedule       → uniquely identified occurrence → Redis Stream / consumer group
-                              → schedule dispatch (resolve/adopt handler; bypass pattern matching)
-                              → handler → one-shot function
-Services     → continuously reconciled containers
-```
-
-External events and schedule occurrences share the Redis Stream, consumer
-group, invocation-state, retry/recovery, and DLQ infrastructure. Only external
-events go through ordinary event classification and pattern matching. Persistent
-services do not use this message-dispatch or one-shot function lifecycle. An app
-may declare any mix of these.
-
-### Events
-
-For event-driven workloads, Relay follows this path:
-
-```text
-External event
-    ↓
-Redis Stream / consumer group
-    ↓
-event classification and pattern matching
-    ↓
-matching handler(s) → one-shot function(s)
-    ↓
-shared invocation state / retries / recovery / DLQ
-```
-
-A stream message carrying an external event may match one or more handlers
-across one or more apps. Relay only acknowledges it after every matched
-invocation reaches a terminal state.
-
-Entries carry their payload in `value`, with an optional `format` marker; every
-other entry field is ignored.
-Relay accepts raw JSON, normalized Debezium changes (from the Redis sink's
-`extended` message format, reading only `value`; schema-enabled or schemaless,
-`mongodb` and `postgresql`), and its own schedule envelopes; an explicit
-`format=raw` marker forces raw JSON. See [events](docs/events.md) for the
-envelope rules, Debezium normalization, and tombstone handling.
-
-### Schedules
-
-Each schedule is a trigger. A firing creates a uniquely identified occurrence
-and publishes it to the same Redis Stream and consumer group as external events.
-The consumer uses schedule-specific dispatch: it resolves the configured handler
-by schedule name (or adopts the handler contract already pinned at admission),
-bypassing ordinary event classification and pattern matching. The handler then
-runs as a one-shot function through the common runtime machinery.
-
-```text
-cron
-  ↓
-uniquely identified occurrence + deduplicated publication
-  ↓
-Redis Stream / consumer group
-  ↓
-schedule dispatch → configured handler
-  ↓
-one-shot function → shared invocation state / retries / recovery / DLQ
-```
-
-### Services
-
-Persistent services do not pass through the event execution pipeline.
-
-Instead, Relay continuously reconciles their declared configuration:
-
-```text
-service declaration
-       ↓
-service reconciler
-       ↓
-desired replicas / configuration
-       ↓
-long-running containers
-```
-
-Relay keeps those containers aligned with the declared service configuration, restarting or replacing them when necessary.
-
-Relay watches `/apps` for changes. When an app changes, Relay reconciles only the affected app and rebuilds its managed image only when build inputs actually change. Container-only changes such as resource limits do not require a new image. By default the app's source is baked into the immutable runtime image. With `HOT_RELOAD` enabled, mountable runtimes (Python and Node) instead source-mount the live app directory from `/apps` read-only, so a source-only edit reuses the app and dependency images without rebuilding either and the new code takes effect by reloading or restarting the application process: managed services restart in place (same container ID, same image, brief stop/start) and pooled execution containers are recycled onto the live source, with busy invocations draining before replacement; see [docs/configuration.md](docs/configuration.md#hot-reload).
+See [Events](docs/events.md), [Schedules](docs/schedules.md), and
+[Services](docs/services.md) for the public behavior of each workload. Relay
+applies app changes from `/apps` live; see
+[Configuration](docs/configuration.md#hot-reload) for source handling.
 
 ## Guarantees
 
-Relay is designed around explicit delivery, recovery, and convergence semantics.
+- Event and schedule delivery is **at least once**, not exactly once. Handlers
+  that cause side effects should be idempotent.
+- Relay keeps messages pending while matched work is unresolved. It acknowledges
+  only after all matched invocations succeed or are durably dead-lettered.
+- Unavailable apps and temporary capacity limits do not cause matching work to
+  be acknowledged or consume a retry.
+- Schedule publication is deduplicated cluster-wide; handler execution still
+  follows at-least-once delivery.
+- Persistent services are reconciled toward their declared replicas and
+  configuration.
+- Resource limits apply per container; adding concurrency or replicas increases
+  aggregate resource use.
 
-- **Handler execution is at-least-once, not exactly-once.** A crash after a handler performs a side effect but before completion is recorded may cause the handler to run again. Handlers should be idempotent where side effects require it.
-- **Dispatched work is not acknowledged while unresolved.** Running functions, retry backoff, and other non-terminal states keep the Redis message pending.
-- **Unavailable apps do not turn matching external events into unmatched
-  events.** Their event invocations remain recoverable rather than being
-  acknowledged as if nothing matched.
-- **Retries preserve invocation coordination.** Stale claim owners cannot overwrite newer invocation state.
-- **Exhausted invocations enter the DLQ.** DLQ state is tracked per invocation rather than per whole stream message.
-- **Schedule publication is deduplicated cluster-wide.** Multiple workers may evaluate the same cron occurrence, but only one stream entry is admitted for that logical occurrence.
-- **Schedule deduplication does not imply exactly-once execution.** Once
-  published, schedule-triggered function invocations use the shared at-least-once
-  delivery and recovery machinery, but not ordinary event classification or
-  pattern matching.
-- **Redis pending work is recoverable.** Unacknowledged messages remain subject to normal PEL/reclaim handling.
-- **Persistent services converge toward declared state.** Relay continuously reconciles service containers against their configured replicas and runtime configuration.
-- **Dependency images are protected across processes.** Dependency layers are
-  content-addressed and shared by every app version with the same manifest.
-  Relay coordinates their use and garbage collection through PostgreSQL
-  advisory locks: a preparation holds a shared lease from before the dependency
-  probe through the app-image build, and GC removes a layer only under an
-  exclusive lease and after re-reading the daemon's label-derived references.
-  Processes sharing a Docker daemon must use the same `DATABASE_URL` database;
-  separate state databases on one daemon are unsupported (there is no Docker
-  fallback). One state database belongs to one Relay deployment: workers in that
-  deployment share it, but separate deployments must not. Without a coordinator,
-  dependency-consuming builds and dependency GC fail closed.
-- **Warm container generations converge safely.** Idle stale containers are retired while busy old-generation containers are allowed to drain.
-- **Resource limits are per container.** Increasing app concurrency or service replicas multiplies the possible aggregate resource usage.
-- **Shutdown uses a cleanup budget and strict dependency barriers.** Relay performs ordered graceful teardown under an aggregate deadline that caps each best-effort cleanup step (for example metrics, webhook, service-container cleanup, and the stats flush) by the budget remaining at that point; when a best-effort step misses its bound the timeout is logged, its context is cancelled, and the registry proceeds without waiting for that operation to finish — an uncooperative operation may therefore continue in the background — though every later step is still attempted. Steps that gate a shared dependency (scheduler, reconciler, startup housekeeping, the service coordinator, and the background loops) are quiescence barriers: each has a per-step timeout used only to log and cancel the step, after which the registry waits for the operation to actually exit before advancing. Cancellation requests a stop but does not instantly terminate in-flight work, so those strict joins can extend total shutdown beyond the aggregate deadline — a wedged dependency-holding operation is waited out rather than used to close a resource another operation is still using.
+See [Events](docs/events.md) and [Schedules](docs/schedules.md) for delivery and
+recovery details, and [Operations](docs/operations.md) for deployment guidance.
 
 ## Apps
 
@@ -308,26 +217,9 @@ See [docs/services.md](docs/services.md).
 
 ## Schedules
 
-Schedules are evaluated locally by every Relay worker, but publication is deduplicated by logical occurrence before entering the Redis stream.
-
-```text
-worker A ─┐
-worker B ─┼─→ same occurrence → atomic publish-if-new → Redis Stream
-worker C ─┘
-```
-
-This avoids leader election while preserving a single published stream entry per occurrence cluster-wide.
-
-Publication durability is intent-first: every due occurrence's exact intent is
-persisted to the durable local outbox **before** it is published, so a crash
-between persistence and publication recovers it. Publication retries — including
-the durable local retry of an occurrence whose publication has not yet resolved —
-and startup catch-up reuse the same occurrence identity, so duplicates remain
-harmless.
-
-Handler execution after publication is still at-least-once.
-
-See [docs/schedules.md](docs/schedules.md).
+Schedule publication is deduplicated cluster-wide by occurrence. A durable
+outbox retries unresolved publications across restarts; handler execution remains
+at least once. See [docs/schedules.md](docs/schedules.md).
 
 ## Managed images and external images
 
@@ -384,18 +276,13 @@ relay dlq replay <id>
 relay dlq rm <id>
 ```
 
-Manual invocation takes a positional JSON object, or `-` to read it from stdin;
-a bare `NAME` is a usage error and never reads stdin. Secrets are read from a
-hidden prompt on an interactive terminal, or from all of stdin when `-` is
-given; they are never arguments:
-
-To invoke an app, first place it under `./apps` and provide an event matching
-one of its handlers.
+Manual invocation takes a JSON object, or `-` to read it from stdin. Secret
+values can be entered at a hidden prompt or read from stdin; they are never
+command-line arguments. For command details, see [CLI](docs/cli.md).
 
 ```sh
 relay app invoke my-app '{"recordType":"INSERT"}'
 relay app invoke my-app - < event.json
-echo '{"recordType":"INSERT"}' | relay app invoke my-app -
 
 # -T keeps stdin a pipe instead of an allocated pseudo-TTY.
 docker compose exec -T relay app invoke my-app - < event.json
@@ -404,19 +291,6 @@ relay secret set API_KEY                          # hidden prompt (requires a te
 printf '%s' 'value' | relay secret set API_KEY -  # read all of stdin
 docker compose exec -T relay secret set API_KEY - < value.txt
 ```
-
-Piped secrets are stored byte-for-byte except for exactly one trailing line
-ending (one `CRLF`, or else one `LF`). An empty piped value is rejected.
-
-Use:
-
-```sh
-relay <command> --help
-```
-
-for command-specific flags.
-
-See [docs/cli.md](docs/cli.md) for the detailed CLI reference.
 
 ## Documentation
 
