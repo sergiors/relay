@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -28,6 +29,8 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"relay/internal/app"
+	"relay/internal/event"
 	"relay/internal/testutil"
 )
 
@@ -111,11 +114,12 @@ func dbzOrderDoc(oid string) map[string]any {
 }
 
 // dbzOrderDocExpected is the NORMALIZED expected form of dbzOrderDoc: the
-// ObjectIds unwrapped and the other Extended JSON wrappers untouched.
+// Extended JSON wrappers are normalized — ObjectIds unwrap to strings, dates
+// become RFC3339 UTC strings, and $numberDecimal survives untouched.
 func dbzOrderDocExpected(oid string) map[string]any {
 	return map[string]any{
 		"_id":       oid,
-		"orderdate": map[string]any{"$date": "2026-01-17T10:33:00Z"},
+		"orderdate": "2026-01-17T10:33:00Z",
 		"total":     map[string]any{"$numberDecimal": "112.50"},
 		"tags":      []any{"rush", "663c9c0f00000000000007c5"},
 	}
@@ -317,6 +321,200 @@ func TestIntegrationDebeziumMongoImagesNormalized(t *testing.T) {
 		return !ok
 	})
 	e.stop(t)
+}
+
+// dbzCompletedAtDoc is one realistic orders document whose only changed field
+// is completed_at, carried as the canonical Extended JSON $date wrapper the
+// MongoDB connector emits ($numberLong Unix milliseconds).
+func dbzCompletedAtDoc(oid string, ms int64) map[string]any {
+	return map[string]any{
+		"_id":          map[string]any{"$oid": oid},
+		"completed_at": map[string]any{"$date": map[string]any{"$numberLong": strconv.FormatInt(ms, 10)}},
+	}
+}
+
+// dbzNormalizedCompletedAt renders the exact normalized handler value for a
+// $date carried as Unix milliseconds: the RFC3339Nano UTC string.
+func dbzNormalizedCompletedAt(ms int64) string {
+	return time.UnixMilli(ms).UTC().Format(time.RFC3339Nano)
+}
+
+// TestIntegrationMongoUpdateCompletedAtTemporalMatching pins the date
+// normalization + temporal matching boundary end to end on real transports: a
+// MongoDB UPDATE whose after image carries a recent $date normalizes
+// completed_at to an RFC3339 UTC string, and the runner-shaped pattern
+// `newImage.completed_at > now()-5m` matches that update while a stale one does
+// not. The cutoff is pinned with the template clock seam
+// (app.ParseTemplateWithClock) and both instants sit four minutes inside and
+// outside the cutoff, so the result cannot depend on test timing.
+func TestIntegrationMongoUpdateCompletedAtTemporalMatching(t *testing.T) {
+	testutil.RequireRedis(t)
+	e := newEnv(t, ConsumerConfig{})
+
+	// One pinned clock for the whole test: the temporal cutoff is recomputed
+	// from this closure at match time, so it is deterministic.
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	tmpl, err := app.ParseTemplateWithClock([]byte(`
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      newImage:
+        completed_at: [{gt: "now()-5m"}]
+`), func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("parse template with clock: %v", err)
+	}
+
+	recentMS := now.Add(-time.Minute).UnixMilli()     // inside the 5-minute cutoff
+	staleMS := now.Add(-10 * time.Minute).UnixMilli() // outside it
+	recentDoc := dbzCompletedAtDoc("663c9c0f0000000000000aaa", recentMS)
+	staleDoc := dbzCompletedAtDoc("663c9c0f0000000000000bbb", staleMS)
+
+	// Realistic updates: the old image carries the (older) previous value and
+	// the new image the fresh one.
+	idRecent := e.xaddDebezium(t, "", marshalDBZ(t, dbzMongoChange("u",
+		dbzImage(t, dbzCompletedAtDoc("663c9c0f0000000000000aaa", staleMS)),
+		dbzImage(t, recentDoc), "orders")), nil)
+	idStale := e.xaddDebezium(t, "", marshalDBZ(t, dbzMongoChange("u",
+		dbzImage(t, dbzCompletedAtDoc("663c9c0f0000000000000bbb", staleMS)),
+		dbzImage(t, staleDoc), "orders")), nil)
+
+	// Handler workers run on separate goroutines while the test polls, so the
+	// observed results are mutex-guarded.
+	var mu sync.Mutex
+	matched := map[string]bool{}
+	normalized := map[string]string{}
+	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID != idRecent && msgID != idStale {
+			return nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		// The handler-visible image carries completed_at as a plain RFC3339
+		// UTC string: the Extended JSON wrapper is gone in BOTH images.
+		newImage, ok := ev["newImage"].(map[string]any)
+		if !ok {
+			t.Errorf("newImage = %v (%T), want a normalized document map", ev["newImage"], ev["newImage"])
+			return nil
+		}
+		got, ok := newImage["completed_at"].(string)
+		if !ok {
+			t.Errorf("newImage.completed_at = %v (%T), want a normalized RFC3339 string",
+				newImage["completed_at"], newImage["completed_at"])
+			return nil
+		}
+		normalized[msgID] = got
+		if oldImage, ok := ev["oldImage"].(map[string]any); ok {
+			if _, ok := oldImage["completed_at"].(string); !ok {
+				t.Errorf("oldImage.completed_at = %v (%T), want a normalized RFC3339 string too",
+					oldImage["completed_at"], oldImage["completed_at"])
+			}
+		}
+		// The runner-shaped matching decision over the normalized event.
+		matched[msgID] = len(event.MatchingEventRules(tmpl.Events, ev)) > 0
+		return nil
+	})
+	testutil.WaitFor(t, 8*time.Second, "both mongo updates handled", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(matched) == 2
+	})
+	e.stop(t)
+
+	if got := normalized[idRecent]; got != dbzNormalizedCompletedAt(recentMS) {
+		t.Fatalf("recent update completed_at = %q, want the normalized UTC instant %q",
+			got, dbzNormalizedCompletedAt(recentMS))
+	}
+	if got := normalized[idStale]; got != dbzNormalizedCompletedAt(staleMS) {
+		t.Fatalf("stale update completed_at = %q, want the normalized UTC instant %q",
+			got, dbzNormalizedCompletedAt(staleMS))
+	}
+	if !matched[idRecent] {
+		t.Fatalf("the recent update did not match completed_at > now()-5m (normalized %q, cutoff %q)",
+			normalized[idRecent], now.Add(-5*time.Minute).Format(time.RFC3339Nano))
+	}
+	if matched[idStale] {
+		t.Fatalf("the stale update matched completed_at > now()-5m, but %q is outside the window",
+			normalized[idStale])
+	}
+}
+
+// TestIntegrationMongoUpdateExhaustedCarriesWireValueAndNormalizedReplay pins
+// the durable DLQ replay contract for a MongoDB UPDATE on real transports: the
+// exhausted entry stores the ORIGINAL Debezium wire value verbatim (its $date
+// wrappers intact), while ReplayPayload is the exact normalized four-field
+// handler payload the live handler received — completed_at already the
+// RFC3339 UTC string.
+func TestIntegrationMongoUpdateExhaustedCarriesWireValueAndNormalizedReplay(t *testing.T) {
+	testutil.RequireRedis(t)
+	e := newEnv(t, ConsumerConfig{})
+
+	const oid = "663c9c0f0000000000000111"
+	completedMS := time.Now().UTC().Truncate(time.Millisecond).Add(-time.Minute).UnixMilli()
+	previousMS := time.Now().UTC().Truncate(time.Millisecond).Add(-10 * time.Minute).UnixMilli()
+	value := marshalDBZ(t, dbzMongoChange("u",
+		dbzImage(t, dbzCompletedAtDoc(oid, previousMS)),
+		dbzImage(t, dbzCompletedAtDoc(oid, completedMS)), "orders"))
+	want := expectEventJSON(t, map[string]any{
+		"collectionName": "orders",
+		"recordType":     "UPDATE",
+		"newImage":       map[string]any{"_id": oid, "completed_at": dbzNormalizedCompletedAt(completedMS)},
+		"oldImage":       map[string]any{"_id": oid, "completed_at": dbzNormalizedCompletedAt(previousMS)},
+	})
+	id := e.xaddDebezium(t, `{"_id":{"$oid":"`+oid+`"}}`, value, nil)
+
+	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID != id {
+			return nil
+		}
+		// The live handler payload must already be the normalized form: plain
+		// RFC3339 UTC strings, wrappers gone.
+		newImage, _ := ev["newImage"].(map[string]any)
+		if got, ok := newImage["completed_at"].(string); !ok || got != dbzNormalizedCompletedAt(completedMS) {
+			t.Errorf("live handler newImage.completed_at = %v (%T), want normalized %q",
+				newImage["completed_at"], newImage["completed_at"], dbzNormalizedCompletedAt(completedMS))
+		}
+		// Then exhaust the invocation so the message routes to the DLQ.
+		p, ok := invocationStateFromCtx(t, ctx)
+		if !ok {
+			return fmt.Errorf("no invocation state in ctx")
+		}
+		started, claim, _, _ := p.TryStart("fn/h", time.Hour)
+		if !started {
+			return ErrInvocationNotEligible
+		}
+		p.MarkExhausted("fn/h", claim)
+		return &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
+			{App: "fn", Handler: "h", Attempts: claim.Attempt, Err: ErrInvocationExhausted},
+		}}
+	})
+	testutil.WaitFor(t, 8*time.Second, "mongo update routed to DLQ", func() bool {
+		_, ok := e.dlqEntry(id)
+		return ok
+	})
+	testutil.WaitFor(t, 8*time.Second, "mongo update acked", func() bool {
+		_, ok := e.pending()[id]
+		return !ok
+	})
+	e.stop(t)
+
+	m, ok := e.dlqEntry(id)
+	if !ok {
+		t.Fatalf("expected a DLQ row for %s", id)
+	}
+	if m.Event != value {
+		t.Fatalf("DLQ Event = %q, want the original Debezium wire value verbatim ($date wrappers intact)", m.Event)
+	}
+	if string(m.ReplayPayload) != want {
+		t.Fatalf("DLQ ReplayPayload = %q, want the normalized handler payload %q", m.ReplayPayload, want)
+	}
+	if !m.Replayable() {
+		t.Fatalf("an exhausted CDC entry must be replayable: %+v", m)
+	}
+	if m.SettledAt == "" {
+		t.Fatalf("the row must be settled after the confirmed ACK")
+	}
 }
 
 // TestIntegrationDebeziumTombstoneAckedNeverMatched pins the value-sentinel

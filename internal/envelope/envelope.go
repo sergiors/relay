@@ -110,7 +110,7 @@ func decodeStructured(value []byte) (Result, error) {
 		return decodeSchedule(event)
 	}
 	if payload, claimed := debeziumPayload(event); claimed {
-		return decodeDebezium(payload)
+		return decodeDebezium(payload, value)
 	}
 	return rawResult(event)
 }
@@ -267,7 +267,12 @@ func hasCDCEnvelopeShape(payload map[string]any) bool {
 // back to raw matching, because the record already claimed Debezium structure.
 // A missing image field is treated as null; only non-null values that are not
 // objects (or invalid MongoDB JSON strings) are rejected.
-func decodeDebezium(payload map[string]any) (Result, error) {
+//
+// raw is the original envelope value. Once the connector is known to be
+// MongoDB, the payload is re-decoded with json.Decoder.UseNumber so integer
+// values in direct object images are not rounded through float64. No other
+// connector, and no raw event, takes that path.
+func decodeDebezium(payload map[string]any, raw []byte) (Result, error) {
 	source, ok := payload["source"].(map[string]any)
 	if !ok {
 		return Result{}, fmt.Errorf("debezium: source is not an object")
@@ -276,6 +281,17 @@ func decodeDebezium(payload map[string]any) (Result, error) {
 	if !ok || connector == "" {
 		return Result{}, fmt.Errorf(
 			"debezium: source.connector is missing or not a non-empty string")
+	}
+	if connector == connectorMongoDB && raw != nil {
+		exact, err := decodeMongoPayload(raw)
+		if err != nil {
+			return Result{}, fmt.Errorf("debezium: %w", err)
+		}
+		payload = exact
+		source, ok = payload["source"].(map[string]any)
+		if !ok {
+			return Result{}, fmt.Errorf("debezium: source is not an object")
+		}
 	}
 	op, ok := payload["op"].(string)
 	if !ok || op == "" {
@@ -368,9 +384,13 @@ func normalizedImage(field string, value any, connector string) (any, error) {
 			"debezium: %s must be a JSON object or null", field)
 	}
 	if connector == connectorMongoDB {
-		// A top-level Extended JSON $oid wrapper is not a document image, so
+		// A top-level Extended JSON wrapper is not a document image, so
 		// validate the normalized result rather than only its input shape.
-		value = normalizeMongoImage(object)
+		normalized, err := normalizeMongoImage(object)
+		if err != nil {
+			return nil, fmt.Errorf("debezium: %s: %w", field, err)
+		}
+		value = normalized
 	}
 	switch v := value.(type) {
 	case nil:
@@ -393,8 +413,8 @@ func decodeMongoImage(value any) (any, error) {
 	case nil:
 		return nil, nil
 	case string:
-		var decoded any
-		if err := json.Unmarshal([]byte(v), &decoded); err != nil {
+		decoded, err := decodeMongoJSON([]byte(v))
+		if err != nil {
 			return nil, fmt.Errorf("decode JSON image: %w", err)
 		}
 		switch decoded.(type) {
@@ -407,44 +427,4 @@ func decodeMongoImage(value any) (any, error) {
 	default:
 		return value, nil
 	}
-}
-
-// normalizeMongoImage recursively unwraps only Extended JSON ObjectId wrappers.
-// Other BSON Extended JSON wrappers ($date, $numberDecimal, $binary, ...) are
-// left untouched so no value is converted lossily.
-func normalizeMongoImage(value map[string]any) any {
-	if oid, ok := objectID(value); ok {
-		return oid
-	}
-	for key, child := range value {
-		value[key] = normalizeMongoValue(child)
-	}
-	return value
-}
-
-func normalizeMongoValue(value any) any {
-	switch v := value.(type) {
-	case map[string]any:
-		return normalizeMongoImage(v)
-	case []any:
-		for i, child := range v {
-			v[i] = normalizeMongoValue(child)
-		}
-		return v
-	default:
-		return value
-	}
-}
-
-// objectID returns the string inside an Extended JSON ObjectId wrapper. Only
-// the exact single-key shape is unwrapped.
-func objectID(value map[string]any) (string, bool) {
-	if len(value) != 1 {
-		return "", false
-	}
-	oid, ok := value["$oid"].(string)
-	if !ok {
-		return "", false
-	}
-	return oid, true
 }

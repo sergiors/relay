@@ -86,9 +86,29 @@ A snapshot read (`r`) is an existing captured row, so it is normalized to
 `INSERT`. `after` becomes `newImage` and `before` becomes `oldImage`; each must
 be a JSON object or `null`, and an unknown `op` or unsupported connector is
 non-retryable rather than matching as a raw event. For MongoDB, `before`/`after`
-are JSON strings and are decoded strictly; Extended JSON `{"$oid":"..."}`
-wrappers are recursively unwrapped to their string, while other BSON wrappers
-(`$date`, `$numberDecimal`, `$binary`, and so on) are left untouched.
+may be JSON strings or objects and are decoded without float conversion.
+Extended JSON is normalized recursively, but only an exact single-key wrapper
+is converted:
+
+- `$oid` becomes its canonical 24-character lowercase hex string.
+- `$date` becomes an RFC3339 UTC timestamp (`RFC3339Nano`). Integer Unix
+  milliseconds, ISO-8601 strings with offsets, and
+  `{"$numberLong":"..."}` are accepted; malformed or out-of-range dates, and
+  strings with precision beyond nanoseconds, are non-retryable.
+- `$numberInt` and `$numberLong` become range-checked signed integers, never
+  `float64`. `$numberDouble` becomes a JSON number when finite; `NaN` and
+  infinities keep their wrapper because JSON cannot carry them.
+- `$numberDecimal` and `$binary` keep their Extended JSON wrappers exactly.
+  Decimals are never converted to `float64`, and binary data is not flattened.
+  `$timestamp` keeps its wrapper and retains its `t`/`i` information, though
+  safe numeric values in those fields may be normalized to exact integer types.
+
+Objects with extra keys are ordinary application values, not wrappers. A
+malformed `$oid` or numeric wrapper is preserved rather than guessed. Plain JSON
+numbers in MongoDB images are decoded without `float64` rounding: safe integers
+become Go integer values, finite decimals become `float64`, and values outside
+those ranges retain their exact JSON number. An image that is not an object (or
+`null`) is still rejected.
 
 A Debezium tombstone is ignored (acknowledged without execution) only when there
 is no `format=raw` marker and `value` is exactly the default null-value

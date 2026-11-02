@@ -156,12 +156,13 @@ func mongoDoc(oid string) map[string]any {
 }
 
 // mongoDocUnwrapped is the EXPECTED normalized form of mongoDoc after the
-// ObjectId wrappers are unwrapped recursively and every other Extended JSON
-// wrapper is left untouched.
+// Extended JSON wrappers are normalized recursively: ObjectIds unwrap to
+// strings, dates normalize to RFC3339 UTC strings, and the wrappers with no
+// exact Go equivalent ($numberDecimal, $binary, $timestamp) survive untouched.
 func mongoDocUnwrapped(oid string) map[string]any {
 	return map[string]any{
 		"_id":       oid,
-		"orderdate": map[string]any{"$date": "2026-01-17T10:33:00Z"},
+		"orderdate": "2026-01-17T10:33:00Z",
 		"total":     map[string]any{"$numberDecimal": "112.50"},
 		"checksum":  map[string]any{"$binary": map[string]any{"base64": "SGVsbG8=", "subType": "00"}},
 		"clock":     map[string]any{"$timestamp": map[string]any{"t": 1767200000, "i": 1}},
