@@ -581,41 +581,56 @@ func (st *State) resetAppStatsTx(ctx context.Context, tx *sql.Tx, ts string) err
 	return nil
 }
 
-// Stats returns the operational snapshot AGGREGATED across every node's
-// persisted row, or (zero, false) when no row has been recorded yet or the
-// read/decoding fails (which is logged). Cumulative counters are summed across
-// nodes; the two backlog gauges (a shared Redis backlog each worker reports)
-// come from the FRESHEST node snapshot (the newest updated_at), so a dead node's
-// stale gauge cannot mask the live value; UpdatedAt is the newest. It is the
-// read the CLI and observability use; a worker restoring its own counters uses
-// OwnerStats instead.
+// ReadStats returns the operational snapshot AGGREGATED across every node's
+// persisted row. ok is false only when no row has been recorded yet; a query,
+// scan, or decode failure is returned as an error so a caller can distinguish
+// an empty stats table from an unreadable one instead of rendering zeros.
+// Cumulative counters are summed across nodes; the two backlog gauges (a shared
+// Redis backlog each worker reports) come from the FRESHEST node snapshot (the
+// newest updated_at), so a dead node's stale gauge cannot mask the live value;
+// UpdatedAt is the newest.
+func (st *State) ReadStats(ctx context.Context) (Stats, bool, error) {
+	return st.readStats(ctx, "")
+}
+
+// Stats is the best-effort form of ReadStats: it returns (zero, false) for an
+// absent row and also for a read/decode failure (which is logged). Callers that
+// must tell those apart use ReadStats.
 func (st *State) Stats() (Stats, bool) {
-	return st.aggregateStats(false, "")
+	s, ok, err := st.ReadStats(context.Background())
+	if err != nil {
+		st.log.Warn("State: read stats failed", "error", err)
+		return Stats{}, false
+	}
+	return s, ok
 }
 
 // OwnerStats returns THIS node's operational snapshot, or (zero, false) when
-// this node has no row yet. It is the read a worker uses at startup to restore
-// its own counters (never another node's), so restarts of the same identity
-// continue its totals without double-counting a shared database.
+// this node has no row yet or the read fails (which is logged). It is the read a
+// worker uses at startup to restore its own counters (never another node's), so
+// restarts of the same identity continue its totals without double-counting a
+// shared database.
 func (st *State) OwnerStats() (Stats, bool) {
-	return st.aggregateStats(true, st.nodeID)
+	s, ok, err := st.readStats(context.Background(), st.nodeID)
+	if err != nil {
+		st.log.Warn("State: read stats failed", "error", err)
+		return Stats{}, false
+	}
+	return s, ok
 }
 
-// aggregateStats reads stats rows and merges them. When byNode is true only
-// rows for nodeID are read (the node-scoped restore); otherwise every row is
-// read and merged (the cross-node aggregate).
-func (st *State) aggregateStats(byNode bool, nodeID string) (Stats, bool) {
-	ctx := context.Background()
-	query := `SELECT ` + jsonPayloadExpr + `, updated_at FROM stats`
-	args := []any(nil)
-	if byNode {
+// readStats reads and merges stats rows. An empty nodeID reads every row (the
+// cross-node aggregate); a non-empty nodeID reads only that node's row.
+func (st *State) readStats(ctx context.Context, nodeID string) (Stats, bool, error) {
+	query := `SELECT node_id, ` + jsonPayloadExpr + `, updated_at FROM stats`
+	var args []any
+	if nodeID != "" {
 		query += ` WHERE node_id = $1`
 		args = append(args, nodeID)
 	}
 	rows, err := st.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		st.log.Warn("State: read stats failed", "error", err)
-		return Stats{}, false
+		return Stats{}, false, fmt.Errorf("read stats: %w", err)
 	}
 	defer rows.Close()
 
@@ -624,24 +639,28 @@ func (st *State) aggregateStats(byNode bool, nodeID string) (Stats, bool) {
 		seen bool
 	)
 	for rows.Next() {
-		var data, updatedAt sql.NullString
-		if err := rows.Scan(&data, &updatedAt); err != nil {
-			st.log.Warn("State: read stats failed", "error", err)
-			return out, seen
+		var (
+			rowNodeID       string
+			data, updatedAt sql.NullString
+		)
+		if err := rows.Scan(&rowNodeID, &data, &updatedAt); err != nil {
+			return Stats{}, false, fmt.Errorf("scan stats row: %w", err)
 		}
 		s, err := unmarshalStats(data)
 		if err != nil {
-			st.log.Warn("State: read stats failed", "error", err)
-			continue
+			return Stats{}, false, fmt.Errorf("read stats for node %q: %w", rowNodeID, err)
 		}
 		s.UpdatedAt = updatedAt.String
 		mergeStats(&out, s)
 		seen = true
 	}
-	if !seen {
-		return Stats{}, false
+	if err := rows.Err(); err != nil {
+		return Stats{}, false, fmt.Errorf("read stats: %w", err)
 	}
-	return out, true
+	if !seen {
+		return Stats{}, false, nil
+	}
+	return out, true, nil
 }
 
 // mergeStats folds src into dst: cumulative counters are summed (each row is an

@@ -137,7 +137,7 @@ func nextFencingTokenTx(ctx context.Context, tx *sql.Tx) (FencingToken, error) {
 	return FencingToken(fencingToken), nil
 }
 
-// Row is the per-app summary returned by ListApps. Its fields are part
+// Row is the per-app summary returned by ReadAppSummaries. Its fields are part
 // of the apps.data snapshot except relational Name/UpdatedAt and the derived
 // HandlerCount. The app fencing token is separate relational metadata and is
 // not part of Row or Detail.
@@ -151,8 +151,8 @@ type Row struct {
 	UpdatedAt           string `json:"-"`
 }
 
-// Detail is the full per-app record returned by GetApp, including the
-// handler list, the schedules, and the services. It is the persistence model:
+// Detail is the full per-app record returned by ReadApp, including the handler
+// list, the schedules, and the services. It is the persistence model:
 // the whole snapshot is stored as one JSON object in apps.data (marshalled
 // through app_json.go), while name, updated_at, and fencing_token are relational
 // columns. The embedded Row fields and every field below — except Name,
@@ -1881,19 +1881,19 @@ func removeTx(ctx context.Context, tx *sql.Tx, name string) error {
 	return err
 }
 
-// ListApps returns the app summaries sorted by name, decoding the
-// relational name/updated_at columns and the apps.data snapshot for each
-// row. A nil/empty slice and nil error mean the state database is simply empty.
-// A row whose stored snapshot is corrupt is logged (naming the app and the
-// decode error) and skipped, so one bad row cannot hide the others.
-func (st *State) ListApps() []Row {
-	ctx := context.Background()
+// ReadAppSummaries returns the app summaries sorted by name, decoding the
+// relational name/updated_at columns and the apps.data snapshot for each row. A
+// nil/empty slice and nil error mean the state database is simply empty; a
+// query or scan failure is returned so a caller never presents an unreadable
+// listing as an empty one. A row whose stored snapshot is corrupt is logged
+// (naming the app and the decode error) and skipped, so one bad row cannot hide
+// the others.
+func (st *State) ReadAppSummaries(ctx context.Context) ([]Row, error) {
 	rows, err := st.db.QueryContext(ctx,
 		`SELECT name, `+jsonPayloadExpr+`, updated_at
 		 FROM apps ORDER BY name`)
 	if err != nil {
-		st.log.Warn("State: list apps failed", "error", err)
-		return nil
+		return nil, fmt.Errorf("list apps: %w", err)
 	}
 	defer rows.Close()
 
@@ -1905,8 +1905,7 @@ func (st *State) ListApps() []Row {
 			updatedAt string
 		)
 		if err := rows.Scan(&name, &data, &updatedAt); err != nil {
-			st.log.Warn("State: scan list failed", "error", err)
-			return out
+			return nil, fmt.Errorf("scan app summary: %w", err)
 		}
 		detail, err := unmarshalApp(data.String)
 		if err != nil {
@@ -1918,7 +1917,22 @@ func (st *State) ListApps() []Row {
 		detail.HandlerCount = len(detail.Handlers)
 		out = append(out, detail.Row)
 	}
-	return out
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list apps: %w", err)
+	}
+	return out, nil
+}
+
+// ListApps is the best-effort form of ReadAppSummaries: a read failure is
+// logged and reported as a nil slice. Callers that must distinguish an empty
+// listing from a failed read use ReadAppSummaries.
+func (st *State) ListApps() []Row {
+	rows, err := st.ReadAppSummaries(context.Background())
+	if err != nil {
+		st.log.Warn("State: list apps failed", "error", err)
+		return nil
+	}
+	return rows
 }
 
 // AppObservation is a snapshot of an app's persisted row taken BEFORE a caller
@@ -1949,22 +1963,28 @@ func (st *State) ObserveApp(ctx context.Context, name string) (AppObservation, e
 	return AppObservation{Detail: detail, FencingToken: fencingToken, Found: found}, nil
 }
 
-// GetApp returns the full detail for name, or (zero, false) if unknown. A
-// corrupt persisted snapshot fails clearly: the decode error is logged and the
-// row reads as unknown rather than yielding a partial record.
-func (st *State) GetApp(name string) (Detail, bool) {
-	ctx := context.Background()
+// ReadApp returns the full detail for name. found is false only when no row
+// exists; a query or decode failure is returned so callers can distinguish an
+// unknown app from an unreadable state row.
+func (st *State) ReadApp(ctx context.Context, name string) (Detail, bool, error) {
 	detail, found, err := scanApp(name, st.db.QueryRowContext(ctx,
 		`SELECT `+jsonPayloadExpr+`, updated_at
 		 FROM apps WHERE name = $1`, name))
 	if err != nil {
+		return Detail{}, false, fmt.Errorf("read app %q: %w", name, err)
+	}
+	return detail, found, nil
+}
+
+// GetApp is the best-effort form of ReadApp: an unknown app and an
+// unreadable row both report (zero, false), and the read failure is logged.
+func (st *State) GetApp(name string) (Detail, bool) {
+	detail, found, err := st.ReadApp(context.Background(), name)
+	if err != nil {
 		st.log.Warn("State: get failed", "app", name, "error", err)
 		return Detail{}, false
 	}
-	if !found {
-		return Detail{}, false
-	}
-	return detail, true
+	return detail, found
 }
 
 // scanApp decodes one apps row selected as (data::text, updated_at)

@@ -79,12 +79,12 @@ func seedStatsState(t *testing.T) (*state.State, Dependencies) {
 	return st, deps
 }
 
-// printStats renders the recorded snapshot with tab-aligned labels, Go-duration
+// renderStats renders the recorded snapshot with tab-aligned labels, Go-duration
 // age formatting, and a relative Updated timestamp.
 func TestPrintStats(t *testing.T) {
 	st, _ := seedStatsState(t)
 	var w bytes.Buffer
-	printStats(&w, st)
+	renderStatsForTest(t, &w, st)
 	out := w.String()
 
 	lines := strings.Split(strings.TrimSpace(out), "\n")
@@ -117,13 +117,13 @@ func TestPrintStats(t *testing.T) {
 	}
 }
 
-// A fresh state DB has no stats row; printStats renders all zeros, "0s" age,
+// A fresh state DB has no stats row; renderStats renders all zeros, "0s" age,
 // and "never" for Updated, and the command exits 0.
 func TestPrintStatsEmptyDB(t *testing.T) {
 	st, deps := openTempState(t)
 
 	var w bytes.Buffer
-	printStats(&w, st)
+	renderStatsForTest(t, &w, st)
 	out := w.String()
 	for _, want := range []string{
 		"Events received:     0",

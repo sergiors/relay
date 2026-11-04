@@ -438,3 +438,65 @@ func TestStatelessAdminCommandsDoNotAcquireLockWithoutDatabase(t *testing.T) {
 		t.Fatal("stateless admin commands modified the lock file; they must not touch it")
 	}
 }
+
+// renderAppDetailForTest reads an app's persisted stats and renders the detail,
+// mirroring appInspect's retrieval-and-render split for renderer-level tests.
+func renderAppDetailForTest(
+	t *testing.T, w io.Writer, st *state.State, detail state.Detail,
+) state.AppStats {
+	t.Helper()
+	stats, _, err := st.ReadAppStats(context.Background(), detail.Name)
+	if err != nil {
+		t.Fatalf("read app stats for %q: %v", detail.Name, err)
+	}
+	if err := renderAppDetail(w, detail, stats); err != nil {
+		t.Fatalf("render app detail for %q: %v", detail.Name, err)
+	}
+	return stats
+}
+
+// renderAppPoolForTest resolves live gauges and renders the Runtime pool
+// section, mirroring the two steps appInspect performs.
+func renderAppPoolForTest(
+	t *testing.T,
+	w io.Writer,
+	name string,
+	stats state.AppStats,
+	provider PoolSnapshotProvider,
+	socketPath string,
+) {
+	t.Helper()
+	gauges, live := resolvePoolGauges(name, provider, socketPath)
+	var liveGauges *poolGauges
+	if live {
+		liveGauges = &gauges
+	}
+	if err := renderRuntimePool(w, stats, liveGauges); err != nil {
+		t.Fatalf("render runtime pool for %q: %v", name, err)
+	}
+}
+
+// renderAppListForTest reads and renders app summaries, mirroring appList.
+func renderAppListForTest(t *testing.T, w io.Writer, st *state.State) {
+	t.Helper()
+	rows, err := st.ReadAppSummaries(context.Background())
+	if err != nil {
+		t.Fatalf("read app summaries: %v", err)
+	}
+	if err := renderAppList(w, rows); err != nil {
+		t.Fatalf("render app list: %v", err)
+	}
+}
+
+// renderStatsForTest reads and renders the operational snapshot, mirroring the
+// `relay stats` action.
+func renderStatsForTest(t *testing.T, w io.Writer, st *state.State) {
+	t.Helper()
+	stats, _, err := st.ReadStats(context.Background())
+	if err != nil {
+		t.Fatalf("read stats: %v", err)
+	}
+	if err := renderStats(w, stats); err != nil {
+		t.Fatalf("render stats: %v", err)
+	}
+}

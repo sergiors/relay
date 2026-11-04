@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"fmt"
 )
 
 // AppStats is the per-app operational snapshot persisted as the JSONB
@@ -112,19 +113,17 @@ func (st *State) RecordAppStatsContext(ctx context.Context, appStats AppStats) {
 	}
 }
 
-// AppStats returns the per-app snapshot for name AGGREGATED across every worker
-// owner, or (zero, false) when no row has been recorded yet or the read/decoding
-// fails (which is logged). Counters are summed and the Last*At timestamps take
-// the newest observation. The App field is set to name on success (it is
-// relational metadata, not part of the JSON payload). A worker restoring its own
-// per-app counters uses OwnerAppStats instead.
-func (st *State) AppStats(name string) (AppStats, bool) {
-	ctx := context.Background()
+// ReadAppStats returns the per-app snapshot for name AGGREGATED across every
+// worker owner. ok is false only when no row has been recorded yet; a query,
+// scan, or decode failure is returned as an error. Counters are summed and the
+// Last*At timestamps take the newest observation. The App field is set to name
+// on success (it is relational metadata, not part of the JSON payload).
+func (st *State) ReadAppStats(ctx context.Context, name string) (AppStats, bool, error) {
 	rows, err := st.db.QueryContext(ctx,
-		`SELECT `+jsonPayloadExpr+`, updated_at FROM app_stats WHERE app_name = $1`, name)
+		`SELECT node_id, `+jsonPayloadExpr+`, updated_at
+		 FROM app_stats WHERE app_name = $1`, name)
 	if err != nil {
-		st.log.Warn("State: read app stats failed", "app", name, "error", err)
-		return AppStats{}, false
+		return AppStats{}, false, fmt.Errorf("read app stats for %q: %w", name, err)
 	}
 	defer rows.Close()
 
@@ -133,25 +132,42 @@ func (st *State) AppStats(name string) (AppStats, bool) {
 		seen bool
 	)
 	for rows.Next() {
-		var data, updatedAt sql.NullString
-		if err := rows.Scan(&data, &updatedAt); err != nil {
-			st.log.Warn("State: read app stats failed", "app", name, "error", err)
-			return out, seen
+		var (
+			nodeID          string
+			data, updatedAt sql.NullString
+		)
+		if err := rows.Scan(&nodeID, &data, &updatedAt); err != nil {
+			return AppStats{}, false, fmt.Errorf("scan app stats for %q: %w", name, err)
 		}
 		fs, err := unmarshalAppStats(data)
 		if err != nil {
-			st.log.Warn("State: read app stats failed", "app", name, "error", err)
-			continue
+			return AppStats{}, false,
+				fmt.Errorf("read app stats for %q (node %q): %w", name, nodeID, err)
 		}
 		fs.UpdatedAt = updatedAt.String
 		mergeAppStatsInto(&out, fs)
 		seen = true
 	}
+	if err := rows.Err(); err != nil {
+		return AppStats{}, false, fmt.Errorf("read app stats for %q: %w", name, err)
+	}
 	if !seen {
-		return AppStats{}, false
+		return AppStats{}, false, nil
 	}
 	out.App = name
-	return out, true
+	return out, true, nil
+}
+
+// AppStats is the best-effort form of ReadAppStats: it returns (zero, false)
+// for an absent row and also for a read/decode failure (which is logged).
+// Callers that must tell those apart use ReadAppStats.
+func (st *State) AppStats(name string) (AppStats, bool) {
+	fs, ok, err := st.ReadAppStats(context.Background(), name)
+	if err != nil {
+		st.log.Warn("State: read app stats failed", "app", name, "error", err)
+		return AppStats{}, false
+	}
+	return fs, ok
 }
 
 // OwnerAppStats returns every app_stats row owned by THIS worker, grouped by

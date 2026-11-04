@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"strings"
-	"text/tabwriter"
 
 	"github.com/urfave/cli/v3"
 	"golang.org/x/term"
@@ -112,13 +111,14 @@ func secretList(ctx context.Context, w io.Writer, deps Dependencies) error {
 	if err != nil {
 		return err
 	}
-	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	out := newOutput(w)
+	tw := out.table(2)
 	fmt.Fprintln(tw, "NAME")
 	for _, n := range names {
 		fmt.Fprintln(tw, n)
 	}
-	_ = tw.Flush()
-	return nil
+	out.flush(tw)
+	return out.err
 }
 
 // secretSet reads a value (hidden from an interactive terminal, or all of stdin

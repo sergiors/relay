@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"text/tabwriter"
 	"time"
 
 	"github.com/urfave/cli/v3"
@@ -18,9 +17,10 @@ import (
 // resets the operational snapshot in the local state database at
 // deps.OpenState; a reset with a running worker goes through the worker's Unix
 // socket so its in-memory totals are reset too, but the read path never needs
-// Redis, Docker, or the worker, so `relay stats` works with no REDIS_URI set. A
-// missing or unreadable stats row renders a zero snapshot rather than failing,
-// so an empty state database always produces sensible output with exit 0.
+// Redis, Docker, or the worker, so `relay stats` works with no REDIS_URI set. An
+// absent stats row renders a zero snapshot; an unreadable one is an error, never
+// a fabricated zero, so an empty state database still exits 0 but a real
+// failure surfaces.
 //
 // It is a hybrid grouping command: bare `relay stats` keeps rendering the table
 // through the parent Action (urfave runs it when no subcommand token resolves),
@@ -42,8 +42,14 @@ func statsCommand(deps Dependencies) *cli.Command {
 				return err
 			}
 			defer cleanup()
-			printStats(cmd.Writer, st)
-			return nil
+
+			// An absent stats row renders zeros; only a failed read is an
+			// error, so a fresh database still exits 0.
+			s, _, err := st.ReadStats(ctx)
+			if err != nil {
+				return fmt.Errorf("stats: %w", err)
+			}
+			return renderStats(cmd.Writer, s)
 		},
 		Commands: []*cli.Command{statsResetCommand(deps)},
 	}
@@ -79,12 +85,16 @@ func statsResetCommand(deps Dependencies) *cli.Command {
 			// absent worker (no socket / connection refused) permits the direct
 			// state-DB write; every ambiguous outcome is surfaced so a live
 			// worker is never second-guessed.
-			if err := worker.ResetRuntimeStats(deps.SocketPath); err == nil {
-				fmt.Fprintln(cmd.Writer, "Stats reset")
-				return nil
-			} else if !errors.Is(err, worker.ErrRuntimeStatsNoWorker) {
+			err := worker.ResetRuntimeStats(deps.SocketPath)
+			switch {
+			case err == nil:
+				out := newOutput(cmd.Writer)
+				out.line("Stats reset")
+				return out.err
+			case !errors.Is(err, worker.ErrRuntimeStatsNoWorker):
 				return fmt.Errorf("stats reset: %w", err)
 			}
+
 			st, cleanup, err := deps.OpenState(ctx)
 			if err != nil {
 				return err
@@ -93,8 +103,9 @@ func statsResetCommand(deps Dependencies) *cli.Command {
 			if _, err := st.ResetStats(); err != nil {
 				return fmt.Errorf("stats reset: %w", err)
 			}
-			fmt.Fprintln(cmd.Writer, "Stats reset")
-			return nil
+			out := newOutput(cmd.Writer)
+			out.line("Stats reset")
+			return out.err
 		},
 	}
 }
@@ -106,27 +117,27 @@ func humanAge(seconds int64) string {
 	return (time.Duration(seconds) * time.Second).String()
 }
 
-// printStats renders the operational snapshot to w. The zero value of the
-// Stats struct is used when no row exists yet (absent or read error), which
-// keeps the output predictable on a fresh state database.
-func printStats(w io.Writer, st *state.State) {
-	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+// renderStats renders the operational snapshot. The zero Stats value is a
+// valid rendering for a state database with no snapshot yet.
+func renderStats(w io.Writer, stats state.Stats) error {
+	out := newOutput(w)
+	tw := out.table(2)
 
-	s, _ := st.Stats()
 	updated := "never"
-	if s.UpdatedAt != "" {
-		updated = relativeAgo(s.UpdatedAt)
+	if stats.UpdatedAt != "" {
+		updated = relativeAgo(stats.UpdatedAt)
 	}
 
-	fmt.Fprintf(tw, "Events received:\t%d\n", s.EventsReceivedTotal)
-	fmt.Fprintf(tw, "Events matched:\t%d\n", s.EventsMatchedTotal)
-	fmt.Fprintf(tw, "Events unmatched:\t%d\n", s.EventsUnmatchedTotal)
-	fmt.Fprintf(tw, "Handler successes:\t%d\n", s.HandlerSuccessTotal)
-	fmt.Fprintf(tw, "Handler failures:\t%d\n", s.HandlerFailureTotal)
-	fmt.Fprintf(tw, "Message reclaims:\t%d\n", s.RetryTotal)
-	fmt.Fprintf(tw, "DLQ entries:\t%d\n", s.DLQTotal)
-	fmt.Fprintf(tw, "Pending entries:\t%d\n", s.PendingEntries)
-	fmt.Fprintf(tw, "Oldest pending age:\t%s\n", humanAge(s.OldestPendingAgeSeconds))
+	fmt.Fprintf(tw, "Events received:\t%d\n", stats.EventsReceivedTotal)
+	fmt.Fprintf(tw, "Events matched:\t%d\n", stats.EventsMatchedTotal)
+	fmt.Fprintf(tw, "Events unmatched:\t%d\n", stats.EventsUnmatchedTotal)
+	fmt.Fprintf(tw, "Handler successes:\t%d\n", stats.HandlerSuccessTotal)
+	fmt.Fprintf(tw, "Handler failures:\t%d\n", stats.HandlerFailureTotal)
+	fmt.Fprintf(tw, "Message reclaims:\t%d\n", stats.RetryTotal)
+	fmt.Fprintf(tw, "DLQ entries:\t%d\n", stats.DLQTotal)
+	fmt.Fprintf(tw, "Pending entries:\t%d\n", stats.PendingEntries)
+	fmt.Fprintf(tw, "Oldest pending age:\t%s\n", humanAge(stats.OldestPendingAgeSeconds))
 	fmt.Fprintf(tw, "Updated:\t%s\n", updated)
-	_ = tw.Flush()
+	out.flush(tw)
+	return out.err
 }

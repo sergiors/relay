@@ -22,7 +22,7 @@ var cronDescriptor = sync.OnceValue(func() *cron.ExpressionDescriptor {
 	return d
 })
 
-// describeCronFunc is the description resolver used by printInspect. It is a
+// describeCronFunc is the description resolver used by renderAppDetail. It is a
 // package var (not const) solely so tests can inject a failing implementation to
 // exercise the graceful fallback; production always uses defaultDescribeCron.
 var describeCronFunc = defaultDescribeCron

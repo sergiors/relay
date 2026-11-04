@@ -19,7 +19,9 @@ import (
 // only when an in-flight lazy start is observed.
 func TestAppInspectRuntimePoolStartingRow(t *testing.T) {
 	var w bytes.Buffer
-	printRuntimePool(&w, &poolGauges{Capacity: 2, Starting: 1}, 0, 0, 0)
+	if err := renderRuntimePool(&w, state.AppStats{}, &poolGauges{Capacity: 2, Starting: 1}); err != nil {
+		t.Fatalf("renderRuntimePool: %v", err)
+	}
 	out := normWS(w.String())
 	if !strings.Contains(out, "Starting: 1") {
 		t.Errorf("starting row missing:\n%s", out)
@@ -97,7 +99,7 @@ func startUnitSocketServer(t *testing.T, snap worker.PoolSnapshotter) string {
 	return sockPath
 }
 
-// pooledStats is the persisted per-app stats row passed to appendRuntimePool —
+// pooledStats is the persisted per-app stats row passed to renderAppPoolForTest —
 // the same struct appInspect carries in from the state database. The live
 // sources in these tests deliberately report different counter values that must
 // never render: the cumulative counters are persisted-state only.
@@ -142,7 +144,7 @@ func TestAppendRuntimePoolProviderPrecedesSocket(t *testing.T) {
 	})
 
 	var w bytes.Buffer
-	appendRuntimePool(&w, "user-events-python", pooledStats(), prov, sockPath)
+	renderAppPoolForTest(t, &w, "user-events-python", pooledStats(), prov, sockPath)
 	out := normWS(w.String())
 	// The provider's gauges — not the socket's 40/20/10/10.
 	for _, row := range []string{"Capacity: 4", "Containers: 2", "Busy: 1", "Idle: 1"} {
@@ -173,7 +175,7 @@ func TestAppendRuntimePoolSocketBacksUnwiredProvider(t *testing.T) {
 	sockPath := startUnitSocketServer(t, socket)
 
 	var w bytes.Buffer
-	appendRuntimePool(&w, "user-events-python", pooledStats(), nil, sockPath)
+	renderAppPoolForTest(t, &w, "user-events-python", pooledStats(), nil, sockPath)
 	out := normWS(w.String())
 	for _, row := range []string{"Capacity: 40", "Containers: 20", "Busy: 10", "Idle: 10"} {
 		if !strings.Contains(out, row) {
@@ -195,7 +197,7 @@ func TestAppendRuntimePoolSocketBacksProviderWithoutPool(t *testing.T) {
 	sockPath := startUnitSocketServer(t, socket)
 
 	var w bytes.Buffer
-	appendRuntimePool(&w, "user-events-python", pooledStats(), noPoolProvider, sockPath)
+	renderAppPoolForTest(t, &w, "user-events-python", pooledStats(), noPoolProvider, sockPath)
 	out := normWS(w.String())
 	for _, row := range []string{"Capacity: 9", "Containers: 5", "Busy: 2", "Idle: 3"} {
 		if !strings.Contains(out, row) {
@@ -220,7 +222,7 @@ func TestAppendRuntimePoolUnknownWhenNoLiveSource(t *testing.T) {
 	// The directory exists but nothing serves the socket: the dial fails.
 
 	var w bytes.Buffer
-	appendRuntimePool(&w, "user-events-python", pooledStats(), nil, filepath.Join(dir, "unused.sock"))
+	renderAppPoolForTest(t, &w, "user-events-python", pooledStats(), nil, filepath.Join(dir, "unused.sock"))
 	out := normWS(w.String())
 	for _, row := range []string{
 		"Capacity: unknown",
@@ -241,7 +243,7 @@ func TestAppendRuntimePoolUnknownWhenNoLiveSource(t *testing.T) {
 // TestPoolProviderClosuresDoNotCrossContaminate pins the command-local pool
 // contract at the unit level: two independently constructed Dependencies trees
 // each carry their OWN provider closure and socket path, and the same
-// resolution chain appInspect drives (appendRuntimePool with the tree's deps
+// resolution chain appInspect drives (resolvePoolGauges with the tree's deps
 // fields) resolves every tree from its own sources only. A regression that
 // captures a shared provider, leaks a closure into package state, cross-wires
 // socket paths, or lets one tree read the other's pool shows up here as the
@@ -297,8 +299,8 @@ func TestPoolProviderClosuresDoNotCrossContaminate(t *testing.T) {
 	row := pooledStats()
 
 	var outA, outB bytes.Buffer
-	appendRuntimePool(&outA, sharedName, row, depsA.PoolSnapshotProvider, depsA.SocketPath)
-	appendRuntimePool(&outB, sharedName, row, depsB.PoolSnapshotProvider, depsB.SocketPath)
+	renderAppPoolForTest(t, &outA, sharedName, row, depsA.PoolSnapshotProvider, depsA.SocketPath)
+	renderAppPoolForTest(t, &outB, sharedName, row, depsB.PoolSnapshotProvider, depsB.SocketPath)
 
 	a, b := normWS(outA.String()), normWS(outB.String())
 

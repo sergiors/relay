@@ -80,8 +80,8 @@ func TestAppInspectRuntimePoolSection(t *testing.T) {
 	}
 
 	var w bytes.Buffer
-	fs := printInspect(&w, st, detail)
-	appendRuntimePool(&w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
+	fs := renderAppDetailForTest(t, &w, st, detail)
+	renderAppPoolForTest(t, &w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
 	out := normWS(w.String())
 	for _, want := range []string{
 		"Runtime pool:",
@@ -138,8 +138,8 @@ func TestAppInspectRuntimePoolPersistedCountersWithoutProvider(t *testing.T) {
 	// neither live source resolves a pool.
 
 	var w bytes.Buffer
-	fs := printInspect(&w, st, detail)
-	appendRuntimePool(&w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
+	fs := renderAppDetailForTest(t, &w, st, detail)
+	renderAppPoolForTest(t, &w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
 	out := normWS(w.String())
 	if !strings.Contains(out, "Runtime pool:") {
 		t.Fatalf("standalone inspect must render the Runtime pool section from persisted counters:\n%s", out)
@@ -185,8 +185,8 @@ func TestAppInspectRuntimePoolProviderUnknownApp(t *testing.T) {
 	deps.PoolSnapshotProvider = noPoolProvider
 
 	var w bytes.Buffer
-	fs := printInspect(&w, st, detail)
-	appendRuntimePool(&w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
+	fs := renderAppDetailForTest(t, &w, st, detail)
+	renderAppPoolForTest(t, &w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
 	out := normWS(w.String())
 	if !strings.Contains(out, "Runtime pool:") || !strings.Contains(out, "Warm acquires: 4") {
 		t.Fatalf("not-found provider must still render persisted counters:\n%s", out)
@@ -240,8 +240,8 @@ func TestAppInspectSocketLiveGauges(t *testing.T) {
 	})
 
 	var w bytes.Buffer
-	fs := printInspect(&w, st, detail)
-	appendRuntimePool(&w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
+	fs := renderAppDetailForTest(t, &w, st, detail)
+	renderAppPoolForTest(t, &w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
 	out := normWS(w.String())
 	for _, row := range []string{
 		"Capacity: 4",
@@ -282,8 +282,8 @@ func TestAppInspectSocketKnownZeros(t *testing.T) {
 	})
 
 	var w bytes.Buffer
-	fs := printInspect(&w, st, detail)
-	appendRuntimePool(&w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
+	fs := renderAppDetailForTest(t, &w, st, detail)
+	renderAppPoolForTest(t, &w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
 	out := normWS(w.String())
 	for _, row := range []string{
 		"Capacity: 0",
@@ -320,8 +320,8 @@ func TestAppInspectSocketUnknownApp(t *testing.T) {
 	})
 
 	var w bytes.Buffer
-	fs := printInspect(&w, st, detail)
-	appendRuntimePool(&w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
+	fs := renderAppDetailForTest(t, &w, st, detail)
+	renderAppPoolForTest(t, &w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
 	out := normWS(w.String())
 	if !strings.Contains(out, "Warm acquires: 5") || !strings.Contains(out, "Capacity: unknown") {
 		t.Fatalf("unknown-function answer must render persisted counters and unknown gauges:\n%s", out)
@@ -345,8 +345,8 @@ func TestAppInspectSocketUnavailable(t *testing.T) {
 	// deps.SocketPath: the dial fails.
 
 	var w bytes.Buffer
-	fs := printInspect(&w, st, detail)
-	appendRuntimePool(&w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
+	fs := renderAppDetailForTest(t, &w, st, detail)
+	renderAppPoolForTest(t, &w, "user-events-python", fs, deps.PoolSnapshotProvider, deps.SocketPath)
 	out := normWS(w.String())
 	if !strings.Contains(out, "Warm acquires: 6") || !strings.Contains(out, "Capacity: unknown") {
 		t.Fatalf("unavailable socket must render persisted counters and unknown gauges:\n%s", out)

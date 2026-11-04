@@ -118,9 +118,7 @@ events:
 func TestAppListColumns(t *testing.T) {
 	st, _ := seedTestState(t)
 	var w bytes.Buffer
-	if err := printList(&w, st); err != nil {
-		t.Fatalf("printList: %v", err)
-	}
+	renderAppListForTest(t, &w, st)
 	lines := strings.Split(strings.TrimSpace(w.String()), "\n")
 	hdr := lines[0]
 	for _, col := range []string{"NAME", "RUNTIME", "STATUS", "UPDATED"} {
@@ -200,9 +198,7 @@ func TestAppListStatusesConsistentWithInspect(t *testing.T) {
 
 	// ls: each row carries its status column verbatim.
 	var lw bytes.Buffer
-	if err := printList(&lw, st); err != nil {
-		t.Fatalf("printList: %v", err)
-	}
+	renderAppListForTest(t, &lw, st)
 	rows := map[string]string{}
 	for _, l := range strings.Split(strings.TrimSpace(lw.String()), "\n")[1:] {
 		fields := strings.Fields(l)
@@ -220,7 +216,7 @@ func TestAppListStatusesConsistentWithInspect(t *testing.T) {
 			t.Fatalf("expected function %s", name)
 		}
 		var iw bytes.Buffer
-		printInspect(&iw, st, detail)
+		renderAppDetailForTest(t, &iw, st, detail)
 		if !strings.Contains(normWS(iw.String()), "Status: "+status) {
 			t.Errorf("inspect status for %s missing %q:\n%s", name, status, iw.String())
 		}
@@ -235,7 +231,7 @@ func TestAppInspectDetail(t *testing.T) {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, detail)
+	renderAppDetailForTest(t, &w, st, detail)
 	out := normWS(w.String())
 	// Whitespace is normalized: this test pins which detail rows render, not
 	// their tabwriter column alignment (that is anchored in TestPrintStats).
@@ -267,14 +263,14 @@ func TestAppInspectPendingOmitsActiveFields(t *testing.T) {
 		t.Fatal("expected pending function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, detail)
+	renderAppDetailForTest(t, &w, st, detail)
 	out := w.String()
 	if strings.Contains(out, "Image:") || strings.Contains(out, "Prepared:") || strings.Contains(out, "Fingerprint:") {
 		t.Fatalf("pending function should omit Image/Fingerprint/Prepared:\n%s", out)
 	}
 }
 
-// printInspect appends a per-app stats section between the metadata block
+// renderAppDetail appends a per-app stats section between the metadata block
 // and the Handlers section, using the same wider padding as Handlers for visual
 // grouping. The long label "Handler successes:" drives the value column.
 func TestAppInspectStatsSection(t *testing.T) {
@@ -292,7 +288,7 @@ func TestAppInspectStatsSection(t *testing.T) {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, detail)
+	renderAppDetailForTest(t, &w, st, detail)
 	out := normWS(w.String())
 	for _, want := range []string{
 		"Stats:",
@@ -323,7 +319,7 @@ func TestAppInspectStatsZeroWithoutRow(t *testing.T) {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, detail)
+	renderAppDetailForTest(t, &w, st, detail)
 	out := normWS(w.String())
 	for _, want := range []string{
 		"Stats:",
@@ -363,7 +359,7 @@ events:
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, detail)
+	renderAppDetailForTest(t, &w, st, detail)
 	out := w.String()
 	for _, want := range []string{
 		"Environment:",
@@ -412,7 +408,7 @@ schedules:
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, detail)
+	renderAppDetailForTest(t, &w, st, detail)
 	out := w.String()
 
 	// The Schedules section follows Events.
@@ -455,7 +451,7 @@ schedules:
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, detail)
+	renderAppDetailForTest(t, &w, st, detail)
 	return w.String()
 }
 
@@ -527,7 +523,7 @@ func TestAppInspectNoSchedulesHeader(t *testing.T) {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, detail)
+	renderAppDetailForTest(t, &w, st, detail)
 	if strings.Contains(w.String(), "Schedules:") {
 		t.Fatalf("inspect must omit Schedules: for a template without schedules:\n%s", w.String())
 	}
@@ -619,7 +615,7 @@ services:
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, detail)
+	renderAppDetailForTest(t, &w, st, detail)
 	out := w.String()
 	si, se := strings.Index(out, "Schedules:"), strings.Index(out, "Services:")
 	if si == -1 || se == -1 || si > se {
@@ -635,7 +631,7 @@ func TestAppInspectNoServicesHeader(t *testing.T) {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, detail)
+	renderAppDetailForTest(t, &w, st, detail)
 	if strings.Contains(w.String(), "Services:") {
 		t.Fatalf("inspect must omit Services: for a template without services:\n%s", w.String())
 	}
@@ -675,7 +671,7 @@ events:
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, detail)
+	renderAppDetailForTest(t, &w, st, detail)
 	return w.String()
 }
 
@@ -749,7 +745,7 @@ func TestAppInspectStatsTimestamps(t *testing.T) {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, detail)
+	renderAppDetailForTest(t, &w, st, detail)
 	out := normWS(w.String())
 	for _, want := range []string{
 		"Last execution: 2s ago",
@@ -781,7 +777,7 @@ func TestAppInspectStatsTimestampsNever(t *testing.T) {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, detail)
+	renderAppDetailForTest(t, &w, st, detail)
 	out := normWS(w.String())
 	for _, want := range []string{
 		"Last execution: never",
@@ -842,9 +838,7 @@ events:
 	// carries the "-" runtime placeholder (columns are NAME RUNTIME STATUS
 	// UPDATED, so the placeholder is field 1).
 	var lw bytes.Buffer
-	if err := printList(&lw, st); err != nil {
-		t.Fatalf("printList: %v", err)
-	}
+	renderAppListForTest(t, &lw, st)
 	rows := map[string][]string{}
 	for _, l := range strings.Split(strings.TrimSpace(lw.String()), "\n")[1:] {
 		fields := strings.Fields(l)
@@ -866,7 +860,7 @@ events:
 		t.Fatal("expected runtime-building function")
 	}
 	var iw bytes.Buffer
-	printInspect(&iw, st, detail)
+	renderAppDetailForTest(t, &iw, st, detail)
 	out := normWS(iw.String())
 	if !strings.Contains(out, "Status: "+state.StatusBuilding) {
 		t.Errorf("inspect output missing building status:\n%s", out)
@@ -877,7 +871,7 @@ events:
 		t.Fatal("expected svc-only function")
 	}
 	var sw bytes.Buffer
-	printInspect(&sw, st, svcDetail)
+	renderAppDetailForTest(t, &sw, st, svcDetail)
 	if !strings.Contains(normWS(sw.String()), "Runtime: -") {
 		t.Errorf("inspect output missing 'Runtime: -':\n%s", sw.String())
 	}
@@ -910,7 +904,7 @@ services:
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, detail)
+	renderAppDetailForTest(t, &w, st, detail)
 	out := w.String()
 	for _, want := range []string{
 		"service.js", "port=3000",

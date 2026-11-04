@@ -4,15 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"sort"
-	"text/tabwriter"
 
 	"github.com/urfave/cli/v3"
-
-	"relay/internal/bytesize"
-	"relay/internal/runtime"
-	"relay/internal/state"
-	"relay/internal/worker"
 )
 
 // appCommand builds the `relay app ...` subcommand family. `ls` and
@@ -97,21 +90,28 @@ func appListAction(deps Dependencies) cli.ActionFunc {
 	}
 }
 
-// appList prints a Docker-like table of apps sorted by name, opening the state
-// database through deps.OpenState.
+// appList reads the app summaries and renders the ls table. The read is kept
+// separate from renderAppList so a failed query is never presented as an empty
+// listing.
 func appList(ctx context.Context, w io.Writer, deps Dependencies) error {
 	st, cleanup, err := deps.OpenState(ctx)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
-	return printList(w, st)
+
+	rows, err := st.ReadAppSummaries(ctx)
+	if err != nil {
+		return err
+	}
+	return renderAppList(w, rows)
 }
 
-// appInspect prints the full detail for one app, reading the state
-// database through deps.OpenState and resolving the live pool gauges from the
-// in-process provider when wired, otherwise from the worker socket at
-// deps.SocketPath. An unknown name returns a runtime error (exit 1 via main).
+// appInspect reads one app's detail and persisted stats, resolves the live pool
+// gauges, and renders the full record. An unknown name is a runtime error (exit
+// 1 via main); an unreadable row is a separate error, never reported as an
+// unknown app. The live gauges are best-effort telemetry: an unavailable pool
+// renders as "unknown" without failing the command.
 func appInspect(ctx context.Context, w io.Writer, name string, deps Dependencies) error {
 	st, cleanup, err := deps.OpenState(ctx)
 	if err != nil {
@@ -119,366 +119,26 @@ func appInspect(ctx context.Context, w io.Writer, name string, deps Dependencies
 	}
 	defer cleanup()
 
-	detail, ok := st.GetApp(name)
-	if !ok {
+	detail, found, err := st.ReadApp(ctx, name)
+	if err != nil {
+		return fmt.Errorf("app inspect: %w", err)
+	}
+	if !found {
 		return fmt.Errorf("unknown app %q", name)
 	}
-	fs := printInspect(w, st, detail)
-	appendRuntimePool(w, name, fs, deps.PoolSnapshotProvider, deps.SocketPath)
-	return nil
-}
-
-// printList renders the ls table to w. It is separated from the command
-// plumbing so tests can invoke it against a temp state DB directly.
-func printList(w io.Writer, st *state.State) error {
-	rows := st.ListApps()
-	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
-
-	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tRUNTIME\tSTATUS\tUPDATED")
-
-	for _, r := range rows {
-		runtime := r.Runtime
-		if runtime == "" {
-			runtime = "-"
-		}
-
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n",
-			r.Name, runtime, r.Status, displayTime(r))
-	}
-
-	return tw.Flush()
-}
-
-// printInspect renders the full detail record to w and returns the per-app
-// stats it read, so the caller can render the Runtime pool section from the same
-// persisted snapshot without a second read. Labels are tab-aligned through a
-// tabwriter so padding matches the longest label without hand-maintained spaces.
-// The Events, Schedules, and Services sections are rendered with the same
-// alignment, using a wider padding for visual grouping.
-func printInspect(w io.Writer, st *state.State, detail state.Detail) state.AppStats {
-	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintf(tw, "Name:\t%s\n", detail.Name)
-
-	runtime := detail.Runtime
-	if runtime == "" {
-		runtime = "-"
-	}
-	fmt.Fprintf(tw, "Runtime:\t%s\n", runtime)
-
-	fmt.Fprintf(tw, "Status:\t%s\n", detail.Status)
-	if detail.Image != "" {
-		fmt.Fprintf(tw, "Image:\t%s\n", detail.Image)
-	}
-	if detail.Fingerprint != "" {
-		fmt.Fprintf(tw, "Fingerprint:\t%s\n", detail.Fingerprint)
-	}
-	if detail.PreparedAt != "" {
-		fmt.Fprintf(tw, "Prepared:\t%s (%s)\n", detail.PreparedAt, relativeAgo(detail.PreparedAt))
-	}
-	if detail.LastReconcileAt != "" {
-		fmt.Fprintf(tw, "Last reconcile:\t%s (%s)\n", detail.LastReconcileStatus, relativeAgo(detail.LastReconcileAt))
-	}
-	if detail.LastError != "" {
-		fmt.Fprintf(tw, "Last error:\t%s\n", detail.LastError)
-	}
-	if detail.Resources != nil {
-		fmt.Fprintf(tw, "Resources:\tmemory=%s cpus=%g pids=%d\n",
-			bytesize.Format(detail.Resources.MemoryBytes), detail.Resources.CPUs, detail.Resources.Pids)
-	}
-	tw.Flush()
-
-	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "Stats:")
-	sw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
-	fs, _ := st.AppStats(detail.Name)
-	fmt.Fprintf(sw, "  Events matched:\t%d\n", fs.EventsMatchedTotal)
-	fmt.Fprintf(sw, "  Handler successes:\t%d\n", fs.HandlerSuccessTotal)
-	fmt.Fprintf(sw, "  Handler failures:\t%d\n", fs.HandlerFailureTotal)
-	fmt.Fprintf(sw, "  Handler retries:\t%d\n", fs.RetryTotal)
-	fmt.Fprintf(sw, "  Invocations exhausted:\t%d\n", fs.DLQTotal)
-	fmt.Fprintf(sw, "  Last execution:\t%s\n", lastAgo(fs.LastExecutionAt))
-	fmt.Fprintf(sw, "  Last success:\t%s\n", lastAgo(fs.LastSuccessAt))
-	fmt.Fprintf(sw, "  Last failure:\t%s\n", lastAgo(fs.LastFailureAt))
-	fmt.Fprintf(sw, "  Last exhaustion:\t%s\n", lastAgo(fs.LastDLQAt))
-	sw.Flush()
-
-	if len(detail.Handlers) > 0 {
-		fmt.Fprintln(w, "")
-		fmt.Fprintln(w, "Events:")
-		hw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
-		for _, h := range detail.Handlers {
-			fmt.Fprintf(hw, "  %s\ttimeout=%s\n", h.Name, h.Timeout)
-		}
-		hw.Flush()
-	}
-
-	if len(detail.Schedules) > 0 {
-		fmt.Fprintln(w, "")
-		fmt.Fprintln(w, "Schedules:")
-		sw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
-		for _, s := range detail.Schedules {
-			// Cron descriptions are best-effort; the raw expression remains authoritative.
-			if desc, ok := describeCronFunc(s.Cron); ok {
-				fmt.Fprintf(
-					sw,
-					"  %s\thandler=%s cron=%q (%s) timezone=%s timeout=%s\n",
-					s.Name,
-					s.Handler,
-					s.Cron,
-					desc,
-					s.Timezone,
-					s.Timeout,
-				)
-				continue
-			}
-			fmt.Fprintf(
-				sw,
-				"  %s\thandler=%s cron=%q timezone=%s timeout=%s\n",
-				s.Name,
-				s.Handler,
-				s.Cron,
-				s.Timezone,
-				s.Timeout,
-			)
-		}
-		sw.Flush()
-	}
-
-	if len(detail.Services) > 0 {
-		fmt.Fprintln(w, "")
-		fmt.Fprintln(w, "Services:")
-		srw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
-		for _, svc := range detail.Services {
-			// Prefix non-entrypoint sources so their kind remains visible in CLI output.
-			source := svc.Entrypoint
-			if svc.Image != "" {
-				source = "image:" + svc.Image
-			}
-
-			if svc.Path != "" {
-				fmt.Fprintf(
-					srw,
-					"  %s\tsource=%s port=%d replicas=%d path=%s\n",
-					svc.Name,
-					source,
-					svc.Port,
-					svc.Replicas,
-					svc.Path,
-				)
-				continue
-			}
-			fmt.Fprintf(srw, "  %s\tsource=%s port=%d replicas=%d\n", svc.Name, source, svc.Port, svc.Replicas)
-		}
-		srw.Flush()
-	}
-
-	if len(detail.Env) > 0 {
-		fmt.Fprintln(w, "")
-		fmt.Fprintln(w, "Environment:")
-		ew := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
-		for _, k := range sortedKeys(detail.Env) {
-			// Names only: the persisted value is a redaction marker, and inspect
-			// renders it explicitly so a raw stored value can never be printed.
-			fmt.Fprintf(ew, "  %s=%s\n", k, state.RedactedEnvValue)
-		}
-		ew.Flush()
-	}
-
-	if len(detail.Secrets) > 0 {
-		fmt.Fprintln(w, "")
-		fmt.Fprintln(w, "Secrets:")
-		sw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
-		for _, k := range sortedKeys(detail.Secrets) {
-			// Show secret references only; resolved values must never be exposed.
-			fmt.Fprintf(sw, "  %s=%s\n", k, detail.Secrets[k])
-		}
-		sw.Flush()
-	}
-
-	return fs
-}
-
-// sortedKeys returns the map's keys sorted, for deterministic inspect output.
-func sortedKeys[V any](m map[string]V) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-// poolGauges is the live runtime-pool gauge view rendered by inspect, resolved
-// from either the in-process provider (runtime.PoolSnapshot) or the worker query
-// socket (worker.RuntimeState). Keeping a CLI-local shape lets both sources
-// render identically without importing the worker's wire type into the renderer.
-// It carries ONLY the live gauges: the cumulative counters are not a gauge and
-// always come from the persisted stats row.
-type poolGauges struct {
-	Capacity   int
-	Containers int
-	Busy       int
-	Idle       int
-	Starting   int
-}
-
-// appendRuntimePool appends the Runtime pool section to an inspect output for
-// name. The cumulative acquire/discard counters (warm acquires, cold starts,
-// discarded) ALWAYS come from the persisted app_stats row (fs) — never from
-// a live provider or the socket, so the operator-facing history is the same in
-// every process and survives a worker restart. Only the LIVE gauges (capacity,
-// container counts by lease state) are resolved from a live source, in
-// preference order:
-//
-//  1. the injected in-process provider, when non-nil and it reports a pool;
-//  2. the worker query socket at socketPath (the standalone CLI);
-//  3. otherwise explicitly unavailable ("unknown").
-//
-// The live gauges are NEVER rendered from persisted state: a persisted live
-// gauge would go stale between flushes, so "unknown" is always the honest
-// fallback. name is passed separately because fs is the zero value when no stats
-// row exists yet.
-func appendRuntimePool(
-	w io.Writer,
-	name string,
-	fs state.AppStats,
-	provider PoolSnapshotProvider,
-	socketPath string,
-) {
-	gauges, ok := livePoolGauges(name, provider, socketPath)
-	if !ok {
-		printRuntimePool(w, nil, fs.WarmAcquiresTotal, fs.ColdStartsTotal, fs.DiscardedTotal)
-		return
-	}
-	printRuntimePool(w, &gauges, fs.WarmAcquiresTotal, fs.ColdStartsTotal, fs.DiscardedTotal)
-}
-
-// livePoolGauges resolves name's live pool gauges from the injected in-process
-// provider first, then the worker query socket at socketPath. It reports
-// (zero, false) when neither source resolves a live pool, so the caller renders
-// the gauges unknown. The cumulative counters are deliberately NOT read here:
-// they always come from the persisted stats row.
-func livePoolGauges(
-	name string,
-	provider PoolSnapshotProvider,
-	socketPath string,
-) (poolGauges, bool) {
-	if snap, ok := livePoolSnapshot(name, provider); ok {
-		return poolGauges{
-			Capacity:   snap.Capacity,
-			Containers: snap.Containers,
-			Busy:       snap.Busy,
-			Idle:       snap.Idle,
-			Starting:   snap.Starting,
-		}, true
-	}
-	return socketPoolGauges(name, socketPath)
-}
-
-// livePoolSnapshot consults the injected in-process provider. It returns
-// (zero, false) when no provider is wired (the standalone inspect process) or
-// the provider does not report a live pool for the app.
-func livePoolSnapshot(
-	name string,
-	provider PoolSnapshotProvider,
-) (runtime.PoolSnapshot, bool) {
-	if provider == nil {
-		return runtime.PoolSnapshot{}, false
-	}
-	return provider(name)
-}
-
-// socketPoolGauges queries the live worker socket at socketPath for name's pool
-// gauges. Any failure — no worker running, a stale/unreachable socket, or the
-// worker having no pool for the app — reports (zero, false) so the caller
-// renders the live gauges unknown. It never fails the command: live
-// observability is best-effort, and the persisted counters remain authoritative
-// cumulative history.
-func socketPoolGauges(name, socketPath string) (poolGauges, bool) {
-	st, err := worker.QueryRuntimeState(socketPath, name)
+	stats, _, err := st.ReadAppStats(ctx, name)
 	if err != nil {
-		return poolGauges{}, false
-	}
-	return poolGauges{
-		Capacity:   st.Capacity,
-		Containers: st.Containers,
-		Busy:       st.Busy,
-		Idle:       st.Idle,
-		Starting:   st.Starting,
-	}, true
-}
-
-// printRuntimePool renders the compact Runtime pool section for one app.
-// warm/cold/discarded are the cumulative counters to render; live carries the
-// live gauges when they are known. It has two shapes:
-//
-//   - live != nil: the authoritative gauges (capacity, container counts by
-//     lease state, and the transient starting reservation) are shown. Known
-//     zero values print as 0 (a valid live reading), and Starting is shown only
-//     when non-zero (it is transient and usually zero).
-//   - live == nil: no live pool is reachable from this process, so the live
-//     gauges render as explicitly unavailable ("unknown") — never a guessed or
-//     stale number.
-//
-// The layout matches the wider padding of the Services section.
-func printRuntimePool(w io.Writer, live *poolGauges, warm, cold, discarded int64) {
-	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "Runtime pool:")
-	tw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
-
-	totalAcquires := warm + cold
-	warmAcquires := fmt.Sprintf("%d (n/a)", warm)
-	if totalAcquires > 0 {
-		reuseRate := float64(warm) / float64(totalAcquires) * 100
-		warmAcquires = fmt.Sprintf("%d (%.1f%%)", warm, reuseRate)
+		return fmt.Errorf("app inspect: %w", err)
 	}
 
-	if live != nil {
-		fmt.Fprintf(tw, "  Capacity:\t%d\n", live.Capacity)
-		fmt.Fprintf(tw, "  Containers:\t%d\n", live.Containers)
-		fmt.Fprintf(tw, "  Busy:\t%d\n", live.Busy)
-		fmt.Fprintf(tw, "  Idle:\t%d\n", live.Idle)
-		if live.Starting > 0 {
-			fmt.Fprintf(tw, "  Starting:\t%d\n", live.Starting)
-		}
-		fmt.Fprintf(tw, "  Warm acquires:\t%s\n", warmAcquires)
-		fmt.Fprintf(tw, "  Cold starts:\t%d\n", cold)
-		fmt.Fprintf(tw, "  Discarded:\t%d\n", discarded)
-		tw.Flush()
-		return
+	if err := renderAppDetail(w, detail, stats); err != nil {
+		return err
 	}
-	// No live pool: the gauges are unavailable (the worker's in-memory pool is
-	// not reachable from this process). "unknown" is explicit rather than a
-	// stale number so an operator never mistakes a persisted value for a live
-	// reading.
-	fmt.Fprintf(tw, "  Capacity:\tunknown\n")
-	fmt.Fprintf(tw, "  Containers:\tunknown\n")
-	fmt.Fprintf(tw, "  Busy:\tunknown\n")
-	fmt.Fprintf(tw, "  Idle:\tunknown\n")
-	fmt.Fprintf(tw, "  Warm acquires:\t%s\n", warmAcquires)
-	fmt.Fprintf(tw, "  Cold starts:\t%d\n", cold)
-	fmt.Fprintf(tw, "  Discarded:\t%d\n", discarded)
-	tw.Flush()
-}
 
-// lastAgo renders a per-app timestamp for inspect: the empty string means
-// the event was never observed ("never"); any other value renders through
-// relativeAgo, which falls back to the raw string when parsing fails — an
-// acceptable cosmetic fallback that keeps inspect rendering non-fatal.
-func lastAgo(rfc3339 string) string {
-	if rfc3339 == "" {
-		return "never"
+	gauges, live := resolvePoolGauges(name, deps.PoolSnapshotProvider, deps.SocketPath)
+	var liveGauges *poolGauges
+	if live {
+		liveGauges = &gauges
 	}
-	return relativeAgo(rfc3339)
-}
-
-// displayTime returns the UPDATED column value: prepared_at (if set) else
-// updated_at, rendered as a short relative age.
-func displayTime(r state.Row) string {
-	raw := r.PreparedAt
-	if raw == "" {
-		raw = r.UpdatedAt
-	}
-	return relativeAgo(raw)
+	return renderRuntimePool(w, stats, liveGauges)
 }
