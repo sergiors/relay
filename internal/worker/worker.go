@@ -425,6 +425,21 @@ func Run(logger *slog.Logger) (runErr error) {
 		run:     func(context.Context) error { return st.Close() },
 	})
 
+	// Load the runtime base-image pin snapshot once, directly after the state
+	// database opens and before any app is loaded, fingerprinted, or prepared.
+	// The runtime Manager receives this immutable startup snapshot and does not
+	// poll for changes. A read failure is fatal: treating it as "everything
+	// unpinned" could build from a moving tag when a pin is stored.
+	runtimeSelections, err := st.ReadRuntimeImageSelections(startupCtx)
+	if err != nil {
+		if startupInterrupted(startupCtx, err) {
+			logger.Debug("Startup: runtime image selection load interrupted by shutdown", "error", err)
+			return startupResult(errStartupInterrupted)
+		}
+		return fmt.Errorf("load runtime image selections: %w", err)
+	}
+	logger.Debug("Startup: runtime image selections loaded", "count", len(runtimeSelections))
+
 	// Fixed external-dependency order: Redis/group, Docker manager, NETWORKS,
 	// then the manager's deferred maintenance loop. Any failure short-circuits
 	// every later phase; a cancellation here is a graceful shutdown.
@@ -435,7 +450,7 @@ func Run(logger *slog.Logger) (runErr error) {
 		// Root the manager in the worker lifecycle, not the preflight span, so
 		// builds and the startup ping observe SIGTERM/SIGINT.
 		OpenManager: func(_ context.Context) (*runtime.Manager, error) {
-			return openRuntimeManager(ctx, logger, metricsInstance, cfg, st, shutdown)
+			return openRuntimeManager(ctx, logger, metricsInstance, cfg, st, runtimeSelections, shutdown)
 		},
 		VerifyNetworks: func(ctx context.Context, m *runtime.Manager) error {
 			// Relay never creates networks, so a missing one must fail startup

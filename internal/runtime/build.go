@@ -106,6 +106,7 @@ func buildDependencyImage(
 	depRef, depFingerprint string,
 	targetArch string,
 	reg *metrics.Registry,
+	provenance ...imageProvenance,
 ) error {
 	ctxDir := snap.root
 	if ctxDir == "" {
@@ -142,7 +143,12 @@ func buildDependencyImage(
 		return fmt.Errorf("dependency %s: write dockerfile: %w", depRef, err)
 	}
 
-	return runImageBuild(ctx, cli, "dependency "+depRef, ctxDir, depRef, dependencyImageLabels(spec.Name, depFingerprint), reg)
+	labels := dependencyImageLabels(spec.Name, depFingerprint)
+	if len(provenance) > 0 {
+		provenance[0].apply(labels)
+	}
+
+	return runImageBuild(ctx, cli, "dependency "+depRef, ctxDir, depRef, labels, reg)
 }
 
 // buildImageOptions returns the ImageBuildOptions Relay uses for every app and

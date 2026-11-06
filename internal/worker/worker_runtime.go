@@ -36,6 +36,7 @@ func openRuntimeManager(
 	metricsInstance *metrics.Registry,
 	cfg config.Config,
 	st *state.State,
+	runtimeSelections []state.RuntimeImageSelection,
 	shutdown *shutdownRegistry,
 ) (*runtime.Manager, error) {
 	manager, err := runtime.NewManager(
@@ -86,6 +87,13 @@ func openRuntimeManager(
 		// service-only images keep their existing startup and loop. Startup
 		// configuration; a change requires a worker restart.
 		runtime.WithPythonZuvloop(cfg.PythonZuvloop),
+		// Runtime base-image pin snapshot read from PostgreSQL after the state
+		// handle opened. The Manager keeps this snapshot for its lifetime and does
+		// not poll for changes. A missing selection means the runtime is unpinned
+		// and keeps its historical configured-tag behavior. The Manager validates
+		// each pin against the runtime registry and rejects a malformed or
+		// mismatched selection for a known runtime.
+		runtime.WithRuntimeImageSelections(toRuntimeImageSelections(runtimeSelections)),
 		// Root Dockerfile builds in the WORKER LIFECYCLE (lifecycle), not the
 		// startup-span context: they get an independent 10m bound
 		// (runtime.buildTimeout) but are still cancelled when Relay shuts
@@ -123,4 +131,25 @@ func openRuntimeManager(
 		run:     manager.CloseContext,
 	})
 	return manager, nil
+}
+
+// toRuntimeImageSelections converts the state package's startup read model into
+// the runtime Manager's option type. The two packages deliberately stay
+// independent (state must not import runtime), so the narrow conversion lives at
+// the worker boundary. A nil input stays nil, preserving the unpinned behavior.
+func toRuntimeImageSelections(selections []state.RuntimeImageSelection) []runtime.RuntimeImageSelection {
+	if len(selections) == 0 {
+		return nil
+	}
+	out := make([]runtime.RuntimeImageSelection, 0, len(selections))
+	for _, selection := range selections {
+		out = append(out, runtime.RuntimeImageSelection{
+			RuntimeID:   selection.RuntimeID,
+			SourceImage: selection.SourceImage,
+			Digest:      selection.Digest,
+			Generation:  selection.Generation,
+			SelectedAt:  selection.SelectedAt,
+		})
+	}
+	return out
 }

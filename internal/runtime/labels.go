@@ -1,5 +1,7 @@
 package runtime
 
+import "relay/internal/runtime/plan"
+
 // The Relay Docker label model. A single relay.type label classifies every
 // Relay-owned container population into exactly one of three disjoint types:
 //
@@ -128,6 +130,23 @@ const (
 	// holding a current tag and rebuild them (upgrade safety for the
 	// persistent invocation protocol).
 	labelBootstrap = "relay.bootstrap"
+
+	// Image provenance labels. These are diagnostic only and never participate
+	// in ownership/GC classification (which stays strictly relay.type +
+	// relay.app) or in reuse decisions (which stay keyed on the tag and
+	// relay.bootstrap). They record the runtime a managed image was built for,
+	// the configured source base reference, the selected multi-platform index
+	// digest when the runtime is pinned (omitted otherwise), and the explicit
+	// target platform. They are stamped on BOTH app and dependency images.
+	//
+	// They are deliberately separate from labelRuntime: relay.runtime keeps its
+	// existing dependency-image-only meaning, and adding these labels must not
+	// make an unpinned image look different to the bootstrap reuse probe (it
+	// does not: bootstrapHash never includes labels).
+	labelProvenanceRuntime     = "relay.provenance.runtime"
+	labelProvenanceSourceImage = "relay.provenance.source_image"
+	labelProvenanceDigest      = "relay.provenance.digest"
+	labelProvenancePlatform    = "relay.provenance.platform"
 )
 
 // The relay.type values. Every Relay-owned container carries exactly one; the
@@ -196,6 +215,59 @@ func appImageLabels(fnName, fingerprint, dependency, bootstrap string) map[strin
 // fingerprint.
 func dependencyImageLabels(runtimeName, fingerprint string) map[string]string {
 	return imageLabels(ImageTypeDependency, "", runtimeName, fingerprint, "")
+}
+
+// imageProvenance is the diagnostic build provenance stamped on a managed app or
+// dependency image. Empty fields are omitted. It never affects ownership/GC
+// classification or the bootstrap reuse probe.
+type imageProvenance struct {
+	runtimeName string
+	sourceImage string
+	digest      string
+	platform    string
+}
+
+// apply stamps the non-empty provenance fields onto a managed-image label set.
+func (p imageProvenance) apply(labels map[string]string) {
+	if labels == nil {
+		return
+	}
+	if p.runtimeName != "" {
+		labels[labelProvenanceRuntime] = p.runtimeName
+	}
+	if p.sourceImage != "" {
+		labels[labelProvenanceSourceImage] = p.sourceImage
+	}
+	if p.digest != "" {
+		labels[labelProvenanceDigest] = p.digest
+	}
+	if p.platform != "" {
+		labels[labelProvenancePlatform] = p.platform
+	}
+}
+
+// provenanceFor builds the provenance labels for a runtime image. sourceImage is
+// the CONFIGURED base reference (never the pinned ref@digest form), and digest is
+// set only when the runtime is pinned. platform is the explicit build target
+// (e.g. "linux/amd64").
+func provenanceFor(spec plan.Spec, selection imageSelection) imageProvenance {
+	p := imageProvenance{
+		runtimeName: spec.Name,
+		sourceImage: spec.BaseImage,
+		platform:    targetPlatformLabel(),
+	}
+	if selection.pinned() {
+		p.sourceImage = selection.sourceImage
+		p.digest = selection.digest
+	}
+	return p
+}
+
+// targetPlatformLabel renders the explicit build target platform for provenance
+// labels. Relay always builds Linux images, varying only by architecture.
+func targetPlatformLabel() string {
+	target := buildTargetPlatform()
+	return target.OS + "/" + target.Architecture
 }
 
 // isServiceContainer reports whether labels classify a container as a

@@ -415,6 +415,13 @@ func (m *Manager) prepare(
 	if err != nil {
 		return nil, fmt.Errorf("app %q: %w", fn.Name, err)
 	}
+	// Capture ONE immutable runtime image selection for this preparation. The
+	// Manager's snapshot is startup-only and read-only, and this local copy is
+	// carried through the dependency fingerprint/build, the app Dockerfile, the
+	// image identity, and the provenance labels so every one of them observes the
+	// same pin. A zero selection means the runtime is unpinned and every
+	// historical path below is byte-for-byte unchanged.
+	runtimeSelection := m.imageSelectionFor(spec.Name)
 
 	// mountSource is the HOT_RELOAD decision for THIS app: enabled globally and
 	// permitted by the runtime's dependency layout. It is resolved BEFORE Plan so
@@ -510,12 +517,28 @@ func (m *Manager) prepare(
 		if err != nil {
 			return nil, fmt.Errorf("app %q: %w", fn.Name, fmt.Errorf("dependency fingerprint: %w", err))
 		}
-		depFingerprint, err = m.dependencyFingerprint(arch, platform, spec, planResult.Deps, depSnap)
+		depFingerprint, err = m.dependencyFingerprint(arch, platform, spec, planResult.Deps, depSnap, runtimeSelection)
 		if err != nil {
 			return nil, fmt.Errorf("app %q: dependency fingerprint: %w", fn.Name, err)
 		}
 		depRef = depImageRef(depFingerprint)
 	}
+
+	// buildSpec is the runtime spec the IMAGE builds use. A pinned runtime builds
+	// FROM configured-ref@digest — the multi-platform index digest exactly as
+	// selected, with no registry/child-digest lookup — while the dependency
+	// fingerprint above deliberately kept the configured tag as its input and
+	// hashed the immutable selection separately. The explicit target platform is
+	// carried by buildTargetPlatform on every build.
+	buildSpec := spec
+	if runtimeSelection.pinned() {
+		buildSpec.BaseImage = runtimeSelection.baseImage()
+	}
+	// planResult.BaseImage is the app image's FROM for a dependency-less build.
+	// With deps it is replaced by the dependency reference below; the rendered
+	// Dockerfile for HOT_RELOAD hashes whichever base is in effect here plus the
+	// dependency reference passed separately.
+	planResult.BaseImage = buildSpec.BaseImage
 
 	// The app image reference. For a baked-source image the tag embeds the
 	// source fingerprint, so every source version is a distinct image. A Python
@@ -526,12 +549,19 @@ func (m *Manager) prepare(
 	// warm handler could silently switch loops). Service-only apps and the
 	// disabled/default mode keep ImageRef(name, fp) unchanged.
 	//
+	// A PINNED runtime folds the immutable source-ref@digest identity into the
+	// image identity, so a pin change always produces a new tag for every baked
+	// mode (with or without deps, and zuvloop mode) and one app reference can
+	// never be retagged for two pins. HOT_RELOAD already hashes the rendered
+	// Dockerfile, whose FROM is ref@digest (or the pin-derived dependency
+	// reference), so it changes with the pin without an extra fold.
+	//
 	// Under HOT_RELOAD the live source is bind-mounted instead of baked, so the
 	// tag is derived from the non-source inputs (runtime, dependency, bootstrap,
 	// and the rendered mode-specific install) and a source-only change reuses
 	// the same image; the reconciler advances the warm/service generation from
 	// the source fingerprint instead (see Prepared.Fingerprint).
-	imageFingerprint := fp
+	imageFingerprint := imageIdentityWithSelection(fp, runtimeSelection, depRef)
 	switch {
 	case mountSource:
 		rendered, rerr := renderDockerfileWithSource(planResult, false)
@@ -544,7 +574,9 @@ func (m *Manager) prepare(
 		// serves event/schedule handlers has the zuvloop bootstrap and install.
 		// Mode-scoping here, rather than in the engine, keeps Prepared.Fingerprint
 		// the real source identity while making the two builds distinct images.
-		imageFingerprint = zuvloopImageFingerprint(fp)
+		// The pin fold is applied to the mode hash so a pinned zuvloop image also
+		// changes identity with the selected digest.
+		imageFingerprint = imageIdentityWithSelection(zuvloopImageFingerprint(fp), runtimeSelection, depRef)
 	}
 	image := ImageRef(fn.Name, imageFingerprint)
 
@@ -706,7 +738,7 @@ func (m *Manager) prepare(
 			return nil, fmt.Errorf("app %q: dependency %s: %w", fn.Name, depRef, err)
 		}
 		depRef, err = m.ensureDependencyImage(
-			ctx, fn, spec, planResult.Deps, depSnap, depFingerprint, depRef,
+			ctx, fn, buildSpec, planResult.Deps, depSnap, depFingerprint, depRef, runtimeSelection,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("app %q: %w", fn.Name, err)
@@ -752,6 +784,7 @@ func (m *Manager) prepare(
 	// inherited label, so inspection yields "" and the Prepared fingerprint is
 	// used.
 	appLabels := appImageLabels(fn.Name, fp, depRef, bootstrapLabelHash)
+	provenanceFor(spec, runtimeSelection).apply(appLabels)
 	if mountSource {
 		appLabels[labelFingerprint] = ""
 	}
@@ -957,12 +990,19 @@ func (m *Manager) clipConcurrency(n int) int {
 // dependencyFingerprint computes a dependency layer's content address from the
 // snapshot Prepare captured, using the injected seam when set (tests) and the
 // production dependencyFingerprintFrom otherwise. Prepare calls it exactly once
-// per dependency-bearing prepare.
-func (m *Manager) dependencyFingerprint(arch, platform string, spec plan.Spec, deps plan.Deps, snap dependencySnapshot) (string, error) {
+// per dependency-bearing prepare. selection is the one immutable runtime pin
+// captured for this preparation; the production path hashes it into the digest,
+// and the test seam's result is folded with the same identity so a pinned
+// dependency layer still gets a distinct content address.
+func (m *Manager) dependencyFingerprint(arch, platform string, spec plan.Spec, deps plan.Deps, snap dependencySnapshot, selection imageSelection) (string, error) {
 	if m.depFingerprint != nil {
-		return m.depFingerprint(arch, platform, spec, deps, snap)
+		fingerprint, err := m.depFingerprint(arch, platform, spec, deps, snap)
+		if err != nil {
+			return "", err
+		}
+		return foldDependencySelection(fingerprint, selection), nil
 	}
-	return dependencyFingerprintFrom(arch, platform, spec, deps, snap)
+	return dependencyFingerprintFrom(arch, platform, spec, deps, snap, selection)
 }
 
 // ensureDependencyImage builds the dependency image for the app's
@@ -988,9 +1028,14 @@ func (m *Manager) ensureDependencyImage(
 	snap dependencySnapshot,
 	depFingerprint string,
 	depRef string,
+	selections ...imageSelection,
 ) (string, error) {
 	if depRef == "" {
 		depRef = depImageRef(depFingerprint)
+	}
+	var provenance imageProvenance
+	if len(selections) > 0 {
+		provenance = provenanceFor(spec, selections[0])
 	}
 	// The inspect duration is logged at Debug on BOTH outcomes below, mirroring
 	// Prepare's app-image reuse probe, so the dependency probe's daemon
@@ -1036,7 +1081,7 @@ func (m *Manager) ensureDependencyImage(
 			// reconcile budget while still being cancelled at Relay shutdown.
 			return buildDependencyImage(
 				buildCtx, m.cli, spec, deps, snap, depRef, depFingerprint,
-				arch, m.metrics,
+				arch, m.metrics, provenance,
 			)
 		})
 		if buildErr != nil {

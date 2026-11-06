@@ -28,6 +28,20 @@
 //     not a Docker refusal, is authoritative. A Manager with no coordinator
 //     fails closed for dependency-image builds and GC; there is no manager-local
 //     fallback because a process-local lock cannot protect a shared Docker image.
+//   - Runtime image pins (startup only): WithRuntimeImageSelections gives the
+//     Manager an immutable snapshot read from the shared state database after it
+//     opens and before app preparation. A pinned runtime must name a known
+//     runtime, its exact configured Spec.BaseImage, and a
+//     "sha256:<64 lowercase hex>" multi-platform index digest; the Manager
+//     rejects a malformed/mismatched entry for a known runtime and ignores
+//     unknown runtime IDs. Prepare captures one selection per app and builds
+//     FROM configured-ref@digest (no registry/child-digest lookup), folding the
+//     immutable identity into dependency fingerprints, app image identities
+//     (baked with/without deps, HOT_RELOAD, and zuvloop modes), and provenance
+//     labels while Prepared.Fingerprint stays source-only. A missing row is
+//     UNPINNED and preserves the historical byte-for-byte behavior. Workers read
+//     pins at startup and do not refresh them while running (see state and
+//     docs/operations.md).
 //   - Source mount (HOT_RELOAD): when enabled, a runtime whose dependency
 //     layout permits it (Python and Node; see plan.Spec.MountableSource) builds
 //     the app image WITHOUT the source and bind-mounts the app's live directory
@@ -130,8 +144,10 @@
 //     download/verify/extract RUN for a remote archive) and the dependency
 //     image inherits the tool. The dependency images
 //     and their content-addressed
-//     `relay-dep-*` references live entirely here. The dependency fingerprint
-//     keys on the base image TAG, not its digest (a documented limitation).
+//     `relay-dep-*` references live entirely here. An UNPINNED dependency
+//     fingerprint keys on the base image TAG, not its digest (a documented
+//     limitation); a pinned runtime hashes the selected ref@digest identity and
+//     is not exposed to that tag-movement limitation.
 //   - The package knows nothing about matching or Redis
 //
 // Security baseline: every execution container is hardened. It runs as a

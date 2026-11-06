@@ -780,6 +780,23 @@ func (st *State) initSchema(ctx context.Context) error {
 		// look up unsettled rows by delivery_id only.
 		`CREATE INDEX IF NOT EXISTS dlq_unsettled
 			ON dlq (delivery_id, created_at_ms) WHERE settled_at_ms IS NULL`,
+		// runtime_image_selections is the startup-only runtime base-image pin
+		// table. runtime_id is the template runtime identifier; a missing row
+		// means UNPINNED and preserves the historical configured base-image tag
+		// behavior exactly. source_image is the exact configured base reference
+		// the pin was validated against, digest is a Docker multi-platform index
+		// digest ("sha256:" + lowercase hex; NOT a child manifest digest), and
+		// generation is the monotonic compare-and-swap generation. selected_at is
+		// the RFC3339 write time. There is deliberately no history table: a pin
+		// is replaced in place under compare-and-swap. Workers read selections at
+		// startup; a running worker does not refresh this table.
+		`CREATE TABLE IF NOT EXISTS runtime_image_selections (
+			runtime_id TEXT PRIMARY KEY,
+			source_image TEXT NOT NULL,
+			digest TEXT NOT NULL CHECK (digest ~ '^sha256:[0-9a-f]{64}$'),
+			generation BIGINT NOT NULL CHECK (generation > 0),
+			selected_at TEXT NOT NULL
+		)`,
 	}
 
 	for _, s := range stmts {

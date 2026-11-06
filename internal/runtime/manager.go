@@ -244,6 +244,13 @@ type Manager struct {
 	// handlers. It never affects Node, managed services, or dependency-image
 	// identity. False (the default) is the standard asyncio loop.
 	pythonZuvloop bool
+	// imageSelections is the immutable startup snapshot of validated runtime
+	// base-image pins, keyed by template runtime identifier. It is resolved once
+	// at construction (WithRuntimeImageSelections; the worker wires the state
+	// database's rows) and read without a lock. A running Manager does not refresh
+	// selections; a missing key means unpinned. See
+	// image_selection.go.
+	imageSelections map[string]imageSelection
 	// mounts records, per app, the live source mount published by a successful
 	// Prepare (see setSourceMount). It is read at execution-container create and
 	// by ResolveServiceImage, and cleared on removal or when an app stops being
@@ -409,6 +416,10 @@ type managerOptions struct {
 	// pythonZuvloop is the worker-global PYTHON_ZUVLOOP switch
 	// (WithPythonZuvloop). False preserves the standard asyncio loop.
 	pythonZuvloop bool
+	// imageSelections is the startup runtime base-image pin snapshot
+	// (WithRuntimeImageSelections). Nil/empty preserves the historical
+	// configured-tag behavior for every runtime.
+	imageSelections []RuntimeImageSelection
 	// depCoord is the cross-process dependency-image coordination authority
 	// (WithDependencyImageCoordinator). Nil means no coordination: a preparation
 	// that must build from a dependency image and dependency GC fail closed.
@@ -571,6 +582,15 @@ func NewManager(
 ) (*Manager, error) {
 	resolved := resolveManagerOptions(opts)
 
+	// Validate the startup image-selection snapshot before touching Docker: a
+	// malformed selection for a runtime this binary knows must fail startup, not
+	// silently build from an unpinned tag. Unknown runtime IDs are ignored (see
+	// WithRuntimeImageSelections) and logged once the manager exists.
+	imageSelections, unknownSelections, err := resolveImageSelections(resolved.imageSelections)
+	if err != nil {
+		return nil, fmt.Errorf("runtime image selection: %w", err)
+	}
+
 	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return nil, fmt.Errorf("cannot connect to Docker daemon: %w", err)
@@ -611,8 +631,16 @@ func NewManager(
 		now:                      resolved.now,
 		sourceMount:              resolved.sourceMount,
 		pythonZuvloop:            resolved.pythonZuvloop,
+		imageSelections:          imageSelections,
 		pullChecks:               map[string]time.Time{},
 		depCoord:                 resolved.depCoord,
+	}
+	// An unknown runtime ID can only be a pin written by another Relay version
+	// sharing this database. No app in this process can select it, so it is safe
+	// to ignore rather than failing startup.
+	for _, runtimeID := range unknownSelections {
+		mgr.Logger().Debug("Runtime: ignoring image selection for an unknown runtime",
+			"runtime", runtimeID)
 	}
 	// Construct the build limiter now with the resolved capacity, so the lazy
 	// fallback in buildLimiterFor is never needed for a NewManager-built

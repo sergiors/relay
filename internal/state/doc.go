@@ -155,6 +155,32 @@
 // stored only as the bounded diagnostic summary produced by the stream layer,
 // never as its raw payload.
 //
+// Runtime image selection state:
+//
+// runtime_image_selections(runtime_id TEXT PRIMARY KEY, source_image TEXT NOT
+// NULL, digest TEXT NOT NULL, generation BIGINT NOT NULL, selected_at TEXT NOT
+// NULL) is a small startup-only table of runtime base-image pins, keyed by the
+// template runtime identifier. source_image stores the EXACT configured base
+// reference (e.g. "python:3.14-slim"), and digest stores a Docker
+// multi-platform index digest in the form "sha256:<64 lowercase hex>" — never a
+// child manifest digest. generation is monotonically increasing and selected_at
+// is the RFC3339 selection timestamp. There is no history table: a pin is
+// replaced in place. A MISSING ROW MEANS UNPINNED, which preserves the exact
+// historical base-image tag behavior for every existing deployment.
+//
+// ReadRuntimeImageSelections is the worker's startup read; the runtime snapshot
+// it feeds is immutable for the process lifetime and there is no polling or live
+// refresh. CompareAndSwapRuntimeImageSelection is the narrow write API: it
+// inserts at expected generation 0 (absent/unpinned) or updates only when the
+// stored generation still matches the expected positive generation, advancing it
+// by one. A lost race is reported as ErrRuntimeImageSelectionConflict, distinct
+// from a PostgreSQL error. This package does not import the runtime package and
+// does not validate runtime/source-image binding; the runtime layer does.
+//
+// Workers read selections once at startup. The current CLI has no selection
+// writer, and a running worker does not refresh changed rows; a stored change
+// takes effect after the worker restarts. Runtimes without a row remain unpinned.
+//
 // Secret values are never stored: only the reference names appear in the
 // snapshot. Literal env values are never stored either: env entries keep the
 // env-var name only, with a fixed redaction marker as the value.

@@ -191,6 +191,7 @@ func dependencyFingerprintFrom(
 	spec plan.Spec,
 	deps plan.Deps,
 	snap dependencySnapshot,
+	selections ...imageSelection,
 ) (string, error) {
 	h := sha256.New()
 
@@ -227,6 +228,16 @@ func dependencyFingerprintFrom(
 		if err := hashManifestBytes(h, snap.root, f.name); err != nil {
 			return "", err
 		}
+	}
+
+	// A pinned runtime base is part of the installed layer's identity: the same
+	// manifests installed on a different immutable base image are a different
+	// layer. Unpinned callers pass no selection and hash exactly the historical
+	// inputs above, byte-for-byte.
+	if len(selections) > 0 && selections[0].pinned() {
+		hashField(h, "relay-dependency-image-selection")
+		hashField(h, selections[0].sourceImage)
+		hashField(h, selections[0].digest)
 	}
 
 	return hex.EncodeToString(h.Sum(nil)), nil
@@ -308,12 +319,15 @@ func hashFieldBytes(h io.Writer, value []byte) {
 
 // Known limitation: DependencyFingerprint keys on the base image TAG
 // (spec.BaseImage, e.g. "python:3.14-slim") rather than its immutable digest.
-// If the daemon later pulls a newer image for that tag, an existing relay-dep-*
-// image built from the older base is still reused (same tag -> same fingerprint
-// -> same cached layer). This matches the pre-existing exposure of the
-// app-image reuse path (app fingerprints never included the base image
-// either). Operators wanting a refresh must force it (e.g. remove the
-// relay-dep-* images); a future digest-pinning feature is the proper fix.
+// Without a runtime image selection, if the daemon later pulls a newer image
+// for that tag, an existing relay-dep-* image built from the older base is still
+// reused (same tag -> same fingerprint -> same cached layer). This matches the
+// pre-existing exposure of the app-image reuse path (app fingerprints never
+// included the base image either). A pinned runtime avoids it: the Manager hashes
+// the selected source-ref@digest identity into the dependency fingerprint (see
+// dependencyFingerprintFrom's selections argument), so a pin change creates a
+// distinct dependency layer. Unpinned operators wanting a refresh must force it
+// (e.g. remove the relay-dep-* images).
 //
 // depImageRef maps a dependency fingerprint to the docker reference for that
 // exact dependency layer. Dependency images are content-addressed by

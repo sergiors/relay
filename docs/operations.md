@@ -48,6 +48,20 @@ When multiple Relay processes share a Docker daemon, they must use the same
 PostgreSQL database. It coordinates shared dependency-image use and cleanup;
 separate state databases on one daemon are unsupported.
 
+### Runtime image selection state
+
+PostgreSQL also holds the `runtime_image_selections` table. It is keyed by runtime
+ID and records a pinned configured source image reference, a multi-platform index
+digest (`sha256:<64 lowercase hex>`), a monotonically increasing generation, and
+the selection time. A missing row means the runtime is **unpinned** and keeps its
+historical configured base-image behavior exactly; existing deployments therefore
+do not rebuild images.
+
+Workers read this table once during startup, before app preparation, and use a
+pin only as `FROM <configured-ref>@<digest>`. The current CLI has no selection
+writer, and a running worker does not refresh changed rows; a stored change takes
+effect after restart. Runtimes without a row remain unpinned.
+
 ## Health and statistics
 
 `relay health` reports the running worker's readiness and live Redis, Docker,
