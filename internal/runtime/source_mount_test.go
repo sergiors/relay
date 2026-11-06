@@ -370,7 +370,7 @@ func TestPrepareSourceMountNodeUsesDistinctTarget(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755); err != nil {
 		t.Fatalf("mkdir node_modules: %v", err)
 	}
-	fn := app.App{Name: "node-mount", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "node-mount", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 
 	var tag, labelsJSON string
 	var contextTar []byte
@@ -438,9 +438,11 @@ func TestPrepareSourceMountNodeUsesDistinctTarget(t *testing.T) {
 // input slice is never mutated.
 func TestServiceEntryForSourceMountRewritesNodePath(t *testing.T) {
 	nodeEntry := []string{"node", "/app/app/service.js"}
-	got := serviceEntryForSourceMount(nodeEntry, "/app/src", "node24")
-	if len(got) != 4 || got[0] != "node" || got[1] != "--import" || got[2] != node.ResolveHookPath || got[3] != "/app/src/app/service.js" {
-		t.Fatalf("node entry = %v, want [node --import %s /app/src/app/service.js]", got, node.ResolveHookPath)
+	for _, runtimeName := range []string{"nodejs24.x", "nodejs24.x", "nodejs26.x"} {
+		got := serviceEntryForSourceMount(nodeEntry, "/app/src", runtimeName)
+		if len(got) != 4 || got[0] != "node" || got[1] != "--import" || got[2] != node.ResolveHookPath || got[3] != "/app/src/app/service.js" {
+			t.Fatalf("%s entry = %v, want [node --import %s /app/src/app/service.js]", runtimeName, got, node.ResolveHookPath)
+		}
 	}
 	if nodeEntry[1] != "/app/app/service.js" {
 		t.Fatal("the input entry must not be mutated")
@@ -448,10 +450,10 @@ func TestServiceEntryForSourceMountRewritesNodePath(t *testing.T) {
 	if got := serviceEntryForSourceMount([]string{"python", "-m", "app.main"}, "/app/src", "python3.14"); len(got) != 3 || got[2] != "app.main" {
 		t.Fatalf("python entry = %v, want it unchanged", got)
 	}
-	if got := serviceEntryForSourceMount(nodeEntry, "/app", "node24"); len(got) != 2 || got[1] != "/app/app/service.js" {
+	if got := serviceEntryForSourceMount(nodeEntry, "/app", "nodejs24.x"); len(got) != 2 || got[1] != "/app/app/service.js" {
 		t.Fatalf("a workdir target must be a no-op (no hook preload), got %v", got)
 	}
-	if got := serviceEntryForSourceMount(nil, "/app/src", "node24"); got != nil {
+	if got := serviceEntryForSourceMount(nil, "/app/src", "nodejs24.x"); got != nil {
 		t.Fatalf("nil entry = %v, want nil", got)
 	}
 }
@@ -464,7 +466,7 @@ func TestResolveServiceImageNodeRemapsEntryAtMountTarget(t *testing.T) {
 	m := &Manager{log: testutil.DiscardLogger()}
 	m.setSourceMount("fn", SourceMount{HostPath: "/apps/fn", Target: "/app/src", WorkDir: "/app/src", Masks: []string{"/app/src/node_modules"}, Identity: "fp1"})
 
-	tmpl := &app.Template{Runtime: "node24"}
+	tmpl := &app.Template{Runtime: "nodejs24.x"}
 	svc := app.Service{Name: "svc", Entrypoint: "app/service.js", Port: 3000}
 	img, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, "relay-app-fn:tag")
 	if err != nil {
@@ -488,7 +490,7 @@ func TestResolveServiceImageNodeRemapsEntryAtMountTarget(t *testing.T) {
 func TestResolveServiceImageNodeWithoutMountHasNoHook(t *testing.T) {
 	m := &Manager{log: testutil.DiscardLogger()}
 
-	tmpl := &app.Template{Runtime: "node24"}
+	tmpl := &app.Template{Runtime: "nodejs24.x"}
 	svc := app.Service{Name: "svc", Entrypoint: "app/service.js", Port: 3000}
 	img, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, "relay-app-fn:tag")
 	if err != nil {

@@ -20,7 +20,7 @@ func TestPrepareReuseTransfersImageLease(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
-	fn := app.App{Name: "reuse-lease", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "reuse-lease", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 
 	// The image exists (200 on inspect) and the bootstrap label matches, so
 	// Prepare takes the reuse path without a build.
@@ -61,7 +61,7 @@ func TestPrepareRetiringImageRejected(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
-	fn := app.App{Name: "retiring-lease", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "retiring-lease", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	fp, err := app.FingerprintApp(dir, fn.Template)
 	if err != nil {
 		t.Fatalf("fingerprint: %v", err)

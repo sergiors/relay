@@ -58,7 +58,7 @@ func TestReloadRejectsSymlinkedTemplateRetainsLoaded(t *testing.T) {
 
 	targetDir := t.TempDir()
 	target := filepath.Join(targetDir, "template.yaml")
-	if err := os.WriteFile(target, []byte("runtime: node24\nevents:\n  - handler: index.other\n    pattern: {event_name: [OTHER]}\n"), 0o644); err != nil {
+	if err := os.WriteFile(target, []byte("runtime: nodejs24.x\nevents:\n  - handler: index.other\n    pattern: {event_name: [OTHER]}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	template := filepath.Join(dir, "template.yaml")
@@ -317,7 +317,7 @@ func TestPeriodicReconcileKeepsAppWhenTemplateIsSymlinked(t *testing.T) {
 
 	targetDir := t.TempDir()
 	target := filepath.Join(targetDir, "template.yaml")
-	if err := os.WriteFile(target, []byte("runtime: node24\nevents:\n  - handler: index.other\n    pattern: {event_name: [OTHER]}\n"), 0o644); err != nil {
+	if err := os.WriteFile(target, []byte("runtime: nodejs24.x\nevents:\n  - handler: index.other\n    pattern: {event_name: [OTHER]}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Remove(filepath.Join(guardedDir, "template.yaml")); err != nil {

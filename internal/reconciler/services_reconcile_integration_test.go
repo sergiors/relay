@@ -137,9 +137,9 @@ func TestServicesReconcileIntegration(t *testing.T) {
 	assertServiceCounts(t, m, name, 0)
 }
 
-// serviceReconcileTemplate renders a node24 template declaring one service.
+// serviceReconcileTemplate renders a nodejs24.x template declaring one service.
 func serviceReconcileTemplate(port, replicas int) string {
-	return "runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\nservices:\n  - name: app-service\n    entrypoint: app/service.js\n    port: 3000\n    replicas: " + strconv.Itoa(replicas) + "\n"
+	return "runtime: nodejs24.x\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\nservices:\n  - name: app-service\n    entrypoint: app/service.js\n    port: 3000\n    replicas: " + strconv.Itoa(replicas) + "\n"
 }
 
 // TestServicesReconcileEnvChangeReplacesContainer proves against a real daemon
@@ -169,7 +169,7 @@ func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	writeTemplate := func(version string) {
-		tmpl := "runtime: node24\nenv:\n  APP_VERSION: " + version + "\nservices:\n  - name: app-service\n    entrypoint: app/service.js\n    port: 3000\n    replicas: 1\n"
+		tmpl := "runtime: nodejs24.x\nenv:\n  APP_VERSION: " + version + "\nservices:\n  - name: app-service\n    entrypoint: app/service.js\n    port: 3000\n    replicas: 1\n"
 		if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(tmpl), 0o644); err != nil {
 			t.Fatalf("write template: %v", err)
 		}

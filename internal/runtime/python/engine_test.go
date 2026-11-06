@@ -18,8 +18,7 @@ const testUvTag = "ghcr.io/astral-sh/uv:0.12.17"
 
 // Two runtime versions served by the same Python engine. The engine must
 // produce identical build logic for both, differing only in the base image
-// (and runtime tools) taken from the spec. The second spec is test-only and is
-// never registered in the runtime registry.
+// (and runtime tools) taken from the spec.
 var testSpecs = []plan.Spec{
 	{
 		Name:      "python3.14",

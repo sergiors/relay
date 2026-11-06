@@ -27,7 +27,7 @@ func TestPrepareWithFingerprintRuntimeUsesSnapshotIdentity(t *testing.T) {
 		t.Fatalf("write source: %v", err)
 	}
 	const supplied = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	fn := app.App{Name: "supplied-fp", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "supplied-fp", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 
 	snapshot, err := app.CaptureSourceSnapshot(mustSelect(t, dir))
 	if err != nil {

@@ -67,7 +67,7 @@ func parsedFn(t *testing.T, name, tmplYAML string, exec Executor) *PreparedApp {
 	return NewPrepared(app.App{Name: name, Template: tmpl}, &runtime.Prepared{Name: name, Image: "x"}, exec)
 }
 
-const indexedTmplA = `runtime: node24
+const indexedTmplA = `runtime: nodejs24.x
 events:
   - handler: handler.eq
     pattern:
@@ -85,7 +85,7 @@ events:
       table_name: [enrollments]
 `
 
-const indexedTmplB = `runtime: node24
+const indexedTmplB = `runtime: nodejs24.x
 events:
   - handler: handler.numeric
     pattern:
@@ -223,7 +223,7 @@ func TestRegistryIndexNilTemplateFallback(t *testing.T) {
 func TestHandleIndexedExecutionOrder(t *testing.T) {
 	exec := &recordingExecutor{}
 	r := New([]*PreparedApp{
-		parsedFn(t, "beta", `runtime: node24
+		parsedFn(t, "beta", `runtime: nodejs24.x
 events:
   - handler: beta.first
     pattern:

@@ -137,7 +137,7 @@ func TestIntegrationDeferredRetirementReDrivenAfterServiceContainerStops(t *test
 		_, _ = cli.ImageRemove(c, newImage, client.ImageRemoveOptions{Force: true})
 	})
 
-	fn := app.App{Name: appName, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: appName, Template: &app.Template{Runtime: "nodejs24.x"}}
 	pf := NewPrepared(fn, &runtime.Prepared{Name: appName, Image: newImage}, mgr)
 	r := NewWithMetrics([]*PreparedApp{pf}, testutil.DiscardLogger(), nil)
 	// Short bounded retries: the chain exhausts quickly, so the deferral is

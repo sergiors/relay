@@ -179,7 +179,7 @@ func TestStartupParseGateReparsesChangedInvalidIdentity(t *testing.T) {
 
 	// A valid correction at the next startup parses and clears the identity.
 	if err := os.WriteFile(filepath.Join(dir, app.TemplateFile), []byte(
-		"runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"), 0o644); err != nil {
+		"runtime: nodejs24.x\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"), 0o644); err != nil {
 		t.Fatalf("write valid template: %v", err)
 	}
 	gate = newStartupGate(context.Background(), st, logger)
@@ -330,8 +330,8 @@ func assertCorrectedStartupRow(t *testing.T, detail state.Detail) {
 	if detail.Name != "shared" {
 		t.Fatalf("corrected name = %q, want shared", detail.Name)
 	}
-	if detail.Runtime != "node24" {
-		t.Fatalf("corrected runtime = %q, want node24", detail.Runtime)
+	if detail.Runtime != "nodejs24.x" {
+		t.Fatalf("corrected runtime = %q, want nodejs24.x", detail.Runtime)
 	}
 	if detail.Status != state.StatusPreparing {
 		t.Fatalf("corrected status = %q, want preparing", detail.Status)

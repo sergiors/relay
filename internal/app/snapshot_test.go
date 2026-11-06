@@ -42,7 +42,7 @@ func TestSnapshotFingerprintMatchesFingerprintSelection(t *testing.T) {
 // the runtime derive the tag and stage the context from one read.
 func TestSnapshotIsImmutableAcrossMutation(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: node24\n")
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\n")
 	writeFile(t, filepath.Join(dir, "index.js"), "export function h(){ return 1; }\n")
 
 	snapshot, err := CaptureSourceSnapshot(mustSnapshotSelection(t, dir))
@@ -72,7 +72,7 @@ func TestSnapshotEntriesCarryStageRelAndContent(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "fn")
 	writeFile(t, filepath.Join(root, ".gitignore"), "*.generated\n")
-	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: node24\n")
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\n")
 	writeFile(t, filepath.Join(dir, "sub", "helper.js"), "export const x = 1\n")
 
 	selection, err := source.New(root, dir)
@@ -147,14 +147,14 @@ func TestSnapshotDiscardReleasesBytes(t *testing.T) {
 func TestSnapshotTemplateResourcesStripped(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "index.js"), "export function run(e){}\n")
-	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: node24\nresources:\n  memory: 128MiB\nevents:\n  - handler: index.run\n    pattern:\n      event_name: [INSERT]\n")
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\nresources:\n  memory: 128MiB\nevents:\n  - handler: index.run\n    pattern:\n      event_name: [INSERT]\n")
 
 	base := snapshotDigest(t, dir)
-	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: node24\nresources:\n  memory: 512MiB\nevents:\n  - handler: index.run\n    pattern:\n      event_name: [INSERT]\n")
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\nresources:\n  memory: 512MiB\nevents:\n  - handler: index.run\n    pattern:\n      event_name: [INSERT]\n")
 	if got := snapshotDigest(t, dir); got != base {
 		t.Fatalf("resource-only edit changed the snapshot digest: %q != %q", got, base)
 	}
-	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: node24\nresources:\n  memory: 512MiB\nevents:\n  - handler: index.run\n    pattern:\n      event_name: [MODIFY]\n")
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\nresources:\n  memory: 512MiB\nevents:\n  - handler: index.run\n    pattern:\n      event_name: [MODIFY]\n")
 	if got := snapshotDigest(t, dir); got == base {
 		t.Fatal("a non-resource template edit must change the snapshot digest")
 	}
@@ -200,7 +200,7 @@ func TestSnapshotDiscardRemovesRoot(t *testing.T) {
 func TestSnapshotStagesDiskBackedContentAndFingerprintMatchesSelection(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, ".gitignore"), "*.log\n")
-	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: node24\n")
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\n")
 	writeFile(t, filepath.Join(dir, "index.js"), "export function h(){}\n")
 	writeFile(t, filepath.Join(dir, "debug.log"), "noise\n")
 

@@ -219,7 +219,7 @@ func TestReplayDLQUnknownApp(t *testing.T) {
 func TestReplayDLQUnavailableApp(t *testing.T) {
 	r := New([]*PreparedApp{NewUnavailable(app.App{
 		Name:     "broken",
-		Template: &app.Template{Runtime: "node24"},
+		Template: &app.Template{Runtime: "nodejs24.x"},
 	})}, testutil.DiscardLogger())
 
 	err := r.ReplayDLQ(context.Background(), "broken", "index.run", []byte(`{}`), "")

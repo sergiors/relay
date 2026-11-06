@@ -23,7 +23,7 @@ func schedTmplFn(t *testing.T, exec Executor, schedules ...app.Schedule) *Prepar
 		app.App{
 			Name: "fn",
 			Template: &app.Template{
-				Runtime:   "node24",
+				Runtime:   "nodejs24.x",
 				Schedules: schedules,
 			},
 		},

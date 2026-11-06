@@ -9,7 +9,7 @@ import (
 // template (one event rule) so parsing exercises resources resolution alongside
 // an otherwise-valid document.
 func baseResourceTemplate(resources string) string {
-	body := "runtime: node24\n"
+	body := "runtime: nodejs24.x\n"
 	if resources != "" {
 		body += "resources:\n" + resources
 	}

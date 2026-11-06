@@ -27,7 +27,7 @@ func TestAppBuildObserverFiresOnlyOnActualBuild(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
 			t.Fatalf("write source: %v", err)
 		}
-		fn := app.App{Name: "build-fires", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+		fn := app.App{Name: "build-fires", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 
 		cli := newScriptedDockerClient(t,
 			dockerRoute{method: http.MethodGet, path: "/images/", status: http.StatusNotFound, body: `{"message":"no such image"}`},
@@ -77,7 +77,7 @@ func TestAppBuildObserverFiresOnlyOnActualBuild(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
 			t.Fatalf("write source: %v", err)
 		}
-		fn := app.App{Name: "nil-observer", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+		fn := app.App{Name: "nil-observer", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 
 		cli := newScriptedDockerClient(t,
 			dockerRoute{method: http.MethodGet, path: "/images/", status: http.StatusNotFound, body: `{"message":"no such image"}`},

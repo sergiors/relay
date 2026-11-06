@@ -145,7 +145,7 @@ func TestEnqueueStartupServicesRootedInLifecycle(t *testing.T) {
 	coordinator.Start(lifecycle)
 
 	tmpl := &app.Template{
-		Runtime:  "node24",
+		Runtime:  "nodejs24.x",
 		Services: []app.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	prepared := []*runner.PreparedApp{
@@ -186,7 +186,7 @@ func TestEnqueueStartupServicesBoundedPerApp(t *testing.T) {
 	defer stop()
 
 	tmpl := &app.Template{
-		Runtime: "node24",
+		Runtime: "nodejs24.x",
 		Services: []app.Service{
 			{Entrypoint: "service.js", Port: 80, Replicas: 1},
 		},

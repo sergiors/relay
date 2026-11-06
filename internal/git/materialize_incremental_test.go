@@ -165,7 +165,7 @@ func TestMaterializeDetectsResourceOnlyChangeWithoutFingerprintChange(t *testing
 	requireAtomicExchange(t)
 
 	src := t.TempDir()
-	const resourceTemplate = `runtime: node24
+	const resourceTemplate = `runtime: nodejs24.x
 resources:
   memory: 128MiB
 events:
@@ -231,7 +231,7 @@ func TestSameStagedTreeMatchesMaterializedRepresentation(t *testing.T) {
 			live:   filepath.Join(t.TempDir(), "live"),
 		}
 		for _, root := range []string{pair.staged, pair.live} {
-			writeFile(t, filepath.Join(root, "template.yaml"), "runtime: node24\n")
+			writeFile(t, filepath.Join(root, "template.yaml"), "runtime: nodejs24.x\n")
 			writeFile(t, filepath.Join(root, "nested", "keep.txt"), "same bytes\n")
 			if err := os.MkdirAll(filepath.Join(root, "empty"), 0o755); err != nil {
 				t.Fatalf("mkdir empty: %v", err)

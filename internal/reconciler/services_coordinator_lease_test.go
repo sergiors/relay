@@ -34,7 +34,7 @@ func TestServiceCoordinatorLeasedRequestHoldsLeaseThroughRun(t *testing.T) {
 	}
 
 	tmpl := &app.Template{
-		Runtime:  "node24",
+		Runtime:  "nodejs24.x",
 		Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	coordinator.EnqueueLeased("alpha", tmpl, "relay-app-a:v1", nil, lease)
@@ -71,7 +71,7 @@ func TestServiceCoordinatorCoalescedRequestReleasesLease(t *testing.T) {
 	coordinator.Start(lifecycle)
 
 	tmpl := &app.Template{
-		Runtime:  "node24",
+		Runtime:  "nodejs24.x",
 		Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 
@@ -122,7 +122,7 @@ func TestServiceCoordinatorCancellationReleasesPendingLease(t *testing.T) {
 	coordinator.Start(lifecycle)
 
 	tmpl := &app.Template{
-		Runtime:  "node24",
+		Runtime:  "nodejs24.x",
 		Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 

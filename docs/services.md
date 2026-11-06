@@ -15,7 +15,7 @@ Every service declares a **mandatory `name`** — its stable identity within the
 app — and **exactly one source**:
 
 ```yaml
-runtime: node24
+runtime: nodejs24.x
 
 services:
   - name: web # stable identity: keys containers, routing, state

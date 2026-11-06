@@ -95,7 +95,7 @@ func TestPrepareTagAndStagedBytesShareOneSnapshot(t *testing.T) {
 		}
 	}
 
-	fn := app.App{Name: "snapshot-coherent", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "snapshot-coherent", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	got, err := m.Prepare(context.Background(), fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -146,7 +146,7 @@ func TestPrepareSnapshotFailureRejectsBuild(t *testing.T) {
 	)
 	m := newLifecycleManager(t, cli, context.Background())
 
-	fn := app.App{Name: "unreadable", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "unreadable", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	if _, err := m.Prepare(context.Background(), fn); err == nil {
 		t.Fatal("Prepare must fail when a selected file cannot be captured")
 	}
@@ -204,7 +204,7 @@ func TestPrepareMutationDuringBlockedBuildKeepsCapturedIdentity(t *testing.T) {
 	)
 	m := newLifecycleManager(t, cli, context.Background())
 
-	fn := app.App{Name: "blocked-build", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "blocked-build", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	type result struct {
 		prepared *Prepared
 		err      error
@@ -288,7 +288,7 @@ func TestPrepareReleasesSnapshotOnSuccessAndFailure(t *testing.T) {
 				capturedRoot = s.Root()
 			}
 
-			fn := app.App{Name: "release-" + tc.name, Dir: dir, Template: &app.Template{Runtime: "node24"}}
+			fn := app.App{Name: "release-" + tc.name, Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 			_, err := m.Prepare(context.Background(), fn)
 			if tc.wantErr && err == nil {
 				t.Fatal("expected the scripted build failure to surface")
@@ -349,7 +349,7 @@ func TestPrepareReleasesSnapshotOnCancellation(t *testing.T) {
 		capturedRoot = s.Root()
 	}
 
-	fn := app.App{Name: "release-cancel", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "release-cancel", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	done := make(chan error, 1)
 	go func() {
 		_, err := m.Prepare(context.Background(), fn)

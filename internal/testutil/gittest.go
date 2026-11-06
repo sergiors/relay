@@ -38,7 +38,7 @@ func init() {
 
 // DefaultTemplate is the minimal app template committed at fn/template.yaml
 // when Options.Template is empty.
-const DefaultTemplate = "runtime: node24\n"
+const DefaultTemplate = "runtime: nodejs24.x\n"
 
 // Repo is a local git fixture: a non-bare work repo with one commit on branch
 // main plus a bare remote seeded from it. Only the paths are exposed; the tests

@@ -50,7 +50,7 @@ func TestIntegrationFingerprintedImageLifecycle(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.hi
     pattern:
@@ -58,7 +58,7 @@ events:
 `)
 	writeFile(t, dir, "index.js", "export function hi(e){ console.log('v1'); }\n")
 
-	fn := app.App{Name: "fn-ver", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "fn-ver", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	fp1, err := app.Fingerprint(dir)
 	if err != nil {
 		t.Fatalf("fingerprint v1: %v", err)

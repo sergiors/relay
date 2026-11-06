@@ -171,13 +171,13 @@ func TestIntegrationRebuildLeavesNoIntermediateContainers(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.hi
     pattern:
       event_name: [INSERT]
 `)
-	fn := app.App{Name: "rebuild-int", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "rebuild-int", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 
 	// Track the relay-app-* images this test creates so t.Cleanup can remove them
 	// (intermediates are expected to be gone by the fix; if the test fails they
@@ -281,7 +281,7 @@ func TestIntegrationFailedBuildKeepsIntermediatesAndPropagatesError(t *testing.T
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.hi
     pattern:
@@ -299,7 +299,7 @@ events:
 	// Per-invocation unique app identity: cleanup below removes only this run's
 	// relay-app-<appName>:* tags, never another invocation's image namespace.
 	appName := testutil.UniqueName(t, "failed-build-int")
-	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 
 	// The RETAINED intermediate IDs the failed build leaves behind (started by
 	// `Running in` and not later retired by `Removed intermediate container`),

@@ -12,7 +12,7 @@ import (
 // oneHandlerNodeTmpl is a config that differs from twoHandlerTmpl in runtime,
 // handler count, and handler name, so a lost read-modify-write is visible on any
 // of those fields.
-const oneHandlerNodeTmpl = `runtime: node24
+const oneHandlerNodeTmpl = `runtime: nodejs24.x
 events:
   - handler: jobs.run.handler
     pattern:
@@ -96,8 +96,8 @@ func TestConcurrentAppSnapshotWritesPreserveFields(t *testing.T) {
 		if detail.DesiredFingerprint != "fp-B" {
 			t.Fatalf("round %d: desired fingerprint = %q, want fp-B (stale snapshot clobbered it)", r, detail.DesiredFingerprint)
 		}
-		if detail.Runtime != "node24" {
-			t.Fatalf("round %d: runtime = %q, want node24 (stale config clobbered it)", r, detail.Runtime)
+		if detail.Runtime != "nodejs24.x" {
+			t.Fatalf("round %d: runtime = %q, want nodejs24.x (stale config clobbered it)", r, detail.Runtime)
 		}
 		if len(detail.Handlers) != 1 || detail.Handlers[0].Name != "jobs.run.handler" {
 			t.Fatalf("round %d: handlers = %+v, want the desired config's single handler", r, detail.Handlers)

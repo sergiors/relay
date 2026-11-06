@@ -75,7 +75,7 @@ func writeNodeFn(t *testing.T, root, name, output string) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir %s: %v", dir, err)
 	}
-	tmpl := "runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"
+	tmpl := "runtime: nodejs24.x\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(tmpl), 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
 	}
@@ -247,5 +247,5 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 }
 
 func templateWithInsert() string {
-	return "runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"
+	return "runtime: nodejs24.x\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"
 }

@@ -1,6 +1,8 @@
 package runtime
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -22,105 +24,188 @@ func TestLookupResolvesRuntimeSpecAndRejectsUnknown(t *testing.T) {
 		t.Errorf("python3.14 base image = %q, want python:3.14-slim", spec.BaseImage)
 	}
 
-	spec, err = lookup("node24")
+	spec, err = lookup("nodejs24.x")
 	if err != nil {
-		t.Fatalf("lookup node24: %v", err)
+		t.Fatalf("lookup nodejs24.x: %v", err)
 	}
 	if spec.Engine != plan.EngineNode {
-		t.Errorf("node24 engine = %q, want %q", spec.Engine, plan.EngineNode)
+		t.Errorf("nodejs24.x engine = %q, want %q", spec.Engine, plan.EngineNode)
 	}
 	if spec.BaseImage != "node:24-alpine" {
-		t.Errorf("node24 base image = %q, want node:24-alpine", spec.BaseImage)
+		t.Errorf("nodejs24.x base image = %q, want node:24-alpine", spec.BaseImage)
 	}
 
-	if _, err := lookup("ruby5"); err == nil {
-		t.Error("lookup(ruby5) succeeded, want error")
-	} else if !strings.Contains(err.Error(), "unsupported runtime") {
-		t.Errorf(`lookup(ruby5) error = %q, want "unsupported runtime"`, err)
+	// node24 is the removed identifier: it must be rejected, never aliased.
+	for _, name := range []string{"ruby5", "node24"} {
+		if _, err := lookup(name); err == nil {
+			t.Errorf("lookup(%s) succeeded, want error", name)
+		} else if !strings.Contains(err.Error(), "unsupported runtime") {
+			t.Errorf(`lookup(%s) error = %q, want "unsupported runtime"`, name, err)
+		}
 	}
 }
 
-// TestPythonSpecPinsUvTool verifies the Python runtime declares the pinned uv
+// TestLookupResolvesAllManagedRuntimes pins the complete supported-runtime set
+// and its official base images. The map key must equal Spec.Name: it is the
+// identity hashed into dependency fingerprints and stamped on images, so a
+// mismatch would silently merge or split image identities.
+func TestLookupResolvesAllManagedRuntimes(t *testing.T) {
+	cases := []struct {
+		name      string
+		engine    plan.Engine
+		baseImage string
+	}{
+		{"python3.14", plan.EnginePython, "python:3.14-slim"},
+		{"python3.15", plan.EnginePython, "python:3.15-slim"},
+		{"nodejs24.x", plan.EngineNode, "node:24-alpine"},
+		{"nodejs26.x", plan.EngineNode, "node:26-alpine"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec, err := lookup(tc.name)
+			if err != nil {
+				t.Fatalf("lookup %s: %v", tc.name, err)
+			}
+			if spec.Name != tc.name {
+				t.Errorf("spec name = %q, want the registry key %q", spec.Name, tc.name)
+			}
+			if spec.Engine != tc.engine {
+				t.Errorf("engine = %q, want %q", spec.Engine, tc.engine)
+			}
+			if spec.BaseImage != tc.baseImage {
+				t.Errorf("base image = %q, want %q", spec.BaseImage, tc.baseImage)
+			}
+			if !spec.MountableSource {
+				t.Error("managed runtimes must support HOT_RELOAD source mounting")
+			}
+		})
+	}
+}
+
+// TestManagedRuntimeDependencyIdentitiesAreDistinct verifies that every
+// registry identifier has its own dependency fingerprint. Distinct fingerprints
+// map to distinct dependency image tags, so a template runtime change can never
+// reuse another runtime's installed layer.
+func TestManagedRuntimeDependencyIdentitiesAreDistinct(t *testing.T) {
+	dir := t.TempDir()
+	const manifest = "manifest.txt"
+	if err := os.WriteFile(filepath.Join(dir, manifest), []byte("same\n"), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	// Identical manifest bytes and install command isolate the runtime identity
+	// inputs (name, base image, and pinned tool) in the fingerprint.
+	deps := plan.Deps{Files: []string{manifest}, Install: "install", Dir: "/app"}
+
+	names := []string{
+		"python3.14", "python3.15",
+		"nodejs24.x", "nodejs26.x",
+	}
+	seen := make(map[string]string, len(names))
+	for _, name := range names {
+		spec, err := lookup(name)
+		if err != nil {
+			t.Fatalf("lookup %s: %v", name, err)
+		}
+		fp, err := DependencyFingerprint("arm64", "linux", spec, dir, deps)
+		if err != nil {
+			t.Fatalf("%s dependency fingerprint: %v", name, err)
+		}
+		if prev, ok := seen[fp]; ok {
+			t.Errorf("%s and %s share dependency fingerprint %s", prev, name, fp)
+		}
+		seen[fp] = name
+	}
+}
+
+// TestPythonSpecPinsUvTool verifies every Python runtime declares the pinned uv
 // runtime tool (source ghcr.io/astral-sh/uv:<pinned>) so every Python image has
 // the uv binary. It also guards against a floating "latest" tag: the version
 // must be an explicit semver so builds are reproducible.
 func TestPythonSpecPinsUvTool(t *testing.T) {
-	spec, err := lookup("python3.14")
-	if err != nil {
-		t.Fatalf("lookup python3.14: %v", err)
-	}
-	if len(spec.RuntimeTools) != 1 {
-		t.Fatalf("python3.14 runtime tools = %+v, want exactly the uv tool", spec.RuntimeTools)
-	}
-	tool := spec.RuntimeTools[0]
-	if tool.From != UvImageTag {
-		t.Errorf("uv tool source = %q, want %q", tool.From, UvImageTag)
-	}
-	if tool.Source != "/uv" || tool.Destination != "/usr/local/bin/uv" {
-		t.Errorf("uv tool = %+v, want /uv -> /usr/local/bin/uv", tool)
-	}
-	if !strings.HasPrefix(tool.From, "ghcr.io/astral-sh/uv:") {
-		t.Errorf("uv tool source = %q, want the official ghcr.io/astral-sh/uv source", tool.From)
-	}
-	version := strings.TrimPrefix(tool.From, "ghcr.io/astral-sh/uv:")
-	if version == "latest" || version == "" {
-		t.Errorf("uv tool version = %q, must be a pinned version, never latest", version)
-	}
-	if strings.Count(version, ".") != 2 {
-		t.Errorf("uv tool version = %q, want a full pinned major.minor.patch version", version)
+	for _, name := range []string{"python3.14", "python3.15"} {
+		t.Run(name, func(t *testing.T) {
+			spec, err := lookup(name)
+			if err != nil {
+				t.Fatalf("lookup %s: %v", name, err)
+			}
+			if len(spec.RuntimeTools) != 1 {
+				t.Fatalf("%s runtime tools = %+v, want exactly the uv tool", name, spec.RuntimeTools)
+			}
+			tool := spec.RuntimeTools[0]
+			if tool.From != UvImageTag {
+				t.Errorf("uv tool source = %q, want %q", tool.From, UvImageTag)
+			}
+			if tool.Source != "/uv" || tool.Destination != "/usr/local/bin/uv" {
+				t.Errorf("uv tool = %+v, want /uv -> /usr/local/bin/uv", tool)
+			}
+			if !strings.HasPrefix(tool.From, "ghcr.io/astral-sh/uv:") {
+				t.Errorf("uv tool source = %q, want the official ghcr.io/astral-sh/uv source", tool.From)
+			}
+			version := strings.TrimPrefix(tool.From, "ghcr.io/astral-sh/uv:")
+			if version == "latest" || version == "" {
+				t.Errorf("uv tool version = %q, must be a pinned version, never latest", version)
+			}
+			if strings.Count(version, ".") != 2 {
+				t.Errorf("uv tool version = %q, want a full pinned major.minor.patch version", version)
+			}
+		})
 	}
 }
 
-// TestNodeSpecPinsPnpmTool verifies the Node runtime declares the pinned pnpm
+// TestNodeSpecPinsPnpmTool verifies every Node runtime declares the pinned pnpm
 // runtime tool as a per-architecture remote archive artifact: the official
 // pnpm musl standalone binary, downloaded and checksum-verified at build time.
 // It pins the version (never a floating "latest"), the two supported
 // architectures (amd64/arm64), the extracted member, and the digest shape.
 func TestNodeSpecPinsPnpmTool(t *testing.T) {
-	spec, err := lookup("node24")
-	if err != nil {
-		t.Fatalf("lookup node24: %v", err)
-	}
-	if len(spec.RuntimeTools) != 1 {
-		t.Fatalf("node24 runtime tools = %+v, want exactly the pnpm tool", spec.RuntimeTools)
-	}
-	tool := spec.RuntimeTools[0]
-	if tool.Artifact == nil {
-		t.Fatalf("pnpm tool = %+v, want the remote-archive artifact form", tool)
-	}
-	if tool.From != "" || tool.Source != "" {
-		t.Errorf("pnpm artifact tool must not be an image copy (from=%q source=%q)", tool.From, tool.Source)
-	}
-	if tool.Destination != "/usr/local/bin/pnpm" {
-		t.Errorf("pnpm tool destination = %q, want /usr/local/bin/pnpm", tool.Destination)
-	}
-	if PnpmVersion == "latest" || PnpmVersion == "" || strings.Count(PnpmVersion, ".") != 2 {
-		t.Errorf("PnpmVersion = %q, want a full pinned major.minor.patch version", PnpmVersion)
-	}
-	want := map[string]string{
-		"amd64": pnpmReleaseBaseURL + "pnpm-linux-x64-musl.tar.gz",
-		"arm64": pnpmReleaseBaseURL + "pnpm-linux-arm64-musl.tar.gz",
-	}
-	if len(tool.Artifact.Variants) != len(want) {
-		t.Fatalf("pnpm artifact variants = %+v, want exactly %d", tool.Artifact.Variants, len(want))
-	}
-	for arch, url := range want {
-		variant, ok := tool.Artifact.VariantForArch(arch)
-		if !ok {
-			t.Fatalf("pnpm artifact has no variant for %s", arch)
-		}
-		if variant.URL != url {
-			t.Errorf("pnpm %s url = %q, want %q", arch, variant.URL, url)
-		}
-		if !strings.HasPrefix(variant.URL, "https://github.com/pnpm/pnpm/releases/download/v"+PnpmVersion+"/") {
-			t.Errorf("pnpm %s url = %q, want the pinned pnpm release download", arch, variant.URL)
-		}
-		if variant.Member != pnpmMember {
-			t.Errorf("pnpm %s member = %q, want %q", arch, variant.Member, pnpmMember)
-		}
-		if len(variant.SHA256) != 64 {
-			t.Errorf("pnpm %s sha256 = %q, want 64 hex characters", arch, variant.SHA256)
-		}
+	for _, name := range []string{"nodejs24.x", "nodejs26.x"} {
+		t.Run(name, func(t *testing.T) {
+			spec, err := lookup(name)
+			if err != nil {
+				t.Fatalf("lookup %s: %v", name, err)
+			}
+			if len(spec.RuntimeTools) != 1 {
+				t.Fatalf("%s runtime tools = %+v, want exactly the pnpm tool", name, spec.RuntimeTools)
+			}
+			tool := spec.RuntimeTools[0]
+			if tool.Artifact == nil {
+				t.Fatalf("pnpm tool = %+v, want the remote-archive artifact form", tool)
+			}
+			if tool.From != "" || tool.Source != "" {
+				t.Errorf("pnpm artifact tool must not be an image copy (from=%q source=%q)", tool.From, tool.Source)
+			}
+			if tool.Destination != "/usr/local/bin/pnpm" {
+				t.Errorf("pnpm tool destination = %q, want /usr/local/bin/pnpm", tool.Destination)
+			}
+			if PnpmVersion == "latest" || PnpmVersion == "" || strings.Count(PnpmVersion, ".") != 2 {
+				t.Errorf("PnpmVersion = %q, want a full pinned major.minor.patch version", PnpmVersion)
+			}
+			want := map[string]string{
+				"amd64": pnpmReleaseBaseURL + "pnpm-linux-x64-musl.tar.gz",
+				"arm64": pnpmReleaseBaseURL + "pnpm-linux-arm64-musl.tar.gz",
+			}
+			if len(tool.Artifact.Variants) != len(want) {
+				t.Fatalf("pnpm artifact variants = %+v, want exactly %d", tool.Artifact.Variants, len(want))
+			}
+			for arch, url := range want {
+				variant, ok := tool.Artifact.VariantForArch(arch)
+				if !ok {
+					t.Fatalf("pnpm artifact has no variant for %s", arch)
+				}
+				if variant.URL != url {
+					t.Errorf("pnpm %s url = %q, want %q", arch, variant.URL, url)
+				}
+				if !strings.HasPrefix(variant.URL, "https://github.com/pnpm/pnpm/releases/download/v"+PnpmVersion+"/") {
+					t.Errorf("pnpm %s url = %q, want the pinned pnpm release download", arch, variant.URL)
+				}
+				if variant.Member != pnpmMember {
+					t.Errorf("pnpm %s member = %q, want %q", arch, variant.Member, pnpmMember)
+				}
+				if len(variant.SHA256) != 64 {
+					t.Errorf("pnpm %s sha256 = %q, want 64 hex characters", arch, variant.SHA256)
+				}
+			}
+		})
 	}
 }
 
@@ -167,8 +252,8 @@ func TestEngineForRuntimeResolvesSharedEngine(t *testing.T) {
 	if nd.Engine != plan.EngineNode {
 		t.Errorf("%s engine = %q, want %q (shared engine)", tempNode, nd.Engine, plan.EngineNode)
 	}
-	if specs["node24"].Engine != nd.Engine {
-		t.Errorf("node24 and %s do not share an engine", tempNode)
+	if specs["nodejs24.x"].Engine != nd.Engine {
+		t.Errorf("nodejs24.x and %s do not share an engine", tempNode)
 	}
 }
 
@@ -201,7 +286,7 @@ func TestEngineForSharedEngineDispatch(t *testing.T) {
 		}
 	}
 
-	for _, name := range []string{"node24", tempNode} {
+	for _, name := range []string{"nodejs24.x", tempNode} {
 		spec, err := lookupIn(table, name)
 		if err != nil {
 			t.Fatalf("lookup(%s): %v", name, err)

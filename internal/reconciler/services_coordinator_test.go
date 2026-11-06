@@ -68,7 +68,7 @@ func TestServiceCoordinatorLimitsConcurrencyAndCoalescesLatest(t *testing.T) {
 	coordinator.Start(lifecycle)
 
 	tmpl := &app.Template{
-		Runtime:  "node24",
+		Runtime:  "nodejs24.x",
 		Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	coordinator.Enqueue("alpha", tmpl, "img-1", nil)
@@ -113,7 +113,7 @@ func TestServiceCoordinatorLimitsConcurrencyAndCoalescesLatest(t *testing.T) {
 
 func TestServiceCoordinatorStatusAuthority(t *testing.T) {
 	tmpl := &app.Template{
-		Runtime:  "node24",
+		Runtime:  "nodejs24.x",
 		Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	for _, tc := range []struct {
@@ -181,7 +181,7 @@ func TestServiceCoordinatorNewMeaningfulRequestSupersedesStatus(t *testing.T) {
 		cancel()
 		_ = coordinator.Join(context.Background())
 	}()
-	tmpl := &app.Template{Runtime: "node24", Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}}}
+	tmpl := &app.Template{Runtime: "nodejs24.x", Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}}}
 	oldDone := make(chan struct{}, 1)
 	newDone := make(chan struct{}, 1)
 	coordinator.EnqueueWithStatus("alpha", tmpl, "img-1", nil, nil, func(error) { oldDone <- struct{}{} })
@@ -243,7 +243,7 @@ func TestServiceCoordinatorWaitCancelsPromptlyWhileBusy(t *testing.T) {
 	defer release()
 
 	tmpl := &app.Template{
-		Runtime:  "node24",
+		Runtime:  "nodejs24.x",
 		Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	coordinator.Enqueue("alpha", tmpl, "img-1", nil)
@@ -273,7 +273,7 @@ func TestServiceCoordinatorJoinBoundedThenDrains(t *testing.T) {
 	defer release()
 
 	tmpl := &app.Template{
-		Runtime:  "node24",
+		Runtime:  "nodejs24.x",
 		Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	coordinator.Enqueue("alpha", tmpl, "img-1", nil)
@@ -502,7 +502,7 @@ func TestServiceCoordinatorSnapshotsTemplateAtEnqueue(t *testing.T) {
 	coordinator.Start(lifecycle)
 
 	tmpl := &app.Template{
-		Runtime:  "node24",
+		Runtime:  "nodejs24.x",
 		Env:      map[string]string{"A": "1"},
 		Secrets:  map[string]app.SecretRef{"S": "ref-1"},
 		Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
@@ -635,7 +635,7 @@ func TestServiceCoordinatorRunExclusivePausesScheduling(t *testing.T) {
 	coordinator.Start(lifecycle)
 
 	tmpl := &app.Template{
-		Runtime:  "node24",
+		Runtime:  "nodejs24.x",
 		Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	// The initial desired state settles before housekeeping starts.
@@ -715,7 +715,7 @@ func TestServiceCoordinatorRunExclusiveCancelledBarrierSkipsCallback(t *testing.
 	defer release()
 
 	tmpl := &app.Template{
-		Runtime:  "node24",
+		Runtime:  "nodejs24.x",
 		Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	coordinator.Enqueue("alpha", tmpl, "img-1", nil)

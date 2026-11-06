@@ -16,7 +16,7 @@ func TestAppSnapshotResourcesEffective(t *testing.T) {
 	c := openTestState(t)
 
 	// Configured resources.
-	tmpl := mustTemplate(t, `runtime: node24
+	tmpl := mustTemplate(t, `runtime: nodejs24.x
 resources:
   memory: 512MiB
   cpus: 2.5
@@ -44,7 +44,7 @@ events:
 	}
 
 	// Omitted resources persist the effective defaults.
-	defaulted := fnFor(t, "defaulted", mustTemplate(t, `runtime: node24
+	defaulted := fnFor(t, "defaulted", mustTemplate(t, `runtime: nodejs24.x
 events:
   - handler: index.run
     pattern:

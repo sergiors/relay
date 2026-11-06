@@ -101,7 +101,7 @@ func TestMaterializeDiscoveryIgnoresNonApps(t *testing.T) {
 func TestDiscoverAppsRejectsSymlinkedTemplate(t *testing.T) {
 	src := t.TempDir()
 	target := filepath.Join(t.TempDir(), "template.yaml")
-	if err := os.WriteFile(target, []byte("runtime: node24\n"), 0o644); err != nil {
+	if err := os.WriteFile(target, []byte("runtime: nodejs24.x\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Mkdir(filepath.Join(src, "linked"), 0o755); err != nil {
@@ -125,7 +125,7 @@ func TestDiscoverAppsRejectsSymlinkedTemplate(t *testing.T) {
 // the loader would skip them. A real sibling with a template is still selected.
 func TestDiscoverAppsSkipsSymlinkEntries(t *testing.T) {
 	src := t.TempDir()
-	writeFile(t, filepath.Join(src, "valid", "template.yaml"), "runtime: node24\n")
+	writeFile(t, filepath.Join(src, "valid", "template.yaml"), "runtime: nodejs24.x\n")
 	if err := os.Symlink(filepath.Join(src, "valid"), filepath.Join(src, "aliased")); err != nil {
 		t.Skipf("symlink unsupported: %v", err)
 	}
@@ -152,14 +152,14 @@ func TestDiscoverAppsSkipsSymlinkEntries(t *testing.T) {
 // removed.
 func TestMaterializeDoesNotRemoveStagingDir(t *testing.T) {
 	src := t.TempDir()
-	writeFile(t, filepath.Join(src, "keep", "template.yaml"), "runtime: node24\n")
+	writeFile(t, filepath.Join(src, "keep", "template.yaml"), "runtime: nodejs24.x\n")
 
 	funcs := t.TempDir()
 	// A transient staging directory in the target (as git leaves it mid-copy).
 	stage := filepath.Join(funcs, ".sync-live")
-	writeFile(t, filepath.Join(stage, "template.yaml"), "runtime: node24\n")
+	writeFile(t, filepath.Join(stage, "template.yaml"), "runtime: nodejs24.x\n")
 	// A genuinely stale app directory.
-	writeFile(t, filepath.Join(funcs, "stale", "template.yaml"), "runtime: node24\n")
+	writeFile(t, filepath.Join(funcs, "stale", "template.yaml"), "runtime: nodejs24.x\n")
 
 	mat, rem, err := materialize(mustSelect(t, src, src), funcs)
 	if err != nil {
@@ -188,11 +188,11 @@ func TestMaterializeDoesNotRemoveStagingDir(t *testing.T) {
 func TestMaterializeHonorsIgnoreRules(t *testing.T) {
 	src := t.TempDir()
 	writeFile(t, filepath.Join(src, ".gitignore"), "ignored/\n")
-	writeFile(t, filepath.Join(src, "keep", "template.yaml"), "runtime: node24\n")
+	writeFile(t, filepath.Join(src, "keep", "template.yaml"), "runtime: nodejs24.x\n")
 	writeFile(t, filepath.Join(src, "keep", ".gitignore"), "*.tmp\n")
 	writeFile(t, filepath.Join(src, "keep", "handler.js"), "export const x=1;\n")
 	writeFile(t, filepath.Join(src, "keep", "scratch.tmp"), "junk\n")
-	writeFile(t, filepath.Join(src, "ignored", "template.yaml"), "runtime: node24\n")
+	writeFile(t, filepath.Join(src, "ignored", "template.yaml"), "runtime: nodejs24.x\n")
 
 	funcs := t.TempDir()
 	mat, rem, err := materialize(mustSelect(t, src, src), funcs)
@@ -231,7 +231,7 @@ func TestMaterializeAnchorsRootIgnoreRules(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, ".gitignore"), "*.generated\n")
 	sub := filepath.Join(root, "services")
-	writeFile(t, filepath.Join(sub, "funa", "template.yaml"), "runtime: node24\n")
+	writeFile(t, filepath.Join(sub, "funa", "template.yaml"), "runtime: nodejs24.x\n")
 	writeFile(t, filepath.Join(sub, "funa", "handler.generated"), "generated\n")
 	writeFile(t, filepath.Join(sub, "funa", "handler.js"), "export const x=1;\n")
 

@@ -22,27 +22,52 @@ events:
 
 func TestParseRuntimeNode(t *testing.T) {
 	tmpl := mustParse(t, `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
       status: [COMPLETED]
 `)
-	if tmpl.Runtime != "node24" {
-		t.Errorf("expected runtime node24, got %q", tmpl.Runtime)
+	if tmpl.Runtime != "nodejs24.x" {
+		t.Errorf("expected runtime nodejs24.x, got %q", tmpl.Runtime)
 	}
 }
 
+// TestParseManagedRuntimes accepts every managed runtime identifier. The
+// identifiers mirror the AWS Lambda runtime names.
+func TestParseManagedRuntimes(t *testing.T) {
+	for _, runtimeName := range []string{
+		"python3.14", "python3.15", "nodejs24.x", "nodejs26.x",
+	} {
+		t.Run(runtimeName, func(t *testing.T) {
+			tmpl := mustParse(t, "runtime: "+runtimeName+`
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`)
+			if tmpl.Runtime != runtimeName {
+				t.Errorf("runtime = %q, want %q", tmpl.Runtime, runtimeName)
+			}
+		})
+	}
+}
+
+// TestParseUnsupportedRuntimeRejected rejects identifiers outside the allowlist,
+// including the removed node24 spelling.
 func TestParseUnsupportedRuntimeRejected(t *testing.T) {
-	_, err := ParseTemplate([]byte(`
-runtime: python3.12
+	for _, runtimeName := range []string{"python3.12", "node24"} {
+		t.Run(runtimeName, func(t *testing.T) {
+			_, err := ParseTemplate([]byte("runtime: " + runtimeName + `
 events:
   - handler: handler.main
     pattern:
       status: [COMPLETED]
 `))
-	if err == nil {
-		t.Fatal("expected error for unsupported runtime")
+			if err == nil {
+				t.Fatalf("expected error for unsupported runtime %q", runtimeName)
+			}
+		})
 	}
 }
 

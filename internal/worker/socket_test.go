@@ -1135,7 +1135,7 @@ func (e *testExecutor) got() []string {
 func TestRuntimeSocketInvokeAppFullStack(t *testing.T) {
 	path := testSocketPath(t)
 	exec := &testExecutor{}
-	tmpl, err := app.ParseTemplate([]byte(`runtime: node24
+	tmpl, err := app.ParseTemplate([]byte(`runtime: nodejs24.x
 events:
   - handler: events.created.handler
     pattern:

@@ -184,7 +184,7 @@ events:
       event_name: [MODIFY]
 `)
 	writeTemplate(t, dir, "fn-b", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -219,7 +219,7 @@ events:
       event_name: [MODIFY]
 `)
 	writeTemplate(t, dir, "also-good", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:

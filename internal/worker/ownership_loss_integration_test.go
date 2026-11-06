@@ -82,7 +82,7 @@ func TestIntegrationOwnershipLossMidHandler(t *testing.T) {
 		t.Fatalf("mkdir fn: %v", err)
 	}
 	writeTestFile(t, fnDir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.slow
     pattern:

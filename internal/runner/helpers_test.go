@@ -356,10 +356,10 @@ type fnSpec struct {
 }
 
 // buildFn assembles a prepared app from spec. The runtime defaults to
-// node24 so ServiceEntry and rule resolution behave like production.
+// nodejs24.x so ServiceEntry and rule resolution behave like production.
 func buildFn(spec fnSpec, exec Executor) *PreparedApp {
 	if spec.runtime == "" {
-		spec.runtime = "node24"
+		spec.runtime = "nodejs24.x"
 	}
 	if spec.image == "" {
 		spec.image = "x"
@@ -409,7 +409,7 @@ func unavailableMatchFn(t *testing.T, name string) *PreparedApp {
 	return NewUnavailable(app.App{
 		Name: name,
 		Template: &app.Template{
-			Runtime: "node24",
+			Runtime: "nodejs24.x",
 			Events:  []app.EventRule{alwaysMatchRule(time.Second)},
 		},
 	})

@@ -20,7 +20,7 @@ func seedListState(t *testing.T) Dependencies {
 	t.Helper()
 	st, deps := openTempState(t)
 
-	tmpl, err := app.ParseTemplate([]byte(`runtime: node24
+	tmpl, err := app.ParseTemplate([]byte(`runtime: nodejs24.x
 events:
   - handler: index.hi
     pattern:

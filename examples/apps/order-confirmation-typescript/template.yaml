@@ -1,4 +1,4 @@
-runtime: node24
+runtime: nodejs24.x
 
 events:
   - handler: src.handler.handler

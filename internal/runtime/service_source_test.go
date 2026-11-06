@@ -37,7 +37,7 @@ func newClockManager(t *testing.T, cli *client.Client, now func() time.Time) *Ma
 // no Docker source resolution.
 func TestResolveEntrypointServiceUsesAppImage(t *testing.T) {
 	m := newClockManager(t, nil, time.Now)
-	tmpl := &app.Template{Runtime: "node24"}
+	tmpl := &app.Template{Runtime: "nodejs24.x"}
 	svc := app.Service{Entrypoint: "app/service.js", Port: 80, Replicas: 1}
 
 	got, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, "relay-app-fn:abc")
@@ -101,7 +101,7 @@ func TestResolveExternalServiceImagePullAtMostHourlyAndImmediateOnChange(t *test
 	)
 	m := newClockManager(t, cli, func() time.Time { return now })
 
-	tmpl := &app.Template{Runtime: "node24"}
+	tmpl := &app.Template{Runtime: "nodejs24.x"}
 	svc := app.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
 
 	got, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, "")
@@ -152,7 +152,7 @@ func TestResolveExternalServiceImageFailedPullDoesNotAdvance(t *testing.T) {
 		dockerRoute{method: http.MethodGet, path: "/images/", body: `{"Id":"sha256:cafe"}`},
 	)
 	m := newClockManager(t, cli, func() time.Time { return now })
-	tmpl := &app.Template{Runtime: "node24"}
+	tmpl := &app.Template{Runtime: "nodejs24.x"}
 	svc := app.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
 
 	if _, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, ""); err == nil {
@@ -188,7 +188,7 @@ func TestResolveExternalServiceImageMissingLocalPullsImmediately(t *testing.T) {
 	// A recorded successful check would suppress a remote check for a PRESENT
 	// image, but a missing local image must still be pulled.
 	m.recordPullCheck("fn", "ghcr.io/acme/api:1.2", now)
-	tmpl := &app.Template{Runtime: "node24"}
+	tmpl := &app.Template{Runtime: "nodejs24.x"}
 	svc := app.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
 
 	_, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, "")
@@ -211,7 +211,7 @@ func TestResolveExternalServiceImagePresentWithinWindowSkipsPull(t *testing.T) {
 	)
 	m := newClockManager(t, cli, func() time.Time { return now })
 	m.recordPullCheck("fn", "ghcr.io/acme/api:1.2", now)
-	tmpl := &app.Template{Runtime: "node24"}
+	tmpl := &app.Template{Runtime: "nodejs24.x"}
 	svc := app.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
 
 	got, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, "")
@@ -231,7 +231,7 @@ func TestResolveExternalServiceImagePresentWithinWindowSkipsPull(t *testing.T) {
 // image, while an image source resolves to the external reference with its
 // content ID. Both leave no spurious build.
 func TestResolveServiceImageDispatchesBySource(t *testing.T) {
-	entryTmpl := &app.Template{Runtime: "node24"}
+	entryTmpl := &app.Template{Runtime: "nodejs24.x"}
 	entrySvc := app.Service{Entrypoint: "service.js", Port: 80, Replicas: 1}
 	entry, err := newClockManager(t, nil, time.Now).ResolveServiceImage(context.Background(), "fn", entryTmpl, entrySvc, "relay-app-fn:abc")
 	if err != nil {

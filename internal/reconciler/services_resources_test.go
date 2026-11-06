@@ -174,7 +174,7 @@ func TestReconcileResourceChangeReplacesContainer(t *testing.T) {
 
 			// Template with explicit resources, then without (defaults): the
 			// desired fingerprint changes and the running container is replaced.
-			withResources := serviceTemplate("node24", tc.spec)
+			withResources := serviceTemplate("nodejs24.x", tc.spec)
 			withResources.Resources = app.ResourceLimits{MemoryBytes: 512 << 20, NanoCPUs: 2_000_000_000, PidsLimit: 64}
 			if _, err := reconcile(t, f, "fn", withResources, "img-1", routing.TraefikConfig{}); err != nil {
 				t.Fatalf("reconcile 1: %v", err)
@@ -188,7 +188,7 @@ func TestReconcileResourceChangeReplacesContainer(t *testing.T) {
 			}
 
 			// Change only the resource config (same image, env, port).
-			defaulted := serviceTemplate("node24", tc.spec)
+			defaulted := serviceTemplate("nodejs24.x", tc.spec)
 			changed, err := reconcile(t, f, "fn", defaulted, "img-1", routing.TraefikConfig{})
 			if err != nil {
 				t.Fatalf("reconcile 2: %v", err)
@@ -214,7 +214,7 @@ func TestReconcileResourceChangeReplacesContainer(t *testing.T) {
 // never replaces the container: the periodic reconcile stays a no-op.
 func TestReconcileUnchangedResourcesNoChurn(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	tmpl.Resources = app.ResourceLimits{MemoryBytes: 256 << 20, NanoCPUs: 1_000_000_000, PidsLimit: 128}
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
@@ -240,7 +240,7 @@ func TestReconcileLegacyContainerWithoutResourcesReplaced(t *testing.T) {
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
 		envHash: serviceEnvHash(80), // env correct, resources label absent
 	}
-	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}

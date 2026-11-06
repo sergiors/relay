@@ -159,7 +159,7 @@ func (d *phaseDocker) startCount() int {
 // resolution may run a remote inspect/pull.
 func slowResolveServiceTemplate() *app.Template {
 	return &app.Template{
-		Runtime:  "node24",
+		Runtime:  "nodejs24.x",
 		Services: []app.Service{{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}},
 	}
 }

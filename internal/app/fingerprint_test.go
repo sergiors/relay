@@ -76,7 +76,7 @@ func TestFingerprintAppNarrowsRuntimeLessToTemplate(t *testing.T) {
 
 	// A runtime template uses the full source digest: the unreadable file then
 	// makes fingerprinting fail, proving the narrow path is not being taken.
-	runtimeTmpl := &Template{Runtime: "node24"}
+	runtimeTmpl := &Template{Runtime: "nodejs24.x"}
 	if _, err := FingerprintApp(dir, runtimeTmpl); err == nil {
 		t.Fatal("a runtime template must fingerprint the full source (and fail on the unreadable file)")
 	}
@@ -102,7 +102,7 @@ func TestFingerprintUnchangedStable(t *testing.T) {
 // Deterministic across directory iteration order because paths are sorted.
 func TestFingerprintDeterministicAcrossOrdering(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: node24\n")
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\n")
 	writeFile(t, filepath.Join(dir, "index.js"), "export function hi(e){}\n")
 
 	first := fp(t, dir)
@@ -167,7 +167,7 @@ func TestFingerprintTemplateChangeDetected(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e): pass\n")
 	before := fp(t, dir)
 
-	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: node24\n")
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\n")
 	after := fp(t, dir)
 	if after == before {
 		t.Fatal("template change should change fingerprint")
@@ -181,7 +181,7 @@ func TestFingerprintTemplateChangeDetected(t *testing.T) {
 // be visible without a second fingerprint mechanism.
 func TestFingerprintServicePathChangeDetected(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "template.yaml"), `runtime: node24
+	writeFile(t, filepath.Join(dir, "template.yaml"), `runtime: nodejs24.x
 services:
   - name: service
     entrypoint: service.js
@@ -190,7 +190,7 @@ services:
 `)
 	before := fp(t, dir)
 
-	writeFile(t, filepath.Join(dir, "template.yaml"), `runtime: node24
+	writeFile(t, filepath.Join(dir, "template.yaml"), `runtime: nodejs24.x
 services:
   - name: service
     entrypoint: service.js
@@ -308,7 +308,7 @@ func TestFingerprintTracksAncestorIgnoreAfterSubselection(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "services", "fn")
 	writeFile(t, filepath.Join(root, ".gitignore"), "*.generated\n")
-	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: node24\n")
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\n")
 	writeFile(t, filepath.Join(dir, "handler.js"), "export const x = 1\n")
 
 	selection, err := source.New(root, dir)
@@ -362,7 +362,7 @@ func TestFingerprintNestedIgnoreRuleChangeDetected(t *testing.T) {
 // field still must. Container rotation is driven by the separate resource
 // fingerprint, not by this digest.
 func TestFingerprintIgnoresResources(t *testing.T) {
-	const baseTmpl = `runtime: node24
+	const baseTmpl = `runtime: nodejs24.x
 resources:
   memory: 128MiB
   cpus: 1
@@ -372,7 +372,7 @@ events:
     pattern:
       event_name: [INSERT]
 `
-	changedResources := `runtime: node24
+	changedResources := `runtime: nodejs24.x
 resources:
   memory: 512MiB
   cpus: 0.5
@@ -382,7 +382,7 @@ events:
     pattern:
       event_name: [INSERT]
 `
-	withoutResources := `runtime: node24
+	withoutResources := `runtime: nodejs24.x
 events:
   - handler: index.run
     pattern:
@@ -445,8 +445,8 @@ resources:
 // byte-stable for the rest of the document (comments, key order, and inline
 // style survive) and a no-op when there is no resources key.
 func TestStripTemplateResourcesPreservesRest(t *testing.T) {
-	withResources := []byte("# head\nruntime: node24\nconcurrency: 2\nresources:\n  memory: 1GiB\nevents:\n  - handler: index.run\n    pattern: {a: [1]}\n")
-	without := []byte("# head\nruntime: node24\nconcurrency: 2\nevents:\n  - handler: index.run\n    pattern: {a: [1]}\n")
+	withResources := []byte("# head\nruntime: nodejs24.x\nconcurrency: 2\nresources:\n  memory: 1GiB\nevents:\n  - handler: index.run\n    pattern: {a: [1]}\n")
+	without := []byte("# head\nruntime: nodejs24.x\nconcurrency: 2\nevents:\n  - handler: index.run\n    pattern: {a: [1]}\n")
 	if string(stripTemplateResources(withResources)) != string(stripTemplateResources(without)) {
 		t.Fatalf("strip must yield identical bytes with and without a resources key:\n with=%q\n without=%q",
 			stripTemplateResources(withResources), stripTemplateResources(without))
@@ -474,7 +474,7 @@ func TestStripTemplateResourcesPreservesRest(t *testing.T) {
 // baked into the image, so the sources must version it.
 func TestFingerprintTracksTypeScriptSources(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: node24\n")
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\n")
 	writeFile(t, filepath.Join(dir, "tsconfig.json"), `{"compilerOptions":{"strict":true}}`+"\n")
 	writeFile(t, filepath.Join(dir, "src", "handler.ts"),
 		"import { msg } from \"./msg\";\nexport function handler(e) { console.log(msg(e)); }\n")
@@ -510,7 +510,7 @@ func TestFingerprintTracksTypeScriptSources(t *testing.T) {
 func TestFingerprintIgnoresIgnoredTypeScript(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, ".gitignore"), "*.generated.ts\n")
-	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: node24\n")
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\n")
 	writeFile(t, filepath.Join(dir, "handler.ts"), "export function handler(e) {}\n")
 	writeFile(t, filepath.Join(dir, "scratch.generated.ts"), "export const scratch = 1\n")
 	base := fp(t, dir)
@@ -589,7 +589,7 @@ func TestFingerprintSelectionMatchesOldReadFileAlgorithm(t *testing.T) {
 // in-source fixture) and is several times larger than io.Copy's internal buffer.
 func TestFingerprintSelectionStreamsLargeFile(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: node24\n")
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\n")
 
 	const chunk = 64 * 1024
 	big := filepath.Join(dir, "big.bin")

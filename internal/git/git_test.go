@@ -24,7 +24,7 @@ import (
 // fixtureTemplate is the app committed by fixture: one handler with an
 // INSERT pattern, distinct from testutil.DefaultTemplate so git package tests can
 // assert on the handler.
-const fixtureTemplate = "runtime: node24\nevents:\n  - handler: foo.handler\n    pattern:\n      event_name: [INSERT]\n"
+const fixtureTemplate = "runtime: nodejs24.x\nevents:\n  - handler: foo.handler\n    pattern:\n      event_name: [INSERT]\n"
 
 // testEnv bundles the temp dirs and a local fixture repo for a sync test.
 type testEnv struct {

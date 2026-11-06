@@ -150,7 +150,7 @@ func testLogger() *slog.Logger {
 }
 
 func schedTemplate(handler, cron, timezone, timeout string) *app.Template {
-	t := &app.Template{Runtime: "node24"}
+	t := &app.Template{Runtime: "nodejs24.x"}
 	sch := app.Schedule{Name: handler, Handler: handler, Cron: cron, Location: time.UTC, Timeout: app.DefaultTimeout}
 	if timezone != "" {
 		loc, err := time.LoadLocation(timezone)
@@ -171,7 +171,7 @@ func schedTemplate(handler, cron, timezone, timeout string) *app.Template {
 }
 
 func twoSchedules() *app.Template {
-	return &app.Template{Runtime: "node24", Schedules: []app.Schedule{
+	return &app.Template{Runtime: "nodejs24.x", Schedules: []app.Schedule{
 		{Name: "jobs.a", Handler: "jobs.a", Cron: "0 3 * * *", Location: time.UTC, Timeout: app.DefaultTimeout},
 		{Name: "jobs.b", Handler: "jobs.b", Cron: "0 4 * * *", Location: time.UTC, Timeout: 20 * time.Second},
 	}}
@@ -205,7 +205,7 @@ func TestReplaceAppRegistersJobs(t *testing.T) {
 	}
 
 	// No schedules -> replaces with zero jobs, leaving the prior ones removed.
-	s.ReplaceApp("fn", &app.Template{Runtime: "node24"})
+	s.ReplaceApp("fn", &app.Template{Runtime: "nodejs24.x"})
 	if n := s.JobCount(); n != 0 {
 		t.Fatalf("jobs = %d, want 0 (empty template replaces)", n)
 	}
@@ -221,7 +221,7 @@ func TestReplaceAppSkipsUnregisterableSchedule(t *testing.T) {
 	s := testScheduler(fp, logger)
 	defer func() { _ = s.Stop(context.Background()) }()
 
-	s.ReplaceApp("fn", &app.Template{Runtime: "node24", Schedules: []app.Schedule{
+	s.ReplaceApp("fn", &app.Template{Runtime: "nodejs24.x", Schedules: []app.Schedule{
 		{Name: "good", Handler: "jobs.good", Cron: "0 3 * * *", Location: time.UTC, Timeout: app.DefaultTimeout},
 		{Name: "bad", Handler: "jobs.bad", Cron: "not a cron", Location: time.UTC, Timeout: app.DefaultTimeout},
 	}})
@@ -251,7 +251,7 @@ func TestReplaceAppSkipsSixFieldSchedule(t *testing.T) {
 	s := testScheduler(fp, logger)
 	defer func() { _ = s.Stop(context.Background()) }()
 
-	s.ReplaceApp("fn", &app.Template{Runtime: "node24", Schedules: []app.Schedule{
+	s.ReplaceApp("fn", &app.Template{Runtime: "nodejs24.x", Schedules: []app.Schedule{
 		{Name: "five", Handler: "jobs.five", Cron: "0 0 * * *", Location: time.UTC, Timeout: app.DefaultTimeout},
 		{Name: "six", Handler: "jobs.six", Cron: "30 0 0 * * *", Location: time.UTC, Timeout: app.DefaultTimeout},
 	}})
@@ -277,7 +277,7 @@ func TestReplaceAppSkipsEverySchedule(t *testing.T) {
 	s := testScheduler(fp, testLogger())
 	defer func() { _ = s.Stop(context.Background()) }()
 
-	s.ReplaceApp("fn", &app.Template{Runtime: "node24", Schedules: []app.Schedule{
+	s.ReplaceApp("fn", &app.Template{Runtime: "nodejs24.x", Schedules: []app.Schedule{
 		{Handler: "jobs.every", Cron: "@every 30s", Location: time.UTC, Timeout: app.DefaultTimeout},
 	}})
 	if n := s.JobCount(); n != 0 {
@@ -706,7 +706,7 @@ func TestReplaceAppScheduleNameStableAcrossHandlerChange(t *testing.T) {
 	defer func() { _ = s.Stop(context.Background()) }()
 	s.Start()
 
-	s.ReplaceApp("fn", &app.Template{Runtime: "node24", Schedules: []app.Schedule{
+	s.ReplaceApp("fn", &app.Template{Runtime: "nodejs24.x", Schedules: []app.Schedule{
 		{Name: "cleanup", Handler: "jobs.old", Cron: "0 3 * * *", Location: time.UTC, Timeout: app.DefaultTimeout},
 	}})
 	if n := s.JobCount(); n != 1 {
@@ -717,7 +717,7 @@ func TestReplaceAppScheduleNameStableAcrossHandlerChange(t *testing.T) {
 	}
 
 	// Same name, new handler: still one job, same job name.
-	s.ReplaceApp("fn", &app.Template{Runtime: "node24", Schedules: []app.Schedule{
+	s.ReplaceApp("fn", &app.Template{Runtime: "nodejs24.x", Schedules: []app.Schedule{
 		{Name: "cleanup", Handler: "jobs.new", Cron: "0 3 * * *", Location: time.UTC, Timeout: app.DefaultTimeout},
 	}})
 	if n := s.JobCount(); n != 1 {
@@ -753,7 +753,7 @@ func TestReplaceAppSameHandlerMultipleNames(t *testing.T) {
 		for _, n := range names {
 			scheds = append(scheds, app.Schedule{Name: n, Handler: "jobs.shared", Cron: "0 3 * * *", Location: time.UTC, Timeout: app.DefaultTimeout})
 		}
-		return &app.Template{Runtime: "node24", Schedules: scheds}
+		return &app.Template{Runtime: "nodejs24.x", Schedules: scheds}
 	}
 
 	s.ReplaceApp("fn", shared("morning", "evening"))
@@ -806,7 +806,7 @@ func TestReplaceAppRetainsUnchangedJobIDs(t *testing.T) {
 	}
 
 	// Change only jobs.b's cron. jobs.a must keep its exact job (same ID).
-	changed := &app.Template{Runtime: "node24", Schedules: []app.Schedule{
+	changed := &app.Template{Runtime: "nodejs24.x", Schedules: []app.Schedule{
 		{Name: "jobs.a", Handler: "jobs.a", Cron: "0 3 * * *", Location: time.UTC, Timeout: app.DefaultTimeout},
 		{Name: "jobs.b", Handler: "jobs.b", Cron: "0 9 * * *", Location: time.UTC, Timeout: 20 * time.Second},
 	}}
@@ -825,7 +825,7 @@ func TestReplaceAppRetainsUnchangedJobIDs(t *testing.T) {
 
 	// Change only jobs.a's handler. jobs.b must now keep its (new) ID.
 	beforeHandler := jobIDs(s)
-	s.ReplaceApp("fn", &app.Template{Runtime: "node24", Schedules: []app.Schedule{
+	s.ReplaceApp("fn", &app.Template{Runtime: "nodejs24.x", Schedules: []app.Schedule{
 		{Name: "jobs.a", Handler: "jobs.new", Cron: "0 3 * * *", Location: time.UTC, Timeout: app.DefaultTimeout},
 		{Name: "jobs.b", Handler: "jobs.b", Cron: "0 9 * * *", Location: time.UTC, Timeout: 20 * time.Second},
 	}})
@@ -863,7 +863,7 @@ func TestReplaceAppTimeoutOnlyChangeRetainsJobID(t *testing.T) {
 	}
 
 	// Same handler, cron, and timezone; only timeout and retries change.
-	s.ReplaceApp("fn", &app.Template{Runtime: "node24", Schedules: []app.Schedule{
+	s.ReplaceApp("fn", &app.Template{Runtime: "nodejs24.x", Schedules: []app.Schedule{
 		{Name: "jobs.a", Handler: "jobs.a", Cron: "0 3 * * *", Location: time.UTC, Timeout: 45 * time.Second, Retries: 2},
 	}})
 
@@ -921,7 +921,7 @@ func TestReplaceAppRenameRemovesOldOnly(t *testing.T) {
 	before := jobIDs(s)
 
 	// Rename jobs.b -> jobs.c (same handler, same cron).
-	s.ReplaceApp("fn", &app.Template{Runtime: "node24", Schedules: []app.Schedule{
+	s.ReplaceApp("fn", &app.Template{Runtime: "nodejs24.x", Schedules: []app.Schedule{
 		{Name: "jobs.a", Handler: "jobs.a", Cron: "0 3 * * *", Location: time.UTC, Timeout: app.DefaultTimeout},
 		{Name: "jobs.c", Handler: "jobs.b", Cron: "0 4 * * *", Location: time.UTC, Timeout: 20 * time.Second},
 	}})
@@ -956,7 +956,7 @@ func TestReplaceAppKeepsCatchUpRecordsCoherent(t *testing.T) {
 	s.ReplaceApp("fn", twoSchedules())
 	// Update: jobs.a keeps its name but changes handler and cron; jobs.b is
 	// removed; jobs.c is added.
-	s.ReplaceApp("fn", &app.Template{Runtime: "node24", Schedules: []app.Schedule{
+	s.ReplaceApp("fn", &app.Template{Runtime: "nodejs24.x", Schedules: []app.Schedule{
 		{Name: "jobs.a", Handler: "jobs.a2", Cron: "0 5 * * *", Location: time.UTC, Timeout: app.DefaultTimeout},
 		{Name: "jobs.c", Handler: "jobs.c", Cron: "0 6 * * *", Location: time.UTC, Timeout: app.DefaultTimeout},
 	}})

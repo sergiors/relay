@@ -49,7 +49,7 @@ func (f *fakeBuilder) prepares() int {
 	return f.prepCnt
 }
 
-const template = "runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"
+const template = "runtime: nodejs24.x\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"
 
 func writeFnDir(t *testing.T, root, name string) string {
 	t.Helper()

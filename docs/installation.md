@@ -107,11 +107,11 @@ changes. An optional GitHub push webhook can request synchronization with
 not configure `GIT_WEBHOOK_ADDR` or expose/route the webhook endpoint. It does
 not provide automatic external webhook access as configured.
 
-For example, the `welcome-email-node` app uses the `node24` runtime and matches
-`INSERT` events for the `users` table, exposed as `collectionName`. Its handler
-reads `event.newImage` and logs a welcome-email message. See [apps](apps.md),
-[events](events.md), and [services](services.md) for app behavior and
-configuration.
+For example, the `welcome-email-node` app uses the `nodejs24.x` runtime and
+matches `INSERT` events for the `users` table, exposed as `collectionName`. Its
+handler reads `event.newImage` and logs a welcome-email message. See
+[apps](apps.md), [events](events.md), and [services](services.md) for app
+behavior and configuration.
 
 ## Manage Relay
 

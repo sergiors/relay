@@ -188,7 +188,7 @@ func (d *ctxRecordDocker) waitCount(t *testing.T, op string, n int) {
 // resolve, env, and start — the ops the live/startup paths must bound.
 func applyServiceTemplate() *app.Template {
 	return &app.Template{
-		Runtime:  "node24",
+		Runtime:  "nodejs24.x",
 		Services: []app.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 }
@@ -369,7 +369,7 @@ func TestEnqueueStartupServicesStandaloneRemoveBounded(t *testing.T) {
 	coordinator, stop := startCoordinatorFixture(t, svcCtrl)
 	defer stop()
 
-	tmpl := &app.Template{Runtime: "node24"} // no services
+	tmpl := &app.Template{Runtime: "nodejs24.x"} // no services
 	fn := app.App{Name: "broken", Template: tmpl}
 	prepared := []*runner.PreparedApp{runner.NewUnavailable(fn)}
 
@@ -405,7 +405,7 @@ func TestEnqueueStartupServicesStandaloneRemoveNonBlocking(t *testing.T) {
 
 	// The removal's remove call blocks until the coordinator lifecycle is
 	// cancelled, so enqueueStartupServices must return immediately.
-	tmpl := &app.Template{Runtime: "node24"} // no services
+	tmpl := &app.Template{Runtime: "nodejs24.x"} // no services
 	fn := app.App{Name: "broken", Template: tmpl}
 	prepared := []*runner.PreparedApp{runner.NewUnavailable(fn)}
 

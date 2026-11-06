@@ -18,6 +18,7 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/runtime/node"
+	"relay/internal/runtime/plan"
 	"relay/internal/runtime/python"
 )
 
@@ -958,11 +959,19 @@ func serviceEntryForSourceMount(entry []string, target, runtimeName string) []st
 	// the hook re-anchors bare specifiers from MOUNT_ROOT to the baked workdir, so
 	// a workdir-equal target (Python, and the Node no-op case) must stay
 	// byte-for-byte. The hook file exists only in a source-mounted Node image, so
-	// this is emitted only for node24 under a distinct mount target.
-	if target != serviceBakedWorkDir && runtimeName == "node24" {
+	// this is emitted only for a Node runtime under a distinct mount target.
+	if target != serviceBakedWorkDir && isNodeRuntime(runtimeName) {
 		out = append([]string{out[0], "--import", node.ResolveHookPath}, out[1:]...)
 	}
 	return out
+}
+
+// isNodeRuntime reports whether name resolves to a Node-engine runtime in the
+// registry. It dispatches by engine so every Node version identifier
+// (nodejs24.x, nodejs26.x) follows the same path instead of matching one name.
+func isNodeRuntime(name string) bool {
+	spec, err := lookup(name)
+	return err == nil && spec.Engine == plan.EngineNode
 }
 
 // ServiceEntry returns the container entrypoint override for a service
@@ -970,16 +979,16 @@ func serviceEntryForSourceMount(entry []string, target, runtimeName string) []st
 // or an invalid entrypoint. One image serves both invocations and services
 // (the app image's bootstrap entrypoint is overridden per-container), so
 // this is the only service-specific knowledge the generic layers need — no
-// separate plan or image per service — and the runtime switch here is the
-// sanctioned dispatch point.
+// separate plan or image per service — and the engine dispatch here is the
+// sanctioned runtime-specific point.
 //
-// entrypoint is a RELATIVE source FILE path (e.g. "app/main.py"); each runtime
+// entrypoint is a RELATIVE source FILE path (e.g. "app/main.py"); each engine
 // decides how that file is executed:
 //
-//   - node24 runs the file directly: `node /app/<entrypoint>`. The `/app/`
+//   - Node runs the file directly: `node /app/<entrypoint>`. The `/app/`
 //     prefix is the image WORKDIR where the app directory is COPYied, so a
 //     nested entrypoint like "app/service.js" resolves to /app/app/service.js.
-//   - python3.14 executes the file as a MODULE under the app directory
+//   - Python executes the file as a MODULE under the app directory
 //     (`python -m <module>`, e.g. "app/main.py" → `python -m app.main`), so
 //     package-relative imports (`from .deps import ...`) work. The conversion
 //     and its Python-specific validation live in python.ServiceCommand.
@@ -987,10 +996,14 @@ func ServiceEntry(runtimeName, entrypoint string) ([]string, error) {
 	if err := validateServiceEntrypoint(entrypoint); err != nil {
 		return nil, err
 	}
-	switch runtimeName {
-	case "node24":
+	spec, err := lookup(runtimeName)
+	if err != nil {
+		return nil, fmt.Errorf("unsupported runtime %q for services", runtimeName)
+	}
+	switch spec.Engine {
+	case plan.EngineNode:
 		return []string{"node", serviceBakedWorkDir + "/" + entrypoint}, nil
-	case "python3.14":
+	case plan.EnginePython:
 		return python.ServiceCommand(entrypoint)
 	default:
 		return nil, fmt.Errorf("unsupported runtime %q for services", runtimeName)

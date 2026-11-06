@@ -78,9 +78,14 @@ var removedConditionOperators = map[string]struct{}{
 	"equals": {},
 }
 
+// supportedRuntimes is the template-level runtime allowlist. It intentionally
+// mirrors the runtime registry's template identifiers; app is a leaf package
+// and cannot import runtime, so a runtime added there must also be added here.
 var supportedRuntimes = map[string]bool{
 	"python3.14": true,
-	"node24":     true,
+	"python3.15": true,
+	"nodejs24.x": true,
+	"nodejs26.x": true,
 }
 
 // SecretRef is a reference to a secret by name. It is a distinct type from a

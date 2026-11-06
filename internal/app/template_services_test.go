@@ -10,7 +10,7 @@ import (
 // exactly as before.
 func TestParseNoServicesNil(t *testing.T) {
 	tmpl := mustParse(t, `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -27,7 +27,7 @@ events:
 // Omitted port and replicas resolve to their defaults (80 and 1).
 func TestParseServiceDefaults(t *testing.T) {
 	tmpl := mustParse(t, `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -54,7 +54,7 @@ services:
 // Explicit port and replicas are honored.
 func TestParseServiceExplicitPortAndReplicas(t *testing.T) {
 	tmpl := mustParse(t, `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -80,7 +80,7 @@ services:
 // Multiple services with distinct ports resolve independently.
 func TestParseMultipleServices(t *testing.T) {
 	tmpl := mustParse(t, `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -123,7 +123,7 @@ func TestParseServicePortRejected(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := ParseTemplate([]byte(`
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -162,7 +162,7 @@ func TestParseServiceReplicasRejected(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := ParseTemplate([]byte(`
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -189,7 +189,7 @@ services:
 // rejected.
 func TestParseServiceMissingSource(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -206,7 +206,7 @@ services:
 // A service without a name is rejected: the name is its mandatory identity.
 func TestParseServiceMissingName(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
-runtime: node24
+runtime: nodejs24.x
 services:
   - entrypoint: service.js
 `))
@@ -220,7 +220,7 @@ func TestParseServiceInvalidName(t *testing.T) {
 	for _, bad := range []string{"Web", "_x", "with space", "trailing.", "a/b"} {
 		t.Run(bad, func(t *testing.T) {
 			_, err := ParseTemplate([]byte(`
-runtime: node24
+runtime: nodejs24.x
 services:
   - name: "` + bad + `"
     entrypoint: service.js
@@ -236,7 +236,7 @@ services:
 // service identity, so duplicates would be ambiguous for reconciliation.
 func TestParseServiceDuplicateName(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -256,7 +256,7 @@ services:
 // source is the implementation, not the identity.
 func TestParseServiceSameSourceDistinctNames(t *testing.T) {
 	tmpl := mustParse(t, `
-runtime: node24
+runtime: nodejs24.x
 services:
   - name: api
     entrypoint: service.js
@@ -280,7 +280,7 @@ services:
 // entrypoint/image is allowed.
 func TestParseServiceMultipleSourcesRejected(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -313,7 +313,7 @@ services:
 
 func TestParseServiceEntrypointWhitespace(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -330,7 +330,7 @@ services:
 // A template with both events AND services parses both correctly.
 func TestParseEventsAndServices(t *testing.T) {
 	tmpl := mustParse(t, `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: events.created.handler
     pattern:
@@ -359,7 +359,7 @@ services:
 // and services parse.
 func TestParseServicesAndSchedules(t *testing.T) {
 	tmpl := mustParse(t, `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -387,7 +387,7 @@ services:
 // A port boundary: the minimum (1) and maximum (65535) are accepted.
 func TestParseServicePortBoundaries(t *testing.T) {
 	tmpl := mustParse(t, `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -409,7 +409,7 @@ services:
 // not consume events, so `services:` alone is a complete, valid template.
 func TestParseServicesOnlyTemplate(t *testing.T) {
 	tmpl, err := ParseTemplate([]byte(`
-runtime: node24
+runtime: nodejs24.x
 services:
   - name: service
     entrypoint: service.js
@@ -430,10 +430,10 @@ services:
 
 // A template with neither events nor services is inert and rejected.
 func TestParseInertTemplateRejected(t *testing.T) {
-	if _, err := ParseTemplate([]byte("runtime: node24\n")); err == nil {
+	if _, err := ParseTemplate([]byte("runtime: nodejs24.x\n")); err == nil {
 		t.Fatal("expected error for a template with no events and no services")
 	}
-	if _, err := ParseTemplate([]byte("runtime: node24\nevents: []\nservices: []\n")); err == nil {
+	if _, err := ParseTemplate([]byte("runtime: nodejs24.x\nevents: []\nservices: []\n")); err == nil {
 		t.Fatal("expected error for explicitly empty events and services")
 	}
 }
@@ -450,7 +450,7 @@ schedules:
     handler: jobs.cleanup.handler
     cron: "0 3 * * *"
 `
-	_, err := ParseTemplate([]byte("runtime: node24\n" + schedule))
+	_, err := ParseTemplate([]byte("runtime: nodejs24.x\n" + schedule))
 	if err == nil {
 		t.Fatal("expected a schedules-only template to be rejected")
 	}
@@ -461,7 +461,7 @@ schedules:
 	// The same schedule is schema-valid: it parses alongside one valid event
 	// rule, proving the rejection above is structural, not a bad schedule.
 	tmpl, err := ParseTemplate([]byte(`
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -525,7 +525,7 @@ func TestParseServiceNestedEntrypoint(t *testing.T) {
 	for _, ep := range []string{"app/service.js", "app/main.py", "a/b/c.js"} {
 		t.Run(ep, func(t *testing.T) {
 			tmpl := mustParse(t, `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -549,7 +549,7 @@ services:
 // internal unrouted service); an omitted host is nil -> "" too.
 func TestParseServiceHost(t *testing.T) {
 	tmpl := mustParse(t, `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -598,7 +598,7 @@ func TestParseServiceHostRejected(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := ParseTemplate([]byte(`
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -632,7 +632,7 @@ func TestParseServiceHostBoundaries(t *testing.T) {
 		t.Fatalf("test host length = %d, want 253", len(host253))
 	}
 	tmpl := mustParse(t, `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -660,7 +660,7 @@ services:
 // empty path both parse to "" (host-only routing, exactly as before paths).
 func TestParseServicePath(t *testing.T) {
 	tmpl := mustParse(t, `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -706,7 +706,7 @@ func TestParseServicePathCanonicalization(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {
 			tmpl := mustParse(t, `
-runtime: node24
+runtime: nodejs24.x
 services:
   - name: service
     entrypoint: service.js
@@ -738,7 +738,7 @@ func TestParseServicePathRejected(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := ParseTemplate([]byte(`
-runtime: node24
+runtime: nodejs24.x
 services:
   - name: service
     entrypoint: service.js
@@ -762,7 +762,7 @@ services:
 // addressable route and the no-host service must remain unrouted.
 func TestParseServicePathWithoutHostRejected(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
-runtime: node24
+runtime: nodejs24.x
 services:
   - name: service
     entrypoint: service.js
@@ -780,7 +780,7 @@ services:
 // the path-without-host entry fails validation.
 func TestParseServicePathWithoutHostAfterHostedService(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
-runtime: node24
+runtime: nodejs24.x
 services:
   - name: routed
     entrypoint: routed.js
@@ -826,7 +826,7 @@ services:
 // with a runtime-specific command).
 func TestParseServiceEntrypointSourceWithRuntime(t *testing.T) {
 	tmpl, err := ParseTemplate([]byte(`
-runtime: node24
+runtime: nodejs24.x
 services:
   - name: service
     entrypoint: service.js
@@ -915,7 +915,7 @@ func TestParseServiceImageValidation(t *testing.T) {
 // reference) are both retained and have distinct identities.
 func TestParseServiceIdentityAcrossKinds(t *testing.T) {
 	tmpl := mustParse(t, `
-runtime: node24
+runtime: nodejs24.x
 services:
   - name: service
     entrypoint: service.js

@@ -87,15 +87,16 @@ const (
 // version is coupled to the user's opentelemetry-sdk version, so an exact pin
 // would silently replace a matching API and leave the SDK paired with a
 // mismatched one. The floor is the first release that imports without
-// `pkg_resources` (gone from python:3.14-slim), which the bootstrap's
-// context/propagate imports need; the <2 cap refuses a future major Relay has
-// not validated. When a user SDK already installed a satisfying API, uv keeps
-// it and Relay never downgrades it.
+// `pkg_resources` (gone from python:3.14-slim and python:3.15-slim), which the
+// bootstrap's context/propagate imports need; the <2 cap refuses a future major
+// Relay has not validated. When a user SDK already installed a satisfying API,
+// uv keeps it and Relay never downgrades it.
 const otelAPIFloor = "opentelemetry-api>=1.16,<2"
 
 // zuvloopVersion is the exact pinned release installed when PYTHON_ZUVLOOP
-// applies to a Python app image. zuvloop requires Python 3.14+, which is the
-// managed python3.14 runtime, and publishes prebuilt Linux amd64/arm64 wheels.
+// applies to a Python app image. zuvloop requires Python 3.14+, which both
+// managed Python runtimes (3.14 and 3.15) satisfy, and publishes prebuilt
+// Linux amd64/arm64 wheels.
 // The pin is exact (no range) so an image cannot change loop behavior when a
 // new release appears.
 const zuvloopVersion = "0.0.17"
@@ -146,8 +147,9 @@ const (
 // The runtime user is a fixed numeric identity (10001:10001) shared by every
 // Relay app so the container never runs as root and the identity is stable
 // across images and rebuilds; the numeric id is what the kernel enforces, so the
-// user/group name is cosmetic. python:3.14-slim (Debian) has no pre-created user,
-// so the Dockerfile creates one at build time via UserSetup.
+// user/group name is cosmetic. The managed python:3.14-slim and
+// python:3.15-slim images (Debian) have no pre-created user, so the Dockerfile
+// creates one at build time via UserSetup.
 const (
 	userID   = "10001:10001"
 	userName = "app"

@@ -1,4 +1,4 @@
-runtime: node24
+runtime: nodejs24.x
 concurrency: 2
 
 # Per-container resource limits. Optional and resolved independently; omitted

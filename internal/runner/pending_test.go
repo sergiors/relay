@@ -15,7 +15,7 @@ import (
 )
 
 // pendingTmplV1 is an active generation with a single "created" rule.
-const pendingTmplV1 = `runtime: node24
+const pendingTmplV1 = `runtime: nodejs24.x
 events:
   - handler: handler.created
     pattern:
@@ -25,7 +25,7 @@ events:
 // pendingTmplV2 adds a "deleted" rule to the v1 generation. The two rules carry
 // DISTINCT handlers so the template validates (a parsed template rejects two
 // event rules sharing a handler).
-const pendingTmplV2 = `runtime: node24
+const pendingTmplV2 = `runtime: nodejs24.x
 events:
   - handler: handler.created
     pattern:
@@ -37,7 +37,7 @@ events:
 
 // pendingTmplOther is a generation whose rules do not overlap v1/v2, used to
 // prove slice/index coherence across concurrent pending swaps.
-const pendingTmplOther = `runtime: node24
+const pendingTmplOther = `runtime: nodejs24.x
 events:
   - handler: handler.other_one
     pattern:
@@ -50,7 +50,7 @@ events:
 // pendingTmplDistinctSamePattern declares two rules with DISTINCT handlers that
 // match the SAME event, so an active rule and a pending-only rule can both match
 // one delivery without being deduped by invocation identity.
-const pendingTmplDistinctSamePattern = `runtime: node24
+const pendingTmplDistinctSamePattern = `runtime: nodejs24.x
 events:
   - handler: handler.created
     pattern:
@@ -267,7 +267,7 @@ func TestHandlePendingOnlyPreventsDLQOfExhaustedSibling(t *testing.T) {
 	r := NewWithMetrics([]*PreparedApp{active}, testutil.DiscardLogger(), nil)
 	// The pending desired generation declares a DISTINCT handler matching the
 	// same event, so it is not deduped and stays unresolved.
-	pendingTmpl := `runtime: node24
+	pendingTmpl := `runtime: nodejs24.x
 events:
   - handler: handler.extra
     pattern: {}

@@ -119,8 +119,8 @@ func TestHandleEmitsAppInvokeSpan(t *testing.T) {
 	if got := attrString(span, "relay.handler.name"); got != "index.run" {
 		t.Errorf("relay.handler.name = %q, want index.run", got)
 	}
-	if got := attrString(span, "relay.app.runtime"); got != "node24" {
-		t.Errorf("relay.app.runtime = %q, want node24", got)
+	if got := attrString(span, "relay.app.runtime"); got != "nodejs24.x" {
+		t.Errorf("relay.app.runtime = %q, want nodejs24.x", got)
 	}
 	if got := attrString(span, "function.result"); got != "success" {
 		t.Errorf("function.result = %q, want success", got)
@@ -446,7 +446,7 @@ func TestHandleTracingDisabledPersistsNoLineage(t *testing.T) {
 func TestInvokeAppEmitsManualRootOperation(t *testing.T) {
 	rec := withSpanRecorder(t)
 	exec := &countingExecutor{}
-	r := New([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
+	r := New([]*PreparedApp{invokeFn(t, "fn", `runtime: nodejs24.x
 events:
   - handler: events.created.handler
     pattern:
@@ -725,7 +725,7 @@ func TestHandleRetrySpanCarriesHandlerAttempt(t *testing.T) {
 // function.invoke without a fabricated function.attempt attribute.
 func TestInvokeAppManualSpanOmitsUnknownAttempt(t *testing.T) {
 	rec := withSpanRecorder(t)
-	r := New([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
+	r := New([]*PreparedApp{invokeFn(t, "fn", `runtime: nodejs24.x
 events:
   - handler: events.created.handler
     pattern:
@@ -777,7 +777,7 @@ func TestInvokeAppInvalidStillTraced(t *testing.T) {
 
 	t.Run("no matching rule", func(t *testing.T) {
 		rec := withSpanRecorder(t)
-		r := New([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
+		r := New([]*PreparedApp{invokeFn(t, "fn", `runtime: nodejs24.x
 events:
   - handler: events.created.handler
     pattern:

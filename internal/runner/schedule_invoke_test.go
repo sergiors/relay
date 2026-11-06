@@ -93,7 +93,7 @@ func TestInvokeHandlerMissingApp(t *testing.T) {
 	}
 
 	// Unavailable (nil prepared) app.
-	r = New([]*PreparedApp{NewUnavailable(app.App{Name: "broken", Template: &app.Template{Runtime: "node24"}})}, testutil.DiscardLogger())
+	r = New([]*PreparedApp{NewUnavailable(app.App{Name: "broken", Template: &app.Template{Runtime: "nodejs24.x"}})}, testutil.DiscardLogger())
 	err = r.InvokeHandler(context.Background(), "1-0", "broken", "sched", "index.run", []byte(`{}`))
 	if err == nil || !strings.Contains(err.Error(), `app "broken" is not available`) {
 		t.Fatalf("err = %v, want not-available error for unavailable function", err)

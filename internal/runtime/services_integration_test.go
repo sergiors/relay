@@ -25,7 +25,7 @@ import (
 	"relay/internal/testutil"
 )
 
-// buildServiceHost builds a tiny node24 app directory containing a
+// buildServiceHost builds a tiny nodejs24.x app directory containing a
 // long-lived service.js (keeps node alive with an interval) alongside a trivial
 // invocation handler, then m.Prepare-builds its image and returns the app
 // handle plus the prepared image ref.
@@ -33,7 +33,7 @@ func buildServiceHost(t *testing.T, ctx context.Context, fnName string) (app.App
 	t.Helper()
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.hi
     pattern:
@@ -58,7 +58,7 @@ process.on("SIGTERM", () => process.exit(0));
 console.log("started");
 setInterval(() => {}, 1 << 30);
 `)
-	fn := app.App{Name: fnName, Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: fnName, Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	prepared, err := mPrepare(ctx, t, fn)
 	if err != nil {
 		t.Fatalf("prepare %s: %v", fnName, err)
@@ -362,7 +362,7 @@ func TestIntegrationServiceImageRetirement(t *testing.T) {
 	// fn1 with v1 source.
 	dir1 := t.TempDir()
 	writeFile(t, dir1, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.hi
     pattern:
@@ -372,7 +372,7 @@ events:
 	// SIGTERM handler so the daemon's stop is prompt (node as PID 1 ignores the
 	// default SIGTERM action; without this every stop pays the full 10s grace).
 	writeFile(t, dir1, "service.js", "process.on('SIGTERM', () => process.exit(0));\nsetInterval(() => {}, 1 << 30);\n")
-	fn1 := app.App{Name: "svc-retire", Dir: dir1, Template: &app.Template{Runtime: "node24"}}
+	fn1 := app.App{Name: "svc-retire", Dir: dir1, Template: &app.Template{Runtime: "nodejs24.x"}}
 
 	// Build v1, get its image ref. Reuse the test's single Manager for every
 	// Prepare (mPrepare would spin a fresh client+manager per call): the
@@ -451,14 +451,14 @@ events:
 	// A second app's repo must be untouched. Build fn2 image.
 	dir2 := t.TempDir()
 	writeFile(t, dir2, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.hi
     pattern:
       event_name: [INSERT]
 `)
 	writeFile(t, dir2, "index.js", "export function hi(e){ console.log('other'); }\n")
-	fn2 := app.App{Name: "svc-other", Dir: dir2, Template: &app.Template{Runtime: "node24"}}
+	fn2 := app.App{Name: "svc-other", Dir: dir2, Template: &app.Template{Runtime: "nodejs24.x"}}
 	pOther, err := m.Prepare(ctx, fn2)
 	if err != nil {
 		t.Fatalf("prepare other: %v", err)
@@ -727,7 +727,7 @@ func TestIntegrationExternalImageService(t *testing.T) {
 	// Build a small app image to serve as the external reference.
 	dir := t.TempDir()
 	writeFile(t, dir, "index.js", "setInterval(() => {}, 1 << 30);\n")
-	tmpl, err := app.ParseTemplate([]byte("runtime: node24\nevents:\n  - handler: index.handler\n    pattern:\n      event_name: [INSERT]\n"))
+	tmpl, err := app.ParseTemplate([]byte("runtime: nodejs24.x\nevents:\n  - handler: index.handler\n    pattern:\n      event_name: [INSERT]\n"))
 	if err != nil {
 		t.Fatalf("parse template: %v", err)
 	}

@@ -13,16 +13,15 @@ import (
 
 // Two runtime versions served by the same Node engine. The engine must produce
 // identical build logic for both, differing only in the base image taken from
-// the spec. The second spec is test-only and is never registered in the runtime
-// registry.
+// the spec.
 var testSpecs = []plan.Spec{
 	{
-		Name:      "node24",
+		Name:      "nodejs24.x",
 		Engine:    plan.EngineNode,
 		BaseImage: "node:24-alpine",
 	},
 	{
-		Name:      "node26",
+		Name:      "nodejs26.x",
 		Engine:    plan.EngineNode,
 		BaseImage: "node:26-alpine",
 	},
@@ -100,7 +99,7 @@ func TestPlanCarriesRuntimeTools(t *testing.T) {
 			Arch: "amd64", URL: "https://example.test/pnpm.tgz", SHA256: strings.Repeat("a", 64), Member: "pnpm",
 		}}},
 	}
-	spec := plan.Spec{Name: "node24", Engine: plan.EngineNode, BaseImage: "node:24-alpine", RuntimeTools: []plan.RuntimeTool{tool}}
+	spec := plan.Spec{Name: "nodejs24.x", Engine: plan.EngineNode, BaseImage: "node:24-alpine", RuntimeTools: []plan.RuntimeTool{tool}}
 
 	p, err := Engine{}.Plan(spec, t.TempDir(), nil)
 	if err != nil {
@@ -238,7 +237,7 @@ func TestPlanRejectsNpmLock(t *testing.T) {
 // rewritten (pnpm add always saves).
 func TestPlanOtelInstallUsesPnpm(t *testing.T) {
 	dir := t.TempDir()
-	p, err := Engine{}.Plan(specByName(t, "node24"), dir, nil)
+	p, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, nil)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -357,13 +356,13 @@ func TestPlanJSHandlersNoBuild(t *testing.T) {
 
 // TestPlanTSHandlerBuilds pins the TypeScript build command: one RUN that installs
 // the pinned esbuild with pnpm, bundles the .ts source to a sibling .mjs with the
-// runtime's own version as --target, keeps packages external, and removes the
+// managed Node major as --target, keeps packages external, and removes the
 // tooling and the pnpm store in the same layer.
 func TestPlanTSHandlerBuilds(t *testing.T) {
 	dir := t.TempDir()
 	writeSource(t, dir, "src/order.ts", "export function handler(e) {}\n")
 
-	p, err := Engine{}.Plan(specByName(t, "node24"), dir, []string{"src.order"})
+	p, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{"src.order"})
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -410,19 +409,51 @@ func TestPlanTSHandlerBuilds(t *testing.T) {
 	}
 }
 
-// TestPlanTSTargetUsesSpecName pins that --target tracks the managed runtime
-// version from the spec, so the emitted syntax matches the runtime that executes
-// it.
-func TestPlanTSTargetUsesSpecName(t *testing.T) {
-	dir := t.TempDir()
-	writeSource(t, dir, "index.ts", "export function handler(e) {}\n")
-
-	p, err := Engine{}.Plan(specByName(t, "node26"), dir, []string{"index"})
-	if err != nil {
-		t.Fatalf("plan: %v", err)
+// TestEsbuildTargetFallsBackToSpecName pins the non-managed fallback: a spec
+// whose base image lacks the managed node:<major>-alpine shape keeps the
+// historical behavior of targeting its spec name.
+func TestEsbuildTargetFallsBackToSpecName(t *testing.T) {
+	spec := plan.Spec{
+		Name:      "custom-node",
+		Engine:    plan.EngineNode,
+		BaseImage: "example.test/custom-node",
 	}
-	if cmd := requireInstall(t, p); !strings.Contains(cmd, "--target=node26") {
-		t.Errorf("Install command must target node26 from the spec, got:\n%s", cmd)
+	if got := esbuildTarget(spec); got != spec.Name {
+		t.Errorf("esbuild target = %q, want the spec name %q", got, spec.Name)
+	}
+}
+
+// TestPlanTSTargetFromManagedNodeIdentifier pins that every registry-style
+// Node identifier targets the Node major of its base image. Template
+// identifiers such as nodejs26.x are not esbuild targets; the emitted --target
+// must be node26 (and nodejs24.x must target node24).
+func TestPlanTSTargetFromManagedNodeIdentifier(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		baseImage  string
+		wantTarget string
+	}{
+		{"nodejs24.x", "node:24-alpine", "node24"},
+		{"nodejs26.x", "node:26-alpine", "node26"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeSource(t, dir, "index.ts", "export function handler(e) {}\n")
+			spec := plan.Spec{
+				Name:      tc.name,
+				Engine:    plan.EngineNode,
+				BaseImage: tc.baseImage,
+			}
+
+			p, err := Engine{}.Plan(spec, dir, []string{"index"})
+			if err != nil {
+				t.Fatalf("plan: %v", err)
+			}
+			want := "--target=" + tc.wantTarget
+			if cmd := requireInstall(t, p); !strings.Contains(cmd, want) {
+				t.Errorf("Install command must contain %q, got:\n%s", want, cmd)
+			}
+		})
 	}
 }
 
@@ -478,7 +509,7 @@ func TestPlanTSResolutionAndPrecedence(t *testing.T) {
 			for _, f := range tc.files {
 				writeSource(t, dir, f, "export function handler(e) {}\n")
 			}
-			p, err := Engine{}.Plan(specByName(t, "node24"), dir, []string{tc.module})
+			p, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{tc.module})
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}
@@ -513,7 +544,7 @@ func TestPlanJSResolutionUnchanged(t *testing.T) {
 			for _, f := range tc.files {
 				writeSource(t, dir, f, "export function handler(e) {}\n")
 			}
-			p, err := Engine{}.Plan(specByName(t, "node24"), dir, []string{tc.module})
+			p, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{tc.module})
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}
@@ -530,7 +561,7 @@ func TestPlanTSWithTsconfig(t *testing.T) {
 	writeSource(t, dir, "index.ts", "export function handler(e) {}\n")
 	writeSource(t, dir, "tsconfig.json", `{"compilerOptions":{"strict":true}}`)
 
-	p, err := Engine{}.Plan(specByName(t, "node24"), dir, []string{"index"})
+	p, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{"index"})
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -556,7 +587,7 @@ func TestPlanSourceMountedPersistsEsbuildAndMountsSource(t *testing.T) {
 		t.Fatalf("mkdir node_modules: %v", err)
 	}
 
-	spec := specByName(t, "node24")
+	spec := specByName(t, "nodejs24.x")
 	spec.SourceMounted = true
 	p, err := Engine{}.Plan(spec, dir, []string{"src.order", "src.plain"})
 	if err != nil {
@@ -617,7 +648,7 @@ func TestPlanSourceMountedShipsSharedResolveHook(t *testing.T) {
 	dir := t.TempDir()
 	writeSource(t, dir, "index.js", "export function handler(e) {}\n")
 
-	mounted := specByName(t, "node24")
+	mounted := specByName(t, "nodejs24.x")
 	mounted.SourceMounted = true
 	p, err := Engine{}.Plan(mounted, dir, []string{"index"})
 	if err != nil {
@@ -642,7 +673,7 @@ func TestPlanSourceMountedShipsSharedResolveHook(t *testing.T) {
 		t.Fatalf("ResolveHookPath = %q, want /relay/resolve-hook.mjs", ResolveHookPath)
 	}
 
-	baked, err := Engine{}.Plan(specByName(t, "node24"), dir, []string{"index"})
+	baked, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{"index"})
 	if err != nil {
 		t.Fatalf("baked plan: %v", err)
 	}
@@ -659,7 +690,7 @@ func TestPlanSourceMountedShipsSharedResolveHook(t *testing.T) {
 func TestPlanBakedHasNoSourceMountLayout(t *testing.T) {
 	dir := t.TempDir()
 	writeSource(t, dir, "index.js", "export function handler(e) {}\n")
-	p, err := Engine{}.Plan(specByName(t, "node24"), dir, []string{"index"})
+	p, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{"index"})
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -675,7 +706,7 @@ func TestPlanBakedHasNoSourceMountLayout(t *testing.T) {
 // yields NO mask because Docker cannot create a mountpoint inside the read-only
 // source bind.
 func TestPlanSourceMountedMasksHostNodeModulesOnlyWhenPresent(t *testing.T) {
-	spec := specByName(t, "node24")
+	spec := specByName(t, "nodejs24.x")
 	spec.SourceMounted = true
 
 	absent := t.TempDir()
@@ -712,11 +743,11 @@ func TestPlanSourceMountedDepsUnchanged(t *testing.T) {
 	writeSource(t, dir, "package.json", `{"type":"module"}`)
 	writeSource(t, dir, "pnpm-lock.yaml", `lockfileVersion: '9.0'`)
 
-	baked, err := Engine{}.Plan(specByName(t, "node24"), dir, nil)
+	baked, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, nil)
 	if err != nil {
 		t.Fatalf("baked plan: %v", err)
 	}
-	spec := specByName(t, "node24")
+	spec := specByName(t, "nodejs24.x")
 	spec.SourceMounted = true
 	mounted, err := Engine{}.Plan(spec, dir, nil)
 	if err != nil {
@@ -738,7 +769,7 @@ func TestPlanSourceMountedDepsUnchanged(t *testing.T) {
 // still fails Plan, so a source-mounted image never defers the error to every
 // invocation.
 func TestPlanSourceMountedStillValidatesHandlers(t *testing.T) {
-	spec := specByName(t, "node24")
+	spec := specByName(t, "nodejs24.x")
 	spec.SourceMounted = true
 
 	dir := t.TempDir()
@@ -763,7 +794,7 @@ func TestPlanMultipleHandlersOneInstallDedup(t *testing.T) {
 	writeSource(t, dir, "events/created.ts", "export function handler(e) {}\n")
 	writeSource(t, dir, "events/deleted.ts", "export function handler(e) {}\n")
 
-	p, err := Engine{}.Plan(specByName(t, "node24"), dir, []string{"events.created", "events.deleted"})
+	p, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{"events.created", "events.deleted"})
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -799,7 +830,7 @@ func TestPlanAmbiguousHandlerErrors(t *testing.T) {
 			for _, f := range tc.files {
 				writeSource(t, dir, f, "export function handler(e) {}\n")
 			}
-			_, err := Engine{}.Plan(specByName(t, "node24"), dir, []string{tc.module})
+			_, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{tc.module})
 			if err == nil {
 				t.Fatal("expected an ambiguity error")
 			}
@@ -817,7 +848,7 @@ func TestPlanMissingHandlerErrors(t *testing.T) {
 	dir := t.TempDir()
 	writeSource(t, dir, "index.ts", "export function handler(e) {}\n")
 
-	_, err := Engine{}.Plan(specByName(t, "node24"), dir, []string{"missing"})
+	_, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{"missing"})
 	if err == nil {
 		t.Fatal("expected a missing-module error")
 	}
@@ -833,7 +864,7 @@ func TestPlanInvalidModuleErrors(t *testing.T) {
 	for _, module := range []string{"", ".", "..", "a..b", "a.", ".a", "../evil", "../../etc/passwd", "src/../etc"} {
 		t.Run(module, func(t *testing.T) {
 			dir := t.TempDir()
-			_, err := Engine{}.Plan(specByName(t, "node24"), dir, []string{module})
+			_, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{module})
 			if err == nil {
 				t.Fatal("expected an invalid-module error")
 			}
@@ -851,7 +882,7 @@ func TestPlanTSDoesNotInjectTsconfig(t *testing.T) {
 	dir := t.TempDir()
 	writeSource(t, dir, "index.ts", "export function handler(e) {}\n")
 
-	p, err := Engine{}.Plan(specByName(t, "node24"), dir, []string{"index"})
+	p, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{"index"})
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -873,7 +904,7 @@ func TestShellQuoteArg(t *testing.T) {
 	}{
 		{"/app/src/order.ts", "/app/src/order.ts"},
 		{"esbuild@0.28.2", "esbuild@0.28.2"},
-		{"node24", "node24"},
+		{"nodejs24.x", "nodejs24.x"},
 		{"", "''"},
 		{"a b", "'a b'"},
 		{"$HOME", "'$HOME'"},
@@ -921,7 +952,7 @@ func TestPlanShellQuotesHandlerDerivedPaths(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			writeSource(t, dir, tc.rel, source)
-			p, err := Engine{}.Plan(specByName(t, "node24"), dir, []string{tc.module})
+			p, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{tc.module})
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}
@@ -947,7 +978,7 @@ func TestPlanShellQuoteNestedJSAndTSUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	writeSource(t, dir, "src/deep/order.ts", "export function handler(e) {}\n")
 
-	p, err := Engine{}.Plan(specByName(t, "node24"), dir, []string{"src.deep.order"})
+	p, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{"src.deep.order"})
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -973,7 +1004,7 @@ func TestPlanTraversalStillRejected(t *testing.T) {
 	for _, module := range []string{"../etc/passwd", "a/../../etc/passwd", "..", "a..b"} {
 		t.Run(module, func(t *testing.T) {
 			dir := t.TempDir()
-			_, err := Engine{}.Plan(specByName(t, "node24"), dir, []string{module})
+			_, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{module})
 			if err == nil {
 				t.Fatal("expected a traversal/invalid-module rejection")
 			}

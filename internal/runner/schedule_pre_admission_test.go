@@ -76,7 +76,7 @@ func schedLeaseFn(t *testing.T, name, image string, exec *schedLeaseExecutor, sc
 	pf := NewPrepared(app.App{
 		Name: name,
 		Template: &app.Template{
-			Runtime:     "node24",
+			Runtime:     "nodejs24.x",
 			Concurrency: 1,
 			Schedules:   schedules,
 		},

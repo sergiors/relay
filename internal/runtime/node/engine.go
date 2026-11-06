@@ -14,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"relay/internal/runtime/plan"
@@ -209,8 +210,9 @@ const otelInstall = "mkdir -p " + otelProjectDir +
 // The runtime user is a fixed numeric identity (10001:10001) shared by every
 // Relay app so the container never runs as root and the identity is stable
 // across images and rebuilds; the numeric id is what the kernel enforces, so the
-// user/group name is cosmetic. node:24-alpine (BusyBox) has no pre-created user,
-// so the Dockerfile creates one at build time via UserSetup. Node needs only read
+// user/group name is cosmetic. The node:24-alpine and node:26-alpine images
+// (BusyBox) have no pre-created user, so the Dockerfile creates one at build time
+// via UserSetup. Node needs only read
 // access to /app (ESM modules are read, not compiled to a cache by default), so
 // /app is chowned to the user for symmetry with the Python engine; the read-only
 // rootfs is never written at runtime.
@@ -364,7 +366,7 @@ func (Engine) Plan(spec plan.Spec, fnDir string, handlers []string) (plan.BuildP
 		}
 		install = append(install, mountedEsbuildInstall())
 	} else if len(tsSources) > 0 {
-		install = append(install, esbuildCommand(spec.Name, tsSources, fileExists(fnDir, tsconfigFile)))
+		install = append(install, esbuildCommand(spec, tsSources, fileExists(fnDir, tsconfigFile)))
 	}
 
 	return plan.BuildPlan{
@@ -566,6 +568,25 @@ func firstExisting(fnDir string, candidates []string) string {
 	return ""
 }
 
+// esbuildTarget returns the esbuild --target for a managed Node spec. The
+// template's runtime identifier is not an esbuild target: identifiers such as
+// nodejs24.x and nodejs26.x must target the Node major of the pinned official
+// base image (node:26-alpine → node26), never the raw identifier. A spec that
+// does not use the managed base-image shape keeps the historical behavior of
+// targeting its name.
+func esbuildTarget(spec plan.Spec) string {
+	tag, ok := strings.CutPrefix(spec.BaseImage, "node:")
+	if !ok {
+		return spec.Name
+	}
+	major, _, _ := strings.Cut(tag, "-")
+	n, err := strconv.Atoi(major)
+	if err != nil || n <= 0 {
+		return spec.Name
+	}
+	return "node" + strconv.Itoa(n)
+}
+
 // esbuildCommand builds ONE RUN command that installs the pinned esbuild into an
 // ephemeral /tmp prefix with pnpm, transpiles every TypeScript handler, then
 // removes the tooling and the pnpm store in the SAME layer. A single install
@@ -577,7 +598,7 @@ func firstExisting(fnDir string, candidates []string) string {
 // keeps bare node_modules imports out of the bundle so they resolve at runtime
 // from the dependency layer; --format=esm and the .mjs output make the result
 // unconditionally ESM, which the bootstrap imports dynamically; --target is the
-// runtime spec name (e.g. node24) so the emitted syntax matches the managed Node.
+// managed Node major version so the emitted syntax matches the interpreter.
 // --tsconfig is added only when the app ships a tsconfig.json.
 //
 // Shell safety: every value interpolated into the RUN is passed through
@@ -586,19 +607,20 @@ func firstExisting(fnDir string, candidates []string) string {
 // argument and is never expanded, split, or executed by the build shell. The
 // fixed prefixes/stores/versions are constants and pass through quoted-or-bare
 // like any other value.
-func esbuildCommand(specName string, sources []handlerSource, tsconfig bool) string {
+func esbuildCommand(spec plan.Spec, sources []handlerSource, tsconfig bool) string {
 	parts := []string{pnpmEsbuildAdd(esbuildPrefix)}
 	tsconfigFlag := ""
 	if tsconfig {
 		tsconfigFlag = " --tsconfig=" + shellQuoteArg(path.Join(workDir, tsconfigFile))
 	}
+	target := esbuildTarget(spec)
 	for _, s := range sources {
 		parts = append(parts, fmt.Sprintf(
 			"%s --bundle %s --outfile=%s --format=esm --platform=node --target=%s --packages=external%s --log-level=warning",
 			shellQuoteArg(esbuildBin),
 			shellQuoteArg(s.srcPath()),
 			shellQuoteArg(s.outPath()),
-			shellQuoteArg(specName),
+			shellQuoteArg(target),
 			tsconfigFlag,
 		))
 	}

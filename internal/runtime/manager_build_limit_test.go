@@ -117,7 +117,7 @@ func writeBuildApp(t *testing.T, name string) app.App {
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){ return 'ok'; }\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
-	return app.App{Name: name, Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	return app.App{Name: name, Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 }
 
 // buildCapManager builds a Manager directly (no daemon) whose preparation

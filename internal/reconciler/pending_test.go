@@ -128,7 +128,7 @@ func waitDone(t *testing.T, done <-chan struct{}) {
 // templateWithEvents builds a minimal valid runtime template with the given
 // `events:` body (already indented under the events key).
 func templateWithEvents(body string) string {
-	return "runtime: node24\nevents:\n" + body
+	return "runtime: nodejs24.x\nevents:\n" + body
 }
 
 // writeTemplateDirFor writes a directory under root with the given template and

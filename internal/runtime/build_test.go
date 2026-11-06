@@ -574,7 +574,7 @@ func TestQuoteEntrypointJSON(t *testing.T) {
 // assertion also covers the capture boundary.
 func TestCaptureSourceSnapshotSkipsTemplateYaml(t *testing.T) {
 	src := t.TempDir()
-	if err := os.WriteFile(filepath.Join(src, "template.yaml"), []byte("runtime: node24\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(src, "template.yaml"), []byte("runtime: nodejs24.x\n"), 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(src, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
@@ -630,7 +630,7 @@ func TestCaptureSourceSnapshotHonorsSelection(t *testing.T) {
 		}
 	}
 	write(".gitignore", "*.log\ntemplate.yaml-ignored\n")
-	write("template.yaml", "runtime: node24\n")
+	write("template.yaml", "runtime: nodejs24.x\n")
 	write("index.js", "export function h(){}\n")
 	write("debug.log", "noise\n")
 

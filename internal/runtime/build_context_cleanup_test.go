@@ -71,7 +71,7 @@ func TestBuildContextTempDirRemovedOnBuildSuccess(t *testing.T) {
 	)
 	m := newLifecycleManager(t, cli, context.Background())
 
-	fn := app.App{Name: "ctx-success", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "ctx-success", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	if _, err := m.Prepare(context.Background(), fn); err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestBuildContextTempDirRemovedOnBuildFailure(t *testing.T) {
 	)
 	m := newLifecycleManager(t, cli, context.Background())
 
-	fn := app.App{Name: "ctx-failure", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "ctx-failure", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	if _, err := m.Prepare(context.Background(), fn); err == nil {
 		t.Fatal("expected the scripted build failure to surface")
 	}
@@ -151,7 +151,7 @@ func TestBuildContextTempDirRemovedOnBuildCancellation(t *testing.T) {
 	)
 	m := newLifecycleManager(t, cli, lifecycle)
 
-	fn := app.App{Name: "ctx-cancel", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "ctx-cancel", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	done := make(chan error, 1)
 	go func() {
 		_, err := m.Prepare(context.Background(), fn)

@@ -72,8 +72,10 @@ combine schedules with at least one event rule or service.
 
 ### Runtime
 
-`runtime` is `python3.14` or `node24`; any other value fails validation. It is
-required whenever Relay must launch work through a runtime:
+`runtime` is one of `python3.14`, `python3.15`, `nodejs24.x`, or `nodejs26.x`;
+any other value fails validation. These identifiers mirror the AWS Lambda
+runtime names. `runtime` is required whenever Relay must launch work through a
+runtime:
 
 - any `events` or `schedules` entry, or
 - any service using an `entrypoint` source.
@@ -83,23 +85,35 @@ needs no `runtime` at all — those images carry their own `ENTRYPOINT`/`CMD`. A
 explicitly configured runtime is always validated, so a typo in an otherwise
 image-only template is still a parse error.
 
-The managed runtimes and dependency handling are:
+The managed runtimes and their official base images are:
 
-| Runtime      | Base image         | Dependencies                                                                                                                                                                                                                                                 |
-| ------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `python3.14` | `python:3.14-slim` | `uv.lock` + `pyproject.toml` (native uv project, installed locked); else `requirements.txt` via `uv pip install --system`.                                                                                                                                   |
-| `node24`     | `node:24-alpine`   | `pnpm-lock.yaml` + `package.json` → `pnpm install --prod --frozen-lockfile`; a `package.json` without `pnpm-lock.yaml` is an error, and `package-lock.json` is rejected. TypeScript is bundled at build time (or at container startup under `HOT_RELOAD`). |
+| Runtime      | Base image         |
+| ------------ | ------------------ |
+| `python3.14` | `python:3.14-slim` |
+| `python3.15` | `python:3.15-slim` |
+| `nodejs24.x` | `node:24-alpine`   |
+| `nodejs26.x` | `node:26-alpine`   |
+
+Dependency handling:
+
+- **Python** installs `uv.lock` + `pyproject.toml` as a native uv project
+  (locked); otherwise it installs `requirements.txt` with
+  `uv pip install --system`.
+- **Node.js** installs `pnpm-lock.yaml` + `package.json` with
+  `pnpm install --prod --frozen-lockfile`. A `package.json` without
+  `pnpm-lock.yaml` is an error, and `package-lock.json` is rejected.
+  TypeScript is bundled at build time (or at container startup under
+  `HOT_RELOAD`).
 
 Python dependencies are installed with uv, never pip. Node dependencies are
 installed with pnpm, never npm: a committed `pnpm-lock.yaml` is mandatory
 whenever the app has a `package.json`, and an npm `package-lock.json` is
 rejected rather than silently used. A `uv.lock` without `pyproject.toml` (or
 vice versa) is an error rather than a guess, and the same holds for
-`pnpm-lock.yaml` without `package.json`. `node24`
-accepts JavaScript **and** TypeScript handlers; TypeScript is transpiled and
-bundled by Relay — at build time for a baked image, or at container startup from
-the live mount under `HOT_RELOAD` — so esbuild is never needed in your
-`package.json`.
+`pnpm-lock.yaml` without `package.json`. Node runtimes accept JavaScript **and**
+TypeScript handlers; TypeScript is transpiled and bundled by Relay — at build
+time for a baked image, or at container startup from the live mount under
+`HOT_RELOAD` — so esbuild is never needed in your `package.json`.
 
 Relay materializes each runtime's pinned tool in every image it builds, so you
 never declare it: Python copies the uv binary from its official distroless
@@ -134,7 +148,7 @@ nothing extra. See
 `handler` has the form `module.function`, split at the **last** dot:
 `events.created.handler` → module `events.created`, app `handler`.
 Handlers may live in nested modules (for example the `events/` package), not
-only top-level files. On `node24` a module may be `.js`/`.mjs` or
+only top-level files. On a Node runtime a module may be `.js`/`.mjs` or
 `.ts`/`.mts`; the handler string never carries an extension.
 
 Both event and schedule handlers run as one-shot functions through the managed

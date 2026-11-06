@@ -270,7 +270,7 @@ func TestInvokeHandlerObsoleteScheduleRemoved(t *testing.T) {
 		app.App{
 			Name: "fn",
 			Template: &app.Template{
-				Runtime: "node24",
+				Runtime: "nodejs24.x",
 				Events:  []app.EventRule{{Handler: "index.run", Pattern: app.Pattern{}}},
 			},
 		},
@@ -304,7 +304,7 @@ func TestInvokeHandlerHandlerChangeRunsCurrentHandler(t *testing.T) {
 		app.App{
 			Name: "fn",
 			Template: &app.Template{
-				Runtime: "node24",
+				Runtime: "nodejs24.x",
 				Schedules: []app.Schedule{
 					{Name: "cleanup", Handler: "jobs.new", Cron: "0 3 * * *", Location: time.UTC, Timeout: app.DefaultTimeout, Retries: 0},
 				},
@@ -340,7 +340,7 @@ func TestInvokeHandlerRemovingOneSharedHandlerScheduleDoesNotObsoleteAnother(t *
 		app.App{
 			Name: "fn",
 			Template: &app.Template{
-				Runtime: "node24",
+				Runtime: "nodejs24.x",
 				Schedules: []app.Schedule{
 					{Name: "a", Handler: "jobs.shared", Cron: "0 3 * * *", Location: time.UTC, Timeout: app.DefaultTimeout},
 				},
@@ -378,7 +378,7 @@ func TestInvokeHandlerRemovingOneSharedHandlerScheduleDoesNotObsoleteAnother(t *
 // TryStart (the unavailable branch returns before claiming).
 func TestInvokeHandlerUnavailableAppStillRetryable(t *testing.T) {
 	r := NewWithMetrics(
-		[]*PreparedApp{NewUnavailable(app.App{Name: "broken", Template: &app.Template{Runtime: "node24"}})},
+		[]*PreparedApp{NewUnavailable(app.App{Name: "broken", Template: &app.Template{Runtime: "nodejs24.x"}})},
 		testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)

@@ -136,7 +136,7 @@ func byApp(fs []metrics.AppStat, name string) metrics.AppStat {
 // stateApp builds a minimal app.App for seeding state rows in
 // worker tests without importing the reconciler's helpers.
 func stateApp(name, dir string) app.App {
-	tmpl, err := app.ParseTemplate([]byte("runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"))
+	tmpl, err := app.ParseTemplate([]byte("runtime: nodejs24.x\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"))
 	if err != nil {
 		panic(err)
 	}

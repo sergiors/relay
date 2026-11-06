@@ -695,7 +695,7 @@ func TestIntegrationPendingDesiredRuleStaysPendingThenRuns(t *testing.T) {
 
 // pendingIntegrationTemplate is a single-rule template matching the integration
 // event used above.
-const pendingIntegrationTemplate = `runtime: node24
+const pendingIntegrationTemplate = `runtime: nodejs24.x
 events:
   - handler: handler.created
     pattern:

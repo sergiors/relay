@@ -189,7 +189,7 @@ func TestDependencyFingerprintCanonicalFileOrder(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "pnpm-lock.yaml"), []byte("lockfileVersion: '9.0'\n"), 0o644); err != nil {
 		t.Fatalf("write lock: %v", err)
 	}
-	spec := plan.Spec{Name: "node24", Engine: plan.EngineNode, BaseImage: "node:24-alpine"}
+	spec := plan.Spec{Name: "nodejs24.x", Engine: plan.EngineNode, BaseImage: "node:24-alpine"}
 
 	ab := plan.Deps{Files: []string{"package.json", "pnpm-lock.yaml"}, Install: "pnpm install --prod --frozen-lockfile", Dir: "/app"}
 	ba := plan.Deps{Files: []string{"pnpm-lock.yaml", "package.json"}, Install: "pnpm install --prod --frozen-lockfile", Dir: "/app"}
@@ -306,9 +306,9 @@ func TestDependencyFingerprintNodePlanDepsPairSensitivity(t *testing.T) {
 	writeNodeTestFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	writeNodeTestFile(t, dir, "index.js", "export function handler(e) {}\n")
 
-	spec, err := lookup("node24")
+	spec, err := lookup("nodejs24.x")
 	if err != nil {
-		t.Fatalf("lookup node24: %v", err)
+		t.Fatalf("lookup nodejs24.x: %v", err)
 	}
 
 	// planDeps is the production path: the Node engine's actual Plan(...).Deps
@@ -381,7 +381,7 @@ func TestDependencyFingerprintPnpmTool(t *testing.T) {
 		t.Fatalf("write pnpm-lock.yaml: %v", err)
 	}
 	deps := plan.Deps{Files: []string{"package.json", "pnpm-lock.yaml"}, Install: "pnpm install --prod --frozen-lockfile", Dir: "/app"}
-	base := plan.Spec{Name: "node24", Engine: plan.EngineNode, BaseImage: "node:24-alpine", RuntimeTools: []plan.RuntimeTool{pnpmTool}}
+	base := plan.Spec{Name: "nodejs24.x", Engine: plan.EngineNode, BaseImage: "node:24-alpine", RuntimeTools: []plan.RuntimeTool{pnpmTool}}
 
 	orig, err := DependencyFingerprint("amd64", "linux", base, dir, deps)
 	if err != nil {
@@ -532,7 +532,7 @@ func TestTypeScriptEditsInvalidateAppNotDependency(t *testing.T) {
 		t.Fatalf("write handler.ts: %v", err)
 	}
 
-	spec := plan.Spec{Name: "node24", Engine: plan.EngineNode, BaseImage: "node:24-alpine"}
+	spec := plan.Spec{Name: "nodejs24.x", Engine: plan.EngineNode, BaseImage: "node:24-alpine"}
 	deps := plan.Deps{Files: []string{"package.json"}, Install: "pnpm install --prod --frozen-lockfile", Dir: "/app"}
 
 	funcBefore := fpOf(t, dir)
@@ -592,7 +592,7 @@ func TestTypeScriptIgnoredFileChangesNeitherFingerprint(t *testing.T) {
 		t.Fatalf("write generated.ts: %v", err)
 	}
 
-	spec := plan.Spec{Name: "node24", Engine: plan.EngineNode, BaseImage: "node:24-alpine"}
+	spec := plan.Spec{Name: "nodejs24.x", Engine: plan.EngineNode, BaseImage: "node:24-alpine"}
 	deps := plan.Deps{Files: []string{"package.json"}, Install: "pnpm install --prod --frozen-lockfile", Dir: "/app"}
 
 	funcBefore := fpOf(t, dir)

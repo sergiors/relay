@@ -168,7 +168,7 @@ func TestRefChange(t *testing.T) {
 	e := fixture(t, false)
 	cfg := Config{Repository: "git@github.com:acme/r.git", Ref: "other"}
 	// Distinct content only on 'other'.
-	updateFnAndAdd(t, e, "other", "fn", "runtime: node24\n#other\n", "otherfn")
+	updateFnAndAdd(t, e, "other", "fn", "runtime: nodejs24.x\n#other\n", "otherfn")
 	mustSync(t, e, cfg)
 	b, _ := os.ReadFile(filepath.Join(e.apps, "fn", "template.yaml"))
 	if !strings.Contains(string(b), "#other") {
@@ -241,9 +241,9 @@ func TestMonorepoSync(t *testing.T) {
 		t.Fatalf("worktree: %v", err)
 	}
 	writeFile(t, filepath.Join(e.work, "services", "funa", "template.yaml"),
-		"runtime: node24\nevents:\n  - handler: a.handler\n")
+		"runtime: nodejs24.x\nevents:\n  - handler: a.handler\n")
 	writeFile(t, filepath.Join(e.work, "services", "funb", "template.yaml"),
-		"runtime: node24\nevents:\n  - handler: b.handler\n")
+		"runtime: nodejs24.x\nevents:\n  - handler: b.handler\n")
 	writeFile(t, filepath.Join(e.work, "services", "README.md"), "# services\n")
 	writeFile(t, filepath.Join(e.work, "services", "vendor", "lib.go"), "package vendor\n")
 	for _, p := range []string{

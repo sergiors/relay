@@ -90,7 +90,7 @@ func TestAppImageBuildGetsIndependentTenMinuteDeadline(t *testing.T) {
 	fn := app.App{
 		Name:     "build-deadline",
 		Dir:      dir,
-		Template: &app.Template{Runtime: "node24"},
+		Template: &app.Template{Runtime: "nodejs24.x"},
 	}
 
 	var got buildDeadline
@@ -138,7 +138,7 @@ func TestLifecycleCancellationCancelsActiveBuild(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
-	fn := app.App{Name: "cancel-build", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "cancel-build", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 
 	lifecycle, cancelLifecycle := context.WithCancel(context.Background())
 	defer cancelLifecycle()
@@ -208,7 +208,7 @@ func TestServiceImageSourceKeepsCallerShortDeadline(t *testing.T) {
 
 	shortCtx, shortCancel := context.WithTimeout(context.Background(), reconcileShort)
 	defer shortCancel()
-	if _, err := m.ResolveServiceImage(shortCtx, "fn", &app.Template{Runtime: "node24"}, svc, ""); err != nil {
+	if _, err := m.ResolveServiceImage(shortCtx, "fn", &app.Template{Runtime: "nodejs24.x"}, svc, ""); err != nil {
 		t.Fatalf("resolve (image source): %v", err)
 	}
 	if !inspectDeadline.seen || !inspectDeadline.ok {

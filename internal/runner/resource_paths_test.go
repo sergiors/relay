@@ -18,7 +18,7 @@ import (
 // internal/runtime (manager_resources_test.go).
 func TestAllEntryPathsSharePreparedHandle(t *testing.T) {
 	exec := &captureExecutor{}
-	tmpl := `runtime: node24
+	tmpl := `runtime: nodejs24.x
 events:
   - handler: index.run
     pattern:

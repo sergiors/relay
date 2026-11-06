@@ -39,8 +39,9 @@ const pnpmReleaseBaseURL = "https://github.com/pnpm/pnpm/releases/download/v" + 
 
 // pnpmMember is the archive member holding the standalone pnpm executable, and
 // pnpmDestination is where every Node image exposes it. The binary is
-// statically linked (musl), so it runs on node:24-alpine with no wrapper and no
-// dependency on the base image's Node interpreter.
+// statically linked (musl), so it runs on the Node Alpine base images
+// (node:24-alpine and node:26-alpine) with no wrapper and no dependency on the
+// base image's Node interpreter.
 const (
 	pnpmMember      = "pnpm"
 	pnpmDestination = "/usr/local/bin/pnpm"
@@ -70,7 +71,11 @@ var pnpmTool = plan.RuntimeTool{
 }
 
 // Supported runtimes. Runtime versions exist only here; adding a version (e.g.
-// python3.15 or node26) needs just another entry.
+// python3.15 or nodejs26.x) needs just another entry. Both engines are
+// version-generic, so a new version differs only in its base image and the
+// template identifier. The map key is the template runtime identifier; Name is
+// the identity hashed into dependency fingerprints and stamped on images, so
+// the two must stay in lockstep.
 var specs = map[string]plan.Spec{
 	"python3.14": {
 		Name:         "python3.14",
@@ -81,15 +86,30 @@ var specs = map[string]plan.Spec{
 		// so mounting live source at /app does not hide runtime dependencies.
 		MountableSource: true,
 	},
-	"node24": {
-		Name:      "node24",
+	"python3.15": {
+		Name:         "python3.15",
+		Engine:       plan.EnginePython,
+		BaseImage:    "python:3.15-slim",
+		RuntimeTools: []plan.RuntimeTool{uvTool},
+		// See python3.14: dependencies live outside the mounted source.
+		MountableSource: true,
+	},
+	"nodejs24.x": {
+		Name:      "nodejs24.x",
 		Engine:    plan.EngineNode,
 		BaseImage: "node:24-alpine",
-		// Node installs dependencies with pnpm (copied from the official pnpm
-		// image; see pnpmTool for the Alpine-compatibility blocker).
+		// Node installs dependencies with the pinned standalone pnpm binary
+		// (see pnpmTool).
 		RuntimeTools: []plan.RuntimeTool{pnpmTool},
 		// Node keeps dependencies under /app, so live source is mounted at
 		// /app/src to keep /app/node_modules available.
+		MountableSource: true,
+	},
+	"nodejs26.x": {
+		Name:            "nodejs26.x",
+		Engine:          plan.EngineNode,
+		BaseImage:       "node:26-alpine",
+		RuntimeTools:    []plan.RuntimeTool{pnpmTool},
 		MountableSource: true,
 	},
 }

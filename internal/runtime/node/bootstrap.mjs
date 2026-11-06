@@ -63,7 +63,7 @@ const BAKED_ROOT = "/app";
 const SOURCE_ROOT = MOUNTED ? MOUNT_ROOT : BAKED_ROOT;
 const GENERATED_ROOT = "/tmp/relay-gen";
 const ESBUILD_BIN = "/relay/esbuild/node_modules/.bin/esbuild";
-// The esbuild --target tracks the managed runtime version (node24 -> node24).
+// The esbuild --target tracks the running Node major (nodejs26.x -> node26).
 const NODE_TARGET = "node" + process.versions.node.split(".")[0];
 
 // Resolve from BAKED_ROOT so the bootstrap and user modules share one API
@@ -152,7 +152,7 @@ function isFile(candidate) {
   }
 }
 
-// A mounted container runs Node 24, whose synchronous registerHooks API the
+// A mounted container runs Node 24 or 26, whose synchronous registerHooks API the
 // shared hook relies on. Import /relay/resolve-hook.mjs (present only in a
 // source-mounted image) for its side effect: it self-installs the resolve hook
 // so a bare import OR require from the mounted source always resolves from the

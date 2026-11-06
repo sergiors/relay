@@ -55,7 +55,9 @@ untrusted networks.
 ## What you get
 
 - **Event-driven execution** — Redis Streams, declarative matching, retries, reclaim, dead-lettering, and at-least-once delivery.
-- **Managed runtimes** — Python 3.14 and Node 24, including TypeScript support, with reusable warm containers and bounded concurrency.
+- **Managed runtimes** — Python 3.14/3.15 (`python3.14`/`python3.15`) and
+  Node.js 24/26 (`nodejs24.x`/`nodejs26.x`), with TypeScript support, reusable
+  warm containers, and bounded concurrency.
 - **Cron schedules** — minute-precision cron with IANA timezones, deterministic occurrence identity, cluster-wide publication deduplication, bounded retries with a durable local outbox, and startup catch-up.
 - **Persistent services** — run APIs, workers, gateways, consumers, and other long-running processes from managed-runtime entrypoints or external container images, with replicas, Docker networks, resource limits, environment configuration, secrets, and optional Traefik routing.
 - **Resource controls** — per-container memory, CPU, and PID limits.
@@ -102,7 +104,7 @@ Each app is a direct child of `/apps` and contains a `template.yaml`.
 A small event-driven app might look like:
 
 ```yaml
-runtime: node24
+runtime: nodejs24.x
 concurrency: 4
 
 resources:

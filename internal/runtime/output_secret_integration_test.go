@@ -32,7 +32,7 @@ func TestIntegrationAppEnvInjection(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 env:
   GREETING: hello
 events:
@@ -49,7 +49,7 @@ export function env(event) {
   console.log("FILES=" + readdirSync("/app").join(","));
 }
 `)
-	fn := app.App{Name: "env-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "env-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	m, _ := newManager(t)
 	out := newAppOutputSink(t)
 
@@ -82,7 +82,7 @@ func TestIntegrationSecretInjectionAndRotation(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 secrets:
   TOKEN: relay-itest-token
 events:
@@ -95,7 +95,7 @@ export function secret(event) {
   console.log("TOKEN=" + process.env.TOKEN);
 }
 `)
-	fn := app.App{Name: "secret-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "secret-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	m, _ := newManager(t)
 	out := newAppOutputSink(t)
 
@@ -143,7 +143,7 @@ func TestIntegrationMultilineSecretInjection(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 secrets:
   PRIVATE_KEY: rsa-private-key
 events:
@@ -159,7 +159,7 @@ export function secret(event) {
   console.log("PK<begin>" + v + "<end>");
 }
 `)
-	fn := app.App{Name: "multiline-secret-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "multiline-secret-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	m, logBuf := newManager(t)
 	out := newAppOutputSink(t)
 
@@ -216,7 +216,7 @@ func TestIntegrationMultipleAppsSameSecret(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 secrets:
   TOKEN: relay-itest-token
 events:
@@ -229,7 +229,7 @@ export function secret(event) {
   console.log("TOKEN=" + process.env.TOKEN);
 }
 `)
-			fn := app.App{Name: tc.name, Dir: dir, Template: &app.Template{Runtime: "node24"}}
+			fn := app.App{Name: tc.name, Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 			m, _ := newManager(t)
 			out := newAppOutputSink(t)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -271,7 +271,7 @@ func TestIntegrationAppOutputIgnoresLogLevel(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.emit
     pattern:
@@ -284,7 +284,7 @@ export function emit(event) {
   console.error("err-line");
 }
 `)
-	fn := app.App{Name: "loglevel-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "loglevel-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -316,7 +316,7 @@ func TestIntegrationPanickingSinkDoesNotBreakInvocation(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.paniclog
     pattern:
@@ -327,7 +327,7 @@ export function paniclog(event) {
   console.log("output before panic");
 }
 `)
-	fn := app.App{Name: "paniclog-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "paniclog-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)

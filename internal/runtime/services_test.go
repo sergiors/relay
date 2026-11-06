@@ -409,12 +409,14 @@ func TestServiceEntryTranslatesPerRuntime(t *testing.T) {
 		want       []string
 		wantErr    string // substring; empty means success
 	}{
-		{"node24", "service.js", []string{"node", "/app/service.js"}, ""},
+		{"nodejs24.x", "service.js", []string{"node", "/app/service.js"}, ""},
+		{"nodejs26.x", "service.js", []string{"node", "/app/service.js"}, ""},
 		{"python3.14", "service.py", []string{"python", "-m", "service"}, ""},
-		{"node24", "app/service.js", []string{"node", "/app/app/service.js"}, ""},
+		{"python3.15", "service.py", []string{"python", "-m", "service"}, ""},
+		{"nodejs24.x", "app/service.js", []string{"node", "/app/app/service.js"}, ""},
 		{"python3.14", "app/main.py", []string{"python", "-m", "app.main"}, ""},
 		{"python3.14", "app/http/server.py", []string{"python", "-m", "app.http.server"}, ""},
-		{"node24", "a/b/c.js", []string{"node", "/app/a/b/c.js"}, ""},
+		{"nodejs24.x", "a/b/c.js", []string{"node", "/app/a/b/c.js"}, ""},
 		// Python entrypoints that are valid files but not importable modules fail
 		// with a python-specific error (the conversion runs after validation).
 		{"python3.14", "app/main.js", nil, "require a .py module file"},
@@ -422,7 +424,7 @@ func TestServiceEntryTranslatesPerRuntime(t *testing.T) {
 		{"unknown", "service.js", nil, "unsupported runtime"},
 		// The generic path rules reject these for BOTH runtimes, before any
 		// runtime-specific translation.
-		{"node24", "../../etc/passwd", nil, "must not contain"},
+		{"nodejs24.x", "../../etc/passwd", nil, "must not contain"},
 		{"python3.14", "../main.py", nil, "must not contain"},
 		{"python3.14", "/app/main.py", nil, "relative"},
 		{"python3.14", "a//b.py", nil, "empty path elements"},

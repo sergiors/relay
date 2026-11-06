@@ -640,7 +640,7 @@ func TestSeparateTreesUseIndependentGitCloneOverrides(t *testing.T) {
 	// Distinguishable template content per repo: the materialized app name is
 	// the fixture's fn dir in both trees, so the RENDERED template content is
 	// what proves which repo each tree cloned from.
-	bareA := testutil.New(t, testutil.Options{Template: "runtime: node24\n"}).Bare
+	bareA := testutil.New(t, testutil.Options{Template: "runtime: nodejs24.x\n"}).Bare
 	bareB := testutil.New(t, testutil.Options{Template: "runtime: python3.14\n"}).Bare
 
 	// Each tree persists its own validated SSH URL; the transport override is
@@ -694,10 +694,10 @@ func TestSeparateTreesUseIndependentGitCloneOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read tree B materialized template: %v", err)
 	}
-	if !strings.Contains(string(tmplA), "runtime: node24") || strings.Contains(string(tmplA), "python3.14") {
+	if !strings.Contains(string(tmplA), "runtime: nodejs24.x") || strings.Contains(string(tmplA), "python3.14") {
 		t.Fatalf("tree A materialized from the wrong source: %s", tmplA)
 	}
-	if !strings.Contains(string(tmplB), "runtime: python3.14") || strings.Contains(string(tmplB), "node24") {
+	if !strings.Contains(string(tmplB), "runtime: python3.14") || strings.Contains(string(tmplB), "nodejs24.x") {
 		t.Fatalf("tree B did not sync from its own local repo: %s", tmplB)
 	}
 

@@ -55,7 +55,7 @@ func recoveryServiceEntry() []string {
 // app image is recoveryImage) so adoption can be exercised without a registry.
 func recoveryServiceTemplate() *app.Template {
 	return &app.Template{
-		Runtime: "node24",
+		Runtime: "nodejs24.x",
 		Services: []app.Service{{
 			Name:       "web",
 			Entrypoint: "web.js",
@@ -516,7 +516,7 @@ func TestIntegrationStartupRecoveryAdoptsServiceAfterAbruptExit(t *testing.T) {
 	// Ordinary live convergence still runs after recovery: publishing the
 	// removal through the same coordinator stops this identity's adopted
 	// container, while the other worker's same-app container is untouched.
-	emptyTemplate := &app.Template{Runtime: "node24"}
+	emptyTemplate := &app.Template{Runtime: "nodejs24.x"}
 	services.Enqueue(desiredApp, emptyTemplate, recoveryImage, nil)
 	recoveryWaitContainerGone(t, dcli, desiredID)
 	if !recoveryContainerRunning(t, dcli, foreignSameAppID) {

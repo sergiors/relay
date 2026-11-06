@@ -721,7 +721,7 @@ func (e *cliTestExecutor) got() []string {
 func TestAppInvokeFullStack(t *testing.T) {
 	deps := invokeDeps(t)
 	exec := &cliTestExecutor{}
-	tmpl, err := app.ParseTemplate([]byte(`runtime: node24
+	tmpl, err := app.ParseTemplate([]byte(`runtime: nodejs24.x
 events:
   - handler: events.created.handler
     pattern:

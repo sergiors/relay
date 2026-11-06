@@ -15,7 +15,7 @@ import (
 // hardeningTemplate is a parseable template carrying marker as a comment, so a
 // test can distinguish generations with the real app loader.
 func hardeningTemplate(marker string) string {
-	return "runtime: node24\n# " + marker +
+	return "runtime: nodejs24.x\n# " + marker +
 		"\nevents:\n  - handler: h.handler\n    pattern:\n      event_name: [INSERT]\n"
 }
 
@@ -187,7 +187,7 @@ func TestMaterializeAddsNewAppAndRemovesAbsentSourceApp(t *testing.T) {
 
 	apps := t.TempDir()
 	writeFile(t, filepath.Join(apps, "stale", "template.yaml"),
-		"runtime: node24\n# stale\n")
+		"runtime: nodejs24.x\n# stale\n")
 	writeFile(t, filepath.Join(apps, "stale", "old.txt"), "old\n")
 
 	mat, rem, err := materialize(mustSelect(t, src, src), apps)
@@ -201,7 +201,7 @@ func TestMaterializeAddsNewAppAndRemovesAbsentSourceApp(t *testing.T) {
 		t.Fatalf("removed = %v, want [stale]", rem)
 	}
 	if got := mustReadFile(t,
-		filepath.Join(apps, "newapp", "template.yaml")); !strings.Contains(got, "node24") {
+		filepath.Join(apps, "newapp", "template.yaml")); !strings.Contains(got, "nodejs24.x") {
 		t.Fatalf("new app template = %q", got)
 	}
 	if _, err := os.Stat(filepath.Join(apps, "stale")); !os.IsNotExist(err) {
@@ -231,9 +231,9 @@ func TestMaterializeStagingFailureLeavesLiveAppsUntouched(t *testing.T) {
 	src := t.TempDir()
 	writeFile(t, filepath.Join(src, ".gitignore"), "*.ignored\n")
 	writeFile(t, filepath.Join(src, "alpha", "template.yaml"),
-		"runtime: node24\n# new-alpha\n")
+		"runtime: nodejs24.x\n# new-alpha\n")
 	writeFile(t, filepath.Join(src, "zeta", "template.yaml"),
-		"runtime: node24\n# zeta\n")
+		"runtime: nodejs24.x\n# zeta\n")
 	selection := mustSelect(t, src, src)
 	if err := os.MkdirAll(filepath.Join(src, "zeta", ".gitignore"), 0o755); err != nil {
 		t.Fatalf("seed non-file .gitignore: %v", err)
@@ -241,10 +241,10 @@ func TestMaterializeStagingFailureLeavesLiveAppsUntouched(t *testing.T) {
 
 	apps := t.TempDir()
 	writeFile(t, filepath.Join(apps, "alpha", "template.yaml"),
-		"runtime: node24\n# old-alpha\n")
+		"runtime: nodejs24.x\n# old-alpha\n")
 	writeFile(t, filepath.Join(apps, "alpha", "old-only.txt"), "old only\n")
 	writeFile(t, filepath.Join(apps, "stale", "template.yaml"),
-		"runtime: node24\n# stale\n")
+		"runtime: nodejs24.x\n# stale\n")
 
 	exchanges := 0
 	swapExchange(t, func(a, b string) error {
@@ -303,8 +303,8 @@ func TestMaterializeUnreadableSourceDirFailsClosed(t *testing.T) {
 
 	src := t.TempDir()
 	writeFile(t, filepath.Join(src, "alpha", "template.yaml"),
-		"runtime: node24\n# new-alpha\n")
-	writeFile(t, filepath.Join(src, "locked", "template.yaml"), "runtime: node24\n")
+		"runtime: nodejs24.x\n# new-alpha\n")
+	writeFile(t, filepath.Join(src, "locked", "template.yaml"), "runtime: nodejs24.x\n")
 	// Resolve the selection BEFORE the failure injection (as a real sync does:
 	// the checkout policy is read first), so the failure below lands on
 	// materialize's own discovery, not on the selection construction.
@@ -317,10 +317,10 @@ func TestMaterializeUnreadableSourceDirFailsClosed(t *testing.T) {
 
 	apps := t.TempDir()
 	writeFile(t, filepath.Join(apps, "alpha", "template.yaml"),
-		"runtime: node24\n# old-alpha\n")
+		"runtime: nodejs24.x\n# old-alpha\n")
 	writeFile(t, filepath.Join(apps, "alpha", "old-only.txt"), "old\n")
 	writeFile(t, filepath.Join(apps, "stale", "template.yaml"),
-		"runtime: node24\n# stale\n")
+		"runtime: nodejs24.x\n# stale\n")
 
 	mat, rem, err := materialize(selection, apps)
 	if err == nil {
@@ -353,16 +353,16 @@ func TestMaterializeUnreadableSourceDirFailsClosed(t *testing.T) {
 func TestMaterializeUnsupportedExchangeFailsBeforeMutation(t *testing.T) {
 	src := t.TempDir()
 	writeFile(t, filepath.Join(src, "alpha", "template.yaml"),
-		"runtime: node24\n# new-alpha\n")
+		"runtime: nodejs24.x\n# new-alpha\n")
 	writeFile(t, filepath.Join(src, "added", "template.yaml"),
-		"runtime: node24\n# added\n")
+		"runtime: nodejs24.x\n# added\n")
 
 	apps := t.TempDir()
 	writeFile(t, filepath.Join(apps, "alpha", "template.yaml"),
-		"runtime: node24\n# old-alpha\n")
+		"runtime: nodejs24.x\n# old-alpha\n")
 	writeFile(t, filepath.Join(apps, "alpha", "old-only.txt"), "old only\n")
 	writeFile(t, filepath.Join(apps, "stale", "template.yaml"),
-		"runtime: node24\n# stale\n")
+		"runtime: nodejs24.x\n# stale\n")
 
 	unsupported := errors.New("injected unsupported exchange")
 	var targets []string
@@ -410,17 +410,17 @@ func TestMaterializeCommitFailureRollsBackPreviousSwap(t *testing.T) {
 
 	src := t.TempDir()
 	writeFile(t, filepath.Join(src, "alpha", "template.yaml"),
-		"runtime: node24\n# new-alpha\n")
+		"runtime: nodejs24.x\n# new-alpha\n")
 	writeFile(t, filepath.Join(src, "alpha", "new-only.txt"), "new\n")
 	writeFile(t, filepath.Join(src, "beta", "template.yaml"),
-		"runtime: node24\n# new-beta\n")
+		"runtime: nodejs24.x\n# new-beta\n")
 
 	apps := t.TempDir()
 	writeFile(t, filepath.Join(apps, "alpha", "template.yaml"),
-		"runtime: node24\n# old-alpha\n")
+		"runtime: nodejs24.x\n# old-alpha\n")
 	writeFile(t, filepath.Join(apps, "alpha", "old-only.txt"), "old\n")
 	writeFile(t, filepath.Join(apps, "beta", "template.yaml"),
-		"runtime: node24\n# old-beta\n")
+		"runtime: nodejs24.x\n# old-beta\n")
 	writeFile(t, filepath.Join(apps, "beta", "old-only.txt"), "old\n")
 
 	commitFailure := errors.New("injected commit failure")
@@ -483,17 +483,17 @@ func TestMaterializeCommitFailureRollsBackNewApp(t *testing.T) {
 
 	src := t.TempDir()
 	writeFile(t, filepath.Join(src, "alpha", "template.yaml"),
-		"runtime: node24\n# new-alpha\n")
+		"runtime: nodejs24.x\n# new-alpha\n")
 	writeFile(t, filepath.Join(src, "beta", "template.yaml"),
-		"runtime: node24\n# new-beta\n")
+		"runtime: nodejs24.x\n# new-beta\n")
 	writeFile(t, filepath.Join(src, "gamma", "template.yaml"),
-		"runtime: node24\n# new-gamma\n")
+		"runtime: nodejs24.x\n# new-gamma\n")
 
 	apps := t.TempDir()
 	writeFile(t, filepath.Join(apps, "alpha", "template.yaml"),
-		"runtime: node24\n# old-alpha\n")
+		"runtime: nodejs24.x\n# old-alpha\n")
 	writeFile(t, filepath.Join(apps, "gamma", "template.yaml"),
-		"runtime: node24\n# old-gamma\n")
+		"runtime: nodejs24.x\n# old-gamma\n")
 
 	commitFailure := errors.New("injected gamma commit failure")
 	var liveTargets []string
@@ -549,14 +549,14 @@ func TestMaterializeRollbackFailurePreservesOldTreeBackup(t *testing.T) {
 		hardeningTemplate("new-alpha"))
 	writeFile(t, filepath.Join(src, "alpha", "new-only.txt"), "new only\n")
 	writeFile(t, filepath.Join(src, "beta", "template.yaml"),
-		"runtime: node24\n# new-beta\n")
+		"runtime: nodejs24.x\n# new-beta\n")
 
 	apps := t.TempDir()
 	writeFile(t, filepath.Join(apps, "alpha", "template.yaml"),
 		hardeningTemplate("old-alpha"))
 	writeFile(t, filepath.Join(apps, "alpha", "old-only.txt"), "old only\n")
 	writeFile(t, filepath.Join(apps, "beta", "template.yaml"),
-		"runtime: node24\n# old-beta\n")
+		"runtime: nodejs24.x\n# old-beta\n")
 
 	commitFailure := errors.New("injected beta commit failure")
 	rollbackFailure := errors.New("injected alpha rollback failure")
@@ -674,7 +674,7 @@ func TestMaterializeRollbackFailurePreservesOldTreeBackup(t *testing.T) {
 func TestRollbackRemovalsRestoresDetachedTree(t *testing.T) {
 	apps := t.TempDir()
 	writeFile(t, filepath.Join(apps, "gone", "template.yaml"),
-		"runtime: node24\n# gone\n")
+		"runtime: nodejs24.x\n# gone\n")
 
 	detached, err := detachStaleApp(apps, "gone")
 	if err != nil {
@@ -706,7 +706,7 @@ func TestRollbackRemovalsRestoresDetachedTree(t *testing.T) {
 func TestRollbackRemovalsRefusesOccupiedLiveName(t *testing.T) {
 	apps := t.TempDir()
 	writeFile(t, filepath.Join(apps, "gone", "template.yaml"),
-		"runtime: node24\n# old gone\n")
+		"runtime: nodejs24.x\n# old gone\n")
 	detached, err := detachStaleApp(apps, "gone")
 	if err != nil {
 		t.Fatalf("detach stale app: %v", err)
@@ -733,10 +733,10 @@ func TestRollbackRemovalsRefusesOccupiedLiveName(t *testing.T) {
 func TestClearStaleStagesRemovesOnlyReservedEntries(t *testing.T) {
 	apps := t.TempDir()
 	writeFile(t, filepath.Join(apps, "keep", "template.yaml"),
-		"runtime: node24\n")
+		"runtime: nodejs24.x\n")
 	writeFile(t, filepath.Join(apps, "keep", "handler.js"), "export const x=1\n")
 	writeFile(t, filepath.Join(apps, ".sync-orphan", "template.yaml"),
-		"runtime: node24\n")
+		"runtime: nodejs24.x\n")
 	writeFile(t, filepath.Join(apps, ".sync-removed-dead", "partial.txt"),
 		"partial\n")
 	writeFile(t, filepath.Join(apps, ".sync-leftover-file"), "junk\n")
@@ -745,7 +745,7 @@ func TestClearStaleStagesRemovesOnlyReservedEntries(t *testing.T) {
 		t.Fatalf("clearStaleStages: %v", err)
 	}
 	if got := mustReadFile(t,
-		filepath.Join(apps, "keep", "template.yaml")); !strings.Contains(got, "node24") {
+		filepath.Join(apps, "keep", "template.yaml")); !strings.Contains(got, "nodejs24.x") {
 		t.Fatalf("live app content changed: %q", got)
 	}
 	if _, err := os.Stat(filepath.Join(apps, "keep", "handler.js")); err != nil {
@@ -765,7 +765,7 @@ func TestClearStaleStagesRemovesOnlyReservedEntries(t *testing.T) {
 func TestSyncReclaimsStaleStagesBeforeMaterializing(t *testing.T) {
 	e := fixture(t, false)
 	writeFile(t, filepath.Join(e.apps, ".sync-interrupted", "template.yaml"),
-		"runtime: node24\n")
+		"runtime: nodejs24.x\n")
 	writeFile(t, filepath.Join(e.apps, ".sync-interrupted", "partial.txt"),
 		"partial\n")
 

@@ -99,7 +99,7 @@ export function handler(event) {
 }
 `)
 
-	fn := app.App{Name: "src-mount-node-js-it", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "src-mount-node-js-it", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -183,7 +183,7 @@ exports.handler = function (event) {
 };
 `)
 
-	fn := app.App{Name: "src-mount-node-cjs-it", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "src-mount-node-cjs-it", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -257,7 +257,7 @@ export function handler(event: { event_id: string }): void {
 }
 `)
 
-	tmpl := &app.Template{Runtime: "node24"}
+	tmpl := &app.Template{Runtime: "nodejs24.x"}
 	tmpl.Events = append(tmpl.Events, app.EventRule{Handler: "index.handler"})
 	fn := app.App{Name: "src-mount-node-ts-it", Dir: dir, Template: tmpl}
 
@@ -353,7 +353,7 @@ export function handler(event: { event_id: string }): void {
 }
 `)
 
-	tmpl := &app.Template{Runtime: "node24"}
+	tmpl := &app.Template{Runtime: "nodejs24.x"}
 	tmpl.Events = append(tmpl.Events, app.EventRule{Handler: "index.handler"})
 	fn := app.App{Name: "src-mount-node-ts-selfref-it", Dir: dir, Template: tmpl}
 
@@ -436,7 +436,7 @@ export function handler(event) {
 	writeFile(t, dir, "node_modules/picocolors/package.json", `{"name":"picocolors","version":"9.9.9","main":"index.cjs"}`)
 	writeFile(t, dir, "node_modules/picocolors/index.cjs", `module.exports = { red: function () { return "HOST_MODULE_SHADOW"; } };`)
 
-	fn := app.App{Name: "src-mount-shadow-it", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "src-mount-shadow-it", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -493,7 +493,7 @@ export function handler(event) {
 }
 `)
 
-	fn := app.App{Name: "src-mount-late-it", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "src-mount-late-it", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -571,7 +571,7 @@ export function handler(event) {
 }
 `)
 
-	fn := app.App{Name: "src-mount-cwd-it", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "src-mount-cwd-it", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -627,7 +627,7 @@ setInterval(() => {}, 1 << 30);
 `)
 
 	appName := "src-mount-svc-shadow-it"
-	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -689,7 +689,7 @@ setInterval(() => {}, 1 << 30);
 		t.Fatalf("creating an ignored node_modules moved the source fingerprint: %q -> %q", fpBefore, fpAfter)
 	}
 
-	tmpl := &app.Template{Runtime: "node24"}
+	tmpl := &app.Template{Runtime: "nodejs24.x"}
 	svc := app.Service{Name: "svc", Entrypoint: "app/service.js", Port: 3000}
 	resolved, err := m.ResolveServiceImage(ctx, fn.Name, tmpl, svc, prepared.Image)
 	if err != nil {
@@ -759,7 +759,7 @@ setInterval(() => {}, 1 << 30);
 `)
 
 	appName := "src-mount-svc-it"
-	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -791,7 +791,7 @@ setInterval(() => {}, 1 << 30);
 		t.Fatalf("prepare: %v", err)
 	}
 
-	tmpl := &app.Template{Runtime: "node24"}
+	tmpl := &app.Template{Runtime: "nodejs24.x"}
 	svc := app.Service{Name: "svc", Entrypoint: "app/service.js", Port: 3000}
 	resolved, err := m.ResolveServiceImage(ctx, fn.Name, tmpl, svc, prepared.Image)
 	if err != nil {
@@ -862,7 +862,7 @@ export function handler(event) {
 }
 `)
 
-	fn := app.App{Name: "src-mount-dep-it", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "src-mount-dep-it", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 
@@ -1031,7 +1031,7 @@ func TestIntegrationSourceMountBusyGenerationAdvanceDrains(t *testing.T) {
 	dir := writeSourceMountGateApp(t)
 
 	fn := app.App{Name: "src-mount-busy-it", Dir: dir,
-		Template: &app.Template{Runtime: "node24", Concurrency: 2}}
+		Template: &app.Template{Runtime: "nodejs24.x", Concurrency: 2}}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -1137,7 +1137,7 @@ func TestIntegrationSourceMountWarmBoundBackpressuresBusyGeneration(t *testing.T
 	dir := writeSourceMountGateApp(t)
 
 	fn := app.App{Name: "src-mount-warm-it", Dir: dir,
-		Template: &app.Template{Runtime: "node24", Concurrency: 1}}
+		Template: &app.Template{Runtime: "nodejs24.x", Concurrency: 1}}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -1284,7 +1284,7 @@ setInterval(() => {}, 1 << 30);
 `)
 
 	appName := "src-mount-svc-replace-it"
-	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 
@@ -1339,7 +1339,7 @@ setInterval(() => {}, 1 << 30);
 	// an unrelated relay-dep-* tag concurrently), and it is never used to delete.
 	depAfterFirst := depTagSet(ctx, cli)
 
-	tmpl := &app.Template{Runtime: "node24"}
+	tmpl := &app.Template{Runtime: "nodejs24.x"}
 	svc := app.Service{Name: "svc", Entrypoint: "app/service.js", Port: 3000}
 	resolved1, err := m.ResolveServiceImage(ctx, appName, tmpl, svc, first.Image)
 	if err != nil {
@@ -1475,7 +1475,7 @@ setInterval(() => {}, 1 << 30);
 `)
 
 	appName := "src-mount-restart-it"
-	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 
@@ -1507,7 +1507,7 @@ setInterval(() => {}, 1 << 30);
 		t.Fatalf("prepare v1: %v", err)
 	}
 
-	tmpl := &app.Template{Runtime: "node24"}
+	tmpl := &app.Template{Runtime: "nodejs24.x"}
 	svc := app.Service{Name: "svc", Entrypoint: "app/service.js", Port: 3000}
 	resolved1, err := m.ResolveServiceImage(ctx, appName, tmpl, svc, first.Image)
 	if err != nil {
@@ -1633,7 +1633,7 @@ export function handler(event: { event_id: string }): void {
 }
 `)
 
-	tmpl := &app.Template{Runtime: "node24"}
+	tmpl := &app.Template{Runtime: "nodejs24.x"}
 	tmpl.Events = append(tmpl.Events, app.EventRule{Handler: "index.handler"})
 	fn := app.App{Name: "src-mount-node-ts-alias-it", Dir: dir, Template: tmpl}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)

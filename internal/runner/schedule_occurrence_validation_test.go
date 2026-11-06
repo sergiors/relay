@@ -221,7 +221,7 @@ func TestInvokeOccurrenceUnavailableRetryable(t *testing.T) {
 	r := New([]*PreparedApp{NewUnavailable(app.App{
 		Name: "fn",
 		Template: &app.Template{
-			Runtime: "node24",
+			Runtime: "nodejs24.x",
 			Schedules: []app.Schedule{{
 				Name: "cleanup", Handler: "jobs.run", Cron: "0 3 * * *", Location: time.UTC,
 			}},

@@ -64,7 +64,7 @@ func TestReconcileResourceOnlyChangeSkipsPrepareAndPublishesResources(t *testing
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	const base = `runtime: node24
+	const base = `runtime: nodejs24.x
 resources:
   memory: 128MiB
 events:
@@ -88,7 +88,7 @@ events:
 	firstImage := reg.GetByName("res").Prepared().Image
 
 	// Change resources ONLY. The fingerprint must not move, so no rebuild.
-	const changed = `runtime: node24
+	const changed = `runtime: nodejs24.x
 resources:
   memory: 1GiB
   cpus: 0.5
@@ -130,7 +130,7 @@ func TestReconcileResourceOnlyChangeDoesNotChurnBuilder(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	const tmpl = `runtime: node24
+	const tmpl = `runtime: nodejs24.x
 resources:
   memory: 256MiB
 events:
@@ -169,7 +169,7 @@ func TestReconcileNonResourceEditStillRebuilds(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	const base = `runtime: node24
+	const base = `runtime: nodejs24.x
 resources:
   memory: 128MiB
 events:
@@ -191,7 +191,7 @@ events:
 		t.Fatalf("prepare count = %d, want 1", b.prepareCount())
 	}
 
-	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(`runtime: node24
+	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(`runtime: nodejs24.x
 resources:
   memory: 128MiB
 events:

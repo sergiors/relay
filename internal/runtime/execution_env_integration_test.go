@@ -44,7 +44,7 @@ func TestIntegrationExecutionConfigEnvExcludesDynamicEnv(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 env:
   GREETING: `+envValue+`
 secrets:
@@ -63,7 +63,7 @@ export async function env(event) {
   await new Promise(r => setTimeout(r, event.blockMs ?? 0));
 }
 `)
-	fn := app.App{Name: "env-boundary-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "env-boundary-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)

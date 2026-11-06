@@ -640,7 +640,7 @@ func TestHandleRemovedRuleDoesNotGateAck(t *testing.T) {
 		app.App{
 			Name: "alpha",
 			Template: &app.Template{
-				Runtime: "node24",
+				Runtime: "nodejs24.x",
 				Events:  []app.EventRule{},
 			},
 		},

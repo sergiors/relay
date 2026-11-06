@@ -191,7 +191,7 @@ func TestIntegrationNodeEndToEnd(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.created
     pattern:
@@ -208,7 +208,7 @@ export async function created(event) {
 		Name: "node-e2e",
 		Dir:  dir,
 		Template: &app.Template{
-			Runtime: "node24",
+			Runtime: "nodejs24.x",
 		},
 	}
 	m, _ := newManager(t)
@@ -320,7 +320,7 @@ func TestIntegrationNodeBrokenDependencyEndToEnd(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.run
     pattern:
@@ -333,7 +333,7 @@ export function run(event) {
 }
 `)
 
-	fn := app.App{Name: "node-broken-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "node-broken-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	m, _ := newManager(t)
 	out := newAppOutputSink(t)
 
@@ -358,11 +358,11 @@ export function run(event) {
 	t.Logf("container logs: %s", logs)
 }
 
-// tsTemplate builds a hand-constructed node24 template carrying the given event
+// tsTemplate builds a hand-constructed nodejs24.x template carrying the given event
 // handlers, since Prepare derives the handler modules from the template (an
 // empty template would mean no TypeScript compilation).
 func tsTemplate(handlers ...string) *app.Template {
-	tmpl := &app.Template{Runtime: "node24"}
+	tmpl := &app.Template{Runtime: "nodejs24.x"}
 	for _, h := range handlers {
 		tmpl.Events = append(tmpl.Events, app.EventRule{Handler: h})
 	}
@@ -377,7 +377,7 @@ func TestIntegrationNodeTSEndToEnd(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.handler
     pattern:
@@ -422,7 +422,7 @@ func TestIntegrationNodeTSDepsEndToEnd(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.handler
     pattern:
@@ -508,7 +508,7 @@ func TestIntegrationNodeTSMultipleHandlersEndToEnd(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: events.created.handler
     pattern:
@@ -564,7 +564,7 @@ func TestIntegrationNodeTSAmbiguousFailsPrepare(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: x.handler
     pattern:
@@ -596,7 +596,7 @@ func TestIntegrationNodeTSMissingFailsPrepare(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: events.created.handler
     pattern:

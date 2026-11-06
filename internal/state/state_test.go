@@ -1372,7 +1372,7 @@ func TestEnvSecretsMappingsNilWhenAbsent(t *testing.T) {
 
 	// A directly-constructed Template (nil Env/Secrets maps) must not panic and
 	// must also persist nil maps.
-	direct := &app.Template{Runtime: "node24"}
+	direct := &app.Template{Runtime: "nodejs24.x"}
 	directFn := fnFor(t, "direct", direct)
 	directFencingToken := seedFencingToken(t, c, directFn)
 	if _, err := c.RecordReconcileSuccess(context.Background(), "direct", "img", "fp", time.Now(), directFn, directFencingToken); err != nil {

@@ -81,7 +81,7 @@ func TestPrepareStagesBuildRootsInsideBuildTempSession(t *testing.T) {
 	m.buildTempStore = store
 	m.buildTemp = sess
 
-	fn := app.App{Name: "session-build", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "session-build", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	if _, err := m.Prepare(context.Background(), fn); err != nil {
 		t.Fatalf("prepare: %v", err)
 	}

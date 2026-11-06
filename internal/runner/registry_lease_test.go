@@ -102,7 +102,7 @@ func TestHandlePinsImageAcrossDelivery(t *testing.T) {
 	}
 	pf := NewPrepared(app.App{
 		Name:     "a",
-		Template: &app.Template{Runtime: "node24", Events: []app.EventRule{alwaysMatchRule(time.Second)}},
+		Template: &app.Template{Runtime: "nodejs24.x", Events: []app.EventRule{alwaysMatchRule(time.Second)}},
 	}, &runtime.Prepared{Name: "a", Image: "relay-app-a:v1"}, exec)
 	pf.lease = lease
 	reg.Set([]*PreparedApp{pf})
@@ -156,7 +156,7 @@ func leasePrepared(exec *leaseExecutor, name, image string) (*PreparedApp, error
 	}
 	pf := NewPrepared(app.App{
 		Name:     name,
-		Template: &app.Template{Runtime: "node24", Events: []app.EventRule{alwaysMatchRule(time.Second)}},
+		Template: &app.Template{Runtime: "nodejs24.x", Events: []app.EventRule{alwaysMatchRule(time.Second)}},
 	}, &runtime.Prepared{Name: name, Image: image}, exec)
 	pf.lease = lease
 	return pf, nil

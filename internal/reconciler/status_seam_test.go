@@ -23,7 +23,7 @@ import (
 func TestReconcileWithStatusCallbackOrdering(t *testing.T) {
 	t.Run("entrypoint service fires reconciling on corrective work", func(t *testing.T) {
 		f := newFakeDocker()
-		entryTmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+		entryTmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 		var order []string
 		c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
@@ -66,7 +66,7 @@ func TestReconcileWithStatusNoOpVerificationDoesNotNotifyReconciling(t *testing.
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
 		envHash: serviceEnvHash(80), resources: serviceResources(),
 	}
-	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	var reconciling int
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
@@ -85,7 +85,7 @@ func TestReconcileWithStatusNoOpVerificationDoesNotNotifyReconciling(t *testing.
 // fires reconciling exactly once before converging the container.
 func TestReconcileWithStatusCorrectiveStartNotifiesReconciling(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	var reconciling int
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
@@ -111,7 +111,7 @@ func TestReconcileWithStatusRemovedServiceNotifiesReconciling(t *testing.T) {
 		id: "old-1", appName: "fn", entrypoint: "old.js",
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
 	}
-	tmpl := serviceTemplate("node24") // old.js is no longer desired
+	tmpl := serviceTemplate("nodejs24.x") // old.js is no longer desired
 
 	var reconciling int
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)

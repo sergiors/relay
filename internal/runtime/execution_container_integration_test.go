@@ -78,7 +78,7 @@ func TestIntegrationProcessExitDiscardsContainer(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.run
     pattern:
@@ -97,7 +97,7 @@ export function run(event) {
   console.log("resurrected");
 }
 `)
-	fn := app.App{Name: "proc-exit-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "proc-exit-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -152,14 +152,14 @@ func TestIntegrationImageChangeDiscardsContainer(t *testing.T) {
 	t.Cleanup(cleanupImagePrefixes(m.cli, "relay-app-img-change:"))
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.run
     pattern:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", "export function run(e){ console.log('v1'); }\n")
-	fn := app.App{Name: "img-change", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "img-change", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 
 	p1, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -210,14 +210,14 @@ func TestIntegrationTwoAppsDistinctContainers(t *testing.T) {
 	for _, name := range []string{"two-fn-a", "two-fn-b"} {
 		dir := t.TempDir()
 		writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.run
     pattern:
       event_name: [INSERT]
 `)
 		writeFile(t, dir, "index.js", "export function run(e){ console.log('"+name+"'); }\n")
-		fn := app.App{Name: name, Dir: dir, Template: &app.Template{Runtime: "node24"}}
+		fn := app.App{Name: name, Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 		prepared, err := m.Prepare(ctx, fn)
 		if err != nil {
 			t.Fatalf("prepare %s: %v", name, err)
@@ -288,7 +288,7 @@ func TestIntegrationConcurrentInvocationsDistinctContainers(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 concurrency: 2
 events:
   - handler: index.a
@@ -315,7 +315,7 @@ export async function c(event) {
 }
 `)
 	fn := app.App{Name: "concurrent-e2e", Dir: dir,
-		Template: &app.Template{Runtime: "node24", Concurrency: 2}}
+		Template: &app.Template{Runtime: "nodejs24.x", Concurrency: 2}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -396,7 +396,7 @@ func TestIntegrationPoolBoundedByConcurrency(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 concurrency: 1
 events:
   - handler: index.run
@@ -408,7 +408,7 @@ export async function run(event) {
   await new Promise(r => setTimeout(r, 150));
 }
 `)
-	fn := app.App{Name: "bounded-e2e", Dir: dir, Template: &app.Template{Runtime: "node24", Concurrency: 1}}
+	fn := app.App{Name: "bounded-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x", Concurrency: 1}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -451,14 +451,14 @@ func TestIntegrationInvalidateImage(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.run
     pattern:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", "export function run(e){ console.log('ok'); }\n")
-	fn := app.App{Name: "invalidate-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "invalidate-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -508,14 +508,14 @@ func TestIntegrationIdleEviction(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.run
     pattern:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", "export function run(e){ console.log('ok'); }\n")
-	fn := app.App{Name: "idle-evict-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "idle-evict-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -567,7 +567,7 @@ func TestIntegrationBusyImageChangeDrains(t *testing.T) {
 	t.Cleanup(cleanupImagePrefixes(m.cli, "relay-app-busy-change:"))
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 concurrency: 2
 events:
   - handler: index.run
@@ -583,7 +583,7 @@ export async function run(event) {
   console.log("END v1");
 }
 `)
-	fn := app.App{Name: "busy-change", Dir: dir, Template: &app.Template{Runtime: "node24", Concurrency: 2}}
+	fn := app.App{Name: "busy-change", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x", Concurrency: 2}}
 	p1, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare v1: %v", err)
@@ -648,14 +648,14 @@ func TestIntegrationRemoveAppDiscardsContainers(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.run
     pattern:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", "export function run(e){ console.log('ok'); }\n")
-	fn := app.App{Name: "remove-fn-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "remove-fn-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -709,7 +709,7 @@ func TestIntegrationPoolMetricsColdWarmDiscard(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.ok
     pattern:
@@ -721,7 +721,7 @@ export async function slow(event) {
   await new Promise(r => setTimeout(r, 10000));
 }
 `)
-	fn := app.App{Name: "pool-metrics-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "pool-metrics-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -801,7 +801,7 @@ func TestIntegrationPoolMetricsConcurrent(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 concurrency: 2
 events:
   - handler: index.sleep
@@ -817,7 +817,7 @@ export async function sleep(event) {
 }
 `)
 	fn := app.App{Name: "pool-metrics-conc", Dir: dir,
-		Template: &app.Template{Runtime: "node24", Concurrency: 2}}
+		Template: &app.Template{Runtime: "nodejs24.x", Concurrency: 2}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -884,7 +884,7 @@ func TestIntegrationPrepareResizesLivePool(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "index.js", "export function run(e){ console.log('ok'); }\n")
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 concurrency: 1
 events:
   - handler: index.run
@@ -892,7 +892,7 @@ events:
       event_name: [INSERT]
 `)
 	fn := app.App{Name: "prepare-resize-e2e", Dir: dir,
-		Template: &app.Template{Runtime: "node24", Concurrency: 1}}
+		Template: &app.Template{Runtime: "nodejs24.x", Concurrency: 1}}
 	p1, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare concurrency 1: %v", err)
@@ -913,14 +913,14 @@ events:
 	// Hot-swap template.yaml to concurrency 3 (changing the app content, so
 	// the reconciler rebuilds) and re-Prepare.
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 concurrency: 3
 events:
   - handler: index.run
     pattern:
       event_name: [INSERT]
 `)
-	fn.Template = &app.Template{Runtime: "node24", Concurrency: 3}
+	fn.Template = &app.Template{Runtime: "nodejs24.x", Concurrency: 3}
 	p2, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare concurrency 3: %v", err)
@@ -965,14 +965,14 @@ func TestIntegrationPrepareClipsConcurrencyToGlobal(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "index.js", "export function run(e){ console.log('ok'); }\n")
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 concurrency: 15
 events:
   - handler: index.run
     pattern:
       event_name: [INSERT]
 `)
-	fn := app.App{Name: "clip-e2e", Dir: dir, Template: &app.Template{Runtime: "node24", Concurrency: 15}}
+	fn := app.App{Name: "clip-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x", Concurrency: 15}}
 	p1, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare concurrency 15: %v", err)
@@ -996,14 +996,14 @@ events:
 
 	// Hot-swap to concurrency 4 (below the cap): the live pool follows to 4.
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 concurrency: 4
 events:
   - handler: index.run
     pattern:
       event_name: [INSERT]
 `)
-	fn.Template = &app.Template{Runtime: "node24", Concurrency: 4}
+	fn.Template = &app.Template{Runtime: "nodejs24.x", Concurrency: 4}
 	p2, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare concurrency 4: %v", err)
@@ -1034,7 +1034,7 @@ func TestIntegrationSuccessfulRunKeepsContainer(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.ok
     pattern:
@@ -1045,7 +1045,7 @@ export function ok(event) {
   console.log("ok " + event.event_id);
 }
 `)
-	fn := app.App{Name: "no-remove-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "no-remove-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -1187,7 +1187,7 @@ func TestIntegrationContainerCreationLabels(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.slow
     pattern:
@@ -1199,7 +1199,7 @@ export async function slow(event) {
   console.log("completed " + event.event_id);
 }
 `)
-	fn := app.App{Name: "labels-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "labels-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -1299,7 +1299,7 @@ func TestIntegrationHandlerErrorKeepsContainer(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.fail
     pattern:
@@ -1314,7 +1314,7 @@ export function ok(event) {
   console.log("recovered " + event.n);
 }
 `)
-	fn := app.App{Name: "fail-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "fail-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -1372,7 +1372,7 @@ func TestIntegrationTimeoutDiscardsContainer(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.sleeper
     pattern:
@@ -1389,7 +1389,7 @@ export function quick(event) {
   console.log("quick done");
 }
 `)
-	fn := app.App{Name: "timeout-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "timeout-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -1495,7 +1495,7 @@ def check(event):
 	// write, and /proc/self/status CapEff.
 	ndDir := t.TempDir()
 	writeFile(t, ndDir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.check
     pattern:
@@ -1553,7 +1553,7 @@ export function check(event) {
 		event   []byte
 	}{
 		{"python", pyDir, "python3.14", "handler.check", []byte(`{"status":"COMPLETED"}`)},
-		{"node", ndDir, "node24", "index.check", []byte(`{"event_name":"INSERT"}`)},
+		{"node", ndDir, "nodejs24.x", "index.check", []byte(`{"event_name":"INSERT"}`)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fn := app.App{Name: "harden-" + tc.name, Dir: tc.dir, Template: &app.Template{Runtime: tc.runtime}}

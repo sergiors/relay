@@ -31,7 +31,7 @@ func newPnpmNodeApp(t *testing.T, name string, manifests map[string]string) app.
 	t.Helper()
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: handler.run
     pattern:
@@ -41,7 +41,7 @@ events:
 	for fileName, content := range manifests {
 		writeFile(t, dir, fileName, content)
 	}
-	return app.App{Name: name, Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	return app.App{Name: name, Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 }
 
 // TestIntegrationNodeNoDepsHasPnpmBinary verifies the pinned pnpm binary is
@@ -64,14 +64,14 @@ func TestIntegrationNodeNoDepsHasPnpmBinary(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: handler.run
     pattern:
       status: [COMPLETED]
 `)
 	writeFile(t, dir, "handler.js", "export function run(event) { console.log('ok'); }\n")
-	fn := app.App{Name: "pnpm-nodeps", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "pnpm-nodeps", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 
 	m, _ := newManager(t)
 	p, err := m.Prepare(ctx, fn)

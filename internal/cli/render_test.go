@@ -52,7 +52,7 @@ func TestRenderStatsPropagatesWriteFailure(t *testing.T) {
 func TestRenderAppListPropagatesWriteFailure(t *testing.T) {
 	rows := []state.Row{
 		{Name: "alpha", Runtime: "python3.14", Status: state.StatusReady},
-		{Name: "beta", Runtime: "node24", Status: state.StatusPreparing},
+		{Name: "beta", Runtime: "nodejs24.x", Status: state.StatusPreparing},
 	}
 	requireWriteFailure(t, "renderAppList", func() error {
 		return renderAppList(failingWriter{}, rows)

@@ -98,7 +98,7 @@ events:
 	recordSuccess(t, st, "user-events-python", "relay-app-user-events-python",
 		"abc123hash", time.Now(), readyFn)
 
-	nodeTmpl, _ := app.ParseTemplate([]byte(`runtime: node24
+	nodeTmpl, _ := app.ParseTemplate([]byte(`runtime: nodejs24.x
 events:
   - handler: index.hi
     pattern:
@@ -141,7 +141,7 @@ func TestAppListColumns(t *testing.T) {
 	if !strings.Contains(userRow, "python3.14") || !strings.Contains(userRow, state.StatusReady) {
 		t.Fatalf("user row wrong: %q", userRow)
 	}
-	if !strings.Contains(nodeRow, "node24") || !strings.Contains(nodeRow, state.StatusPreparing) {
+	if !strings.Contains(nodeRow, "nodejs24.x") || !strings.Contains(nodeRow, state.StatusPreparing) {
 		t.Fatalf("node row wrong: %q", nodeRow)
 	}
 }
@@ -153,7 +153,7 @@ func TestAppListColumns(t *testing.T) {
 // through the two renderers.
 func TestAppListStatusesConsistentWithInspect(t *testing.T) {
 	st, _ := openTempState(t)
-	tmpl, err := app.ParseTemplate([]byte("runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"))
+	tmpl, err := app.ParseTemplate([]byte("runtime: nodejs24.x\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"))
 	if err != nil {
 		t.Fatalf("parse template: %v", err)
 	}
@@ -804,7 +804,7 @@ func TestAppBuildingStatusAndEmptyRuntimeRendering(t *testing.T) {
 
 	// A runtime app with a persisted building status (written at the
 	// managed-runtime image build boundary).
-	runtimeTmpl, err := app.ParseTemplate([]byte(`runtime: node24
+	runtimeTmpl, err := app.ParseTemplate([]byte(`runtime: nodejs24.x
 events:
   - handler: index.hi
     pattern:
@@ -881,7 +881,7 @@ events:
 // prefix, so an operator can tell how each service is produced.
 func TestAppInspectServicesSourceKinds(t *testing.T) {
 	st, _ := openTempState(t)
-	tmpl, err := app.ParseTemplate([]byte(`runtime: node24
+	tmpl, err := app.ParseTemplate([]byte(`runtime: nodejs24.x
 events:
   - handler: events.created.handler
     pattern:

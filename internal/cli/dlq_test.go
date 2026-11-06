@@ -777,7 +777,7 @@ func dlqReplayRunnerWithExecutor(t *testing.T, store *fakeDLQStore, exec runner.
 // every matching rule.
 func dlqReplayRunnerOn(t *testing.T, deps Dependencies, exec runner.Executor) Dependencies {
 	t.Helper()
-	tmpl, err := app.ParseTemplate([]byte(`runtime: node24
+	tmpl, err := app.ParseTemplate([]byte(`runtime: nodejs24.x
 events:
   - handler: events.created.handler
     pattern: {}

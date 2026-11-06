@@ -56,7 +56,7 @@ func TestPrepareSourceMountNodeSourceOnlyChangeDoesNotBuildDependency(t *testing
 	writeNodeTestFile(t, dir, "package.json", `{"type":"module","dependencies":{"picocolors":"^1.0.0"}}`)
 	writeNodeTestFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	writeNodeTestFile(t, dir, "index.js", "import colors from 'picocolors';\nexport function handler(e){ console.log(colors.red('v1')); }\n")
-	fn := app.App{Name: "node-source-only", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "node-source-only", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 
 	var first buildCounts
 	cli := newScriptedDockerClient(t,
@@ -120,7 +120,7 @@ func TestPrepareSourceMountNodeDependencyChangeBuildsNewGeneration(t *testing.T)
 	writeNodeTestFile(t, dir, "package.json", `{"type":"module","dependencies":{"picocolors":"^1.0.0"}}`)
 	writeNodeTestFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	writeNodeTestFile(t, dir, "index.js", "import colors from 'picocolors';\nexport function handler(e){ console.log(colors.green('v1')); }\n")
-	fn := app.App{Name: "node-dep-change", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "node-dep-change", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 
 	var first buildCounts
 	cli := newScriptedDockerClient(t,

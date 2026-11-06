@@ -411,7 +411,7 @@ func findContainerByLabels(ctx context.Context, cli *client.Client, labels map[s
 // waitForContainer polls until a container carrying every label appears,
 // returning its ID. It is the synchronization point for "the handler is actually
 // executing" — no arbitrary sleep. The bound is generous (45s) because on a
-// cold daemon the first node24 build inside startWorker's Prepare can dominate;
+// cold daemon the first nodejs24.x build inside startWorker's Prepare can dominate;
 // the container only appears once the image exists and the event is delivered.
 func waitForContainer(t *testing.T, cli *client.Client, labels map[string]string) string {
 	t.Helper()
@@ -503,7 +503,7 @@ func TestIntegrationGracefulShutdownMidHandler(t *testing.T) {
 		t.Fatalf("mkdir fn: %v", err)
 	}
 	writeTestFile(t, fnDir, "template.yaml", `
-runtime: node24
+runtime: nodejs24.x
 events:
   - handler: index.slow
     pattern:

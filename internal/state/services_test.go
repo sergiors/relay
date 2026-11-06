@@ -133,7 +133,7 @@ func TestServiceEmptyStored(t *testing.T) {
 	}
 }
 
-const sourceServicesTmpl = `runtime: node24
+const sourceServicesTmpl = `runtime: nodejs24.x
 services:
   - name: service
     entrypoint: service.js

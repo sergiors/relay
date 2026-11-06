@@ -163,7 +163,7 @@ func TestSyncResolvesFreshRemoteBranch(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("checkout main: %v", err)
 	}
-	writeFile(t, filepath.Join(e.work, "fn", "template.yaml"), "# NEW\nruntime: node24\n")
+	writeFile(t, filepath.Join(e.work, "fn", "template.yaml"), "# NEW\nruntime: nodejs24.x\n")
 	if _, err := wt.Add("fn/template.yaml"); err != nil {
 		t.Fatalf("add: %v", err)
 	}

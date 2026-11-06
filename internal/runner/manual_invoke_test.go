@@ -37,7 +37,7 @@ func invokeFn(t *testing.T, name, tmplYAML string, exec Executor) *PreparedApp {
 func TestInvokeAppExecutesMatchingHandler(t *testing.T) {
 	exec := &captureExecutor{}
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
+	r := NewWithMetrics([]*PreparedApp{invokeFn(t, "fn", `runtime: nodejs24.x
 events:
   - handler: events.created.handler
     pattern:
@@ -84,7 +84,7 @@ events:
 // declaration order, and the returned count reflects all of them.
 func TestInvokeAppMultipleMatchingRules(t *testing.T) {
 	exec := &captureExecutor{}
-	r := New([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
+	r := New([]*PreparedApp{invokeFn(t, "fn", `runtime: nodejs24.x
 events:
   - handler: first.run
     pattern:
@@ -117,7 +117,7 @@ events:
 func TestInvokeAppNoMatchingRules(t *testing.T) {
 	exec := &countingExecutor{}
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
+	r := NewWithMetrics([]*PreparedApp{invokeFn(t, "fn", `runtime: nodejs24.x
 events:
   - handler: events.created.handler
     pattern:
@@ -146,7 +146,7 @@ func TestInvokeAppFailureRunsLaterHandlers(t *testing.T) {
 	failing := &countingExecutor{fail: true}
 	// Two rules sharing one executor: the executor fails for the first rule, but
 	// the second rule must still be attempted.
-	r := New([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
+	r := New([]*PreparedApp{invokeFn(t, "fn", `runtime: nodejs24.x
 events:
   - handler: first.run
     pattern:
@@ -175,7 +175,7 @@ events:
 // the stable not-found sentinel and nothing executes.
 func TestInvokeAppUnknownApp(t *testing.T) {
 	exec := &countingExecutor{}
-	r := New([]*PreparedApp{invokeFn(t, "present", `runtime: node24
+	r := New([]*PreparedApp{invokeFn(t, "present", `runtime: nodejs24.x
 events:
   - handler: index.run
     pattern: {}
@@ -197,7 +197,7 @@ events:
 // app is reported with the stable unavailable sentinel.
 func TestInvokeAppUnavailableApp(t *testing.T) {
 	r := New([]*PreparedApp{
-		NewUnavailable(app.App{Name: "broken", Template: &app.Template{Runtime: "node24"}}),
+		NewUnavailable(app.App{Name: "broken", Template: &app.Template{Runtime: "nodejs24.x"}}),
 	}, testutil.DiscardLogger())
 
 	invoked, err := r.InvokeApp(context.Background(), "broken", map[string]any{"x": 1})
@@ -215,7 +215,7 @@ func TestInvokeAppUnavailableApp(t *testing.T) {
 // exhaustion.
 func TestInvokeAppWritesNoBrokerState(t *testing.T) {
 	exec := &countingExecutor{}
-	r := New([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
+	r := New([]*PreparedApp{invokeFn(t, "fn", `runtime: nodejs24.x
 events:
   - handler: index.run
     pattern: {}
@@ -251,7 +251,7 @@ events:
 // (which reflect a real execution) are recorded.
 func TestInvokeAppNoEventClassificationCounters(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
+	r := NewWithMetrics([]*PreparedApp{invokeFn(t, "fn", `runtime: nodejs24.x
 events:
   - handler: index.run
     pattern: {}
@@ -285,7 +285,7 @@ events:
 // but never a retry or DLQ counter: there is no broker retry lifecycle.
 func TestInvokeAppNoRetryOrDLQOnFailure(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
+	r := NewWithMetrics([]*PreparedApp{invokeFn(t, "fn", `runtime: nodejs24.x
 events:
   - handler: index.run
     pattern: {}
@@ -354,7 +354,7 @@ func TestInvokeAppMixedOutcomesAttributeMetrics(t *testing.T) {
 	// fails only its first call.
 	exec := &flipExecutor{}
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
+	r := NewWithMetrics([]*PreparedApp{invokeFn(t, "fn", `runtime: nodejs24.x
 events:
   - handler: first.run
     pattern:

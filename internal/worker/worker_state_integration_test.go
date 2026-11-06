@@ -30,7 +30,7 @@ func TestManagedRuntimeBuildObserverPublishesBuildingOnlyOnActualBuild(t *testin
 	runtimeFn := app.App{
 		Name:     "runtime-fn",
 		Dir:      t.TempDir(),
-		Template: &app.Template{Runtime: "node24"},
+		Template: &app.Template{Runtime: "nodejs24.x"},
 	}
 	noRuntimeFn := app.App{
 		Name:     "no-runtime-fn",
@@ -86,7 +86,7 @@ func TestManagedRuntimeBuildObserverPublishesBuildingOnlyOnActualBuild(t *testin
 
 	// A preparation failure without an active image is unavailable, again
 	// clearing building.
-	failFn := app.App{Name: "fail-fn", Dir: t.TempDir(), Template: &app.Template{Runtime: "node24"}}
+	failFn := app.App{Name: "fail-fn", Dir: t.TempDir(), Template: &app.Template{Runtime: "nodejs24.x"}}
 	failFencingToken := seedFencingToken(t, st, failFn)
 	runtime.AppBuildObserverFromContext(
 		managedRuntimeBuildContext(context.Background(), st, failFn, failFencingToken),

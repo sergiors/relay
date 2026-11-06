@@ -329,7 +329,7 @@ func TestStartupSweepPrunesBeforeSeeding(t *testing.T) {
 	if err := os.MkdirAll(keptDir, 0o755); err != nil {
 		t.Fatalf("mkdir kept: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(keptDir, "template.yaml"), []byte("runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(keptDir, "template.yaml"), []byte("runtime: nodejs24.x\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"), 0o644); err != nil {
 		t.Fatalf("write kept template: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(keptDir, "index.js"), []byte("export function hi(e){}\n"), 0o644); err != nil {

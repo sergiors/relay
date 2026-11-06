@@ -355,7 +355,7 @@ func scheduleFnForHandler(t *testing.T, handler string, exec Executor, scheduleT
 		app.App{
 			Name: scheduleFnName,
 			Template: &app.Template{
-				Runtime: "node24",
+				Runtime: "nodejs24.x",
 				Events:  []app.EventRule{{Handler: "index.run", Pattern: app.Pattern{}, Timeout: scheduleTimeout, Retries: app.DefaultRetries}},
 				Schedules: []app.Schedule{{
 					Name:     handler,
@@ -705,7 +705,7 @@ func TestIntegrationScheduleObsoleteScheduleHandlerRemoved(t *testing.T) {
 		app.App{
 			Name: scheduleFnName,
 			Template: &app.Template{
-				Runtime: "node24",
+				Runtime: "nodejs24.x",
 				Events:  []app.EventRule{{Handler: "index.run", Pattern: app.Pattern{}}},
 				// No Schedules: the handler is removed.
 			},
@@ -739,7 +739,7 @@ func TestIntegrationScheduleObsoleteScheduleHandlerRemoved(t *testing.T) {
 // temporary condition, not an obsolete removal.
 func TestIntegrationScheduleUnavailableStaysPending(t *testing.T) {
 	r := NewWithMetrics(
-		[]*PreparedApp{NewUnavailable(app.App{Name: scheduleFnName, Template: &app.Template{Runtime: "node24"}})},
+		[]*PreparedApp{NewUnavailable(app.App{Name: scheduleFnName, Template: &app.Template{Runtime: "nodejs24.x"}})},
 		testutil.DiscardLogger(), nil)
 	e := newScheduleEnv(t, r)
 	o := scheduleOcc(time.Date(2026, 8, 3, 14, 0, 0, 0, time.UTC))
@@ -779,7 +779,7 @@ func scheduleFnNamed(t *testing.T, name, handler string, exec Executor, schedule
 		app.App{
 			Name: scheduleFnName,
 			Template: &app.Template{
-				Runtime: "node24",
+				Runtime: "nodejs24.x",
 				Schedules: []app.Schedule{{
 					Name:     name,
 					Handler:  handler,
@@ -888,7 +888,7 @@ func TestIntegrationScheduleAdmittedThenScheduleRemovedStillCompletes(t *testing
 		app.App{
 			Name: scheduleFnName,
 			Template: &app.Template{
-				Runtime: "node24",
+				Runtime: "nodejs24.x",
 				// No Schedules: the admitted name is gone.
 			},
 		},

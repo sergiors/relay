@@ -79,7 +79,7 @@ func TestPrepareWithSelectionUsesSuppliedSelection(t *testing.T) {
 	)
 	m := newLifecycleManager(t, cli, context.Background())
 
-	fn := app.App{Name: "selected", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fn := app.App{Name: "selected", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	got, err := m.PrepareWithFingerprintAndSelection(context.Background(), fn, fp, selection)
 	if err != nil {
 		t.Fatalf("prepare with supplied selection: %v", err)
@@ -232,7 +232,7 @@ func TestSelectAndFingerprintAppsRuntimeReturnsSelection(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
-	selection, fp, err := app.SelectAndFingerprintApp(dir, &app.Template{Runtime: "node24"})
+	selection, fp, err := app.SelectAndFingerprintApp(dir, &app.Template{Runtime: "nodejs24.x"})
 	if err != nil {
 		t.Fatalf("select and fingerprint: %v", err)
 	}

@@ -128,7 +128,7 @@ func TestReconcileOverDeepPatternInvalidRetainsActive(t *testing.T) {
 // field level over app.MaxPatternDepth.
 func overDeepPatternTemplate() string {
 	var b strings.Builder
-	b.WriteString("runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n")
+	b.WriteString("runtime: nodejs24.x\nevents:\n  - handler: index.hi\n    pattern:\n")
 	indent := "      "
 	for i := 1; i <= app.MaxPatternDepth; i++ {
 		fmt.Fprintf(&b, "%sf%d:\n", indent, i)

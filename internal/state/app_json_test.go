@@ -212,7 +212,7 @@ func TestAppSnapshotAtomicReplacement(t *testing.T) {
 
 	// Replace with a leaner template: one handler (new timeout), no schedules,
 	// one service (new source/port), no secrets.
-	changed := mustTemplate(t, `runtime: node24
+	changed := mustTemplate(t, `runtime: nodejs24.x
 events:
   - handler: index.main
     pattern:
@@ -232,7 +232,7 @@ services:
 	if !ok {
 		t.Fatal("expected demo")
 	}
-	if detail.Runtime != "node24" || detail.Image != "img2" || detail.Fingerprint != "fp2" {
+	if detail.Runtime != "nodejs24.x" || detail.Image != "img2" || detail.Fingerprint != "fp2" {
 		t.Fatalf("lifecycle not replaced: %+v", detail)
 	}
 	if len(detail.Handlers) != 1 || detail.Handlers[0].Name != "index.main" || detail.Handlers[0].Timeout != 30*time.Second {
@@ -347,7 +347,7 @@ func TestCorruptAppSnapshotFailsClearly(t *testing.T) {
 	// A valid JSONB row and a wrong-shape row.
 	if _, err := c.db.ExecContext(ctx,
 		`INSERT INTO apps (name, data, updated_at) VALUES ('good', $1, $2)`,
-		`{"runtime":"node24","handlers":[{"name":"a.b","timeout":1000000000}]}`, "2020-01-01T00:00:00Z"); err != nil {
+		`{"runtime":"nodejs24.x","handlers":[{"name":"a.b","timeout":1000000000}]}`, "2020-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("seed good: %v", err)
 	}
 	if _, err := c.db.ExecContext(ctx,
@@ -364,7 +364,7 @@ func TestCorruptAppSnapshotFailsClearly(t *testing.T) {
 	}
 
 	rows := c.ListApps()
-	if len(rows) != 1 || rows[0].Name != "good" || rows[0].Runtime != "node24" {
+	if len(rows) != 1 || rows[0].Name != "good" || rows[0].Runtime != "nodejs24.x" {
 		t.Fatalf("ListApps = %+v, want only the good row", rows)
 	}
 
