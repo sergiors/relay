@@ -75,8 +75,72 @@ published or warmed. If a pin changes while an image is being built, that stale
 generation is discarded (its preparation and publication leases are released),
 the old active version keeps serving (or the app is represented by an unavailable
 placeholder that still matches events), and a refreshed reconcile retries against
-the current pin. The current CLI has no selection writer. Runtimes without a row
-remain unpinned.
+the current pin. Runtimes without a row remain unpinned.
+
+#### Updating a runtime image selection
+
+`relay runtime update RUNTIME` is the supported selection writer. It loads the
+current row, resolves ONLY that runtime's exact configured base tag through the
+Docker Engine Distribution API (`GET /distribution/<ref>/json`), and persists the
+returned multi-platform index digest with a compare-and-swap on the persisted
+generation. The Engine contacts the registry; Relay does not implement a registry
+HTTP client and never pulls the image. If the resolved digest equals the current
+selection, no write occurs, so the generation and timestamp are unchanged; that
+no-op is confirmed against the authoritative row under the same per-runtime lock
+used by selection writes, so a concurrent winner is reported instead of a stale
+success. A concurrent write is an explicit conflict and is never overwritten
+blindly. `relay runtime update --all` processes every configured runtime
+independently, continues after failures, and exits non-zero if any runtime failed.
+Both update forms report the previous identity (`unpinned` or the prior digest)
+and the newly resolved digest.
+
+There is no operator-facing CLI rollback or arbitrary-digest command:
+`runtime update` resolves only the current configured tag. An authorized
+administrative operation can roll back by calling the existing
+`state.CompareAndSwapRuntimeImageSelection` API with a previously known valid
+digest and the runtime's current expected generation; that path shares the
+per-runtime advisory lock used by publication. Direct SQL or other manual edits
+to `runtime_image_selections` must not bypass that CAS and lock path.
+
+`relay runtime check [RUNTIME]` resolves the current registry digest read-only
+through the same Engine API and compares it with the persisted selection. It
+shows the selected digest (or `unpinned`), the remote digest, and a status
+(`matching`, `different`, `available`, `unpinned`, `invalid`, or `failed`). It
+performs no state write, pull, build, or restart; all-mode continues across every
+runtime, renders per-runtime registry failures, and exits non-zero if any runtime
+failed. `relay runtime ls` and `relay runtime inspect` remain local-only and read
+PostgreSQL without contacting Docker or a registry; `ls` shows selection
+generation and time, and `inspect` shows the target build platform and effective
+image reference.
+
+A digest is accepted only as a multi-platform index identity. Relay validates
+that the Engine response refers to the queried reference, carries a valid
+`sha256:<64 lowercase hex>` digest, and has an OCI image index or Docker manifest
+list media type. A missing, unknown, or platform-specific manifest is rejected.
+When the Engine reports platforms, the index must contain more than one distinct
+concrete OS/architecture combination (unknown/attestation entries are ignored).
+Relay never persists a child manifest digest; workers build from
+`<configured-ref>@<index-digest>` for the target Linux architecture.
+
+The Docker Engine must permit the Distribution endpoint. The bundled
+`compose.yaml` and `compose.prod.yaml` socket proxies already set
+`DISTRIBUTION=1`; an externally managed proxy must do the same. Registry
+credentials are read from the Docker client configuration selected by
+`DOCKER_CONFIG` (a directory), falling back to `$HOME/.docker/config.json`. The
+supported fields are `auths` (base64 `username:password` or
+`identitytoken`), `credHelpers`, and `credsStore`. Credential helpers are invoked
+as context-bound `docker-credential-<helper> get` subprocesses; their output is
+parsed but never logged. Public Docker Hub works anonymously. When Relay runs in
+a container, mount the Docker client configuration and set `DOCKER_CONFIG` if it
+is not at the container user's `$HOME/.docker/config.json`; Relay does not read
+credentials from the daemon or from the relay container's environment.
+
+Persisting a selection is not an application rollout. Running workers refresh
+the complete selection snapshot once per periodic reconciliation pass (the
+default is 30 seconds) and reprepare only the runtime-backed apps using the
+changed runtime. `update` does not pull or build an image, restart the worker,
+restart apps, or deploy anything; wait for the next pass (or restart the worker
+if it is not running) to observe app convergence.
 
 ## Health and statistics
 

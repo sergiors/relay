@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"relay/internal/runtime/plan"
 )
 
 // ErrRuntimeImageSelectionStale reports that the authoritative runtime image
@@ -83,10 +85,7 @@ func (s imageSelection) pinned() bool {
 // The digest is the multi-platform index digest exactly as selected; Relay never
 // resolves a registry or child manifest digest.
 func (s imageSelection) baseImage() string {
-	if !s.pinned() {
-		return s.sourceImage
-	}
-	return s.sourceImage + "@" + s.digest
+	return EffectiveBaseImage(s.sourceImage, s.digest)
 }
 
 // identity returns the stable, persisted selection identity a preparation
@@ -160,15 +159,9 @@ func resolveImageSelections(selections []RuntimeImageSelection) (map[string]imag
 			unknown = append(unknown, selection.RuntimeID)
 			continue
 		}
-		if selection.SourceImage != spec.BaseImage {
-			return nil, nil, fmt.Errorf(
-				"runtime %q: selected source image %q does not match configured base image %q",
-				selection.RuntimeID, selection.SourceImage, spec.BaseImage)
-		}
-		if !validImageDigest(selection.Digest) {
-			return nil, nil, fmt.Errorf(
-				"runtime %q: selected digest %q must be sha256:<64 lowercase hex>",
-				selection.RuntimeID, selection.Digest)
+		if err := validateRuntimeImageSelectionForSpec(
+			selection.RuntimeID, spec, selection.SourceImage, selection.Digest); err != nil {
+			return nil, nil, err
 		}
 		if _, exists := pins[selection.RuntimeID]; exists {
 			return nil, nil, fmt.Errorf("runtime %q: duplicate image selection", selection.RuntimeID)
@@ -179,6 +172,50 @@ func resolveImageSelections(selections []RuntimeImageSelection) (map[string]imag
 		}
 	}
 	return pins, unknown, nil
+}
+
+// ValidateRuntimeImageSelection validates one persisted selection against the
+// immutable runtime registry: the runtime ID must be known, SourceImage must be
+// that runtime's EXACT configured base image, and Digest must be a valid
+// multi-platform index digest. The CLI uses it to report a row that a worker
+// would reject instead of duplicating the binding rules.
+func ValidateRuntimeImageSelection(runtimeID, sourceImage, digest string) error {
+	spec, err := lookup(runtimeID)
+	if err != nil {
+		return err
+	}
+	return validateRuntimeImageSelectionForSpec(runtimeID, spec, sourceImage, digest)
+}
+
+// validateRuntimeImageSelectionForSpec applies the source-image binding and
+// digest-shape rules to an already-resolved runtime spec. resolveImageSelections
+// and the CLI validation path share it, so the manager and operator tooling can
+// never disagree about what a valid selection is.
+func validateRuntimeImageSelectionForSpec(
+	runtimeID string,
+	spec plan.Spec,
+	sourceImage string,
+	digest string,
+) error {
+	if sourceImage != spec.BaseImage {
+		return fmt.Errorf(
+			"runtime %q: selected source image %q does not match configured base image %q",
+			runtimeID, sourceImage, spec.BaseImage)
+	}
+	if !validImageDigest(digest) {
+		return fmt.Errorf(
+			"runtime %q: selected digest %q must be sha256:<64 lowercase hex>",
+			runtimeID, digest)
+	}
+	return nil
+}
+
+// ValidImageDigest reports whether digest is a Docker multi-platform index
+// digest in the persisted form: "sha256:" followed by 64 lowercase hex chars.
+// The runtime selection store enforces the same shape at the database boundary;
+// the CLI reuses this predicate so it does not invent a second definition.
+func ValidImageDigest(digest string) bool {
+	return validImageDigest(digest)
 }
 
 // validImageDigest reports whether digest is a Docker multi-platform index
@@ -194,6 +231,18 @@ func validImageDigest(digest string) bool {
 		}
 	}
 	return true
+}
+
+// EffectiveBaseImage returns the reference a managed build uses for a pinned
+// selection: "<source-image>@<digest>". An empty digest means unpinned and
+// returns the configured source image unchanged. The worker's imageSelection
+// uses the same function, so the CLI's displayed effective reference and the
+// build FROM cannot drift.
+func EffectiveBaseImage(sourceImage, digest string) string {
+	if digest == "" {
+		return sourceImage
+	}
+	return sourceImage + "@" + digest
 }
 
 // RuntimeImageSelectionIdentity returns the effective identity of runtimeID in

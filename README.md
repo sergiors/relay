@@ -262,6 +262,12 @@ relay app ls
 relay app inspect <name>
 relay app invoke <name> [json|-]
 
+relay runtime ls
+relay runtime inspect <runtime>
+relay runtime check [runtime]
+relay runtime update <runtime>
+relay runtime update --all
+
 relay secret ls
 relay secret set <name> [-]
 relay secret rm <name>

@@ -2,6 +2,9 @@ package runtime
 
 import (
 	"fmt"
+	"sort"
+
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"relay/internal/runtime/plan"
 )
@@ -112,6 +115,60 @@ var specs = map[string]plan.Spec{
 		RuntimeTools:    []plan.RuntimeTool{pnpmTool},
 		MountableSource: true,
 	},
+}
+
+// RuntimeInfo is the immutable, read-only identity of one managed runtime. It
+// deliberately exposes only the configured identity and base image; the build
+// plan, external tools, and engine-specific shape stay internal to the runtime
+// package. The slice returned by Runtimes is a copy, so a caller cannot mutate
+// the registry.
+type RuntimeInfo struct {
+	// ID is the template runtime identifier (e.g. "python3.14").
+	ID string
+	// Engine is the language engine that prepares this runtime.
+	Engine plan.Engine
+	// BaseImage is the EXACT configured base image reference (without a
+	// digest). A runtime image selection must bind to this value unchanged.
+	BaseImage string
+	// TargetPlatform is the OCI platform every image for this runtime is built
+	// for. It comes from the same buildTargetPlatform contract used by image
+	// builds and dependency fingerprints, not a second architecture mapping.
+	TargetPlatform ocispec.Platform
+}
+
+// Runtimes returns every configured managed runtime sorted by ID. The result is
+// a fresh immutable snapshot: adding, removing, or reordering entries in the
+// returned slice cannot change the registry. It is the single listing used by
+// the CLI, so no command duplicates the runtime IDs.
+func Runtimes() []RuntimeInfo {
+	target := buildTargetPlatform()
+	infos := make([]RuntimeInfo, 0, len(specs))
+	for id, spec := range specs {
+		infos = append(infos, RuntimeInfo{
+			ID:             id,
+			Engine:         spec.Engine,
+			BaseImage:      spec.BaseImage,
+			TargetPlatform: target,
+		})
+	}
+	sort.Slice(infos, func(i, j int) bool { return infos[i].ID < infos[j].ID })
+	return infos
+}
+
+// LookupRuntime resolves one runtime ID against the immutable registry. The
+// boolean reports whether the ID is configured; an unknown ID is never treated
+// as an unpinned runtime.
+func LookupRuntime(name string) (RuntimeInfo, bool) {
+	spec, ok := specs[name]
+	if !ok {
+		return RuntimeInfo{}, false
+	}
+	return RuntimeInfo{
+		ID:             name,
+		Engine:         spec.Engine,
+		BaseImage:      spec.BaseImage,
+		TargetPlatform: buildTargetPlatform(),
+	}, true
 }
 
 func lookup(name string) (plan.Spec, error) {

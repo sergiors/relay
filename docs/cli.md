@@ -9,6 +9,7 @@ relay health
 relay stats [reset]
 relay app <ls|inspect|invoke>
 relay apps
+relay runtime <ls|inspect|check|update>
 relay dlq <ls|inspect|replay|rm>
 relay secret <ls|set|rm>
 relay git <keygen|set|sync|status|remove>
@@ -24,6 +25,8 @@ Run `relay <command> --help` for flags. `relay apps` is an alias for
 | `start`                              | Redis, PostgreSQL, Docker, configured networks |
 | `health`, `app invoke`, `dlq replay` | Running worker                                 |
 | `stats`, `app ls`, `app inspect`     | PostgreSQL (`DATABASE_URL`)                    |
+| `runtime ls`, `runtime inspect`     | PostgreSQL (`DATABASE_URL`)                    |
+| `runtime check`, `runtime update`    | PostgreSQL and Docker Engine (Distribution API) |
 | `dlq ls`, `dlq inspect`, `dlq rm`    | PostgreSQL (`DATABASE_URL`)                    |
 | `secret *`                           | Local Relay data directory                     |
 | `git *`                              | Local Git configuration and `/apps`            |
@@ -62,6 +65,65 @@ Prometheus counters.
 “Message reclaims” counts stream redeliveries, not handler retry attempts. “DLQ
 entries” counts rows written to PostgreSQL, not just invocations that exhausted
 their retry budgets. See [Operations](operations.md#health-and-statistics).
+
+## relay runtime
+
+```sh
+relay runtime ls
+relay runtime inspect python3.14
+relay runtime check [python3.14]
+relay runtime update python3.14
+relay runtime update --all
+```
+
+Managed runtimes build from their configured base tag unless the operator pins
+that tag to a registry digest. `ls` and `inspect` read only PostgreSQL; they
+never contact Docker or a registry. `check` reads PostgreSQL and resolves the
+current registry digest through the Docker Engine Distribution API without
+writing anything, pulling, building, or restarting. `update` resolves the
+runtime's exact configured base tag through the same API and persists the
+multi-platform index digest.
+
+- `ls` lists every runtime this Relay binary supports, its configured base
+  image, whether the runtime is `pinned`, `unpinned`, or `invalid`, the
+  selection generation and time, and the persisted digest.
+- `inspect` shows one runtime's engine, base image, target build platform,
+  source image, digest, generation, selection time, and effective image
+  reference (`base@digest` when pinned, the base tag when unpinned). A runtime
+  with no row is reported as unpinned.
+- `check` validates the persisted binding and compares it with the current
+  registry digest. It displays the selected digest (or `unpinned`), the remote
+  digest, and a status: `matching`, `different`, `available` (no selection and
+  the remote digest is available), `unpinned` (no selection and the registry
+  could not be checked), `invalid` (a stored row a worker would reject), or
+  `failed` (a pinned runtime whose registry lookup failed). It continues across
+  every runtime in all-mode, shows per-runtime registry errors, and exits
+  non-zero if any runtime failed. It never writes PostgreSQL.
+- `update RUNTIME` resolves only that runtime's configured base tag. It requires
+  an OCI image index or Docker manifest list and rejects a missing, unknown, or
+  platform-specific manifest. When the Engine reports platforms, the index must
+  cover more than one concrete platform. The command compare-and-swaps the
+  persisted row; if the current digest is already selected, its generation and
+  timestamp do not change. A concurrent change is reported as a conflict rather
+  than overwritten.
+- `update --all` processes every runtime independently, continues after
+  failures, and exits non-zero if any runtime failed. Both update forms report
+  the previous identity (`unpinned` or digest) and the newly resolved digest.
+
+A persisted selection is not an application rollout. Running workers refresh
+the selection once per periodic reconciliation pass; only the runtime-backed
+apps using that runtime then reprepare. Neither `check` nor `update` pulls or
+builds an image, restarts the worker, restarts apps, or deploys anything. See
+[Operations](operations.md#runtime-image-selection-state).
+
+Both `check` and `update` use the Docker Engine API, so the Engine (or its socket
+proxy) must allow the Distribution endpoint; the bundled Compose files already
+set `DISTRIBUTION=1`. Registry credentials come from the Docker client
+configuration (`DOCKER_CONFIG` or `$HOME/.docker/config.json`), including
+`auths`, `identitytoken`, `credHelpers`, and `credsStore`. Public Docker Hub
+works anonymously. In a container, mount the Docker client configuration and
+set `DOCKER_CONFIG`; Relay does not read credentials from the daemon. Credential
+values are never printed.
 
 ## relay app
 

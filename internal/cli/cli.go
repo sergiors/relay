@@ -51,6 +51,24 @@ type StartRun func(logger *slog.Logger) error
 // isolated handle.
 type OpenState func(ctx context.Context) (*state.State, func(), error)
 
+// RuntimeImageResolver resolves one configured base-image reference to the
+// registry metadata Relay needs for a pin. The interface keeps the CLI
+// transport-independent: production uses the Docker Engine Distribution API
+// (internal/runtime.DistributionResolver), while tests and embedders can supply
+// a fake without a Docker daemon or network.
+type RuntimeImageResolver interface {
+	ResolveBaseImage(ctx context.Context, imageRef string) (runtime.BaseImageResolution, error)
+}
+
+// OpenRuntimeImageResolver opens the registry-metadata resolver for one
+// `relay runtime check` or `relay runtime update` invocation and returns a
+// cleanup func. It is lazy: `runtime ls` and `runtime inspect` never call it, so
+// they need no Docker connection. Tests inject a fake resolver that never
+// contacts a daemon or registry.
+type OpenRuntimeImageResolver func(
+	ctx context.Context,
+) (resolver RuntimeImageResolver, cleanup func(), err error)
+
 // PoolSnapshotProvider is the optional in-process source of live warm-container
 // pool gauges for `relay app inspect`. It reports whether the named app has a
 // live pool in this process and, when it does, the current gauge reading. It
@@ -71,6 +89,12 @@ type Dependencies struct {
 	// (app inspect, stats) only read, while `stats reset` writes (zeroing
 	// the cumulative counters in place). Production: openPostgresState.
 	OpenState OpenState
+	// OpenRuntimeImageResolver opens the Docker Engine-backed registry resolver
+	// used by `relay runtime check` (read-only) and `relay runtime update`
+	// (persisting). It is lazy, so `runtime ls` and `runtime inspect` never
+	// contact Docker or a registry. Production: openDistributionResolver. Tests
+	// inject a transport-free fake.
+	OpenRuntimeImageResolver OpenRuntimeImageResolver
 	// SocketPath is the live worker control socket: `relay health` dials it to
 	// ask whether the running worker is healthy (worker readiness plus live
 	// dependency health), `relay app inspect` dials it for the live
@@ -129,16 +153,17 @@ type Dependencies struct {
 // there are no environment overrides or setters.
 func DefaultDependencies() Dependencies {
 	return Dependencies{
-		OpenState:      openPostgresState,
-		SocketPath:     worker.SocketPath,
-		LockPath:       processlock.DefaultPath,
-		GitConfigPath:  git.ConfigPath,
-		GitCheckoutDir: git.CheckoutDir,
-		GitSSHDir:      git.SSHDir,
-		GitAppsDir:     app.Dir,
-		SecretsDir:     secrets.SecretsDir,
-		Start:          worker.Run,
-		OpenDLQ:        openPostgresDLQStore,
+		OpenState:                openPostgresState,
+		OpenRuntimeImageResolver: openDistributionResolver,
+		SocketPath:               worker.SocketPath,
+		LockPath:                 processlock.DefaultPath,
+		GitConfigPath:            git.ConfigPath,
+		GitCheckoutDir:           git.CheckoutDir,
+		GitSSHDir:                git.SSHDir,
+		GitAppsDir:               app.Dir,
+		SecretsDir:               secrets.SecretsDir,
+		Start:                    worker.Run,
+		OpenDLQ:                  openPostgresDLQStore,
 	}
 }
 
@@ -194,6 +219,7 @@ func New(logger *slog.Logger, writer io.Writer, deps Dependencies) *cli.Command 
 			gitCommand(deps),
 			statsCommand(deps),
 			healthCommand(deps),
+			runtimeCommand(deps),
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if !cmd.Args().Present() {
