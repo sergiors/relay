@@ -62,6 +62,21 @@ func (a dockerManagerAdapter) Execute(
 	return a.m.Execute(ctx, prepared, handler, eventJSON, extraEnv)
 }
 
+// The adapter must forward BOTH halves of the fenced preparation/publication
+// seam. With only selectionPreparer, the reconciler would use the Manager's
+// deferred preparation and never run its matching fenced publication/activation.
+func (a dockerManagerAdapter) RefreshRuntimeImageSelections(ctx context.Context) ([]string, error) {
+	return a.m.RefreshRuntimeImageSelections(ctx)
+}
+
+func (a dockerManagerAdapter) PublishPrepared(
+	ctx context.Context,
+	prepared *runtime.Prepared,
+	publish func() error,
+) error {
+	return a.m.PublishPrepared(ctx, prepared, publish)
+}
+
 // SetAppResources implements the optional resourceSetter seam so the
 // adapter exercises the same resource-only hot-change path production uses.
 func (a dockerManagerAdapter) SetAppResources(name string, limits app.ResourceLimits) {

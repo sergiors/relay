@@ -28,20 +28,27 @@
 //     not a Docker refusal, is authoritative. A Manager with no coordinator
 //     fails closed for dependency-image builds and GC; there is no manager-local
 //     fallback because a process-local lock cannot protect a shared Docker image.
-//   - Runtime image pins (startup only): WithRuntimeImageSelections gives the
-//     Manager an immutable snapshot read from the shared state database after it
-//     opens and before app preparation. A pinned runtime must name a known
-//     runtime, its exact configured Spec.BaseImage, and a
+//   - Runtime image pins (live periodic refresh): WithRuntimeImageSelections
+//     supplies the startup snapshot read from the shared state database, and
+//     WithRuntimeImageSelectionStore supplies the authoritative source the
+//     reconciler refreshes once per periodic pass. A pinned runtime must name a
+//     known runtime, its exact configured Spec.BaseImage, and a
 //     "sha256:<64 lowercase hex>" multi-platform index digest; the Manager
-//     rejects a malformed/mismatched entry for a known runtime and ignores
-//     unknown runtime IDs. Prepare captures one selection per app and builds
-//     FROM configured-ref@digest (no registry/child-digest lookup), folding the
+//     rejects a malformed/mismatched entry for a known runtime, keeps its
+//     last-known-good snapshot, and ignores unknown runtime IDs. Prepare captures
+//     one selection per app (Prepared.ImageSelection, distinct from the
+//     source-only Prepared.Fingerprint) and builds FROM
+//     configured-ref@digest (no registry/child-digest lookup), folding the
 //     immutable identity into dependency fingerprints, app image identities
 //     (baked with/without deps, HOT_RELOAD, and zuvloop modes), and provenance
-//     labels while Prepared.Fingerprint stays source-only. A missing row is
-//     UNPINNED and preserves the historical byte-for-byte behavior. Workers read
-//     pins at startup and do not refresh them while running (see state and
-//     docs/operations.md).
+//     labels. Publication — including the initial startup registry population —
+//     revalidates that captured identity against the authoritative row under the
+//     same per-runtime advisory lock every selection CAS write takes, and only an
+//     accepted generation activates warm state. A stale generation is discarded
+//     with its leases released; the old active version stays serving (or the app
+//     gets an unavailable placeholder that still matches events until a refreshed
+//     reconcile retries). A missing row is UNPINNED and preserves the historical
+//     byte-for-byte behavior. See state and docs/operations.md.
 //   - Source mount (HOT_RELOAD): when enabled, a runtime whose dependency
 //     layout permits it (Python and Node; see plan.Spec.MountableSource) builds
 //     the app image WITHOUT the source and bind-mounts the app's live directory

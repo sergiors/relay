@@ -244,13 +244,21 @@ type Manager struct {
 	// handlers. It never affects Node, managed services, or dependency-image
 	// identity. False (the default) is the standard asyncio loop.
 	pythonZuvloop bool
-	// imageSelections is the immutable startup snapshot of validated runtime
-	// base-image pins, keyed by template runtime identifier. It is resolved once
-	// at construction (WithRuntimeImageSelections; the worker wires the state
-	// database's rows) and read without a lock. A running Manager does not refresh
-	// selections; a missing key means unpinned. See
-	// image_selection.go.
+	// imageSelections is the current validated snapshot of runtime base-image
+	// pins, keyed by template runtime identifier. It is resolved at construction
+	// (WithRuntimeImageSelections; the worker wires the state database's rows) and
+	// may be replaced atomically by RefreshRuntimeImageSelections once per
+	// reconciliation pass. A missing key means unpinned. Guarded by selectionMu;
+	// a preparation reads it once and carries that value through every derived
+	// identity. See image_selection.go.
+	selectionMu     sync.RWMutex
 	imageSelections map[string]imageSelection
+	// selectionStore is the shared authoritative selection source
+	// (WithRuntimeImageSelectionStore, wired by the worker from the state
+	// database). It powers periodic refresh and fences publication against a
+	// concurrent selection CAS. Nil for direct construction/tests, where the
+	// startup snapshot is immutable. See image_selection.go.
+	selectionStore RuntimeImageSelectionStore
 	// mounts records, per app, the live source mount published by a successful
 	// Prepare (see setSourceMount). It is read at execution-container create and
 	// by ResolveServiceImage, and cleared on removal or when an app stops being
@@ -420,6 +428,10 @@ type managerOptions struct {
 	// (WithRuntimeImageSelections). Nil/empty preserves the historical
 	// configured-tag behavior for every runtime.
 	imageSelections []RuntimeImageSelection
+	// selectionStore is the shared authoritative selection source
+	// (WithRuntimeImageSelectionStore). Nil means the startup snapshot is
+	// immutable and publication is not cross-process fenced.
+	selectionStore RuntimeImageSelectionStore
 	// depCoord is the cross-process dependency-image coordination authority
 	// (WithDependencyImageCoordinator). Nil means no coordination: a preparation
 	// that must build from a dependency image and dependency GC fail closed.
@@ -582,10 +594,12 @@ func NewManager(
 ) (*Manager, error) {
 	resolved := resolveManagerOptions(opts)
 
-	// Validate the startup image-selection snapshot before touching Docker: a
+	// Validate the initial image-selection snapshot before touching Docker: a
 	// malformed selection for a runtime this binary knows must fail startup, not
 	// silently build from an unpinned tag. Unknown runtime IDs are ignored (see
-	// WithRuntimeImageSelections) and logged once the manager exists.
+	// WithRuntimeImageSelections) and logged once the manager exists. With a
+	// selection store the snapshot is refreshed from the database later; a bad
+	// row then keeps this last-known-good view instead of failing the process.
 	imageSelections, unknownSelections, err := resolveImageSelections(resolved.imageSelections)
 	if err != nil {
 		return nil, fmt.Errorf("runtime image selection: %w", err)
@@ -632,6 +646,7 @@ func NewManager(
 		sourceMount:              resolved.sourceMount,
 		pythonZuvloop:            resolved.pythonZuvloop,
 		imageSelections:          imageSelections,
+		selectionStore:           resolved.selectionStore,
 		pullChecks:               map[string]time.Time{},
 		depCoord:                 resolved.depCoord,
 	}

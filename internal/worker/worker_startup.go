@@ -337,6 +337,25 @@ func startupSeedFingerprints(
 	return seeds
 }
 
+// startupSeedImageSelections returns the runtime base-image selection identity
+// each app's PUBLISHED generation was actually built from, keyed by app name. It
+// uses the identity carried by the accepted Prepared handle; an unavailable
+// app (including a startup generation rejected by the selection fence) has no
+// published image and therefore an empty identity. The reconciler stores this
+// empty value explicitly, so the next pass compares it with the refreshed
+// snapshot and retries instead of taking a source-only skip path.
+func startupSeedImageSelections(prepared []*runner.PreparedApp) map[string]string {
+	selections := make(map[string]string, len(prepared))
+	for _, pf := range prepared {
+		identity := ""
+		if p := pf.Prepared(); p != nil {
+			identity = p.ImageSelection
+		}
+		selections[pf.Name()] = identity
+	}
+	return selections
+}
+
 // persistStartupDiscovery writes the startup state phase: it seeds a fresh
 // database from the already-loaded (app, fingerprint) pairs, records each
 // PRESENT-but-invalid app candidate from the loader diagnostics as invalid
@@ -547,9 +566,12 @@ type appPreparer interface {
 	runner.Executor
 }
 
-// prepareApps builds each app's image and returns the prepared set. An
-// app whose image cannot be built is marked unavailable (the runner skips
-// it) rather than failing startup; the rest carry their fresh image.
+// prepareApps builds each app's image and returns the CANDIDATE set. An app
+// whose image cannot be built is marked unavailable (the runner skips it)
+// rather than failing startup; the rest carry their fresh image and an admitted
+// publication lease. Candidates are not yet in the registry and are not
+// activated: the caller publishes each accepted generation through the
+// authoritative selection fence, which is also where warm state is activated.
 // Preparations run in a bounded worker pool sized by the runtime Manager's
 // effective MAX_CONCURRENT_BUILDS, so startup never launches one goroutine per
 // app. The Manager's single shared limiter still bounds actual image builds
@@ -557,8 +579,8 @@ type appPreparer interface {
 // startup order. Jobs are assigned incrementally: each worker takes the next app
 // as soon as it finishes the previous one, with no batch barrier. A cancelled
 // lifecycle stops assigning new work and joins the active workers before
-// returning, as startup preparation must complete before service enqueue and
-// runner construction. It receives
+// returning, as startup preparation must complete before fenced registry
+// publication, service enqueue, and consumption. It receives
 // the startup records — each app with the fingerprint resolved exactly once
 // and (for a runtime-backed app) the source selection that fingerprint was
 // derived from — and supplies BOTH to the selection-aware Prepare. Prepare
@@ -575,7 +597,8 @@ type appPreparer interface {
 // The building status is published at the ACTUAL managed runtime image-build
 // boundary via the observer installed by managedRuntimeBuildContext: a reused
 // image and a no-runtime template never flash building, while a real build does.
-// A successful no-service preparation reaches ready below; an app whose
+// A successful no-service preparation records ready only in the caller, AFTER
+// the generation is accepted by fenced registry publication; an app whose
 // template declares services records its terminal outcome after service
 // convergence (services have no separate image build, so building is
 // published only for the managed-runtime image build itself), and a preparation
@@ -699,12 +722,13 @@ schedule:
 	return prepared
 }
 
-// prepareStartupApp prepares ONE startup app and records its terminal state.
-// It is the per-app unit run concurrently by prepareApps: all per-app failure
-// semantics (unavailable without an active image, the interruption
-// classification that suppresses a spurious state failure, and the
-// building/ready observations) are unchanged. The exact startup fencing token
-// for this app is used for every guarded write.
+// prepareStartupApp prepares ONE startup app and records a preparation FAILURE.
+// A successful candidate is not made ready here: the caller records ready only
+// after fenced registry publication accepts it. It is the per-app unit run
+// concurrently by prepareApps: all per-app failure semantics (unavailable
+// without an active image, the interruption classification that suppresses a
+// spurious state failure, and the building observation) are unchanged. The exact
+// startup fencing token for this app is used for every guarded write.
 func prepareStartupApp(
 	ctx context.Context,
 	manager appPreparer,
@@ -732,15 +756,9 @@ func prepareStartupApp(
 		}
 		return runner.NewUnavailable(fn)
 	}
-	if st != nil && len(fn.Template.Services) == 0 {
-		// Persist the fingerprint the image was ACTUALLY built from
-		// (prep.Fingerprint, derived from the one immutable source snapshot the
-		// build staged), never a later live rescan. Recording a post-build scan
-		// would claim the image serves content it does not: a source edit during
-		// a long build is not in the image, and the reconciler's watcher/periodic
-		// audit detects it by comparing the on-disk digest against this recorded
-		// built identity on the next pass.
-		st.RecordReconcileSuccess(ctx, fn.Name, prep.Image, prep.Fingerprint, time.Now(), fn, fencingToken)
-	}
+	// State success is recorded by the caller only AFTER the generation is
+	// accepted into the registry by the authoritative selection publication. A
+	// preparation that is rejected as stale must never leave a ready state row
+	// for an image this worker does not serve.
 	return runner.NewPrepared(fn, prep, manager)
 }

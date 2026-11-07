@@ -5,6 +5,7 @@ package state
 import (
 	"context"
 	"errors"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -396,6 +397,128 @@ func TestReadRuntimeImageSelectionsNeverWrites(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0] != inserted {
 		t.Fatalf("readings mutated the selection: want %+v, got %+v", inserted, rows)
+	}
+}
+
+// Publication checks use the same lock as CAS for both a missing row (the
+// unpinned identity) and a present row. The callback receives the authoritative
+// value while that lock is held; absence is not confused with a read failure.
+func TestWithRuntimeImageSelectionLockReportsAbsentAndCurrentSelection(t *testing.T) {
+	st := openSelectionState(t)
+	ctx := context.Background()
+	called := false
+	if err := st.WithRuntimeImageSelectionLock(ctx, "python3.14", func(_ context.Context, current *RuntimeImageSelection) error {
+		called = true
+		if current != nil {
+			t.Fatalf("absent runtime selection = %+v, want nil", current)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("lock absent selection: %v", err)
+	}
+	if !called {
+		t.Fatal("absent selection callback was not invoked")
+	}
+
+	written, err := st.CompareAndSwapRuntimeImageSelection(ctx,
+		selectionFixture("python3.14", validRuntimeDigest(11)), 0)
+	if err != nil {
+		t.Fatalf("insert selection: %v", err)
+	}
+	called = false
+	if err := st.WithRuntimeImageSelectionLock(ctx, "python3.14", func(_ context.Context, current *RuntimeImageSelection) error {
+		called = true
+		if current == nil || *current != written {
+			t.Fatalf("locked selection = %+v, want persisted row %+v", current, written)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("lock current selection: %v", err)
+	}
+	if !called {
+		t.Fatal("current selection callback was not invoked")
+	}
+}
+
+// The publication lock also fences a first pin write when no row exists. This
+// test observes PostgreSQL's ungranted advisory lock rather than relying on a
+// sleep: after the CAS is demonstrably waiting on the same key, releasing the
+// publication callback lets it insert generation 1.
+func TestRuntimeImageSelectionLockFencesCASForAbsentRow(t *testing.T) {
+	st := openSelectionState(t)
+	ctx := context.Background()
+	const runtimeID = "python3.14"
+	callbackEntered := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	publicationDone := make(chan error, 1)
+	go func() {
+		publicationDone <- st.WithRuntimeImageSelectionLock(ctx, runtimeID,
+			func(_ context.Context, current *RuntimeImageSelection) error {
+				if current != nil {
+					return errors.New("expected absent selection")
+				}
+				close(callbackEntered)
+				<-releaseCallback
+				return nil
+			})
+	}()
+	<-callbackEntered
+
+	casStarted := make(chan struct{})
+	casDone := make(chan error, 1)
+	go func() {
+		close(casStarted)
+		_, err := st.CompareAndSwapRuntimeImageSelection(ctx,
+			selectionFixture(runtimeID, validRuntimeDigest(12)), 0)
+		casDone <- err
+	}()
+	<-casStarted
+
+	key := uint32(runtimeSelectionLockKey(runtimeID))
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting bool
+		err := st.db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_locks
+				WHERE locktype = 'advisory' AND NOT granted
+			  AND classid = 3 AND objid = $1 AND objsubid = 2
+			)`, key).Scan(&waiting)
+		if err != nil {
+			close(releaseCallback)
+			<-publicationDone
+			<-casDone
+			t.Fatalf("inspect advisory lock wait: %v", err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(releaseCallback)
+			<-publicationDone
+			<-casDone
+			t.Fatal("CAS never waited on the publication's advisory lock")
+		}
+		runtime.Gosched()
+	}
+	select {
+	case err := <-casDone:
+		close(releaseCallback)
+		<-publicationDone
+		t.Fatalf("CAS completed while publication held the selection lock: %v", err)
+	default:
+	}
+
+	close(releaseCallback)
+	if err := <-publicationDone; err != nil {
+		t.Fatalf("publication lock callback: %v", err)
+	}
+	if err := <-casDone; err != nil {
+		t.Fatalf("CAS after publication released lock: %v", err)
+	}
+	rows, err := st.ReadRuntimeImageSelections(ctx)
+	if err != nil || len(rows) != 1 || rows[0].Generation != 1 {
+		t.Fatalf("CAS result = (%+v, %v), want one generation-1 row", rows, err)
 	}
 }
 

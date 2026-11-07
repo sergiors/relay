@@ -58,6 +58,20 @@ func (b *diskIdentityBuilder) Execute(context.Context, *runtime.Prepared, string
 	return nil
 }
 
+// The fenced publication half of the optional seam. This fake has no runtime
+// Manager, so it publishes directly; the real Manager validates and activates.
+func (b *diskIdentityBuilder) RefreshRuntimeImageSelections(context.Context) ([]string, error) {
+	return nil, nil
+}
+
+func (b *diskIdentityBuilder) PublishPrepared(
+	_ context.Context,
+	_ *runtime.Prepared,
+	publish func() error,
+) error {
+	return publish()
+}
+
 // TestReconcileRealBuiltGenerationsTrackSourceAndConverge exercises the
 // startup/live shared contract end to end with real digests (not sentinels): a
 // app is seeded with generation A, edited and rebuilt to a distinct

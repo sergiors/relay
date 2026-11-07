@@ -142,6 +142,16 @@ type Prepared struct {
 	// HOT_RELOAD generation identity even when Image is derived from non-source
 	// build inputs.
 	Fingerprint string
+	// Runtime is the template runtime identifier this image was built for, or ""
+	// for a no-runtime app. Publication uses it to take the authoritative
+	// per-runtime selection lock.
+	Runtime string
+	// ImageSelection is the captured runtime base-image selection identity
+	// (configured source reference plus selected digest) this image was built
+	// from, or "" when the runtime was unpinned. It is deliberately DISTINCT
+	// from Fingerprint and is compared with the authoritative persisted row at
+	// publication time; a mismatch makes the preparation stale.
+	ImageSelection string
 	// Env are the runtime environment variables the app's engine requires
 	// (e.g. PYTHONDONTWRITEBYTECODE for Python). They are applied to every
 	// execution container for this app, after the base RELAY_HANDLER var.
@@ -170,6 +180,15 @@ type Prepared struct {
 	// registry publication (runner.NewPrepared → Registry) or release it. It is
 	// nil for a no-runtime app and for hand-built Prepared values.
 	lease *ImageLease
+	// resources is the template's resolved per-container resource limits,
+	// captured for publication-time warm-pool activation. Resource limits are
+	// not image inputs.
+	resources app.ResourceLimits
+	// sourceMount is the captured live-source mount to publish when this
+	// generation is accepted, or nil to clear any stale mount. It is carried
+	// from the same preparation that staged the build, so activation never
+	// re-resolves daemon paths or the source policy.
+	sourceMount *SourceMount
 }
 
 // Lease returns the admitted image lease Prepare acquired for this handle, or
@@ -229,7 +248,7 @@ func (p *Prepared) TakeLease() *ImageLease {
 // done up front: a failed prepare must not lift a removal, or a stale acquire
 // could warm an app the reconciler has not actually reconciled.
 func (m *Manager) Prepare(ctx context.Context, fn app.App) (*Prepared, error) {
-	return m.prepare(ctx, fn, "", nil)
+	return m.prepare(ctx, fn, "", nil, true)
 }
 
 // PrepareWithFingerprint is Prepare with a caller-supplied content fingerprint.
@@ -259,7 +278,7 @@ func (m *Manager) PrepareWithFingerprint(
 	fn app.App,
 	fingerprint string,
 ) (*Prepared, error) {
-	return m.prepare(ctx, fn, fingerprint, nil)
+	return m.prepare(ctx, fn, fingerprint, nil, true)
 }
 
 // PrepareWithFingerprintAndSelection is Prepare with BOTH a caller-supplied
@@ -274,13 +293,20 @@ func (m *Manager) PrepareWithFingerprint(
 // A nil selection falls back to resolving one here (matching PrepareWithFingerprint).
 // A no-runtime app ignores both: it builds no image and its template-only
 // fingerprint is used verbatim when supplied.
+//
+// This is the publication-aware preparation used by the worker's startup pass
+// and by live reconciliation. It deliberately does NOT mutate the warm pool,
+// source mount, or live resource limits: those side effects belong to
+// PublishPrepared (or ActivatePrepared for an embedding caller that publishes
+// itself), which runs only after the generation is accepted. A stale generation
+// therefore leaves the active app untouched.
 func (m *Manager) PrepareWithFingerprintAndSelection(
 	ctx context.Context,
 	fn app.App,
 	fingerprint string,
 	selection *source.Selection,
 ) (*Prepared, error) {
-	return m.prepare(ctx, fn, fingerprint, selection)
+	return m.prepare(ctx, fn, fingerprint, selection, false)
 }
 
 // buildTempParent returns the directory a preparation's private source and
@@ -298,12 +324,16 @@ func (m *Manager) buildTempParent() string {
 // PrepareWithFingerprint, and PrepareWithFingerprintAndSelection. fingerprint is
 // the caller-supplied content fingerprint, or "" to compute one here.
 // suppliedSelection is the caller's already-resolved source selection for a
-// runtime-backed app, or nil to resolve one here.
+// runtime-backed app, or nil to resolve one here. activate applies the legacy
+// immediate warm-state side effects: the plain Prepare entry points keep them
+// for direct callers, while publication-aware callers defer them until the
+// generation is accepted (see PublishPrepared).
 func (m *Manager) prepare(
 	ctx context.Context,
 	fn app.App,
 	fingerprint string,
 	suppliedSelection *source.Selection,
+	activate bool,
 ) (*Prepared, error) {
 	// Gate the whole preparation as one Manager-owned Docker operation: the
 	// reuse probes (imageExists/bootstrapLabelMatches), the self-mount inspect,
@@ -345,13 +375,13 @@ func (m *Manager) prepare(
 			Name:        fn.Name,
 			Fingerprint: fp,
 			Concurrency: m.effectiveConcurrency(fn),
+			resources:   fn.Template.ResourceLimits(),
 		}
-		m.containers.activateApp(fn.Name, "")
-		m.containers.setAppConcurrency(fn.Name, prepared.Concurrency)
-		m.containers.setAppResources(fn.Name, fn.Template.ResourceLimits())
-		// A no-runtime app has no app image and no source to mount; clear any
-		// stale mount record from a previous runtime-backed version.
-		m.clearSourceMount(fn.Name)
+		if activate {
+			// A no-runtime app has no app image and no source to mount; activation
+			// clears a stale mount record from a previous runtime-backed version.
+			m.activatePrepared(prepared)
+		}
 		return prepared, nil
 	}
 
@@ -415,12 +445,13 @@ func (m *Manager) prepare(
 	if err != nil {
 		return nil, fmt.Errorf("app %q: %w", fn.Name, err)
 	}
-	// Capture ONE immutable runtime image selection for this preparation. The
-	// Manager's snapshot is startup-only and read-only, and this local copy is
+	// Capture ONE runtime image selection for this preparation. This local copy is
 	// carried through the dependency fingerprint/build, the app Dockerfile, the
 	// image identity, and the provenance labels so every one of them observes the
-	// same pin. A zero selection means the runtime is unpinned and every
-	// historical path below is byte-for-byte unchanged.
+	// same pin even if a reconciliation pass refreshes the Manager snapshot
+	// concurrently. The captured identity is also recorded on Prepared and
+	// revalidated at publication. A zero selection means the runtime is unpinned
+	// and every historical path below is byte-for-byte unchanged.
 	runtimeSelection := m.imageSelectionFor(spec.Name)
 
 	// mountSource is the HOT_RELOAD decision for THIS app: enabled globally and
@@ -581,14 +612,27 @@ func (m *Manager) prepare(
 	image := ImageRef(fn.Name, imageFingerprint)
 
 	prepared := &Prepared{
-		Name:        fn.Name,
-		Image:       image,
-		Fingerprint: fp,
-		Env:         planResult.Env,
-		Concurrency: m.effectiveConcurrency(fn),
+		Name:           fn.Name,
+		Image:          image,
+		Fingerprint:    fp,
+		Runtime:        spec.Name,
+		ImageSelection: runtimeSelection.identity(),
+		Env:            planResult.Env,
+		Concurrency:    m.effectiveConcurrency(fn),
 		// The dependency image the app image is built FROM (both paths); it is
 		// the input to dependency garbage collection.
-		Dependency: depRef,
+		Dependency:  depRef,
+		resources:   fn.Template.ResourceLimits(),
+		sourceMount: nil,
+	}
+	if mountSource {
+		prepared.sourceMount = &SourceMount{
+			HostPath: sourceHostPath,
+			Target:   mountTarget,
+			WorkDir:  planResult.SourceMountWorkDir,
+			Masks:    planResult.SourceMountMasks,
+			Identity: fp,
+		}
 	}
 
 	// Admit the app image reference BEFORE any probe or build. Holding this
@@ -678,32 +722,11 @@ func (m *Manager) prepare(
 			"image", image,
 			"inspect_duration", time.Since(reuseStart),
 		)
-		// The prepare succeeded (the image is present and current), so activate
-		// the exact image: a previously removed app warms again, and a
-		// reverted same-source image is no longer treated as retired.
-		m.containers.activateApp(fn.Name, image)
-		// Propagate the reconciled concurrency to the live pool: the effective
-		// bound must follow a successful Prepare even when the image was reused
-		// (a concurrency-only change rebuilds the same fingerprinted image).
-		m.containers.setAppConcurrency(fn.Name, prepared.Concurrency)
-		// Propagate the reconciled resource limits too: they never affect the
-		// image fingerprint, so a resource-only change reaches the live pool
-		// here (or via SetAppResources on the reconciler's skip path).
-		m.containers.setAppResources(fn.Name, fn.Template.ResourceLimits())
-		// Publish the live source mount (or clear a stale one) so a source-only
-		// change — which reuses this exact image — still reaches execution and
-		// entrypoint-service containers. Identity is the source fingerprint the
-		// reconciler compared; the mount itself is the app's live /apps dir.
-		if mountSource {
-			m.setSourceMount(fn.Name, SourceMount{
-				HostPath: sourceHostPath,
-				Target:   mountTarget,
-				WorkDir:  planResult.SourceMountWorkDir,
-				Masks:    planResult.SourceMountMasks,
-				Identity: fp,
-			})
-		} else {
-			m.clearSourceMount(fn.Name)
+		// The prepare succeeded (the image is present and current). Plain Prepare
+		// callers activate it immediately; publication-aware callers activate only
+		// after the generation is accepted.
+		if activate {
+			m.activatePrepared(prepared)
 		}
 		leaseTransferred = true
 		return prepared, nil
@@ -864,29 +887,46 @@ func (m *Manager) prepare(
 		"duration", elapsed,
 		"result", "success",
 	)
-	// The build succeeded: activate the exact image so a removed-then-recreated
-	// app warms again and a same-content rebuild is not left retired, then
-	// propagate the reconciled concurrency to the live pool (a hot-swapped
-	// concurrency takes effect without a worker restart).
-	m.containers.activateApp(fn.Name, image)
-	m.containers.setAppConcurrency(fn.Name, prepared.Concurrency)
-	m.containers.setAppResources(fn.Name, fn.Template.ResourceLimits())
-	// Publish the live source mount for this now-active version (or clear a
-	// stale one), mirroring the reuse path above.
-	if mountSource {
-		m.setSourceMount(fn.Name, SourceMount{
-			HostPath: sourceHostPath,
-			Target:   mountTarget,
-			WorkDir:  planResult.SourceMountWorkDir,
-			Masks:    planResult.SourceMountMasks,
-			Identity: fp,
-		})
-	} else {
-		m.clearSourceMount(fn.Name)
+	// The build succeeded. Plain Prepare callers activate the exact image now;
+	// publication-aware callers do so only after acceptance, so a generation
+	// rejected by the selection fence never touches the live warm pool.
+	if activate {
+		m.activatePrepared(prepared)
 	}
 	leaseTransferred = true
 	prepared.Dependency = depRef
 	return prepared, nil
+}
+
+// activatePrepared applies a prepared generation's warm-container side effects:
+// it clears any removal mark for the exact image, propagates the reconciled
+// concurrency and resource limits, and publishes (or clears) the live source
+// mount. It runs only for an ACCEPTED generation — plain Prepare (direct
+// callers), the worker's startup publication, and PublishPrepared after its
+// authoritative selection check. It is idempotent and safe to call more than
+// once for the same handle.
+func (m *Manager) activatePrepared(prepared *Prepared) {
+	if m == nil || prepared == nil {
+		return
+	}
+	m.containers.activateApp(prepared.Name, prepared.Image)
+	m.containers.setAppConcurrency(prepared.Name, prepared.Concurrency)
+	m.containers.setAppResources(prepared.Name, prepared.resources)
+	if prepared.sourceMount != nil {
+		m.setSourceMount(prepared.Name, *prepared.sourceMount)
+		return
+	}
+	m.clearSourceMount(prepared.Name)
+}
+
+// ActivatePrepared publishes a prepared generation's warm-container state. It is
+// the explicit activation step for an embedding caller that uses the
+// publication-aware PrepareWithFingerprintAndSelection but manages its own
+// registry publication; the worker uses PublishPrepared for both startup and live
+// reconciliation, which activates only after the fenced registry swap. It is
+// nil-safe and idempotent.
+func (m *Manager) ActivatePrepared(prepared *Prepared) {
+	m.activatePrepared(prepared)
 }
 
 // zuvloopImageFingerprint derives the baked-source app image identity for a

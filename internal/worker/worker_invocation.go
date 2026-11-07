@@ -13,23 +13,35 @@ import (
 	"relay/internal/stream"
 )
 
-// newWorkerRunner constructs the invocation runner and wires every
-// worker-owned setting before the consumer can dispatch to it: the stable
-// NODE_ID as the execution-container node identity, the shared secrets provider,
-// the handler-timeout cap, and the global invocation concurrency bound. It also
-// exposes the live runner to the manual-invocation and DLQ-replay socket
-// commands; both setters are safe to call after the socket exists because the
-// socket guards its invoker/replayer under a mutex, so a command racing the
-// wiring answers unavailable rather than observing a torn value.
-func newWorkerRunner(
-	prepared []*runner.PreparedApp,
+// newWorkerRunnerShell constructs the live runner with an EMPTY registry. The
+// worker builds this shell before startup preparation so each accepted startup
+// generation can be added to the SAME registry atomically with its authoritative
+// runtime-selection check (see runtime.Manager.PublishPrepared). A rejected
+// generation is never added as available; it is replaced with an unavailable
+// placeholder by the startup publication pass.
+func newWorkerRunnerShell(
 	logger *slog.Logger,
-	cfg config.Config,
 	metricsInstance *metrics.Registry,
+) *runner.Runner {
+	return runner.NewWithMetrics(nil, logger, metricsInstance)
+}
+
+// wireWorkerRunner installs every worker-owned runner setting before the
+// consumer can dispatch to it: the stable NODE_ID as the execution-container
+// node identity, the shared secrets provider, the handler-timeout cap, and the
+// global invocation concurrency bound. It also exposes the live runner to the
+// manual-invocation and DLQ-replay socket commands; both setters are safe to
+// call after the socket exists because the socket guards its invoker/replayer
+// under a mutex, so a command racing the wiring answers unavailable rather than
+// observing a torn value. It is separate from construction because the registry
+// must exist (and be populated through fenced publication) before consumption
+// starts.
+func wireWorkerRunner(
+	runWorker *runner.Runner,
+	cfg config.Config,
 	secretProvider secrets.Provider,
 	rtSocket *SocketServer,
-) *runner.Runner {
-	runWorker := runner.NewWithMetrics(prepared, logger, metricsInstance)
+) {
 	// Stamp the relay.node_id label (the node/consumer identity) on every
 	// execution container, so all invocations carry it.
 	runWorker.SetNodeID(cfg.NodeID)
@@ -55,7 +67,6 @@ func newWorkerRunner(
 	// entry's exact recorded app/handler once against the current registry.
 	rtSocket.SetInvoker(runWorker)
 	rtSocket.SetReplayer(runWorker)
-	return runWorker
 }
 
 // newStreamConsumer constructs the Redis stream consumer after the runner so

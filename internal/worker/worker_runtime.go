@@ -88,12 +88,17 @@ func openRuntimeManager(
 		// configuration; a change requires a worker restart.
 		runtime.WithPythonZuvloop(cfg.PythonZuvloop),
 		// Runtime base-image pin snapshot read from PostgreSQL after the state
-		// handle opened. The Manager keeps this snapshot for its lifetime and does
-		// not poll for changes. A missing selection means the runtime is unpinned
-		// and keeps its historical configured-tag behavior. The Manager validates
-		// each pin against the runtime registry and rejects a malformed or
-		// mismatched selection for a known runtime.
+		// handle opened. The Manager validates each pin against the runtime
+		// registry and rejects a malformed or mismatched selection for a known
+		// runtime. A missing selection means the runtime is unpinned and keeps its
+		// historical configured-tag behavior.
 		runtime.WithRuntimeImageSelections(toRuntimeImageSelections(runtimeSelections)),
+		// The shared authoritative selection source. The reconciler refreshes the
+		// complete snapshot from it once per periodic pass, and live publication
+		// revalidates the captured selection under the same per-runtime advisory
+		// lock every selection CAS write takes. A read/validation failure keeps the
+		// last-known-good snapshot.
+		runtime.WithRuntimeImageSelectionStore(newStateRuntimeImageSelectionStore(st)),
 		// Root Dockerfile builds in the WORKER LIFECYCLE (lifecycle), not the
 		// startup-span context: they get an independent 10m bound
 		// (runtime.buildTimeout) but are still cancelled when Relay shuts
@@ -152,4 +157,50 @@ func toRuntimeImageSelections(selections []state.RuntimeImageSelection) []runtim
 		})
 	}
 	return out
+}
+
+// stateRuntimeImageSelectionStore adapts the State-backed runtime selection API
+// to the runtime's refresh/publication-fence seam. State owns the PostgreSQL
+// transaction-scoped advisory lock and the authoritative row read; runtime owns
+// when a reconciliation pass refreshes and when a preparation may publish. The
+// adapter only bridges the two structurally identical read models.
+type stateRuntimeImageSelectionStore struct {
+	st *state.State
+}
+
+func newStateRuntimeImageSelectionStore(st *state.State) runtime.RuntimeImageSelectionStore {
+	if st == nil {
+		return nil
+	}
+	return stateRuntimeImageSelectionStore{st: st}
+}
+
+// ReadRuntimeImageSelections returns the complete current snapshot.
+func (s stateRuntimeImageSelectionStore) ReadRuntimeImageSelections(
+	ctx context.Context,
+) ([]runtime.RuntimeImageSelection, error) {
+	selections, err := s.st.ReadRuntimeImageSelections(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return toRuntimeImageSelections(selections), nil
+}
+
+// WithRuntimeImageSelectionLock runs fn under the authoritative per-runtime
+// selection lock, converting the current row (nil when absent) to the runtime
+// read model.
+func (s stateRuntimeImageSelectionStore) WithRuntimeImageSelectionLock(
+	ctx context.Context,
+	runtimeID string,
+	fn func(context.Context, *runtime.RuntimeImageSelection) error,
+) error {
+	return s.st.WithRuntimeImageSelectionLock(ctx, runtimeID,
+		func(ctx context.Context, current *state.RuntimeImageSelection) error {
+			var converted *runtime.RuntimeImageSelection
+			if current != nil {
+				rows := toRuntimeImageSelections([]state.RuntimeImageSelection{*current})
+				converted = &rows[0]
+			}
+			return fn(ctx, converted)
+		})
 }

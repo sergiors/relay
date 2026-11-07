@@ -54,6 +54,21 @@ func (s *selectionSpyBuilder) Execute(context.Context, *runtime.Prepared, string
 	return nil
 }
 
+// RefreshRuntimeImageSelections and PublishPrepared complete the fenced seam so
+// the spy exercises the same deferred-prepare / fenced-publication pair as the
+// production Manager.
+func (s *selectionSpyBuilder) RefreshRuntimeImageSelections(context.Context) ([]string, error) {
+	return nil, nil
+}
+
+func (s *selectionSpyBuilder) PublishPrepared(
+	_ context.Context,
+	_ *runtime.Prepared,
+	publish func() error,
+) error {
+	return publish()
+}
+
 // TestReconcileHandsComputedFingerprintAndSelectionToBuilder is the live-rebuild
 // handoff regression: the reconciler computes each app's fingerprint and
 // resolves its source selection ONCE (SelectAndFingerprintApp), then hands
@@ -155,6 +170,56 @@ func TestReconcileFallsBackToPlainPrepareForTestBuilders(t *testing.T) {
 
 	if b.prepares() != 1 {
 		t.Fatalf("plain Prepare calls = %d, want 1 for a builder without the selection seam", b.prepares())
+	}
+}
+
+// selectionOnlyBuilder implements the selection-aware preparation but NOT its
+// matching fenced publication. It stands for an incomplete optional
+// implementation (for example a wrapper that forwards only one Manager method).
+type selectionOnlyBuilder struct {
+	plainCalls     int
+	selectionCalls int
+}
+
+func (s *selectionOnlyBuilder) Prepare(_ context.Context, fn app.App) (*runtime.Prepared, error) {
+	s.plainCalls++
+	return &runtime.Prepared{Name: fn.Name, Image: "img-" + fn.Name}, nil
+}
+
+func (s *selectionOnlyBuilder) PrepareWithFingerprintAndSelection(
+	_ context.Context,
+	fn app.App,
+	_ string,
+	_ *source.Selection,
+) (*runtime.Prepared, error) {
+	s.selectionCalls++
+	return &runtime.Prepared{Name: fn.Name, Image: "img-" + fn.Name}, nil
+}
+
+func (s *selectionOnlyBuilder) Execute(context.Context, *runtime.Prepared, string, []byte, []string) error {
+	return nil
+}
+
+// TestReconcileFallsBackToPlainPrepareForIncompleteSelectionBuilder pins the
+// pairing rule: deferred selection-aware preparation is used only when the
+// builder also implements the fenced publication that activates the accepted
+// generation. A selectionPreparer-only builder keeps its legacy immediate-
+// activation contract through plain Prepare instead of silently losing warm
+// state.
+func TestReconcileFallsBackToPlainPrepareForIncompleteSelectionBuilder(t *testing.T) {
+	root := t.TempDir()
+	writeFnDir(t, root, "incomplete")
+
+	b := &selectionOnlyBuilder{}
+	r, _ := newTestReconciler(t, root, b, nil, nil)
+
+	r.reconcileApp("incomplete")
+
+	if b.plainCalls != 1 {
+		t.Fatalf("plain Prepare calls = %d, want 1 for an incomplete selection seam", b.plainCalls)
+	}
+	if b.selectionCalls != 0 {
+		t.Fatalf("selection-aware Prepare calls = %d, want 0 without matching publication", b.selectionCalls)
 	}
 }
 

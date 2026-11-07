@@ -57,10 +57,26 @@ the selection time. A missing row means the runtime is **unpinned** and keeps it
 historical configured base-image behavior exactly; existing deployments therefore
 do not rebuild images.
 
-Workers read this table once during startup, before app preparation, and use a
-pin only as `FROM <configured-ref>@<digest>`. The current CLI has no selection
-writer, and a running worker does not refresh changed rows; a stored change takes
-effect after restart. Runtimes without a row remain unpinned.
+Workers read this table at startup, before app preparation, and refresh the
+complete snapshot once per periodic reconciliation pass (the default cadence is
+30 seconds). A pin is used only as `FROM <configured-ref>@<digest>`; Relay never
+resolves the registry or a child manifest digest. A changed pin invalidates only
+the runtime-backed apps using that runtime, which reprepare without a worker
+restart. A read or validation failure keeps the last-known-good snapshot and is
+retried on the next pass. In particular, a row whose configured source image does
+not match the runtime's built-in base reference is rejected rather than applied;
+correct the row to let that runtime converge.
+
+Publication is fenced: a transaction-scoped PostgreSQL advisory lock keyed by
+runtime ID is shared by selection CAS writes and by the authoritative
+check-plus-registry-swap. This includes the initial startup registry population,
+so a pin cannot change during startup preparation and have a stale image
+published or warmed. If a pin changes while an image is being built, that stale
+generation is discarded (its preparation and publication leases are released),
+the old active version keeps serving (or the app is represented by an unavailable
+placeholder that still matches events), and a refreshed reconcile retries against
+the current pin. The current CLI has no selection writer. Runtimes without a row
+remain unpinned.
 
 ## Health and statistics
 

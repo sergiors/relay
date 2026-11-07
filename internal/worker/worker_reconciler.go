@@ -30,11 +30,12 @@ import (
 // successful watcher construction cannot run against an unseeded reconciler.
 //
 // Seeding uses the identity each app's image was ACTUALLY built from
-// (startupSeedFingerprints), so the first reconcile compares the live tree
-// against what is really baked. Start runs in its own goroutine and exits on
-// lifecycle cancellation; reconcilerDone is the shutdown barrier that
-// guarantees no reconcile can still use the runtime manager or state DB when
-// those are closed.
+// (startupSeedFingerprints) plus the runtime base-image selection identity of
+// that published generation (startupSeedImageSelections), so the first reconcile
+// compares the live tree and the current pin against what is really published.
+// Start runs in its own goroutine and exits on lifecycle cancellation;
+// reconcilerDone is the shutdown barrier that guarantees no reconcile can still
+// use the runtime manager or state DB when those are closed.
 func startAppReconciler(
 	lifecycle context.Context,
 	logger *slog.Logger,
@@ -64,8 +65,14 @@ func startAppReconciler(
 
 	seedStart := time.Now()
 	seeds := startupSeedFingerprints(apps, fingerprints, prepared)
+	selections := startupSeedImageSelections(prepared)
 	for _, fn := range apps {
 		rec.Seed(fn, seeds[fn.Name])
+		// Seed the runtime base-image identity the published generation was
+		// ACTUALLY built from. An app whose startup publication was rejected is
+		// represented by an unavailable placeholder and this empty identity; it
+		// retries regardless of the source fingerprint.
+		rec.SeedImageSelection(fn.Name, selections[fn.Name])
 	}
 	// Seed the EXACT fencing token each startup discovery/invalid write
 	// returned. This lets the first live observation reuse that generation

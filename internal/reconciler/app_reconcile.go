@@ -25,6 +25,13 @@ import (
 // when it was previously known. Each candidate is dispatched through the same
 // single pump so reconciles stay serialized per app.
 func (r *Reconciler) reconcileAll() {
+	// Refresh the complete runtime base-image selection snapshot ONCE per pass,
+	// before dispatching any app. Each reconcile then compares its app's recorded
+	// built identity with the refreshed snapshot, so only runtime-backed apps whose
+	// selection actually changed reprepare while every other app keeps its
+	// unchanged skip path. A read/validation failure leaves the Manager's
+	// last-known-good snapshot in place and is retried on the next pass.
+	r.refreshRuntimeSelections()
 	seen := map[string]bool{}
 	entries, err := os.ReadDir(r.root)
 	if err != nil {
@@ -94,6 +101,40 @@ func (r *Reconciler) reconcileAll() {
 	for _, name := range r.missingNames(seen) {
 		r.dispatch(name)
 	}
+}
+
+// refreshRuntimeSelections refreshes the runtime Manager's complete validated
+// selection snapshot. An error is logged and leaves the last-known-good snapshot
+// untouched; the next periodic pass retries. It reports whether the refresh
+// itself succeeded (even when no runtime changed), so a stale-publication retry
+// can distinguish a converged snapshot from a database/validation failure it
+// must leave to the periodic backstop.
+//
+// It intentionally does NOT invalidate recorded build identities here: every
+// reconcile compares each app's published selection identity against the current
+// snapshot (see currentImageSelection), so only apps whose runtime actually
+// changed reprepare, and a change that was already consumed by a snapshot refresh
+// (notably during startup publication) is still detected.
+func (r *Reconciler) refreshRuntimeSelections() bool {
+	publisher, ok := r.builder.(selectionPublisher)
+	if !ok {
+		return false
+	}
+	changed, err := publisher.RefreshRuntimeImageSelections(r.rctx())
+	if err != nil {
+		r.log.Warn(
+			"Runtime: image selection refresh failed; retaining last known good",
+			"error", err,
+		)
+		return false
+	}
+	if len(changed) > 0 {
+		r.log.Info(
+			"Runtime: image selection changed; affected apps will reprepare",
+			"runtimes", changed,
+		)
+	}
+	return true
 }
 
 // missingNames returns the locally-known names (active, pending-only, or
@@ -355,14 +396,22 @@ func (r *Reconciler) reconcileApp(name string) {
 		return
 	}
 
+	currentSelection := r.currentImageSelection(fn.Template)
 	r.mu.Lock()
 	known, hasFingerprint := r.fingerprints[name]
+	knownSelection, hasSelection := r.imageSelections[name]
 	r.mu.Unlock()
+	// A tracked built identity must equal the Manager's current validated snapshot.
+	// An untracked entry preserves the legacy source-fingerprint-only behavior for
+	// fake/non-runtime-backed builders that never seed or publish a selection.
+	selectionUnchanged := !hasSelection || knownSelection == currentSelection
 
-	// Skip a rebuild only when the current build is healthy AND content is
-	// unchanged. A previously-failed build (unavailable) is retried even if the
-	// fingerprint is stable, so a broken app recovers without edits.
-	if cur != nil && isAvailable(cur) && hasFingerprint && known == fp {
+	// Skip a rebuild only when the current build is healthy, content is unchanged,
+	// AND the runtime base-image selection it was built from is still current. A
+	// previously-failed build (unavailable) is retried even if the fingerprint is
+	// stable, so a broken app recovers without edits. A changed selection always
+	// reprepares, even when the source fingerprint is identical.
+	if cur != nil && isAvailable(cur) && hasFingerprint && known == fp && selectionUnchanged {
 		// No image transition is needed, so the pending desired rules published
 		// above (which, for a byte-identical template, are the same rules as the
 		// active generation) are cleared: no stale pending state may linger.
@@ -498,7 +547,52 @@ func (r *Reconciler) reconcileApp(name string) {
 		oldImage = cur.Prepared().Image
 	}
 
-	r.reg.Replace(name, pf)
+	// Publish only if the selection this generation was built from is still the
+	// authoritative one. The Manager takes the same per-runtime advisory lock a
+	// selection CAS write takes for the whole check-plus-swap, so a concurrent
+	// write cannot slip between them. A rejected generation releases its
+	// preparation/publication lease and leaves the old active app, its services,
+	// its schedules, and its warm pool untouched.
+	publish := func() error {
+		r.reg.Replace(name, pf)
+		return nil
+	}
+	if publisher, ok := r.builder.(fencedSelectionBuilder); ok {
+		if pubErr := publisher.PublishPrepared(r.rctx(), built, publish); pubErr != nil {
+			// The publication handle owns the transferred image lease; release
+			// it (and the preparation handle's own reference defensively) so a
+			// rejected generation strands no admitted image.
+			pf.ReleasePublication()
+			built.ReleaseLease()
+			if errors.Is(pubErr, runtime.ErrRuntimeImageSelectionStale) {
+				r.log.Info(
+					"App: runtime image selection changed during preparation; retaining previous version",
+					"app", name,
+					"error", pubErr,
+				)
+				// Refresh the complete snapshot before retrying so the next
+				// attempt builds from the authoritative pin, then coalesce a
+				// prompt retry. The old generation remains active throughout.
+				// When the refresh itself fails, leave the retry to the periodic
+				// backstop instead of spinning against an unavailable database.
+				if r.refreshRuntimeSelections() {
+					r.Enqueue(name)
+				}
+				return
+			}
+			r.log.Error(
+				"App: publication failed; retaining previous version",
+				"app", name,
+				"error", pubErr,
+			)
+			if r.st != nil {
+				r.st.RecordReconcileFailure(r.rctx(), name, pubErr, fencingToken)
+			}
+			return
+		}
+	} else {
+		publish()
+	}
 	// The skip key and the persisted active fingerprint are the identity the
 	// image was ACTUALLY built from (built.Fingerprint, derived inside Prepare
 	// from the one immutable source snapshot the build staged), not the pre-build
@@ -514,6 +608,10 @@ func (r *Reconciler) reconcileApp(name string) {
 	}
 	r.mu.Lock()
 	r.fingerprints[name] = builtFP
+	// Record the identity the published image was built from, not a later read
+	// of the Manager snapshot: a pin change after publication must compare unequal
+	// on the next pass and reprepare.
+	r.imageSelections[name] = built.ImageSelection
 	r.mu.Unlock()
 
 	ready := func() {
@@ -591,6 +689,21 @@ func (r *Reconciler) reconcileApp(name string) {
 	}
 }
 
+// currentImageSelection returns the runtime Manager's current validated selection
+// identity for the template's runtime, or "" for a no-runtime app or a builder
+// that does not expose a live selection snapshot. It is read on every app pass so
+// a pin change is detected by identity comparison, not only by the refresh
+// change notification.
+func (r *Reconciler) currentImageSelection(tmpl *app.Template) string {
+	if tmpl == nil || !tmpl.NeedsRuntime() {
+		return ""
+	}
+	if source, ok := r.builder.(selectionIdentitySource); ok {
+		return source.RuntimeImageSelectionIdentity(tmpl.Runtime)
+	}
+	return ""
+}
+
 func (r *Reconciler) currentGeneration(name string, generation uint64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -621,25 +734,30 @@ func (r *Reconciler) setFencingToken(name string, fencingToken state.FencingToke
 
 // prepareImage builds the app's image, passing the fingerprint the
 // reconciler already computed (and, for a runtime-backed app, the source
-// selection it was computed from) when the builder supports it. The runtime
-// Manager does, so a live rebuild hands it BOTH the tag identity it compared and
-// the exact policy to stage: the selection is never re-derived and the
-// fingerprint is never re-hashed by the reconciler. The Manager still captures
-// the selection once and derives the built identity from that capture; the
-// caller records the RETURNED fingerprint. A test or non-Manager Builder that
-// only implements Builder falls back to Prepare, which computes them itself;
-// those fakes do not care about the identity anyway. fp is "" only for an app
-// the reconciler could not hash (which then never reaches here: a fingerprint
-// error retains the previous version), so the value supplied is always the one
-// just compared.
+// selection it was computed from) only when the builder implements BOTH the
+// selection-aware preparation and its matching fenced publication. The runtime
+// Manager implements both, so a live rebuild hands it BOTH the tag identity it
+// compared and the exact policy to stage: the selection is never re-derived and
+// the fingerprint is never re-hashed by the reconciler. The Manager still
+// captures the selection once and derives the built identity from that capture;
+// the caller records the RETURNED fingerprint.
+//
+// A Builder that implements only selectionPreparer is treated as an incomplete
+// optional implementation and falls back to plain Prepare: the deferred
+// preparation contract is only safe when the matching PublishPrepared will run
+// and activate the accepted generation. A test or non-Manager Builder that
+// implements neither seam also uses plain Prepare. fp is "" only for an app the
+// reconciler could not hash (which then never reaches here: a fingerprint error
+// retains the previous version), so the value supplied is always the one just
+// compared.
 func (r *Reconciler) prepareImage(
 	ctx context.Context,
 	fn app.App,
 	fp string,
 	selection *source.Selection,
 ) (*runtime.Prepared, error) {
-	if sp, ok := r.builder.(selectionPreparer); ok {
-		return sp.PrepareWithFingerprintAndSelection(ctx, fn, fp, selection)
+	if fb, ok := r.builder.(fencedSelectionBuilder); ok {
+		return fb.PrepareWithFingerprintAndSelection(ctx, fn, fp, selection)
 	}
 	return r.builder.Prepare(ctx, fn)
 }
@@ -695,6 +813,7 @@ func (r *Reconciler) observeApp(name string) *state.AppObservation {
 func (r *Reconciler) skipUnchangedInvalidDesired(name string, observation *state.AppObservation) {
 	r.mu.Lock()
 	delete(r.fingerprints, name)
+	delete(r.imageSelections, name)
 	r.generations[name]++
 	if observation != nil && observation.Found && observation.FencingToken > 0 {
 		r.fencingTokens[name] = observation.FencingToken
@@ -748,6 +867,7 @@ func (r *Reconciler) recordInvalidDesired(
 ) {
 	r.mu.Lock()
 	delete(r.fingerprints, name)
+	delete(r.imageSelections, name)
 	r.generations[name]++
 	delete(r.fencingTokens, name)
 	r.mu.Unlock()
@@ -798,6 +918,7 @@ func (r *Reconciler) remove(name string) {
 	r.reg.Replace(name, nil)
 	r.mu.Lock()
 	delete(r.fingerprints, name)
+	delete(r.imageSelections, name)
 	r.generations[name]++
 	fencingToken := r.fencingTokens[name]
 	delete(r.fencingTokens, name)

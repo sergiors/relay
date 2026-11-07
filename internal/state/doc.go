@@ -159,27 +159,35 @@
 //
 // runtime_image_selections(runtime_id TEXT PRIMARY KEY, source_image TEXT NOT
 // NULL, digest TEXT NOT NULL, generation BIGINT NOT NULL, selected_at TEXT NOT
-// NULL) is a small startup-only table of runtime base-image pins, keyed by the
-// template runtime identifier. source_image stores the EXACT configured base
-// reference (e.g. "python:3.14-slim"), and digest stores a Docker
-// multi-platform index digest in the form "sha256:<64 lowercase hex>" — never a
-// child manifest digest. generation is monotonically increasing and selected_at
-// is the RFC3339 selection timestamp. There is no history table: a pin is
-// replaced in place. A MISSING ROW MEANS UNPINNED, which preserves the exact
-// historical base-image tag behavior for every existing deployment.
+// NULL) is a small table of runtime base-image pins, keyed by the template
+// runtime identifier. source_image stores the EXACT configured base reference
+// (e.g. "python:3.14-slim"), and digest stores a Docker multi-platform index
+// digest in the form "sha256:<64 lowercase hex>" — never a child manifest
+// digest. generation is monotonically increasing and selected_at is the RFC3339
+// selection timestamp. There is no history table: a pin is replaced in place. A
+// MISSING ROW MEANS UNPINNED, which preserves the exact historical base-image tag
+// behavior for every existing deployment.
 //
-// ReadRuntimeImageSelections is the worker's startup read; the runtime snapshot
-// it feeds is immutable for the process lifetime and there is no polling or live
-// refresh. CompareAndSwapRuntimeImageSelection is the narrow write API: it
-// inserts at expected generation 0 (absent/unpinned) or updates only when the
-// stored generation still matches the expected positive generation, advancing it
-// by one. A lost race is reported as ErrRuntimeImageSelectionConflict, distinct
-// from a PostgreSQL error. This package does not import the runtime package and
-// does not validate runtime/source-image binding; the runtime layer does.
+// ReadRuntimeImageSelections is the complete snapshot read used both at worker
+// startup and by each periodic reconciliation pass, which refreshes the runtime
+// Manager's validated view. A read or validation failure leaves the worker's
+// last-known-good snapshot in place. CompareAndSwapRuntimeImageSelection is the
+// narrow write API: it inserts at expected generation 0 (absent/unpinned) or
+// updates only when the stored generation still matches the expected positive
+// generation, advancing it by one. A lost race is reported as
+// ErrRuntimeImageSelectionConflict, distinct from a PostgreSQL error.
 //
-// Workers read selections once at startup. The current CLI has no selection
-// writer, and a running worker does not refresh changed rows; a stored change
-// takes effect after the worker restarts. Runtimes without a row remain unpinned.
+// Selection writes and runtime publication are fenced by one transaction-scoped
+// PostgreSQL advisory lock keyed by runtime ID: CAS writes take it, and
+// WithRuntimeImageSelectionLock reads the authoritative row (including the
+// absent/unpinned case) and runs the caller's publication inside the same lock.
+// A preparation whose captured ref@digest no longer matches the row is therefore
+// never published, while the active version keeps serving until a later pass
+// converges. This package does not import the runtime package and does not
+// validate runtime/source-image binding; the runtime layer does.
+//
+// The current CLI has no selection writer. Runtimes without a row remain
+// unpinned; a stored change converges without a worker restart.
 //
 // Secret values are never stored: only the reference names appear in the
 // snapshot. Literal env values are never stored either: env entries keep the

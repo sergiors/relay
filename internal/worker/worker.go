@@ -425,11 +425,12 @@ func Run(logger *slog.Logger) (runErr error) {
 		run:     func(context.Context) error { return st.Close() },
 	})
 
-	// Load the runtime base-image pin snapshot once, directly after the state
+	// Load the initial runtime base-image pin snapshot directly after the state
 	// database opens and before any app is loaded, fingerprinted, or prepared.
-	// The runtime Manager receives this immutable startup snapshot and does not
-	// poll for changes. A read failure is fatal: treating it as "everything
-	// unpinned" could build from a moving tag when a pin is stored.
+	// The runtime Manager receives this validated startup snapshot plus the
+	// authoritative store the reconciler refreshes once per periodic pass. A read
+	// failure is fatal: treating it as "everything unpinned" could build from a
+	// moving tag when a pin is stored.
 	runtimeSelections, err := st.ReadRuntimeImageSelections(startupCtx)
 	if err != nil {
 		if startupInterrupted(startupCtx, err) {
@@ -551,16 +552,18 @@ func Run(logger *slog.Logger) (runErr error) {
 		ctx, startupCtx, logger, manager, cfg.NodeID, proof,
 	)
 
-	prepared := prepareAndStartApps(
-		ctx, startupCtx, logger, manager, st, startupSet,
+	// The live runner (and its registry) exists BEFORE preparation so each
+	// accepted startup generation is added to the SAME registry atomically with
+	// its authoritative selection check. It is wired for consumption only after
+	// the registry population is complete.
+	runWorker := newWorkerRunnerShell(logger, metricsInstance)
+	prepared, retryStartup := prepareAndStartApps(
+		ctx, startupCtx, logger, manager, runWorker, st, startupSet,
 		services, svcCtrl, proof, shutdown,
 	)
+	wireWorkerRunner(runWorker, cfg, secretProvider, rtSocket)
 
 	// Runner before consumer: the consumer wires it as its ScheduleRunner seam.
-	runWorker := newWorkerRunner(
-		prepared, logger, cfg, metricsInstance, secretProvider, rtSocket,
-	)
-
 	consumer := newStreamConsumer(client, logger, cfg, metricsInstance, st, runWorker)
 	// The durable DLQ lives in PostgreSQL, so its depth gauge is sampled from
 	// the state handle on the consumer's existing periodic gauge refresher.
@@ -610,6 +613,16 @@ func Run(logger *slog.Logger) (runErr error) {
 			reportReconcilerFailure(ctx, stop, reconcilerFailures, err)
 		},
 	)
+	// A startup preparation rejected by the selection fence is represented in
+	// the registry by an unavailable placeholder. Promptly re-drive exactly those
+	// apps once the watcher/pump is live, against the snapshot refreshed by the
+	// publication pass, instead of waiting for the periodic backstop. The
+	// placeholder keeps events matched-but-unavailable in the meantime.
+	if ctx.Err() == nil {
+		for _, name := range retryStartup {
+			rec.Enqueue(name)
+		}
+	}
 	if ctx.Err() != nil {
 		// A failed watch setup latches its error and cancels the lifecycle. A
 		// signal during startup is also cancellation, but is otherwise graceful;

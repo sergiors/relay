@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -173,12 +174,7 @@ func sweepStartupImages(
 	// The exact image each prepared app is serving this boot. This is the
 	// authoritative keep input: no fingerprint re-scan, no expected-tag
 	// reconstruction.
-	preparedImages := make([]string, 0, len(prepared))
-	for _, pf := range prepared {
-		if p := pf.Prepared(); p != nil && p.Image != "" {
-			preparedImages = append(preparedImages, p.Image)
-		}
-	}
+	preparedImages := startupPreparedImages(prepared)
 
 	// Images referenced by any Relay-owned service container are kept too: a
 	// container kept by the Applys above (unchanged image) or left over from a
@@ -223,6 +219,19 @@ func sweepStartupImages(
 			logStartupCleanupFailure(lifecycle, logger, "Image cleanup: startup sweep failed", err)
 		}
 	}
+}
+
+// startupPreparedImages returns images belonging to accepted, prepared startup
+// generations. Unavailable placeholders (including stale rejected candidates)
+// have no image to keep; a last-active image is provided separately by state.
+func startupPreparedImages(prepared []*runner.PreparedApp) []string {
+	images := make([]string, 0, len(prepared))
+	for _, pf := range prepared {
+		if p := pf.Prepared(); p != nil && p.Image != "" {
+			images = append(images, p.Image)
+		}
+	}
+	return images
 }
 
 // liveAppNames builds the startup service-orphan sweep's present-app set from
@@ -407,14 +416,19 @@ func cleanupStartupDependencies(lifecycle context.Context, manager *runtime.Mana
 	}
 }
 
-// prepareAndStartApps builds every app's image, publishes the initial desired
-// service state, and starts the background startup housekeeping that runs once
-// the coordinator's initial service attempts settle. It returns the prepared
-// set the runner and reconciler seed consume.
+// prepareAndStartApps builds every app's image, publishes each ACCEPTED
+// generation into the live registry through the authoritative runtime-selection
+// fence, publishes the initial desired service state, and starts the background
+// startup housekeeping that runs once the coordinator's initial service attempts
+// settle. It returns the published set the reconciler seed and startup sweeps
+// consume, plus the names whose preparation was rejected and need a prompt
+// reconcile.
 //
-// Ordering is part of the contract: preparation completes before any service
-// state is published, the enqueue returns before housekeeping starts, and the
-// housekeeping barrier is registered immediately after it starts. The
+// Ordering is part of the contract: preparation completes before publication;
+// registry publication precedes warm activation, service enqueue, and startup
+// sweeps; a rejected stale generation never appears as available and never
+// enqueues a service request. The enqueue returns before housekeeping starts,
+// and the housekeeping barrier is registered immediately after it starts. The
 // housekeeping lifecycle is the worker lifecycle, so shutdown cancels an
 // in-flight wait or sweep promptly, and the barrier keeps the runtime manager
 // and state DB open until the pass actually exits.
@@ -423,29 +437,41 @@ func prepareAndStartApps(
 	startupCtx context.Context,
 	logger *slog.Logger,
 	manager *runtime.Manager,
+	runWorker *runner.Runner,
 	st *state.State,
 	startup startupAppSet,
 	services *reconciler.ServiceCoordinator,
 	svcCtrl *reconciler.ServiceReconciler,
 	proof ownershipProof,
 	shutdown *shutdownRegistry,
-) []*runner.PreparedApp {
+) ([]*runner.PreparedApp, []string) {
 	prepareCtx, prepareSpan := tracing.Start(startupCtx, "apps.prepare")
 	prepareStart := time.Now()
-	prepared := prepareApps(prepareCtx, manager, startup.records, st, startup.fencingTokens, logger)
+	candidates := prepareApps(prepareCtx, manager, startup.records, st, startup.fencingTokens, logger)
 	logger.Debug("Startup: prepared apps",
-		"count", len(prepared),
+		"count", len(candidates),
 		"duration", time.Since(prepareStart),
 	)
 	prepareSpan.End()
+
+	var publicationState startupPublicationState
+	if st != nil {
+		publicationState = st
+	}
+	published, retry := publishStartupApps(
+		lifecycle, candidates, runWorker.Registry(), manager, publicationState, startup, logger,
+	)
 
 	// Publish each app's initial desired service state and return immediately.
 	// The coordinator's bounded workers converge the states in the background,
 	// so startup never blocks on service convergence (e.g. an external image
 	// pull) — nor on the unavailable/no-services removals, which are published
 	// the same nonblocking way (the coordinator derives their own fresh bound).
+	// Only accepted generations reach this list; a rejected stale preparation is
+	// represented by its unavailable placeholder, so no stale service request is
+	// enqueued.
 	_, enqueueSpan := tracing.Start(startupCtx, "services.enqueue")
-	enqueueStartupServicesWithState(lifecycle, prepared, services, st, startup.fencingTokens, logger)
+	enqueueStartupServicesWithState(lifecycle, published, services, st, startup.fencingTokens, logger)
 	enqueueSpan.End()
 
 	// Lifecycle-aware background housekeeping. It waits behind the coordinator's
@@ -487,7 +513,7 @@ func prepareAndStartApps(
 				sweepStartupServiceOrphans(hctx, svcCtrl, liveNames, proof, logger)
 			},
 			images: func(hctx context.Context) {
-				sweepStartupImages(hctx, manager, prepared, st, logger)
+				sweepStartupImages(hctx, manager, published, st, logger)
 			},
 			deps: func(hctx context.Context) {
 				cleanupStartupDependencies(hctx, manager, logger)
@@ -499,5 +525,142 @@ func prepareAndStartApps(
 	// merely for this step's bound) before closing either.
 	shutdown.register(housekeepingBarrierStep(housekeepingDone))
 
-	return prepared
+	return published, retry
+}
+
+// startupSelectionPublisher is the narrow runtime-manager surface needed to
+// publish startup candidates. Keeping this boundary explicit lets worker tests
+// deterministically exercise the same stale-generation handoff without Docker.
+type startupSelectionPublisher interface {
+	PublishPrepared(context.Context, *runtime.Prepared, func() error) error
+	RefreshRuntimeImageSelections(context.Context) ([]string, error)
+	RuntimeImageSelectionIdentity(string) string
+}
+
+type startupPublicationState interface {
+	RecordReconcileSuccess(context.Context, string, string, string, time.Time, app.App, state.FencingToken) (bool, error)
+	RecordReconcileFailure(context.Context, string, error, state.FencingToken) (bool, error)
+}
+
+// publishStartupApps performs the startup check-and-publish handoff for prepared
+// candidates. It is deliberately separate from background housekeeping so the
+// registry/status/retry decisions are directly testable with a fake publisher
+// and state recorder.
+func publishStartupApps(
+	lifecycle context.Context,
+	candidates []*runner.PreparedApp,
+	registry *runner.Registry,
+	manager startupSelectionPublisher,
+	st startupPublicationState,
+	startup startupAppSet,
+	logger *slog.Logger,
+) ([]*runner.PreparedApp, []string) {
+
+	// Publish each startup generation into the empty live registry through the
+	// SAME authoritative per-runtime selection fence live reconciliation uses.
+	// The registry add happens inside the check-plus-publication critical section,
+	// so a selection CAS cannot slip between the authoritative read and the initial
+	// registry add. Warm-pool activation also happens only after acceptance.
+	//
+	// A rejected generation is replaced with an unavailable placeholder built from
+	// the current template. That preserves matching (a delivery remains
+	// matched-but-unavailable and is never ACKed as unmatched) without exposing a
+	// stale image, service request, or warm container. Rejected names are returned
+	// so the caller can seed a prompt reconcile after the watcher starts.
+	var (
+		published []*runner.PreparedApp
+		retry     []string
+	)
+	for _, pf := range candidates {
+		if pf == nil {
+			continue
+		}
+		fn := pf.App()
+		built := pf.Prepared()
+		if built == nil {
+			// A preparation failure already produced the existing unavailable
+			// semantics; add its current desired rules so matching stays live.
+			registry.Replace(fn.Name, pf)
+			published = append(published, pf)
+			continue
+		}
+		publish := func() error {
+			registry.Replace(fn.Name, pf)
+			return nil
+		}
+		pubErr := manager.PublishPrepared(lifecycle, built, publish)
+		if pubErr != nil {
+			// The generation was not accepted: drop its publication lease and
+			// never enqueue a service request or activate warm state for it.
+			pf.ReleasePublication()
+			built.ReleaseLease()
+			unavailable := runner.NewUnavailable(fn)
+			registry.Replace(fn.Name, unavailable)
+			published = append(published, unavailable)
+			retry = append(retry, fn.Name)
+			if startupInterrupted(lifecycle, pubErr) {
+				logger.Debug("Startup: app publication interrupted by shutdown",
+					"app", fn.Name, "error", pubErr)
+				continue
+			}
+			if errors.Is(pubErr, runtime.ErrRuntimeImageSelectionStale) {
+				logger.Info(
+					"Startup: runtime image selection changed before publication; app will reprepare",
+					"app", fn.Name,
+					"error", pubErr,
+				)
+			} else {
+				logger.Error(
+					"Startup: app publication failed; app marked unavailable",
+					"app", fn.Name,
+					"error", pubErr,
+				)
+			}
+			if st != nil {
+				st.RecordReconcileFailure(lifecycle, fn.Name, pubErr, startup.fencingTokens[fn.Name])
+			}
+			continue
+		}
+		published = append(published, pf)
+		if st != nil && len(fn.Template.Services) == 0 {
+			// Persist the fingerprint the image was ACTUALLY built from after the
+			// registry accepted it. Service-declaring apps record success from the
+			// service convergence callback instead (see enqueueStartupServices).
+			st.RecordReconcileSuccess(
+				lifecycle, fn.Name, built.Image, built.Fingerprint, time.Now(), fn,
+				startup.fencingTokens[fn.Name],
+			)
+		}
+	}
+	if lifecycle.Err() == nil {
+		// Refresh the complete authoritative snapshot after publication. A pin that
+		// changed after an earlier app was accepted (a post-publication change, not
+		// a stale publication) must still be visible to the reconciler's first pass;
+		// comparing each accepted generation's built identity with this refreshed
+		// snapshot schedules exactly those apps for a prompt rebuild. A refresh
+		// failure keeps last-known-good; the periodic pass retries, and any rejected
+		// unavailable placeholders already preserve event matching meanwhile.
+		if _, err := manager.RefreshRuntimeImageSelections(lifecycle); err != nil {
+			logger.Warn("Startup: runtime image selection refresh failed; retaining last known good",
+				"error", err)
+		} else {
+			retrySet := make(map[string]bool, len(retry))
+			for _, name := range retry {
+				retrySet[name] = true
+			}
+			for _, pf := range published {
+				built := pf.Prepared()
+				if built == nil || built.Runtime == "" {
+					continue
+				}
+				if built.ImageSelection != manager.RuntimeImageSelectionIdentity(built.Runtime) &&
+					!retrySet[pf.Name()] {
+					retry = append(retry, pf.Name())
+					retrySet[pf.Name()] = true
+				}
+			}
+		}
+	}
+
+	return published, retry
 }

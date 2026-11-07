@@ -57,6 +57,43 @@ type selectionPreparer interface {
 	) (*runtime.Prepared, error)
 }
 
+// selectionPublisher is the OPTIONAL extension implemented by the runtime
+// Manager (not by test fakes). It refreshes the Manager's complete validated
+// selection snapshot from the shared database once per reconciliation pass, and
+// fences a prepared generation's registry publication against the authoritative
+// per-runtime selection row. A Builder that does not implement it keeps the
+// historical behavior: no live refresh and plain publication.
+type selectionPublisher interface {
+	RefreshRuntimeImageSelections(ctx context.Context) ([]string, error)
+	PublishPrepared(
+		ctx context.Context,
+		prepared *runtime.Prepared,
+		publish func() error,
+	) error
+}
+
+// fencedSelectionBuilder is the COMPLETE optional preparation/publication pair.
+// Both halves are required together: the publication-aware preparation defers
+// warm-state side effects (and the selection identity is meaningful only when the
+// matching fenced publication activates it). A Builder that implements only one
+// half is an incomplete optional implementation and falls back to legacy plain
+// Prepare/publication, which keeps its own immediate-activation contract.
+type fencedSelectionBuilder interface {
+	selectionPreparer
+	selectionPublisher
+}
+
+// selectionIdentitySource is the OPTIONAL extension implemented by the runtime
+// Manager (not by test fakes). It reports the current validated selection
+// identity for a runtime, so a reconcile can compare every app's last published
+// generation against the live snapshot. This is independent of the refresh
+// change notification: even if a snapshot refresh already happened (including
+// during startup publication), the per-app comparison still detects a pin that
+// changed after that app was published.
+type selectionIdentitySource interface {
+	RuntimeImageSelectionIdentity(runtimeID string) string
+}
+
 // resourceSetter is the OPTIONAL extension of Builder implemented by the runtime
 // Manager (but not by the test fakes). Resource limits deliberately do not
 // participate in the image fingerprint, so a resource-only template change does
@@ -178,9 +215,10 @@ type Reconciler struct {
 	updateServicesObservationWithStatus func(name string, tmpl *app.Template, image string, onReconcileStart func(), onComplete func(error))
 	removeServices                      func(name string)
 
-	mu           sync.Mutex
-	fingerprints map[string]string // name -> last-reconciled fingerprint
-	generations  map[string]uint64
+	mu              sync.Mutex
+	fingerprints    map[string]string // name -> last-reconciled fingerprint
+	imageSelections map[string]string // name -> published runtime selection identity
+	generations     map[string]uint64
 	// fencingTokens carries the PostgreSQL-authoritative fencing token returned
 	// by the desired-generation write that started each app's current
 	// generation. It is deliberately SEPARATE from generations: generations is a
@@ -265,6 +303,7 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 		updateServicesObservationWithStatus: cfg.UpdateServicesObservationWithStatus,
 		removeServices:                      cfg.RemoveServices,
 		fingerprints:                        map[string]string{},
+		imageSelections:                     map[string]string{},
 		generations:                         map[string]uint64{},
 		fencingTokens:                       map[string]state.FencingToken{},
 		timers:                              map[string]*time.Timer{},
@@ -297,6 +336,20 @@ func (r *Reconciler) Seed(fn app.App, fingerprint string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.fingerprints[fn.Name] = fingerprint
+}
+
+// SeedImageSelection records the runtime base-image selection identity the app's
+// published generation was ACTUALLY built from. It is seeded from the same
+// startup publication result that produced the fingerprint, so the first live
+// pass compares the current validated snapshot against that built identity even
+// if the snapshot changed between startup publication and the first pass. An
+// empty identity is the unpinned state and is stored explicitly; a fake or
+// non-runtime-backed builder that never calls this keeps the legacy
+// source-fingerprint-only skip behavior.
+func (r *Reconciler) SeedImageSelection(name, identity string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.imageSelections[name] = identity
 }
 
 // SeedFencingToken records the PostgreSQL fencing token returned by the exact
