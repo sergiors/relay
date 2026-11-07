@@ -396,32 +396,82 @@ func buildTestImage(ctx context.Context, t *testing.T, ref, dockerfile string) s
 	return ref
 }
 
-// cleanupImagePrefixes force-removes every local image whose repo tag starts with
-// any of the given prefixes. It is t.Cleanup glue so dependency-layer tests never
-// leak relay-dep-* / relay-app-* images onto a shared daemon.
-func cleanupImagePrefixes(cli *client.Client, prefixes ...string) func() {
+// cleanupImagePrefixes removes the images a test created, scoped EXACTLY to what
+// the test owns, with no whole-daemon unfiltered ImageList. Each argument picks
+// a scope in one of two forms:
+//
+//   - an app-image prefix "relay-app-<name>" or "relay-app-<name>:": cleanup
+//     lists ONLY images the daemon-side label filter reports as that app's
+//     managed images (relay.type=app AND relay.app=<name>), then re-checks each
+//     listed image through the production ownership predicate
+//     managedAppImageName (repository exactly relay-app-<name> plus the same
+//     label pair) before removing its tags. An unlabeled, mislabeled, or foreign
+//     image is never matched and never removed — the same strict classification
+//     the dependency GC reads, minus the whole-daemon enumeration.
+//   - an exact tracked reference (any other argument, e.g. this run's
+//     content-addressed "relay-dep-<fp>" layer or a named unmanaged fixture such
+//     as "relay-dep-evil:1"): only that reference is removed, plus the
+//     daemon-normalized "<repo>:latest" form when the argument is a bare repo.
+//
+// It is t.Cleanup glue so dependency-layer tests never leak relay-dep-* /
+// relay-app-* images onto a shared daemon. Cleanup is preserved on partial
+// failures: every removal is best-effort, so one failed removal never skips the
+// remaining scopes (a list failure yields nothing to remove, as before).
+func cleanupImagePrefixes(cli *client.Client, scopes ...string) func() {
 	return func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		// Non-All (tagged images only): every prefix match below is on a
-		// RepoTag, and a dangling image has none, so All:dangling would only add
-		// ~5s of daemon work per call on a large shared daemon with no effect on
-		// the result.
-		imgs, err := cli.ImageList(ctx, client.ImageListOptions{})
-		if err != nil {
-			return
-		}
-		for _, img := range imgs.Items {
-			for _, tag := range img.RepoTags {
-				for _, p := range prefixes {
-					if strings.HasPrefix(tag, p) {
-						cleanupImage(cli, ctx, tag)
-						break
-					}
+		for _, scope := range scopes {
+			if name, ok := appImageCleanupName(scope); ok {
+				for _, tag := range managedAppImageTags(cli, ctx, name) {
+					cleanupImage(cli, ctx, tag)
 				}
+				continue
+			}
+			cleanupImage(cli, ctx, scope)
+			if _, _, hasTag := strings.Cut(scope, ":"); !hasTag {
+				// A bare repository reference is daemon-normalized to
+				// "<repo>:latest"; cover both spellings of the exact ref.
+				cleanupImage(cli, ctx, scope+":latest")
 			}
 		}
 	}
+}
+
+// appImageCleanupName reports whether a cleanup scope is the app-image prefix
+// form — repo "relay-app-<name>", with the ":<tag>" suffix optional — and
+// returns the owning app's name for the label-filtered cleanup.
+func appImageCleanupName(scope string) (string, bool) {
+	repo, _, _ := strings.Cut(scope, ":")
+	return strings.CutPrefix(repo, relayRepoPrefix)
+}
+
+// managedAppImageTags lists the full tags of the named app's managed app images.
+// The daemon-side label filter (relay.type=app AND relay.app=<name>) keeps the
+// scan from enumerating every image on the shared daemon; each listed image is
+// then re-checked with the production ownership predicate managedAppImageName,
+// so a removed tag always satisfies the exact repository+label rule. A listing
+// failure returns nothing to remove: cleanup stays best-effort.
+func managedAppImageTags(cli *client.Client, ctx context.Context, name string) []string {
+	filters := make(client.Filters).
+		Add("label", labelType+"="+ImageTypeApp, labelApp+"="+name)
+	list, err := cli.ImageList(ctx, client.ImageListOptions{Filters: filters})
+	if err != nil {
+		return nil
+	}
+	var tags []string
+	for _, img := range list.Items {
+		for _, tag := range img.RepoTags {
+			repo, _, ok := strings.Cut(tag, ":")
+			if !ok {
+				continue
+			}
+			if got, ok := managedAppImageName(repo, img.Labels); ok && got == name {
+				tags = append(tags, tag)
+			}
+		}
+	}
+	return tags
 }
 
 // depTags lists every local relay-dep-* image tag currently present on the

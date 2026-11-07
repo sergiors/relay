@@ -38,7 +38,6 @@ func integrationReplayDeps(t *testing.T, dsn string, exec runner.Executor) Depen
 // any dial) with the explicit in-progress error, and the handler executes
 // exactly once. The first replay then completes and deletes the settled row.
 func TestIntegrationDLQReplayConcurrentClaimsRejectSecondClaimant(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	ctx := context.Background()
 
@@ -117,7 +116,6 @@ func TestIntegrationDLQReplayConcurrentClaimsRejectSecondClaimant(t *testing.T) 
 // store) no longer blocks the next `relay dlq replay`, which is admitted with a
 // newer fencing token and completes.
 func TestIntegrationDLQReplayClaimLeaseExpiresPermitsRetake(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	ctx := context.Background()
 
@@ -179,7 +177,6 @@ func TestIntegrationDLQReplayClaimLeaseExpiresPermitsRetake(t *testing.T) {
 // entry with an active replay claim and becomes removable after the claim is
 // released (rm must never delete a row out from under a running replay).
 func TestIntegrationDLQReplayRmRefusesEntryWithActiveClaim(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	ctx := context.Background()
 

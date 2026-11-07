@@ -32,7 +32,6 @@ import (
 // contact), so removal and listing cannot mutate invocation state or cause
 // execution by construction — this test configures no broker at all.
 func TestIntegrationDLQCommandsAgainstPostgres(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	ctx := context.Background()
 
@@ -179,7 +178,6 @@ func integrationDLQHexID(parts ...string) string {
 // disappears, and the resolved row stays claimable afterwards. No broker is
 // configured, per the command family's contract.
 func TestIntegrationDLQReplayAndAmbiguityViaPrefix(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	dsn := testutil.NewStateDSN(t)
 	ctx := context.Background()
 

@@ -169,7 +169,14 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cleanupCancel()
 		defer cleanupCli.Close()
-		imgs, err := cleanupCli.ImageList(cleanupCtx, client.ImageListOptions{All: true})
+		// Daemon-side ownership filter: only THIS app's managed app images
+		// (relay.type=app AND relay.app=<name>), so cleanup never enumerates
+		// the whole shared daemon and the repo-prefix match below can only ever
+		// see candidates the label filter already narrowed to this app.
+		imgs, err := cleanupCli.ImageList(cleanupCtx, client.ImageListOptions{
+			Filters: make(client.Filters).
+				Add("label", "relay.type="+runtime.ImageTypeApp, "relay.app="+name),
+		})
 		if err != nil {
 			t.Logf("cleanup: image list: %v", err)
 			return

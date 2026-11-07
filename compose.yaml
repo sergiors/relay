@@ -59,7 +59,7 @@ services:
       - --entrypoints.web.address=:80
 
     ports:
-      - "80:80"
+      - 80:80
 
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -123,6 +123,7 @@ services:
       NETWORKS: 1
       POST: 1
       DELETE: 1
+      DISTRIBUTION: 1
 
       TIMEOUT_CLIENT: 1h
       TIMEOUT_CONNECT: 10s

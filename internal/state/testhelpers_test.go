@@ -62,25 +62,26 @@ func testDatabaseEndpoint() string {
 
 // newTestDSN creates a fresh isolated schema and returns a DSN pinned to it.
 // It fails (never skips) when PostgreSQL is unreachable: only
-// integration-tagged tests call it, and they require a real database.
+// integration-tagged tests call it, and they require a real database. The
+// CREATE SCHEMA itself is the availability check — it already exercises
+// connectivity and the permission the suite needs — so there is no separate
+// ping. The diagnostic names only the sanitized endpoint, never the DSN.
 func newTestDSN(t *testing.T) string {
 	t.Helper()
 	base := testDatabaseURL()
-	if !testDatabaseAvailable(t) {
-		t.Fatalf("state integration test requires a reachable PostgreSQL at %s "+
-			"(from TEST_DATABASE_URL); start one and point TEST_DATABASE_URL at it",
-			testDatabaseEndpoint())
-	}
 	schema := "relay_test_" + randHex(t)
 	admin, err := sql.Open("pgx", base)
 	if err != nil {
-		t.Fatalf("open admin connection: %v", err)
+		t.Fatalf("state integration test requires PostgreSQL at %s "+
+			"(from TEST_DATABASE_URL); check the DSN is valid", testDatabaseEndpoint())
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if _, err := admin.ExecContext(ctx, `CREATE SCHEMA `+quoteSchemaIdent(schema)); err != nil {
 		_ = admin.Close()
-		t.Fatalf("create test schema: %v", err)
+		t.Fatalf("state integration test requires a reachable PostgreSQL at %s "+
+			"(from TEST_DATABASE_URL) with permission to create a test schema; "+
+			"start PostgreSQL and check the DSN", testDatabaseEndpoint())
 	}
 	t.Cleanup(func() {
 		dropCtx, dropCancel := context.WithTimeout(context.Background(), 10*time.Second)

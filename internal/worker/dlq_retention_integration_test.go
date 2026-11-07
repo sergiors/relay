@@ -73,7 +73,6 @@ func pruneFixture(t *testing.T, st *state.State) (oldSettled, recentSettled, uns
 }
 
 func TestIntegrationDLQRetentionTickPrunesSettledPreservesUnsettled(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := testutil.NewState(t)
 	oldSettled, recentSettled, unsettled := pruneFixture(t, st)
 	ctx := context.Background()
@@ -111,7 +110,6 @@ func TestIntegrationDLQRetentionTickPrunesSettledPreservesUnsettled(t *testing.T
 // window are both long past, and it becomes prunable as soon as its claim is
 // released (the same protection the state store enforces directly).
 func TestIntegrationDLQRetentionTickSkipsRowWithActiveReplayClaim(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := testutil.NewState(t)
 	oldSettled, recentSettled, unsettled := pruneFixture(t, st)
 	ctx := context.Background()
@@ -158,7 +156,6 @@ func TestIntegrationDLQRetentionTickSkipsRowWithActiveReplayClaim(t *testing.T) 
 // row estimate (pg_class.reltuples), never an exact COUNT, and an unreachable
 // table skips the tick instead of failing or zeroing.
 func TestIntegrationDLQDepthGaugeReportsApproximateRowCount(t *testing.T) {
-	testutil.RequireStateDatabase(t)
 	st := testutil.NewState(t)
 	m := metrics.New()
 	g := &dlqDepthGauge{st: st, metrics: m, log: testutil.DiscardLogger()}

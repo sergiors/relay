@@ -144,7 +144,7 @@ func TestIntegrationSharedDependencyGC(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-dep-gc-a:", "relay-app-dep-gc-b:", "relay-dep-evil"))
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-dep-gc-a:", "relay-app-dep-gc-b:", "relay-dep-evil:1"))
 
 	newManaged := func(name, deps string) app.App {
 		dir := t.TempDir()
@@ -168,8 +168,9 @@ events:
 	// six==1.16.0 layer is shared daemon-wide by sibling tests and by any leak
 	// from an interrupted earlier run, so asserting its removal races them; a
 	// per-run marker makes the assertion deterministic without changing what is
-	// proven (A and B still share exactly one layer, and the manifest change
-	// still produces a new one).
+	// proven (A and B still share exactly one layer, each app image inherits it
+	// through its relay.dependency label, and GC prunes it exactly once the
+	// last inheriting app image is lifecycle-removed).
 	marker := "# gc-run " + strconv.FormatInt(time.Now().UnixNano(), 10) + "\n"
 
 	// A and B share one dependency fingerprint (identical requirements).
@@ -211,25 +212,17 @@ events:
 	// the 217MB python base.
 	buildTestImage(ctx, t, "relay-dep-evil:1", "FROM scratch\nCMD []\n")
 
-	// Migrate A to a different manifest, then remove A's OLD app image
-	// (which references depX), so depX is then referenced only by B's app
-	// image. The new manifest is a different SINGLE tiny package (six 1.15.0):
-	// a one-package change is the minimum that produces a new fingerprint, and it
-	// avoids the five transitive wheels `requests` would pull — the invalidation
-	// proof is identical.
-	fnA2 := newManaged("dep-gc-a", marker+"six==1.15.0\n")
-	pa2, err := mgr.Prepare(ctx, fnA2)
-	if err != nil {
-		t.Fatalf("prepare A v2: %v", err)
-	}
-	if pa2.Image == pa.Image {
-		t.Fatalf("A v1 and v2 must be different images, both %s", pa2.Image)
-	}
-	// A's v1 handle is never published in this test; release its admitted image
-	// lease so the removal below is not held by a stale reference.
+	// Remove A's original app image (which references depX), so depX is then
+	// referenced only by B's app image. There is deliberately no migrated A
+	// generation here: GC's re-reference decision needs only the app-image
+	// lifecycle (Prepare -> image removal), and "a manifest change produces a
+	// different dependency layer" is covered separately by
+	// TestIntegrationDependencyChangeProducesNewDepLayer. A's handle is never
+	// published in this test; release its admitted image lease so the removal
+	// below is not held by a stale reference.
 	pa.ReleaseLease()
 	if err := mgr.RemoveImage(ctx, pa.Image); err != nil {
-		t.Fatalf("remove A v1 image: %v", err)
+		t.Fatalf("remove A image: %v", err)
 	}
 
 	// GC now: depX is still referenced by B's app image -> kept; the
@@ -244,34 +237,14 @@ events:
 		t.Error("an unmanaged relay-dep-* image (no relay.type label) must never be removed")
 	}
 
-	// Migrate B to the same new manifest, prepare, and remove B's OLD image,
-	// which was the last reference to depX.
-	fnB2 := newManaged("dep-gc-b", marker+"six==1.15.0\n")
-	pb2, err := mgr.Prepare(ctx, fnB2)
-	if err != nil {
-		t.Fatalf("prepare B v2: %v", err)
-	}
-	// Find B's v1 image (the relay-app-dep-gc-b tag that is NOT pb2.Image).
-	bOld := ""
-	list, err := cli.ImageList(ctx, client.ImageListOptions{})
-	if err != nil {
-		t.Fatalf("list images: %v", err)
-	}
-	for _, img := range list.Items {
-		for _, tag := range img.RepoTags {
-			if strings.HasPrefix(tag, "relay-app-dep-gc-b:") && tag != pb2.Image {
-				bOld = tag
-			}
-		}
-	}
-	if bOld == "" {
-		t.Fatalf("could not find B's old function image")
-	}
-	// B's v1 handle is never published in this test; release its admitted lease
-	// so the removal (and the subsequent GC of depX) is not held by it.
+	// Remove B's original app image, which was the last reference to depX.
+	// B's tag is pb.Image itself (there is no migrated B generation), so no
+	// whole-daemon listing is needed to name it. B's handle is never published
+	// in this test; release its admitted lease so the removal (and the
+	// subsequent GC of depX) is not held by it.
 	pb.ReleaseLease()
-	if err := mgr.RemoveImage(ctx, bOld); err != nil {
-		t.Fatalf("remove B v1 image: %v", err)
+	if err := mgr.RemoveImage(ctx, pb.Image); err != nil {
+		t.Fatalf("remove B image: %v", err)
 	}
 
 	// GC now: depX has no referencing app image left -> removed. The

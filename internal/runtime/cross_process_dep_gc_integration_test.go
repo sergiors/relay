@@ -450,12 +450,21 @@ events:
 	); err != nil {
 		t.Fatalf("remove the unique app image %s: %v", prepared.Image, err)
 	}
+	// The poll retries the GC only while it errors (a transient coordination or
+	// daemon failure, bounded by the poll budget). After the FIRST successful
+	// GC pass the dependency DELETE has been issued synchronously; repeating the
+	// full GC pass (candidate listing + exclusive lease per attempt) cannot
+	// learn anything more, so the poll then checks only image existence and the
+	// final assertions below still prove every DELETE the guard recorded.
 	var gcLastErr error
+	var gcSucceeded bool
 	if !pollUntil(ctx, 90*time.Second, func() bool {
-		_, err := mB.CleanupUnusedDependencies(ctx)
-		if err != nil {
-			gcLastErr = err
-			return false
+		if !gcSucceeded {
+			if _, err := mB.CleanupUnusedDependencies(ctx); err != nil {
+				gcLastErr = err
+				return false
+			}
+			gcSucceeded = true
 		}
 		return !imageExistsInDaemon(cli, ctx, depRef)
 	}) {

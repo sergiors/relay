@@ -8,11 +8,8 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"strings"
 	"testing"
 	"time"
-
-	"github.com/moby/moby/client"
 
 	"relay/internal/app"
 	"relay/internal/testutil"
@@ -28,25 +25,24 @@ func TestIntegrationFingerprintedImageLifecycle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// The test's own fn-ver images should be cleaned up even on failure so the
-	// test never leaks images into another package's cleanup on the shared
-	// daemon. Best-effort force-removal, like cleanupImage.
-	t.Cleanup(func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cleanupCancel()
-		imgs, err := cli.ImageList(cleanupCtx, client.ImageListOptions{})
-		if err != nil {
-			return
-		}
-		for _, img := range imgs.Items {
-			for _, tag := range img.RepoTags {
-				if strings.HasPrefix(tag, "relay-app-fn-ver:") {
-					cleanupImage(cli, cleanupCtx, tag)
-					break
-				}
-			}
-		}
-	})
+	// The test's own fn-ver images are cleaned up even on failure via the
+	// shared scoped helper, so the test never leaks images into another
+	// package's cleanup on the shared daemon. The helper lists only THIS app's
+	// managed images (daemon-side relay.type=app / relay.app=fn-ver label
+	// filter plus the production ownership predicate) and force-removes them,
+	// without enumerating the whole daemon.
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-fn-ver:"))
+
+	// One real Manager/State pair builds both versions: manager independence
+	// between the two builds is not part of this contract (the builds are
+	// ordinary fingerprint-versioned prepares). The REMOVAL below instead
+	// deliberately runs on a DIFFERENT manager (m1), which is the independence
+	// the removal semantics prove.
+	m, err := newCoordinatedRealManager(t, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -68,7 +64,7 @@ events:
 		t.Fatalf("image %s already exists before build", ref1)
 	}
 
-	p1, err := mPrepare(ctx, t, fn)
+	p1, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare v1: %v", err)
 	}
@@ -90,7 +86,7 @@ events:
 		t.Fatalf("v1 and v2 references must differ, both = %s", ref1)
 	}
 
-	p2, err := mPrepare(ctx, t, fn)
+	p2, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare v2: %v", err)
 	}
@@ -173,6 +169,17 @@ func TestIntegrationDependencyLayerReuse(t *testing.T) {
 	// before/after tag delta is not proof of exclusive ownership.
 	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-dep-reuse:"))
 
+	// One real Manager/State pair prepares BOTH versions: this test is about
+	// the SAME manager's reuse of one dependency layer across a source-only
+	// change, so manager independence between the two builds is not part of the
+	// contract (a fresh manager per build would only re-verify Docker-side
+	// content addressing, not the in-manager reuse probe).
+	m, err := newCoordinatedRealManager(t, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
 runtime: python3.14
@@ -209,7 +216,7 @@ events:
 	}
 	ref1 := ImageRef(fn.Name, fp1)
 
-	p1, err := mPrepare(ctx, t, fn)
+	p1, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare v1: %v", err)
 	}
@@ -248,7 +255,7 @@ events:
 		t.Fatalf("v1 and v2 refs must differ, both %s", ref1)
 	}
 
-	p2, err := mPrepare(ctx, t, fn)
+	p2, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare v2: %v", err)
 	}
@@ -318,6 +325,16 @@ func TestIntegrationDependencyChangeProducesNewDepLayer(t *testing.T) {
 	// before/after delta observed.
 	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-dep-change:"))
 
+	// One real Manager/State pair prepares BOTH manifests: the contract is that
+	// a manifest change invalidates the dependency FINGERPRINT, which is checked
+	// against production content addressing, not against any manager-local
+	// state; manager independence between the two builds is not part of it.
+	m, err := newCoordinatedRealManager(t, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
 runtime: python3.14
@@ -332,7 +349,7 @@ events:
 	// v1 manifest.
 	writeFile(t, dir, "requirements.txt", "six==1.16.0\n")
 	dep1 := expectedDependencyRef(t, fn)
-	p1, err := mPrepare(ctx, t, fn)
+	p1, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare v1: %v", err)
 	}
@@ -352,7 +369,7 @@ events:
 	if dep1 == dep2 {
 		t.Fatalf("dependency reference did not change across a manifest change, both %s", dep1)
 	}
-	p2, err := mPrepare(ctx, t, fn)
+	p2, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare v2: %v", err)
 	}

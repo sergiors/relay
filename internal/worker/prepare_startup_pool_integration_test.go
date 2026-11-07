@@ -9,9 +9,25 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/runner"
+	"relay/internal/runtime"
 	"relay/internal/state"
 	"relay/internal/testutil"
 )
+
+// acceptStartupPublisher stands in for a selection-current runtime manager: it
+// exercises the same registry callback and post-publication refresh path while
+// leaving the PostgreSQL fencing-token writes real.
+type acceptStartupPublisher struct{}
+
+func (acceptStartupPublisher) PublishPrepared(_ context.Context, _ *runtime.Prepared, publish func() error) error {
+	return publish()
+}
+
+func (acceptStartupPublisher) RefreshRuntimeImageSelections(context.Context) ([]string, error) {
+	return nil, nil
+}
+
+func (acceptStartupPublisher) RuntimeImageSelectionIdentity(string) string { return "" }
 
 // TestPrepareAppsStartupUsesExactPerAppFencingToken pins the per-app fencing
 // contract at the state boundary: each app's guarded write carries that app's
@@ -68,7 +84,26 @@ func TestPrepareAppsStartupUsesExactPerAppFencingToken(t *testing.T) {
 	waitArrivedIn(t, parks, "fence-alpha", "fence-beta")
 	parks["fence-alpha"].free()
 	parks["fence-beta"].free()
-	collectPrepared(t, done, []string{"fence-alpha", "fence-beta"}, nil)
+	candidates := collectPrepared(t, done, []string{"fence-alpha", "fence-beta"}, nil)
+	for _, name := range []string{"fence-alpha", "fence-beta"} {
+		detail, ok := st.GetApp(name)
+		if !ok || detail.Fingerprint != "" || detail.Status == state.StatusReady {
+			t.Fatalf("%s was marked successful before startup publication: %+v (found=%v)", name, detail, ok)
+		}
+	}
+	registry := &runner.Registry{}
+	published, retry := publishStartupApps(
+		context.Background(), candidates, registry, acceptStartupPublisher{}, st,
+		startupAppSet{fencingTokens: tokens}, discardLogger(),
+	)
+	if len(published) != 2 || len(retry) != 0 {
+		t.Fatalf("published/retry = %d/%v, want two candidates accepted and no retries", len(published), retry)
+	}
+	for _, pf := range candidates {
+		if registry.GetByName(pf.Name()) != pf {
+			t.Fatalf("accepted %s candidate was not published into the registry", pf.Name())
+		}
+	}
 
 	alpha, ok := st.GetApp("fence-alpha")
 	if !ok {

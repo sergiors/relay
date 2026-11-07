@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"relay/internal/app"
+	"relay/internal/runner"
 	"relay/internal/state"
 	"relay/internal/testutil"
 )
@@ -130,7 +131,24 @@ func TestStartupBuiltFingerprintIsReturnedIdentity(t *testing.T) {
 		startup[0].App.Name: seedFencingToken(t, st, startup[0].App),
 	}
 
-	prepareApps(context.Background(), spy, startup, st, fencingTokens, discardLogger())
+	candidates := prepareApps(context.Background(), spy, startup, st, fencingTokens, discardLogger())
+	beforePublish, ok := st.GetApp("runtime-fn")
+	if !ok {
+		t.Fatal("expected a runtime-fn row before publication")
+	}
+	if beforePublish.Fingerprint != "" || beforePublish.Status == state.StatusReady {
+		t.Fatalf("prepareApps published success before selection fencing: %+v", beforePublish)
+	}
+
+	registry := &runner.Registry{}
+	published, retry := publishStartupApps(
+		context.Background(), candidates, registry, acceptStartupPublisher{}, st,
+		startupAppSet{fencingTokens: fencingTokens}, discardLogger(),
+	)
+	if len(published) != 1 || registry.GetByName("runtime-fn") != candidates[0] || len(retry) != 0 {
+		t.Fatalf("startup publication = %d handles, registry=%p, retry=%v; want accepted handle and no retry",
+			len(published), registry.GetByName("runtime-fn"), retry)
+	}
 
 	detail, ok := st.GetApp("runtime-fn")
 	if !ok {

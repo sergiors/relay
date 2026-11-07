@@ -193,6 +193,16 @@ events:
 		}
 	})
 
+	// One real Manager/State pair prepares BOTH versions: this contract is about
+	// the daemon's build/intermediate-container behavior across rebuilds, not
+	// manager independence, so a fresh manager (and State schema) per build adds
+	// nothing the assertions can see.
+	m, err := newCoordinatedRealManager(t, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+
 	// Snapshot the image set ONCE before the first build so the first build's
 	// own new layers can be identified; later builds extend the known set with
 	// their own output (rememberLayers) rather than re-listing every image.
@@ -221,7 +231,7 @@ events:
 		ref := ImageRef(fn.Name, fp)
 		cleanupImage(cli, ctx, ref)
 
-		prepared, err := mPrepare(ctx, t, fn)
+		prepared, err := m.Prepare(ctx, fn)
 		if err != nil {
 			t.Fatalf("prepare %s: %v", ver, err)
 		}
@@ -330,9 +340,14 @@ events:
 			}
 		}
 		// This test's own FAILED build produced (at most) one tagged
-		// relay-app-<appName>:* image; remove ONLY tags whose image carries the
-		// proof of ownership — the existing Relay labels — never a repo prefix.
-		imgs, err := cli.ImageList(cleanupCtx, client.ImageListOptions{})
+		// relay-app-<appName>:* image; list ONLY the daemon-side label-filtered
+		// candidates for this app (relay.type=app AND relay.app=<appName>), then
+		// re-check the ownership proof on each listed image — never a repo
+		// prefix, never an unfiltered whole-daemon enumeration.
+		imgs, err := cli.ImageList(cleanupCtx, client.ImageListOptions{
+			Filters: make(client.Filters).
+				Add("label", labelType+"="+ImageTypeApp, labelApp+"="+appName),
+		})
 		if err != nil {
 			t.Errorf("cleanup: list images: %v", err)
 			return
