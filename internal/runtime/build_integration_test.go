@@ -265,6 +265,63 @@ events:
 	}
 }
 
+// TestIntegrationBuildTestImageLeavesNoIntermediateContainers pins for the
+// shared fixture helper buildTestImage the same no-leak contract
+// TestIntegrationRebuildLeavesNoIntermediateContainers pins for the production
+// builder. The helper issues its own ImageBuild over unmanaged relay-named
+// fixture images (relay-dep-evil:1, relay-unrelated-guard), so a
+// Remove:false/rm=0 regression there would leave one classic-builder
+// "#(nop) CMD ..." Created container on the shared daemon per cache-missing
+// build — the exact intermediate shape the production path is proven not to
+// leave.
+//
+// Attribution is by command CONTENT, neither by image ancestry nor by a
+// whole-daemon before/after delta. Image ancestry cannot work for these
+// scratch fixtures: a scratch intermediate commits a config-only layer and its
+// Summary.ImageID is empty, so layer-set matching is blind; a whole-daemon
+// delta would mistake another package's concurrently created intermediates
+// (go test ./... runs packages in parallel) for this build's leak. The classic
+// builder embeds a metadata step's content verbatim in the step container's
+// command ("/bin/sh -c #(nop) CMD [...]"), so a nonce CMD instruction in the
+// fixture Dockerfile is attributable to this one build alone — no other
+// container on the daemon can carry its value.
+//
+// Fresh content additionally keeps the assertion non-vacuous across reruns:
+// the daemon caches the build chain by content, and a cache-hit build re-runs
+// no step containers at all, so reusing the shared `CMD []` fixture Dockerfile
+// could silently observe nothing to clean. The nonce makes every invocation a
+// genuinely new build.
+func TestIntegrationBuildTestImageLeavesNoIntermediateContainers(t *testing.T) {
+	cli := testutil.RequireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	nonce := fmt.Sprintf("relay-buildtest-noprune-%d", time.Now().UnixNano())
+	ref := fmt.Sprintf("relay-buildtest-noprune-%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		cleanupImage(cli, cleanupCtx, ref)
+	})
+
+	buildTestImage(ctx, t, ref, "FROM scratch\nCMD [\""+nonce+"\"]\n")
+	if !imageExistsInDaemon(cli, ctx, ref) {
+		t.Fatalf("fixture image %s must exist after the helper build; a vacuously failed build cannot prove cleanup", ref)
+	}
+
+	leaked, listErr := awaitNoFixtureIntermediate(ctx, cli, nonce, 30*time.Second)
+	if listErr != nil {
+		// Fail-closed: without an IN-WINDOW successful container read, "no
+		// leak" was never observed — a stalled or unreadable daemon fails the
+		// test instead of passing or hanging it past the stated window.
+		t.Fatalf("could not verify the fixture build left no intermediate (no in-window container read): %v", listErr)
+	}
+	if len(leaked) > 0 {
+		t.Errorf("buildTestImage leaked %d classic-builder intermediate container(s) "+
+			"(a Remove:false/rm=0 regression in the helper): %v", len(leaked), leaked)
+	}
+}
+
 // TestIntegrationFailedBuildKeepsIntermediatesAndPropagatesError verifies that
 // a failed build (a) surfaces the real build-stream error through Prepare and
 // (b) intentionally KEEPS its classic-builder intermediate containers for

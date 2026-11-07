@@ -5,7 +5,6 @@ package state
 import (
 	"context"
 	"errors"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -444,12 +443,24 @@ func TestWithRuntimeImageSelectionLockReportsAbsentAndCurrentSelection(t *testin
 // test observes PostgreSQL's ungranted advisory lock rather than relying on a
 // sleep: after the CAS is demonstrably waiting on the same key, releasing the
 // publication callback lets it insert generation 1.
+//
+// The runtime ID is unique per test-binary run. PostgreSQL advisory locks are
+// database-wide — newTestDSN's per-test schemas do NOT namespace them — so a
+// fixed ID like "python3.14" makes concurrent test binaries (this package's
+// suite, internal/cli's e2e) contend on one shared key: their waiters would
+// pollute this test's pg_locks observation and foreign holders (including
+// another copy of this test) could delay it. With a run-unique ID, the only
+// possible waiter on the observed key is this test's own CAS.
 func TestRuntimeImageSelectionLockFencesCASForAbsentRow(t *testing.T) {
 	st := openSelectionState(t)
 	ctx := context.Background()
-	const runtimeID = "python3.14"
+	runtimeID := "fence-absent-python3.14-" + randHex(t)
 	callbackEntered := make(chan struct{})
 	releaseCallback := make(chan struct{})
+	var releaseOnce sync.Once
+	releasePublication := func() {
+		releaseOnce.Do(func() { close(releaseCallback) })
+	}
 	publicationDone := make(chan error, 1)
 	go func() {
 		publicationDone <- st.WithRuntimeImageSelectionLock(ctx, runtimeID,
@@ -474,42 +485,47 @@ func TestRuntimeImageSelectionLockFencesCASForAbsentRow(t *testing.T) {
 	}()
 	<-casStarted
 
+	// The CAS must sit ungranted on the publication's transaction advisory
+	// lock. Poll pg_locks on a fixed cadence instead of a Gosched hot loop:
+	// the hot loop hammered the shared database and kept pool connections
+	// churning, which could starve the CAS of its connection before it ever
+	// reached the advisory lock — the waiter then never appeared at all.
 	key := uint32(runtimeSelectionLockKey(runtimeID))
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		var waiting bool
-		err := st.db.QueryRowContext(ctx, `
-			SELECT EXISTS (
-				SELECT 1 FROM pg_locks
-				WHERE locktype = 'advisory' AND NOT granted
-			  AND classid = 3 AND objid = $1 AND objsubid = 2
-			)`, key).Scan(&waiting)
-		if err != nil {
-			close(releaseCallback)
-			<-publicationDone
-			<-casDone
-			t.Fatalf("inspect advisory lock wait: %v", err)
-		}
-		if waiting {
-			break
-		}
-		if time.Now().After(deadline) {
-			close(releaseCallback)
+	pollCtx, cancelPoll := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelPoll()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for waiting := false; !waiting; {
+		select {
+		case <-pollCtx.Done():
+			releasePublication()
 			<-publicationDone
 			<-casDone
 			t.Fatal("CAS never waited on the publication's advisory lock")
+		case <-ticker.C:
+			err := st.db.QueryRowContext(pollCtx, `
+				SELECT EXISTS (
+					SELECT 1 FROM pg_locks
+					WHERE locktype = 'advisory' AND NOT granted
+					  AND classid = 3 AND objid = $1 AND objsubid = 2
+				)`, key).Scan(&waiting)
+			if err != nil {
+				releasePublication()
+				<-publicationDone
+				<-casDone
+				t.Fatalf("inspect advisory lock wait: %v", err)
+			}
 		}
-		runtime.Gosched()
 	}
 	select {
 	case err := <-casDone:
-		close(releaseCallback)
+		releasePublication()
 		<-publicationDone
 		t.Fatalf("CAS completed while publication held the selection lock: %v", err)
 	default:
 	}
 
-	close(releaseCallback)
+	releasePublication()
 	if err := <-publicationDone; err != nil {
 		t.Fatalf("publication lock callback: %v", err)
 	}
@@ -519,6 +535,73 @@ func TestRuntimeImageSelectionLockFencesCASForAbsentRow(t *testing.T) {
 	rows, err := st.ReadRuntimeImageSelections(ctx)
 	if err != nil || len(rows) != 1 || rows[0].Generation != 1 {
 		t.Fatalf("CAS result = (%+v, %v), want one generation-1 row", rows, err)
+	}
+}
+
+// newTestDSN gives every test its own schema, but PostgreSQL advisory locks are
+// DATABASE-wide: independent handles — the same seam every concurrent test
+// binary exercises — contend on one key. A publication lock on one handle must
+// therefore block another handle's CAS for the same runtime ID (which is also
+// why concurrent tests must use run-unique IDs), rows stay schema-local, and
+// the lock must free the moment the publication callback returns. The held
+// check uses pg_try_advisory_xact_lock — acquire-or-fail instantly, no waiter,
+// no polling, no sleep.
+func TestRuntimeImageSelectionLockIsGlobalAcrossHandles(t *testing.T) {
+	st := openSelectionState(t)
+	other := openSelectionState(t) // a second schema on the SAME database
+	ctx := context.Background()
+	runtimeID := "global-python3.14-" + randHex(t)
+	key := uint32(runtimeSelectionLockKey(runtimeID))
+
+	callbackEntered := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	var releaseOnce sync.Once
+	releasePublication := func() { releaseOnce.Do(func() { close(releaseCallback) }) }
+	defer releasePublication()
+	publicationDone := make(chan error, 1)
+	go func() {
+		publicationDone <- st.WithRuntimeImageSelectionLock(ctx, runtimeID,
+			func(_ context.Context, current *RuntimeImageSelection) error {
+				if current != nil {
+					return errors.New("expected absent selection")
+				}
+				close(callbackEntered)
+				<-releaseCallback
+				return nil
+			})
+	}()
+	<-callbackEntered
+
+	// While the publication callback is open, the transaction advisory lock is
+	// held database-wide: an independent handle's instant try-acquire fails.
+	var acquired bool
+	if err := other.db.QueryRowContext(ctx,
+		`SELECT pg_try_advisory_xact_lock($1, $2)`,
+		runtimeSelectionLockNamespace, int32(key)).Scan(&acquired); err != nil {
+		t.Fatalf("try-acquire while publication holds the lock: %v", err)
+	}
+	if acquired {
+		t.Fatal("try-acquire succeeded while the publication held the selection lock")
+	}
+
+	releasePublication()
+	if err := <-publicationDone; err != nil {
+		t.Fatalf("publication lock callback: %v", err)
+	}
+
+	// And: the free lock is acquirable by the other handle — its CAS for the
+	// same runtime ID inserts generation 1 in ITS schema while the original
+	// handle still sees no row (locks are shared, rows are schema-local).
+	if _, err := other.CompareAndSwapRuntimeImageSelection(ctx,
+		selectionFixture(runtimeID, validRuntimeDigest(13)), 0); err != nil {
+		t.Fatalf("CAS from the second handle: %v", err)
+	}
+	rows, err := other.ReadRuntimeImageSelections(ctx)
+	if err != nil || len(rows) != 1 || rows[0].Generation != 1 {
+		t.Fatalf("second handle's rows = (%+v, %v), want one generation-1 row", rows, err)
+	}
+	if rows2, err := st.ReadRuntimeImageSelections(ctx); err != nil || len(rows2) != 0 {
+		t.Fatalf("first handle's rows = (%+v, %v), want none (rows are schema-local)", rows2, err)
 	}
 }
 

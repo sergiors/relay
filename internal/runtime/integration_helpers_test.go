@@ -370,6 +370,14 @@ func newCoordinatedRealManager(
 // buildTestImage builds a tiny image with the given tag and an inline Dockerfile
 // via the Engine API, used to create a non-relay-owned image to prove the sweep
 // never touches it.
+//
+// Remove is true, like production (buildImageOptions): the moby client emits
+// rm=0 when Remove is false, suppressing the daemon's default cleanup, so
+// every cache-missing fixture build (relay-dep-evil:1, relay-unrelated-guard)
+// would leave its classic-builder "#(nop) CMD" metadata step behind as a
+// Created container on the shared daemon. ForceRemove stays unset, mirroring
+// production: an intermittent fixture-build failure keeps its intermediates
+// visible for debugging while the test fails.
 func buildTestImage(ctx context.Context, t *testing.T, ref, dockerfile string) string {
 	t.Helper()
 	cli, err := client.NewClientWithOpts(client.FromEnv)
@@ -385,7 +393,11 @@ func buildTestImage(ctx context.Context, t *testing.T, ref, dockerfile string) s
 	go func() {
 		_ = writer.CloseWithError(writeContextTar(ctx, ctxDir, writer))
 	}()
-	resp, err := cli.ImageBuild(ctx, reader, client.ImageBuildOptions{Tags: []string{ref}, Dockerfile: "Dockerfile"})
+	resp, err := cli.ImageBuild(ctx, reader, client.ImageBuildOptions{
+		Tags:       []string{ref},
+		Dockerfile: "Dockerfile",
+		Remove:     true,
+	})
 	if err != nil {
 		t.Fatalf("build unrelated image: %v", err)
 	}

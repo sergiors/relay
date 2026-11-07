@@ -278,10 +278,17 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", `
-export function emit(event) {
+export async function emit(event) {
   console.log("out-first");
   console.log("out-second");
   console.error("err-line");
+  // The invocation response can arrive before Relay's separate attach reader
+  // forwards app output. Empty writes queue callbacks behind each stream's
+  // console writes, so the handler does not resolve until both are flushed.
+  await Promise.all([
+    new Promise((resolve, reject) => process.stdout.write("", err => err ? reject(err) : resolve())),
+    new Promise((resolve, reject) => process.stderr.write("", err => err ? reject(err) : resolve())),
+  ]);
 }
 `)
 	fn := app.App{Name: "loglevel-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}

@@ -35,11 +35,22 @@ func imageExistsInRunnerDaemon(ctx context.Context, cli *client.Client, ref stri
 // has to pull a base image. It fails the test when the image is not present
 // after the build, so a silently failed build cannot make a later assertion
 // vacuous.
-func buildScratchImage(ctx context.Context, t *testing.T, cli *client.Client, ref string) {
+//
+// Remove is true, like production (runtime's buildImageOptions): the moby
+// client emits rm=0 when Remove is false, suppressing the daemon's default
+// cleanup, so every cache-missing fixture build would leave its
+// classic-builder "#(nop) CMD" metadata step behind as a Created container on
+// the shared daemon. ForceRemove stays unset, mirroring production: an
+// intermittent fixture-build failure keeps its intermediates visible for
+// debugging while the test fails.
+//
+// The Dockerfile is a parameter so the fixture-build contract can be tested
+// with content-attributable (nonce) builds; the retirement fixtures pass
+// retireScratchDockerfile.
+func buildScratchImage(ctx context.Context, t *testing.T, cli *client.Client, ref, dockerfile string) {
 	t.Helper()
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
-	dockerfile := "FROM scratch\nCMD [\"/nonexistent\"]\n"
 	hdr := &tar.Header{Name: "Dockerfile", Mode: 0o644, Size: int64(len(dockerfile))}
 	if err := tw.WriteHeader(hdr); err != nil {
 		t.Fatalf("tar header: %v", err)
@@ -53,6 +64,7 @@ func buildScratchImage(ctx context.Context, t *testing.T, cli *client.Client, re
 	resp, err := cli.ImageBuild(ctx, bytes.NewReader(buf.Bytes()), client.ImageBuildOptions{
 		Tags:       []string{ref},
 		Dockerfile: "Dockerfile",
+		Remove:     true,
 	})
 	if err != nil {
 		t.Fatalf("build scratch image %s: %v", ref, err)
@@ -65,6 +77,12 @@ func buildScratchImage(ctx context.Context, t *testing.T, cli *client.Client, re
 		t.Fatalf("scratch image %s was not produced by the build", ref)
 	}
 }
+
+// retireScratchDockerfile is the fixed scratch fixture the retirement tests
+// build: a bare scratch image whose CMD points at a nonexistent binary, so an
+// executed attempt fails fast while Prepare/retirement logic still sees a real
+// image.
+const retireScratchDockerfile = "FROM scratch\nCMD [\"/nonexistent\"]\n"
 
 // TestIntegrationDeferredRetirementReDrivenAfterServiceContainerStops is the
 // end-to-end proof of the fixed leak against a real daemon: a retired app image
@@ -80,7 +98,7 @@ func TestIntegrationDeferredRetirementReDrivenAfterServiceContainerStops(t *test
 
 	const appName = "retire-drive"
 	img := fmt.Sprintf("relay-app-%s:%d", appName, time.Now().UnixNano())
-	buildScratchImage(ctx, t, cli, img)
+	buildScratchImage(ctx, t, cli, img, retireScratchDockerfile)
 	t.Cleanup(func() {
 		c, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -130,7 +148,7 @@ func TestIntegrationDeferredRetirementReDrivenAfterServiceContainerStops(t *test
 	// new image BEFORE it retires the superseded one. A retired image the
 	// registry still served would (correctly) have its retirement cancelled.
 	newImage := fmt.Sprintf("relay-app-%s:%d-new", appName, time.Now().UnixNano())
-	buildScratchImage(ctx, t, cli, newImage)
+	buildScratchImage(ctx, t, cli, newImage, retireScratchDockerfile)
 	t.Cleanup(func() {
 		c, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -190,5 +208,56 @@ func TestIntegrationDeferredRetirementReDrivenAfterServiceContainerStops(t *test
 	}
 	if got := r.refs.deferredImages(); len(got) != 0 {
 		t.Fatalf("deferred images after the re-driven removal = %v, want none", got)
+	}
+}
+
+// TestIntegrationBuildScratchImageLeavesNoIntermediateContainers pins for the
+// runner's fixture helper buildScratchImage the same no-leak contract the
+// runtime suite pins for its buildTestImage helper: a successful fixture build
+// must issue the same rm=1 (ImageBuildOptions.Remove) cleanup the production
+// builder uses, so unmanaged fixture images do not leak classic-builder
+// "#(nop) CMD ..." Created containers onto the shared daemon — the exact
+// intermediate shape the deferred-retirement fixtures themselves were observed
+// leaving before the fix (dockerfile CMD ["/nonexistent"]).
+//
+// Attribution is by command CONTENT (a nonce CMD instruction), neither by
+// image ancestry (a scratch intermediate commits a config-only layer, so its
+// Summary.ImageID is empty and layer-set matching is blind) nor by a
+// whole-daemon before/after delta (go test ./... runs packages in parallel, so
+// concurrent foreign builds create their own intermediates). No other
+// container can carry the nonce's value, and the nonce also makes a rerun a
+// genuinely new build: the daemon caches build chains by content, and a
+// cache-hit build runs no step containers at all, so reusing the fixed
+// retireScratchDockerfile would leave nothing for the contract to observe —
+// and pre-existing leaked intermediates of the SAME shape from runs before the
+// fix carry a different command and can never match.
+func TestIntegrationBuildScratchImageLeavesNoIntermediateContainers(t *testing.T) {
+	cli := testutil.RequireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	nonce := fmt.Sprintf("relay-runner-noprune-%d", time.Now().UnixNano())
+	ref := fmt.Sprintf("relay-runner-noprune-%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		_, _ = cli.ImageRemove(cleanupCtx, ref, client.ImageRemoveOptions{Force: true})
+	})
+
+	buildScratchImage(ctx, t, cli, ref, "FROM scratch\nCMD [\""+nonce+"\"]\n")
+	if !imageExistsInRunnerDaemon(ctx, cli, ref) {
+		t.Fatalf("scratch image %s must exist after the helper build; a vacuously failed build cannot prove cleanup", ref)
+	}
+
+	leaked, listErr := awaitNoFixtureIntermediate(ctx, cli, nonce, 30*time.Second)
+	if listErr != nil {
+		// Fail-closed: without a single successful container list, "no leak"
+		// was never observed — an unreadable daemon must fail the test rather
+		// than pass for it.
+		t.Fatalf("could not verify the fixture build left no intermediate (no successful container list): %v", listErr)
+	}
+	if len(leaked) > 0 {
+		t.Errorf("buildScratchImage leaked %d classic-builder intermediate container(s) "+
+			"(a Remove:false/rm=0 regression in the helper): %v", len(leaked), leaked)
 	}
 }

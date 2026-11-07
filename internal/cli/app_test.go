@@ -722,10 +722,20 @@ func TestAppInspectCommand(t *testing.T) {
 }
 
 // The Stats section renders the four per-app execution-history timestamps
-// as relative ages ("2s ago"-style rows) after the Invocations exhausted line.
+// as relative ages ("2m ago"-style rows) after the Invocations exhausted line.
+//
+// LastExecutionAt/LastSuccessAt are seeded two minutes old on purpose:
+// relativeAgo floors elapsed seconds, so the floor edge of a
+// seconds-formatted row ("2s ago" -> "3s ago") sits 1.0 seconds from the
+// seeded age and a busy host (the full integration suite shares this box)
+// crossing it flips the rendered string. A two-minute age lands in the
+// minutes bucket, roughly 59-60 seconds away from its next floor edge at 3m
+// (RFC3339 truncates the fractional second, so the stored age runs slightly
+// past two minutes) — far wider than realistic render-time jitter, though
+// not an unconditional guarantee.
 func TestAppInspectStatsTimestamps(t *testing.T) {
 	st, _ := seedTestState(t)
-	exec := time.Now().Add(-2 * time.Second).UTC()
+	exec := time.Now().Add(-2 * time.Minute).UTC()
 	failure := time.Now().Add(-90 * time.Second).UTC()
 	dlq := time.Now().Add(-48 * time.Hour).UTC()
 	st.RecordAppStats(state.AppStats{
@@ -748,8 +758,8 @@ func TestAppInspectStatsTimestamps(t *testing.T) {
 	renderAppDetailForTest(t, &w, st, detail)
 	out := normWS(w.String())
 	for _, want := range []string{
-		"Last execution: 2s ago",
-		"Last success: 2s ago",
+		"Last execution: 2m ago",
+		"Last success: 2m ago",
 		"Last failure: 1m ago",
 		"Last exhaustion: 2d ago",
 	} {
