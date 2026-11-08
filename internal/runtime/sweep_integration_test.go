@@ -20,6 +20,7 @@ import (
 // the sweep tests never leak.
 func createOrphanContainer(t *testing.T, cli *client.Client, ctx context.Context, labels map[string]string) string {
 	t.Helper()
+	testutil.RequireImage(t, cli, "node:24-alpine")
 	resp, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Config:     &container.Config{Image: "node:24-alpine", Labels: labels, Cmd: []string{"sh", "-c", "sleep 300"}},
 		HostConfig: &container.HostConfig{},

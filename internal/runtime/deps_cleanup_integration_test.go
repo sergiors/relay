@@ -316,9 +316,11 @@ func (f *faultingBuildTransport) sawAppBuild() bool {
 }
 
 // faultBuildClient returns a Docker client that reaches the real daemon through
-// the env-configured dialer but fails the given app image build. The transport
-// ignores the request host (the dialer already targets the daemon), which is why
-// no WithHost option is applied.
+// the env-configured dialer but fails the given app image build. FromEnv is
+// applied BEFORE WithHTTPClient so the client's own host/proto/addr still name
+// the env-configured daemon; the BuildKit session attaches through this client's
+// DialHijack, which does not use the faulting RoundTripper. The RoundTripper
+// itself ignores the request host (its dialer already targets the daemon).
 func faultBuildClient(t *testing.T, appImage string) (*client.Client, *faultingBuildTransport) {
 	t.Helper()
 	envCli, err := client.New(client.FromEnv)
@@ -332,7 +334,10 @@ func faultBuildClient(t *testing.T, appImage string) (*client.Client, *faultingB
 	}
 	t.Cleanup(base.CloseIdleConnections)
 	proxy := &faultingBuildTransport{base: base, appImage: appImage}
-	cli, err := client.New(client.WithHTTPClient(&http.Client{Transport: proxy}))
+	cli, err := client.New(
+		client.FromEnv,
+		client.WithHTTPClient(&http.Client{Transport: proxy}),
+	)
 	if err != nil {
 		t.Fatalf("fault docker client: %v", err)
 	}
@@ -380,6 +385,13 @@ events:
 
 	faultCli, proxy := faultBuildClient(t, appImage)
 	m := newLifecycleManager(t, faultCli, context.Background())
+	// newLifecycleManager is for scripted-daemon tests and deliberately omits the
+	// BuildKit session hook. This test drives a REAL daemon, so it must attach the
+	// same session production uses: dependency builds resolve the base image
+	// through it, and without one some daemons fail before the app build is ever
+	// issued. The custom client keeps the env daemon for DialHijack (see
+	// faultBuildClient), so only the build HTTP transport is intercepted.
+	m.startBuildSessionFn = connectBuildSession
 	// This test prepares and garbage-collects REAL dependency images on the
 	// daemon other tests/processes share, so it uses REAL cross-process
 	// coordination (State-backed, per-test schema on TEST_DATABASE_URL) even

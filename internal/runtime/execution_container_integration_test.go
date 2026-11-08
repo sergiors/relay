@@ -1105,6 +1105,7 @@ export function ok(event) {
 // leaves behind. The container must be gone afterward.
 func TestIntegrationFailedStartRemovesContainer(t *testing.T) {
 	cli := testutil.RequireDocker(t)
+	testutil.RequireImage(t, cli, "node:24-alpine")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -1141,6 +1142,7 @@ func TestIntegrationFailedStartRemovesContainer(t *testing.T) {
 // spurious failure.
 func TestIntegrationRemoveContainerTwiceBenign(t *testing.T) {
 	cli := testutil.RequireDocker(t)
+	testutil.RequireImage(t, cli, "node:24-alpine")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 

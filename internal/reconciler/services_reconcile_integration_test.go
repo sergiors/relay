@@ -409,6 +409,7 @@ func TestIntegrationShutdownCleanupNodeScoped(t *testing.T) {
 		t.Fatalf("raw docker client: %v", err)
 	}
 	t.Cleanup(func() { _ = dcli.Close() })
+	testutil.RequireImage(t, dcli, "node:24-alpine")
 
 	var buf strings.Builder
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
