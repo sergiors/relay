@@ -104,7 +104,7 @@ jobs:
           make test-integration-race GOTEST="go test -json" 2>&1 | tee integration-race.log
 
       - name: Upload integration test logs
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: integration-test-logs
