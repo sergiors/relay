@@ -42,7 +42,6 @@ import (
 	"relay/internal/dlq"
 	"relay/internal/observability/metrics"
 	"relay/internal/schedule"
-	"relay/internal/state"
 	"relay/internal/testutil"
 )
 
@@ -90,6 +89,23 @@ func newEnv(t *testing.T, cfg ConsumerConfig) *testEnv {
 	cli := redis.NewClient(redisOpts)
 	ctx, cancel := context.WithCancel(context.Background())
 	prefix := fmt.Sprintf("itest-%d", time.Now().UnixNano())
+	var env *testEnv
+	needsFinalJoin := false
+	// Register before NewState registers its own cleanups. If the consumer stays
+	// alive after its client is closed, make one final bounded join only after
+	// the test's state handle and schema have been cleaned up.
+	t.Cleanup(func() {
+		if !needsFinalJoin {
+			return
+		}
+		if !env.waitDone() {
+			t.Errorf("consumer did not stop after final cleanup join")
+			return
+		}
+		cleanupClient := redis.NewClient(redisOpts)
+		cleanupEnvRedisKeys(context.Background(), cleanupClient, env.stream, env.group)
+		_ = cleanupClient.Close()
+	})
 	if cfg.Stream == "" {
 		cfg.Stream = prefix + "-stream"
 	}
@@ -127,25 +143,7 @@ func newEnv(t *testing.T, cfg ConsumerConfig) *testEnv {
 	if err := c.EnsureGroup(ctx); err != nil {
 		t.Fatalf("ensure group: %v", err)
 	}
-	t.Cleanup(func() {
-		cancel()
-		// Use a fresh context: cancel() above invalidates ctx, but Redis calls
-		// still need a live context to run the cleanup DELs and scans. The DLQ
-		// rows live in the per-test PostgreSQL schema, which testutil drops via
-		// its own cleanup.
-		cleanupCtx := context.Background()
-		_ = cli.Del(cleanupCtx, c.stream).Err()
-		// Also clear any invocation-state keys this env's stream/group created,
-		// otherwise a message claimed on a failure path can leak a
-		// `relay:invocation:<stream>:<group>:*` hash in Redis. The scan pattern
-		// is bounded to the unique stream/group names this test owns — never a
-		// global FLUSHDB/FLUSHALL.
-		cleanupInvocationKeys(cleanupCtx, cli, prefix)
-		_ = cli.Close()
-	})
-	st, _ := cfg.DLQStore.(*state.State)
-	_ = st // (unused; the DLQ is read through the broker-neutral e.dlqStore)
-	return &testEnv{
+	env = &testEnv{
 		client:   cli,
 		consumer: c,
 		stream:   cfg.Stream,
@@ -154,6 +152,36 @@ func newEnv(t *testing.T, cfg ConsumerConfig) *testEnv {
 		ctx:      ctx,
 		cancel:   cancel,
 	}
+	t.Cleanup(func() {
+		cancel()
+		cleanupClient := cli
+		if !env.waitDone() {
+			// Close the Redis connection to interrupt a blocked client call,
+			// then join once more before touching the consumer's resources.
+			_ = cli.Close()
+			if !env.waitDone() {
+				// The final join runs after testutil's State cleanup. Do not race
+				// deletion or client teardown against a still-active consumer.
+				needsFinalJoin = true
+				return
+			}
+			cleanupClient = redis.NewClient(redisOpts)
+		}
+		// Use a fresh context: cancel() above invalidates ctx, but Redis calls
+		// still need a live context to run the cleanup DELs and scans. The DLQ
+		// rows live in the per-test PostgreSQL schema, which testutil drops via
+		// its own cleanup.
+		cleanupCtx := context.Background()
+		_ = cleanupClient.Del(cleanupCtx, c.stream).Err()
+		// Also clear any invocation-state keys this env's stream/group created,
+		// otherwise a message claimed on a failure path can leak a
+		// `relay:invocation:<stream>:<group>:*` hash in Redis. The scan pattern
+		// is bounded to the unique stream/group names this test owns — never a
+		// global FLUSHDB/FLUSHALL.
+		cleanupInvocationKeys(cleanupCtx, cleanupClient, prefix)
+		_ = cleanupClient.Close()
+	})
+	return env
 }
 
 func (e *testEnv) start(handler Handler) {
@@ -170,13 +198,23 @@ func (e *testEnv) start(handler Handler) {
 func (e *testEnv) stop(t *testing.T) {
 	t.Helper()
 	e.cancel()
-	select {
-	case <-e.done:
-	case <-time.After(5 * time.Second):
+	if !e.waitDone() {
 		t.Fatalf("consumer did not stop on cancellation")
 	}
 	if err := <-e.errCh; err != nil {
 		t.Fatalf("consume returned error: %v", err)
+	}
+}
+
+func (e *testEnv) waitDone() bool {
+	if e.done == nil {
+		return true
+	}
+	select {
+	case <-e.done:
+		return true
+	case <-time.After(5 * time.Second):
+		return false
 	}
 }
 
@@ -282,6 +320,35 @@ func cleanupInvocationKeys(ctx context.Context, cli *redis.Client, prefix string
 		}
 		if len(keys) > 0 {
 			_ = cli.Del(ctx, keys...).Err()
+		}
+		if next == 0 {
+			break
+		}
+		cursor = next
+	}
+}
+
+// cleanupEnvRedisKeys removes only the stream and invocation-state keys owned
+// by this env's stream/group pair. It is used by the deferred cleanup path,
+// where caller-provided stream/group names need not contain the generated env
+// prefix.
+func cleanupEnvRedisKeys(ctx context.Context, cli *redis.Client, stream, group string) {
+	_ = cli.Del(ctx, stream).Err()
+	keyPrefix := "relay:invocation:" + encodeComponent(stream) + ":" + encodeComponent(group) + ":"
+	var cursor uint64
+	for {
+		keys, next, err := cli.Scan(ctx, cursor, "relay:invocation:*", 0).Result()
+		if err != nil {
+			break
+		}
+		var owned []string
+		for _, key := range keys {
+			if strings.HasPrefix(key, keyPrefix) {
+				owned = append(owned, key)
+			}
+		}
+		if len(owned) > 0 {
+			_ = cli.Del(ctx, owned...).Err()
 		}
 		if next == 0 {
 			break

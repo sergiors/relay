@@ -618,11 +618,11 @@ func TestIntegrationDependencyLeaseCloseLifecycle(t *testing.T) {
 	open := func() *state.State { return testutil.OpenState(t, dsn) }
 	a := open()
 	b := open()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
 	ref := leaseRefFor("close")
 
-	l, err := a.AcquireDependencyImageUse(ctx, ref)
+	acquireCtx, cancelAcquire := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelAcquire()
+	l, err := a.AcquireDependencyImageUse(acquireCtx, ref)
 	if err != nil {
 		t.Fatalf("AcquireDependencyImageUse: %v", err)
 	}
@@ -631,19 +631,27 @@ func TestIntegrationDependencyLeaseCloseLifecycle(t *testing.T) {
 	if err := a.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	gc, ok, err := b.TryAcquireDependencyImageGC(ctx, ref)
+	closeCtx, cancelClose := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelClose()
+	gc, ok, err := b.TryAcquireDependencyImageGC(closeCtx, ref)
 	if err != nil || !ok {
 		t.Fatalf("TryAcquireDependencyImageGC after A closed = (%v, %v), want acquired", ok, err)
 	}
-	if err := l.Verify(ctx); err == nil {
+	if err := l.Verify(closeCtx); err == nil {
 		t.Fatal("a lease token from a closed handle must no longer verify")
 	}
 
 	// B's held exclusive lease blocks a NEW handle (simulating another
 	// process/worker starting on the same DB) while B keeps it.
 	fresh := open()
-	if _, err := fresh.AcquireDependencyImageUse(ctx, ref); err == nil {
-		t.Fatal("new handle must not acquire while B holds the exclusive GC lease")
+	// Isolate the contention poll and a delayed PostgreSQL query from the
+	// post-close acquisition.
+	busyCtx, cancelBusy := context.WithTimeout(
+		context.Background(), 15*time.Second,
+	)
+	defer cancelBusy()
+	if _, err := fresh.AcquireDependencyImageUse(busyCtx, ref); !errors.Is(err, state.ErrDependencyImageBusy) {
+		t.Fatalf("new handle acquisition while B holds GC lease = %v, want ErrDependencyImageBusy", err)
 	}
 
 	// B closes, releasing everything it held; the fresh handle acquires.
@@ -653,7 +661,9 @@ func TestIntegrationDependencyLeaseCloseLifecycle(t *testing.T) {
 	if err := b.Close(); err != nil {
 		t.Fatalf("Close B: %v", err)
 	}
-	_, err = fresh.AcquireDependencyImageUse(ctx, ref)
+	reacquireCtx, cancelReacquire := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelReacquire()
+	_, err = fresh.AcquireDependencyImageUse(reacquireCtx, ref)
 	if err != nil {
 		t.Fatalf("AcquireDependencyImageUse after B closed: %v", err)
 	}

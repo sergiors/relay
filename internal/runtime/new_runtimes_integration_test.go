@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -190,14 +191,15 @@ func TestIntegrationNode26PreparePnpmJSTSAndWarmReuse(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// Both test-specific app images are cleaned up: the JS app (node26-e2e) and
-	// the TypeScript app (node26-ts-e2e). The TS prefix ends in a different
-	// name, so one prefix alone would leak its images onto the shared daemon.
-	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-node26-e2e:", "relay-app-node26-ts-e2e:"))
+	// Both test-specific app images are cleaned up. Architecture-qualified names
+	// prevent another architecture's image from being reused on the shared daemon.
+	jsAppName := "node26-e2e-" + runtime.GOARCH
+	tsAppName := "node26-ts-e2e-" + runtime.GOARCH
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-"+jsAppName+":", "relay-app-"+tsAppName+":"))
 
 	// JS app: dependency import + per-invocation pid/version proof.
 	jsDir := t.TempDir()
-	jsFn := newAppFromTemplate(t, "node26-e2e", jsDir, `
+	jsFn := newAppFromTemplate(t, jsAppName, jsDir, `
 runtime: nodejs26.x
 events:
   - handler: handler.on
@@ -216,7 +218,7 @@ export function on(event) {
 	// committed dependency, so the import resolves from the dependency image's
 	// node_modules rather than the bundled sources.
 	tsDir := t.TempDir()
-	tsFn := newAppFromTemplate(t, "node26-ts-e2e", tsDir, `
+	tsFn := newAppFromTemplate(t, tsAppName, tsDir, `
 runtime: nodejs26.x
 events:
   - handler: index.tick
@@ -239,6 +241,11 @@ export function tick(event: { event_id: string }): void {
 	if err != nil {
 		t.Fatalf("prepare js: %v", err)
 	}
+	jsImage, err := cli.ImageInspect(ctx, prepared.Image)
+	if err != nil {
+		t.Fatalf("inspect prepared js image: %v", err)
+	}
+	assertBuiltPlatform(t, jsImage.Os, jsImage.Architecture)
 	if prepared.Dependency != jsDep {
 		t.Fatalf("js prepare dependency = %q, want %q", prepared.Dependency, jsDep)
 	}
@@ -310,6 +317,11 @@ export function tick(event: { event_id: string }): void {
 	if err != nil {
 		t.Fatalf("prepare ts: %v", err)
 	}
+	tsImage, err := cli.ImageInspect(ctx, tsPrepared.Image)
+	if err != nil {
+		t.Fatalf("inspect prepared ts image: %v", err)
+	}
+	assertBuiltPlatform(t, tsImage.Os, tsImage.Architecture)
 	if tsPrepared.Dependency != jsDep {
 		t.Fatalf("ts prepare dependency = %q, want the same content-addressed %q (identical manifest)", tsPrepared.Dependency, jsDep)
 	}

@@ -3,9 +3,12 @@ package runtime
 import (
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/moby/moby/api/types/build"
 
 	"relay/internal/app"
 	"relay/internal/runtime/plan"
@@ -33,6 +36,9 @@ func TestBuildImageOptionsRemoveIntermediateContainers(t *testing.T) {
 	}
 	if opts.Dockerfile != "Dockerfile" {
 		t.Errorf("Dockerfile = %q, want %q", opts.Dockerfile, "Dockerfile")
+	}
+	if opts.Version != build.BuilderBuildKit {
+		t.Errorf("Version = %q, want explicit BuildKit version %q", opts.Version, build.BuilderBuildKit)
 	}
 	if opts.Labels != nil {
 		t.Errorf("Labels = %v, want nil for a plain build", opts.Labels)
@@ -388,11 +394,20 @@ func artifactPnpmTool() plan.RuntimeTool {
 	}
 }
 
-// TestRenderDockerfileArtifactTool verifies an archive-artifact RuntimeTool is
-// materialized as one fail-closed RUN that downloads the pinned archive for the
-// TARGET architecture with wget (falling back to curl), verifies the SHA-256,
-// extracts only the validated member, and moves it to its destination BEFORE
-// the install RUN.
+func artifactPnpmToolWithFallback() plan.RuntimeTool {
+	tool := artifactPnpmTool()
+	variant := tool.Artifact.Variants[0]
+	variant.Fallbacks = []plan.ArtifactSource{{
+		URL:    "https://registry.npmjs.org/@pnpm/exe.linux-x64-musl/-/exe-linux-x64-musl-12.10.1.tgz",
+		SHA256: strings.Repeat("b", 64), Member: "package/pnpm",
+	}}
+	tool.Artifact.Variants[0] = variant
+	return tool
+}
+
+// TestRenderDockerfileArtifactTool verifies artifacts use the explicit frontend
+// and BuildKit cache, retry only bounded wget failures, verify cached/downloaded
+// bytes, and install only after verification.
 func TestRenderDockerfileArtifactTool(t *testing.T) {
 	p := plan.BuildPlan{
 		BaseImage:    "node:24-alpine",
@@ -403,31 +418,443 @@ func TestRenderDockerfileArtifactTool(t *testing.T) {
 	}
 	df := mustRenderDockerfile(t, p)
 
-	// The full expected output, byte-for-byte: one fail-closed RUN (download the
-	// amd64 archive with wget falling back to curl, verify the SHA-256, extract
-	// exactly the validated member, install it, and remove every scratch path
-	// before the layer commits) BEFORE the install RUN, so the whole acquisition
-	// is a single RUN (the archive never becomes a retained layer) and only the
-	// target architecture's artifact is referenced. The digest argument is
-	// quoted as one shell word (it contains the two sha256sum separator spaces).
 	digest := strings.Repeat("a", 64)
-	want := "FROM node:24-alpine\n" +
-		"WORKDIR /app\n" +
-		"COPY . /app\n" +
-		"RUN ( wget -q -O /tmp/relay-tool-0.tar.gz https://example.test/pnpm-x64.tgz" +
-		" || curl -fsSL -o /tmp/relay-tool-0.tar.gz https://example.test/pnpm-x64.tgz )" +
-		" && echo '" + digest + "  /tmp/relay-tool-0.tar.gz' | sha256sum -c -" +
-		" && rm -rf /tmp/relay-tool-0.unpack" +
-		" && mkdir -p /tmp/relay-tool-0.unpack" +
-		" && tar -xzf /tmp/relay-tool-0.tar.gz -C /tmp/relay-tool-0.unpack bin/pnpm" +
-		" && mkdir -p /usr/local/bin" +
-		" && mv /tmp/relay-tool-0.unpack/bin/pnpm /usr/local/bin/pnpm" +
-		" && chmod 0755 /usr/local/bin/pnpm" +
-		" && rm -rf /tmp/relay-tool-0.unpack /tmp/relay-tool-0.tar.gz\n" +
-		"RUN pnpm install --prod\n"
-	if df != want {
-		t.Errorf("rendered dockerfile mismatch.\n--- got ---\n%s\n--- want ---\n%s", df, want)
+	for _, want := range []string{
+		"FROM node:24-alpine\n",
+		"RUN --mount=type=cache,id=relay-artifact-" + digest + ",target=/var/cache/relay-artifacts,sharing=locked",
+		"sha256sum -c - >/dev/null 2>&1; then if [ ! -f /tmp/relay-tool-0.tar.gz ]; then cp /var/cache/relay-artifacts/" + digest + ".tar.gz /tmp/relay-tool-0.tar.gz",
+		"busybox timeout -k 2 25 busybox wget -T 20 -O /var/cache/relay-artifacts/." + digest + ".download https://example.test/pnpm-x64.tgz",
+		"echo '" + digest + "  /var/cache/relay-artifacts/." + digest + ".download' | sha256sum -c -; then rm -f",
+		"attempt=1; while [ \"$attempt\" -le 3 ]",
+		"sleep \"$attempt\"",
+		"artifact SHA-256 mismatch",
+		"echo \"$archive_sha256  /tmp/relay-tool-0.tar.gz\" | sha256sum -c -",
+		"tar -xzf /tmp/relay-tool-0.tar.gz -C /tmp/relay-tool-0.unpack \"$archive_member\"",
+		"RUN pnpm install --prod\n",
+	} {
+		if !strings.Contains(df, want) {
+			t.Errorf("rendered artifact Dockerfile does not contain %q:\n%s", want, df)
+		}
 	}
+	if strings.Contains(df, "curl") {
+		t.Errorf("artifact Dockerfile must not use the unavailable curl fallback:\n%s", df)
+	}
+	if got := strings.Count(df, "busybox timeout -k 2 25 busybox wget -T 20 -O"); got != 1 {
+		t.Errorf("download retry loop must contain one bounded wget invocation, got %d:\n%s", got, df)
+	}
+	if !strings.Contains(df, "echo 'artifact SHA-256 mismatch' >&2; exit 1; fi; mv ") {
+		t.Errorf("a downloaded checksum mismatch must fail before cache publication:\n%s", df)
+	}
+	if strings.Index(df, "sha256sum -c -") > strings.Index(df, "tar -xzf") {
+		t.Errorf("artifact checksum verification must precede extraction:\n%s", df)
+	}
+}
+
+// TestRenderDockerfileArtifactShellRetriesAndReusesVerifiedCache executes the
+// generated artifact RUN with fake download/checksum commands. It verifies the
+// retry and checksum-keyed cache behavior rather than only matching shell text.
+func TestRenderDockerfileArtifactShellRetriesAndReusesVerifiedCache(t *testing.T) {
+	const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	df := mustRenderDockerfile(t, plan.BuildPlan{
+		BaseImage:    "node:24-alpine",
+		TargetArch:   "amd64",
+		RuntimeTools: []plan.RuntimeTool{artifactPnpmTool()},
+		Install:      []string{"pnpm install --prod"},
+	})
+	workDir := t.TempDir()
+	body := artifactRunBody(t, df, digest, workDir)
+	commands, countFile := artifactShellCommands(t)
+	cacheDir := filepath.Join(workDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configureArtifactShell(t, commands, countFile, digest, "transient")
+
+	if output, err := runArtifactShell(body); err != nil {
+		t.Fatalf("artifact RUN after transient wget failure: %v\n%s", err, output)
+	}
+	if got := readFile(t, countFile); got != "2\n" {
+		t.Fatalf("wget calls after retry = %q, want 2", got)
+	}
+	cached := filepath.Join(cacheDir, digest+".tar.gz")
+	if got := readFile(t, cached); got != "VALID" {
+		t.Fatalf("cached artifact = %q, want verified content", got)
+	}
+
+	if output, err := runArtifactShell(body); err != nil {
+		t.Fatalf("artifact RUN using verified cache: %v\n%s", err, output)
+	}
+	if got := readFile(t, countFile); got != "2\n" {
+		t.Fatalf("wget calls after cache reuse = %q, want no additional download", got)
+	}
+}
+
+// TestRenderDockerfileArtifactShellRejectsChecksumMismatch verifies a
+// checksum-mismatched download fails closed before extraction or cache publish.
+func TestRenderDockerfileArtifactShellRejectsChecksumMismatch(t *testing.T) {
+	const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	df := mustRenderDockerfile(t, plan.BuildPlan{
+		BaseImage:    "node:24-alpine",
+		TargetArch:   "amd64",
+		RuntimeTools: []plan.RuntimeTool{artifactPnpmTool()},
+		Install:      []string{"pnpm install --prod"},
+	})
+	workDir := t.TempDir()
+	body := artifactRunBody(t, df, digest, workDir)
+	commands, countFile := artifactShellCommands(t)
+	cacheDir := filepath.Join(workDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cacheDir, digest+".tar.gz"), []byte("CORRUPT"), 0o644); err != nil {
+		t.Fatalf("write corrupt cache artifact: %v", err)
+	}
+	configureArtifactShell(t, commands, countFile, digest, "mismatch")
+
+	output, err := runArtifactShell(body)
+	if err == nil {
+		t.Fatalf("artifact RUN succeeded for a mismatched checksum:\n%s", output)
+	}
+	if !strings.Contains(string(output), "artifact SHA-256 mismatch") {
+		t.Errorf("failure output = %q, want checksum mismatch diagnostic", output)
+	}
+	if got := readFile(t, countFile); got != "1\n" {
+		t.Errorf("wget calls = %q, want one mismatched download", got)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(countFile), "tar-called")); !os.IsNotExist(err) {
+		t.Errorf("tar ran before checksum rejection (stat error %v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(cacheDir, digest+".tar.gz")); !os.IsNotExist(err) {
+		t.Errorf("unverified cached artifact was retained (stat error %v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(cacheDir, "."+digest+".download")); !os.IsNotExist(err) {
+		t.Errorf("mismatched temporary download was retained (stat error %v)", err)
+	}
+	if !strings.Contains(df, "RUN pnpm install --prod\n") ||
+		strings.Index(df, "RUN pnpm install --prod\n") < strings.Index(df, "RUN --mount=type=cache,id=") {
+		t.Errorf("pnpm install must follow the fail-closed artifact RUN:\n%s", df)
+	}
+}
+
+func TestRenderDockerfileArtifactStopsAfterDownloadRetries(t *testing.T) {
+	const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	df := mustRenderDockerfile(t, plan.BuildPlan{
+		BaseImage:    "node:24-alpine",
+		TargetArch:   "amd64",
+		RuntimeTools: []plan.RuntimeTool{artifactPnpmTool()},
+		Install:      []string{"pnpm install --prod"},
+	})
+	workDir := t.TempDir()
+	body := artifactRunBody(t, df, digest, workDir)
+	commands, countFile := artifactShellCommands(t)
+	cacheDir := filepath.Join(workDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configureArtifactShell(t, commands, countFile, digest, "failure")
+
+	output, err := runArtifactShell(body)
+	if err == nil {
+		t.Fatalf("artifact RUN succeeded after every download failed:\n%s", output)
+	}
+	if !strings.Contains(string(output), "artifact download failed after 3 attempts") {
+		t.Errorf("failure output = %q, want the bounded retry diagnostic", output)
+	}
+	if got := readFile(t, countFile); got != "3\n" {
+		t.Errorf("wget calls = %q, want exactly 3", got)
+	}
+	if _, err := os.Stat(filepath.Join(cacheDir, digest+".tar.gz")); !os.IsNotExist(err) {
+		t.Errorf("failed download was published to cache (stat error %v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(countFile), "tar-called")); !os.IsNotExist(err) {
+		t.Errorf("tar ran after every download failed (stat error %v)", err)
+	}
+}
+
+func TestRenderDockerfileArtifactFallsBackAndCachesBySourceDigest(t *testing.T) {
+	const (
+		primaryDigest  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		fallbackDigest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
+	df := mustRenderDockerfile(t, plan.BuildPlan{
+		BaseImage: "node:24-alpine", TargetArch: "amd64", RuntimeTools: []plan.RuntimeTool{artifactPnpmToolWithFallback()},
+	})
+	if !strings.Contains(df, primaryDigest+".tar.gz") || !strings.Contains(df, fallbackDigest+".tar.gz") {
+		t.Fatalf("each source must have an independently digest-keyed cache entry:\n%s", df)
+	}
+	workDir := t.TempDir()
+	body := artifactRunBody(t, df, primaryDigest, workDir)
+	commands, countFile := artifactShellCommands(t)
+	if err := os.MkdirAll(filepath.Join(workDir, "cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configureArtifactShell(t, commands, countFile, primaryDigest+","+fallbackDigest, "primary-fails")
+
+	if output, err := runArtifactShell(body); err != nil {
+		t.Fatalf("artifact RUN after primary source exhaustion: %v\n%s", err, output)
+	}
+	if got := readFile(t, countFile); got != "4\n" {
+		t.Fatalf("download calls = %q, want three primary attempts then one fallback", got)
+	}
+	if got := readFile(t, os.Getenv("WGET_PRIMARY_COUNT")); got != "3\n" {
+		t.Fatalf("primary source calls = %q, want 3", got)
+	}
+	if got := readFile(t, os.Getenv("WGET_FALLBACK_COUNT")); got != "1\n" {
+		t.Fatalf("fallback source calls = %q, want 1", got)
+	}
+	cacheDir := filepath.Join(workDir, "cache")
+	if got := readFile(t, filepath.Join(cacheDir, fallbackDigest+".tar.gz")); got != "VALID" {
+		t.Fatalf("fallback cache = %q, want verified content", got)
+	}
+	if _, err := os.Stat(filepath.Join(cacheDir, primaryDigest+".tar.gz")); !os.IsNotExist(err) {
+		t.Fatalf("failed primary source was cached (stat error %v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(cacheDir, "."+fallbackDigest+".download")); !os.IsNotExist(err) {
+		t.Fatalf("temporary fallback download was retained (stat error %v)", err)
+	}
+	// The generated RUN checks all source caches before network access. The
+	// verified fallback archive therefore succeeds without retrying GitHub.
+	if output, err := runArtifactShell(body); err != nil {
+		t.Fatalf("artifact RUN from verified fallback cache: %v\n%s", err, output)
+	}
+	if got := readFile(t, countFile); got != "4\n" {
+		t.Fatalf("download calls after fallback cache population = %q, want no additional download", got)
+	}
+}
+
+func TestRenderDockerfileArtifactPrimarySuccessSkipsFallback(t *testing.T) {
+	const (
+		primaryDigest  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		fallbackDigest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
+	df := mustRenderDockerfile(t, plan.BuildPlan{
+		BaseImage:    "node:24-alpine",
+		TargetArch:   "amd64",
+		RuntimeTools: []plan.RuntimeTool{artifactPnpmToolWithFallback()},
+	})
+	workDir := t.TempDir()
+	body := artifactRunBody(t, df, primaryDigest, workDir)
+	commands, countFile := artifactShellCommands(t)
+	if err := os.MkdirAll(filepath.Join(workDir, "cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configureArtifactShell(t, commands, countFile, primaryDigest+","+fallbackDigest, "primary-success")
+
+	if output, err := runArtifactShell(body); err != nil {
+		t.Fatalf("artifact RUN from primary source: %v\n%s", err, output)
+	}
+	if got := readFile(t, countFile); got != "1\n" {
+		t.Fatalf("download calls = %q, want only the primary source", got)
+	}
+	if got := readFile(t, os.Getenv("WGET_PRIMARY_COUNT")); got != "1\n" {
+		t.Errorf("primary source calls = %q, want 1", got)
+	}
+	if _, err := os.Stat(os.Getenv("WGET_FALLBACK_COUNT")); !os.IsNotExist(err) {
+		t.Errorf("fallback was requested after primary success (stat error %v)", err)
+	}
+	if got := readFile(t, filepath.Join(workDir, "cache", primaryDigest+".tar.gz")); got != "VALID" {
+		t.Fatalf("primary cache = %q, want verified content", got)
+	}
+}
+
+func TestRenderDockerfileArtifactFallbackChecksumFailuresAreFatal(t *testing.T) {
+	const (
+		primaryDigest  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		fallbackDigest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
+	for _, tc := range []struct {
+		name string
+		mode string
+		want string
+	}{
+		{name: "primary", mode: "primary-mismatch", want: primaryDigest},
+		{name: "fallback", mode: "fallback-mismatch", want: fallbackDigest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			df := mustRenderDockerfile(t, plan.BuildPlan{
+				BaseImage: "node:24-alpine", TargetArch: "amd64", RuntimeTools: []plan.RuntimeTool{artifactPnpmToolWithFallback()},
+			})
+			workDir := t.TempDir()
+			body := artifactRunBody(t, df, primaryDigest, workDir)
+			commands, countFile := artifactShellCommands(t)
+			cacheDir := filepath.Join(workDir, "cache")
+			if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			configureArtifactShell(t, commands, countFile, primaryDigest+","+fallbackDigest, tc.mode)
+			output, err := runArtifactShell(body)
+			if err == nil || !strings.Contains(string(output), "artifact SHA-256 mismatch") {
+				t.Fatalf("checksum mismatch result = %v, output %q; want fatal mismatch", err, output)
+			}
+			if got := readFile(t, countFile); got == "" {
+				t.Fatal("expected source download")
+			}
+			if tc.name == "primary" {
+				if got := readFile(t, countFile); got != "1\n" {
+					t.Errorf("primary checksum mismatch download calls = %q, want one", got)
+				}
+				if _, err := os.Stat(os.Getenv("WGET_FALLBACK_COUNT")); !os.IsNotExist(err) {
+					t.Errorf("fallback was attempted after a primary checksum mismatch (stat error %v)", err)
+				}
+			} else if got := readFile(t, countFile); got != "4\n" {
+				t.Errorf("fallback checksum mismatch download calls = %q, want three primary failures and one fallback", got)
+			}
+			if _, err := os.Stat(filepath.Join(cacheDir, tc.want+".tar.gz")); !os.IsNotExist(err) {
+				t.Errorf("mismatched source was cached (stat error %v)", err)
+			}
+			if _, err := os.Stat(filepath.Join(cacheDir, "."+tc.want+".download")); !os.IsNotExist(err) {
+				t.Errorf("mismatched temporary source was retained (stat error %v)", err)
+			}
+			if _, err := os.Stat(filepath.Join(filepath.Dir(countFile), "tar-called")); !os.IsNotExist(err) {
+				t.Errorf("tar ran after checksum rejection (stat error %v)", err)
+			}
+		})
+	}
+}
+
+func TestRenderDockerfileArtifactFallbackExhaustionIsBounded(t *testing.T) {
+	const primaryDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	df := mustRenderDockerfile(t, plan.BuildPlan{
+		BaseImage: "node:24-alpine", TargetArch: "amd64", RuntimeTools: []plan.RuntimeTool{artifactPnpmToolWithFallback()},
+	})
+	workDir := t.TempDir()
+	body := artifactRunBody(t, df, primaryDigest, workDir)
+	commands, countFile := artifactShellCommands(t)
+	if err := os.MkdirAll(filepath.Join(workDir, "cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configureArtifactShell(t, commands, countFile, "", "failure")
+	output, err := runArtifactShell(body)
+	if err == nil || !strings.Contains(string(output), "all sources after 3 attempts each") {
+		t.Fatalf("exhaustion result = %v, output %q; want bounded source exhaustion", err, output)
+	}
+	if got := readFile(t, countFile); got != "6\n" {
+		t.Fatalf("wget calls = %q, want three per source", got)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(countFile), "tar-called")); !os.IsNotExist(err) {
+		t.Errorf("tar ran after every source failed (stat error %v)", err)
+	}
+}
+
+func artifactRunBody(t *testing.T, dockerfile, digest, workDir string) string {
+	t.Helper()
+	const mount = "RUN --mount=type=cache,id=relay-artifact-"
+	start := strings.Index(dockerfile, mount)
+	if start < 0 {
+		t.Fatalf("Dockerfile has no artifact RUN:\n%s", dockerfile)
+	}
+	line := strings.TrimSpace(strings.SplitN(dockerfile[start:], "\n", 2)[0])
+	marker := "sharing=locked "
+	bodyStart := strings.Index(line, marker)
+	if bodyStart < 0 {
+		t.Fatalf("artifact RUN has no expected locked cache mount: %q", line)
+	}
+	if !strings.Contains(line, digest) {
+		t.Fatalf("artifact RUN is not keyed by expected digest %q: %s", digest, line)
+	}
+	body := line[bodyStart+len(marker):]
+	body = strings.ReplaceAll(body, "/var/cache/relay-artifacts", filepath.Join(workDir, "cache"))
+	body = strings.ReplaceAll(body, "/tmp/relay-tool-0.tar.gz", filepath.Join(workDir, "artifact.tar.gz"))
+	body = strings.ReplaceAll(body, "/tmp/relay-tool-0.unpack", filepath.Join(workDir, "unpack"))
+	body = strings.ReplaceAll(body, "/usr/local/bin/pnpm", filepath.Join(workDir, "bin", "pnpm"))
+	body = strings.ReplaceAll(body, "/usr/local/bin", filepath.Join(workDir, "bin"))
+	return body
+}
+
+func artifactShellCommands(t *testing.T) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	countFile := filepath.Join(dir, "wget-count")
+	commands := filepath.Join(dir, "bin")
+	if err := os.Mkdir(commands, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeCommand := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(commands, name), []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeCommand("busybox", strings.Join([]string{
+		"set -eu",
+		"[ \"$1\" = timeout ] && [ \"$2\" = -k ] && [ \"$3\" = 2 ] && [ \"$4\" = 25 ] || exit 2",
+		"shift 4",
+		"[ \"$1\" = busybox ] || exit 2",
+		"shift",
+		"[ \"$1\" = wget ] || exit 2",
+		"shift",
+		"output=",
+		"url=",
+		"while [ \"$#\" -gt 0 ]; do",
+		"  if [ \"$1\" = -O ]; then shift; output=$1; fi",
+		"  case \"$1\" in https://*) url=$1 ;; esac",
+		"  shift",
+		"done",
+		"count=$(cat \"$WGET_COUNT\" 2>/dev/null || echo 0)",
+		"count=$((count + 1))",
+		"printf '%s\\n' \"$count\" > \"$WGET_COUNT\"",
+		"if [ \"$url\" = https://example.test/pnpm-x64.tgz ]; then source=primary; else source=fallback; fi",
+		"if [ \"$source\" = primary ]; then source_count=$(cat \"$WGET_PRIMARY_COUNT\" 2>/dev/null || echo 0); else source_count=$(cat \"$WGET_FALLBACK_COUNT\" 2>/dev/null || echo 0); fi",
+		"source_count=$((source_count + 1))",
+		"if [ \"$source\" = primary ]; then printf '%s\\n' \"$source_count\" > \"$WGET_PRIMARY_COUNT\"; else printf '%s\\n' \"$source_count\" > \"$WGET_FALLBACK_COUNT\"; fi",
+		"if [ \"$WGET_MODE\" = failure ]; then exit 1; fi",
+		"if [ \"$WGET_MODE\" = transient ] && [ \"$count\" -eq 1 ]; then exit 1; fi",
+		"if [ \"$WGET_MODE\" = primary-fails ] && [ \"$source\" = primary ]; then exit 1; fi",
+		"if [ \"$WGET_MODE\" = primary-mismatch ] && [ \"$source\" = primary ]; then printf INVALID > \"$output\"; exit 0; fi",
+		"if [ \"$WGET_MODE\" = fallback-mismatch ] && [ \"$source\" = primary ]; then exit 1; fi",
+		"if [ \"$WGET_MODE\" = fallback-mismatch ] && [ \"$source\" = fallback ]; then printf INVALID > \"$output\"; exit 0; fi",
+		"if [ \"$WGET_MODE\" = mismatch ]; then printf INVALID > \"$output\"; else printf VALID > \"$output\"; fi",
+	}, "\n")+"\n")
+	writeCommand("sha256sum", strings.Join([]string{
+		"set -eu",
+		"[ \"$1\" = -c ] && [ \"$2\" = - ] || exit 2",
+		"IFS= read -r line",
+		"expected=${line%%  *}",
+		"file=${line#*  }",
+		"expected_ok=no",
+		"old_ifs=$IFS; IFS=,; for allowed in $EXPECTED_DIGEST; do [ \"$expected\" = \"$allowed\" ] && expected_ok=yes; done; IFS=$old_ifs",
+		"[ \"$expected_ok\" = yes ] && [ \"$(cat \"$file\")\" = VALID ]",
+	}, "\n")+"\n")
+	writeCommand("sleep", "exit 0\n")
+	writeCommand("tar", strings.Join([]string{
+		"printf called > \"$TAR_CALLED\"",
+		"destination=",
+		"member=",
+		"while [ \"$#\" -gt 0 ]; do",
+		"  if [ \"$1\" = -C ]; then shift; destination=$1; fi",
+		"  case \"$1\" in -*) ;; *) member=$1 ;; esac",
+		"  shift",
+		"done",
+		"mkdir -p \"$destination/$(dirname \"$member\")\"",
+		": > \"$destination/$member\"",
+	}, "\n")+"\n")
+	t.Setenv("TAR_CALLED", filepath.Join(dir, "tar-called"))
+	t.Setenv("WGET_PRIMARY_COUNT", filepath.Join(dir, "primary-count"))
+	t.Setenv("WGET_FALLBACK_COUNT", filepath.Join(dir, "fallback-count"))
+	return commands, countFile
+}
+
+func configureArtifactShell(t *testing.T, commands, countFile, digest, mode string) {
+	t.Helper()
+	t.Setenv("PATH", commands+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("WGET_COUNT", countFile)
+	t.Setenv("EXPECTED_DIGEST", digest)
+	t.Setenv("WGET_MODE", mode)
+}
+
+func runArtifactShell(body string) ([]byte, error) {
+	cmd := exec.Command("/bin/sh", "-c", body)
+	cmd.Env = os.Environ()
+	return cmd.CombinedOutput()
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(contents)
 }
 
 // TestRenderDockerfileArtifactSelectsTargetArch verifies the same plan renders a
@@ -440,11 +867,17 @@ func TestRenderDockerfileArtifactSelectsTargetArch(t *testing.T) {
 		RuntimeTools: []plan.RuntimeTool{artifactPnpmTool()},
 	}
 	df := mustRenderDockerfile(t, p)
-	if !strings.Contains(df, "wget -q -O /tmp/relay-tool-0.tar.gz https://example.test/pnpm-arm64.tgz") {
+	if !strings.Contains(df, "https://example.test/pnpm-arm64.tgz") {
 		t.Errorf("arm64 render must reference the arm64 artifact:\n%s", df)
 	}
 	if strings.Contains(df, "pnpm-x64.tgz") {
 		t.Errorf("arm64 render must not reference the amd64 artifact:\n%s", df)
+	}
+	if !strings.Contains(df, "id=relay-artifact-"+strings.Repeat("b", 64)) {
+		t.Errorf("arm64 cache identity must be keyed by its artifact checksum:\n%s", df)
+	}
+	if strings.Contains(df, "id=relay-artifact-"+strings.Repeat("a", 64)) {
+		t.Errorf("arm64 cache identity must not reuse the amd64 artifact cache:\n%s", df)
 	}
 }
 
@@ -497,7 +930,7 @@ func TestRenderDockerfileArtifactRejectsMixedForm(t *testing.T) {
 // closed on an unsafe member or a malformed digest/url instead of emitting a
 // Dockerfile that could traverse or skip verification.
 func TestRenderDockerfileArtifactRejectsUnsafeData(t *testing.T) {
-	base := artifactPnpmTool()
+	base := artifactPnpmToolWithFallback()
 	v := base.Artifact.Variants[0]
 
 	cases := []struct {
@@ -506,11 +939,15 @@ func TestRenderDockerfileArtifactRejectsUnsafeData(t *testing.T) {
 	}{
 		{"traversal member", func(x *plan.ArtifactVariant) { x.Member = "../etc/passwd" }},
 		{"absolute member", func(x *plan.ArtifactVariant) { x.Member = "/etc/passwd" }},
+		{"newline member", func(x *plan.ArtifactVariant) { x.Member = "pnpm\nRUN touch /tmp/injected" }},
 		{"option member", func(x *plan.ArtifactVariant) { x.Member = "--checkpoint=1" }},
 		{"backend member", func(x *plan.ArtifactVariant) { x.Member = `a\b` }},
 		{"non-https url", func(x *plan.ArtifactVariant) { x.URL = "http://example.test/x.tgz" }},
 		{"short digest", func(x *plan.ArtifactVariant) { x.SHA256 = "abc" }},
 		{"uppercase digest", func(x *plan.ArtifactVariant) { x.SHA256 = strings.Repeat("A", 64) }},
+		{"fallback newline member", func(x *plan.ArtifactVariant) {
+			x.Fallbacks[0].Member = "package/pnpm\nRUN touch /tmp/injected"
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -538,7 +975,7 @@ func TestValidateArtifactMember(t *testing.T) {
 			t.Errorf("validateArtifactMember(%q) = %v, want nil", m, err)
 		}
 	}
-	invalid := []string{"", "/pnpm", "-pnpm", `a\b`, ".", "..", "a/../b", "a//b", "a/./b", "a/", "./a"}
+	invalid := []string{"", "/pnpm", "-pnpm", `a\b`, "pnpm\nRUN x", "pnpm\rx", "pnpm\x00x", ".", "..", "a/../b", "a//b", "a/./b", "a/", "./a"}
 	for _, m := range invalid {
 		if err := validateArtifactMember(m); err == nil {
 			t.Errorf("validateArtifactMember(%q) = nil, want an error", m)

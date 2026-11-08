@@ -148,6 +148,19 @@ type ArtifactVariant struct {
 	// the archive root (e.g. "pnpm"). It must be a clean relative path; the
 	// renderer rejects traversal, absolute, and option-like members.
 	Member string
+	// Fallbacks are ordered alternate sources for the same tool/archive layout.
+	// Each source has an independent checksum and member because alternate
+	// registries may package identical binaries in a different archive format.
+	Fallbacks []ArtifactSource
+}
+
+// ArtifactSource is an alternate pinned archive source for an artifact
+// variant. Its digest keys the verified BuildKit cache independently from the
+// primary source and every other fallback.
+type ArtifactSource struct {
+	URL    string
+	SHA256 string
+	Member string
 }
 
 // VariantForArch returns the artifact variant for arch, reporting false when the

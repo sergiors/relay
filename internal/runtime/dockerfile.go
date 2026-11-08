@@ -5,6 +5,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"relay/internal/runtime/plan"
 )
@@ -115,52 +116,76 @@ func renderRuntimeTools(b *strings.Builder, p plan.BuildPlan) error {
 	return nil
 }
 
-// renderArtifactTool renders one artifact tool as a single fail-closed RUN that
-// downloads the pinned archive, verifies its SHA-256, extracts exactly the
-// validated member, installs it at destination, and removes every scratch path
-// before the layer commits. One RUN keeps the archive out of the final image (an
-// ADD would retain the download even if a later RUN deleted it). i makes the
-// scratch paths unique per tool so two artifacts cannot clash.
-//
-// Download tries wget then curl; the artifact is only declared by runtimes whose
-// base provides one. If neither succeeds the RUN exits non-zero and the build
-// fails closed.
+// renderArtifactTool renders one fail-closed RUN that retrieves and verifies the
+// pinned archive, extracts exactly the validated member, installs it at
+// destination, and removes scratch paths before the layer commits. A
+// checksum-keyed BuildKit cache mount shares verified archives across builds.
+// Locked sharing serializes access while temporary data is verified/published.
 func renderArtifactTool(i int, destination string, variant plan.ArtifactVariant) string {
 	archive := fmt.Sprintf("/tmp/relay-tool-%d.tar.gz", i)
 	unpack := fmt.Sprintf("/tmp/relay-tool-%d.unpack", i)
 	destDir := path.Dir(destination)
-
 	archiveArg := dockerfileShellArg(archive)
-	urlArg := dockerfileShellArg(variant.URL)
-	digestArg := dockerfileShellArg(variant.SHA256 + "  " + archive)
 	unpackArg := dockerfileShellArg(unpack)
-	memberArg := dockerfileShellArg(variant.Member)
 	destDirArg := dockerfileShellArg(destDir)
-	unpackedMemberArg := dockerfileShellArg(path.Join(unpack, variant.Member))
 	destinationArg := dockerfileShellArg(destination)
+	cacheID := "relay-artifact-" + variant.SHA256
+	sources := make([]plan.ArtifactSource, 0, 1+len(variant.Fallbacks))
+	sources = append(sources, plan.ArtifactSource{URL: variant.URL, SHA256: variant.SHA256, Member: variant.Member})
+	sources = append(sources, variant.Fallbacks...)
 
 	var b strings.Builder
 	fmt.Fprintf(&b,
-		"RUN ( wget -q -O %s %s || curl -fsSL -o %s %s )"+
-			" && echo %s | sha256sum -c -"+
-			" && rm -rf %s"+
-			" && mkdir -p %s"+
-			" && tar -xzf %s -C %s %s"+
-			" && mkdir -p %s"+
-			" && mv %s %s"+
-			" && chmod 0755 %s"+
-			" && rm -rf %s %s\n",
-		archiveArg, urlArg, archiveArg, urlArg,
-		digestArg,
-		unpackArg,
-		unpackArg,
-		archiveArg, unpackArg, memberArg,
-		destDirArg,
-		unpackedMemberArg, destinationArg,
-		destinationArg,
-		unpackArg, archiveArg,
-	)
+		"RUN --mount=type=cache,id=%s,target=/var/cache/relay-artifacts,sharing=locked set -eu; ", cacheID)
+	b.WriteString("archive_sha256=; archive_member=; ")
+	// Inspect every source's cache before any network access. The primary wins
+	// when both caches are valid, while a verified fallback cache bypasses a
+	// temporarily unavailable primary on future builds.
+	for _, source := range sources {
+		cached := artifactCachePath(source.SHA256)
+		fmt.Fprintf(&b,
+			"if [ -f %s ]; then if echo %s | sha256sum -c - >/dev/null 2>&1; then if [ ! -f %s ]; then cp %s %s; archive_sha256=%s; archive_member=%s; fi; else rm -f %s; fi; fi; ",
+			dockerfileShellArg(cached),
+			dockerfileShellArg(source.SHA256+"  "+cached),
+			archiveArg, dockerfileShellArg(cached), archiveArg, source.SHA256, dockerfileShellArg(source.Member),
+			dockerfileShellArg(cached))
+	}
+	for _, source := range sources {
+		cached := artifactCachePath(source.SHA256)
+		temp := artifactTempPath(source.SHA256)
+		cachedArg := dockerfileShellArg(cached)
+		tempArg := dockerfileShellArg(temp)
+		fmt.Fprintf(&b,
+			"if [ ! -f %s ]; then attempt=1; while [ \"$attempt\" -le 3 ]; do rm -f %s; "+
+				"if busybox timeout -k 2 25 busybox wget -T 20 -O %s %s; then "+
+				"if ! echo %s | sha256sum -c -; then rm -f %s %s %s %s; echo 'artifact SHA-256 mismatch' >&2; exit 1; fi; "+
+				"mv %s %s; cp %s %s; archive_sha256=%s; archive_member=%s; break; fi; rm -f %s; "+
+				"if [ \"$attempt\" -lt 3 ]; then sleep \"$attempt\"; fi; attempt=$((attempt + 1)); done; fi; ",
+			archiveArg, tempArg, tempArg, dockerfileShellArg(source.URL),
+			dockerfileShellArg(source.SHA256+"  "+temp), tempArg, cachedArg, archiveArg, unpackArg,
+			tempArg, cachedArg, cachedArg, archiveArg, source.SHA256, dockerfileShellArg(source.Member), tempArg)
+	}
+	if len(sources) == 1 {
+		fmt.Fprintf(&b, "if [ ! -f %s ]; then echo 'artifact download failed after 3 attempts' >&2; exit 1; fi; ", archiveArg)
+	} else {
+		fmt.Fprintf(&b, "if [ ! -f %s ]; then echo 'artifact download failed for all sources after 3 attempts each' >&2; exit 1; fi; ", archiveArg)
+	}
+	fmt.Fprintf(&b,
+		"echo \"$archive_sha256  %s\" | sha256sum -c - && rm -rf %s && mkdir -p %s && ",
+		archiveArg, unpackArg, unpackArg)
+	fmt.Fprintf(&b, "tar -xzf %s -C %s \"$archive_member\" && mkdir -p %s && mv %s/\"$archive_member\" %s && chmod 0755 %s && rm -rf %s %s\n",
+		archiveArg, unpackArg, destDirArg, unpackArg, destinationArg, destinationArg, unpackArg, archiveArg)
 	return b.String()
+}
+
+func artifactCachePath(digest string) string {
+	return "/var/cache/relay-artifacts/" + digest + ".tar.gz"
+}
+
+func artifactTempPath(digest string) string {
+	// sharing=locked makes this deterministic temporary name safe even when
+	// builds for the same artifact arrive concurrently.
+	return "/var/cache/relay-artifacts/." + digest + ".download"
 }
 
 // validateArtifactVariant rejects a variant whose data could produce an unsafe
@@ -186,7 +211,21 @@ func validateArtifactVariant(v plan.ArtifactVariant) error {
 			return fmt.Errorf("artifact variant for %s: sha256 %q must be lowercase hex", v.Arch, v.SHA256)
 		}
 	}
-	return validateArtifactMember(v.Member)
+	if err := validateArtifactMember(v.Member); err != nil {
+		return err
+	}
+	for i, fallback := range v.Fallbacks {
+		if err := validateArtifactSource(v.Arch, fallback); err != nil {
+			return fmt.Errorf("fallback %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+func validateArtifactSource(arch string, source plan.ArtifactSource) error {
+	return validateArtifactVariant(plan.ArtifactVariant{
+		Arch: arch, URL: source.URL, SHA256: source.SHA256, Member: source.Member,
+	})
 }
 
 // validateArtifactMember rejects a tar member that is not a clean, non-option
@@ -196,6 +235,9 @@ func validateArtifactVariant(v plan.ArtifactVariant) error {
 func validateArtifactMember(member string) error {
 	if member == "" {
 		return fmt.Errorf("artifact member is empty")
+	}
+	if strings.IndexFunc(member, unicode.IsControl) >= 0 {
+		return fmt.Errorf("artifact member %q must not contain control characters", member)
 	}
 	if strings.HasPrefix(member, "/") || strings.HasPrefix(member, "-") {
 		return fmt.Errorf("artifact member %q must be a relative path without a leading %q", member, string(member[0]))

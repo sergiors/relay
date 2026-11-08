@@ -6,11 +6,14 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	robfigcron "github.com/robfig/cron/v3"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"relay/internal/observability/metrics"
@@ -179,7 +182,20 @@ func TestPublishCancellationStopsRetries(t *testing.T) {
 // one occurrence is a `schedule.publish.attempt` child of the SAME
 // `schedule.publish` logical span, so all attempts share one trace.
 func TestFireRetriesShareOneTrace(t *testing.T) {
-	exp, provider := withCronSpanRecorder(t)
+	previousProvider := otel.GetTracerProvider()
+	previousPropagator := otel.GetTextMapPropagator()
+	recorder := &logicalSpanEndRecorder{
+		SpanRecorder: tracetest.NewSpanRecorder(),
+		ended:        make(chan struct{}),
+	}
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	otel.SetTracerProvider(provider)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() {
+		_ = provider.Shutdown(context.Background())
+		otel.SetTracerProvider(previousProvider)
+		otel.SetTextMapPropagator(previousPropagator)
+	})
 
 	fp := newFakePublisher(8)
 	fp.script = []pubResult{
@@ -194,24 +210,28 @@ func TestFireRetriesShareOneTrace(t *testing.T) {
 	s.Start()
 
 	fireNow(t, s, "fn/jobs.a")
-	deadline := time.Now().Add(3 * time.Second)
-	for fp.callCount() < 3 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	select {
+	case <-recorder.ended:
+	case <-time.After(3 * time.Second):
+		t.Fatal("logical publish span did not end after all retries")
 	}
 	if err := provider.ForceFlush(context.Background()); err != nil {
 		t.Fatalf("ForceFlush: %v", err)
 	}
-	spans := exp.GetSpans()
-	var logical []tracetest.SpanStub
+	if calls := fp.callCount(); calls != 3 {
+		t.Fatalf("publish attempts = %d, want 3", calls)
+	}
+	spans := recorder.Ended()
+	var logical []sdktrace.ReadOnlySpan
 	for _, sp := range spans {
-		if sp.Name == "schedule.publish" {
+		if sp.Name() == "schedule.publish" {
 			logical = append(logical, sp)
 		}
 	}
 	if len(logical) != 1 {
 		t.Fatalf("schedule.publish logical spans = %d, want 1", len(logical))
 	}
-	logicalTrace := logical[0].SpanContext.TraceID()
+	logicalTrace := logical[0].SpanContext().TraceID()
 	// Each retry's context must share the logical trace.
 	attempts := fp.spans()
 	if len(attempts) < 3 {
@@ -224,6 +244,19 @@ func TestFireRetriesShareOneTrace(t *testing.T) {
 		if sc.TraceID() != logicalTrace {
 			t.Fatalf("attempt %d trace = %s, want logical %s", i, sc.TraceID(), logicalTrace)
 		}
+	}
+}
+
+type logicalSpanEndRecorder struct {
+	*tracetest.SpanRecorder
+	ended chan struct{}
+	once  sync.Once
+}
+
+func (r *logicalSpanEndRecorder) OnEnd(span sdktrace.ReadOnlySpan) {
+	r.SpanRecorder.OnEnd(span)
+	if span.Name() == "schedule.publish" {
+		r.once.Do(func() { close(r.ended) })
 	}
 }
 

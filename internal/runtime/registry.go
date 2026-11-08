@@ -63,12 +63,22 @@ var pnpmTool = plan.RuntimeTool{
 			URL:    pnpmReleaseBaseURL + "pnpm-linux-x64-musl.tar.gz",
 			SHA256: "f2ad050a705ab433e6c1c4fd57d584462896062b048e9d29a90548ad6d91f91b",
 			Member: pnpmMember,
+			Fallbacks: []plan.ArtifactSource{{
+				URL:    "https://registry.npmjs.org/@pnpm/exe.linux-x64-musl/-/exe.linux-x64-musl-" + PnpmVersion + ".tgz",
+				SHA256: "7313bee7b14e8e2ccffec28c11dc1302640a5e8de9f75625dab07ebab244c3ea",
+				Member: "package/pnpm",
+			}},
 		},
 		{
 			Arch:   "arm64",
 			URL:    pnpmReleaseBaseURL + "pnpm-linux-arm64-musl.tar.gz",
 			SHA256: "906259045aaef37a3fe6145fabdc1cc3195da523a788900875bf97be3b40333e",
 			Member: pnpmMember,
+			Fallbacks: []plan.ArtifactSource{{
+				URL:    "https://registry.npmjs.org/@pnpm/exe.linux-arm64-musl/-/exe.linux-arm64-musl-" + PnpmVersion + ".tgz",
+				SHA256: "0c1f2736a856a766044d7a8706e60aa1284ea17080606897d3a5167caa5c0c55",
+				Member: "package/pnpm",
+			}},
 		},
 	}},
 }

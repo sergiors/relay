@@ -407,6 +407,20 @@ func TestDependencyFingerprintPnpmTool(t *testing.T) {
 		t.Error("a changed pnpm artifact digest must change the dependency fingerprint")
 	}
 
+	changedFallback := base
+	changedVariant := pnpmTool.Artifact.Variants[0]
+	changedVariant.Fallbacks = append([]plan.ArtifactSource(nil), changedVariant.Fallbacks...)
+	changedVariant.Fallbacks[0].SHA256 = strings.Repeat("1", 64)
+	changedFallback.RuntimeTools = []plan.RuntimeTool{{
+		Destination: pnpmTool.Destination,
+		Artifact:    &plan.RuntimeArtifact{Variants: []plan.ArtifactVariant{changedVariant}},
+	}}
+	if got, err := DependencyFingerprint("amd64", "linux", changedFallback, dir, deps); err != nil {
+		t.Fatalf("fingerprint changed fallback: %v", err)
+	} else if got == orig {
+		t.Error("a changed pnpm fallback digest must change the dependency fingerprint")
+	}
+
 	// An artifact with no variant for the target architecture is an error, so an
 	// unsupported target never gets a cached layer for a tool it cannot install.
 	if _, err := DependencyFingerprint("riscv64", "linux", base, dir, deps); err == nil {

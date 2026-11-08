@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/moby/moby/api/types/build"
 	"github.com/moby/moby/client"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -160,6 +161,8 @@ func buildDependencyImage(
 //
 // labels stamp managed-image identity onto the image config (the build backend
 // applies them as LABEL equivalents); nil stamps nothing.
+// Version explicitly selects BuildKit: artifact tools use cache mounts, so an
+// API build must not depend on the daemon's DOCKER_BUILDKIT environment default.
 //
 // Platform is explicit from the resolved target architecture rather than the
 // daemon's default, so the image, the dependency fingerprint, and any artifact
@@ -169,6 +172,7 @@ func buildImageOptions(image string, labels map[string]string) client.ImageBuild
 	return client.ImageBuildOptions{
 		Tags:       []string{image},
 		Dockerfile: "Dockerfile",
+		Version:    build.BuilderBuildKit,
 		Remove:     true,
 		Labels:     labels,
 		Platforms:  []ocispec.Platform{buildTargetPlatform()},

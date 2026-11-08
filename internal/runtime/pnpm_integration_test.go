@@ -8,6 +8,7 @@ package runtime
 
 import (
 	"context"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -60,7 +61,8 @@ func TestIntegrationNodeNoDepsHasPnpmBinary(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-pnpm-nodeps:"))
+	appName := "pnpm-nodeps-" + runtime.GOARCH
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-"+appName+":"))
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -71,13 +73,18 @@ events:
       status: [COMPLETED]
 `)
 	writeFile(t, dir, "handler.js", "export function run(event) { console.log('ok'); }\n")
-	fn := app.App{Name: "pnpm-nodeps", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
+	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 
 	m, _ := newManager(t)
 	p, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
+	insp, err := cli.ImageInspect(ctx, p.Image)
+	if err != nil {
+		t.Fatalf("inspect prepared image: %v", err)
+	}
+	assertBuiltPlatform(t, insp.Os, insp.Architecture)
 	if p.Dependency != "" {
 		t.Errorf("a function with no deps must have no dependency layer, got %q", p.Dependency)
 	}
@@ -109,9 +116,10 @@ func TestIntegrationNodePnpmInstallsDependencyAndExecutes(t *testing.T) {
 
 	// Dependency layers are content-addressed and shared daemon-wide, so they
 	// are intentionally retained; only this test's app image is test-specific.
-	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-pnpm-dep:"))
+	appName := "pnpm-dep-" + runtime.GOARCH
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-"+appName+":"))
 
-	fn := newPnpmNodeApp(t, "pnpm-dep", map[string]string{
+	fn := newPnpmNodeApp(t, appName, map[string]string{
 		"package.json":   `{"type":"module","dependencies":{"picocolors":"^1.0.0"}}`,
 		"pnpm-lock.yaml": nodePnpmLockPicocolors,
 	})
@@ -122,6 +130,11 @@ func TestIntegrationNodePnpmInstallsDependencyAndExecutes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
+	insp, err := cli.ImageInspect(ctx, prepared.Image)
+	if err != nil {
+		t.Fatalf("inspect prepared image: %v", err)
+	}
+	assertBuiltPlatform(t, insp.Os, insp.Architecture)
 	if !strings.HasPrefix(prepared.Dependency, depRepoPrefix) {
 		t.Fatalf("dependency = %q, want a relay-dep-* layer", prepared.Dependency)
 	}

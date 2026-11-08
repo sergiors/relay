@@ -184,6 +184,22 @@ func TestNodeSpecPinsPnpmTool(t *testing.T) {
 				"amd64": pnpmReleaseBaseURL + "pnpm-linux-x64-musl.tar.gz",
 				"arm64": pnpmReleaseBaseURL + "pnpm-linux-arm64-musl.tar.gz",
 			}
+			wantSHA256 := map[string]string{
+				"amd64": "f2ad050a705ab433e6c1c4fd57d584462896062b048e9d29a90548ad6d91f91b",
+				"arm64": "906259045aaef37a3fe6145fabdc1cc3195da523a788900875bf97be3b40333e",
+			}
+			wantFallback := map[string]plan.ArtifactSource{
+				"amd64": {
+					URL:    "https://registry.npmjs.org/@pnpm/exe.linux-x64-musl/-/exe.linux-x64-musl-12.10.1.tgz",
+					SHA256: "7313bee7b14e8e2ccffec28c11dc1302640a5e8de9f75625dab07ebab244c3ea",
+					Member: "package/pnpm",
+				},
+				"arm64": {
+					URL:    "https://registry.npmjs.org/@pnpm/exe.linux-arm64-musl/-/exe.linux-arm64-musl-12.10.1.tgz",
+					SHA256: "0c1f2736a856a766044d7a8706e60aa1284ea17080606897d3a5167caa5c0c55",
+					Member: "package/pnpm",
+				},
+			}
 			if len(tool.Artifact.Variants) != len(want) {
 				t.Fatalf("pnpm artifact variants = %+v, want exactly %d", tool.Artifact.Variants, len(want))
 			}
@@ -201,11 +217,69 @@ func TestNodeSpecPinsPnpmTool(t *testing.T) {
 				if variant.Member != pnpmMember {
 					t.Errorf("pnpm %s member = %q, want %q", arch, variant.Member, pnpmMember)
 				}
-				if len(variant.SHA256) != 64 {
-					t.Errorf("pnpm %s sha256 = %q, want 64 hex characters", arch, variant.SHA256)
+				if variant.SHA256 != wantSHA256[arch] {
+					t.Errorf("pnpm %s sha256 = %q, want exact pinned digest %q", arch, variant.SHA256, wantSHA256[arch])
+				}
+				if len(variant.Fallbacks) != 1 || variant.Fallbacks[0] != wantFallback[arch] {
+					t.Errorf("pnpm %s fallback = %+v, want exact registry source %+v", arch, variant.Fallbacks, wantFallback[arch])
 				}
 			}
 		})
+	}
+}
+
+// TestNodeRuntimePnpmCacheIsReusableAcrossVersions verifies Node 24 and Node 26
+// render the same BuildKit cache IDs for the same pinned artifacts. The cache
+// therefore survives their distinct base-image layers, while the architecture-
+// specific checksums keep the amd64 and arm64 artifact entries isolated.
+func TestNodeRuntimePnpmCacheIsReusableAcrossVersions(t *testing.T) {
+	for _, arch := range []string{"amd64", "arm64"} {
+		var cacheID string
+		for _, runtimeID := range []string{"nodejs24.x", "nodejs26.x"} {
+			t.Run(runtimeID+"/"+arch, func(t *testing.T) {
+				spec, err := lookup(runtimeID)
+				if err != nil {
+					t.Fatalf("lookup %s: %v", runtimeID, err)
+				}
+				p := plan.BuildPlan{
+					BaseImage:    spec.BaseImage,
+					TargetArch:   arch,
+					RuntimeTools: spec.RuntimeTools,
+				}
+				df, err := renderDockerfile(p)
+				if err != nil {
+					t.Fatalf("render %s for %s: %v", runtimeID, arch, err)
+				}
+				lineStart := strings.Index(df, "RUN --mount=type=cache,id=")
+				if lineStart < 0 {
+					t.Fatalf("%s Dockerfile has no artifact cache mount:\n%s", runtimeID, df)
+				}
+				mount := strings.TrimPrefix(df[lineStart:], "RUN --mount=type=cache,id=")
+				mount = mount[:strings.IndexByte(mount, ' ')]
+				id := mount
+				variant, ok := spec.RuntimeTools[0].Artifact.VariantForArch(arch)
+				if !ok {
+					t.Fatalf("%s has no pnpm variant for %s", runtimeID, arch)
+				}
+				if want := "relay-artifact-" + variant.SHA256 + ",target=/var/cache/relay-artifacts,sharing=locked"; id != want {
+					t.Fatalf("%s %s cache mount = %q, want %q", runtimeID, arch, id, want)
+				}
+				fallback := variant.Fallbacks[0]
+				for _, want := range []string{
+					fallback.URL,
+					fallback.SHA256 + ".tar.gz",
+					"tar -xzf /tmp/relay-tool-0.tar.gz -C /tmp/relay-tool-0.unpack \"$archive_member\"",
+				} {
+					if !strings.Contains(df, want) {
+						t.Errorf("%s %s artifact Dockerfile missing fallback/cache identity %q:\n%s", runtimeID, arch, want, df)
+					}
+				}
+				if cacheID != "" && cacheID != id {
+					t.Errorf("%s and %s must reuse the same %s cache ID: %q != %q", "nodejs24.x", runtimeID, arch, cacheID, id)
+				}
+				cacheID = id
+			})
+		}
 	}
 }
 

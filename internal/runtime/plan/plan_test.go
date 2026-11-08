@@ -1,6 +1,9 @@
 package plan
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 // TestDepsIsZero verifies the driving field is Files: a Deps with no manifest
 // files is zero regardless of the install command/dir, and any manifest makes it
@@ -117,14 +120,20 @@ func TestRuntimeToolValidateForm(t *testing.T) {
 // reports false so the caller can fail unsupported rather than build a
 // wrong-architecture tool.
 func TestRuntimeArtifactVariantForArch(t *testing.T) {
-	amd64 := ArtifactVariant{Arch: "amd64", URL: "https://example.test/x.tgz", SHA256: "aa", Member: "pnpm"}
-	arm64 := ArtifactVariant{Arch: "arm64", URL: "https://example.test/y.tgz", SHA256: "bb", Member: "pnpm"}
+	amd64 := ArtifactVariant{
+		Arch: "amd64", URL: "https://example.test/x.tgz", SHA256: "aa", Member: "pnpm",
+		Fallbacks: []ArtifactSource{{URL: "https://mirror.test/x.tgz", SHA256: "cc", Member: "package/pnpm"}},
+	}
+	arm64 := ArtifactVariant{
+		Arch: "arm64", URL: "https://example.test/y.tgz", SHA256: "bb", Member: "pnpm",
+		Fallbacks: []ArtifactSource{{URL: "https://mirror.test/y.tgz", SHA256: "dd", Member: "package/pnpm"}},
+	}
 	artifact := &RuntimeArtifact{Variants: []ArtifactVariant{amd64, arm64}}
 
-	if got, ok := artifact.VariantForArch("amd64"); !ok || got != amd64 {
+	if got, ok := artifact.VariantForArch("amd64"); !ok || !reflect.DeepEqual(got, amd64) {
 		t.Errorf("VariantForArch(amd64) = %+v, %v; want %+v, true", got, ok, amd64)
 	}
-	if got, ok := artifact.VariantForArch("arm64"); !ok || got != arm64 {
+	if got, ok := artifact.VariantForArch("arm64"); !ok || !reflect.DeepEqual(got, arm64) {
 		t.Errorf("VariantForArch(arm64) = %+v, %v; want %+v, true", got, ok, arm64)
 	}
 	if _, ok := artifact.VariantForArch("riscv64"); ok {

@@ -50,6 +50,10 @@ func TestIntegrationOversizedEventRoutesToDLQImmediately(t *testing.T) {
 		_, ok := e.pending()[id]
 		return !ok
 	})
+	testutil.WaitFor(t, 8*time.Second, "oversized DLQ entry settled", func() bool {
+		entry, ok := e.dlqEntry(id)
+		return ok && entry.SettledAt != ""
+	})
 	e.stop(t)
 
 	if handlerRan.Load() {

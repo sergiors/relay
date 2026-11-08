@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"relay/internal/runtime/plan"
@@ -273,6 +274,13 @@ func hashRuntimeTool(h io.Writer, tool plan.RuntimeTool, arch string) error {
 	hashField(h, variant.URL)
 	hashField(h, variant.SHA256)
 	hashField(h, variant.Member)
+	hashField(h, "artifact-fallbacks")
+	hashField(h, strconv.Itoa(len(variant.Fallbacks)))
+	for _, fallback := range variant.Fallbacks {
+		hashField(h, fallback.URL)
+		hashField(h, fallback.SHA256)
+		hashField(h, fallback.Member)
+	}
 	return nil
 }
 
