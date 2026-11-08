@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"relay/internal/source"
 )
@@ -85,7 +84,7 @@ func TestPrepareBuildLimitSharedByStartupAndLiveEntryPoints(t *testing.T) {
 			if err != nil {
 				t.Fatalf("preparation %d failed: %v", i, err)
 			}
-		case <-time.After(2 * time.Second):
+		case <-deadlockGuard(t):
 			t.Fatalf("preparation %d did not finish", i)
 		}
 	}
@@ -214,7 +213,13 @@ func TestPrepareDependencySharedBuildNotDuplicatedUnderCapOne(t *testing.T) {
 
 	// The follower JOINED that in-flight build instead of claiming another: the
 	// seam fires while the leader is still parked.
-	if joinedDepRef := <-joined; joinedDepRef != depRef {
+	var joinedDepRef string
+	select {
+	case joinedDepRef = <-joined:
+	case <-deadlockGuard(t):
+		t.Fatal("follower did not join the shared dependency build")
+	}
+	if joinedDepRef != depRef {
 		t.Fatalf("joined depRef = %q, want the shared %q", joinedDepRef, depRef)
 	}
 	// The joined follower HOLDS NO PERMIT while it waits for the outcome.
@@ -232,7 +237,7 @@ func TestPrepareDependencySharedBuildNotDuplicatedUnderCapOne(t *testing.T) {
 			if err != nil {
 				t.Fatalf("prepare %d failed: %v", i, err)
 			}
-		case <-time.After(2 * time.Second):
+		case <-deadlockGuard(t):
 			t.Fatalf("prepare %d did not finish (a build-slot deadlock would look like this)", i)
 		}
 	}
@@ -292,7 +297,13 @@ func TestPrepareDependencyFollowerJoinsWithoutSlot(t *testing.T) {
 	// The leader parks mid-shared-build; the follower JOINED the in-flight
 	// generation (witnessed while the leader stays parked) and holds no slot.
 	leaderPark.wait(t, "the shared dependency build")
-	if joinedDepRef := <-joined; joinedDepRef != depRef {
+	var joinedDepRef string
+	select {
+	case joinedDepRef = <-joined:
+	case <-deadlockGuard(t):
+		t.Fatal("follower did not join the shared dependency build")
+	}
+	if joinedDepRef != depRef {
 		t.Fatalf("joined depRef = %q, want %q", joinedDepRef, depRef)
 	}
 	if got := depBuilds.Load(); got != 1 {
@@ -321,7 +332,7 @@ func TestPrepareDependencyFollowerJoinsWithoutSlot(t *testing.T) {
 			if err != nil {
 				t.Fatalf("prepare %d failed: %v", i, err)
 			}
-		case <-time.After(2 * time.Second):
+		case <-deadlockGuard(t):
 			t.Fatalf("prepare %d did not finish", i)
 		}
 	}

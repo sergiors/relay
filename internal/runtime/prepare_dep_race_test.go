@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 
 	"relay/internal/app"
 )
@@ -63,7 +62,7 @@ func (g *raceGate) wait(t *testing.T, what string) {
 	t.Helper()
 	select {
 	case <-g.entered:
-	case <-time.After(2 * time.Second):
+	case <-deadlockGuard(t):
 		t.Fatalf("%s was never entered", what)
 	}
 }
@@ -228,7 +227,7 @@ func TestPrepareDependencyLeaseSpansBuildVsGC(t *testing.T) {
 		if p.Dependency != depRef {
 			t.Fatalf("prepared dependency = %q, want %q", p.Dependency, depRef)
 		}
-	case <-time.After(2 * time.Second):
+	case <-deadlockGuard(t):
 		t.Fatal("Prepare did not return after all builds were released")
 	}
 

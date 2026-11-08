@@ -248,6 +248,17 @@ func TestImageIdentityWithSelectionSeparation(t *testing.T) {
 	}
 }
 
+// alternateArch is an architecture guaranteed to differ from the build host's
+// current one. A hardcoded variant (for example "amd64") is identical to arch
+// on that host and makes the separation assertion vacuous — the failure seen
+// on linux/amd64.
+func alternateArch() string {
+	if arch == "amd64" {
+		return "arm64"
+	}
+	return "amd64"
+}
+
 // TestDependencyFingerprintSelectionSeparation pins the dependency-layer
 // identity: the selected (sourceImage, digest) pin is part of the dependency
 // content address, separate from the runtime/arch/platform inputs; the same
@@ -286,7 +297,9 @@ func TestDependencyFingerprintSelectionSeparation(t *testing.T) {
 		"source": func() (string, error) {
 			return dependencyFingerprintFrom(arch, platform, spec, deps, snap, selOtherSource)
 		},
-		"arch": func() (string, error) { return dependencyFingerprintFrom("amd64", platform, spec, deps, snap, selA) },
+		"arch": func() (string, error) {
+			return dependencyFingerprintFrom(alternateArch(), platform, spec, deps, snap, selA)
+		},
 		"runtime": func() (string, error) {
 			s := spec
 			s.Name = "python3.15"

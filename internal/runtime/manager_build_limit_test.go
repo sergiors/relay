@@ -68,7 +68,7 @@ func (p *permitPark) waitArrival(t *testing.T) {
 	t.Helper()
 	select {
 	case <-p.arrival:
-	case <-time.After(2 * time.Second):
+	case <-deadlockGuard(t):
 		t.Fatal("a preparation did not enter the bounded section in time")
 	}
 }
@@ -192,7 +192,7 @@ func TestPrepareBuildLimitBoundsConcurrentPipelines(t *testing.T) {
 			if err != nil {
 				t.Fatalf("prepare %d failed: %v", i, err)
 			}
-		case <-time.After(2 * time.Second):
+		case <-deadlockGuard(t):
 			t.Fatalf("prepare %d did not finish after release", i)
 		}
 	}
@@ -252,7 +252,7 @@ func TestPrepareBuildLimitCancelledWaiterReturns(t *testing.T) {
 			if err != nil {
 				t.Fatalf("held prepare %d failed: %v", i, err)
 			}
-		case <-time.After(2 * time.Second):
+		case <-deadlockGuard(t):
 			t.Fatalf("held prepare %d did not finish", i)
 		}
 	}
@@ -425,7 +425,7 @@ func TestPrepareBuildLimitReleasesPermit(t *testing.T) {
 		firstDone := prepareAsync(m, first, context.Background())
 		select {
 		case <-entered:
-		case <-time.After(2 * time.Second):
+		case <-deadlockGuard(t):
 			t.Fatal("the first build was not entered")
 		}
 		cancelLifecycle()
@@ -444,7 +444,7 @@ func TestPrepareBuildLimitReleasesPermit(t *testing.T) {
 		done := prepareAsync(m, second, context.Background())
 		select {
 		case <-done:
-		case <-time.After(2 * time.Second):
+		case <-deadlockGuard(t):
 			t.Fatal("permit was not released after lifecycle cancellation")
 		}
 	})
@@ -465,7 +465,7 @@ func assertPermitReleased(t *testing.T, m *Manager, first func() error, second a
 		if err != nil {
 			t.Fatalf("second preparation after a returned first: %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-deadlockGuard(t):
 		t.Fatal("second preparation blocked on a leaked build permit")
 	}
 }

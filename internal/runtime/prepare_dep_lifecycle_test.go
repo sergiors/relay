@@ -17,8 +17,9 @@ import (
 // when the Nth arrives, so a test can prove N preparations are simultaneously
 // holding a lease. Each arrival gets its OWN release channel, so a test can let
 // the preparations finish one at a time and observe the reference count fall.
-// Every wait is a channel signal at an exact production boundary; time.After is
-// a deadlock failure bound only, never a delay used to order the test.
+// Every wait is a channel signal at an exact production boundary; the shared
+// deadlockGuard bound exists only to fail a genuinely deadlocked wait, never
+// to order the test or to bound normal scheduling latency.
 type countingRaceGate struct {
 	want int
 
@@ -60,7 +61,7 @@ func (g *countingRaceGate) waitEntered(t *testing.T, what string) {
 	t.Helper()
 	select {
 	case <-g.entered:
-	case <-time.After(2 * time.Second):
+	case <-deadlockGuard(t):
 		t.Fatalf("%s: only %d of %d arrivals observed", what, g.count(), g.want)
 	}
 }
@@ -81,6 +82,50 @@ func (g *countingRaceGate) slot(idx int) chan struct{} {
 
 func (g *countingRaceGate) releaseAll() {
 	g.releaseAllOnce.Do(func() { close(g.releaseAllCh) })
+}
+
+// deadlockGuardBound is the failure bound for runtime concurrency-test waits.
+// Each signal is closed deterministically at an exact production boundary, so
+// the bound only turns a stuck preparation or lost signal into a focused
+// failure. It sits far above normal CI scheduling latency, which a fixed 2s
+// bound misreported as a deadlock under contention. Never use it as a pacing
+// delay or shrink it to a latency expectation.
+const deadlockGuardBound = 30 * time.Second
+
+// deadlockGuardDeadlineMargin keeps a wait's guard just inside the test's own
+// deadline, so a genuinely stuck wait still reports its focused message before
+// go test panics the whole package at that deadline.
+const deadlockGuardDeadlineMargin = time.Second
+
+// deadlockGuard arms that bound, trimmed to just inside the test's own deadline
+// when one exists. A negative bound (deadline already within the margin) fires
+// immediately and still fails with the wait's focused message rather than a
+// blanket package timeout.
+func deadlockGuard(t *testing.T) <-chan time.Time {
+	bound := deadlockGuardBound
+	if deadline, ok := t.Deadline(); ok {
+		if remaining := time.Until(deadline) - deadlockGuardDeadlineMargin; remaining < bound {
+			bound = remaining
+		}
+	}
+	return time.After(bound)
+}
+
+// awaitPrepare waits for one completed preparation. The signal is sent only
+// after Prepare returns, so the time bound is a deadlock failure guard: it
+// turns a stuck preparation (or a leaked goroutine holding a resource) into a
+// prompt test failure instead of letting the whole package run out the go test
+// timeout.
+func awaitPrepare(t *testing.T, done <-chan error, what string) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("%s failed: %v", what, err)
+		}
+	case <-deadlockGuard(t):
+		t.Fatalf("%s did not finish", what)
+	}
 }
 
 // parked blocks the calling scripted request until its own slot is released, the
@@ -436,6 +481,12 @@ func TestPrepareMultipleDependencyLeasesSpanGC(t *testing.T) {
 		dockerRoute{method: http.MethodDelete, path: "/images/", body: "[]", onMatch: func() { dels++ }},
 	)
 	m := newLifecycleManager(t, cli, context.Background())
+	// The join seam fires in the follower exactly when it joins the in-flight
+	// build. The follower admits its dependency lease BEFORE joining, so the
+	// witness is the deterministic point at which both leases are held; no
+	// poll is needed to bridge goroutine scheduling.
+	joinSeam, joined := joinWitness()
+	m.afterDependencyJoin = joinSeam
 
 	done := make(chan error, 2)
 	for _, fn := range []app.App{fnA, fnB} {
@@ -447,10 +498,16 @@ func TestPrepareMultipleDependencyLeasesSpanGC(t *testing.T) {
 	}
 
 	depGate.waitEntered(t, "the leader parked in the shared dependency build")
-	// The follower admits its dependency lease before it joins the in-flight
-	// build, so a bounded poll is only bridging that goroutine scheduling gap.
-	if !pollUntil(nil, 2*time.Second, func() bool { return m.LeaseCount(depRef) == 2 }) {
-		t.Fatalf("dependency lease count = %d, want 2 (one per in-flight preparation)", m.LeaseCount(depRef))
+	select {
+	case joinedDep := <-joined:
+		if joinedDep != depRef {
+			t.Fatalf("joined depRef = %q, want the shared %q", joinedDep, depRef)
+		}
+	case <-deadlockGuard(t):
+		t.Fatal("the second preparation never joined the in-flight dependency build")
+	}
+	if got := m.LeaseCount(depRef); got != 2 {
+		t.Fatalf("dependency lease count = %d, want 2 (one per in-flight preparation)", got)
 	}
 
 	// Both preparations hold the layer: GC must keep it and issue no DELETE.
@@ -472,9 +529,7 @@ func TestPrepareMultipleDependencyLeasesSpanGC(t *testing.T) {
 
 	// Release one preparation: the other still pins the layer.
 	close(appGate.slot(0))
-	if err := <-done; err != nil {
-		t.Fatalf("first prepare failed: %v", err)
-	}
+	awaitPrepare(t, done, "first prepare")
 	if got := m.LeaseCount(depRef); got != 1 {
 		t.Fatalf("dependency lease count after one prepare returned = %d, want 1", got)
 	}
@@ -488,9 +543,7 @@ func TestPrepareMultipleDependencyLeasesSpanGC(t *testing.T) {
 
 	// The last preparation releases: the layer is now collectible.
 	close(appGate.slot(1))
-	if err := <-done; err != nil {
-		t.Fatalf("second prepare failed: %v", err)
-	}
+	awaitPrepare(t, done, "second prepare")
 	if got := m.LeaseCount(depRef); got != 0 {
 		t.Fatalf("dependency lease count after both prepares returned = %d, want 0", got)
 	}
