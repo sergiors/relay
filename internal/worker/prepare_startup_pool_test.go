@@ -15,9 +15,9 @@ import (
 
 // poolPark is one deterministic per-app gate around a blockingPreparer call. It
 // closes arrived exactly when the app's preparation starts, blocks that call on
-// its own release (or the caller's ctx), and closes returned exactly when the
-// call completes — so a test admits apps one at a time by channel signal, never
-// by sleep, and can prove prepareApps joins the work it already admitted.
+// its own release, and closes returned exactly when the call completes — so a
+// test admits apps one at a time by channel signal, never by sleep, and can
+// prove prepareApps joins the work it already admitted.
 type poolPark struct {
 	arrived     chan struct{}
 	arrivedOnce sync.Once
@@ -35,19 +35,22 @@ func newPoolPark() *poolPark {
 	}
 }
 
-// await blocks this preparation until its gate is released or ctx ends.
+// await models an admitted preparation that remains active until its manager
+// finishes cleanup, even after the caller's context has been cancelled.
 func (p *poolPark) await(ctx context.Context) error {
-	select {
-	case <-p.release:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	<-p.release
+	return ctx.Err()
 }
 
 func (p *poolPark) markArrived()  { p.arrivedOnce.Do(func() { close(p.arrived) }) }
 func (p *poolPark) free()         { p.releaseOnce.Do(func() { close(p.release) }) }
 func (p *poolPark) markReturned() { p.returnOnce.Do(func() { close(p.returned) }) }
+
+func releasePoolParks(parks map[string]*poolPark) {
+	for _, park := range parks {
+		park.free()
+	}
+}
 
 // blockingPreparer stands in for the runtime Manager behind the appPreparer
 // seam while behaving like a real blocking build: it parks inside
@@ -249,6 +252,7 @@ func TestPrepareAppsStartupPoolHonorsBuildCapTwo(t *testing.T) {
 	for _, n := range names {
 		parks[n] = newPoolPark()
 	}
+	t.Cleanup(func() { releasePoolParks(parks) })
 	spy := newBlockingPreparer(2, parks)
 
 	done := make(chan []*runner.PreparedApp, 1)
@@ -292,6 +296,7 @@ func TestPrepareAppsStartupPoolSequentialWithCapOne(t *testing.T) {
 		"seq-a": newPoolPark(),
 		"seq-b": newPoolPark(),
 	}
+	t.Cleanup(func() { releasePoolParks(parks) })
 	spy := newBlockingPreparer(1, parks)
 
 	done := make(chan []*runner.PreparedApp, 1)
@@ -329,6 +334,7 @@ func TestPrepareAppsStartupPoolFailureReleasesSlot(t *testing.T) {
 	for _, n := range names {
 		parks[n] = newPoolPark()
 	}
+	t.Cleanup(func() { releasePoolParks(parks) })
 	spy := newBlockingPreparer(2, parks)
 	spy.setFail("rel-b", errors.New("injected build failure"))
 	spy.setFail("rel-d", errors.New("injected build failure"))
@@ -364,6 +370,7 @@ func TestPrepareAppsStartupPoolIndependentFailuresIsolated(t *testing.T) {
 		"mix-good2": newPoolPark(),
 		"mix-good3": newPoolPark(),
 	}
+	t.Cleanup(func() { releasePoolParks(parks) })
 	spy := newBlockingPreparer(2, parks)
 	spy.setFail("mix-bad", errors.New("injected isolated failure"))
 
@@ -404,7 +411,20 @@ func TestPrepareAppsStartupPoolCancellationStopsSchedulingAndJoinsActiveWork(t *
 	defer cancel()
 
 	done := make(chan []*runner.PreparedApp, 1)
-	go func() { done <- prepareApps(ctx, spy, startupAppsFor(names...), nil, nil, discardLogger()) }()
+	finished := make(chan struct{})
+	go func() {
+		done <- prepareApps(ctx, spy, startupAppsFor(names...), nil, nil, discardLogger())
+		close(finished)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		releasePoolParks(parks)
+		select {
+		case <-finished:
+		case <-time.After(2 * time.Second):
+			t.Errorf("prepareApps goroutine did not finish during cleanup")
+		}
+	})
 
 	// The pool admits the first two apps and parks them inside the spy.
 	waitArrivedIn(t, parks, "cxl-a", "cxl-b")
@@ -444,6 +464,28 @@ func TestPrepareAppsStartupPoolCancellationStopsSchedulingAndJoinsActiveWork(t *
 	assertNotArrived(t, parks, "cxl-c", "cxl-d")
 }
 
+// TestPrepareStartupJobSkipsPreparationWhenAlreadyCanceled directly covers the
+// worker receive boundary: even if a job has already been handed off, a
+// canceled lifecycle must leave its slot unavailable without calling Prepare.
+func TestPrepareStartupJobSkipsPreparationWhenAlreadyCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	spy := newBlockingPreparer(1, nil)
+	startup := startupAppsFor("canceled-job")
+	got := prepareStartupJob(ctx, spy, startup[0], nil, 0, discardLogger())
+
+	if got.Name() != startup[0].App.Name {
+		t.Fatalf("prepared app name = %q, want %q", got.Name(), startup[0].App.Name)
+	}
+	if got.Prepared() != nil {
+		t.Fatal("canceled job should be unavailable")
+	}
+	if calls := spy.callCount(); calls != 0 {
+		t.Fatalf("Prepare calls = %d, want 0 for a canceled job", calls)
+	}
+}
+
 // TestPrepareAppsStartupPoolNoStateSinkRunsWithoutGates keeps the standalone
 // shape (nil state sink, nil tokens) covered and pins the pool's steady-state
 // concurrency: two apps park simultaneously (the pool runs at most two), and
@@ -454,6 +496,7 @@ func TestPrepareAppsStartupPoolNoStateSinkRunsWithoutGates(t *testing.T) {
 		"free-a": newPoolPark(),
 		"free-b": newPoolPark(),
 	}
+	t.Cleanup(func() { releasePoolParks(parks) })
 	spy := newBlockingPreparer(2, parks)
 
 	done := make(chan []*runner.PreparedApp, 1)

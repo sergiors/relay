@@ -656,7 +656,7 @@ func prepareApps(
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				slots[job.index] = prepareStartupApp(
+				slots[job.index] = prepareStartupJob(
 					ctx, manager, job.app, st, job.fencingToken, logger,
 				)
 			}
@@ -720,6 +720,23 @@ schedule:
 	}
 	logger.Info("Prepared apps", "count", preparedCount)
 	return prepared
+}
+
+// prepareStartupJob checks cancellation at the worker receive boundary: a send
+// can win the scheduler's select just as the lifecycle is cancelled, in which
+// case the app must not be prepared.
+func prepareStartupJob(
+	ctx context.Context,
+	manager appPreparer,
+	s startupApp,
+	st *state.State,
+	fencingToken state.FencingToken,
+	logger *slog.Logger,
+) *runner.PreparedApp {
+	if ctx.Err() != nil {
+		return runner.NewUnavailable(s.App)
+	}
+	return prepareStartupApp(ctx, manager, s, st, fencingToken, logger)
 }
 
 // prepareStartupApp prepares ONE startup app and records a preparation FAILURE.

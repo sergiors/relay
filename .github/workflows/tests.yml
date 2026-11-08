@@ -81,7 +81,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.14'
+          python-version: "3.14"
 
       - name: Verify integration tools
         run: |
@@ -92,7 +92,24 @@ jobs:
         run: go vet -tags=integration ./...
 
       - name: Test
-        run: make test-integration GOTEST="go test"
+        shell: bash
+        run: |
+          set -o pipefail
+          make test-integration GOTEST="go test -json" 2>&1 | tee integration-test.log
 
       - name: Test (race)
-        run: make test-integration-race GOTEST="go test"
+        shell: bash
+        run: |
+          set -o pipefail
+          make test-integration-race GOTEST="go test -json" 2>&1 | tee integration-race.log
+
+      - name: Upload integration test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-logs
+          path: |
+            integration-test.log
+            integration-race.log
+          if-no-files-found: warn
+          retention-days: 3
