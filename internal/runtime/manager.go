@@ -364,6 +364,11 @@ type Manager struct {
 	// the bounded section (tracking how many run concurrently) and to prove the
 	// per-worker build cap is enforced without sleeps.
 	afterBuildPermit func()
+	// startBuildSessionFn attaches the BuildKit session required by the Engine
+	// API build path. NewManager sets connectBuildSession; it is nil for a
+	// directly constructed Manager (in-package tests), whose scripted daemon
+	// cannot perform the /session hijack, so those builds run without a session.
+	startBuildSessionFn func(context.Context, *client.Client) (buildSessionHandle, error)
 	// afterDependencyJoin is the deterministic seam fired when a preparation
 	// takes the in-flight deduplication JOIN branch in buildDependencyOnce —
 	// i.e. exactly when a concurrent preparation with the same
@@ -649,6 +654,7 @@ func NewManager(
 		selectionStore:           resolved.selectionStore,
 		pullChecks:               map[string]time.Time{},
 		depCoord:                 resolved.depCoord,
+		startBuildSessionFn:      connectBuildSession,
 	}
 	// An unknown runtime ID can only be a pin written by another Relay version
 	// sharing this database. No app in this process can select it, so it is safe

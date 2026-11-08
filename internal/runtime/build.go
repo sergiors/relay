@@ -52,6 +52,7 @@ func buildImage(
 	snapshot *app.SourceSnapshot,
 	reg *metrics.Registry,
 	copySource bool,
+	sessionID string,
 ) error {
 	// The snapshot is the single immutable read the caller already fingerprinted:
 	// the image is staged from exactly the bytes its tag describes, with the
@@ -81,7 +82,7 @@ func buildImage(
 		return fmt.Errorf("app %q: write dockerfile: %w", name, err)
 	}
 
-	return runImageBuild(ctx, cli, name, ctxDir, image, labels, reg)
+	return runImageBuild(ctx, cli, name, ctxDir, image, labels, reg, sessionID)
 }
 
 // buildDependencyImage builds the reusable dependency layer for an app. The
@@ -107,6 +108,7 @@ func buildDependencyImage(
 	depRef, depFingerprint string,
 	targetArch string,
 	reg *metrics.Registry,
+	sessionID string,
 	provenance ...imageProvenance,
 ) error {
 	ctxDir := snap.root
@@ -149,30 +151,33 @@ func buildDependencyImage(
 		provenance[0].apply(labels)
 	}
 
-	return runImageBuild(ctx, cli, "dependency "+depRef, ctxDir, depRef, labels, reg)
+	return runImageBuild(ctx, cli, "dependency "+depRef, ctxDir, depRef, labels, reg, sessionID)
 }
 
 // buildImageOptions returns the ImageBuildOptions Relay uses for every app and
 // dependency build. Remove is true because the moby client v0.6.0 emits rm=0
 // when Remove is false (suppressing the daemon's default cleanup); it restores
-// rm=1 so successful builds prune intermediate RUN/metadata containers.
-// ForceRemove is deliberately not used: failed builds keep their intermediates
-// for debugging.
+// rm=1 so the classic builder prunes successful steps' intermediates. BuildKit
+// ignores rm and keeps failed-step state in its own cache. ForceRemove is
+// deliberately not used: failed builds keep their diagnostics.
 //
 // labels stamp managed-image identity onto the image config (the build backend
 // applies them as LABEL equivalents); nil stamps nothing.
 // Version explicitly selects BuildKit: artifact tools use cache mounts, so an
 // API build must not depend on the daemon's DOCKER_BUILDKIT environment default.
+// sessionID names the live BuildKit session that resolves source metadata and
+// registry credentials; BuildKit builds require it (see connectBuildSession).
 //
 // Platform is explicit from the resolved target architecture rather than the
 // daemon's default, so the image, the dependency fingerprint, and any artifact
 // variant keyed on the same arch cannot disagree (e.g. Relay under emulation).
 // Every base is a Linux image, so only the architecture varies.
-func buildImageOptions(image string, labels map[string]string) client.ImageBuildOptions {
+func buildImageOptions(image string, labels map[string]string, sessionID string) client.ImageBuildOptions {
 	return client.ImageBuildOptions{
 		Tags:       []string{image},
 		Dockerfile: "Dockerfile",
 		Version:    build.BuilderBuildKit,
+		SessionID:  sessionID,
 		Remove:     true,
 		Labels:     labels,
 		Platforms:  []ocispec.Platform{buildTargetPlatform()},

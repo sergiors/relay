@@ -818,10 +818,10 @@ func (m *Manager) prepare(
 	if err := verifyDependencyImageUse(ctx, depProtection, depRef); err != nil {
 		return nil, fmt.Errorf("app %q: %w", fn.Name, err)
 	}
-	buildElapsed, buildErr := m.runImageBuild(ctx, fn.Name, image, func(buildCtx context.Context) error {
+	buildElapsed, buildErr := m.runImageBuild(ctx, fn.Name, image, func(buildCtx context.Context, sessionID string) error {
 		return buildImage(
 			buildCtx, m.cli, fn.Name, planResult, image, appLabels,
-			sourceSnapshot, m.metrics, !mountSource,
+			sourceSnapshot, m.metrics, !mountSource, sessionID,
 		)
 	})
 	if buildErr != nil {
@@ -1114,14 +1114,14 @@ func (m *Manager) ensureDependencyImage(
 			"inspect_duration", time.Since(reprobeStart),
 		)
 
-		elapsed, buildErr := m.runImageBuild(ctx, fn.Name, depRef, func(buildCtx context.Context) error {
+		elapsed, buildErr := m.runImageBuild(ctx, fn.Name, depRef, func(buildCtx context.Context, sessionID string) error {
 			// As in Prepare's app-image build, the dependency build uses an
 			// independent lifecycle-rooted buildTimeout context rather than the
 			// caller's ctx, so a slow install step is never cut off by a short
 			// reconcile budget while still being cancelled at Relay shutdown.
 			return buildDependencyImage(
 				buildCtx, m.cli, spec, deps, snap, depRef, depFingerprint,
-				arch, m.metrics, provenance,
+				arch, m.metrics, sessionID, provenance,
 			)
 		})
 		if buildErr != nil {
@@ -1229,12 +1229,19 @@ func (m *Manager) buildDependencyOnce(ctx context.Context, depRef string, build 
 // selection/snapshot, dependency snapshots, and reuse probes never occupy a
 // slot. notifyAppBuild and the runtime.build span fire only once the slot is
 // held and a build is actually issued; a reused image does neither. The
-// returned duration measures the build itself, excluding any wait for a slot.
+// returned duration measures the issued build (including the BuildKit session
+// handshake), excluding any wait for a slot.
+//
+// A BuildKit session is attached for exactly the life of the build: the
+// Engine API build path needs it to resolve base-image metadata (see
+// buildSession). It is started after the permit so waiting for a slot never
+// holds a hijacked daemon connection, and closed before the permit is released
+// so the next build starts with a fresh session.
 func (m *Manager) runImageBuild(
 	ctx context.Context,
 	appName string,
 	image string,
-	build func(context.Context) error,
+	build func(context.Context, string) error,
 ) (time.Duration, error) {
 	limit := m.buildLimiterFor()
 	if err := limit.acquire(ctx); err != nil {
@@ -1253,7 +1260,7 @@ func (m *Manager) runImageBuild(
 	buildCtx, buildCancel := m.buildContext()
 	defer buildCancel()
 	_, buildSpan := startRuntimeSpan(ctx, "runtime.build", appName, image)
-	err := build(buildCtx)
+	err := m.buildWithSession(buildCtx, appName, build)
 	elapsed := time.Since(start)
 	if err != nil {
 		buildSpan.RecordError(err)
@@ -1261,4 +1268,23 @@ func (m *Manager) runImageBuild(
 	}
 	buildSpan.End()
 	return elapsed, err
+}
+
+// buildWithSession attaches the BuildKit session one build requires and passes
+// its ID to build. A directly constructed Manager (in-package tests) has no
+// session hook and builds without one, because its scripted daemon cannot
+// perform the /session hijack; NewManager always sets connectBuildSession.
+func (m *Manager) buildWithSession(ctx context.Context, appName string, build func(context.Context, string) error) error {
+	if m.startBuildSessionFn == nil {
+		return build(ctx, "")
+	}
+	sess, err := m.startBuildSessionFn(ctx, m.cli)
+	if err != nil {
+		return fmt.Errorf("app %q: docker build session: %w", appName, err)
+	}
+	if sess == nil {
+		return build(ctx, "")
+	}
+	defer func() { _ = sess.Close() }()
+	return build(ctx, sess.ID())
 }

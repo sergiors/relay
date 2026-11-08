@@ -843,8 +843,8 @@ events:
 // policy) and fails INSIDE the dependency-image build, with the pnpm/JSON
 // failure propagated to Prepare and no app image tagged for the app. The same
 // failure shape the established build test asserts on nodejs24.x
-// (TestIntegrationFailedBuildKeepsIntermediatesAndPropagatesError), narrowed to
-// the new-runtime identifier.
+// (TestIntegrationFailedBuildPropagatesError), narrowed to the new-runtime
+// identifier.
 func TestIntegrationNode26MalformedPackageJSONFailsPrepare(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)

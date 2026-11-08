@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/moby/moby/api/types/build"
 	"github.com/moby/moby/api/types/jsonstream"
 
 	"relay/internal/observability/metrics"
@@ -369,7 +371,7 @@ func TestRunImageBuildStreamsOutputAndDrains(t *testing.T) {
 		cli := newScriptedDockerClient(t,
 			dockerRoute{method: "POST", path: "/build", body: drainResponse([]string{"ok\n"}, "")},
 		)
-		if err := runImageBuild(context.Background(), cli, "app", ctxDir, "relay-app-x:fp", nil, reg); err != nil {
+		if err := runImageBuild(context.Background(), cli, "app", ctxDir, "relay-app-x:fp", nil, reg, ""); err != nil {
 			t.Fatalf("runImageBuild: %v", err)
 		}
 		if got := reg.Counter(metrics.MetricBuildOutputTruncated); got != 0 {
@@ -383,13 +385,46 @@ func TestRunImageBuildStreamsOutputAndDrains(t *testing.T) {
 		cli := newScriptedDockerClient(t,
 			dockerRoute{method: "POST", path: "/build", body: drainResponse([]string{chunk, chunk, chunk}, "")},
 		)
-		if err := runImageBuild(context.Background(), cli, "app", ctxDir, "relay-app-x:fp2", nil, reg); err != nil {
+		if err := runImageBuild(context.Background(), cli, "app", ctxDir, "relay-app-x:fp2", nil, reg, ""); err != nil {
 			t.Fatalf("runImageBuild oversized: %v", err)
 		}
 		if got := reg.Counter(metrics.MetricBuildOutputTruncated); got != 1 {
 			t.Fatalf("truncation counter = %d, want 1", got)
 		}
 	})
+}
+
+// TestRunImageBuildNamesBuildKitSession pins the regression behind the
+// BuildKit switch: the build request must carry both version=2 and a live
+// client session ID, or a daemon whose BuildKit requires a session cannot
+// resolve remote base-image metadata ("no active sessions"). The scripted
+// daemon observes the real client-built query string.
+func TestRunImageBuildNamesBuildKitSession(t *testing.T) {
+	ctxDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ctxDir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatalf("write dockerfile: %v", err)
+	}
+
+	var query url.Values
+	cli := newScriptedDockerClient(t,
+		dockerRoute{
+			method: http.MethodPost, path: "/build",
+			body:      drainResponse([]string{"ok\n"}, ""),
+			onRequest: func(req *http.Request) { query = req.URL.Query() },
+		},
+	)
+	if err := runImageBuild(context.Background(), cli, "app", ctxDir, "relay-app-x:fp", nil, nil, "session-42"); err != nil {
+		t.Fatalf("runImageBuild: %v", err)
+	}
+	if query == nil {
+		t.Fatal("the scripted daemon was not reached; the query assertion would be vacuous")
+	}
+	if got := query.Get("session"); got != "session-42" {
+		t.Errorf("build request session = %q, want the live BuildKit session ID", got)
+	}
+	if got := query.Get("version"); got != string(build.BuilderBuildKit) {
+		t.Errorf("build request version = %q, want explicit BuildKit %q", got, build.BuilderBuildKit)
+	}
 }
 
 // TestRunImageBuildProducerErrorFailsBuild pins that a context-tar producer
@@ -413,7 +448,7 @@ func TestRunImageBuildProducerErrorFailsBuild(t *testing.T) {
 			onMatch: func() { reached.Store(true) },
 		},
 	)
-	err := runImageBuild(context.Background(), cli, "app", ctxDir, "relay-app-x:fp", nil, nil)
+	err := runImageBuild(context.Background(), cli, "app", ctxDir, "relay-app-x:fp", nil, nil, "")
 	if !reached.Load() {
 		t.Fatal("the scripted daemon was not reached; the producer-error assertion would be vacuous")
 	}
@@ -566,7 +601,7 @@ func TestRunImageBuildJoinsProducerOnDaemonFailure(t *testing.T) {
 	)
 	done := make(chan error, 1)
 	go func() {
-		done <- runImageBuild(context.Background(), cli, "app", ctxDir, "relay-app-x:fp", nil, nil)
+		done <- runImageBuild(context.Background(), cli, "app", ctxDir, "relay-app-x:fp", nil, nil, "")
 	}()
 	select {
 	case err := <-done:
@@ -631,7 +666,7 @@ func TestRunImageBuildCancelsBlockedTarProducer(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- runImageBuild(ctx, cli, "app", ctxDir, "relay-app-x:fp", nil, nil)
+		done <- runImageBuild(ctx, cli, "app", ctxDir, "relay-app-x:fp", nil, nil, "")
 	}()
 
 	select {

@@ -32,14 +32,26 @@ const buildOutputTruncatedMarker = "[build output truncated]"
 // runImageBuild is the shared ImageBuild tail: the Dockerfile is already written
 // by the caller; this streams the context tar, builds, and drains the response.
 // labels are the managed-image labels stamped onto the resulting image (see
-// buildImageOptions); nil means no labels.
+// buildImageOptions); nil means no labels. sessionID names the live BuildKit
+// session the caller attached for this build (see buildSession); an empty ID
+// means no session, which is only appropriate for a build path that does not
+// require one (unit tests of the streaming/cleanup seams).
 //
 // The context tar is STREAMED through an io.Pipe rather than buffered in memory,
 // so an arbitrarily large context never has to be materialized in the worker
 // heap. The producer goroutine is joined on every path (success, daemon error,
 // cancellation, and early consumer close), so a failed or cancelled build cannot
 // leak it or block on a full pipe.
-func runImageBuild(ctx context.Context, cli *client.Client, name, ctxDir, image string, labels map[string]string, reg *metrics.Registry) error {
+func runImageBuild(
+	ctx context.Context,
+	cli *client.Client,
+	name,
+	ctxDir,
+	image string,
+	labels map[string]string,
+	reg *metrics.Registry,
+	sessionID string,
+) error {
 	pr, pw := io.Pipe()
 	producerDone := make(chan error, 1)
 	go func() {
@@ -50,7 +62,7 @@ func runImageBuild(ctx context.Context, cli *client.Client, name, ctxDir, image 
 		producerDone <- err
 	}()
 
-	resp, buildErr := cli.ImageBuild(ctx, pr, buildImageOptions(image, labels))
+	resp, buildErr := cli.ImageBuild(ctx, pr, buildImageOptions(image, labels, sessionID))
 	if buildErr != nil {
 		// The client produced no response (transport failure or cancellation).
 		// It may have abandoned the context body, so unblock the producer before

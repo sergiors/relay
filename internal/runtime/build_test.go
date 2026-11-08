@@ -19,17 +19,17 @@ import (
 // options request the daemon to remove intermediate containers after a
 // successful build. The moby client v0.6.0 emits rm=0 when Remove is false
 // (suppressing the daemon's default cleanup), so Remove must be true to restore
-// rm=1. It also asserts ForceRemove is NOT set: failed builds must keep their
-// intermediates for debugging.
+// rm=1 (BuildKit ignores rm and keeps failed state in its own cache). It also
+// asserts ForceRemove is NOT set: Relay never force-removes build diagnostics.
 func TestBuildImageOptionsRemoveIntermediateContainers(t *testing.T) {
-	opts := buildImageOptions("relay-app-test:abc123", nil)
+	opts := buildImageOptions("relay-app-test:abc123", nil, "session-1")
 
 	if !opts.Remove {
 		t.Error("expected Remove=true so the daemon removes intermediate containers after a " +
 			"successful build (moby client v0.6.0 emits rm=0 when Remove is false)")
 	}
 	if opts.ForceRemove {
-		t.Error("expected ForceRemove=false: failed builds must keep their intermediates for debugging")
+		t.Error("expected ForceRemove=false: build diagnostics must not be force-removed")
 	}
 	if len(opts.Tags) != 1 || opts.Tags[0] != "relay-app-test:abc123" {
 		t.Errorf("Tags = %v, want [relay-app-test:abc123]", opts.Tags)
@@ -39,6 +39,9 @@ func TestBuildImageOptionsRemoveIntermediateContainers(t *testing.T) {
 	}
 	if opts.Version != build.BuilderBuildKit {
 		t.Errorf("Version = %q, want explicit BuildKit version %q", opts.Version, build.BuilderBuildKit)
+	}
+	if opts.SessionID != "session-1" {
+		t.Errorf("SessionID = %q, want the live BuildKit session", opts.SessionID)
 	}
 	if opts.Labels != nil {
 		t.Errorf("Labels = %v, want nil for a plain build", opts.Labels)
@@ -51,7 +54,7 @@ func TestBuildImageOptionsRemoveIntermediateContainers(t *testing.T) {
 // equivalents, the same mechanism Relay relies on for its label model).
 func TestBuildImageOptionsCarriesManagedLabels(t *testing.T) {
 	labels := map[string]string{labelType: ImageTypeApp, labelApp: "a", labelDependency: "relay-dep-abc"}
-	opts := buildImageOptions("relay-app-a:abc123", labels)
+	opts := buildImageOptions("relay-app-a:abc123", labels, "session-2")
 
 	if got := opts.Labels[labelType]; got != ImageTypeApp {
 		t.Errorf("opts.Labels[relay.type] = %q, want %q", got, ImageTypeApp)
@@ -987,7 +990,7 @@ func TestValidateArtifactMember(t *testing.T) {
 // resolved target platform explicitly (linux at the resolved arch) instead of
 // letting the builder default to the daemon's platform.
 func TestBuildImageOptionsSetsTargetPlatform(t *testing.T) {
-	opts := buildImageOptions("relay-app-test:abc123", nil)
+	opts := buildImageOptions("relay-app-test:abc123", nil, "session-1")
 	if len(opts.Platforms) != 1 {
 		t.Fatalf("Platforms = %+v, want exactly one", opts.Platforms)
 	}

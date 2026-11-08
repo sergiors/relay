@@ -22,33 +22,13 @@ import (
 	"relay/internal/testutil"
 )
 
-// isClassicBuilderIntermediate reports whether a container's Config.Cmd matches
-// the shape of a classic-builder (V1) intermediate container: a metadata-only
-// step (`#(nop) ...`) or a `/bin/sh -c` step container. The daemon represents
-// the step command either as a single string (`/bin/sh -c <cmd>`) or split into
-// separate argv elements (`["/bin/sh","-c","<cmd>"]`), so both forms are
-// detected. Relay execution containers never match this shape (their Cmd is the
-// handler entrypoint), so any such container that is not relay-labeled is a
-// leaked build intermediate.
-func isClassicBuilderIntermediate(cmd []string) bool {
-	for i, part := range cmd {
-		if strings.Contains(part, "#(nop)") {
-			return true
-		}
-		if strings.Contains(part, "/bin/sh -c") {
-			return true
-		}
-		// Split argv form: ["/bin/sh","-c","<cmd>"].
-		if part == "/bin/sh" && i+1 < len(cmd) && cmd[i+1] == "-c" {
-			return true
-		}
-	}
-	return false
-}
-
-// isClassicBuilderIntermediateCmd is isClassicBuilderIntermediate for the
-// flat command string a ContainerList Summary carries (Summary has no Config;
-// the daemon joins the argv with spaces). Same detection, one argument.
+// isClassicBuilderIntermediateCmd reports whether the flat command string of a
+// container-list summary matches the shape of a classic-builder (V1)
+// intermediate container: a metadata-only step (`#(nop) ...`) or a `/bin/sh -c`
+// step container. Summary has no Config, so the daemon's joined command string
+// is the only form available. Relay execution containers never match this shape
+// (their command is the handler entrypoint), so any such container that is not
+// relay-labeled is a leaked build intermediate.
 func isClassicBuilderIntermediateCmd(command string) bool {
 	return strings.Contains(command, "#(nop)") || strings.Contains(command, "/bin/sh -c")
 }
@@ -322,26 +302,14 @@ func TestIntegrationBuildTestImageLeavesNoIntermediateContainers(t *testing.T) {
 	}
 }
 
-// TestIntegrationFailedBuildKeepsIntermediatesAndPropagatesError verifies that
-// a failed build (a) surfaces the real build-stream error through Prepare and
-// (b) intentionally KEEPS its classic-builder intermediate containers for
-// debugging (the daemon only removes intermediates when the build completed
-// successfully; Remove:true does not apply to failed builds). It uses a
-// malformed package.json so the node engine's `pnpm install --prod
-// --frozen-lockfile` step fails deterministically.
-//
-// The RETAINED intermediate is identified from the build output Prepare itself
-// carries in err.Error(): the classic builder's `Running in <id>` lines START a
-// container per step, and it removes each successful step's container again
-// (`Removed intermediate container <id>`); the failing step's container is the
-// one left behind. Inspecting ONLY those started-but-not-removed IDs (never a
-// daemon-wide container enumeration) keeps this test race-free on a shared
-// daemon: another package's transient container can vanish between a
-// ContainerList and its inspection, but a container ID that was named as a
-// RETAINED intermediate of OUR failed build is ours alone. A missing or
-// inspect-erroring intermediate is a FAILURE (it is the expected debugging
-// intermediate — its NotFound must not be suppressed generically).
-func TestIntegrationFailedBuildKeepsIntermediatesAndPropagatesError(t *testing.T) {
+// TestIntegrationFailedBuildPropagatesError verifies that a failed build
+// surfaces the real build-stream error through Prepare. It uses a malformed
+// package.json so the node engine's `pnpm install --prod --frozen-lockfile`
+// step fails deterministically. Production builds select BuildKit, which keeps
+// failed-step state in its cache rather than in classic-builder intermediate
+// containers, so this test asserts the failure contract (the stream error
+// reaches the caller) and does not look for container-visible leftovers.
+func TestIntegrationFailedBuildPropagatesError(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -368,19 +336,8 @@ events:
 	appName := testutil.UniqueName(t, "failed-build-int")
 	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 
-	// The RETAINED intermediate IDs the failed build leaves behind (started by
-	// `Running in` and not later retired by `Removed intermediate container`),
-	// parsed after the failure, BEFORE the closure below runs — t.Cleanup is
-	// deferred to test end.
-	var intermediates []string
-
 	// Scoped cleanup registered BEFORE the build, ownership-checked and
 	// error-reporting:
-	//   - retained intermediates: safe exact IDs parsed from THIS test's own
-	//     build output (started by `Running in`, not already removed); the
-	//     daemon named them and left them behind. removeContainer already
-	//     treats NotFound as benign, and every other removal failure is
-	//     REPORTED with t.Errorf instead of silently discarded.
 	//   - app images: only tags on images whose EXISTING Relay labels prove
 	//     relay.type == ImageTypeApp AND relay.app == this run's unique
 	//     appName — never a repo prefix, never unlabeled or foreign images.
@@ -391,11 +348,6 @@ events:
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cleanupCancel()
-		for _, id := range intermediates {
-			if err := removeContainer(cli, id); err != nil {
-				t.Errorf("cleanup: remove failed-build intermediate %s: %v", id, err)
-			}
-		}
 		// This test's own FAILED build produced (at most) one tagged
 		// relay-app-<appName>:* image; list ONLY the daemon-side label-filtered
 		// candidates for this app (relay.type=app AND relay.app=<appName>), then
@@ -436,35 +388,82 @@ events:
 	if !strings.Contains(errText, "pnpm") && !strings.Contains(errText, "JSON") && !strings.Contains(errText, "package.json") {
 		t.Errorf("expected the build-stream error to mention pnpm/JSON/package.json, got: %v", err)
 	}
+}
 
-	// The failed build output names the intermediates of THIS build that the
-	// daemon STARTED (`Running in <id>`) and did not subsequently remove
-	// (`Removed intermediate container <id>`) — the retained leftovers of the
-	// failing step. Parse them out; the daemon-wide before/after container
-	// enumeration this used to do is gone (it raced other processes' transient
-	// containers).
-	intermediates = failedBuildIntermediateIDs(errText)
-	if len(intermediates) == 0 {
-		t.Fatalf("the failed build output must name its classic-builder intermediate containers "+
-			"(no 'Running in <id>' line found in the propagated build stream): %s", errText)
+// TestIntegrationBuildKitResolvesRemoteBaseThroughSession covers the
+// "failed to resolve source metadata: no active sessions" regression against a
+// real daemon. Relay forces the BuildKit build path, which resolves a base
+// image's metadata through the client session named by
+// ImageBuildOptions.SessionID. Daemons whose BuildKit predates tolerating an
+// absent session fail that resolution; this test removes the base locally so
+// the metadata must come from the registry, then builds through the same
+// session-attaching path production uses. On a newer daemon the session-less
+// build also succeeds, so the negative case is not observable here; the
+// session-carrying request itself is pinned by
+// TestRunImageBuildNamesBuildKitSession.
+func TestIntegrationBuildKitResolvesRemoteBaseThroughSession(t *testing.T) {
+	cli := testutil.RequireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	const base = "busybox:1.36.1"
+	if _, err := cli.ImageRemove(ctx, base, client.ImageRemoveOptions{Force: true}); err != nil && !cerrdefs.IsNotFound(err) {
+		t.Fatalf("remove cached base %s: %v", base, err)
 	}
-	t.Logf("failed build named %d intermediate container(s): %v", len(intermediates), intermediates)
+	if imageExistsInDaemon(cli, ctx, base) {
+		t.Fatalf("base %s still exists locally; the metadata-resolution assertion would be vacuous", base)
+	}
 
-	// Each parsed retained intermediate is the expected debugging leftover and
-	// MUST remain inspectable; a missing (NotFound) or erroring one FAILS the
-	// test.
-	for _, id := range intermediates {
-		insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
-		if err != nil {
-			t.Fatalf("the failed-build intermediate %s must remain inspectable: %v", id, err)
+	// Re-run the affected request without a session first. Older BuildKit
+	// daemons reproduce the regression here; newer daemons tolerate the missing
+	// session, so accept success only as a daemon-version difference. In either
+	// case, remove the image again before the session-attached assertion below.
+	ctxDir := t.TempDir()
+	writeFile(t, ctxDir, "Dockerfile", "FROM "+base+"\nRUN true\n")
+	withoutSessionRef := fmt.Sprintf("relay-buildkit-no-session-%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		cleanupImage(cli, cleanupCtx, withoutSessionRef)
+	})
+	if err := runImageBuild(ctx, cli, "buildkit-no-session", ctxDir, withoutSessionRef, nil, nil, ""); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "no active sessions") {
+			t.Fatalf("session-less BuildKit build failed for an unexpected reason: %v", err)
 		}
-		var cmd []string
-		if insp.Container.Config != nil {
-			cmd = insp.Container.Config.Cmd
-		}
-		if !isClassicBuilderIntermediate(cmd) {
-			t.Fatalf("the parsed intermediate %s must be a classic-builder intermediate", id)
-		}
+		t.Logf("reproduced session-less BuildKit failure: %v", err)
+	} else {
+		t.Log("daemon tolerated a BuildKit build without a session")
+	}
+	if _, err := cli.ImageRemove(ctx, base, client.ImageRemoveOptions{Force: true}); err != nil && !cerrdefs.IsNotFound(err) {
+		t.Fatalf("remove base %s after session-less build: %v", base, err)
+	}
+	if imageExistsInDaemon(cli, ctx, base) {
+		t.Fatalf("base %s is still local after the session-less build", base)
+	}
+
+	ref := fmt.Sprintf("relay-buildkit-session-%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		cleanupImage(cli, cleanupCtx, ref)
+	})
+
+	// A directly constructed Manager suffices: buildWithSession only needs the
+	// client and the session hook NewManager installs in production.
+	m := &Manager{cli: cli, startBuildSessionFn: connectBuildSession}
+	var sessionID string
+	err := m.buildWithSession(ctx, "buildkit-session", func(buildCtx context.Context, id string) error {
+		sessionID = id
+		return runImageBuild(buildCtx, cli, "buildkit-session", ctxDir, ref, nil, nil, id)
+	})
+	if err != nil {
+		t.Fatalf("BuildKit build with an attached session must resolve the remote base %s: %v", base, err)
+	}
+	if sessionID == "" {
+		t.Fatal("the production build path did not attach a BuildKit session")
+	}
+	if !imageExistsInDaemon(cli, ctx, ref) {
+		t.Fatalf("image %s should exist after the BuildKit build", ref)
 	}
 }
 
