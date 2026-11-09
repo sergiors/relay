@@ -864,12 +864,6 @@ func (st *State) claimStatsOwnership(ctx context.Context, q execQuerier) error {
 // the identity its persisted stats are scoped to.
 func (st *State) NodeID() string { return st.nodeID }
 
-// nowString returns the current time as an RFC3339 UTC string for timestamps
-// embedded in app snapshots, using the injectable clock when set.
-func (st *State) nowString() string {
-	return st.nowTime().UTC().Format(time.RFC3339)
-}
-
 // timestampString preserves the existing RFC3339 UTC presentation at the
 // state/CLI boundary. A zero timestamp is the historical empty value.
 func timestampString(value time.Time) string {
@@ -879,9 +873,10 @@ func timestampString(value time.Time) string {
 	return value.UTC().Format(time.RFC3339)
 }
 
-// nowTime returns the current instant as a time.Time from the same injectable
-// clock nowString uses, defaulting to time.Now when no clock is installed. It is
-// used for native timestamp and integer Unix-millisecond persistence.
+// nowTime returns the current instant as a time.Time from the injectable clock
+// (nowFn when set), defaulting to time.Now. It is the single clock read for a
+// state transition; callers pass that instant to native timestamp persistence
+// and present it with timestampString where the payload needs RFC3339 text.
 func (st *State) nowTime() time.Time {
 	if st.nowFn != nil {
 		return st.nowFn()
@@ -1039,7 +1034,6 @@ func (st *State) rebuildDiscoveredTx(ctx context.Context, discovered []Discovere
 			}
 			detail := appSnapshot(d.App.Name, d.App.Template, StatusPreparing, "", "", d.Fingerprint, "", "", "", "")
 			updatedAt := st.nowTime().UTC()
-			detail.UpdatedAt = timestampString(updatedAt)
 			if err := upsertAppTx(ctx, tx, detail, fencingToken, updatedAt); err != nil {
 				return err
 			}
@@ -1173,7 +1167,6 @@ func recordDesiredTx(
 			active.Image, active.Fingerprint, fingerprint,
 			active.PreparedAt, active.LastReconcileAt, active.LastReconcileStatus, active.LastError)
 	}
-	detail.UpdatedAt = timestampString(updatedAt)
 	if err := upsertAppTx(ctx, tx, detail, fencingToken, updatedAt); err != nil {
 		return 0, err
 	}
@@ -1207,15 +1200,14 @@ func (st *State) RecordReconcileSuccess(
 	if fencingToken <= 0 {
 		return false, nil
 	}
-	ts := st.nowString()
-	updatedAt := st.nowTime().UTC()
+	now := st.nowTime().UTC()
+	ts := now.Format(time.RFC3339)
 	prepared := preparedAt.UTC().Format(time.RFC3339)
 	wrote := false
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		detail := appSnapshot(name, fn.Template, StatusReady, image, fingerprint, fingerprint, prepared, ts, ReconcileSuccess, "")
-		detail.UpdatedAt = timestampString(updatedAt)
 		var err error
-		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken, updatedAt)
+		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken, now)
 		return err
 	})
 	if err != nil {
@@ -1330,7 +1322,7 @@ func (st *State) recordStatus(
 		if err != nil || !found {
 			return err
 		}
-		detail.Status, detail.UpdatedAt = status, timestampString(updatedAt)
+		detail.Status = status
 		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken, updatedAt)
 		return err
 	})
@@ -1369,8 +1361,8 @@ func (st *State) RecordReconcileFailure(
 	if fencingToken <= 0 {
 		return false, nil
 	}
-	ts := st.nowString()
-	updatedAt := st.nowTime().UTC()
+	now := st.nowTime().UTC()
+	ts := now.Format(time.RFC3339)
 	status := ""
 	wrote := false
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
@@ -1397,8 +1389,7 @@ func (st *State) RecordReconcileFailure(
 			detail.Status = StatusUnavailable
 		}
 		status = detail.Status
-		detail.UpdatedAt = timestampString(updatedAt)
-		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken, updatedAt)
+		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken, now)
 		return err
 	})
 	if err != nil {
@@ -1534,8 +1525,8 @@ func (st *State) recordInvalidDesired(
 	observed *AppObservation,
 	guarded bool,
 ) (InvalidDesiredResult, error) {
-	ts := st.nowString()
-	updatedAt := st.nowTime().UTC()
+	now := st.nowTime().UTC()
+	ts := now.Format(time.RFC3339)
 	var result InvalidDesiredResult
 	status := ""
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
@@ -1600,8 +1591,7 @@ func (st *State) recordInvalidDesired(
 			detail.Status = StatusUnavailable
 		}
 		status = detail.Status
-		detail.UpdatedAt = timestampString(updatedAt)
-		if err := upsertAppTx(ctx, tx, detail, nextFencingToken, updatedAt); err != nil {
+		if err := upsertAppTx(ctx, tx, detail, nextFencingToken, now); err != nil {
 			return err
 		}
 		result.FencingToken = nextFencingToken
@@ -1690,8 +1680,8 @@ func (st *State) RecordServiceFailure(
 	if fencingToken <= 0 {
 		return false, nil
 	}
-	ts := st.nowString()
-	updatedAt := st.nowTime().UTC()
+	now := st.nowTime().UTC()
+	ts := now.Format(time.RFC3339)
 	status := ""
 	wrote := false
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
@@ -1713,8 +1703,7 @@ func (st *State) RecordServiceFailure(
 			detail.Status = StatusUnavailable
 		}
 		status = detail.Status
-		detail.UpdatedAt = timestampString(updatedAt)
-		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken, updatedAt)
+		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken, now)
 		return err
 	})
 	if err != nil {
