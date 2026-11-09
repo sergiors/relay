@@ -132,11 +132,6 @@ type ServiceContainer struct {
 	// container created before the label existed, which never equals a desired
 	// fingerprint, so such a container is replaced once.
 	Resources string
-	// SecurityProfile is the hardening profile the container was created with,
-	// parsed from relay.security_profile. It is "" for a container created
-	// before the label existed, which never equals the current profile, so a
-	// pre-profile persistent service is replaced once rather than retained.
-	SecurityProfile string
 	// Networks is the canonical, sorted, comma-separated set of Docker
 	// networks the container was created attached to (the worker-global
 	// NETWORKS set plus the routing network for a routed service), parsed from
@@ -363,8 +358,6 @@ func EnvHash(env []string) string {
 // content-addressed), so a moved external tag is detected. relay.env_hash pins
 // the effective environment's content hash so an env/secret change replaces a
 // container whose image reference is unchanged (see labelEnvHash).
-// relay.security_profile pins the hardening profile so a tightened baseline
-// replaces a persistent container created under an older profile.
 //
 // Extra caller-supplied labels (spec.Labels, e.g. routing labels) are merged
 // on top, then the relay ownership keys are RE-applied last so Relay's
@@ -378,17 +371,16 @@ func serviceLabels(spec ServiceSpec, nodeID string, replica int) map[string]stri
 		sourceID = spec.SourceMount.Identity
 	}
 	labels := map[string]string{
-		labelType:            ContainerTypeService,
-		labelApp:             spec.App,
-		labelService:         spec.Name,
-		labelIdentity:        spec.SourceRef,
-		labelImage:           spec.Image,
-		labelNodeID:          nodeID,
-		labelPort:            strconv.Itoa(spec.Port),
-		labelReplica:         strconv.Itoa(replica),
-		labelEnvHash:         envHash,
-		labelResources:       resourceHash,
-		labelSecurityProfile: ServiceSecurityProfile,
+		labelType:      ContainerTypeService,
+		labelApp:       spec.App,
+		labelService:   spec.Name,
+		labelIdentity:  spec.SourceRef,
+		labelImage:     spec.Image,
+		labelNodeID:    nodeID,
+		labelPort:      strconv.Itoa(spec.Port),
+		labelReplica:   strconv.Itoa(replica),
+		labelEnvHash:   envHash,
+		labelResources: resourceHash,
 	}
 	if spec.ImageID != "" {
 		labels[labelImageID] = spec.ImageID
@@ -410,7 +402,6 @@ func serviceLabels(spec ServiceSpec, nodeID string, replica int) map[string]stri
 	labels[labelReplica] = strconv.Itoa(replica)
 	labels[labelEnvHash] = envHash
 	labels[labelResources] = resourceHash
-	labels[labelSecurityProfile] = ServiceSecurityProfile
 	// The image content ID is an ownership key too; a caller can never spoof it,
 	// and an empty ID (a content-addressed Relay tag) clears any spoofed value.
 	if spec.ImageID != "" {
@@ -570,6 +561,27 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 	); err != nil {
 		return "", fmt.Errorf("service: unsafe container configuration: %w", err)
 	}
+	// Docker materializes an image-declared VOLUME as an anonymous writable
+	// mount even under ReadonlyRootfs, so refuse it before create just like an
+	// unsafe HostConfig. This is the enforcement point for external `image`
+	// services as well as Relay-built service images.
+	inspectImage := spec.Image
+	if spec.ImageID != "" {
+		// Mutable external references are resolved by the reconciler before the
+		// start pass. Inspect and create from that same content ID, never from a
+		// tag that could move between validation and ContainerCreate.
+		inspectImage = spec.ImageID
+	}
+	createImage, err := validateImageDeclaredVolumes(ctx, m.cli, inspectImage)
+	if err != nil {
+		return "", fmt.Errorf("service: %w", err)
+	}
+	if err := validateRecursiveReadOnlyMountSupport(m.cli, sourceMounts); err != nil {
+		return "", fmt.Errorf("service: unsafe container configuration: %w", err)
+	}
+	// Keep relay.image and relay.identity tied to the configured source reference;
+	// Config.Image is the immutable ID inspected above.
+	cfg.Image = createImage
 	if endpoints := serviceEndpoints(spec.Networks); len(endpoints) > 0 {
 		// Join every configured network at create time (containers must belong to
 		// a network from creation to be on it at start). The worker-global
@@ -739,22 +751,21 @@ func (m *Manager) serviceContainerList(ctx context.Context, admit dockerOpAdmitt
 			maps.Copy(labelsCopy, c.Labels)
 		}
 		out = append(out, ServiceContainer{
-			ID:              c.ID,
-			App:             c.Labels[labelApp],
-			Name:            c.Labels[labelService],
-			SourceRef:       c.Labels[labelIdentity],
-			Image:           c.Labels[labelImage],
-			ImageID:         c.Labels[labelImageID],
-			NodeID:          c.Labels[labelNodeID],
-			State:           c.State,
-			Replica:         replica,
-			Port:            port,
-			EnvHash:         c.Labels[labelEnvHash],
-			Resources:       c.Labels[labelResources],
-			SecurityProfile: c.Labels[labelSecurityProfile],
-			Networks:        c.Labels[labelNetworks],
-			SourceID:        c.Labels[labelSource],
-			Labels:          labelsCopy,
+			ID:        c.ID,
+			App:       c.Labels[labelApp],
+			Name:      c.Labels[labelService],
+			SourceRef: c.Labels[labelIdentity],
+			Image:     c.Labels[labelImage],
+			ImageID:   c.Labels[labelImageID],
+			NodeID:    c.Labels[labelNodeID],
+			State:     c.State,
+			Replica:   replica,
+			Port:      port,
+			EnvHash:   c.Labels[labelEnvHash],
+			Resources: c.Labels[labelResources],
+			Networks:  c.Labels[labelNetworks],
+			SourceID:  c.Labels[labelSource],
+			Labels:    labelsCopy,
 		})
 	}
 	return out, nil

@@ -91,6 +91,9 @@ func TestBindMountsReadOnly(t *testing.T) {
 	if m.Type != mount.TypeBind || m.Source != "/apps/a" || m.Target != "/app" || !m.ReadOnly {
 		t.Fatalf("mount = %+v, want read-only bind /apps/a -> /app", m)
 	}
+	if m.BindOptions == nil || !m.BindOptions.ReadOnlyForceRecursive {
+		t.Fatalf("bind options = %+v, want fail-closed recursive read-only", m.BindOptions)
+	}
 }
 
 // TestBindMountsMasks pins that each declared mask becomes an empty, READ-ONLY
@@ -262,6 +265,8 @@ func TestPrepareSourceMountReusesImageAcrossSourceOnlyChange(t *testing.T) {
 func TestStartExecutionContainerSerializesSourceMount(t *testing.T) {
 	var createBody []byte
 	cli := newScriptedDockerClient(t, dockerRoute{
+		method: http.MethodGet, path: "/images/img/json", body: `{"Id":"sha256:img","Config":{}}`,
+	}, dockerRoute{
 		method: http.MethodPost, path: "/containers/create",
 		status: http.StatusInternalServerError,
 		body:   `{"message":"scripted create failure"}`,
@@ -283,6 +288,9 @@ func TestStartExecutionContainerSerializesSourceMount(t *testing.T) {
 	if mm.Type != mount.TypeBind || mm.Source != "/apps/fn" || mm.Target != "/app" || !mm.ReadOnly {
 		t.Fatalf("mount = %+v, want read-only bind /apps/fn -> /app", mm)
 	}
+	if mm.BindOptions == nil || !mm.BindOptions.ReadOnlyForceRecursive {
+		t.Fatalf("bind options = %+v, want recursively read-only source", mm.BindOptions)
+	}
 	if req.Config.WorkingDir != "" {
 		t.Fatalf("WorkingDir = %q, want empty (preserve the image workdir) for a target-equals-workdir mount", req.Config.WorkingDir)
 	}
@@ -295,6 +303,8 @@ func TestStartExecutionContainerSerializesSourceMount(t *testing.T) {
 func TestStartExecutionContainerSerializesNodeSourceMountConfig(t *testing.T) {
 	var createBody []byte
 	cli := newScriptedDockerClient(t, dockerRoute{
+		method: http.MethodGet, path: "/images/img/json", body: `{"Id":"sha256:img","Config":{}}`,
+	}, dockerRoute{
 		method: http.MethodPost, path: "/containers/create",
 		status: http.StatusInternalServerError,
 		body:   `{"message":"scripted create failure"}`,
@@ -537,6 +547,9 @@ func TestStartServiceSerializesSourceMountAndLabel(t *testing.T) {
 	mm := withMount.HostConfig.Mounts[0]
 	if mm.Type != mount.TypeBind || mm.Source != "/apps/fn" || mm.Target != "/app" || !mm.ReadOnly {
 		t.Fatalf("mount = %+v, want read-only bind /apps/fn -> /app", mm)
+	}
+	if mm.BindOptions == nil || !mm.BindOptions.ReadOnlyForceRecursive {
+		t.Fatalf("bind options = %+v, want recursively read-only source", mm.BindOptions)
 	}
 	if got := withMount.Config.Labels[labelSource]; got != "fp1" {
 		t.Fatalf("relay.source = %q, want fp1", got)

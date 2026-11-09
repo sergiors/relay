@@ -381,7 +381,10 @@ See [configuration.md](configuration.md#warm-container-bound).
 
 Every execution container is hardened: non-root (uid 10001), all Linux
 capabilities dropped, read-only root filesystem with a bounded `/tmp` tmpfs,
-per-container memory/CPU/PID limits, outbound networking enabled.
+per-container memory/CPU/PID limits, outbound networking enabled. An image whose
+config declares Docker `VOLUME` destinations is refused before create (including
+declarations inherited from a base image), because the daemon would materialize
+them as implicit anonymous writable volumes outside the bounded `/tmp`.
 
 ### Docker networks
 

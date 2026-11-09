@@ -97,7 +97,11 @@ restart.
 
 The mount exposes the app directory to the handler container, so enable hot
 reload only for source trees the app may read. Changing the setting requires a
-worker restart.
+worker restart. Recursive read-only binds require Docker API 1.44 or newer and
+daemon/kernel/runtime support (Moby requires Linux kernel 5.12 or newer). Relay
+asks Docker to fail container creation if it cannot enforce that mode.
+HOT_RELOAD does not make the source tree private from the host or from the
+privileged Relay control plane.
 
 ### Python event loop
 

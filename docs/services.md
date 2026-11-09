@@ -92,15 +92,16 @@ private PID/IPC/network namespaces, read-only rootfs, bounded `/tmp`, and
 memory/CPU/pids limits. A service whose declared `port` is below 1024 gets only
 `NET_BIND_SERVICE` added on top of the dropped set, so managed non-root services
 can bind a privileged port even when the daemon sets a nonzero unprivileged-port
-floor. Each service container records the profile in `relay.security_profile`, so
-a tightened baseline replaces a container created under an older profile.
-Workload containers never receive device access, arbitrary host mounts,
+floor. Workload containers never receive device access, arbitrary host mounts,
 writable app source, or a container-runtime socket.
 
 External images must run under those constraints. Prefer images that already run
 as a non-root user and listen on an unprivileged port (for example
 `nginxinc/nginx-unprivileged`, not the official `nginx`, which expects to chown
-cache directories and setuid its workers).
+cache directories and setuid its workers). An image whose config declares Docker
+`VOLUME` destinations is refused before create: the daemon would materialize
+those as implicit anonymous writable volumes even with a read-only rootfs,
+bypassing the bounded `/tmp` contract. Use an image without declared volumes.
 
 Service networking: every service container joins the worker-global `NETWORKS`
 set (the same set execution containers join); a **routed** service additionally

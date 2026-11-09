@@ -43,9 +43,6 @@ func TestServiceLabelsCarriesServiceIdentityAndOwnership(t *testing.T) {
 		// created without explicit resources still carries the effective
 		// default config's hash so discovery can compare it).
 		labelResources: app.DefaultResourceLimits().Fingerprint(),
-		// The current hardening profile is part of every service container's
-		// identity so a tightened baseline replaces an older container.
-		labelSecurityProfile: ServiceSecurityProfile,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("label count = %d, want %d (%v)", len(got), len(want), got)
@@ -245,6 +242,7 @@ func TestServiceContainerNameForStartUniqueAndBounded(t *testing.T) {
 func TestStartServiceConfirmsRunningBeforeReturn(t *testing.T) {
 	inspected := 0
 	cli := newScriptedDockerClient(t,
+		imageWithoutDeclaredVolumesRoute("img"),
 		dockerRoute{method: http.MethodPost, path: "/containers/create", body: `{"Id":"cid-1"}`,
 			onBody: func([]byte) {}},
 		dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
@@ -276,6 +274,7 @@ func TestStartServiceConfirmsRunningBeforeReturn(t *testing.T) {
 func TestStartServiceNonRunningInspectDiscardsAndFails(t *testing.T) {
 	removed := 0
 	cli := newScriptedDockerClient(t,
+		imageWithoutDeclaredVolumesRoute("img"),
 		dockerRoute{method: http.MethodPost, path: "/containers/create", body: `{"Id":"cid-1"}`},
 		dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
 		dockerRoute{method: http.MethodGet, path: "/containers/cid-1/json",
@@ -309,6 +308,7 @@ func TestStartServiceNonRunningInspectDiscardsAndFails(t *testing.T) {
 func TestStartServiceInspectErrorDiscardsAndFails(t *testing.T) {
 	removed := 0
 	cli := newScriptedDockerClient(t,
+		imageWithoutDeclaredVolumesRoute("img"),
 		dockerRoute{method: http.MethodPost, path: "/containers/create", body: `{"Id":"cid-1"}`},
 		dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
 		dockerRoute{method: http.MethodGet, path: "/containers/cid-1/json",
@@ -340,6 +340,7 @@ func TestStartServiceCreateSendsUniquePhysicalName(t *testing.T) {
 			names = append(names, req.URL.Query().Get("name"))
 		}}
 	cli := newScriptedDockerClient(t,
+		imageWithoutDeclaredVolumesRoute("img"),
 		route,
 		dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
 		dockerRoute{method: http.MethodGet, path: "/containers/cid-1/json", body: `{"Id":"cid-1","State":{"Running":true}}`},
@@ -650,6 +651,20 @@ func TestStartServiceAppliesResourceLimitsForAllSources(t *testing.T) {
 	}
 }
 
+func TestStartServiceCreatesFromResolvedImageID(t *testing.T) {
+	const ref, id = "ghcr.io/acme/api:latest", "sha256:resolved"
+	spec := ServiceSpec{
+		App: "fn", Name: "external", SourceRef: ref, Image: ref, ImageID: id, Port: 8080,
+	}
+	req := decodeCreateRequest(t, captureServiceCreate(t, spec))
+	if req.Config.Image != id {
+		t.Fatalf("Config.Image = %q, want immutable resolved ID %q", req.Config.Image, id)
+	}
+	if req.Config.Labels[labelImage] != ref || req.Config.Labels[labelImageID] != id {
+		t.Fatalf("image labels = %v, want configured reference %q and resolved ID %q", req.Config.Labels, ref, id)
+	}
+}
+
 // TestServiceLabelsResourcesFingerprint pins the relay.resources label's
 // contract: it is value-free (fixed hex length, no raw byte/cpu numbers), it
 // changes when any resource field changes, and a zero value fingerprints as the
@@ -679,7 +694,12 @@ func TestServiceLabelsResourcesFingerprint(t *testing.T) {
 func captureServiceCreate(t *testing.T, spec ServiceSpec) []byte {
 	t.Helper()
 	var createBody []byte
+	inspectImage := spec.Image
+	if spec.ImageID != "" {
+		inspectImage = spec.ImageID
+	}
 	cli := newScriptedDockerClient(t,
+		imageWithoutDeclaredVolumesRoute(inspectImage),
 		// Pre-create validation inspects every selected network. The scripted
 		// daemon reports ordinary networks (no relay.control label).
 		dockerRoute{method: http.MethodGet, path: "/networks/", body: `{"Name":"network","Labels":{}}`},
@@ -931,6 +951,7 @@ func endpointKeys(endpoints map[string]*network.EndpointSettings) []string {
 func TestStartServiceDeletedNetworkCreateFailure(t *testing.T) {
 	networkCreates := 0
 	cli := newScriptedDockerClient(t,
+		imageWithoutDeclaredVolumesRoute("img"),
 		dockerRoute{
 			method: http.MethodGet, path: "/networks/",
 			body: `{"Name":"backend","Labels":{}}`,

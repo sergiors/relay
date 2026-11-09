@@ -38,6 +38,7 @@ func TestExecuteContainerCreateVsRetire(t *testing.T) {
 
 	createErr := errors.New("scripted container create failure")
 	dels := 0
+	imageInspects := 0
 	m := newRetireManager(t,
 		dockerRoute{
 			method: http.MethodPost, path: "/containers/create",
@@ -54,7 +55,16 @@ func TestExecuteContainerCreateVsRetire(t *testing.T) {
 		// pre-create identity resolution inspects the image (absent here, so it
 		// degrades to the reference identity and the create proceeds).
 		dockerRoute{method: http.MethodGet, path: "/containers/json", body: `[]`},
-		dockerRoute{method: http.MethodGet, path: "/images/relay-app-a:v1/json", status: http.StatusNotFound, body: `{"message":"no such image"}`},
+		dockerRoute{
+			method: http.MethodGet, path: "/images/relay-app-a:v1/json",
+			serve: func(*http.Request) (int, string) {
+				imageInspects++
+				if imageInspects == 1 {
+					return http.StatusNotFound, `{"message":"no such image"}`
+				}
+				return http.StatusOK, `{"Id":"sha256:relay-app-a","Config":{}}`
+			},
+		},
 		dockerRoute{method: http.MethodDelete, path: "/images/", body: "[]", onMatch: func() { dels++ }},
 	)
 

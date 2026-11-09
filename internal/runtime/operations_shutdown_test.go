@@ -511,7 +511,10 @@ func TestManagerCloseJoinsBlockedImageRemovalDespiteExpiredContext(t *testing.T)
 // close cancels it, joins it, and only then closes the client.
 func TestManagerCloseCancelsInFlightServiceCreate(t *testing.T) {
 	block := newBlockUntilCancelRoute()
-	ot := newOpsTestManager(t, block.route(http.MethodPost, "/containers/create"))
+	ot := newOpsTestManager(t,
+		imageWithoutDeclaredVolumesRoute("alpine:3"),
+		block.route(http.MethodPost, "/containers/create"),
+	)
 
 	createDone := make(chan error, 1)
 	go func() {

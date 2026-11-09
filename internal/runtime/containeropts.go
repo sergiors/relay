@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"slices"
+	"strconv"
 	"strings"
 
 	cerrdefs "github.com/containerd/errdefs"
@@ -172,6 +174,68 @@ func validateContainerHostConfig(
 	)
 }
 
+// validateImageDeclaredVolumes rejects an image whose Config declares Docker
+// VOLUME destinations, BEFORE Docker ContainerCreate. An image VOLUME is
+// materialized by the daemon as an implicit anonymous writable mount even when
+// HostConfig.ReadonlyRootfs is true, so it would bypass Relay's contract that
+// the bounded /tmp tmpfs is the only writable path. Both production workload
+// create paths (execution containers and persistent services) call this with
+// the exact image they are about to create from.
+//
+// Fail closed: an image that cannot be inspected, has no Config, or has no
+// immutable ID is an error, not a pass. A nonempty Config.Volumes is an error
+// naming every declared destination. Success returns the inspected image ID so
+// the caller can create from exactly the content it validated, closing a
+// mutable-reference inspect/create race. The error is wrapped by the caller
+// with its own workload prefix.
+func validateImageDeclaredVolumes(ctx context.Context, cli *client.Client, image string) (string, error) {
+	insp, err := cli.ImageInspect(ctx, image)
+	if err != nil {
+		return "", fmt.Errorf("inspect image %q: %w", image, err)
+	}
+	if insp.ID == "" {
+		return "", fmt.Errorf("inspect image %q: immutable image ID is missing", image)
+	}
+	if insp.Config == nil {
+		return "", fmt.Errorf("inspect image %q: image config is missing", image)
+	}
+	if len(insp.Config.Volumes) == 0 {
+		return insp.ID, nil
+	}
+	destinations := make([]string, 0, len(insp.Config.Volumes))
+	for destination := range insp.Config.Volumes {
+		destinations = append(destinations, destination)
+	}
+	slices.Sort(destinations)
+	return "", fmt.Errorf(
+		"image %q declares writable volumes %v, which bypass the read-only root filesystem and bounded /tmp",
+		image, destinations)
+}
+
+// validateRecursiveReadOnlyMountSupport prevents HOT_RELOAD from relying on a
+// read-only bind whose nested mounts may remain writable. Docker's recursive
+// read-only option is available from API 1.44; earlier API versions default
+// read-only binds to non-recursive behavior and silently ignore the force flag.
+func validateRecursiveReadOnlyMountSupport(cli *client.Client, mounts []mount.Mount) error {
+	for _, m := range mounts {
+		if m.Type != mount.TypeBind || !m.ReadOnly || m.BindOptions == nil || !m.BindOptions.ReadOnlyForceRecursive {
+			continue
+		}
+		version := strings.TrimPrefix(cli.ClientVersion(), "v")
+		majorMinor := strings.SplitN(version, ".", 3)
+		if len(majorMinor) < 2 {
+			return fmt.Errorf("recursive read-only bind mounts require Docker API 1.44 or newer (got %q)", version)
+		}
+		major, majorErr := strconv.Atoi(majorMinor[0])
+		minor, minorErr := strconv.Atoi(majorMinor[1])
+		if majorErr != nil || minorErr != nil || major < 1 || (major == 1 && minor < 44) {
+			return fmt.Errorf("recursive read-only bind mounts require Docker API 1.44 or newer (got %q)", version)
+		}
+		return nil
+	}
+	return nil
+}
+
 // hasSecurityOpt reports whether opt is present in opts.
 func hasSecurityOpt(opts []string, want string) bool {
 	for _, opt := range opts {
@@ -195,6 +259,9 @@ func validateWorkloadMounts(mounts []mount.Mount, sourceRoot string) error {
 		case mount.TypeBind:
 			if !m.ReadOnly {
 				return fmt.Errorf("bind mount %q at %q must be read-only", m.Source, m.Target)
+			}
+			if m.BindOptions == nil || !m.BindOptions.ReadOnlyForceRecursive {
+				return fmt.Errorf("bind mount %q at %q must be recursively read-only", m.Source, m.Target)
 			}
 			if m.Source == "" {
 				return fmt.Errorf("bind mount at %q has no source", m.Target)

@@ -74,6 +74,49 @@ func TestIntegrationServiceControlNetworkRejected(t *testing.T) {
 	}
 }
 
+// TestIntegrationDeclaredVolumeImageRejectedBeforeCreate builds a tiny external
+// image whose Config declares a Docker VOLUME, then proves StartService rejects
+// it before a persistent service container can be created.
+func TestIntegrationDeclaredVolumeImageRejectedBeforeCreate(t *testing.T) {
+	cli := testutil.RequireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	image := "relay-test-declared-volume-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	buildTestImage(ctx, t, image, `FROM scratch
+VOLUME ["/relay-data"]
+CMD []
+`)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		cleanupImage(cli, cleanupCtx, image)
+	})
+
+	insp, err := cli.ImageInspect(ctx, image)
+	if err != nil {
+		t.Fatalf("inspect fixture image: %v", err)
+	}
+	if insp.Config == nil || len(insp.Config.Volumes) != 1 {
+		t.Fatalf("fixture image Config.Volumes = %v, want /relay-data", insp.Config)
+	}
+	if _, ok := insp.Config.Volumes["/relay-data"]; !ok {
+		t.Fatalf("fixture image Config.Volumes = %v, want /relay-data", insp.Config.Volumes)
+	}
+
+	m, _ := newManager(t)
+	_, err = m.StartService(ctx, ServiceSpec{
+		App: "declared-volume", Name: "external", SourceRef: image,
+		Image: image, Port: 8080,
+	}, 0)
+	if err == nil || !strings.Contains(err.Error(), "declares writable volumes") {
+		t.Fatalf("StartService error = %v, want declared-volume rejection", err)
+	}
+	if got := countServiceContainers(t, ctx, m, "declared-volume"); got != 0 {
+		t.Fatalf("created %d service container(s) despite the declared-volume rejection, want 0", got)
+	}
+}
+
 // TestIntegrationExecutionControlNetworkRejected proves the shared execution
 // create path applies the same control-network guard: with the worker-global
 // network set pointing at a control network, an invocation fails before any

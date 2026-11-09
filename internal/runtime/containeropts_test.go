@@ -7,6 +7,7 @@ import (
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/client"
 
 	"relay/internal/app"
 )
@@ -161,7 +162,7 @@ func TestValidateContainerHostConfig(t *testing.T) {
 		return hardenedServiceHostConfig(app.DefaultResourceLimits(), 3000)
 	}
 	safeMounts := []mount.Mount{
-		{Type: mount.TypeBind, Source: "/apps/demo", Target: "/app/src", ReadOnly: true},
+		{Type: mount.TypeBind, Source: "/apps/demo", Target: "/app/src", ReadOnly: true, BindOptions: &mount.BindOptions{ReadOnlyForceRecursive: true}},
 		{Type: mount.TypeTmpfs, Target: "/app/src/node_modules", ReadOnly: true},
 	}
 	if err := validateContainerHostConfig(base(), safeMounts, 3000, "/apps/demo"); err != nil {
@@ -183,14 +184,14 @@ func TestValidateContainerHostConfig(t *testing.T) {
 	// keeps working because the check uses the app's recorded source root.
 	volumeRoot := "/var/lib/docker/volumes/relay-apps/_data/demo"
 	volumeMounts := []mount.Mount{
-		{Type: mount.TypeBind, Source: volumeRoot, Target: "/app/src", ReadOnly: true},
+		{Type: mount.TypeBind, Source: volumeRoot, Target: "/app/src", ReadOnly: true, BindOptions: &mount.BindOptions{ReadOnlyForceRecursive: true}},
 	}
 	if err := validateContainerHostConfig(base(), volumeMounts, 3000, volumeRoot); err != nil {
 		t.Fatalf("named-volume source mount rejected: %v", err)
 	}
 	// A read-only bind of an arbitrary sensitive host directory is not trusted.
 	sensitive := []mount.Mount{
-		{Type: mount.TypeBind, Source: "/etc", Target: "/etc", ReadOnly: true},
+		{Type: mount.TypeBind, Source: "/etc", Target: "/etc", ReadOnly: true, BindOptions: &mount.BindOptions{ReadOnlyForceRecursive: true}},
 	}
 	if err := validateContainerHostConfig(base(), sensitive, 3000, "/apps/demo"); err == nil {
 		t.Fatal("a read-only /etc bind was accepted")
@@ -350,5 +351,20 @@ func TestValidateContainerHostConfig(t *testing.T) {
 				t.Fatal("unsafe host config was accepted")
 			}
 		})
+	}
+}
+
+func TestRecursiveReadOnlyBindRequiresSupportedAPI(t *testing.T) {
+	cli, err := client.New(client.WithAPIVersion("1.43"))
+	if err != nil {
+		t.Fatalf("create Docker client: %v", err)
+	}
+	t.Cleanup(func() { _ = cli.Close() })
+	mounts := bindMounts(&SourceMount{HostPath: "/apps/demo", Target: "/app/src"})
+	if err := validateRecursiveReadOnlyMountSupport(cli, mounts); err == nil {
+		t.Fatal("API 1.43 accepted a recursive read-only bind; the option would be ignored")
+	}
+	if err := validateRecursiveReadOnlyMountSupport(cli, nil); err != nil {
+		t.Fatalf("a workload without source mounts needs no recursive-read-only API: %v", err)
 	}
 }

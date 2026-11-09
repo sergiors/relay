@@ -311,6 +311,7 @@ func TestStartServiceCarriedEntitlementSharesUnderRetirement(t *testing.T) {
 	var heldDuringCreate int
 	var m0 *Manager
 	cli := newScriptedDockerClient(t,
+		imageWithoutDeclaredVolumesRoute(image),
 		dockerRoute{method: http.MethodPost, path: "/containers/create", body: `{"Id":"cid-1"}`,
 			onRequest: func(*http.Request) { heldDuringCreate = m0.LeaseCount(image) }},
 		dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
@@ -356,6 +357,7 @@ func TestStartServiceCarriedLeaseForOtherImageDoesNotBypassRetirement(t *testing
 
 	creates := 0
 	cli := newScriptedDockerClient(t,
+		imageWithoutDeclaredVolumesRoute(image),
 		dockerRoute{method: http.MethodPost, path: "/containers/create", body: `{"Id":"cid-1"}`,
 			onMatch: func() { creates++ }},
 		dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
@@ -394,6 +396,7 @@ func TestStartServiceCarriedLeaseForOtherImageAcquiresOwn(t *testing.T) {
 	var heldDuringCreate, otherDuringCreate int
 	var m0 *Manager
 	cli := newScriptedDockerClient(t,
+		imageWithoutDeclaredVolumesRoute(image),
 		dockerRoute{method: http.MethodPost, path: "/containers/create", body: `{"Id":"cid-1"}`,
 			onRequest: func(*http.Request) {
 				heldDuringCreate = m0.LeaseCount(image)

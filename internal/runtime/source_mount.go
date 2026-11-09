@@ -78,6 +78,12 @@ func bindMounts(sm *SourceMount) []mount.Mount {
 		Source:   sm.HostPath,
 		Target:   sm.Target,
 		ReadOnly: true,
+		BindOptions: &mount.BindOptions{
+			// Older kernels/runtimes may not support recursive read-only mounts.
+			// Ask Docker to fail the create instead of leaving a nested mount
+			// writable under the workload's source tree.
+			ReadOnlyForceRecursive: true,
+		},
 	}}
 	for _, mask := range sm.Masks {
 		if mask == "" {

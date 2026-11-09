@@ -38,15 +38,10 @@ type fakeContainer struct {
 	entry     []string // the long-lived process command passed to StartService
 	envHash   string   // relay.env_hash as stamped at create (spec.Env's hash); "" = legacy/unlabeled
 	resources string   // relay.resources as stamped at create (spec.Resources' fingerprint); "" = legacy/unlabeled
-	// securityProfile is relay.security_profile as stamped at create. Directly
-	// seeded fixtures leave it empty and get the current profile by default
-	// (see effectiveSecurityProfile); a test that models a pre-profile container
-	// sets a different non-empty value.
-	securityProfile string
-	sourceID        string // relay.source as stamped at create (spec.SourceMount.Identity); "" = no mount
-	labels          map[string]string
-	networks        []string // spec.Networks passed to StartService (global + routing networks)
-	nodeID          string   // the node identity (relay.node_id) that owns the container
+	sourceID  string   // relay.source as stamped at create (spec.SourceMount.Identity); "" = no mount
+	labels    map[string]string
+	networks  []string // spec.Networks passed to StartService (global + routing networks)
+	nodeID    string   // the node identity (relay.node_id) that owns the container
 }
 
 // effectiveSourceRef returns the container's configured source descriptor,
@@ -56,17 +51,6 @@ func (c *fakeContainer) effectiveSourceRef() string {
 		return c.sourceRef
 	}
 	return c.entrypoint
-}
-
-// effectiveSecurityProfile mirrors a container Relay created under the CURRENT
-// profile. Directly seeded fixtures omit the field to model a converged
-// container; a test that wants a pre-profile container sets a different
-// non-empty value explicitly.
-func (c *fakeContainer) effectiveSecurityProfile() string {
-	if c.securityProfile != "" {
-		return c.securityProfile
-	}
-	return runtime.ServiceSecurityProfile
 }
 
 // sourceMountIdentity mirrors production serviceLabels: the relay.source value a
@@ -182,13 +166,12 @@ func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, r
 		// global + routing network set), so a converged pass sees the networks
 		// match. The effective resource limits' fingerprint (relay.resources) is
 		// stamped too, so a resource-only change replaces the container.
-		envHash:         runtime.EnvHash(spec.Env),
-		resources:       spec.Resources.OrDefault().Fingerprint(),
-		securityProfile: runtime.ServiceSecurityProfile,
-		sourceID:        sourceMountIdentity(spec),
-		labels:          spec.Labels,
-		networks:        append([]string(nil), spec.Networks...),
-		nodeID:          defaultFakeNodeID,
+		envHash:   runtime.EnvHash(spec.Env),
+		resources: spec.Resources.OrDefault().Fingerprint(),
+		sourceID:  sourceMountIdentity(spec),
+		labels:    spec.Labels,
+		networks:  append([]string(nil), spec.Networks...),
+		nodeID:    defaultFakeNodeID,
 	}
 	gate := f.startGate
 	f.mu.Unlock()
@@ -211,22 +194,21 @@ func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceCon
 	var out []runtime.ServiceContainer
 	for _, c := range f.ctrs {
 		out = append(out, runtime.ServiceContainer{
-			ID:              c.id,
-			App:             c.appName,
-			Name:            c.entrypoint,
-			SourceRef:       c.effectiveSourceRef(),
-			Image:           c.image,
-			ImageID:         c.imageID,
-			State:           c.state,
-			Replica:         c.replica,
-			Port:            c.port,
-			NodeID:          c.nodeID,
-			EnvHash:         c.envHash,
-			Resources:       c.resources,
-			SecurityProfile: c.effectiveSecurityProfile(),
-			Networks:        runtime.NetworksLabel(c.networks...),
-			SourceID:        c.sourceID,
-			Labels:          c.labels,
+			ID:        c.id,
+			App:       c.appName,
+			Name:      c.entrypoint,
+			SourceRef: c.effectiveSourceRef(),
+			Image:     c.image,
+			ImageID:   c.imageID,
+			State:     c.state,
+			Replica:   c.replica,
+			Port:      c.port,
+			NodeID:    c.nodeID,
+			EnvHash:   c.envHash,
+			Resources: c.resources,
+			Networks:  runtime.NetworksLabel(c.networks...),
+			SourceID:  c.sourceID,
+			Labels:    c.labels,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -1052,31 +1034,6 @@ func TestReconcileLegacyContainerWithoutEnvHashReplaced(t *testing.T) {
 	c := f.lastStartedFor("fn", "service.js")
 	if c == nil || c.envHash != serviceEnvHash(80) {
 		t.Fatalf("replacement = %+v, want a stamped env hash", c)
-	}
-}
-
-// TestReconcileLegacySecurityProfileReplaced: a persistent container created
-// under an older hardening profile is replaced even when every other label
-// matches. Service containers are long-lived, so without this comparison a
-// container from before a tightened HostConfig would be retained indefinitely.
-func TestReconcileLegacySecurityProfileReplaced(t *testing.T) {
-	f := newFakeDocker()
-	f.ctrs["legacy-profile"] = &fakeContainer{
-		id: "legacy-profile", appName: "fn", entrypoint: "service.js",
-		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
-		envHash: serviceEnvHash(80), resources: serviceResources(),
-		securityProfile: "hardened-v0",
-	}
-	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	if len(f.stops) != 1 || f.stops[0] != "legacy-profile" {
-		t.Fatalf("stops = %v, want [legacy-profile] (an old security profile is stale)", f.stops)
-	}
-	c := f.lastStartedFor("fn", "service.js")
-	if c == nil || c.securityProfile != runtime.ServiceSecurityProfile {
-		t.Fatalf("replacement = %+v, want the current security profile", c)
 	}
 }
 

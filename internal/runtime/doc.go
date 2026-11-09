@@ -167,8 +167,11 @@
 // NET_BIND_SERVICE. A network labelled relay.control, and the reserved host /
 // container:<id> pseudo-networks, are refused before create. Mounts are limited
 // to the read-only HOT_RELOAD source bind and its read-only tmpfs masks; a
-// container-runtime socket mount is rejected. These are internal defaults, not
-// configuration. Outbound networking stays enabled (a legitimate app need;
+// container-runtime socket mount is rejected. An image whose Config declares
+// Docker VOLUME destinations is refused before create, because the daemon would
+// materialize them as implicit anonymous writable mounts outside the bounded
+// /tmp contract. These are internal defaults, not configuration. Outbound
+// networking stays enabled (a legitimate app need;
 // network policy beyond control-plane isolation is a documented residual
 // limitation). The app code is unaware of all of this: the hardening is applied
 // entirely by the engines and the container runner.

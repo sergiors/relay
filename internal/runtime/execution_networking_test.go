@@ -95,6 +95,8 @@ func TestStartExecutionContainerNetworkingConfig(t *testing.T) {
 	t.Run("global networks serialized exactly once", func(t *testing.T) {
 		var createBody []byte
 		cli := newScriptedDockerClient(t, dockerRoute{
+			method: http.MethodGet, path: "/images/img/json", body: `{"Id":"sha256:img","Config":{}}`,
+		}, dockerRoute{
 			method: http.MethodPost, path: "/containers/create",
 			status: http.StatusInternalServerError,
 			body:   `{"message":"scripted create failure"}`,
@@ -128,6 +130,8 @@ func TestStartExecutionContainerNetworkingConfig(t *testing.T) {
 	t.Run("no networks sends no NetworkingConfig", func(t *testing.T) {
 		var createBody []byte
 		cli := newScriptedDockerClient(t, dockerRoute{
+			method: http.MethodGet, path: "/images/img/json", body: `{"Id":"sha256:img","Config":{}}`,
+		}, dockerRoute{
 			method: http.MethodPost, path: "/containers/create",
 			status: http.StatusInternalServerError,
 			body:   `{"message":"scripted create failure"}`,
@@ -157,6 +161,7 @@ func TestStartExecutionContainerNetworkingConfig(t *testing.T) {
 	t.Run("deleted-after-start create failure surfaces with no network create", func(t *testing.T) {
 		networkCreates := 0
 		cli := newScriptedDockerClient(t,
+			dockerRoute{method: http.MethodGet, path: "/images/img/json", body: `{"Id":"sha256:img","Config":{}}`},
 			dockerRoute{
 				method: http.MethodPost, path: "/containers/create",
 				status: http.StatusNotFound,

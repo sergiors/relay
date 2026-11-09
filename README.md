@@ -195,7 +195,9 @@ UID on them. The shared hardening still drops capabilities, sets
 `no-new-privileges`, and uses a read-only rootfs, so prefer images that already
 run as a non-root user and listen on an unprivileged port. The official
 `nginx` image expects to chown and setuid as root, which the hardened baseline
-does not permit.
+does not permit. An image whose config declares Docker `VOLUME` destinations is
+rejected before create, because the daemon would materialize those as implicit
+anonymous writable volumes even with a read-only rootfs.
 
 These are intentionally different ownership models:
 

@@ -201,9 +201,19 @@ func startExecutionContainer(
 	); err != nil {
 		return nil, fmt.Errorf("docker run: unsafe container configuration: %w", err)
 	}
+	// Docker materializes an image-declared VOLUME as an anonymous writable
+	// mount even under ReadonlyRootfs, so refuse it before create just like an
+	// unsafe HostConfig. An image without declared volumes is unchanged.
+	createImage, err := validateImageDeclaredVolumes(ctx, cli, image)
+	if err != nil {
+		return nil, fmt.Errorf("docker run: %w", err)
+	}
+	if err := validateRecursiveReadOnlyMountSupport(cli, mounts); err != nil {
+		return nil, fmt.Errorf("docker run: unsafe container configuration: %w", err)
+	}
 	createOps := client.ContainerCreateOptions{
 		Config: &container.Config{
-			Image: image,
+			Image: createImage,
 			Env:   env,
 			// workDir is the HOT_RELOAD app root (Node's /app/src) so
 			// process.cwd() and relative filesystem operations see the app's

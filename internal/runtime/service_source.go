@@ -24,11 +24,12 @@ const serviceImagePullInterval = time.Hour
 
 // ServiceImage is a resolved service source ready to start a container from.
 //
-// Ref is the image reference passed to the container create call. ID is the
-// local image content ID (relay.image_id), used to detect that a moved tag now
-// points at different bytes so the running container is replaced; it is empty
-// when the reference itself already encodes the content (Relay-built images,
-// whose tag embeds the source fingerprint) or when inspection is unavailable.
+// Ref is the configured image reference retained in service identity and
+// labels. ID is the local image content ID (relay.image_id), used to detect
+// that a moved tag now points at different bytes and to create from the
+// inspected immutable content. It is empty when the reference itself already
+// encodes the content (Relay-built images, whose tag embeds the source
+// fingerprint) or when inspection is unavailable.
 //
 // Entry is the per-container entrypoint override. A nil Entry means the
 // container preserves the image's own ENTRYPOINT/CMD — true for the `image`
