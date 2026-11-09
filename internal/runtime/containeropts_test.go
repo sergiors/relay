@@ -151,6 +151,96 @@ func TestResourceHostConfigMapsEffectiveLimits(t *testing.T) {
 	}
 }
 
+func TestApplyServiceTmpfsUsesFixedBoundedOptions(t *testing.T) {
+	hc := hardenedServiceHostConfig(app.DefaultResourceLimits(), 3000)
+	if err := applyServiceTmpfs(hc, []string{"/var/cache/data", "/run/cache"}, app.DefaultResourceLimits()); err != nil {
+		t.Fatalf("applyServiceTmpfs: %v", err)
+	}
+	want := serviceTmpfsOptions()
+	if want != "rw,nosuid,nodev,noexec,size=16m,mode=1777" {
+		t.Fatalf("serviceTmpfsOptions() = %q, want fixed bounded non-root-writable options", want)
+	}
+	for _, destination := range []string{"/tmp", "/run/cache", "/var/cache/data"} {
+		if got := hc.Tmpfs[destination]; got == "" {
+			t.Errorf("HostConfig.Tmpfs[%q] missing", destination)
+		} else if destination != "/tmp" && got != want {
+			t.Errorf("HostConfig.Tmpfs[%q] = %q, want %q", destination, got, want)
+		}
+	}
+	if hc.Tmpfs["/tmp"] != baseTmpfsOptions {
+		t.Errorf("base /tmp options changed to %q", hc.Tmpfs["/tmp"])
+	}
+	if !hc.ReadonlyRootfs {
+		t.Fatal("service tmpfs disabled ReadonlyRootfs")
+	}
+	if got := hc.Memory; got != 128<<20 {
+		t.Fatalf("HostConfig memory = %d, want default 128 MiB", got)
+	}
+
+	// Zero resource values are normalized before calculating the aggregate budget.
+	if err := applyServiceTmpfs(hardenedServiceHostConfig(app.ResourceLimits{}, 3000), []string{"/run/a", "/run/b"}, app.ResourceLimits{}); err != nil {
+		t.Fatalf("two mounts at default memory limit: %v", err)
+	}
+	if err := applyServiceTmpfs(hardenedServiceHostConfig(app.ResourceLimits{}, 3000), []string{"/run/a", "/run/b", "/run/c"}, app.ResourceLimits{}); err == nil {
+		t.Fatal("three mounts exceeding the default aggregate memory budget were accepted")
+	}
+}
+
+func TestValidateContainerHostConfigServiceTmpfs(t *testing.T) {
+	valid := hardenedServiceHostConfig(app.DefaultResourceLimits(), 3000)
+	if err := applyServiceTmpfs(valid, []string{"/run/cache"}, app.DefaultResourceLimits()); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateContainerHostConfig(valid, nil, 3000, ""); err != nil {
+		t.Fatalf("valid service tmpfs rejected: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*container.HostConfig)
+		mounts []mount.Mount
+	}{
+		{
+			name: "caller supplied options",
+			mutate: func(hc *container.HostConfig) {
+				hc.Tmpfs["/run/cache"] = "rw,size=1g,mode=0777"
+			},
+		},
+		{
+			name: "unapproved path",
+			mutate: func(hc *container.HostConfig) {
+				hc.Tmpfs["/etc"] = serviceTmpfsOptions()
+			},
+		},
+		{
+			name: "overlaps base tmpfs",
+			mutate: func(hc *container.HostConfig) {
+				hc.Tmpfs["/tmp/cache"] = serviceTmpfsOptions()
+			},
+		},
+		{
+			name: "overlaps protected source mount",
+			mutate: func(hc *container.HostConfig) {
+				hc.Tmpfs["/var/cache"] = serviceTmpfsOptions()
+			},
+			mounts: []mount.Mount{{Type: mount.TypeBind, Source: "/apps/fn", Target: "/var/cache", ReadOnly: true, BindOptions: &mount.BindOptions{ReadOnlyForceRecursive: true}}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hc := hardenedServiceHostConfig(app.DefaultResourceLimits(), 3000)
+			if err := applyServiceTmpfs(hc, []string{"/run/cache"}, app.DefaultResourceLimits()); err != nil {
+				t.Fatal(err)
+			}
+			if tc.mutate != nil {
+				tc.mutate(hc)
+			}
+			if err := validateContainerHostConfig(hc, tc.mounts, 3000, "/apps/fn"); err == nil {
+				t.Fatal("unsafe final HostConfig tmpfs was accepted")
+			}
+		})
+	}
+}
+
 // TestValidateContainerHostConfig pins the pre-create enforcement boundary: the
 // exact shared baseline (including a read-only source mount and its read-only
 // tmpfs mask) is accepted, while privileged containers, host namespace/network

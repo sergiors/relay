@@ -64,6 +64,13 @@ type ServiceSpec struct {
 	// stamps their fingerprint as relay.resources so a changed spec is detected
 	// and the container replaced.
 	Resources app.ResourceLimits
+	// Tmpfs is the service's configured additional tmpfs destinations (the
+	// template service's `tmpfs` list), beyond Relay's always-present /tmp. Each
+	// entry is an absolute container path; StartService validates the same
+	// policy as template parsing (see app.ValidateServiceTmpfs) and builds the
+	// bounded, safe mount options itself, so a direct caller cannot inject mount
+	// options. An empty list preserves the historical /tmp-only HostConfig.
+	Tmpfs []string
 	// Labels are EXTRA labels the caller wants on the container (routing
 	// labels supplied by the service reconciler). They are merged onto the
 	// relay ownership set, with Relay ownership keys always winning: a caller
@@ -132,6 +139,20 @@ type ServiceContainer struct {
 	// container created before the label existed, which never equals a desired
 	// fingerprint, so such a container is replaced once.
 	Resources string
+	// Tmpfs is the canonical, sorted, comma-separated list of additional tmpfs
+	// destinations the container was created with, parsed from relay.tmpfs. It
+	// is "" for a service with no additional tmpfs (the historical /tmp-only
+	// case). The service reconciler compares it to the desired configured list
+	// and replaces the container when it differs; /tmp is always present and is
+	// deliberately not part of this value.
+	//
+	// The label is the only configuration identity discovery can compare here:
+	// a ContainerList summary exposes only HostConfig.NetworkMode/Annotations —
+	// not HostConfig.Tmpfs — and ContainerInspect.Mounts does not report tmpfs
+	// mounts on every Engine, so observing the live mount table would require an
+	// extra inspect per container on every reconcile. The immutable label is
+	// stamped from the exact destinations StartService applied.
+	Tmpfs string
 	// Networks is the canonical, sorted, comma-separated set of Docker
 	// networks the container was created attached to (the worker-global
 	// NETWORKS set plus the routing network for a routed service), parsed from
@@ -345,6 +366,34 @@ func EnvHash(env []string) string {
 	return hex.EncodeToString(h.Sum(nil))[:serviceIdentityHashLen]
 }
 
+// ServiceTmpfsLabel returns the canonical value of a service's relay.tmpfs
+// label: the sorted, de-duplicated, comma-separated list of additional tmpfs
+// destinations. An empty result means the service declares no additional tmpfs
+// and the label is omitted, so an unaffected service keeps its historical label
+// set. Container paths cannot contain a comma under the template policy (only
+// /run and /var/cache subtrees are accepted), so the joined form is
+// unambiguous. The value is the configuration itself — not security state and
+// not a version marker — so the reconciler can compare it directly.
+func ServiceTmpfsLabel(destinations []string) string {
+	if len(destinations) == 0 {
+		return ""
+	}
+	seen := make(map[string]bool, len(destinations))
+	set := make([]string, 0, len(destinations))
+	for _, destination := range destinations {
+		if destination == "" || seen[destination] {
+			continue
+		}
+		seen[destination] = true
+		set = append(set, destination)
+	}
+	if len(set) == 0 {
+		return ""
+	}
+	sort.Strings(set)
+	return strings.Join(set, ",")
+}
+
 // serviceLabels is the total, greppable label set stamped on every service
 // container: relay.type=service plus relay.app + relay.node_id make a
 // service container recognizable to Relay while the strict relay.type guard
@@ -358,6 +407,9 @@ func EnvHash(env []string) string {
 // content-addressed), so a moved external tag is detected. relay.env_hash pins
 // the effective environment's content hash so an env/secret change replaces a
 // container whose image reference is unchanged (see labelEnvHash).
+// relay.resources and relay.tmpfs pin the effective per-container resources and
+// the configured additional tmpfs destinations, so a change to either replaces
+// a running service.
 //
 // Extra caller-supplied labels (spec.Labels, e.g. routing labels) are merged
 // on top, then the relay ownership keys are RE-applied last so Relay's
@@ -366,6 +418,7 @@ func EnvHash(env []string) string {
 func serviceLabels(spec ServiceSpec, nodeID string, replica int) map[string]string {
 	envHash := EnvHash(spec.Env)
 	resourceHash := spec.Resources.OrDefault().Fingerprint()
+	tmpfsLabel := ServiceTmpfsLabel(spec.Tmpfs)
 	sourceID := ""
 	if spec.SourceMount != nil {
 		sourceID = spec.SourceMount.Identity
@@ -402,6 +455,13 @@ func serviceLabels(spec ServiceSpec, nodeID string, replica int) map[string]stri
 	labels[labelReplica] = strconv.Itoa(replica)
 	labels[labelEnvHash] = envHash
 	labels[labelResources] = resourceHash
+	// The tmpfs configuration is identity metadata too; re-apply it last and
+	// clear a spoofed value when the service declares no additional tmpfs.
+	if tmpfsLabel != "" {
+		labels[labelTmpfs] = tmpfsLabel
+	} else {
+		delete(labels, labelTmpfs)
+	}
 	// The image content ID is an ownership key too; a caller can never spoof it,
 	// and an empty ID (a content-addressed Relay tag) clears any spoofed value.
 	if spec.ImageID != "" {
@@ -534,13 +594,22 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		cfg.WorkingDir = spec.SourceMount.WorkDir
 	}
 
+	// The resolved resource limits apply exactly as they do to an invocation
+	// container. A declared privileged port adds only NET_BIND_SERVICE on top
+	// of the shared CapDrop ALL baseline. Additional service tmpfs mounts are
+	// added here, before create: StartService validates the same destination
+	// policy as template parsing and builds the bounded option strings itself.
+	hostConfig := hardenedServiceHostConfig(spec.Resources, spec.Port)
+	if err := applyServiceTmpfs(
+		hostConfig, spec.Tmpfs, spec.Resources,
+	); err != nil {
+		return "", fmt.Errorf("service: %w", err)
+	}
+
 	createOps := client.ContainerCreateOptions{
 		Config: cfg,
-		// No AutoRemove: persistent, reconciler-owned (see doc comment). The
-		// resolved resource limits apply exactly as they do to an invocation
-		// container. A declared privileged port adds only NET_BIND_SERVICE on
-		// top of the shared CapDrop ALL baseline.
-		HostConfig: hardenedServiceHostConfig(spec.Resources, spec.Port),
+		// No AutoRemove: persistent, reconciler-owned (see doc comment).
+		HostConfig: hostConfig,
 		// A unique physical name per start, so the replacement generation can
 		// be created while the generation it replaces is still running.
 		Name: serviceContainerNameForStart(spec.App, spec.Name, replica),
@@ -572,8 +641,23 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		// tag that could move between validation and ContainerCreate.
 		inspectImage = spec.ImageID
 	}
-	createImage, err := validateImageDeclaredVolumes(ctx, m.cli, inspectImage)
+	createImage, err := validateImageDeclaredVolumes(
+		ctx, m.cli, inspectImage, spec.Tmpfs...)
 	if err != nil {
+		return "", fmt.Errorf("service: %w", err)
+	}
+	// Docker follows container-rootfs symlinks when applying HostConfig.Tmpfs,
+	// so a path allowlist alone is not sufficient. Prove against the exact
+	// immutable image content that no configured tmpfs target (or parent) is a
+	// symlink or other non-directory redirection before create. This runs after
+	// the image identity is pinned and before ContainerCreate; no image code is
+	// executed, and an unreadable/undecodable archive fails closed. Successful
+	// results are reused per immutable image ID and exact destination set, and
+	// concurrent same-pair requests coalesce, so replicas do not each stream the
+	// image archive. Failures are never reused.
+	if err := m.validateImageTmpfsTargetsCached(
+		ctx, createImage, spec.Tmpfs,
+	); err != nil {
 		return "", fmt.Errorf("service: %w", err)
 	}
 	if err := validateRecursiveReadOnlyMountSupport(m.cli, sourceMounts); err != nil {
@@ -763,6 +847,7 @@ func (m *Manager) serviceContainerList(ctx context.Context, admit dockerOpAdmitt
 			Port:      port,
 			EnvHash:   c.Labels[labelEnvHash],
 			Resources: c.Labels[labelResources],
+			Tmpfs:     c.Labels[labelTmpfs],
 			Networks:  c.Labels[labelNetworks],
 			SourceID:  c.Labels[labelSource],
 			Labels:    labelsCopy,

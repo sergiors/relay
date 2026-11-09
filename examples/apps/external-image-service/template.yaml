@@ -10,3 +10,6 @@ services:
     image: nginxinc/nginx-unprivileged:1.27-alpine
     port: 8080
     replicas: 1
+    tmpfs:
+      - /run
+      - /var/cache/nginx

@@ -38,6 +38,7 @@ type fakeContainer struct {
 	entry     []string // the long-lived process command passed to StartService
 	envHash   string   // relay.env_hash as stamped at create (spec.Env's hash); "" = legacy/unlabeled
 	resources string   // relay.resources as stamped at create (spec.Resources' fingerprint); "" = legacy/unlabeled
+	tmpfs     string   // relay.tmpfs as stamped at create (canonical additional destinations)
 	sourceID  string   // relay.source as stamped at create (spec.SourceMount.Identity); "" = no mount
 	labels    map[string]string
 	networks  []string // spec.Networks passed to StartService (global + routing networks)
@@ -168,6 +169,7 @@ func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, r
 		// stamped too, so a resource-only change replaces the container.
 		envHash:   runtime.EnvHash(spec.Env),
 		resources: spec.Resources.OrDefault().Fingerprint(),
+		tmpfs:     runtime.ServiceTmpfsLabel(spec.Tmpfs),
 		sourceID:  sourceMountIdentity(spec),
 		labels:    spec.Labels,
 		networks:  append([]string(nil), spec.Networks...),
@@ -206,6 +208,7 @@ func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceCon
 			NodeID:    c.nodeID,
 			EnvHash:   c.envHash,
 			Resources: c.resources,
+			Tmpfs:     c.tmpfs,
 			Networks:  runtime.NetworksLabel(c.networks...),
 			SourceID:  c.sourceID,
 			Labels:    c.labels,
@@ -416,6 +419,60 @@ func TestReconcileInitialCreation(t *testing.T) {
 	if got := f.runningCount("fn", "service.js"); got != 2 {
 		t.Fatalf("running after idle reconcile = %d, want 2", got)
 	}
+}
+
+func TestReconcileServiceTmpfsChangeReplacesAndUnchangedDoesNotChurn(t *testing.T) {
+	f := newFakeDocker()
+	svc := app.Service{
+		Name: "cache", Entrypoint: "service.js", Port: 8080, Replicas: 1,
+		Tmpfs: []string{"/run/cache"},
+	}
+	tmpl := serviceTemplate("nodejs24.x", svc)
+	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
+		t.Fatalf("initial reconcile: %v", err)
+	}
+	first := fakeServiceContainers(f, "fn", "cache")
+	if len(first) != 1 || first[0].tmpfs != "/run/cache" {
+		t.Fatalf("initial container(s) = %+v, want one with /run/cache tmpfs", first)
+	}
+
+	transitions := len(f.order())
+	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
+		t.Fatalf("unchanged reconcile: %v", err)
+	}
+	if got := len(f.order()); got != transitions {
+		t.Fatalf("unchanged tmpfs caused %d new transition(s), want no churn", got-transitions)
+	}
+	if after := fakeServiceContainers(f, "fn", "cache"); len(after) != 1 || after[0].id != first[0].id {
+		t.Fatalf("unchanged tmpfs replaced the container: before=%+v after=%+v", first, after)
+	}
+
+	svc.Tmpfs = []string{"/var/cache/data"}
+	changed := serviceTemplate("nodejs24.x", svc)
+	if _, err := reconcile(t, f, "fn", changed, "img-1", routing.TraefikConfig{}); err != nil {
+		t.Fatalf("tmpfs-change reconcile: %v", err)
+	}
+	current := fakeServiceContainers(f, "fn", "cache")
+	if len(current) != 1 || current[0].id == first[0].id || current[0].tmpfs != "/var/cache/data" {
+		t.Fatalf("changed tmpfs container(s) = %+v, want replacement with /var/cache/data", current)
+	}
+	order := f.order()
+	if len(order) < transitions+2 || !strings.HasPrefix(order[transitions], "start:") || order[transitions+1] != "stop:"+first[0].id {
+		t.Fatalf("replacement order = %v, want replacement start before old container stop", order)
+	}
+}
+
+func fakeServiceContainers(f *fakeDocker, fn, service string) []fakeContainer {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var result []fakeContainer
+	for _, current := range f.ctrs {
+		if current.appName == fn && current.entrypoint == service {
+			result = append(result, *current)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].id < result[j].id })
+	return result
 }
 
 func TestReconcileScaleUp(t *testing.T) {

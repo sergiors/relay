@@ -10,10 +10,6 @@ services:
       postgres:
         condition: service_healthy
 
-    ports:
-      - 9090:9090
-      - 8081:8081
-
     environment:
       - REDIS_URI=redis:6379
       - REDIS_STREAM=events

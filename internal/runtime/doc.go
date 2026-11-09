@@ -163,14 +163,22 @@
 // capabilities, enables no-new-privileges while preserving Docker's default
 // seccomp profile, uses private PID/IPC/network namespaces, is
 // memory/CPU/pids-limited, has a read-only rootfs, and gets a bounded /tmp tmpfs
-// as its only writable path. A service declaring a port below 1024 adds only
-// NET_BIND_SERVICE. A network labelled relay.control, and the reserved host /
+// as its baseline writable path. A service declaring a port below 1024 adds only
+// NET_BIND_SERVICE. A persistent service may declare additional bounded,
+// nosuid,nodev,noexec tmpfs destinations (validated against the same narrow path
+// policy as template parsing); each target and existing parent component is
+// proven from the immutable image layers to be a non-symlink directory before
+// create, because Docker follows rootfs symlinks when applying HostConfig.Tmpfs.
+// Execution containers never add tmpfs destinations. A network labelled
+// relay.control, and the reserved host /
 // container:<id> pseudo-networks, are refused before create. Mounts are limited
 // to the read-only HOT_RELOAD source bind and its read-only tmpfs masks; a
 // container-runtime socket mount is rejected. An image whose Config declares
 // Docker VOLUME destinations is refused before create, because the daemon would
 // materialize them as implicit anonymous writable mounts outside the bounded
-// /tmp contract. These are internal defaults, not configuration. Outbound
+// /tmp contract; a service volume is allowed only when an explicitly configured
+// tmpfs covers that exact destination. These are internal defaults, not
+// configuration. Outbound
 // networking stays enabled (a legitimate app need;
 // network policy beyond control-plane isolation is a documented residual
 // limitation). The app code is unaware of all of this: the hardening is applied

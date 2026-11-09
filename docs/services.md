@@ -99,9 +99,11 @@ External images must run under those constraints. Prefer images that already run
 as a non-root user and listen on an unprivileged port (for example
 `nginxinc/nginx-unprivileged`, not the official `nginx`, which expects to chown
 cache directories and setuid its workers). An image whose config declares Docker
-`VOLUME` destinations is refused before create: the daemon would materialize
-those as implicit anonymous writable volumes even with a read-only rootfs,
-bypassing the bounded `/tmp` contract. Use an image without declared volumes.
+`VOLUME` destinations is refused before create by default: the daemon would
+materialize those as implicit anonymous writable volumes even with a read-only
+rootfs. A declared destination is accepted only when the service explicitly
+covers it with an additional `tmpfs` at the exact path (see below); Relay never
+adds one automatically.
 
 Service networking: every service container joins the worker-global `NETWORKS`
 set (the same set execution containers join); a **routed** service additionally
@@ -120,6 +122,63 @@ daemon **after** that verification is not re-created: a container that needs
 creating (a replacement or a new replica) fails, the failure is reported for that
 service and retried on the next reconcile, and an already-converged running
 container is left untouched.
+
+## Additional writable tmpfs
+
+A read-only rootfs leaves `/tmp` as the only writable path by default. A service
+that also needs an ephemeral cache or runtime directory can declare a `tmpfs`
+list:
+
+```yaml
+services:
+  - name: web
+    image: nginxinc/nginx-unprivileged:1.27-alpine
+    port: 8080
+    tmpfs: [/var/cache/nginx, /run]
+```
+
+Rules:
+
+- Each entry is an absolute **container** path. The accepted roots are `/run`
+  and `/var/cache` (the root itself or any descendant). Everything else,
+  including `/`, `/tmp`, `/etc`, `/proc`, `/sys`, `/dev`, and `/var/run`, is
+  rejected. Entries must be canonical (no trailing slash, empty segment, or
+  `.`/`..` segment), and duplicate or overlapping destinations are rejected.
+- `/tmp` always exists exactly as before and cannot be redeclared.
+- Relay builds each additional mount with fixed options
+  `rw,nosuid,nodev,noexec,size=16m,mode=1777`. The `1777` (sticky,
+  world-writable) mode lets a non-root service process write. Callers cannot
+  supply mount options.
+- Before create, Relay inspects the exact immutable image content and rejects a
+  target (or any existing parent component) that is a symlink or a non-directory
+  in the image. Docker follows container-rootfs symlinks when applying
+  `HostConfig.Tmpfs`, so without this check an image with
+  `/var/cache -> /etc` could make a tmpfs at `/var/cache` writable over `/etc`
+  despite the read-only rootfs. A missing target directory is allowed: the
+  daemon creates it beneath the checked parents. An image whose filesystem
+  cannot be inspected fails the create closed.
+- Each mount is capped at 16 MiB, and the aggregate upper bound must not exceed
+  one quarter of the app's effective per-container `resources.memory` (default
+  `128MiB`, so two mounts by default). tmpfs pages count against the container
+  memory limit; raise `resources.memory` to allow more mounts. Exceeding the
+  budget is a template error.
+- Additional tmpfs is a service-only capability: execution and warm containers
+  keep their `/tmp`-only configuration.
+
+The configured destinations are part of the service's container identity
+(`relay.tmpfs`, the canonical sorted list). Changing the list replaces the
+running replicas through the normal start-before-stop path.
+
+### Image-declared VOLUME destinations
+
+An image config that declares Docker `VOLUME` destinations is still refused by
+default, because the daemon would materialize them as implicit anonymous
+writable volumes even under a read-only rootfs. The exception is a declared
+destination that is **exactly** covered by one of the service's configured
+`tmpfs` entries: an image declaring `/var/cache/nginx` is accepted when the
+service lists `/var/cache/nginx`. Relay never adds a tmpfs automatically for an
+image volume, and any destination that is not explicitly configured remains an
+error.
 
 ## Convergence and lifecycle
 
@@ -142,8 +201,9 @@ to the template.
   outage therefore never degrades a working service.
 - Containers whose source descriptor, image (or, for an external tag, image
   **content**), port, effective environment (`relay.env_hash`), per-container
-  resources (`relay.resources`), or routing labels no longer match are
-  **replaced**. Others are preserved — no unnecessary restarts. The joined
+  resources (`relay.resources`), additional tmpfs configuration
+  (`relay.tmpfs`), or routing labels no longer match are **replaced**. Others
+  are preserved — no unnecessary restarts. The joined
   network **set** (global `NETWORKS` + routing network for a routed service)
   participates in this comparison order-independently: reordering or repeating a
   network never replaces a container, but adding/removing/switching one does.
@@ -199,14 +259,16 @@ A failed check does not advance the window, so it retries at the next reconcile.
 Containers are identified by deterministic Relay-owned labels
 (`relay.type=service`, `relay.app`, `relay.service`, `relay.identity`, plus
 image content id, port, replica slot, `relay.env_hash`, `relay.resources`,
-`relay.networks`), never by name alone. `relay.service` is the service's stable
-name (the grouping key); `relay.identity` is its configured source descriptor,
-used only to resolve the image/entry command and to detect a changed
-implementation. Service containers carry no `relay.handler` label. The Docker
-container name is greppable and derived from the app/name/replica, but
-carries a per-start uniqueness token so a replacement can be created while the
-container it replaces is still running; ownership, grouping, and the replica slot
-always come from the labels.
+`relay.tmpfs`, `relay.networks`), never by name alone. `relay.service` is the
+service's stable name (the grouping key); `relay.identity` is its configured
+source descriptor, used only to resolve the image/entry command and to detect a
+changed implementation. `relay.tmpfs` is the canonical sorted list of configured
+additional tmpfs destinations (omitted when there are none) and is configuration
+identity, not a security marker. Service containers carry no `relay.handler`
+label. The Docker container name is greppable and derived from the
+app/name/replica, but carries a per-start uniqueness token so a replacement can
+be created while the container it replaces is still running; ownership,
+grouping, and the replica slot always come from the labels.
 
 ## Traefik routing (optional)
 

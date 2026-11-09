@@ -243,6 +243,14 @@ type Service struct {
 	Path     string
 	Port     int
 	Replicas int
+	// Tmpfs lists additional writable tmpfs destinations for the container,
+	// beyond Relay's always-present /tmp. After ParseTemplate it is nil or a
+	// canonical (sorted) list of absolute paths, each validated against the
+	// narrow ephemeral-root policy and the per-container memory budget (see
+	// ValidateServiceTmpfs). Relay builds every mount with a fixed bounded
+	// size and safe nosuid,nodev,noexec options; callers cannot supply mount
+	// options.
+	Tmpfs []string
 }
 
 // NeedsRuntime reports whether Relay must know how to launch this template:
@@ -578,6 +586,11 @@ func ParseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 			// resolveServiceReplicas).
 			Port     any `yaml:"port"`
 			Replicas any `yaml:"replicas"`
+			// Tmpfs is the optional additional-writable-path list. It stays a
+			// plain string slice so a non-list or non-string entry fails the
+			// YAML decode; path policy and memory bounds are validated below
+			// (see resolveServiceTmpfs).
+			Tmpfs []string `yaml:"tmpfs"`
 		} `yaml:"services"`
 	}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
@@ -833,6 +846,15 @@ func ParseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		if err != nil {
 			return nil, fmt.Errorf("service %q: %w", s.Name, err)
 		}
+		// Additional tmpfs destinations are validated against the narrow
+		// ephemeral-path policy and the app's effective per-container memory
+		// budget. The runtime revalidates the same policy (and the final
+		// HostConfig) before create, so a direct ServiceSpec caller cannot
+		// bypass it.
+		tmpfs, err := resolveServiceTmpfs(s.Tmpfs, resources.MemoryBytes)
+		if err != nil {
+			return nil, fmt.Errorf("service %q: %w", s.Name, err)
+		}
 		t.Services = append(t.Services, Service{
 			Name:       s.Name,
 			Entrypoint: entrypoint,
@@ -841,6 +863,7 @@ func ParseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 			Path:       path,
 			Port:       port,
 			Replicas:   replicas,
+			Tmpfs:      tmpfs,
 		})
 	}
 	return t, nil

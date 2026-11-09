@@ -33,9 +33,10 @@
 //     only services use the external `image` source) builds no image from
 //     source, so FingerprintApp narrows its fingerprint to template.yaml
 //     ALONE — an irrelevant source edit can never look like a desired-state
-//     change, and the tree is not scanned. The top-level `resources` mapping is
-//     excluded from BOTH fingerprint paths (stripTemplateResources), so a
-//     resource-only edit never changes the digest and never triggers a rebuild.
+//     change, and the tree is not scanned. Runtime-only configuration (the
+//     top-level `resources` mapping and service `tmpfs` lists) is excluded from
+//     BOTH fingerprint paths (stripTemplateResources), so editing it never
+//     changes the digest and never triggers a rebuild.
 //
 // Resource limits:
 //   - `resources` (optional) declares per-container memory/CPU/PID limits for

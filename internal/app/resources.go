@@ -238,20 +238,22 @@ func numericToFloat(raw any) (float64, bool) {
 	}
 }
 
-// stripTemplateResources removes the top-level `resources` key from a
-// template.yaml document and re-serializes it. It is how the content fingerprint
-// intentionally EXCLUDES resource configuration: a resource-only hot change must
-// not look like a source change, so it must not change the app's image
-// fingerprint (and therefore must not trigger a rebuild). The rest of the
-// document is preserved verbatim by operating on the YAML node tree rather than
-// re-marshalling a decoded Go value, so comments, key order, and inline-vs-block
-// style survive and a resource-only edit yields byte-identical output.
+// stripTemplateResources removes the RUNTIME-ONLY configuration that must not
+// participate in an app's image fingerprint: the top-level `resources` key and
+// each service's `tmpfs` list. Both are applied to containers at create time,
+// never baked into a built image, so a resource-only or tmpfs-only edit must not
+// look like a source change (and therefore must not trigger a rebuild).
+//
+// The rest of the document is preserved verbatim by operating on the YAML node
+// tree rather than re-marshalling a decoded Go value, so comments, key order,
+// and inline-vs-block style survive and such an edit yields byte-identical
+// output.
 //
 // It is best-effort: a document that is not a YAML mapping, or that fails to
 // parse/re-serialize, is returned unchanged (hashing proceeds over the raw
-// bytes). Only the ROOT `resources` mapping is stripped — a nested file named
-// template.yaml is not touched, because callers apply this only to the root
-// template.
+// bytes). Only the ROOT `resources` mapping and ROOT service entries are
+// touched — a nested file named template.yaml is not, because callers apply this
+// only to the root template.
 func stripTemplateResources(raw []byte) []byte {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(raw, &doc); err != nil || len(doc.Content) == 0 {
@@ -263,10 +265,14 @@ func stripTemplateResources(raw []byte) []byte {
 	}
 	kept := make([]*yaml.Node, 0, len(root.Content))
 	for i := 0; i+1 < len(root.Content); i += 2 {
-		if root.Content[i].Value == "resources" {
+		key := root.Content[i]
+		switch key.Value {
+		case "resources":
 			continue
+		case "services":
+			stripServiceTmpfsKeys(root.Content[i+1])
 		}
-		kept = append(kept, root.Content[i], root.Content[i+1])
+		kept = append(kept, key, root.Content[i+1])
 	}
 	root.Content = kept
 	out, err := yaml.Marshal(&doc)
@@ -274,4 +280,27 @@ func stripTemplateResources(raw []byte) []byte {
 		return raw
 	}
 	return out
+}
+
+// stripServiceTmpfsKeys removes the `tmpfs` key from every mapping in a
+// top-level `services` sequence. It is deliberately narrow: a `tmpfs` key
+// elsewhere in the document is not runtime-only service configuration and still
+// participates in the fingerprint.
+func stripServiceTmpfsKeys(services *yaml.Node) {
+	if services == nil || services.Kind != yaml.SequenceNode {
+		return
+	}
+	for _, service := range services.Content {
+		if service.Kind != yaml.MappingNode {
+			continue
+		}
+		kept := make([]*yaml.Node, 0, len(service.Content))
+		for i := 0; i+1 < len(service.Content); i += 2 {
+			if service.Content[i].Value == "tmpfs" {
+				continue
+			}
+			kept = append(kept, service.Content[i], service.Content[i+1])
+		}
+		service.Content = kept
+	}
 }

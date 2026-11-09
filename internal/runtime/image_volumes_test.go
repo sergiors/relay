@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"archive/tar"
 	"context"
 	"net/http"
 	"strings"
@@ -57,6 +58,27 @@ func TestExecutionContainerCreatesFromInspectedImageID(t *testing.T) {
 }
 
 func TestValidateImageDeclaredVolumes(t *testing.T) {
+	t.Run("exact configured tmpfs coverage is accepted", func(t *testing.T) {
+		cli := newScriptedDockerClient(t, dockerRoute{
+			method: http.MethodGet,
+			path:   "/images/test-image/json",
+			body:   `{"Id":"sha256:with-volume","Config":{"Volumes":{"/run/cache":{}}}}`,
+		})
+		if got, err := validateImageDeclaredVolumes(context.Background(), cli, "test-image", "/run/cache"); err != nil || got != "sha256:with-volume" {
+			t.Fatalf("exact tmpfs coverage: id=%q err=%v, want immutable ID and no error", got, err)
+		}
+	})
+	t.Run("ancestor tmpfs does not cover a declared volume", func(t *testing.T) {
+		cli := newScriptedDockerClient(t, dockerRoute{
+			method: http.MethodGet,
+			path:   "/images/test-image/json",
+			body:   `{"Id":"sha256:with-volume","Config":{"Volumes":{"/run/cache":{}}}}`,
+		})
+		if _, err := validateImageDeclaredVolumes(context.Background(), cli, "test-image", "/run"); err == nil || !strings.Contains(err.Error(), "/run/cache") {
+			t.Fatalf("ancestor-only tmpfs coverage error = %v, want uncovered destination", err)
+		}
+	})
+
 	t.Run("rejects destinations in sorted order", func(t *testing.T) {
 		cli := newScriptedDockerClient(t, dockerRoute{
 			method: http.MethodGet,
@@ -119,6 +141,75 @@ func TestValidateImageDeclaredVolumes(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestStartServiceAcceptsExactlyCoveredDeclaredVolumeAndSerializesTmpfs(t *testing.T) {
+	const image = "registry.example/service:with-volume"
+	var createBody []byte
+	cli := newScriptedDockerClient(t,
+		dockerRoute{
+			method: http.MethodGet,
+			path:   "/images/" + image + "/json",
+			body:   `{"Id":"sha256:with-volume","Config":{"Volumes":{"/run/cache":{}}}}`,
+		},
+		imageSaveRoute(imageSaveBody(t, archiveLayer{
+			name: "blobs/sha256/layer0", gzip: true,
+			body: layerTar(t,
+				archiveEntry{name: "run", typ: tar.TypeDir},
+				archiveEntry{name: "run/cache", typ: tar.TypeDir},
+			),
+		})),
+		dockerRoute{
+			method: http.MethodPost, path: "/containers/create", body: `{"Id":"cid-1"}`,
+			onBody: func(body []byte) { createBody = append([]byte(nil), body...) },
+		},
+		dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
+		dockerRoute{method: http.MethodGet, path: "/containers/cid-1/json", body: `{"Id":"cid-1","State":{"Running":true}}`},
+	)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "test-host"}
+	if _, err := m.StartService(context.Background(), ServiceSpec{
+		App: "fn", Name: "svc", SourceRef: image, Image: image, Port: 8080,
+		Tmpfs: []string{"/run/cache"},
+	}, 0); err != nil {
+		t.Fatalf("StartService with exact declared-volume coverage: %v", err)
+	}
+	if len(createBody) == 0 {
+		t.Fatal("no /containers/create request was captured")
+	}
+	req := decodeCreateRequest(t, createBody)
+	if got, want := req.HostConfig.Tmpfs["/run/cache"], serviceTmpfsOptions(); got != want {
+		t.Fatalf("serialized HostConfig.Tmpfs[/run/cache] = %q, want %q", got, want)
+	}
+	if req.Config.Labels[labelTmpfs] != "/run/cache" {
+		t.Fatalf("relay.tmpfs label = %q, want /run/cache", req.Config.Labels[labelTmpfs])
+	}
+	if !req.HostConfig.ReadonlyRootfs {
+		t.Fatal("serialized service HostConfig must retain ReadonlyRootfs")
+	}
+}
+
+func TestStartServiceRejectsInvalidDirectTmpfsSpecBeforeCreate(t *testing.T) {
+	creates := 0
+	const image = "registry.example/service:direct-spec"
+	cli := newScriptedDockerClient(t,
+		imageWithoutDeclaredVolumesRoute(image),
+		dockerRoute{
+			method: http.MethodPost, path: "/containers/create", body: `{"Id":"unexpected"}`,
+			onMatch: func() { creates++ },
+		},
+	)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "test-host"}
+	_, err := m.StartService(context.Background(), ServiceSpec{
+		App: "fn", Name: "svc", SourceRef: image, Image: image, Port: 8080,
+		// Bypass template parsing deliberately: runtime create must enforce policy.
+		Tmpfs: []string{"/etc"},
+	}, 0)
+	if err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("StartService error = %v, want direct-spec tmpfs rejection", err)
+	}
+	if creates != 0 {
+		t.Fatalf("Docker ContainerCreate calls = %d, want none", creates)
+	}
 }
 
 func TestWorkloadCreateRejectsImageDeclaredVolumesBeforeCreate(t *testing.T) {

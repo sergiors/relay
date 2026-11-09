@@ -220,6 +220,13 @@ type Manager struct {
 	// pullMu.
 	pullMu     sync.Mutex
 	pullChecks map[string]time.Time
+	// tmpfsChecks caches SUCCESSFUL service image-filesystem validations by
+	// immutable image content ID and exact additional-tmpfs destination set, so
+	// repeated replicas do not re-stream the image archive, and coalesces
+	// concurrent requests for the same pair. Failures are never retained. It is
+	// in-memory for the Manager's lifetime and holds no image bytes or
+	// filesystem state; see image_tmpfs.go.
+	tmpfsChecks imageTmpfsValidationCache
 	// depBuilds deduplicates concurrent builds of the SAME content-addressed
 	// dependency image. Parallel preparations of apps with identical manifest
 	// inputs are common at startup, and the layer is shared, so only one caller

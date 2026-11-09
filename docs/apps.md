@@ -63,6 +63,9 @@ services: # persistent long-running containers
     entrypoint: service.js
     port: 3000
     replicas: 2
+  - name: cache
+    image: nginxinc/nginx-unprivileged:1.27-alpine
+    tmpfs: [/run, /var/cache/nginx] # optional additional writable tmpfs
 ```
 
 A template must declare **at least one event rule or one service**. `schedules`
@@ -384,7 +387,9 @@ capabilities dropped, read-only root filesystem with a bounded `/tmp` tmpfs,
 per-container memory/CPU/PID limits, outbound networking enabled. An image whose
 config declares Docker `VOLUME` destinations is refused before create (including
 declarations inherited from a base image), because the daemon would materialize
-them as implicit anonymous writable volumes outside the bounded `/tmp`.
+them as implicit anonymous writable volumes outside the bounded `/tmp`. (A
+persistent service can explicitly cover an image volume with a configured
+`tmpfs`; see [services.md](services.md#additional-writable-tmpfs).)
 
 ### Docker networks
 

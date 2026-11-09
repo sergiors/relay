@@ -727,6 +727,16 @@ func reconcileWithObserver(
 		// even though the image reference (and image fingerprint) are unchanged.
 		resources := tmpl.ResourceLimits()
 		resourceHash := resources.Fingerprint()
+		// desiredTmpfs is the canonical identity of the service's configured
+		// additional tmpfs destinations. It is compared against each container's
+		// relay.tmpfs label below, so a tmpfs-configuration change replaces the
+		// running service even though neither the image nor any other label
+		// changes. The label is the only observable identity here: ContainerList
+		// summaries omit HostConfig.Tmpfs and inspected Mounts omit tmpfs entries
+		// on some Engines, so comparing the live mount table would add an inspect
+		// per discovered container each pass. The always-present /tmp mount is
+		// constant and not encoded.
+		desiredTmpfs := runtime.ServiceTmpfsLabel(svc.Tmpfs)
 		// desiredNetworks / desiredNetworkSet is the canonical network set the
 		// container must carry and join: the worker-global NETWORKS set every
 		// service container joins, plus the routing network for a routed
@@ -741,16 +751,17 @@ func reconcileWithObserver(
 
 		// A container is CONVERGED (a keep candidate) only when it is both
 		// healthy (running) and currently configured correctly (source reference,
-		// image, image content, port, effective environment, source mount, and
-		// Docker networks all match the desired values) and carries a real
-		// replica label. Anything else — exited/dead/removing, a changed source, a
-		// changed image, a moved external tag (image content changed), a changed
-		// port, a changed env/secret (env hash mismatch), a changed network set,
-		// a changed mounted source (relay.source), or an unlabeled legacy
-		// container (Replica == -1) — is a non-converged
-		// generation that a converged
-		// replacement supersedes. In addition, the container's labels must match
-		// the desired routing label set exactly: a changed host/path/port leaves
+		// image, image content, port, effective environment, resources, additional
+		// tmpfs destinations, source mount, and Docker networks all match the
+		// desired values) and carries a real replica label. Anything else —
+		// exited/dead/removing, a changed source, a changed image, a moved
+		// external tag (image content changed), a changed port, a changed
+		// env/secret (env hash mismatch), a changed resource configuration, a
+		// changed tmpfs list, a changed network set, a changed mounted source
+		// (relay.source), or an unlabeled legacy container (Replica == -1) — is a
+		// non-converged generation that a converged replacement supersedes. In
+		// addition, the container's labels must match the desired routing label
+		// set exactly: a changed host/path/port leaves
 		// stale Traefik labels pointing traffic at whatever the old container
 		// served, so the container is replaced. SourceRef comparison matters for
 		// an `image` source whose two references resolve to the same bytes: the
@@ -783,6 +794,7 @@ func reconcileWithObserver(
 				ctr.Port == svc.Port &&
 				ctr.EnvHash == envHash &&
 				ctr.Resources == resourceHash &&
+				ctr.Tmpfs == desiredTmpfs &&
 				ctr.Networks == desiredNetworks &&
 				sourceOK &&
 				ctr.Replica >= 0 &&
@@ -793,7 +805,7 @@ func reconcileWithObserver(
 		// EXCEPT for its live source fingerprint: the exact case an in-place
 		// restart resolves under HOT_RELOAD. It requires a real source mount
 		// (desiredSourceID != "") and an immutable relay.source label that differs;
-		// every other field — image, image content, port, env, resources,
+		// every other field — image, image content, port, env, resources, tmpfs,
 		// networks, replica slot, routing labels — must already match, so a
 		// configuration or dependency change still replaces rather than restarts.
 		sourceOnlyStale := func(ctr runtime.ServiceContainer) bool {
@@ -806,6 +818,7 @@ func reconcileWithObserver(
 				ctr.Port == svc.Port &&
 				ctr.EnvHash == envHash &&
 				ctr.Resources == resourceHash &&
+				ctr.Tmpfs == desiredTmpfs &&
 				ctr.Networks == desiredNetworks &&
 				ctr.Replica >= 0 &&
 				routingLabelsMatch(routeLabels, ctr.Labels)
@@ -824,6 +837,7 @@ func reconcileWithObserver(
 				Entry:       resolved.Entry,
 				Env:         env,
 				Resources:   resources,
+				Tmpfs:       svc.Tmpfs,
 				Labels:      routeLabels,
 				Networks:    desiredNetworkSet,
 				SourceMount: resolved.Mount,

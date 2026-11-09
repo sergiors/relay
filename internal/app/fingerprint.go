@@ -17,10 +17,10 @@ import (
 
 // Fingerprint returns a deterministic SHA-256 over the complete contents of the
 // app's SELECTED source: every included file's slash-separated relative path
-// plus its bytes, sorted by path. template.yaml is hashed with its top-level
-// `resources` mapping removed, so a resource-only edit is deliberately invisible
-// to the digest (a resource change is applied to containers, not baked into the
-// image; see stripTemplateResources).
+// plus its bytes, sorted by path. template.yaml is hashed with its runtime-only
+// configuration (top-level `resources` and service `tmpfs`) removed, so an edit
+// to either is deliberately invisible to the digest: both are applied to
+// containers, not baked into the image (see stripTemplateResources).
 //
 // Selection is the shared source policy (internal/source): the app's own
 // .gitignore rules decide which files under dir are source. A file the rules
@@ -112,12 +112,12 @@ func SelectAndFingerprintApp(dir string, tmpl *Template) (*source.Selection, str
 // regardless of .gitignore rules, and for a no-runtime template it is the only
 // input that matters.
 //
-// The top-level `resources` mapping is stripped before hashing (see
-// stripTemplateResources), so a resource-only edit never changes the digest. The
-// strip re-serializes the YAML node tree, which means the FIRST fingerprint
-// computed after this behavior was introduced may differ from one computed by an
-// older Relay (a one-time rebuild per app on upgrade); subsequent
-// fingerprints are stable and resource edits are invisible.
+// Runtime-only configuration (top-level `resources` and service `tmpfs`) is
+// stripped before hashing (see stripTemplateResources), so an edit to it never
+// changes the digest. The strip re-serializes the YAML node tree, which means
+// the FIRST fingerprint computed after a strip change may differ from one
+// computed by an older Relay (a one-time rebuild per app on upgrade);
+// subsequent fingerprints are stable and those edits are invisible.
 func fingerprintTemplate(dir string) (string, error) {
 	const name = "template.yaml"
 	raw, err := os.ReadFile(filepath.Join(dir, name))

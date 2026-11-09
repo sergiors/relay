@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -55,16 +56,18 @@ const lowPortCapability = "NET_BIND_SERVICE"
 
 // hardenedHostConfig returns the shared security/resource baseline HostConfig
 // every Relay container is created with: all capabilities dropped, the resolved
-// memory/CPU/pids limits, a read-only rootfs, a bounded /tmp tmpfs as the only
-// writable path, and no-new-privileges while leaving Docker's default seccomp
-// profile in place. The security baseline is internal and not configuration;
-// the resource limits are per-app configuration mapped by
-// resourceHostConfig. Networking is left enabled (outbound access is a
-// legitimate app need) and PID/IPC/network namespaces stay private because the
-// corresponding HostConfig modes are unset (the zero value); Relay never
-// selects host or container namespace sharing. autoRemove is true for one-shot
-// invocation containers (the daemon removes them the moment they exit) and
-// false for persistent service containers (the reconciler owns their removal).
+// memory/CPU/pids limits, a read-only rootfs, a bounded /tmp tmpfs, and
+// no-new-privileges while leaving Docker's default seccomp profile in place. The
+// security baseline is internal and not configuration; the resource limits are
+// per-app configuration mapped by resourceHostConfig. Networking is left
+// enabled (outbound access is a legitimate app need) and PID/IPC/network
+// namespaces stay private because the corresponding HostConfig modes are unset
+// (the zero value); Relay never selects host or container namespace sharing.
+// autoRemove is true for one-shot invocation containers (the daemon removes them
+// the moment they exit) and false for persistent service containers (the
+// reconciler owns their removal). A persistent service may add configured
+// bounded tmpfs mounts on top of the baseline /tmp (see applyServiceTmpfs);
+// execution containers never do.
 func hardenedHostConfig(autoRemove bool, limits app.ResourceLimits) *container.HostConfig {
 	return &container.HostConfig{
 		AutoRemove:     autoRemove,
@@ -72,7 +75,7 @@ func hardenedHostConfig(autoRemove bool, limits app.ResourceLimits) *container.H
 		CapDrop:        []string{"ALL"},
 		SecurityOpt:    []string{noNewPrivileges},
 		ReadonlyRootfs: true,
-		Tmpfs:          map[string]string{"/tmp": "rw,nosuid,noexec,size=64m"},
+		Tmpfs:          map[string]string{"/tmp": baseTmpfsOptions},
 	}
 }
 
@@ -89,13 +92,64 @@ func hardenedServiceHostConfig(limits app.ResourceLimits, port int) *container.H
 	return hc
 }
 
+// baseTmpfsOptions is the exact option string of Relay's always-present /tmp
+// mount. It is preserved byte-for-byte: additional service tmpfs mounts are an
+// additive surface and must not relax or change /tmp.
+const baseTmpfsOptions = "rw,nosuid,noexec,size=64m"
+
+// additionalTmpfsMode is the permission mode of every additional service
+// tmpfs. 1777 (sticky, world-writable) lets a non-root service process write
+// while keeping per-file ownership semantics; the mount is otherwise bounded
+// and nosuid,nodev,noexec.
+const additionalTmpfsMode = "1777"
+
+// serviceTmpfsOptions is the exact option string Relay builds for every
+// additional service tmpfs. Callers cannot supply options: the fixed size keeps
+// each mount bounded, and nosuid,nodev,noexec prevent it from becoming a
+// privilege-escalation surface.
+func serviceTmpfsOptions() string {
+	return fmt.Sprintf(
+		"rw,nosuid,nodev,noexec,size=%dm,mode=%s",
+		app.ServiceTmpfsMountBytes>>20, additionalTmpfsMode)
+}
+
+// applyServiceTmpfs validates a service's configured additional tmpfs
+// destinations and adds them to hc.Tmpfs with Relay's fixed bounded options. It
+// is the only path that adds service tmpfs mounts; invocation containers never
+// call it, so they keep their /tmp-only HostConfig. Validation uses the same
+// app.ValidateServiceTmpfs policy as template parsing, so a direct ServiceSpec
+// caller cannot bypass the parse-time path and memory rules.
+func applyServiceTmpfs(
+	hc *container.HostConfig,
+	destinations []string,
+	limits app.ResourceLimits,
+) error {
+	if len(destinations) == 0 {
+		return nil
+	}
+	if err := app.ValidateServiceTmpfs(
+		destinations, limits.OrDefault().MemoryBytes,
+	); err != nil {
+		return fmt.Errorf("additional tmpfs: %w", err)
+	}
+	if hc.Tmpfs == nil {
+		hc.Tmpfs = make(map[string]string, len(destinations)+1)
+	}
+	options := serviceTmpfsOptions()
+	for _, destination := range destinations {
+		hc.Tmpfs[destination] = options
+	}
+	return nil
+}
+
 // validateContainerHostConfig rejects a container configuration that departs
 // from Relay's hardening contract BEFORE Docker ContainerCreate. The shared
 // builders already produce a safe HostConfig; this check is the enforcement
 // point for every create path, so a future caller cannot accidentally introduce
 // a privileged container, host namespace sharing, host networking, writable
-// rootfs, an over-broad capability, an unexpected security option, a device, or
-// an unsafe mount.
+// rootfs, an over-broad capability, an unexpected security option, a device, an
+// unsafe mount, or an unsafe/overlapping tmpfs entry (including one that would
+// shadow the HOT_RELOAD source bind or its masks).
 //
 // mounts are the mount.Mount entries a caller intends to apply (the shared
 // source-mount read-only bind plus its read-only tmpfs masks). The HostConfig's
@@ -168,27 +222,102 @@ func validateContainerHostConfig(
 			return fmt.Errorf("security option %q may not override the default profile", opt)
 		}
 	}
-	return validateWorkloadMounts(
-		append(append([]mount.Mount{}, hc.Mounts...), mounts...),
-		sourceRoot,
-	)
+	allMounts := append(append([]mount.Mount{}, hc.Mounts...), mounts...)
+	if err := validateHostTmpfs(hc.Tmpfs, allMounts); err != nil {
+		return err
+	}
+	return validateWorkloadMounts(allMounts, sourceRoot)
 }
 
-// validateImageDeclaredVolumes rejects an image whose Config declares Docker
-// VOLUME destinations, BEFORE Docker ContainerCreate. An image VOLUME is
-// materialized by the daemon as an implicit anonymous writable mount even when
-// HostConfig.ReadonlyRootfs is true, so it would bypass Relay's contract that
-// the bounded /tmp tmpfs is the only writable path. Both production workload
-// create paths (execution containers and persistent services) call this with
-// the exact image they are about to create from.
+// validateHostTmpfs validates the HostConfig's final tmpfs set against Relay's
+// contract before ContainerCreate. The always-present /tmp entry must exist
+// exactly as Relay configures it; every other destination must pass the same
+// narrow path policy as template parsing, carry exactly Relay's bounded safe
+// options, not overlap another tmpfs, and not overlap (equal or ancestor/
+// descendant) any mount target — in particular the HOT_RELOAD source bind and
+// its read-only mask tmpfs. This is the runtime enforcement point that a direct
+// ServiceSpec caller cannot bypass.
+func validateHostTmpfs(tmpfs map[string]string, mounts []mount.Mount) error {
+	if got, ok := tmpfs["/tmp"]; !ok || got != baseTmpfsOptions {
+		return fmt.Errorf(
+			"the /tmp tmpfs must be configured exactly as %q", baseTmpfsOptions)
+	}
+	expected := serviceTmpfsOptions()
+	extra := make([]string, 0, len(tmpfs))
+	for destination, options := range tmpfs {
+		if destination == "/tmp" {
+			continue
+		}
+		if err := app.ValidateServiceTmpfsDestination(destination); err != nil {
+			return err
+		}
+		if options != expected {
+			return fmt.Errorf(
+				"tmpfs %q options %q must be exactly %q",
+				destination, options, expected)
+		}
+		extra = append(extra, destination)
+	}
+	sort.Strings(extra)
+	for i, destination := range extra {
+		for _, previous := range extra[:i] {
+			if pathsOverlap(previous, destination) {
+				return fmt.Errorf(
+					"tmpfs destinations %q and %q overlap",
+					previous, destination)
+			}
+		}
+		for _, m := range mounts {
+			if m.Target == "" {
+				continue
+			}
+			if pathsOverlap(destination, m.Target) {
+				return fmt.Errorf(
+					"tmpfs %q conflicts with mounted path %q",
+					destination, m.Target)
+			}
+		}
+	}
+	return nil
+}
+
+// pathsOverlap reports whether two canonical container paths are equal or one
+// is an ancestor of the other.
+func pathsOverlap(a, b string) bool {
+	if a == b {
+		return true
+	}
+	return strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
+}
+
+// validateImageDeclaredVolumes enforces Relay's writable-path contract for an
+// image's Docker VOLUME destinations, BEFORE Docker ContainerCreate. An image
+// VOLUME is materialized by the daemon as an implicit anonymous writable mount
+// even when HostConfig.ReadonlyRootfs is true, so it would otherwise bypass the
+// read-only filesystem. Both production workload create paths (execution
+// containers and persistent services) call this with the exact image they are
+// about to create from.
+//
+// coveredTmpfs is the set of additional service tmpfs destinations (the
+// service's validated `tmpfs` list). A declared volume is permitted ONLY when
+// it is exactly covered by one of those tmpfs mounts, in which case the daemon
+// mounts the tmpfs at that path instead of an anonymous volume. Relay never
+// auto-adds a tmpfs for an image VOLUME: a destination that is not explicitly
+// configured remains an error. Execution containers pass no destinations, so
+// every declared volume is still rejected there.
 //
 // Fail closed: an image that cannot be inspected, has no Config, or has no
-// immutable ID is an error, not a pass. A nonempty Config.Volumes is an error
-// naming every declared destination. Success returns the inspected image ID so
-// the caller can create from exactly the content it validated, closing a
-// mutable-reference inspect/create race. The error is wrapped by the caller
-// with its own workload prefix.
-func validateImageDeclaredVolumes(ctx context.Context, cli *client.Client, image string) (string, error) {
+// immutable ID is an error, not a pass. A nonempty Config.Volumes with any
+// uncovered destination is an error naming those destinations. Success returns
+// the inspected image ID so the caller can create from exactly the content it
+// validated, closing a mutable-reference inspect/create race. The error is
+// wrapped by the caller with its own workload prefix.
+func validateImageDeclaredVolumes(
+	ctx context.Context,
+	cli *client.Client,
+	image string,
+	coveredTmpfs ...string,
+) (string, error) {
 	insp, err := cli.ImageInspect(ctx, image)
 	if err != nil {
 		return "", fmt.Errorf("inspect image %q: %w", image, err)
@@ -202,14 +331,24 @@ func validateImageDeclaredVolumes(ctx context.Context, cli *client.Client, image
 	if len(insp.Config.Volumes) == 0 {
 		return insp.ID, nil
 	}
-	destinations := make([]string, 0, len(insp.Config.Volumes))
-	for destination := range insp.Config.Volumes {
-		destinations = append(destinations, destination)
+	covered := make(map[string]bool, len(coveredTmpfs))
+	for _, destination := range coveredTmpfs {
+		covered[destination] = true
 	}
-	slices.Sort(destinations)
+	var uncovered []string
+	for destination := range insp.Config.Volumes {
+		if !covered[destination] {
+			uncovered = append(uncovered, destination)
+		}
+	}
+	if len(uncovered) == 0 {
+		return insp.ID, nil
+	}
+	slices.Sort(uncovered)
 	return "", fmt.Errorf(
-		"image %q declares writable volumes %v, which bypass the read-only root filesystem and bounded /tmp",
-		image, destinations)
+		"image %q declares writable volumes %v not covered by a configured "+
+			"service tmpfs, which bypass the read-only root filesystem",
+		image, uncovered)
 }
 
 // validateRecursiveReadOnlyMountSupport prevents HOT_RELOAD from relying on a
