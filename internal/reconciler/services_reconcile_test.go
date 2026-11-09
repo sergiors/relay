@@ -29,20 +29,20 @@ type fakeContainer struct {
 	// sourceRef is the configured source descriptor (relay.identity); when empty
 	// it defaults to entrypoint, so a fixture that does not distinguish name from
 	// source still converges.
-	sourceRef string
-	image     string
-	imageID   string
-	port      int
-	replica   int
-	state     container.ContainerState
-	entry     []string // the long-lived process command passed to StartService
-	envHash   string   // relay.env_hash as stamped at create (spec.Env's hash); "" = legacy/unlabeled
-	resources string   // relay.resources as stamped at create (spec.Resources' fingerprint); "" = legacy/unlabeled
-	tmpfs     string   // relay.tmpfs as stamped at create (canonical additional destinations)
-	sourceID  string   // relay.source as stamped at create (spec.SourceMount.Identity); "" = no mount
-	labels    map[string]string
-	networks  []string // spec.Networks passed to StartService (global + routing networks)
-	nodeID    string   // the node identity (relay.node_id) that owns the container
+	sourceRef              string
+	image                  string
+	imageID                string
+	port                   int
+	replica                int
+	state                  container.ContainerState
+	entry                  []string // the long-lived process command passed to StartService
+	environmentFingerprint string   // relay.environment as stamped at create (spec.Env's fingerprint); "" = unlabeled
+	resources              string   // relay.resources as stamped at create (spec.Resources' fingerprint); "" = legacy/unlabeled
+	tmpfs                  string   // relay.tmpfs as stamped at create (canonical additional destinations)
+	sourceID               string   // relay.source as stamped at create (spec.SourceMount.Identity); "" = no mount
+	labels                 map[string]string
+	networks               []string // spec.Networks passed to StartService (global + routing networks)
+	nodeID                 string   // the node identity (relay.node_id) that owns the container
 }
 
 // effectiveSourceRef returns the container's configured source descriptor,
@@ -161,19 +161,19 @@ func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, r
 		state:      container.StateRunning,
 		entry:      spec.Entry,
 		// Mirror production's serviceLabels: a started container always carries
-		// the effective env's content hash (relay.env_hash), even for an empty
+		// the effective environment fingerprint (relay.environment), even for an empty
 		// env. Directly seeded fakeContainers omit it to model a legacy/unlabeled
 		// container. It also carries the canonical relay.networks label (the
 		// global + routing network set), so a converged pass sees the networks
 		// match. The effective resource limits' fingerprint (relay.resources) is
 		// stamped too, so a resource-only change replaces the container.
-		envHash:   runtime.EnvHash(spec.Env),
-		resources: spec.Resources.OrDefault().Fingerprint(),
-		tmpfs:     runtime.ServiceTmpfsLabel(spec.Tmpfs),
-		sourceID:  sourceMountIdentity(spec),
-		labels:    spec.Labels,
-		networks:  append([]string(nil), spec.Networks...),
-		nodeID:    defaultFakeNodeID,
+		environmentFingerprint: runtime.EnvironmentFingerprint(spec.Env),
+		resources:              spec.Resources.OrDefault().Fingerprint(),
+		tmpfs:                  runtime.ServiceTmpfsLabel(spec.Tmpfs),
+		sourceID:               sourceMountIdentity(spec),
+		labels:                 spec.Labels,
+		networks:               append([]string(nil), spec.Networks...),
+		nodeID:                 defaultFakeNodeID,
 	}
 	gate := f.startGate
 	f.mu.Unlock()
@@ -196,22 +196,22 @@ func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceCon
 	var out []runtime.ServiceContainer
 	for _, c := range f.ctrs {
 		out = append(out, runtime.ServiceContainer{
-			ID:        c.id,
-			App:       c.appName,
-			Name:      c.entrypoint,
-			SourceRef: c.effectiveSourceRef(),
-			Image:     c.image,
-			ImageID:   c.imageID,
-			State:     c.state,
-			Replica:   c.replica,
-			Port:      c.port,
-			NodeID:    c.nodeID,
-			EnvHash:   c.envHash,
-			Resources: c.resources,
-			Tmpfs:     c.tmpfs,
-			Networks:  runtime.NetworksLabel(c.networks...),
-			SourceID:  c.sourceID,
-			Labels:    c.labels,
+			ID:                     c.id,
+			App:                    c.appName,
+			Name:                   c.entrypoint,
+			SourceRef:              c.effectiveSourceRef(),
+			Image:                  c.image,
+			ImageID:                c.imageID,
+			State:                  c.state,
+			Replica:                c.replica,
+			Port:                   c.port,
+			NodeID:                 c.nodeID,
+			EnvironmentFingerprint: c.environmentFingerprint,
+			Resources:              c.resources,
+			Tmpfs:                  c.tmpfs,
+			Networks:               runtime.NetworksLabel(c.networks...),
+			SourceID:               c.sourceID,
+			Labels:                 c.labels,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -359,13 +359,13 @@ func serviceTemplate(runtimeName string, services ...app.Service) *app.Template 
 	return &app.Template{Runtime: runtimeName, Services: services}
 }
 
-// serviceEnvHash is the relay.env_hash label a started container carries for the
+// serviceEnvironmentFingerprint is the relay.environment label a started container carries for the
 // given port with no prepared env and no secrets — the exact shape the
 // package-level reconcile test helper produces (BuildEnv appends PORT last).
 // Directly seeded fakeContainers in converged-state tests set this so they model
 // a container Relay itself created; omitting it models a legacy/unlabeled one.
-func serviceEnvHash(port int) string {
-	return runtime.EnvHash([]string{fmt.Sprintf("PORT=%d", port)})
+func serviceEnvironmentFingerprint(port int) string {
+	return runtime.EnvironmentFingerprint([]string{fmt.Sprintf("PORT=%d", port)})
 }
 
 // serviceResources is the relay.resources label a started container carries for
@@ -951,7 +951,7 @@ func reconcileEnv(t *testing.T, d Docker, fn string, tmpl *app.Template, image s
 // TestReconcileEnvChangeReplacesContainer: changing a template env value on an
 // `image` source (whose image reference is unchanged) leaves the running
 // container's environment stale, so it must be replaced. This is the core
-// regression the relay.env_hash label exists to catch.
+// regression the relay.environment label exists to catch.
 func TestReconcileEnvChangeReplacesContainer(t *testing.T) {
 	f := newFakeDocker()
 	start := serviceTemplate("", app.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
@@ -960,11 +960,11 @@ func TestReconcileEnvChangeReplacesContainer(t *testing.T) {
 		t.Fatalf("reconcile env=a: %v", err)
 	}
 	c := f.lastStartedFor("fn", "ghcr.io/acme/api:1.2")
-	if c == nil || c.envHash != runtime.EnvHash([]string{"MODE=a", "PORT=8080"}) {
-		t.Fatalf("started container hash = %+v, want the hash of the env=a effective env", c)
+	if c == nil || c.environmentFingerprint != runtime.EnvironmentFingerprint([]string{"MODE=a", "PORT=8080"}) {
+		t.Fatalf("started container = %+v, want the env=a effective environment fingerprint", c)
 	}
 
-	// Same image reference, changed env value -> stale by env hash.
+	// Same image reference, changed env value -> stale by environment fingerprint.
 	changed := serviceTemplate("", app.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
 	changed.Env = map[string]string{"MODE": "b"}
 	if _, err := reconcile(t, f, "fn", changed, "", routing.TraefikConfig{}); err != nil {
@@ -974,8 +974,8 @@ func TestReconcileEnvChangeReplacesContainer(t *testing.T) {
 		t.Fatalf("stops = %v, want the env-stale container replaced", f.stops)
 	}
 	c = f.lastStartedFor("fn", "ghcr.io/acme/api:1.2")
-	if c == nil || c.envHash != runtime.EnvHash([]string{"MODE=b", "PORT=8080"}) {
-		t.Fatalf("replacement hash = %+v, want the hash of the env=b effective env", c)
+	if c == nil || c.environmentFingerprint != runtime.EnvironmentFingerprint([]string{"MODE=b", "PORT=8080"}) {
+		t.Fatalf("replacement = %+v, want the env=b effective environment fingerprint", c)
 	}
 }
 
@@ -997,8 +997,8 @@ func TestReconcileEnvRemovedReplacesContainer(t *testing.T) {
 		t.Fatalf("stops = %v, want the container replaced when an env was removed", f.stops)
 	}
 	c := f.lastStartedFor("fn", "service.js")
-	if c == nil || c.envHash != runtime.EnvHash([]string{"PORT=80"}) {
-		t.Fatalf("replacement hash = %+v, want the hash of the env-less effective env", c)
+	if c == nil || c.environmentFingerprint != runtime.EnvironmentFingerprint([]string{"PORT=80"}) {
+		t.Fatalf("replacement = %+v, want the env-less effective environment fingerprint", c)
 	}
 }
 
@@ -1040,16 +1040,16 @@ func TestReconcileSecretRotationReplacesContainer(t *testing.T) {
 	if second == nil {
 		t.Fatal("no replacement container")
 	}
-	if second.envHash == first.envHash {
-		t.Fatalf("env hash unchanged across secret rotation (%q); container would serve the old secret", second.envHash)
+	if second.environmentFingerprint == first.environmentFingerprint {
+		t.Fatalf("environment fingerprint unchanged across secret rotation (%q); container would serve the old secret", second.environmentFingerprint)
 	}
-	if second.envHash != runtime.EnvHash([]string{"TOKEN=v2", "PORT=8080"}) {
-		t.Fatalf("replacement hash = %q, want the v2 effective env hash", second.envHash)
+	if second.environmentFingerprint != runtime.EnvironmentFingerprint([]string{"TOKEN=v2", "PORT=8080"}) {
+		t.Fatalf("replacement fingerprint = %q, want the v2 effective environment fingerprint", second.environmentFingerprint)
 	}
 }
 
 // TestReconcileEnvUnchangedKeepsContainer: an unchanged effective env keeps the
-// running container (no churn), pinning that the env-hash comparison is exact.
+// running container (no churn), pinning that the environment-fingerprint comparison is exact.
 func TestReconcileEnvUnchangedKeepsContainer(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
@@ -1067,30 +1067,30 @@ func TestReconcileEnvUnchangedKeepsContainer(t *testing.T) {
 	}
 }
 
-// TestReconcileLegacyContainerWithoutEnvHashReplaced: a running container with
-// no relay.env_hash (created before the label existed, or otherwise unwritable)
-// never matches a desired hash, so it is replaced exactly once — the same
+// TestReconcileLegacyContainerWithoutEnvironmentFingerprintReplaced: a running container with
+// no relay.environment (created before the label existed, or otherwise unwritable)
+// never matches a desired fingerprint, so it is replaced exactly once — the same
 // missing-label semantics as relay.replica == -1.
-func TestReconcileLegacyContainerWithoutEnvHashReplaced(t *testing.T) {
+func TestReconcileLegacyContainerWithoutEnvironmentFingerprintReplaced(t *testing.T) {
 	f := newFakeDocker()
 	f.ctrs["legacy-1"] = &fakeContainer{
 		id: "legacy-1", appName: "fn", entrypoint: "service.js",
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
-		// No envHash: a pre-label container.
+		// No environmentFingerprint: a pre-label container.
 	}
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if len(f.stops) != 1 || f.stops[0] != "legacy-1" {
-		t.Fatalf("stops = %v, want [legacy-1] (an unlabeled env hash is always stale)", f.stops)
+		t.Fatalf("stops = %v, want [legacy-1] (an unlabeled environment fingerprint is always stale)", f.stops)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 1 {
 		t.Fatalf("running = %d, want 1 (replacement started)", got)
 	}
 	c := f.lastStartedFor("fn", "service.js")
-	if c == nil || c.envHash != serviceEnvHash(80) {
-		t.Fatalf("replacement = %+v, want a stamped env hash", c)
+	if c == nil || c.environmentFingerprint != serviceEnvironmentFingerprint(80) {
+		t.Fatalf("replacement = %+v, want a stamped environment fingerprint", c)
 	}
 }
 
@@ -1114,8 +1114,8 @@ func TestReconcileImageSourceEnvChangeReplaces(t *testing.T) {
 		t.Fatalf("stops = %v, want the image-source env-stale container replaced", f.stops)
 	}
 	c := f.lastStartedFor("fn", "ghcr.io/acme/api:1.2")
-	if c == nil || c.envHash != runtime.EnvHash([]string{"MODE=b", "PORT=3000"}) {
-		t.Fatalf("replacement = %+v, want the env=b effective env hash", c)
+	if c == nil || c.environmentFingerprint != runtime.EnvironmentFingerprint([]string{"MODE=b", "PORT=3000"}) {
+		t.Fatalf("replacement = %+v, want the env=b effective environment fingerprint", c)
 	}
 }
 
@@ -1264,7 +1264,7 @@ func TestReconcileUnchangedIsNoOp(t *testing.T) {
 	f.ctrs["id-1"] = &fakeContainer{
 		id: "id-1", appName: "fn", entrypoint: "service.js",
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
-		envHash: serviceEnvHash(80), resources: serviceResources(),
+		environmentFingerprint: serviceEnvironmentFingerprint(80), resources: serviceResources(),
 	}
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
@@ -1437,7 +1437,7 @@ func TestApplyNoOpLogsDebugNotInfo(t *testing.T) {
 	f.ctrs["id-1"] = &fakeContainer{
 		id: "id-1", appName: "fn", entrypoint: "service.js",
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
-		envHash: serviceEnvHash(80), resources: serviceResources(),
+		environmentFingerprint: serviceEnvironmentFingerprint(80), resources: serviceResources(),
 	}
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 

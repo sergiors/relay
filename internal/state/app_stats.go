@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 )
 
 // AppStats is the per-app operational snapshot persisted as the JSONB
@@ -105,7 +106,7 @@ func (st *State) RecordAppStatsContext(ctx context.Context, appStats AppStats) {
 			 ON CONFLICT(app_name, node_id) DO UPDATE SET
 			   data       = excluded.data,
 			   updated_at = excluded.updated_at`,
-			appStats.App, st.nodeID, payload, st.nowString())
+			appStats.App, st.nodeID, payload, st.nowTime().UTC())
 		return err
 	})
 	if err != nil {
@@ -133,8 +134,9 @@ func (st *State) ReadAppStats(ctx context.Context, name string) (AppStats, bool,
 	)
 	for rows.Next() {
 		var (
-			nodeID          string
-			data, updatedAt sql.NullString
+			nodeID    string
+			data      sql.NullString
+			updatedAt time.Time
 		)
 		if err := rows.Scan(&nodeID, &data, &updatedAt); err != nil {
 			return AppStats{}, false, fmt.Errorf("scan app stats for %q: %w", name, err)
@@ -144,7 +146,7 @@ func (st *State) ReadAppStats(ctx context.Context, name string) (AppStats, bool,
 			return AppStats{}, false,
 				fmt.Errorf("read app stats for %q (node %q): %w", name, nodeID, err)
 		}
-		fs.UpdatedAt = updatedAt.String
+		fs.UpdatedAt = timestampString(updatedAt)
 		mergeAppStatsInto(&out, fs)
 		seen = true
 	}
@@ -189,7 +191,8 @@ func (st *State) OwnerAppStats() []AppStats {
 	var out []AppStats
 	for rows.Next() {
 		var name string
-		var data, updatedAt sql.NullString
+		var data sql.NullString
+		var updatedAt time.Time
 		if err := rows.Scan(&name, &data, &updatedAt); err != nil {
 			st.log.Warn("State: scan app stats failed", "error", err)
 			return out
@@ -200,7 +203,7 @@ func (st *State) OwnerAppStats() []AppStats {
 			continue
 		}
 		appStats.App = name
-		appStats.UpdatedAt = updatedAt.String
+		appStats.UpdatedAt = timestampString(updatedAt)
 		out = append(out, appStats)
 	}
 	return out
@@ -264,7 +267,8 @@ func (st *State) AllAppStats() []AppStats {
 	byApp := make(map[string]AppStats)
 	for rows.Next() {
 		var name string
-		var data, updatedAt sql.NullString
+		var data sql.NullString
+		var updatedAt time.Time
 		if err := rows.Scan(&name, &data, &updatedAt); err != nil {
 			st.log.Warn("State: scan app stats failed", "error", err)
 			return nil
@@ -274,7 +278,7 @@ func (st *State) AllAppStats() []AppStats {
 			st.log.Warn("State: read app stats failed", "app", name, "error", err)
 			continue
 		}
-		fs.UpdatedAt = updatedAt.String
+		fs.UpdatedAt = timestampString(updatedAt)
 		merged := byApp[name]
 		mergeAppStatsInto(&merged, fs)
 		merged.App = name

@@ -87,7 +87,7 @@ func TestReadStatsCorruptPayloadFails(t *testing.T) {
 	// The column is NOT NULL JSONB, so corruption is a well-formed value of
 	// the wrong shape: a bare scalar decodes into the typed struct nowhere.
 	if _, err := c.db.ExecContext(context.Background(),
-		`INSERT INTO stats (node_id, instance, data, updated_at) VALUES ('n1', '-', '123', '')`); err != nil {
+		`INSERT INTO stats (node_id, instance, data, updated_at) VALUES ('n1', '-', '123', '0001-01-01T00:00:00Z')`); err != nil {
 		t.Fatalf("seed corrupt stats row: %v", err)
 	}
 

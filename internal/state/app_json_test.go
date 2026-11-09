@@ -13,7 +13,7 @@ import (
 // rawAppData reads apps.data rendered back to JSON text (the exact
 // expression the production read path uses) plus the row's updated_at and the
 // native JSONB type of the stored value.
-func rawAppData(t *testing.T, c *State, name string) (data, updatedAt, jsonbType string) {
+func rawAppData(t *testing.T, c *State, name string) (data string, updatedAt time.Time, jsonbType string) {
 	t.Helper()
 	if err := c.db.QueryRowContext(context.Background(),
 		`SELECT data::text, updated_at, jsonb_typeof(data)
@@ -70,7 +70,7 @@ services:
 func TestAppSnapshotIsJSONB(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, fullSnapshotTmpl)
-	base := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+	base := time.Date(2026, 3, 1, 9, 0, 0, 345678000, time.UTC)
 	c.nowFn = func() time.Time { return base }
 	fn := fnFor(t, "demo", tmpl)
 	fencingToken := seedFencingToken(t, c, fn)
@@ -85,8 +85,14 @@ func TestAppSnapshotIsJSONB(t *testing.T) {
 	if data == "" {
 		t.Fatal("apps.data must render as JSON text")
 	}
-	if updatedAt != base.Format(time.RFC3339) {
-		t.Fatalf("apps.updated_at = %q, want %q", updatedAt, base.Format(time.RFC3339))
+	if !updatedAt.Equal(base) {
+		t.Fatalf("apps.updated_at = %s, want instant %s", updatedAt, base)
+	}
+	if updatedAt.Nanosecond() != 345678000 {
+		t.Fatalf("apps.updated_at nanoseconds = %d, want 345678000", updatedAt.Nanosecond())
+	}
+	if detail, ok := c.GetApp("demo"); !ok || detail.UpdatedAt != base.Format(time.RFC3339) {
+		t.Fatalf("presented apps.updated_at = %q (found=%v), want UTC RFC3339 %q", detail.UpdatedAt, ok, base.Format(time.RFC3339))
 	}
 
 	// The JSON operators read the payload's fields without decoding in Go,

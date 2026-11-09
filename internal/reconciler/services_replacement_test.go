@@ -136,7 +136,7 @@ func TestReconcileReplaceStartFailureNoFallbackIsUnavailable(t *testing.T) {
 }
 
 // TestReconcileReplaceEnvChangeStartsBeforeStop pins the env-change path (image
-// reference unchanged, so the old container is stale only by relay.env_hash):
+// reference unchanged, so the old container is stale only by relay.environment):
 // the replacement is confirmed running before the env-stale container stops.
 func TestReconcileReplaceEnvChangeStartsBeforeStop(t *testing.T) {
 	f := newFakeDocker()
@@ -291,7 +291,7 @@ func TestReconcileDuplicateCandidatesDeterministicByID(t *testing.T) {
 		return &fakeContainer{
 			id: id, appName: "fn", entrypoint: "service.js", image: "img-1",
 			port: port, replica: 0, state: container.StateRunning,
-			envHash: serviceEnvHash(port), resources: serviceResources(),
+			environmentFingerprint: serviceEnvironmentFingerprint(port), resources: serviceResources(),
 		}
 	}
 	f.ctrs["a-dup"] = converged("a-dup", 80)
@@ -334,7 +334,7 @@ func TestReconcileRestartWithOldAndNewConverges(t *testing.T) {
 	f.ctrs["b-new"] = &fakeContainer{
 		id: "b-new", appName: "fn", entrypoint: "service.js", image: "img-new",
 		port: 80, replica: 0, state: container.StateRunning,
-		envHash: serviceEnvHash(80), resources: serviceResources(),
+		environmentFingerprint: serviceEnvironmentFingerprint(80), resources: serviceResources(),
 	}
 	// A: old generation, still running.
 	seedOldService(f, "a-old", "fn", "service.js", "img-old", 80, 0)
@@ -514,7 +514,7 @@ func TestReconcileStaleStopFailureIsSurfacedAndRecoverable(t *testing.T) {
 		return &fakeContainer{
 			id: id, appName: "fn", entrypoint: "service.js", image: "img-1",
 			port: 80, replica: 0, state: container.StateRunning,
-			envHash: serviceEnvHash(80), resources: serviceResources(),
+			environmentFingerprint: serviceEnvironmentFingerprint(80), resources: serviceResources(),
 		}
 	}
 	f.ctrs["a-keep"] = converged("a-keep")
@@ -650,7 +650,7 @@ func TestServiceCoordinatorReplacementOrderingAndSupersede(t *testing.T) {
 		t.Fatalf("running = %d, want 1", got)
 	}
 	c := f.lastStartedFor("fn", "ghcr.io/acme/api:1.2")
-	if c == nil || c.envHash != runtime.EnvHash([]string{"MODE=b", "PORT=8080"}) {
+	if c == nil || c.environmentFingerprint != runtime.EnvironmentFingerprint([]string{"MODE=b", "PORT=8080"}) {
 		t.Fatalf("final container = %+v, want the LATEST env=b effective env", c)
 	}
 

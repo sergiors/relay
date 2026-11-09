@@ -661,7 +661,7 @@ func (st *State) initSchema(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS apps (
 			name TEXT PRIMARY KEY,
 			data JSONB NOT NULL,
-			updated_at TEXT NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL,
 			fencing_token BIGINT NOT NULL DEFAULT 0
 		)`,
 		// fencing_token is the internal per-app fencing token (see FencingToken).
@@ -685,7 +685,7 @@ func (st *State) initSchema(ctx context.Context) error {
 			node_id TEXT PRIMARY KEY,
 			instance TEXT NOT NULL DEFAULT '',
 			data JSONB NOT NULL,
-			updated_at TEXT NOT NULL
+			updated_at TIMESTAMPTZ NOT NULL
 		)`,
 		// stats_meta is the single-row GLOBAL stats epoch (id is pinned to
 		// 'global'). generation is bumped by every `stats reset`; a flush reads
@@ -696,9 +696,9 @@ func (st *State) initSchema(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS stats_meta (
 			id TEXT PRIMARY KEY CHECK (id = 'global'),
 			generation BIGINT NOT NULL DEFAULT 0,
-			updated_at TEXT NOT NULL
+			updated_at TIMESTAMPTZ NOT NULL
 		)`,
-		`INSERT INTO stats_meta (id, generation, updated_at) VALUES ('global', 0, '')
+		`INSERT INTO stats_meta (id, generation, updated_at) VALUES ('global', 0, CURRENT_TIMESTAMP)
 		 ON CONFLICT (id) DO NOTHING`,
 		// app_stats holds the per-app operational snapshot, keyed by
 		// (app_name, node_id). It mirrors the global stats table but attributes
@@ -716,7 +716,7 @@ func (st *State) initSchema(ctx context.Context) error {
 			app_name TEXT NOT NULL,
 			node_id TEXT NOT NULL,
 			data JSONB NOT NULL,
-			updated_at TEXT NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL,
 			PRIMARY KEY (app_name, node_id)
 		)`,
 		// schedule_pending is the durable schedule-publication retry outbox: one
@@ -786,7 +786,7 @@ func (st *State) initSchema(ctx context.Context) error {
 		// source_image is the exact configured base reference the pin was
 		// validated against, digest is a Docker multi-platform index digest
 		// ("sha256:" + lowercase hex; NOT a child manifest digest), and generation
-		// is the monotonic compare-and-swap generation. selected_at is the RFC3339
+		// is the monotonic compare-and-swap generation. selected_at is the UTC
 		// write time. There is deliberately no history table: a pin is replaced in
 		// place under compare-and-swap. Workers read the complete snapshot at
 		// startup and refresh it once per periodic reconciliation pass; the
@@ -797,7 +797,7 @@ func (st *State) initSchema(ctx context.Context) error {
 			source_image TEXT NOT NULL,
 			digest TEXT NOT NULL CHECK (digest ~ '^sha256:[0-9a-f]{64}$'),
 			generation BIGINT NOT NULL CHECK (generation > 0),
-			selected_at TEXT NOT NULL
+			selected_at TIMESTAMPTZ NOT NULL
 		)`,
 	}
 
@@ -825,7 +825,7 @@ type execQuerier interface {
 // owner of its stats row. It is a no-op for a handle with no owner (CLI/admin).
 //
 // The claim is an unconditional INSERT ... ON CONFLICT DO UPDATE of ONLY the
-// instance column. A fresh owner gets a zero row whose updated_at is ” — the
+// instance column. A fresh owner gets a zero row whose updated_at is the zero time — the
 // oldest possible value — so it can never win the freshest-owner backlog gauge
 // before its first real flush. An EXISTING row keeps its data and updated_at
 // untouched, so a restart's startup restore (OwnerStats) still reads the prior
@@ -851,9 +851,9 @@ func (st *State) claimStatsOwnership(ctx context.Context, q execQuerier) error {
 	// claim must be ordered AFTER the lock is taken, and reusing that connection
 	// needs no second pool slot.
 	if _, err := q.ExecContext(ctx,
-		`INSERT INTO stats (node_id, instance, data, updated_at) VALUES ($1, $2, $3, '')
+		`INSERT INTO stats (node_id, instance, data, updated_at) VALUES ($1, $2, $3, $4)
 		 ON CONFLICT(node_id) DO UPDATE SET instance = excluded.instance`,
-		st.nodeID, st.instance, payload); err != nil {
+		st.nodeID, st.instance, payload, time.Time{}); err != nil {
 		return fmt.Errorf("claim stats ownership: %w", err)
 	}
 	return nil
@@ -864,19 +864,24 @@ func (st *State) claimStatsOwnership(ctx context.Context, q execQuerier) error {
 // the identity its persisted stats are scoped to.
 func (st *State) NodeID() string { return st.nodeID }
 
-// nowString returns the current time as an RFC3339 UTC string, using the
-// injectable clock when set and the package default otherwise. It is the single
-// timestamp source for every State write, so an injected clock (tests) governs
-// every updated_at/last_reconcile_at consistently.
+// nowString returns the current time as an RFC3339 UTC string for timestamps
+// embedded in app snapshots, using the injectable clock when set.
 func (st *State) nowString() string {
 	return st.nowTime().UTC().Format(time.RFC3339)
 }
 
+// timestampString preserves the existing RFC3339 UTC presentation at the
+// state/CLI boundary. A zero timestamp is the historical empty value.
+func timestampString(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339)
+}
+
 // nowTime returns the current instant as a time.Time from the same injectable
 // clock nowString uses, defaulting to time.Now when no clock is installed. It is
-// the time-valued counterpart of nowString, for writes whose persisted form is
-// integer Unix milliseconds rather than an RFC3339 string (the schedule_pending
-// retention deadline).
+// used for native timestamp and integer Unix-millisecond persistence.
 func (st *State) nowTime() time.Time {
 	if st.nowFn != nil {
 		return st.nowFn()
@@ -1033,8 +1038,9 @@ func (st *State) rebuildDiscoveredTx(ctx context.Context, discovered []Discovere
 				return err
 			}
 			detail := appSnapshot(d.App.Name, d.App.Template, StatusPreparing, "", "", d.Fingerprint, "", "", "", "")
-			detail.UpdatedAt = st.nowString()
-			if err := upsertAppTx(ctx, tx, detail, fencingToken); err != nil {
+			updatedAt := st.nowTime().UTC()
+			detail.UpdatedAt = timestampString(updatedAt)
+			if err := upsertAppTx(ctx, tx, detail, fencingToken, updatedAt); err != nil {
 				return err
 			}
 		}
@@ -1116,11 +1122,11 @@ func (st *State) RecordDiscoveredWithFingerprint(
 	fn app.App,
 	fingerprint string,
 ) (FencingToken, error) {
-	ts := st.nowString()
+	updatedAt := st.nowTime().UTC()
 	var fencingToken FencingToken
 	err := st.appWriteTx(ctx, fn.Name, func(tx *sql.Tx) error {
 		var err error
-		fencingToken, err = recordDesiredTx(ctx, tx, fn.Name, fn.Template, fingerprint, ts)
+		fencingToken, err = recordDesiredTx(ctx, tx, fn.Name, fn.Template, fingerprint, updatedAt)
 		return err
 	})
 	if err != nil {
@@ -1147,8 +1153,8 @@ func recordDesiredTx(
 	tx *sql.Tx,
 	name string,
 	tmpl *app.Template,
-	fingerprint,
-	ts string,
+	fingerprint string,
+	updatedAt time.Time,
 ) (FencingToken, error) {
 	fencingToken, err := nextFencingTokenTx(ctx, tx)
 	if err != nil {
@@ -1167,8 +1173,8 @@ func recordDesiredTx(
 			active.Image, active.Fingerprint, fingerprint,
 			active.PreparedAt, active.LastReconcileAt, active.LastReconcileStatus, active.LastError)
 	}
-	detail.UpdatedAt = ts
-	if err := upsertAppTx(ctx, tx, detail, fencingToken); err != nil {
+	detail.UpdatedAt = timestampString(updatedAt)
+	if err := upsertAppTx(ctx, tx, detail, fencingToken, updatedAt); err != nil {
 		return 0, err
 	}
 	return fencingToken, nil
@@ -1202,13 +1208,14 @@ func (st *State) RecordReconcileSuccess(
 		return false, nil
 	}
 	ts := st.nowString()
+	updatedAt := st.nowTime().UTC()
 	prepared := preparedAt.UTC().Format(time.RFC3339)
 	wrote := false
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		detail := appSnapshot(name, fn.Template, StatusReady, image, fingerprint, fingerprint, prepared, ts, ReconcileSuccess, "")
-		detail.UpdatedAt = ts
+		detail.UpdatedAt = timestampString(updatedAt)
 		var err error
-		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken)
+		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken, updatedAt)
 		return err
 	})
 	if err != nil {
@@ -1255,11 +1262,11 @@ func (st *State) RecordPreparingWithFingerprint(
 	fn app.App,
 	fingerprint string,
 ) (FencingToken, error) {
-	ts := st.nowString()
+	updatedAt := st.nowTime().UTC()
 	var fencingToken FencingToken
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		var err error
-		fencingToken, err = recordDesiredTx(ctx, tx, name, fn.Template, fingerprint, ts)
+		fencingToken, err = recordDesiredTx(ctx, tx, name, fn.Template, fingerprint, updatedAt)
 		return err
 	})
 	if err != nil {
@@ -1314,7 +1321,7 @@ func (st *State) recordStatus(
 	if fencingToken <= 0 {
 		return false, nil
 	}
-	ts := st.nowString()
+	updatedAt := st.nowTime().UTC()
 	wrote := false
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		detail, found, err := scanApp(name, tx.QueryRowContext(ctx,
@@ -1323,8 +1330,8 @@ func (st *State) recordStatus(
 		if err != nil || !found {
 			return err
 		}
-		detail.Status, detail.UpdatedAt = status, ts
-		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken)
+		detail.Status, detail.UpdatedAt = status, timestampString(updatedAt)
+		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken, updatedAt)
 		return err
 	})
 	if err != nil {
@@ -1363,6 +1370,7 @@ func (st *State) RecordReconcileFailure(
 		return false, nil
 	}
 	ts := st.nowString()
+	updatedAt := st.nowTime().UTC()
 	status := ""
 	wrote := false
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
@@ -1389,8 +1397,8 @@ func (st *State) RecordReconcileFailure(
 			detail.Status = StatusUnavailable
 		}
 		status = detail.Status
-		detail.UpdatedAt = ts
-		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken)
+		detail.UpdatedAt = timestampString(updatedAt)
+		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken, updatedAt)
 		return err
 	})
 	if err != nil {
@@ -1527,6 +1535,7 @@ func (st *State) recordInvalidDesired(
 	guarded bool,
 ) (InvalidDesiredResult, error) {
 	ts := st.nowString()
+	updatedAt := st.nowTime().UTC()
 	var result InvalidDesiredResult
 	status := ""
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
@@ -1591,8 +1600,8 @@ func (st *State) recordInvalidDesired(
 			detail.Status = StatusUnavailable
 		}
 		status = detail.Status
-		detail.UpdatedAt = ts
-		if err := upsertAppTx(ctx, tx, detail, nextFencingToken); err != nil {
+		detail.UpdatedAt = timestampString(updatedAt)
+		if err := upsertAppTx(ctx, tx, detail, nextFencingToken, updatedAt); err != nil {
 			return err
 		}
 		result.FencingToken = nextFencingToken
@@ -1682,6 +1691,7 @@ func (st *State) RecordServiceFailure(
 		return false, nil
 	}
 	ts := st.nowString()
+	updatedAt := st.nowTime().UTC()
 	status := ""
 	wrote := false
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
@@ -1703,8 +1713,8 @@ func (st *State) RecordServiceFailure(
 			detail.Status = StatusUnavailable
 		}
 		status = detail.Status
-		detail.UpdatedAt = ts
-		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken)
+		detail.UpdatedAt = timestampString(updatedAt)
+		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken, updatedAt)
 		return err
 	})
 	if err != nil {
@@ -1921,7 +1931,7 @@ func (st *State) ReadAppSummaries(ctx context.Context) ([]Row, error) {
 		var (
 			name      string
 			data      sql.NullString
-			updatedAt string
+			updatedAt time.Time
 		)
 		if err := rows.Scan(&name, &data, &updatedAt); err != nil {
 			return nil, fmt.Errorf("scan app summary: %w", err)
@@ -1932,7 +1942,7 @@ func (st *State) ReadAppSummaries(ctx context.Context) ([]Row, error) {
 			continue
 		}
 		detail.Name = name
-		detail.UpdatedAt = updatedAt
+		detail.UpdatedAt = timestampString(updatedAt)
 		detail.HandlerCount = len(detail.Handlers)
 		out = append(out, detail.Row)
 	}
@@ -2013,7 +2023,7 @@ func (st *State) GetApp(name string) (Detail, bool) {
 // failure.
 func scanApp(name string, row *sql.Row) (Detail, bool, error) {
 	var data sql.NullString
-	var updatedAt sql.NullString
+	var updatedAt time.Time
 	if err := row.Scan(&data, &updatedAt); err != nil {
 		if err == sql.ErrNoRows {
 			return Detail{}, false, nil
@@ -2025,7 +2035,7 @@ func scanApp(name string, row *sql.Row) (Detail, bool, error) {
 		return Detail{}, false, err
 	}
 	detail.Name = name
-	detail.UpdatedAt = updatedAt.String
+	detail.UpdatedAt = timestampString(updatedAt)
 	detail.HandlerCount = len(detail.Handlers)
 	return detail, true, nil
 }
@@ -2035,7 +2045,7 @@ func scanApp(name string, row *sql.Row) (Detail, bool, error) {
 // fence. It is the observation/conditional-write form of scanApp.
 func scanAppWithToken(name string, row *sql.Row) (Detail, FencingToken, bool, error) {
 	var data sql.NullString
-	var updatedAt sql.NullString
+	var updatedAt time.Time
 	var fencingToken int64
 	if err := row.Scan(&data, &updatedAt, &fencingToken); err != nil {
 		if err == sql.ErrNoRows {
@@ -2048,7 +2058,7 @@ func scanAppWithToken(name string, row *sql.Row) (Detail, FencingToken, bool, er
 		return Detail{}, 0, false, err
 	}
 	detail.Name = name
-	detail.UpdatedAt = updatedAt.String
+	detail.UpdatedAt = timestampString(updatedAt)
 	detail.HandlerCount = len(detail.Handlers)
 	return detail, FencingToken(fencingToken), true, nil
 }
@@ -2059,7 +2069,13 @@ func scanAppWithToken(name string, row *sql.Row) (Detail, FencingToken, bool, er
 // operations allowed to CREATE a row or advance its fencing token. The snapshot
 // replaces the previous one atomically, so a template change never leaves a
 // mixture of old and new handler/schedule/service configuration.
-func upsertAppTx(ctx context.Context, tx *sql.Tx, detail Detail, fencingToken FencingToken) error {
+func upsertAppTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	detail Detail,
+	fencingToken FencingToken,
+	updatedAt time.Time,
+) error {
 	payload, err := marshalApp(detail)
 	if err != nil {
 		return err
@@ -2071,7 +2087,7 @@ func upsertAppTx(ctx context.Context, tx *sql.Tx, detail Detail, fencingToken Fe
 		   data          = excluded.data,
 		   updated_at    = excluded.updated_at,
 		   fencing_token = excluded.fencing_token`,
-		detail.Name, payload, detail.UpdatedAt, int64(fencingToken))
+		detail.Name, payload, updatedAt, int64(fencingToken))
 	return err
 }
 
@@ -2086,6 +2102,7 @@ func updateAppIfCurrentTx(
 	tx *sql.Tx,
 	detail Detail,
 	fencingToken FencingToken,
+	updatedAt time.Time,
 ) (bool, error) {
 	if fencingToken <= 0 {
 		return false, nil
@@ -2097,7 +2114,7 @@ func updateAppIfCurrentTx(
 	result, err := tx.ExecContext(ctx,
 		`UPDATE apps SET data = $1, updated_at = $2
 		 WHERE name = $3 AND fencing_token = $4`,
-		payload, detail.UpdatedAt, detail.Name, int64(fencingToken))
+		payload, updatedAt, detail.Name, int64(fencingToken))
 	if err != nil {
 		return false, err
 	}

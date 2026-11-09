@@ -281,7 +281,7 @@ func TestPruneStaleStatsRespectsRetention(t *testing.T) {
 	ctx := context.Background()
 	dsn := newTestDSN(t)
 	live := openWithIdentity(t, dsn, "worker-live", "inst-live")
-	base := time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC)
+	base := time.Date(2026, 2, 1, 12, 0, 0, 345678000, time.UTC)
 	live.nowFn = func() time.Time { return base }
 
 	old := openWithIdentity(t, dsn, "worker-old", "inst-old")
@@ -290,23 +290,25 @@ func TestPruneStaleStatsRespectsRetention(t *testing.T) {
 		t.Fatalf("old snapshot: %v", err)
 	}
 
-	removed, err := live.PruneStaleStats(ctx, 24*time.Hour)
+	// updated_at is exactly on the strict cutoff and must survive; advancing
+	// that cutoff by one microsecond must make the row stale.
+	removed, err := live.PruneStaleStats(ctx, time.Hour)
 	if err != nil {
-		t.Fatalf("prune (24h): %v", err)
+		t.Fatalf("prune (exact cutoff): %v", err)
 	}
 	if removed != 0 {
-		t.Fatalf("pruned = %d, want 0 (row is within the retention window)", removed)
+		t.Fatalf("pruned = %d, want 0 (row exactly at cutoff must survive)", removed)
 	}
 	if s, ok := live.Stats(); !ok || s.EventsMatchedTotal != 1 {
-		t.Fatalf("aggregate = %+v ok=%v, want the within-window row preserved", s, ok)
+		t.Fatalf("aggregate = %+v ok=%v, want the row at cutoff preserved", s, ok)
 	}
 
-	removed, err = live.PruneStaleStats(ctx, 30*time.Minute)
+	removed, err = live.PruneStaleStats(ctx, time.Hour-time.Microsecond)
 	if err != nil {
-		t.Fatalf("prune (30m): %v", err)
+		t.Fatalf("prune (cutoff one microsecond later): %v", err)
 	}
 	if removed != 1 {
-		t.Fatalf("pruned = %d, want 1 (row is now past the window)", removed)
+		t.Fatalf("pruned = %d, want 1 (row is one microsecond before cutoff)", removed)
 	}
 }
 

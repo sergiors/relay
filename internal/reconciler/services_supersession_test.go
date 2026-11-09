@@ -121,7 +121,7 @@ func TestServiceCoordinatorSupersededPassPreservesOldGeneration(t *testing.T) {
 		t.Fatalf("running = %d, want 1", got)
 	}
 	final := f.lastStartedFor("fn", "ghcr.io/acme/api:1.2")
-	if final == nil || final.envHash != runtime.EnvHash([]string{"MODE=c", "PORT=8080"}) {
+	if final == nil || final.environmentFingerprint != runtime.EnvironmentFingerprint([]string{"MODE=c", "PORT=8080"}) {
 		t.Fatalf("final = %+v, want the latest MODE=c effective env", final)
 	}
 	// A was preserved through B's abandoned pass and stopped only by C's commit.

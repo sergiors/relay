@@ -87,19 +87,19 @@ const (
 	// has a source mount.
 	labelSource = "relay.source"
 
-	// labelEnvHash pins the exact effective environment a service replica was
-	// created with: a short content hash over the Config.Env slice (runtime plan
-	// env + template env + resolved secrets + PORT), never any value itself.
+	// labelEnvironment records the identity of the effective environment a
+	// service replica was created with (runtime plan env + template env + resolved
+	// secrets + PORT). It is reconciliation metadata, not a confidentiality
+	// boundary.
 	//
 	// It exists because the environment is the one piece of a service's
 	// configuration the image reference cannot carry: an external `image`
 	// source keeps its reference when the template's env changes, and a rotated
-	// secret value never changes the fingerprint at all. Without this label the
-	// service reconciler would keep such a container and it would serve its old
-	// environment forever. The hash is a one-way digest, so no secret value is
-	// exposed; a container built before the label carries none and never
-	// matches the desired hash, so it is replaced once.
-	labelEnvHash = "relay.env_hash"
+	// secret value does not change the service's source fingerprint. Without this
+	// label the service reconciler would keep such a container and it would serve
+	// its old environment forever. A container built before the label carries none and
+	// never matches the desired fingerprint, so it is replaced once.
+	labelEnvironment = "relay.environment"
 
 	// labelResources pins the effective per-container resource configuration a
 	// service replica was created with: a short digest over the resolved

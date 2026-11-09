@@ -102,8 +102,8 @@
 // into the service container's Docker Config.Env. Those values are therefore
 // readable through the Docker daemon/API (docker inspect, the Docker socket) by
 // anyone already trusted with daemon access, which is the same trust boundary as
-// the host itself. Relay never writes any value into a Docker label, log line,
-// metric, or span; only the one-way relay.env_hash digest is labeled.
+// the host itself. The relay.environment label stores an environment fingerprint
+// for reconciliation; it is not a confidentiality boundary.
 //
 // The build context stages exactly the app's selected source via the shared
 // internal/source policy (the app's .gitignore rules), the same selection

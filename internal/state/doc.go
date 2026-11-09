@@ -65,7 +65,9 @@
 // never a fencing token.
 //
 // In both cases a failure never reports "ready": degraded when a usable active
-// generation exists, unavailable otherwise. All timestamps are RFC3339 strings.
+// generation exists, unavailable otherwise. Relational updated_at and
+// selected_at timestamps use PostgreSQL TIMESTAMPTZ; JSON snapshot and public
+// presentation timestamps retain their RFC3339 string form.
 //
 // View boundary: this database is a VIEW, never the source of truth. It
 // records what was loaded/prepared/served for operators, but it never drives
@@ -77,7 +79,7 @@
 //
 // App storage model:
 //
-//   - apps(name TEXT PRIMARY KEY, data JSONB NOT NULL, updated_at TEXT NOT
+//   - apps(name TEXT PRIMARY KEY, data JSONB NOT NULL, updated_at TIMESTAMPTZ NOT
 //     NULL, fencing_token BIGINT NOT NULL DEFAULT 0) stores ONE whole per-app
 //     snapshot as a native JSONB object in data. Only the stable name key, the
 //     write timestamp, and the internal fencing token stay as columns;
@@ -158,13 +160,14 @@
 // Runtime image selection state:
 //
 // runtime_image_selections(runtime_id TEXT PRIMARY KEY, source_image TEXT NOT
-// NULL, digest TEXT NOT NULL, generation BIGINT NOT NULL, selected_at TEXT NOT
-// NULL) is a small table of runtime base-image pins, keyed by the template
+// NULL, digest TEXT NOT NULL, generation BIGINT NOT NULL,
+// selected_at TIMESTAMPTZ NOT NULL) is a small table of runtime base-image pins,
+// keyed by the template
 // runtime identifier. source_image stores the EXACT configured base reference
 // (e.g. "python:3.14-slim"), and digest stores a Docker multi-platform index
 // digest in the form "sha256:<64 lowercase hex>" — never a child manifest
-// digest. generation is monotonically increasing and selected_at is the RFC3339
-// selection timestamp. There is no history table: a pin is replaced in place. A
+// digest. generation is monotonically increasing and selected_at is a native
+// TIMESTAMPTZ. There is no history table: a pin is replaced in place. A
 // MISSING ROW MEANS UNPINNED, which preserves the exact historical base-image tag
 // behavior for every existing deployment.
 //
@@ -210,8 +213,8 @@
 // of last-writer-wins overwriting a single global row, and so same-host workers
 // never collide (two processes must not share a NODE_ID).
 // Only stable relational metadata is kept as columns: stats.node_id,
-// stats.instance, and stats.updated_at, and app_stats.app_name,
-// app_stats.node_id, and app_stats.updated_at. stats.instance is the owning
+// stats.instance, and stats.updated_at (TIMESTAMPTZ), and app_stats.app_name,
+// app_stats.node_id, and app_stats.updated_at (TIMESTAMPTZ). stats.instance is the owning
 // process incarnation (config InstanceID, an always-fresh per-process token):
 // every flush is conditioned on it, so a stale process for the same NodeID can
 // never overwrite a newer incarnation's snapshot (see RecordStatsSnapshot). The
@@ -225,8 +228,9 @@
 // carries no backward-compatibility guarantee across versions: it is
 // coordination/operator state, not a durable public contract.
 //
-// stats_meta holds the single-row GLOBAL reset epoch (generation). Every flush
-// reads it FOR SHARE and every `stats reset` bumps it with an exclusive UPDATE in
+// stats_meta holds the single-row GLOBAL reset epoch (generation) and a native
+// TIMESTAMPTZ updated_at. Every flush reads it FOR SHARE and every `stats reset`
+// bumps it with an exclusive UPDATE in
 // the same transaction that zeroes the rows, so a delayed pre-reset snapshot from
 // ANY worker is fenced out of the reset — not only the socket-owning worker's. The
 // single lock ordering (stats_meta first, then stats/app_stats) makes a flush,

@@ -28,8 +28,9 @@ const (
 )
 
 // resourceFingerprintLen is the number of hex characters in a resource
-// fingerprint. 16 hex chars = 64 bits, matching the service identity/env hash
-// convention (serviceIdentityHashLen) so resource labels share one shape.
+// fingerprint. 16 hex chars = 64 bits, matching the service identity and
+// environment fingerprint convention (serviceIdentityHashLen) so resource
+// labels share one shape.
 const resourceFingerprintLen = 16
 
 // ResourceLimits is an app's EFFECTIVE per-container resource configuration:

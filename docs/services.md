@@ -81,8 +81,9 @@ template's `env` values, resolved `secrets` values, then `PORT`.
 Unlike ephemeral event/schedule functions, a persistent service needs its
 environment at process **start**, so the effective environment is written to the
 service container's Docker `Config.Env`. Anyone with Docker daemon access can read it via
-`docker inspect`; Relay never writes a value into a label, log, metric, or span,
-only the one-way `relay.env_hash` digest.
+`docker inspect`. Relay does not write raw environment values into labels, logs,
+metrics, or spans; the `relay.environment` fingerprint is reconciliation
+metadata, not a confidentiality boundary.
 
 Per-container `resources` apply to service containers too. The hardening is the
 same as invocation containers: non-root (from the managed runtime image or the
@@ -200,7 +201,7 @@ to the template.
   healthy containers** rather than tearing them down. A transient registry
   outage therefore never degrades a working service.
 - Containers whose source descriptor, image (or, for an external tag, image
-  **content**), port, effective environment (`relay.env_hash`), per-container
+  **content**), port, effective environment (`relay.environment`), per-container
   resources (`relay.resources`), additional tmpfs configuration
   (`relay.tmpfs`), or routing labels no longer match are **replaced**. Others
   are preserved — no unnecessary restarts. The joined
@@ -258,7 +259,7 @@ A failed check does not advance the window, so it retries at the next reconcile.
 
 Containers are identified by deterministic Relay-owned labels
 (`relay.type=service`, `relay.app`, `relay.service`, `relay.identity`, plus
-image content id, port, replica slot, `relay.env_hash`, `relay.resources`,
+image content id, port, replica slot, `relay.environment`, `relay.resources`,
 `relay.tmpfs`, `relay.networks`), never by name alone. `relay.service` is the
 service's stable name (the grouping key); `relay.identity` is its configured
 source descriptor, used only to resolve the image/entry command and to detect a

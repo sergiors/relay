@@ -272,14 +272,14 @@ func TestIntegrationServiceStartListStop(t *testing.T) {
 			t.Fatalf("inspect %s: nil Config", id)
 		}
 		want := map[string]string{
-			labelType:     ContainerTypeService,
-			labelApp:      "svc-lifecycle",
-			labelService:  "svc",
-			labelIdentity: "app/service.js",
-			labelImage:    image,
-			labelNodeID:   "test-host",
-			labelPort:     "3000",
-			labelEnvHash:  EnvHash([]string{"PORT=3000"}),
+			labelType:        ContainerTypeService,
+			labelApp:         "svc-lifecycle",
+			labelService:     "svc",
+			labelIdentity:    "app/service.js",
+			labelImage:       image,
+			labelNodeID:      "test-host",
+			labelPort:        "3000",
+			labelEnvironment: EnvironmentFingerprint([]string{"PORT=3000"}),
 		}
 		for k, v := range want {
 			if got := insp.Container.Config.Labels[k]; got != v {

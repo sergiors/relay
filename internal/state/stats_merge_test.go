@@ -4,7 +4,7 @@ import "testing"
 
 // TestMergeStatsEqualUpdatedAtTieIsDeterministic pins the equal-updated_at tie
 // break in mergeStats directly: two snapshots of the SAME shared backlog with the
-// same updated_at (RFC3339 has second granularity) cannot be ordered by
+// same updated_at (the state timestamp presentation has second granularity) cannot be ordered by
 // freshness, so each gauge takes the larger value. Folding the two rows in either
 // order therefore yields the identical result, so the aggregate never depends on
 // the order the stats rows happen to be read in.

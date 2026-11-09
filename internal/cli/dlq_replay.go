@@ -47,10 +47,6 @@ import (
 // fallback to the diagnostic Event body: an entry with no stored payload is an
 // explicit pre-dial error and releases the claim.
 func replayDLQEntry(ctx context.Context, w io.Writer, store dlq.Store, socketPath, id string) error {
-	id, err := resolveDLQID(ctx, store, id)
-	if err != nil {
-		return err
-	}
 	claim, err := store.ClaimDLQReplay(ctx, id, dlq.ReplayLease)
 	if err != nil {
 		switch {

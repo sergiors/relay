@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"strings"
+	"time"
 )
 
 // ErrRuntimeImageSelectionConflict reports that a compare-and-swap on a runtime
@@ -85,11 +86,13 @@ func (st *State) ReadRuntimeImageSelections(ctx context.Context) ([]RuntimeImage
 	var selections []RuntimeImageSelection
 	for rows.Next() {
 		var sel RuntimeImageSelection
+		var selectedAt time.Time
 		if err := rows.Scan(
-			&sel.RuntimeID, &sel.SourceImage, &sel.Digest, &sel.Generation, &sel.SelectedAt,
+			&sel.RuntimeID, &sel.SourceImage, &sel.Digest, &sel.Generation, &selectedAt,
 		); err != nil {
 			return nil, fmt.Errorf("read runtime image selections: %w", err)
 		}
+		sel.SelectedAt = timestampString(selectedAt)
 		selections = append(selections, sel)
 	}
 	if err := rows.Err(); err != nil {
@@ -137,7 +140,7 @@ func (st *State) CompareAndSwapRuntimeImageSelection(
 			"runtime image selection %q: expected generation must be >= 0", selection.RuntimeID)
 	}
 
-	selectedAt := st.nowString()
+	selectedAt := st.nowTime().UTC()
 	tx, err := st.db.BeginTx(ctx, nil)
 	if err != nil {
 		return RuntimeImageSelection{}, fmt.Errorf(
@@ -186,7 +189,7 @@ func (st *State) CompareAndSwapRuntimeImageSelection(
 		return RuntimeImageSelection{}, fmt.Errorf(
 			"commit runtime image selection %q: %w", selection.RuntimeID, err)
 	}
-	selection.SelectedAt = selectedAt
+	selection.SelectedAt = timestampString(selectedAt)
 	return selection, nil
 }
 
@@ -226,12 +229,13 @@ func (st *State) WithRuntimeImageSelectionLock(
 	}
 
 	var current RuntimeImageSelection
+	var selectedAt time.Time
 	err = tx.QueryRowContext(ctx,
 		`SELECT runtime_id, source_image, digest, generation, selected_at
 		 FROM runtime_image_selections WHERE runtime_id = $1`,
 		runtimeID,
 	).Scan(&current.RuntimeID, &current.SourceImage, &current.Digest,
-		&current.Generation, &current.SelectedAt)
+		&current.Generation, &selectedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		if err := fn(ctx, nil); err != nil {
 			return err
@@ -239,6 +243,7 @@ func (st *State) WithRuntimeImageSelectionLock(
 	} else if err != nil {
 		return fmt.Errorf("read runtime image selection %q: %w", runtimeID, err)
 	} else {
+		current.SelectedAt = timestampString(selectedAt)
 		if err := fn(ctx, &current); err != nil {
 			return err
 		}

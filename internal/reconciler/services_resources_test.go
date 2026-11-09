@@ -232,13 +232,13 @@ func TestReconcileUnchangedResourcesNoChurn(t *testing.T) {
 
 // TestReconcileLegacyContainerWithoutResourcesReplaced pins the missing-label
 // semantics: a running container with no relay.resources is replaced once (like
-// a missing relay.env_hash), and is NOT churned again afterwards.
+// a missing relay.environment), and is NOT churned again afterwards.
 func TestReconcileLegacyContainerWithoutResourcesReplaced(t *testing.T) {
 	f := newFakeDocker()
 	f.ctrs["legacy-1"] = &fakeContainer{
 		id: "legacy-1", appName: "fn", entrypoint: "service.js",
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
-		envHash: serviceEnvHash(80), // env correct, resources label absent
+		environmentFingerprint: serviceEnvironmentFingerprint(80), // env correct, resources label absent
 	}
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {

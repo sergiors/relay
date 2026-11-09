@@ -33,9 +33,8 @@ func openPostgresDLQStore(ctx context.Context, _ *slog.Logger) (dlq.Store, func(
 // namespaceAction: a bare `relay dlq` shows the subcommand help, and an unknown
 // first token is a friendly Docker-style usage error naming the full path.
 //
-// ls prints only the first dlqIDShortLength characters of each ID; the admin
-// commands accept that visible prefix (or any longer unique prefix) as well as
-// the full ID.
+// ls prints the full 64-character ID of each entry; inspect, replay, and rm
+// require that exact full ID.
 //
 // PostgreSQL access stays behind the broker-neutral dlq.Store seam and the
 // injected OpenDLQStore opener; the command helpers retrieve entries and pass
@@ -58,15 +57,14 @@ func dlqCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 }
 
 // dlqLsCommand builds `relay dlq ls`: a concise table of the DLQ entries in
-// write order, one row per entry. The row shows the first dlqIDShortLength
-// characters of the entry ID, the exact failed app/handler and its handler
-// attempt count, and the entry's age; the short ID can be passed directly to
-// inspect, replay, or rm as a prefix.
+// write order, one row per entry. The row shows the full entry ID, the exact
+// failed app/handler and its handler attempt count, and the entry's age; the
+// full ID can be passed directly to inspect, replay, or rm.
 func dlqLsCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "ls",
 		Usage: "List DLQ entries",
-		Description: "List every DLQ entry in write order: short entry ID, " +
+		Description: "List every DLQ entry in write order: full entry ID, " +
 			"failed app/handler, handler attempts, and age.",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.Args().Present() {
@@ -83,18 +81,16 @@ func dlqLsCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	}
 }
 
-// dlqInspectCommand builds `relay dlq inspect ID|PREFIX`: the exact current
-// fields of one entry, followed by the original transport `value` pretty-printed.
-// A unique prefix of at least dlqIDShortLength characters is accepted. An
-// unknown or ambiguous ID is a clear error.
+// dlqInspectCommand builds `relay dlq inspect ID`: the exact current fields of
+// one entry, followed by the original transport `value` pretty-printed. The ID
+// must be the full 64-character stable ID. An unknown ID is a clear error.
 func dlqInspectCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:      "inspect",
 		Usage:     "Show one DLQ entry",
-		UsageText: "relay dlq inspect ID|PREFIX",
+		UsageText: "relay dlq inspect ID",
 		Description: "Show a single DLQ entry's metadata and its original " +
-			"transport value, pretty-printed. Accepts the full ID or a unique " +
-			"prefix of at least 10 characters.",
+			"transport value, pretty-printed.",
 		Arguments: []cli.Argument{
 			&cli.StringArgs{Name: "id", Min: 1, Max: 1},
 		},
@@ -114,22 +110,21 @@ func dlqInspectCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	}
 }
 
-// dlqReplayCommand builds `relay dlq replay ID|PREFIX`: it reads the entry's
-// exact stored app, handler, and replay payload, asks the running worker over
-// its query socket to execute exactly that one handler once against the live
-// runtime, and deletes only that DLQ entry after the execution succeeds. A
-// unique prefix of at least dlqIDShortLength characters is accepted. On any
-// failure — a removed app/handler, a failed handler, or an unavailable worker —
-// the entry is retained and a concise error is returned.
+// dlqReplayCommand builds `relay dlq replay ID`: it reads the entry's exact
+// stored app, handler, and replay payload, asks the running worker over its
+// query socket to execute exactly that one handler once against the live
+// runtime, and deletes only that DLQ entry after the execution succeeds. The ID
+// must be the full 64-character stable ID. On any failure — a removed
+// app/handler, a failed handler, or an unavailable worker — the entry is
+// retained and a concise error is returned.
 func dlqReplayCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:      "replay",
 		Usage:     "Replay one DLQ entry",
-		UsageText: "relay dlq replay ID|PREFIX",
+		UsageText: "relay dlq replay ID",
 		Description: "Re-execute one DLQ entry's exact app and handler once on " +
 			"the running worker, then delete the entry on success. The entry is " +
-			"kept on failure. Accepts the full ID or a unique prefix of at " +
-			"least 10 characters.",
+			"kept on failure.",
 		Arguments: []cli.Argument{
 			&cli.StringArgs{Name: "id", Min: 1, Max: 1},
 		},
@@ -145,19 +140,17 @@ func dlqReplayCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	}
 }
 
-// dlqRmCommand builds `relay dlq rm ID|PREFIX`: it deletes exactly one durable
-// entry by its stable ID and leaves every other entry in place. A unique prefix
-// of at least dlqIDShortLength characters is accepted. It never touches broker
-// invocation state and never causes execution; if the source delivery is still
-// pending, a redelivery may recreate the row. An unknown or ambiguous ID is a
-// clear error.
+// dlqRmCommand builds `relay dlq rm ID`: it deletes exactly one durable entry by
+// its stable full ID and leaves every other entry in place. The ID must be the
+// full 64-character stable ID. It never touches broker invocation state and never
+// causes execution; if the source delivery is still pending, a redelivery may
+// recreate the row. An unknown ID is a clear error.
 func dlqRmCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
-		Name:      "rm",
-		Usage:     "Remove one DLQ entry",
-		UsageText: "relay dlq rm ID|PREFIX",
-		Description: "Delete exactly one DLQ entry by its stable ID. " +
-			"Accepts the full ID or a unique prefix of at least 10 characters.",
+		Name:        "rm",
+		Usage:       "Remove one DLQ entry",
+		UsageText:   "relay dlq rm ID",
+		Description: "Delete exactly one DLQ entry by its stable ID.",
 		Arguments: []cli.Argument{
 			&cli.StringArgs{Name: "id", Min: 1, Max: 1},
 		},
@@ -176,7 +169,12 @@ func dlqRmCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 // withDLQStore opens the DLQ store for one command, runs fn, and always closes
 // the store. It keeps the client-open plumbing out of every command Action and
 // out of the entry/render helpers.
-func withDLQStore(ctx context.Context, logger *slog.Logger, deps Dependencies, fn func(dlq.Store) error) error {
+func withDLQStore(
+	ctx context.Context,
+	logger *slog.Logger,
+	deps Dependencies,
+	fn func(dlq.Store) error,
+) error {
 	if deps.OpenDLQ == nil {
 		// No opener wired (an embedding host / test): fail clearly instead of
 		// panicking.
@@ -193,15 +191,10 @@ func withDLQStore(ctx context.Context, logger *slog.Logger, deps Dependencies, f
 	return nil
 }
 
-// removeDLQEntry deletes exactly one settled entry by its stable ID. The
-// supplied ID may be a unique prefix; it is resolved before the exact-ID
-// delete. An unknown ID is a clear error; an entry with an active replay claim
-// is refused, because the replay may still be executing.
+// removeDLQEntry deletes exactly one settled entry by its full stable ID. An
+// unknown ID is a clear error; an entry with an active replay claim is refused,
+// because the replay may still be executing.
 func removeDLQEntry(ctx context.Context, w io.Writer, store dlq.Store, id string) error {
-	id, err := resolveDLQID(ctx, store, id)
-	if err != nil {
-		return err
-	}
 	deleted, err := store.DeleteDLQEntry(ctx, id)
 	if err != nil {
 		switch {
@@ -219,4 +212,17 @@ func removeDLQEntry(ctx context.Context, w io.Writer, store dlq.Store, id string
 	out := newOutput(w)
 	out.line("DLQ entry removed")
 	return out.err
+}
+
+// findDLQEntry loads the entry with the exact supplied ID. An unknown ID is a
+// clear error.
+func findDLQEntry(ctx context.Context, store dlq.Store, id string) (dlq.Entry, error) {
+	entry, ok, err := store.GetDLQEntry(ctx, id)
+	if err != nil {
+		return dlq.Entry{}, err
+	}
+	if !ok {
+		return dlq.Entry{}, fmt.Errorf("unknown DLQ entry %q", id)
+	}
+	return entry, nil
 }

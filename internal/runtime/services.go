@@ -128,12 +128,12 @@ type ServiceContainer struct {
 	// The service reconciler uses it to detect a port change (a stale-config
 	// container whose labelPort != the template's desired port is replaced).
 	Port int
-	// EnvHash is the content hash of the effective environment the container
-	// was created with, parsed from relay.env_hash. It is "" for a container
-	// created before the label existed (or with a missing/invalid value), which
-	// never equals a desired hash, so such a container is replaced once —
-	// exactly like a missing relay.image_id or relay.port.
-	EnvHash string
+	// EnvironmentFingerprint is the identity of the effective environment the
+	// container was created with, parsed from relay.environment. It is "" for a
+	// container created before the label existed (or with a missing/invalid value),
+	// which never equals the desired fingerprint, so such a container is replaced
+	// once — exactly like a missing relay.image_id or relay.port.
+	EnvironmentFingerprint string
 	// Resources is the effective resource configuration's fingerprint the
 	// container was created with, parsed from relay.resources. It is "" for a
 	// container created before the label existed, which never equals a desired
@@ -335,29 +335,10 @@ func NetworksLabel(networks ...string) string {
 	return strings.Join(set, ",")
 }
 
-// EnvHash returns the short content hash of a service replica's effective
-// environment (relay.env_hash): a deterministic, order-sensitive digest over the
-// exact Config.Env slice StartService applies. It is a one-way hash, so no
-// secret value is ever exposed in a label, log, metric, or inspect output.
-//
-// The digest is deliberately UNSALTED (a plain SHA-256 of the NUL-joined
-// Config.Env entries): the reconciler compares a discovered container's label
-// against a freshly computed desired hash on every pass and across worker
-// restarts, so the value must be a deterministic app of the environment
-// alone. A salt would require a stable key persisted somewhere, and without such
-// a key it would change across restarts and break deterministic reconciliation
-// (spuriously replacing every service container). A salted digest with a
-// persisted key remains a possible future hardening step; the value carries no
-// raw content either way.
-//
-// The reconciler uses it to detect that a container's environment no longer
-// matches the template: a changed template env on an `image` source (whose image
-// reference is unchanged), or a rotated secret value (which never changes the
-// source fingerprint), must replace the stale container. The NUL separator is
-// not valid inside an env entry, so the entries cannot run together across the
-// join. The hash length matches serviceIdentityHashLen so the two label values
-// share one convention.
-func EnvHash(env []string) string {
+// EnvironmentFingerprint returns the environment identity used by service
+// reconciliation to determine whether a service container's effective environment
+// has changed.
+func EnvironmentFingerprint(env []string) string {
 	h := sha256.New()
 	for _, kv := range env {
 		_, _ = h.Write([]byte(kv))
@@ -404,9 +385,9 @@ func ServiceTmpfsLabel(destinations []string) string {
 // image reference) for implementation comparison and image resolution. Service
 // containers carry no relay.handler. relay.image_id records the local content ID
 // the container was started from (empty when the reference itself is
-// content-addressed), so a moved external tag is detected. relay.env_hash pins
-// the effective environment's content hash so an env/secret change replaces a
-// container whose image reference is unchanged (see labelEnvHash).
+// content-addressed), so a moved external tag is detected. relay.environment pins
+// the effective environment fingerprint so an env/secret change replaces a
+// container whose image reference is unchanged (see labelEnvironment).
 // relay.resources and relay.tmpfs pin the effective per-container resources and
 // the configured additional tmpfs destinations, so a change to either replaces
 // a running service.
@@ -416,7 +397,7 @@ func ServiceTmpfsLabel(destinations []string) string {
 // ownership labels are always authoritative: a caller can add labels but never
 // clobber or spoof a relay.* key.
 func serviceLabels(spec ServiceSpec, nodeID string, replica int) map[string]string {
-	envHash := EnvHash(spec.Env)
+	environmentFingerprint := EnvironmentFingerprint(spec.Env)
 	resourceHash := spec.Resources.OrDefault().Fingerprint()
 	tmpfsLabel := ServiceTmpfsLabel(spec.Tmpfs)
 	sourceID := ""
@@ -424,16 +405,16 @@ func serviceLabels(spec ServiceSpec, nodeID string, replica int) map[string]stri
 		sourceID = spec.SourceMount.Identity
 	}
 	labels := map[string]string{
-		labelType:      ContainerTypeService,
-		labelApp:       spec.App,
-		labelService:   spec.Name,
-		labelIdentity:  spec.SourceRef,
-		labelImage:     spec.Image,
-		labelNodeID:    nodeID,
-		labelPort:      strconv.Itoa(spec.Port),
-		labelReplica:   strconv.Itoa(replica),
-		labelEnvHash:   envHash,
-		labelResources: resourceHash,
+		labelType:        ContainerTypeService,
+		labelApp:         spec.App,
+		labelService:     spec.Name,
+		labelIdentity:    spec.SourceRef,
+		labelImage:       spec.Image,
+		labelNodeID:      nodeID,
+		labelPort:        strconv.Itoa(spec.Port),
+		labelReplica:     strconv.Itoa(replica),
+		labelEnvironment: environmentFingerprint,
+		labelResources:   resourceHash,
 	}
 	if spec.ImageID != "" {
 		labels[labelImageID] = spec.ImageID
@@ -453,7 +434,7 @@ func serviceLabels(spec ServiceSpec, nodeID string, replica int) map[string]stri
 	labels[labelNodeID] = nodeID
 	labels[labelPort] = strconv.Itoa(spec.Port)
 	labels[labelReplica] = strconv.Itoa(replica)
-	labels[labelEnvHash] = envHash
+	labels[labelEnvironment] = environmentFingerprint
 	labels[labelResources] = resourceHash
 	// The tmpfs configuration is identity metadata too; re-apply it last and
 	// clear a spoofed value when the service declares no additional tmpfs.
@@ -835,22 +816,22 @@ func (m *Manager) serviceContainerList(ctx context.Context, admit dockerOpAdmitt
 			maps.Copy(labelsCopy, c.Labels)
 		}
 		out = append(out, ServiceContainer{
-			ID:        c.ID,
-			App:       c.Labels[labelApp],
-			Name:      c.Labels[labelService],
-			SourceRef: c.Labels[labelIdentity],
-			Image:     c.Labels[labelImage],
-			ImageID:   c.Labels[labelImageID],
-			NodeID:    c.Labels[labelNodeID],
-			State:     c.State,
-			Replica:   replica,
-			Port:      port,
-			EnvHash:   c.Labels[labelEnvHash],
-			Resources: c.Labels[labelResources],
-			Tmpfs:     c.Labels[labelTmpfs],
-			Networks:  c.Labels[labelNetworks],
-			SourceID:  c.Labels[labelSource],
-			Labels:    labelsCopy,
+			ID:                     c.ID,
+			App:                    c.Labels[labelApp],
+			Name:                   c.Labels[labelService],
+			SourceRef:              c.Labels[labelIdentity],
+			Image:                  c.Labels[labelImage],
+			ImageID:                c.Labels[labelImageID],
+			NodeID:                 c.Labels[labelNodeID],
+			State:                  c.State,
+			Replica:                replica,
+			Port:                   port,
+			EnvironmentFingerprint: c.Labels[labelEnvironment],
+			Resources:              c.Labels[labelResources],
+			Tmpfs:                  c.Labels[labelTmpfs],
+			Networks:               c.Labels[labelNetworks],
+			SourceID:               c.Labels[labelSource],
+			Labels:                 labelsCopy,
 		})
 	}
 	return out, nil

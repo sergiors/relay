@@ -9,15 +9,15 @@ import (
 	"relay/internal/dlq"
 )
 
-// renderDLQList renders the ls table in the store's write order. Only the short
-// ID prefix is shown; inspect still renders the full ID.
+// renderDLQList renders the ls table in the store's write order, showing the
+// full entry ID so it can be copied directly into inspect, replay, or rm.
 func renderDLQList(w io.Writer, entries []dlq.Entry) error {
 	out := newOutput(w)
 	tw := out.table(2)
 	fmt.Fprintln(tw, "ID\tAPP\tHANDLER\tATTEMPTS\tAGE")
 	for _, e := range entries {
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n",
-			shortDLQID(e.ID),
+			e.ID,
 			e.App,
 			e.Handler,
 			e.HandlerAttempts,

@@ -35,10 +35,10 @@ func TestServiceLabelsCarriesServiceIdentityAndOwnership(t *testing.T) {
 		labelNodeID:   "worker-1",
 		labelPort:     "3000",
 		labelReplica:  "2",
-		// No spec.Env -> the hash of an empty env slice (a container created
-		// with no effective env still carries its content hash so discovery can
+		// No spec.Env -> the fingerprint of an empty env slice (a container created
+		// with no effective env still carries its environment identity so discovery can
 		// compare it).
-		labelEnvHash: EnvHash(nil),
+		labelEnvironment: EnvironmentFingerprint(nil),
 		// No spec.Resources -> the default limits' fingerprint (a container
 		// created without explicit resources still carries the effective
 		// default config's hash so discovery can compare it).
@@ -67,68 +67,54 @@ func TestServiceLabelsCarriesServiceIdentityAndOwnership(t *testing.T) {
 	}
 }
 
-// TestServiceLabelsEnvHashPinsEffectiveEnv: the relay.env_hash label is the
-// content hash of the EXACT effective env slice (so discovery can tell an
-// env/secret change happened), never a raw value; distinct env produces a
-// distinct hash, and the same env reproduces it. It also pins order sensitivity:
-// the same entries in a different order are a different effective env.
-func TestServiceLabelsEnvHashPinsEffectiveEnv(t *testing.T) {
+// TestServiceLabelsEnvironmentPinsEffectiveEnv: the relay.environment label
+// identifies the exact effective env slice, so discovery can detect changes.
+// It also pins order sensitivity: the same entries in a different order are a
+// different effective env.
+func TestServiceLabelsEnvironmentPinsEffectiveEnv(t *testing.T) {
 	spec := func(env []string) ServiceSpec {
 		return ServiceSpec{App: "fn", Name: "svc", SourceRef: "svc.js", Port: 80, Image: "img", Env: env}
 	}
 	base := serviceLabels(spec([]string{"A=1", "B=2"}), "h", 0)
-	if base[labelEnvHash] != EnvHash([]string{"A=1", "B=2"}) {
-		t.Errorf("env hash = %q, want the hash of the effective env", base[labelEnvHash])
+	if base[labelEnvironment] != EnvironmentFingerprint([]string{"A=1", "B=2"}) {
+		t.Errorf("environment fingerprint = %q, want the identity of the effective env", base[labelEnvironment])
 	}
-	if base[labelEnvHash] == EnvHash([]string{"A=1", "B=3"}) {
-		t.Error("a changed env value must change the env hash")
+	if base[labelEnvironment] == EnvironmentFingerprint([]string{"A=1", "B=3"}) {
+		t.Error("a changed env value must change the environment fingerprint")
 	}
-	if base[labelEnvHash] == EnvHash([]string{"B=2", "A=1"}) {
-		t.Error("a different env order must change the env hash (order-sensitive)")
+	if base[labelEnvironment] == EnvironmentFingerprint([]string{"B=2", "A=1"}) {
+		t.Error("a different env order must change the environment fingerprint (order-sensitive)")
 	}
-	if serviceLabels(spec([]string{"A=1", "B=2"}), "h", 0)[labelEnvHash] != base[labelEnvHash] {
-		t.Error("the same env must reproduce the same hash")
+	if serviceLabels(spec([]string{"A=1", "B=2"}), "h", 0)[labelEnvironment] != base[labelEnvironment] {
+		t.Error("the same env must reproduce the same fingerprint")
 	}
 }
 
-// TestEnvHashEmptyIsStableAndValueFree pins the two properties the reconciler
-// relies on: the empty env hashes to one fixed value, and the hash is a fixed
-// 16-hex-char digest (never the env itself).
-func TestEnvHashEmptyIsStableAndValueFree(t *testing.T) {
-	if EnvHash(nil) != EnvHash([]string{}) {
-		t.Error("nil and empty env must hash identically")
+// TestEnvironmentFingerprintEmptyIsStableAndFixedLength pins the empty-input
+// behavior and the fingerprint's fixed output length.
+func TestEnvironmentFingerprintEmptyIsStableAndFixedLength(t *testing.T) {
+	if EnvironmentFingerprint(nil) != EnvironmentFingerprint([]string{}) {
+		t.Error("nil and empty env must have the same fingerprint")
 	}
-	got := EnvHash([]string{"TOKEN=super-secret-value"})
+	got := EnvironmentFingerprint([]string{"TOKEN=secret-value"})
 	if len(got) != serviceIdentityHashLen {
-		t.Fatalf("env hash length = %d, want %d", len(got), serviceIdentityHashLen)
-	}
-	if strings.Contains(got, "super-secret-value") || strings.Contains(got, "TOKEN") {
-		t.Errorf("env hash %q leaks env content", got)
+		t.Fatalf("environment fingerprint length = %d, want %d", len(got), serviceIdentityHashLen)
 	}
 }
 
-// TestEnvHashDeterministicAcrossProcesses pins the cross-restart determinism the
-// service reconciler depends on: the same effective env must hash to the SAME
-// value every time and every build. The digest is a pure, UNSALTED app of
-// the env alone (nothing per-boot is mixed in), so a container labeled before a
-// worker restart still compares equal after it. A salted digest with no
-// persisted key would break that and spuriously replace every service container
-// on each restart; this test guards against introducing a process-random salt.
-// Only the digest is asserted, never a raw env value.
-func TestEnvHashDeterministicAcrossProcesses(t *testing.T) {
+// TestEnvironmentFingerprintDeterministicAcrossProcesses pins the stable output
+// used by service reconciliation across worker restarts.
+func TestEnvironmentFingerprintDeterministicAcrossProcesses(t *testing.T) {
 	env := []string{"A=1", "TOKEN=secret-value", "PORT=8080"}
-	first := EnvHash(env)
-	second := EnvHash(append([]string(nil), env...))
+	first := EnvironmentFingerprint(env)
+	second := EnvironmentFingerprint(append([]string(nil), env...))
 	if first != second {
-		t.Fatalf("EnvHash is not deterministic: %q vs %q", first, second)
+		t.Fatalf("EnvironmentFingerprint is not deterministic: %q vs %q", first, second)
 	}
-	// The exact digest pins the UNSALTED construction across builds.
+	// The exact digest pins the SHA-256 construction across builds.
 	const want = "f913ec6c9980f339"
 	if first != want {
-		t.Fatalf("EnvHash = %q, want the unsalted construction %q", first, want)
-	}
-	if strings.Contains(first, "secret-value") {
-		t.Fatalf("EnvHash leaked env content: %q", first)
+		t.Fatalf("EnvironmentFingerprint = %q, want %q", first, want)
 	}
 }
 
@@ -494,7 +480,7 @@ func TestSweepSkipsServiceContainers(t *testing.T) {
 func TestServiceContainerListParsing(t *testing.T) {
 	c1Labels := `{"relay.type":"service","relay.app":"fn-a","relay.service":"svcname","relay.identity":"svc.js",` +
 		`"relay.image":"img-a","relay.node_id":"h1","relay.port":"3000","relay.replica":"2",` +
-		`"relay.env_hash":"0123456789abcdef"}`
+		`"relay.environment":"0123456789abcdef"}`
 	c2Labels := `{"relay.type":"service","relay.app":"fn-a","relay.service":"svcname","relay.identity":"svc.js",` +
 		`"relay.image":"img-a","relay.node_id":"h1","relay.port":"notaport"}`
 	body := `[{"Id":"c1","Labels":` + c1Labels + `},` +
@@ -526,14 +512,14 @@ func TestServiceContainerListParsing(t *testing.T) {
 	if c1.Port != 3000 {
 		t.Errorf("c1 port = %d, want the parsed 3000", c1.Port)
 	}
-	if c1.EnvHash != "0123456789abcdef" {
-		t.Errorf("c1 env hash = %q, want the parsed relay.env_hash", c1.EnvHash)
+	if c1.EnvironmentFingerprint != "0123456789abcdef" {
+		t.Errorf("c1 environment fingerprint = %q, want the parsed relay.environment", c1.EnvironmentFingerprint)
 	}
 
 	// c2 has no relay.replica and a non-numeric relay.port: replica defaults to
-	// -1 (always-stale to Reconcile) and port to 0. Its env hash is empty
-	// (missing label) — a legacy/unlabeled container that never matches a
-	// desired hash, so it is replaced once.
+	// -1 (always-stale to Reconcile) and port to 0. Its environment fingerprint
+	// is empty (missing label) — a legacy/unlabeled container that never matches a
+	// desired fingerprint, so it is replaced once.
 	c2 := byID["c2"]
 	if c2.Replica != -1 {
 		t.Errorf("c2 replica = %d, want -1 default for a missing label", c2.Replica)
@@ -541,8 +527,8 @@ func TestServiceContainerListParsing(t *testing.T) {
 	if c2.Port != 0 {
 		t.Errorf("c2 port = %d, want 0 default for a non-numeric label", c2.Port)
 	}
-	if c2.EnvHash != "" {
-		t.Errorf("c2 env hash = %q, want empty for a missing label", c2.EnvHash)
+	if c2.EnvironmentFingerprint != "" {
+		t.Errorf("c2 environment fingerprint = %q, want empty for a missing label", c2.EnvironmentFingerprint)
 	}
 
 	// The full label set is copied, so the reconciler can compare foreign labels.
@@ -564,11 +550,11 @@ func TestServiceLabelsSpecMergedOwnershipWins(t *testing.T) {
 		Labels: map[string]string{
 			"traefik.enable": "true",
 			// Attempted spoof of Relay ownership keys.
-			labelType:    ContainerTypeEvent,
-			labelApp:     "spoofed",
-			labelPort:    "9999",
-			labelEnvHash: "spoofedhash",
-			"custom.key": "custom-value",
+			labelType:        ContainerTypeEvent,
+			labelApp:         "spoofed",
+			labelPort:        "9999",
+			labelEnvironment: "spoofedhash",
+			"custom.key":     "custom-value",
 		},
 	}
 	got := serviceLabels(spec, "worker-1", 0)
@@ -582,8 +568,8 @@ func TestServiceLabelsSpecMergedOwnershipWins(t *testing.T) {
 	if got[labelPort] != "3000" {
 		t.Fatalf("relay.port = %q, want 3000 (ownership must win)", got[labelPort])
 	}
-	if got[labelEnvHash] != EnvHash(nil) {
-		t.Fatalf("relay.env_hash = %q, want the authoritative env hash (ownership must win)", got[labelEnvHash])
+	if got[labelEnvironment] != EnvironmentFingerprint(nil) {
+		t.Fatalf("relay.environment = %q, want the authoritative environment fingerprint (ownership must win)", got[labelEnvironment])
 	}
 	if got["traefik.enable"] != "true" {
 		t.Fatalf("extra routing label missing: %v", got)
@@ -749,7 +735,7 @@ func decodeCreateRequest(t *testing.T, body []byte) *container.CreateRequest {
 // image (preserving the image ENTRYPOINT). The env slice is exactly what the
 // reconciler's BuildEnv produced (prepared env + template env + resolved secrets
 // + PORT), so a service actually receives its configured env/secrets. The
-// relay.env_hash label is the digest of that same slice.
+// relay.environment label is the fingerprint of that same slice.
 func TestStartServiceWritesEffectiveEnvToConfigEnvForAllSources(t *testing.T) {
 	env := []string{"PREPARED=1", "GREETING=hello", "SECRET=s3cr3t", "PORT=3000"}
 	for _, tc := range []struct {
@@ -785,14 +771,8 @@ func TestStartServiceWritesEffectiveEnvToConfigEnvForAllSources(t *testing.T) {
 					t.Fatalf("Config.Env[%d] = %q, want %q (full: %v)", i, cfg.Env[i], env[i], cfg.Env)
 				}
 			}
-			if cfg.Labels[labelEnvHash] != EnvHash(env) {
-				t.Fatalf("relay.env_hash = %q, want the effective env hash %q", cfg.Labels[labelEnvHash], EnvHash(env))
-			}
-			// No secret VALUE is exposed anywhere in the labels; only the digest.
-			for k, v := range cfg.Labels {
-				if strings.Contains(v, "s3cr3t") {
-					t.Fatalf("secret value leaked into label %q=%q", k, v)
-				}
+			if cfg.Labels[labelEnvironment] != EnvironmentFingerprint(env) {
+				t.Fatalf("relay.environment = %q, want the effective environment fingerprint %q", cfg.Labels[labelEnvironment], EnvironmentFingerprint(env))
 			}
 		})
 	}

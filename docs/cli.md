@@ -159,9 +159,9 @@ docker compose exec -T relay relay app invoke my-app - < event.json
 
 ```sh
 relay dlq ls
-relay dlq inspect ID_OR_PREFIX
-relay dlq replay ID_OR_PREFIX
-relay dlq rm ID_OR_PREFIX
+relay dlq inspect ID
+relay dlq replay ID
+relay dlq rm ID
 ```
 
 `ls` lists dead letters. `inspect` shows metadata and the original message value;
@@ -174,8 +174,9 @@ handler may run again if execution completes after a client disconnect or lease
 expiry. Keep handlers idempotent.
 
 `rm` removes only settled entries. An entry is settled after its source message
-is acknowledged; unsettled entries are retained for recovery. IDs accept a
-unique prefix of at least 10 hexadecimal characters. See [Events](events.md#dead-letter-queue)
+is acknowledged; unsettled entries are retained for recovery. Entry IDs are the
+full 64-character lowercase hexadecimal value shown by `relay dlq ls`; `inspect`,
+`replay`, and `rm` require that exact ID. See [Events](events.md#dead-letter-queue)
 and [Operations](operations.md#dlq-controls).
 
 ## relay secret

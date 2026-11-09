@@ -228,8 +228,8 @@ Injection and confidentiality — be precise about the boundaries:
   environment at start, so the effective environment (plan env + template env +
   resolved secrets + `PORT`) **is** written to the service container's Docker
   `Config.Env`. Anyone with Docker daemon access can read it via
-  `docker inspect`. Relay only ever writes the one-way `relay.env_hash` digest
-  into a label.
+  `docker inspect`. The `relay.environment` label stores an environment
+  fingerprint for reconciliation; it is not a confidentiality boundary.
 
 `relay app inspect` always shows env **names** with values redacted and
 secret **reference** names only.

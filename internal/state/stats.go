@@ -90,7 +90,7 @@ func (st *State) RecordStatsContext(ctx context.Context, stats Stats) {
 		 ON CONFLICT(node_id) DO UPDATE SET
 		   data       = excluded.data,
 		   updated_at = excluded.updated_at`,
-		st.nodeID, payload, st.nowString())
+		st.nodeID, payload, st.nowTime().UTC())
 	if err != nil {
 		st.log.Warn("State: record stats failed", "error", err)
 	}
@@ -173,7 +173,7 @@ func (st *State) RecordStatsSnapshot(ctx context.Context, generation int64, stat
 		}
 		// One timestamp for the whole snapshot, so this worker's global row and
 		// every per-app row share the same updated_at.
-		ts := st.nowString()
+		ts := st.nowTime().UTC()
 		res, err := tx.ExecContext(ctx,
 			`INSERT INTO stats (node_id, instance, data, updated_at) VALUES ($1, $2, $3, $4)
 			 ON CONFLICT(node_id) DO UPDATE SET
@@ -372,13 +372,13 @@ func (st *State) ResetStats() (int64, error) {
 		// holding the exclusive lock for the whole reset orders the bump after
 		// every in-flight flush and before every later one.
 		var err error
-		gen, err = bumpGeneration(ctx, tx, st.nowString())
+		gen, err = bumpGeneration(ctx, tx, st.nowTime().UTC())
 		if err != nil {
 			return err
 		}
 		// One timestamp for every rewritten row, so every global row and all
 		// per-app rows share it (the flush snapshot does the same).
-		ts := st.nowString()
+		ts := st.nowTime().UTC()
 		if err := st.resetGlobalStatsTx(ctx, tx, ts); err != nil {
 			return err
 		}
@@ -397,7 +397,7 @@ func (st *State) ResetStats() (int64, error) {
 // SHARE): the single lock ordering — stats_meta first, then stats/app_stats —
 // means a reset and a flush (or a prune) can never deadlock. The stats_meta
 // seed row is created by initSchema, so the update always matches one row.
-func bumpGeneration(ctx context.Context, tx *sql.Tx, ts string) (int64, error) {
+func bumpGeneration(ctx context.Context, tx *sql.Tx, ts time.Time) (int64, error) {
 	var gen int64
 	if err := tx.QueryRowContext(ctx,
 		`UPDATE stats_meta SET generation = generation + 1, updated_at = $1
@@ -414,10 +414,9 @@ func bumpGeneration(ctx context.Context, tx *sql.Tx, ts string) (int64, error) {
 //
 // A worker keeps its OWN row unconditionally (it is the live owner), even if its
 // updated_at looks stale — a temporarily quiet worker must not lose the
-// cumulative totals it will resume writing. Rows are matched by their RFC3339
-// UTC updated_at, which is lexicographically ordered and expressed at second
-// granularity: a row is stale when updated_at < now-retention. The zero row a
-// fresh ownership claim creates (updated_at = ”) is therefore immediately stale
+// cumulative totals it will resume writing. Rows are matched by their native
+// UTC updated_at values: a row is stale when updated_at < now-retention. The
+// zero-time row a fresh ownership claim creates is therefore immediately stale
 // for any OTHER worker, which is intended — an abandoned claim must not linger.
 //
 // Retention <= 0 is a no-op (compaction disabled) and deletes nothing. The whole
@@ -429,7 +428,7 @@ func (st *State) PruneStaleStats(ctx context.Context, retention time.Duration) (
 	if retention <= 0 {
 		return 0, nil
 	}
-	cutoff := st.nowTime().Add(-retention).UTC().Format(time.RFC3339)
+	cutoff := st.nowTime().UTC().Add(-retention)
 	var deleted int64
 	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
 		// Take the meta row FOR SHARE first, matching the flush path's lock
@@ -465,7 +464,7 @@ func (st *State) PruneStaleStats(ctx context.Context, retention time.Duration) (
 // absent table (no rows) has nothing cumulative to zero and is left untouched
 // (creating a row would falsely claim stats were recorded). A corrupt payload is
 // returned as an error so the transaction rolls back.
-func (st *State) resetGlobalStatsTx(ctx context.Context, tx *sql.Tx, ts string) error {
+func (st *State) resetGlobalStatsTx(ctx context.Context, tx *sql.Tx, ts time.Time) error {
 	rows, err := tx.QueryContext(ctx, `SELECT node_id, `+jsonPayloadExpr+` FROM stats`)
 	if err != nil {
 		return err
@@ -525,7 +524,7 @@ func (st *State) resetGlobalStatsTx(ctx context.Context, tx *sql.Tx, ts string) 
 // timestamps. A corrupt payload returns the decode error, rolling the whole
 // reset back. Timestamps are cleared (not merged) because a reset is an explicit
 // erasure of execution history. It covers every worker's row.
-func (st *State) resetAppStatsTx(ctx context.Context, tx *sql.Tx, ts string) error {
+func (st *State) resetAppStatsTx(ctx context.Context, tx *sql.Tx, ts time.Time) error {
 	type row struct {
 		name   string
 		nodeID string
@@ -640,8 +639,9 @@ func (st *State) readStats(ctx context.Context, nodeID string) (Stats, bool, err
 	)
 	for rows.Next() {
 		var (
-			rowNodeID       string
-			data, updatedAt sql.NullString
+			rowNodeID string
+			data      sql.NullString
+			updatedAt time.Time
 		)
 		if err := rows.Scan(&rowNodeID, &data, &updatedAt); err != nil {
 			return Stats{}, false, fmt.Errorf("scan stats row: %w", err)
@@ -650,7 +650,7 @@ func (st *State) readStats(ctx context.Context, nodeID string) (Stats, bool, err
 		if err != nil {
 			return Stats{}, false, fmt.Errorf("read stats for node %q: %w", rowNodeID, err)
 		}
-		s.UpdatedAt = updatedAt.String
+		s.UpdatedAt = timestampString(updatedAt)
 		mergeStats(&out, s)
 		seen = true
 	}
@@ -670,9 +670,9 @@ func (st *State) readStats(ctx context.Context, nodeID string) (Stats, bool, err
 // (the row with the newest updated_at), which is the worker currently flushing.
 // Taking the maximum instead would let a dead worker's stale high gauge mask the
 // live value indefinitely. UpdatedAt takes the newest, and the freshest row's
-// gauges win; on an updated_at tie (RFC3339 has second granularity) the larger
-// gauge wins, so the aggregate is deterministic regardless of row order and never
-// under-reports an equally-fresh backlog.
+// gauges win; when updated_at values tie in RFC3339 presentation (which omits
+// fractional seconds) the larger gauge wins, so the aggregate is deterministic
+// regardless of row order and never under-reports an equally-fresh backlog.
 func mergeStats(dst *Stats, src Stats) {
 	dst.EventsReceivedTotal += src.EventsReceivedTotal
 	dst.EventsMatchedTotal += src.EventsMatchedTotal

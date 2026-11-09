@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -181,25 +180,6 @@ func (f *fakeDLQStore) ListUnsettledDLQDeliveries(_ context.Context, _ string, _
 	return nil, nil
 }
 
-// FindDLQEntryIDsByPrefix mirrors the production store's narrow prefix
-// capability: at most two ascending entry IDs beginning with prefix, without
-// loading any payload. The CLI consumes only zero, one, or two of them.
-func (f *fakeDLQStore) FindDLQEntryIDsByPrefix(_ context.Context, prefix string) ([]string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	var ids []string
-	for _, e := range f.entries {
-		if strings.HasPrefix(e.ID, prefix) {
-			ids = append(ids, e.ID)
-		}
-	}
-	slices.Sort(ids)
-	if len(ids) > 2 {
-		ids = ids[:2]
-	}
-	return ids, nil
-}
-
 func (f *fakeDLQStore) Close() error { f.closed = true; return nil }
 
 // releasedTokensFor returns the tokens presented to ReleaseDLQReplay for id, in
@@ -236,8 +216,7 @@ func (f *fakeDLQStore) supersedeClaim(id string) {
 }
 
 // withFakeDLQStore returns dependencies whose DLQ opener yields the given
-// store, so any fake implementation (the plain in-memory store or one that
-// overrides the prefix lookup) can drive the command tree. It closes the store
+// store, so the plain in-memory fake can drive the command tree. It closes the store
 // after the command.
 func withFakeDLQStore(t *testing.T, store dlq.Store) Dependencies {
 	t.Helper()
@@ -286,18 +265,18 @@ func dlqTestEntry(id, originalID, function, handler, event, timestamp string) dl
 	return entry
 }
 
-// dlqHexID builds a deterministic full-length (dlqIDLength, 64-character)
+// dlqHexID builds a deterministic full-length (64-character)
 // lowercase hexadecimal entry ID out of lowercase-hex fragments: the fragments
 // are joined and the remainder is zero-padded to 64. It gives tests control
-// over the leading prefix — the characters `relay dlq ls` shows and the admin
-// commands accept as a prefix — while every produced ID keeps the exact shape a
-// real dlq.NewID value has. It never returns invalid hex or a non-64 length.
+// over displayed leading characters while every produced ID keeps the exact
+// shape a real dlq.NewID value has. It never returns invalid hex or a non-64
+// length.
 func dlqHexID(parts ...string) string {
 	id := strings.Join(parts, "")
-	if !dlqHexOnly(id) || len(id) > dlqIDLength {
+	if !dlqHexOnly(id) || len(id) > 64 {
 		return ""
 	}
-	return id + strings.Repeat("0", dlqIDLength-len(id))
+	return id + strings.Repeat("0", 64-len(id))
 }
 
 // dlqHexOnly reports whether s consists solely of lowercase hex characters.
@@ -314,27 +293,18 @@ func dlqHexOnly(s string) bool {
 // Deterministic full-length entry-ID fixtures for the CLI unit tests. Real IDs
 // come from dlq.NewID (SHA-256 rendered lowercase hex); the fake stores used
 // here constrain only the same shape, so tests build fixed IDs with controlled
-// leading prefixes via dlqHexID.
+// leading hexadecimal characters via dlqHexID.
 var (
 	// dlqUnitID is the full-length ID of the single entry most CLI unit
 	// fixtures seed.
 	dlqUnitID = dlqHexID("deadc0de01")
 
-	// dlqUnitSecondID is a second, differently-prefixed entry ID.
+	// dlqUnitSecondID is a second entry ID with different leading digits.
 	dlqUnitSecondID = dlqHexID("deadc0de02")
 
 	// dlqMissingID is a well-formed full-length ID that no fixture stores, so
 	// exact-ID lookups exercise the unknown-entry path.
 	dlqMissingID = dlqHexID("ff00cc11ff")
-
-	// dlqSharedPrefix is the ten-character visible prefix two DISTINCT
-	// fixtures share, so prefix inputs can be made deliberately ambiguous.
-	dlqSharedPrefix = "cafebabef0"
-
-	// dlqSharedIDOne and dlqSharedIDTwo are distinct full-length IDs sharing
-	// dlqSharedPrefix, in ascending identity order.
-	dlqSharedIDOne = dlqHexID(dlqSharedPrefix, "1")
-	dlqSharedIDTwo = dlqHexID(dlqSharedPrefix, "2")
 )
 
 // TestDLQBareShowsHelp verifies a bare `relay dlq` shows the subcommand help
@@ -380,8 +350,8 @@ func TestDLQHelpFlagsAndUnknownCommand(t *testing.T) {
 }
 
 // TestDLQListColumnsAndOrder verifies ls renders one row per entry in stream
-// order with the SHORT (first dlqIDShortLength) entry ID, app, handler,
-// attempts, and age — no ORIGINAL column and never the full ID — and that two
+// order with the full entry ID, app, handler, attempts, and age — no ORIGINAL
+// column — and that two
 // entries from the SAME source message ID are listed as distinct rows.
 func TestDLQListColumnsAndOrder(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
@@ -405,14 +375,10 @@ func TestDLQListColumnsAndOrder(t *testing.T) {
 		t.Fatalf("header = %q, want exactly \"ID APP HANDLER ATTEMPTS AGE\"", got)
 	}
 	// Stream order is preserved (not sorted by anything else), and every row
-	// shows exactly the ten-character visible prefix, never the full ID or the
-	// original source message.
+	// shows the full ID while omitting the original source message.
 	for i, id := range []string{dlqUnitID, dlqUnitSecondID, dlqMissingID} {
-		if !strings.HasPrefix(lines[i+1], id[:dlqIDShortLength]) {
-			t.Fatalf("row %d wrong: %q (want it to start with %q)", i+1, lines[i+1], id[:dlqIDShortLength])
-		}
-		if strings.Contains(out, id) {
-			t.Fatalf("ls must never print the full entry ID %q:\n%s", id, out)
+		if !strings.HasPrefix(lines[i+1], id) {
+			t.Fatalf("row %d wrong: %q (want it to start with full ID %q)", i+1, lines[i+1], id)
 		}
 	}
 	if strings.Contains(out, "1699999999999-0") {
@@ -538,6 +504,40 @@ func TestDLQInspectUnknownID(t *testing.T) {
 	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "inspect", dlqMissingID)
 	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("unknown DLQ entry %q", dlqMissingID)) {
 		t.Fatalf("err = %v, want unknown-entry error", err)
+	}
+}
+
+// TestDLQCommandsTreatArbitraryUnknownIDsAsUnknown verifies inspect, replay,
+// and rm use the exact supplied ID. Short or malformed values are ordinary
+// misses: they return the established unknown-entry error without execution or
+// deletion.
+func TestDLQCommandsTreatArbitraryUnknownIDsAsUnknown(t *testing.T) {
+	store := &fakeDLQStore{}
+	deps := withFakeDLQ(t, store)
+	replayer := &recordingReplayer{}
+	startTestSocketWithReplayer(t, deps.SocketPath, replayer)
+
+	unknownIDs := []string{
+		"deadbeef01", // abbreviated prefix
+		"not-a-hex-id",
+		"1-0",
+	}
+	for _, cmd := range []string{"inspect", "replay", "rm"} {
+		for _, id := range unknownIDs {
+			_, _, err := runCLIWithDeps(t, deps, "", "dlq", cmd, id)
+			if want := fmt.Sprintf("unknown DLQ entry %q", id); err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("dlq %s %q err = %v, want %q", cmd, id, err, want)
+			}
+		}
+	}
+	if calls, _, _ := replayer.got(); calls != 0 {
+		t.Fatalf("unknown replay IDs reached the worker %d times", calls)
+	}
+	if len(store.deleted) != 0 || len(store.entries) != 0 {
+		t.Fatalf("unknown IDs changed the store: deleted=%v entries=%+v", store.deleted, store.entries)
+	}
+	if len(store.heldClaim) != 0 {
+		t.Fatalf("unknown replay IDs claimed entries: %v", store.heldClaim)
 	}
 }
 

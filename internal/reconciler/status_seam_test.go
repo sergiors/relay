@@ -64,7 +64,7 @@ func TestReconcileWithStatusNoOpVerificationDoesNotNotifyReconciling(t *testing.
 	f.ctrs["id-1"] = &fakeContainer{
 		id: "id-1", appName: "fn", entrypoint: "service.js",
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
-		envHash: serviceEnvHash(80), resources: serviceResources(),
+		environmentFingerprint: serviceEnvironmentFingerprint(80), resources: serviceResources(),
 	}
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 

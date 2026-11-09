@@ -45,7 +45,7 @@ var appStatsJSONRequiredKeys = []string{
 // rawStatsData reads the stats.data column rendered back to JSON text (the same
 // expression the production read path uses) plus updated_at for this handle's
 // node row.
-func rawStatsData(t *testing.T, c *State) (data, updatedAt string) {
+func rawStatsData(t *testing.T, c *State) (data string, updatedAt time.Time) {
 	t.Helper()
 	if err := c.db.QueryRowContext(context.Background(),
 		`SELECT data::text, updated_at FROM stats WHERE node_id = $1`, c.nodeID).Scan(&data, &updatedAt); err != nil {
@@ -56,7 +56,7 @@ func rawStatsData(t *testing.T, c *State) (data, updatedAt string) {
 
 // rawAppStatsData reads app_stats.data rendered back to JSON text plus
 // updated_at for name's row owned by this handle's worker.
-func rawAppStatsData(t *testing.T, c *State, name string) (data, updatedAt string) {
+func rawAppStatsData(t *testing.T, c *State, name string) (data string, updatedAt time.Time) {
 	t.Helper()
 	if err := c.db.QueryRowContext(context.Background(),
 		`SELECT data::text, updated_at FROM app_stats WHERE app_name = $1 AND node_id = $2`, name, c.nodeID).Scan(&data, &updatedAt); err != nil {
@@ -67,7 +67,7 @@ func rawAppStatsData(t *testing.T, c *State, name string) (data, updatedAt strin
 
 // rawStatsBlob reads the stored stats.data JSON text plus its native JSONB type,
 // so a test can assert the persisted native JSONB format.
-func rawStatsBlob(t *testing.T, c *State) (data, jsonbType, updatedAt string) {
+func rawStatsBlob(t *testing.T, c *State) (data, jsonbType string, updatedAt time.Time) {
 	t.Helper()
 	if err := c.db.QueryRowContext(context.Background(),
 		`SELECT data::text, jsonb_typeof(data), updated_at FROM stats WHERE node_id = $1`, c.nodeID).Scan(&data, &jsonbType, &updatedAt); err != nil {
@@ -77,7 +77,7 @@ func rawStatsBlob(t *testing.T, c *State) (data, jsonbType, updatedAt string) {
 }
 
 // rawAppStatsBlob is the per-app counterpart of rawStatsBlob.
-func rawAppStatsBlob(t *testing.T, c *State, name string) (data, jsonbType, updatedAt string) {
+func rawAppStatsBlob(t *testing.T, c *State, name string) (data, jsonbType string, updatedAt time.Time) {
 	t.Helper()
 	if err := c.db.QueryRowContext(context.Background(),
 		`SELECT data::text, jsonb_typeof(data), updated_at FROM app_stats WHERE app_name = $1 AND node_id = $2`, name, c.nodeID).Scan(&data, &jsonbType, &updatedAt); err != nil {
@@ -161,18 +161,15 @@ func TestStatsPayloadIsCentralizedJSON(t *testing.T) {
 	assertJSONKeysExactly(t, data, statsJSONKeys)
 	// updated_at is relational, not in the payload.
 	assertJSONKeysAbsent(t, data, "updated_at")
-	if updatedAt == "" {
+	if updatedAt.IsZero() {
 		t.Fatal("stats.updated_at column must be set")
-	}
-	if _, err := time.Parse(time.RFC3339, updatedAt); err != nil {
-		t.Fatalf("stats.updated_at not RFC3339: %q: %v", updatedAt, err)
 	}
 
 	got, ok := c.Stats()
 	if !ok {
 		t.Fatal("expected stats row")
 	}
-	in.UpdatedAt = updatedAt
+	in.UpdatedAt = timestampString(updatedAt)
 	if got != in {
 		t.Fatalf("round trip = %+v, want %+v", got, in)
 	}
@@ -221,7 +218,7 @@ func TestAppStatsPayloadIsCentralizedJSON(t *testing.T) {
 	assertJSONKeysAbsent(t, data, "app", "updated_at", "app_name")
 	// The live pool gauges are never persisted.
 	assertJSONKeysAbsent(t, data, "capacity", "containers", "busy", "idle", "starting")
-	if updatedAt == "" {
+	if updatedAt.IsZero() {
 		t.Fatal("app_stats.updated_at column must be set")
 	}
 
@@ -229,7 +226,7 @@ func TestAppStatsPayloadIsCentralizedJSON(t *testing.T) {
 	if !ok {
 		t.Fatal("expected function stats row")
 	}
-	in.UpdatedAt = updatedAt
+	in.UpdatedAt = timestampString(updatedAt)
 	if got != in {
 		t.Fatalf("round trip = %+v, want %+v", got, in)
 	}

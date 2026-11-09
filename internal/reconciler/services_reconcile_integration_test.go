@@ -146,7 +146,7 @@ func serviceReconcileTemplate(port, replicas int) string {
 // that a template `env` change replaces the persistent service container (the
 // running container's Config.Env would otherwise stay stale forever, since the
 // entrypoint image reference is unchanged): the container id changes and the
-// replacement's Config.Env carries the new value and the matching relay.env_hash.
+// replacement's Config.Env carries the new value and the matching relay.environment.
 func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 
@@ -203,7 +203,7 @@ func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
 	assertServiceCounts(t, m, name, 1)
 
 	// Find the running container and capture its id + env.
-	findContainer := func() (id string, env []string, envHash string) {
+	findContainer := func() (id string, env []string, environmentFingerprint string) {
 		t.Helper()
 		list, err := m.ServiceContainerList(context.Background())
 		if err != nil {
@@ -221,12 +221,12 @@ func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
 			if insp.Container.Config != nil {
 				e = insp.Container.Config.Env
 			}
-			return c.ID, e, c.EnvHash
+			return c.ID, e, c.EnvironmentFingerprint
 		}
 		t.Fatal("no running container found")
 		return "", nil, ""
 	}
-	firstID, firstEnv, firstHash := findContainer()
+	firstID, firstEnv, firstFingerprint := findContainer()
 	if !containsEnv(firstEnv, "APP_VERSION=v1") {
 		t.Fatalf("first container env = %v, want APP_VERSION=v1", firstEnv)
 	}
@@ -236,15 +236,15 @@ func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
 	rec.reconcileApp(name)
 	assertServiceCounts(t, m, name, 1)
 
-	secondID, secondEnv, secondHash := findContainer()
+	secondID, secondEnv, secondFingerprint := findContainer()
 	if secondID == firstID {
 		t.Fatalf("container was not replaced on an env change (same id %s); env=%v", secondID, secondEnv)
 	}
 	if !containsEnv(secondEnv, "APP_VERSION=v2") {
 		t.Fatalf("replacement env = %v, want APP_VERSION=v2", secondEnv)
 	}
-	if secondHash == firstHash || secondHash == "" {
-		t.Fatalf("relay.env_hash unchanged across an env change (%q); want a new non-empty hash", secondHash)
+	if secondFingerprint == firstFingerprint || secondFingerprint == "" {
+		t.Fatalf("relay.environment unchanged across an env change (%q); want a new non-empty fingerprint", secondFingerprint)
 	}
 }
 

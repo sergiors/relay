@@ -712,15 +712,15 @@ func reconcileWithObserver(
 			log.Warn("Service: cannot start replicas", "service", name, "error", err)
 			continue
 		}
-		// envHash is the desired effective environment's content hash. It is
-		// compared against each container's relay.env_hash label below: the
+		// environmentFingerprint is the desired effective environment identity. It is
+		// compared against each container's relay.environment label below: the
 		// environment is the one piece of configuration the image reference
 		// cannot carry (a template env change on an `image` source leaves the
 		// reference unchanged; a rotated secret value never changes the source
 		// fingerprint), so without this comparison a stale container would keep
-		// serving its old env/secrets indefinitely. The hash is order-sensitive
-		// and covers the exact slice StartService applies.
-		envHash := runtime.EnvHash(env)
+		// serving its old env/secrets indefinitely. It covers the exact slice
+		// StartService applies, preserving its order.
+		environmentFingerprint := runtime.EnvironmentFingerprint(env)
 		// resources are the app's effective per-container limits; their
 		// fingerprint is compared against each container's relay.resources label
 		// below, so a resource-only template change replaces the running service
@@ -756,8 +756,8 @@ func reconcileWithObserver(
 		// desired values) and carries a real replica label. Anything else —
 		// exited/dead/removing, a changed source, a changed image, a moved
 		// external tag (image content changed), a changed port, a changed
-		// env/secret (env hash mismatch), a changed resource configuration, a
-		// changed tmpfs list, a changed network set, a changed mounted source
+		// env/secret (environment fingerprint mismatch), changed resource
+		// configuration, tmpfs list, network set, mounted source
 		// (relay.source), or an unlabeled legacy container (Replica == -1) — is a
 		// non-converged generation that a converged replacement supersedes. In
 		// addition, the container's labels must match the desired routing label
@@ -792,7 +792,7 @@ func reconcileWithObserver(
 				ctr.Image == resolved.Ref &&
 				ctr.ImageID == resolved.ID &&
 				ctr.Port == svc.Port &&
-				ctr.EnvHash == envHash &&
+				ctr.EnvironmentFingerprint == environmentFingerprint &&
 				ctr.Resources == resourceHash &&
 				ctr.Tmpfs == desiredTmpfs &&
 				ctr.Networks == desiredNetworks &&
@@ -816,7 +816,7 @@ func reconcileWithObserver(
 				ctr.Image == resolved.Ref &&
 				ctr.ImageID == resolved.ID &&
 				ctr.Port == svc.Port &&
-				ctr.EnvHash == envHash &&
+				ctr.EnvironmentFingerprint == environmentFingerprint &&
 				ctr.Resources == resourceHash &&
 				ctr.Tmpfs == desiredTmpfs &&
 				ctr.Networks == desiredNetworks &&
