@@ -48,9 +48,11 @@ docker compose exec relay relay health
 ```
 
 The stack publishes unauthenticated Redis and development-credential PostgreSQL
-on host ports, and Relay accesses Docker through a restricted socket proxy.
-Treat Docker Engine access as highly privileged, and do not expose this stack to
-untrusted networks.
+on host ports, and Relay mounts the host Docker socket read-only to manage
+containers. The read-only mount does not make the Docker API read-only: a
+compromised Relay process can exercise the daemon's full authority (often
+equivalent to host root). Treat Docker Engine access as highly privileged, and
+do not expose this stack to untrusted networks.
 
 ## What you get
 
@@ -184,9 +186,16 @@ A service may also run an existing container image:
 ```yaml
 services:
   - name: gateway
-    image: nginx:latest
-    port: 80
+    image: nginxinc/nginx-unprivileged:1.27-alpine
+    port: 8080
 ```
+
+External images keep their own `USER` and `ENTRYPOINT`; Relay never forces a
+UID on them. The shared hardening still drops capabilities, sets
+`no-new-privileges`, and uses a read-only rootfs, so prefer images that already
+run as a non-root user and listen on an unprivileged port. The official
+`nginx` image expects to chown and setuid as root, which the hardened baseline
+does not permit.
 
 These are intentionally different ownership models:
 

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/client"
 
 	"relay/internal/app"
@@ -322,9 +323,60 @@ func assertHardenedHostConfig(t *testing.T, hc *container.HostConfig) {
 	if hc.Tmpfs["/tmp"] != "rw,nosuid,noexec,size=64m" {
 		t.Errorf("tmpfs = %v, want /tmp rw,nosuid,noexec,size=64m", hc.Tmpfs)
 	}
+	// A service may add only NET_BIND_SERVICE for a privileged declared port.
+	// Docker's inspect normalizes the capability to its CAP_ form.
+	for _, capability := range hc.CapAdd {
+		if !isLowPortCapability(capability) {
+			t.Errorf("unexpected added capability %q", capability)
+		}
+	}
+	if hc.Privileged {
+		t.Error("expected Privileged false")
+	}
+	if hc.PidMode != "" && hc.PidMode != "private" {
+		t.Errorf("pid mode = %q, want the private default", hc.PidMode)
+	}
+	if hc.IpcMode != "" && hc.IpcMode != "private" {
+		t.Errorf("ipc mode = %q, want the private default", hc.IpcMode)
+	}
+	if hc.NetworkMode == "host" || strings.HasPrefix(string(hc.NetworkMode), "container:") {
+		t.Errorf("network mode = %q, want an isolated workload network", hc.NetworkMode)
+	}
+	if !hasSecurityOpt(hc.SecurityOpt, noNewPrivileges) {
+		t.Errorf("security opts = %v, want %s", hc.SecurityOpt, noNewPrivileges)
+	}
+	for _, opt := range hc.SecurityOpt {
+		if opt != noNewPrivileges {
+			t.Errorf("unexpected security opt %q (the default seccomp profile must be preserved)", opt)
+		}
+	}
+	if len(hc.Binds) != 0 {
+		t.Errorf("expected no host binds, got %v", hc.Binds)
+	}
+	if len(hc.VolumesFrom) != 0 {
+		t.Errorf("expected no volumes-from, got %v", hc.VolumesFrom)
+	}
+	if len(hc.Devices) != 0 || len(hc.DeviceRequests) != 0 {
+		t.Errorf("expected no device access, got devices=%v requests=%v", hc.Devices, hc.DeviceRequests)
+	}
+	for _, m := range hc.Mounts {
+		if m.Type == mount.TypeBind && !m.ReadOnly {
+			t.Errorf("bind mount %q at %q is writable", m.Source, m.Target)
+		}
+		if m.Type == mount.TypeBind && isContainerRuntimeSocket(m.Source) {
+			t.Errorf("container runtime socket %q is mounted into the workload", m.Source)
+		}
+	}
 	if len(hc.PortBindings) != 0 {
 		t.Errorf("expected no host port bindings, got %v", hc.PortBindings)
 	}
+}
+
+// isLowPortCapability reports whether a daemon-normalized capability string is
+// the single service low-port capability. Create requests use the unprefixed
+// name; inspect responses use CAP_ prefixed names.
+func isLowPortCapability(capability string) bool {
+	return capability == lowPortCapability || capability == "CAP_"+lowPortCapability
 }
 
 // imageExistsInDaemon reports whether a local image carries exactly ref.

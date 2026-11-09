@@ -110,6 +110,13 @@ const (
 	// replaced once.
 	labelResources = "relay.resources"
 
+	// labelSecurityProfile identifies the hardening profile a persistent service
+	// container was created with (ServiceSecurityProfile). Service containers are
+	// long-lived, so a relay upgrade that tightens the HostConfig must replace
+	// them rather than leave an older, weaker container running forever. A
+	// container created before the label carries none, so it is replaced once.
+	labelSecurityProfile = "relay.security_profile"
+
 	// Managed-image labels. These pin the identity and wiring of a managed
 	// image (app or dependency) so the dependency GC can classify images
 	// and resolve app→dependency ownership without inferring anything
@@ -158,6 +165,14 @@ const (
 	ContainerTypeSchedule = "schedule"
 	ContainerTypeService  = "service"
 )
+
+// ServiceSecurityProfile is the current hardening profile stamped on every
+// persistent service container (relay.security_profile). It must be bumped
+// whenever the service HostConfig baseline changes in a way that requires an
+// already-running container to be replaced; the service reconciler compares it
+// on every pass, so a container from an older profile converges to the current
+// one instead of being retained indefinitely.
+const ServiceSecurityProfile = "hardened-v1"
 
 // The relay.type values for managed IMAGES. Every managed image carries exactly
 // one; the absence of a type (or an unknown type) means an image is NOT managed

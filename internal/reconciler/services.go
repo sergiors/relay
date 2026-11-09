@@ -745,9 +745,10 @@ func reconcileWithObserver(
 		// Docker networks all match the desired values) and carries a real
 		// replica label. Anything else — exited/dead/removing, a changed source, a
 		// changed image, a moved external tag (image content changed), a changed
-		// port, a changed env/secret (env hash mismatch), a changed network set, a
-		// changed mounted source (relay.source), or an unlabeled legacy container
-		// (Replica == -1) — is a non-converged generation that a converged
+		// port, a changed env/secret (env hash mismatch), a changed security
+		// profile, a changed network set, a changed mounted source (relay.source),
+		// or an unlabeled legacy container (Replica == -1) — is a non-converged
+		// generation that a converged
 		// replacement supersedes. In addition, the container's labels must match
 		// the desired routing label set exactly: a changed host/path/port leaves
 		// stale Traefik labels pointing traffic at whatever the old container
@@ -782,6 +783,7 @@ func reconcileWithObserver(
 				ctr.Port == svc.Port &&
 				ctr.EnvHash == envHash &&
 				ctr.Resources == resourceHash &&
+				ctr.SecurityProfile == runtime.ServiceSecurityProfile &&
 				ctr.Networks == desiredNetworks &&
 				sourceOK &&
 				ctr.Replica >= 0 &&
@@ -805,6 +807,7 @@ func reconcileWithObserver(
 				ctr.Port == svc.Port &&
 				ctr.EnvHash == envHash &&
 				ctr.Resources == resourceHash &&
+				ctr.SecurityProfile == runtime.ServiceSecurityProfile &&
 				ctr.Networks == desiredNetworks &&
 				ctr.Replica >= 0 &&
 				routingLabelsMatch(routeLabels, ctr.Labels)

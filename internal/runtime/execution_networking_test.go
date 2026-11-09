@@ -3,11 +3,82 @@ package runtime
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
+
+	"github.com/moby/moby/api/types/mount"
 
 	"relay/internal/app"
 	"relay/internal/testutil"
 )
+
+// TestStartContainerRejectsControlNetworkBeforeCreate proves the execution
+// create path applies the same control-network guard as services, before Docker
+// ContainerCreate: a worker-global set pointing at a labelled control network
+// fails the cold start and no create request is issued.
+func TestStartContainerRejectsControlNetworkBeforeCreate(t *testing.T) {
+	creates := 0
+	cli := newScriptedDockerClient(t,
+		dockerRoute{
+			method: http.MethodGet, path: "/networks/control",
+			body: `{"Name":"control","Labels":{"relay.control":"true"}}`,
+		},
+		dockerRoute{
+			method: http.MethodPost, path: "/containers/create",
+			body: `{"Id":"cid-1"}`,
+			onMatch: func() {
+				creates++
+			},
+		},
+	)
+	m := &Manager{
+		cli:       cli,
+		log:       testutil.DiscardLogger(),
+		nodeID:    "test-host",
+		networks:  []string{"control"},
+		lifecycle: context.Background(),
+	}
+
+	_, err := m.startContainer(context.Background(), "fn",
+		resolvedImage{ref: "relay-app-fn:test"}, nil, app.ResourceLimits{}, RunMeta{})
+	if err == nil {
+		t.Fatal("expected the control network to reject the execution container start")
+	}
+	if !strings.Contains(err.Error(), "control network") {
+		t.Fatalf("error = %v, want a control-network rejection", err)
+	}
+	if creates != 0 {
+		t.Fatalf("Docker ContainerCreate was issued %d time(s) despite the rejection", creates)
+	}
+}
+
+// TestStartExecutionContainerRejectsUnsafeMountBeforeCreate proves the create
+// path refuses a writable host bind before Docker ContainerCreate rather than
+// relying on the caller-side schema.
+func TestStartExecutionContainerRejectsUnsafeMountBeforeCreate(t *testing.T) {
+	creates := 0
+	cli := newScriptedDockerClient(t, dockerRoute{
+		method: http.MethodPost, path: "/containers/create",
+		body: `{"Id":"cid-1"}`,
+		onMatch: func() {
+			creates++
+		},
+	})
+	m := &Manager{cli: cli, log: testutil.DiscardLogger()}
+
+	_, err := startExecutionContainer(context.Background(), containerOps{}, m.cli, m.log,
+		"fn", "img", nil, nil, app.ResourceLimits{}, RunMeta{}, "", "/apps/fn",
+		mount.Mount{Type: mount.TypeBind, Source: "/apps/fn", Target: "/app/src"})
+	if err == nil {
+		t.Fatal("expected a writable host bind to be rejected")
+	}
+	if !strings.Contains(err.Error(), "unsafe container configuration") {
+		t.Fatalf("error = %v, want an unsafe-configuration rejection", err)
+	}
+	if creates != 0 {
+		t.Fatalf("Docker ContainerCreate was issued %d time(s) despite the rejection", creates)
+	}
+}
 
 // TestStartExecutionContainerNetworkingConfig drives the real
 // startExecutionContainer client path against the scripted daemon and inspects
@@ -32,7 +103,7 @@ func TestStartExecutionContainerNetworkingConfig(t *testing.T) {
 		m := &Manager{cli: cli, log: testutil.DiscardLogger()}
 
 		_, err := startExecutionContainer(context.Background(), containerOps{}, m.cli, m.log,
-			"fn", "img", nil, []string{"backend", "frontend", "backend"}, app.ResourceLimits{}, RunMeta{}, "")
+			"fn", "img", nil, []string{"backend", "frontend", "backend"}, app.ResourceLimits{}, RunMeta{}, "", "")
 		if err == nil {
 			t.Fatal("expected the scripted create failure")
 		}
@@ -65,7 +136,7 @@ func TestStartExecutionContainerNetworkingConfig(t *testing.T) {
 		m := &Manager{cli: cli, log: testutil.DiscardLogger()}
 
 		_, err := startExecutionContainer(context.Background(), containerOps{}, m.cli, m.log,
-			"fn", "img", nil, nil, app.ResourceLimits{}, RunMeta{}, "")
+			"fn", "img", nil, nil, app.ResourceLimits{}, RunMeta{}, "", "")
 		if err == nil {
 			t.Fatal("expected the scripted create failure")
 		}
@@ -99,7 +170,7 @@ func TestStartExecutionContainerNetworkingConfig(t *testing.T) {
 		m := &Manager{cli: cli, log: testutil.DiscardLogger()}
 
 		_, err := startExecutionContainer(context.Background(), containerOps{}, m.cli, m.log,
-			"fn", "img", nil, []string{"backend"}, app.ResourceLimits{}, RunMeta{}, "")
+			"fn", "img", nil, []string{"backend"}, app.ResourceLimits{}, RunMeta{}, "", "")
 		if err == nil {
 			t.Fatal("a missing network must surface as a container create error")
 		}

@@ -561,7 +561,7 @@ func TestManagerStartContainerCleansCreateAfterShutdown(t *testing.T) {
 	m.startExecutionContainerFn = func(
 		ctx context.Context, ops containerOps, _ *client.Client, _ *slog.Logger,
 		_, _ string, _ []string, _ []string, _ app.ResourceLimits, _ RunMeta,
-		_ string, _ ...mount.Mount,
+		_, _ string, _ ...mount.Mount,
 	) (reusableContainer, error) {
 		close(created)
 		<-ctx.Done() // complete only once Manager close cancels the create operation

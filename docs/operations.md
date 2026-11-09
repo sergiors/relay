@@ -122,17 +122,18 @@ concrete OS/architecture combination (unknown/attestation entries are ignored).
 Relay never persists a child manifest digest; workers build from
 `<configured-ref>@<index-digest>` for the target Linux architecture.
 
-The Docker Engine must permit the Distribution endpoint. The bundled
-`compose.yaml` and `compose.prod.yaml` socket proxies already set
-`DISTRIBUTION=1`; an externally managed proxy must do the same. Registry
-credentials are read from the Docker client configuration selected by
-`DOCKER_CONFIG` (a directory), falling back to `$HOME/.docker/config.json`. The
-supported fields are `auths` (base64 `username:password` or
-`identitytoken`), `credHelpers`, and `credsStore`. Credential helpers are invoked
-as context-bound `docker-credential-<helper> get` subprocesses; their output is
-parsed but never logged. Public Docker Hub works anonymously. When Relay runs in
-a container, mount the Docker client configuration and set `DOCKER_CONFIG` if it
-is not at the container user's `$HOME/.docker/config.json`; Relay does not read
+The Docker Engine must permit the Distribution endpoint. Relay uses the
+daemon configured by the Docker client environment (by default the mounted
+Unix socket); an externally managed socket proxy must allow the Distribution
+endpoint. Registry credentials are read from the Docker client configuration
+selected by `DOCKER_CONFIG` (a directory), falling back to
+`$HOME/.docker/config.json`. The supported fields are `auths` (base64
+`username:password` or `identitytoken`), `credHelpers`, and `credsStore`.
+Credential helpers are invoked as context-bound
+`docker-credential-<helper> get` subprocesses; their output is parsed but never
+logged. Public Docker Hub works anonymously. When Relay runs in a container,
+mount the Docker client configuration and set `DOCKER_CONFIG` if it is not at
+the container user's `$HOME/.docker/config.json`; Relay does not read
 credentials from the daemon or from the relay container's environment.
 
 Persisting a selection is not an application rollout. Running workers refresh

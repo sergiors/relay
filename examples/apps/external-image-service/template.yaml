@@ -2,8 +2,11 @@
 # ENTRYPOINT/CMD. Relay inspects the local image, pulls it from its registry when
 # needed, and reconciles replicas exactly like any other service. Relay never
 # removes an external image (it only cleans its own relay-app-* namespace).
+#
+# The image must fit the shared hardening: non-root, no added capabilities, and
+# a read-only rootfs. nginx-unprivileged runs as UID 101 and listens on 8080.
 services:
   - name: web
-    image: nginx:1.27-alpine
-    port: 80
+    image: nginxinc/nginx-unprivileged:1.27-alpine
+    port: 8080
     replicas: 1

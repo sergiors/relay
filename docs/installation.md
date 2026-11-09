@@ -12,8 +12,8 @@ This guide covers the repository's production Compose deployment. See
   provisioned by `compose.prod.yaml`.
 - The production Compose file's required environment and supporting files (see
   [Configuration](#configuration)).
-- Compose creates its declared `relay`, `traefik`, and internal `control`
-  networks. Any additional network named in `NETWORKS` must exist before
+- Compose creates its declared `relay` and `traefik` networks. Any additional
+  network named in `NETWORKS` must exist before
   startup; Relay does not create networks, and a missing configured network is
   fatal at worker startup.
 
@@ -37,11 +37,15 @@ development credentials or an untested Relay image.
 
 `NODE_ID` must be unique among concurrent nodes, stable across restarts,
 and at most 128 characters using only ASCII letters, digits, `.`, `_`, and `-`.
-The Compose file sets `DOCKER_HOST` to its socket proxy, sets
+The Compose file mounts the host Docker socket read-only into Relay, sets
 `NETWORKS=relay,traefik`, and configures Relay's Traefik network, HTTPS
 entrypoint, and certificate resolver. Compose creates its declared networks;
 Relay verifies the configured workload networks exist and fails startup if one
-is missing. Consult [configuration](configuration.md) before changing them.
+is missing. The read-only mount does not restrict Docker API operations; a
+compromised Relay process can use the daemon's full authority, often equivalent
+to host root. Workload-container hardening is not protection against a
+compromised Relay process. Consult [configuration](configuration.md) before
+changing the networks.
 
 From the repository root, verify all referenced observability sources are
 present and review their contents:
@@ -165,7 +169,7 @@ from the repository, so these services cannot be assumed to validate, start,
 or have working dashboards until those files are supplied and reviewed. Relay's
 `relay stats` is also available through the CLI without Grafana.
 Relay's metrics endpoint on port `9090` is not published on a host port; it is
-reachable from networks joined by Relay (`runtime`, `edge`, and `control`).
+reachable from networks joined by Relay (`runtime` and `edge`).
 Grafana is routed through Traefik using the configured domain. Its HTTPS
 certificate uses HTTP-01, so the domain must resolve publicly to this ingress
 and be reachable on ports 80 and 443.
@@ -205,7 +209,8 @@ requirements; do not remove volumes as part of routine updates. See
 ## Development Compose
 
 `compose.yaml` is a standalone local quick-start that runs the published Relay
-image, bind-mounts `./apps` at `/apps`, and provisions local Redis, PostgreSQL,
-a Docker socket proxy, and Traefik. Place an app under `./apps` to run it. This
-development stack is not a substitute for the production deployment described
-above, which uses externally managed dependencies and production configuration.
+image, bind-mounts `./apps` at `/apps`, mounts the host Docker socket read-only,
+and provisions local Redis, PostgreSQL, and Traefik. Place an app under `./apps`
+to run it. This development stack is not a substitute for the production
+deployment described above, which uses externally managed dependencies and
+production configuration.

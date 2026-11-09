@@ -8,6 +8,52 @@ import (
 	"relay/internal/testutil"
 )
 
+// TestValidateWorkloadNetworksRejectsControlPlane pins the create-time network
+// guard: a network labelled relay.control is never available to a workload, the
+// reserved host/container pseudo-networks are refused, and an ordinary network
+// passes. The check is label-based, so a renamed control network remains
+// protected.
+func TestValidateWorkloadNetworksRejectsControlPlane(t *testing.T) {
+	cli := newScriptedDockerClient(t,
+		dockerRoute{
+			method: http.MethodGet, path: "/networks/control",
+			body: `{"Name":"control","Labels":{"relay.control":"true"}}`,
+		},
+		dockerRoute{
+			method: http.MethodGet, path: "/networks/backend",
+			body: `{"Name":"backend","Labels":{"com.docker.compose.project":"relay"}}`,
+		},
+	)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger()}
+	ctx := context.Background()
+
+	if err := m.validateWorkloadNetworks(ctx, []string{"control"}); err == nil {
+		t.Fatal("a control network must be rejected for a workload")
+	}
+	if err := m.validateWorkloadNetworks(ctx, []string{"backend"}); err != nil {
+		t.Fatalf("an ordinary network was rejected: %v", err)
+	}
+	for _, reserved := range []string{"host", "container:abc"} {
+		if err := m.validateWorkloadNetworks(ctx, []string{reserved}); err == nil {
+			t.Fatalf("reserved network %q must be rejected", reserved)
+		}
+	}
+}
+
+// TestValidateWorkloadNetworksInspectError pins that the pre-create check does
+// not silently treat an unreadable/missing network as safe.
+func TestValidateWorkloadNetworksInspectError(t *testing.T) {
+	cli := newScriptedDockerClient(t, dockerRoute{
+		method: http.MethodGet, path: "/networks/gone",
+		status: http.StatusNotFound,
+		body:   `{"message":"network gone not found"}`,
+	})
+	m := &Manager{cli: cli, log: testutil.DiscardLogger()}
+	if err := m.validateWorkloadNetworks(context.Background(), []string{"gone"}); err == nil {
+		t.Fatal("a missing network must fail the pre-create validation")
+	}
+}
+
 // TestNetworkExistsNotFoundSemantics pins that a 404 from the daemon is the
 // only "absent" signal: NetworkExists reports (false, nil) for it, and any
 // other inspect failure is a genuine error — never mistaken for a missing

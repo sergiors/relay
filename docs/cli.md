@@ -116,14 +116,13 @@ apps using that runtime then reprepare. Neither `check` nor `update` pulls or
 builds an image, restarts the worker, restarts apps, or deploys anything. See
 [Operations](operations.md#runtime-image-selection-state).
 
-Both `check` and `update` use the Docker Engine API, so the Engine (or its socket
-proxy) must allow the Distribution endpoint; the bundled Compose files already
-set `DISTRIBUTION=1`. Registry credentials come from the Docker client
-configuration (`DOCKER_CONFIG` or `$HOME/.docker/config.json`), including
-`auths`, `identitytoken`, `credHelpers`, and `credsStore`. Public Docker Hub
-works anonymously. In a container, mount the Docker client configuration and
-set `DOCKER_CONFIG`; Relay does not read credentials from the daemon. Credential
-values are never printed.
+Both `check` and `update` use the Docker Engine API, so the Engine (or an
+externally managed socket proxy) must allow the Distribution endpoint. Registry
+credentials come from the Docker client configuration (`DOCKER_CONFIG` or
+`$HOME/.docker/config.json`), including `auths`, `identitytoken`, `credHelpers`,
+and `credsStore`. Public Docker Hub works anonymously. In a container, mount the
+Docker client configuration and set `DOCKER_CONFIG`; Relay does not read
+credentials from the daemon. Credential values are never printed.
 
 ## relay app
 

@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
 
 	"relay/internal/app"
 )
@@ -47,8 +49,9 @@ func TestRemoveContainerErrorsTreatedAsBenign(t *testing.T) {
 // TestHardenedHostConfigSecurityBaseline pins the complete security/resource
 // baseline every Relay container is created with, so the contract is checked
 // without a Docker daemon (the integration hardening test still proves the
-// daemon applies it). autoRemove is the only field that differs between
-// one-shot invocation containers (true) and persistent services (false).
+// daemon applies it). AutoRemove differs between one-shot invocation containers
+// (true) and persistent services (false); a service may additionally carry only
+// NET_BIND_SERVICE for a privileged declared port.
 func TestHardenedHostConfigSecurityBaseline(t *testing.T) {
 	hc := hardenedHostConfig(true, app.DefaultResourceLimits())
 	if hc == nil {
@@ -75,9 +78,28 @@ func TestHardenedHostConfigSecurityBaseline(t *testing.T) {
 	if !hc.AutoRemove {
 		t.Error("AutoRemove = false for an invocation container, want true")
 	}
+	if len(hc.SecurityOpt) != 1 || hc.SecurityOpt[0] != noNewPrivileges {
+		t.Errorf("SecurityOpt = %v, want [%s]", hc.SecurityOpt, noNewPrivileges)
+	}
+	if hc.Privileged {
+		t.Error("Privileged = true, want false")
+	}
+	if hc.PidMode != "" {
+		t.Errorf("PidMode = %q, want the private default", hc.PidMode)
+	}
+	if hc.IpcMode != "" {
+		t.Errorf("IpcMode = %q, want the private default", hc.IpcMode)
+	}
+	if hc.NetworkMode != "" {
+		t.Errorf("NetworkMode = %q, want the default (no host/container sharing)", hc.NetworkMode)
+	}
+	if len(hc.CapAdd) != 0 {
+		t.Errorf("CapAdd = %v, want none", hc.CapAdd)
+	}
 
-	// The persistent-service variant differs ONLY in AutoRemove.
-	svc := hardenedHostConfig(false, app.DefaultResourceLimits())
+	// The persistent-service variant differs in AutoRemove, plus the single
+	// low-port capability addition when the declared port is privileged.
+	svc := hardenedServiceHostConfig(app.DefaultResourceLimits(), 3000)
 	if svc.AutoRemove {
 		t.Error("AutoRemove = true for a service container, want false (reconciler-owned)")
 	}
@@ -85,6 +107,20 @@ func TestHardenedHostConfigSecurityBaseline(t *testing.T) {
 		svc.ReadonlyRootfs != hc.ReadonlyRootfs || svc.PidsLimit == nil ||
 		*svc.PidsLimit != *hc.PidsLimit {
 		t.Errorf("service HostConfig = %+v; want the same baseline as the invocation variant except AutoRemove", svc)
+	}
+	if len(svc.SecurityOpt) != 1 || svc.SecurityOpt[0] != noNewPrivileges {
+		t.Errorf("service SecurityOpt = %v, want [%s]", svc.SecurityOpt, noNewPrivileges)
+	}
+	if len(svc.CapAdd) != 0 {
+		t.Errorf("service CapAdd = %v for an unprivileged port, want none", svc.CapAdd)
+	}
+
+	lowPort := hardenedServiceHostConfig(app.DefaultResourceLimits(), 80)
+	if len(lowPort.CapAdd) != 1 || lowPort.CapAdd[0] != lowPortCapability {
+		t.Errorf("low-port CapAdd = %v, want [%s]", lowPort.CapAdd, lowPortCapability)
+	}
+	if len(lowPort.CapDrop) != 1 || lowPort.CapDrop[0] != "ALL" {
+		t.Errorf("low-port CapDrop = %v, want [ALL]", lowPort.CapDrop)
 	}
 }
 
@@ -111,5 +147,208 @@ func TestResourceHostConfigMapsEffectiveLimits(t *testing.T) {
 	if zero.Memory != def.MemoryBytes || zero.NanoCPUs != def.NanoCPUs ||
 		zero.PidsLimit == nil || *zero.PidsLimit != def.PidsLimit {
 		t.Fatalf("zero limits = %+v; want the defaults %+v mapped", zero, def)
+	}
+}
+
+// TestValidateContainerHostConfig pins the pre-create enforcement boundary: the
+// exact shared baseline (including a read-only source mount and its read-only
+// tmpfs mask) is accepted, while privileged containers, host namespace/network
+// sharing, extra capabilities, devices, writable rootfs, a writable or socket
+// bind, and any security-option override are rejected. This is what makes a
+// future create path unable to bypass the hardening silently.
+func TestValidateContainerHostConfig(t *testing.T) {
+	base := func() *container.HostConfig {
+		return hardenedServiceHostConfig(app.DefaultResourceLimits(), 3000)
+	}
+	safeMounts := []mount.Mount{
+		{Type: mount.TypeBind, Source: "/apps/demo", Target: "/app/src", ReadOnly: true},
+		{Type: mount.TypeTmpfs, Target: "/app/src/node_modules", ReadOnly: true},
+	}
+	if err := validateContainerHostConfig(base(), safeMounts, 3000, "/apps/demo"); err != nil {
+		t.Fatalf("baseline host config rejected: %v", err)
+	}
+	// A privileged service port's single capability addition is still safe.
+	lowPort := hardenedServiceHostConfig(app.DefaultResourceLimits(), 80)
+	if err := validateContainerHostConfig(lowPort, nil, 80, ""); err != nil {
+		t.Fatalf("low-port service host config rejected: %v", err)
+	}
+	// NET_BIND_SERVICE is scoped to services: an invocation container (port 0)
+	// can never carry it.
+	invocationWithCap := hardenedHostConfig(true, app.DefaultResourceLimits())
+	invocationWithCap.CapAdd = []string{lowPortCapability}
+	if err := validateContainerHostConfig(invocationWithCap, nil, 0, ""); err == nil {
+		t.Fatal("an invocation container with NET_BIND_SERVICE was accepted")
+	}
+	// A HOT_RELOAD source legitimately mapped under Docker named-volume storage
+	// keeps working because the check uses the app's recorded source root.
+	volumeRoot := "/var/lib/docker/volumes/relay-apps/_data/demo"
+	volumeMounts := []mount.Mount{
+		{Type: mount.TypeBind, Source: volumeRoot, Target: "/app/src", ReadOnly: true},
+	}
+	if err := validateContainerHostConfig(base(), volumeMounts, 3000, volumeRoot); err != nil {
+		t.Fatalf("named-volume source mount rejected: %v", err)
+	}
+	// A read-only bind of an arbitrary sensitive host directory is not trusted.
+	sensitive := []mount.Mount{
+		{Type: mount.TypeBind, Source: "/etc", Target: "/etc", ReadOnly: true},
+	}
+	if err := validateContainerHostConfig(base(), sensitive, 3000, "/apps/demo"); err == nil {
+		t.Fatal("a read-only /etc bind was accepted")
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*container.HostConfig) []mount.Mount
+	}{
+		{
+			name: "privileged",
+			mutate: func(hc *container.HostConfig) []mount.Mount {
+				hc.Privileged = true
+				return nil
+			},
+		},
+		{
+			name: "host pid namespace",
+			mutate: func(hc *container.HostConfig) []mount.Mount {
+				hc.PidMode = "host"
+				return nil
+			},
+		},
+		{
+			name: "host ipc namespace",
+			mutate: func(hc *container.HostConfig) []mount.Mount {
+				hc.IpcMode = "host"
+				return nil
+			},
+		},
+		{
+			name: "host network",
+			mutate: func(hc *container.HostConfig) []mount.Mount {
+				hc.NetworkMode = "host"
+				return nil
+			},
+		},
+		{
+			name: "container network",
+			mutate: func(hc *container.HostConfig) []mount.Mount {
+				hc.NetworkMode = "container:abc"
+				return nil
+			},
+		},
+		{
+			name: "missing capability drop",
+			mutate: func(hc *container.HostConfig) []mount.Mount {
+				hc.CapDrop = nil
+				return nil
+			},
+		},
+		{
+			name: "partial capability drop",
+			mutate: func(hc *container.HostConfig) []mount.Mount {
+				hc.CapDrop = []string{"ALL", "NET_ADMIN"}
+				return nil
+			},
+		},
+		{
+			name: "extra capability",
+			mutate: func(hc *container.HostConfig) []mount.Mount {
+				hc.CapAdd = []string{"SYS_ADMIN"}
+				return nil
+			},
+		},
+		{
+			name: "low-port capability without privileged port",
+			mutate: func(hc *container.HostConfig) []mount.Mount {
+				hc.CapAdd = []string{lowPortCapability}
+				return nil
+			},
+		},
+		{
+			name: "host bind configuration",
+			mutate: func(hc *container.HostConfig) []mount.Mount {
+				hc.Binds = []string{"/var/run/docker.sock:/var/run/docker.sock"}
+				return nil
+			},
+		},
+		{
+			name: "volumes from",
+			mutate: func(hc *container.HostConfig) []mount.Mount {
+				hc.VolumesFrom = []string{"other"}
+				return nil
+			},
+		},
+		{
+			name: "device",
+			mutate: func(hc *container.HostConfig) []mount.Mount {
+				hc.Devices = []container.DeviceMapping{{PathOnHost: "/dev/kvm"}}
+				return nil
+			},
+		},
+		{
+			name: "writable rootfs",
+			mutate: func(hc *container.HostConfig) []mount.Mount {
+				hc.ReadonlyRootfs = false
+				return nil
+			},
+		},
+		{
+			name: "missing no-new-privileges",
+			mutate: func(hc *container.HostConfig) []mount.Mount {
+				hc.SecurityOpt = nil
+				return nil
+			},
+		},
+		{
+			name: "seccomp override",
+			mutate: func(hc *container.HostConfig) []mount.Mount {
+				hc.SecurityOpt = []string{noNewPrivileges, "seccomp=unconfined"}
+				return nil
+			},
+		},
+		{
+			name: "writable bind",
+			mutate: func(*container.HostConfig) []mount.Mount {
+				return []mount.Mount{{Type: mount.TypeBind, Source: "/apps/demo", Target: "/app/src"}}
+			},
+		},
+		{
+			name: "docker socket bind",
+			mutate: func(*container.HostConfig) []mount.Mount {
+				return []mount.Mount{{
+					Type: mount.TypeBind, Source: "/var/run/docker.sock",
+					Target: "/var/run/docker.sock", ReadOnly: true,
+				}}
+			},
+		},
+		{
+			name: "writable tmpfs",
+			mutate: func(*container.HostConfig) []mount.Mount {
+				return []mount.Mount{{Type: mount.TypeTmpfs, Target: "/app/src"}}
+			},
+		},
+		{
+			name: "volume mount",
+			mutate: func(*container.HostConfig) []mount.Mount {
+				return []mount.Mount{{Type: mount.TypeVolume, Target: "/data", ReadOnly: true}}
+			},
+		},
+		{
+			name: "nested unsafe host config mount",
+			mutate: func(hc *container.HostConfig) []mount.Mount {
+				hc.Mounts = []mount.Mount{{
+					Type: mount.TypeBind, Source: "/var/run/docker.sock",
+					Target: "/sock", ReadOnly: true,
+				}}
+				return nil
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hc := base()
+			mounts := tc.mutate(hc)
+			if err := validateContainerHostConfig(hc, mounts, 3000, "/apps/demo"); err == nil {
+				t.Fatal("unsafe host config was accepted")
+			}
+		})
 	}
 }

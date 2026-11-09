@@ -43,6 +43,9 @@ func TestServiceLabelsCarriesServiceIdentityAndOwnership(t *testing.T) {
 		// created without explicit resources still carries the effective
 		// default config's hash so discovery can compare it).
 		labelResources: app.DefaultResourceLimits().Fingerprint(),
+		// The current hardening profile is part of every service container's
+		// identity so a tightened baseline replaces an older container.
+		labelSecurityProfile: ServiceSecurityProfile,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("label count = %d, want %d (%v)", len(got), len(want), got)
@@ -677,6 +680,9 @@ func captureServiceCreate(t *testing.T, spec ServiceSpec) []byte {
 	t.Helper()
 	var createBody []byte
 	cli := newScriptedDockerClient(t,
+		// Pre-create validation inspects every selected network. The scripted
+		// daemon reports ordinary networks (no relay.control label).
+		dockerRoute{method: http.MethodGet, path: "/networks/", body: `{"Name":"network","Labels":{}}`},
 		dockerRoute{
 			method: http.MethodPost, path: "/containers/create",
 			body:   `{"Id":"cid-1"}`,
@@ -926,6 +932,10 @@ func TestStartServiceDeletedNetworkCreateFailure(t *testing.T) {
 	networkCreates := 0
 	cli := newScriptedDockerClient(t,
 		dockerRoute{
+			method: http.MethodGet, path: "/networks/",
+			body: `{"Name":"backend","Labels":{}}`,
+		},
+		dockerRoute{
 			method: http.MethodPost, path: "/containers/create",
 			status: http.StatusNotFound,
 			body:   `{"message":"network backend not found"}`,
@@ -948,6 +958,40 @@ func TestStartServiceDeletedNetworkCreateFailure(t *testing.T) {
 	}
 	if networkCreates != 0 {
 		t.Fatalf("Relay issued %d network create(s); it must never create networks", networkCreates)
+	}
+}
+
+// TestStartServiceRejectsControlNetworkBeforeCreate proves the control-plane
+// guard is enforced by Relay before Docker ContainerCreate: a selected network
+// carrying relay.control fails the start and no create request is issued.
+func TestStartServiceRejectsControlNetworkBeforeCreate(t *testing.T) {
+	creates := 0
+	cli := newScriptedDockerClient(t,
+		dockerRoute{
+			method: http.MethodGet, path: "/networks/control",
+			body: `{"Name":"control","Labels":{"relay.control":"true"}}`,
+		},
+		dockerRoute{
+			method: http.MethodPost, path: "/containers/create",
+			body: `{"Id":"cid-1"}`,
+			onMatch: func() {
+				creates++
+			},
+		},
+	)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "test-host"}
+
+	_, err := m.StartService(context.Background(), ServiceSpec{
+		App:       "fn",
+		Name:      "svc",
+		SourceRef: "service.js", Port: 3000, Image: "img",
+		Env: []string{"PORT=3000"}, Networks: []string{"control"},
+	}, 0)
+	if err == nil {
+		t.Fatal("expected the control network to be rejected")
+	}
+	if creates != 0 {
+		t.Fatalf("Docker ContainerCreate was issued %d time(s) despite the control-network rejection", creates)
 	}
 }
 

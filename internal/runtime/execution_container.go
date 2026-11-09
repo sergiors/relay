@@ -185,6 +185,7 @@ func startExecutionContainer(
 	limits app.ResourceLimits,
 	meta RunMeta,
 	workDir string,
+	sourceRoot string,
 	mounts ...mount.Mount,
 ) (*executionContainer, error) {
 	hostConfig := hardenedHostConfig(true, limits)
@@ -192,6 +193,13 @@ func startExecutionContainer(
 	// (managed by the caller). An empty list is the historical no-mount shape.
 	if len(mounts) > 0 {
 		hostConfig.Mounts = mounts
+	}
+	// An invocation container declares no service port, so it can never carry
+	// the low-port capability.
+	if err := validateContainerHostConfig(
+		hostConfig, mounts, 0, sourceRoot,
+	); err != nil {
+		return nil, fmt.Errorf("docker run: unsafe container configuration: %w", err)
 	}
 	createOps := client.ContainerCreateOptions{
 		Config: &container.Config{

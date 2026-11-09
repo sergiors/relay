@@ -347,7 +347,7 @@ type Manager struct {
 	// shutdown-race cleanup, and the release path can be exercised
 	// deterministically without a Docker attach hijack (which the scripted
 	// daemon cannot perform).
-	startExecutionContainerFn func(ctx context.Context, ops containerOps, cli *client.Client, log *slog.Logger, fn, image string, env []string, networks []string, limits app.ResourceLimits, meta RunMeta, workDir string, mounts ...mount.Mount) (reusableContainer, error)
+	startExecutionContainerFn func(ctx context.Context, ops containerOps, cli *client.Client, log *slog.Logger, fn, image string, env []string, networks []string, limits app.ResourceLimits, meta RunMeta, workDir, sourceRoot string, mounts ...mount.Mount) (reusableContainer, error)
 	// afterSourceSnapshot is the deterministic seam around the captured source
 	// snapshot: Prepare calls it (test-only) ONCE, immediately after
 	// CaptureSourceSnapshot and before the fingerprint is derived, passing the
@@ -610,7 +610,16 @@ func NewManager(
 		return nil, fmt.Errorf("runtime image selection: %w", err)
 	}
 
-	cli, err := client.New(client.FromEnv)
+	// Moby's ImageBuild accepts the streamed context as an io.PipeReader, so its
+	// HTTP/1 request has no known Content-Length and uses chunked transfer. Send
+	// the standard 100-continue expectation to avoid the observed stall when
+	// BuildKit starts its progress response while the daemon is still reading the
+	// context body. Moby applies this header client-wide; requests without bodies
+	// do not wait for a continue response.
+	cli, err := client.New(
+		client.FromEnv,
+		client.WithHTTPHeaders(map[string]string{"Expect": "100-continue"}),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("cannot connect to Docker daemon: %w", err)
 	}

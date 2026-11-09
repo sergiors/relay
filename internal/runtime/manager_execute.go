@@ -46,10 +46,14 @@ func (m *Manager) startContainer(
 	if err != nil {
 		return nil, err
 	}
-	workDir, mounts := m.executionSourceMount(fnName)
+	if err := m.validateWorkloadNetworks(opCtx, m.networks); err != nil {
+		release()
+		return nil, fmt.Errorf("docker run: %w", err)
+	}
+	workDir, sourceRoot, mounts := m.executionSourceMount(fnName)
 	c, err := m.createExecutionContainer(
 		opCtx, m.containerOps(), m.cli, m.log, fnName, img.createImage(), env,
-		m.networks, limits, meta, workDir, mounts...,
+		m.networks, limits, meta, workDir, sourceRoot, mounts...,
 	)
 	if err != nil {
 		// startExecutionContainer has already removed any container it created
@@ -92,12 +96,19 @@ func (m *Manager) createExecutionContainer(
 	limits app.ResourceLimits,
 	meta RunMeta,
 	workDir string,
+	sourceRoot string,
 	mounts ...mount.Mount,
 ) (reusableContainer, error) {
 	if m.startExecutionContainerFn != nil {
-		return m.startExecutionContainerFn(ctx, ops, cli, log, fn, image, env, networks, limits, meta, workDir, mounts...)
+		return m.startExecutionContainerFn(
+			ctx, ops, cli, log, fn, image, env, networks, limits, meta,
+			workDir, sourceRoot, mounts...,
+		)
 	}
-	return startExecutionContainer(ctx, ops, cli, log, fn, image, env, networks, limits, meta, workDir, mounts...)
+	return startExecutionContainer(
+		ctx, ops, cli, log, fn, image, env, networks, limits, meta,
+		workDir, sourceRoot, mounts...,
+	)
 }
 
 // containerOps returns the manager-owned lifecycle an execution container uses

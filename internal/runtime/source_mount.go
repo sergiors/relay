@@ -149,14 +149,19 @@ func (m *Manager) sourceMountFor(name string) (SourceMount, bool) {
 
 // executionSourceMount returns the HOT_RELOAD container configuration for an
 // app's execution containers: the working directory (empty preserves the image
-// workdir) and the bind/mask mounts. Both are nil/empty when the app has no
-// recorded source mount, which is the exact pre-HOT_RELOAD create shape.
-func (m *Manager) executionSourceMount(fnName string) (string, []mount.Mount) {
+// workdir), the trusted host source root (empty when there is no mount), and
+// the bind/mask mounts. All are empty when the app has no recorded source
+// mount, which is the exact pre-HOT_RELOAD create shape. The root is returned
+// separately so create-time validation checks the bind against Relay's own
+// resolved provenance instead of trusting the mount list.
+func (m *Manager) executionSourceMount(
+	fnName string,
+) (string, string, []mount.Mount) {
 	sm, ok := m.sourceMountFor(fnName)
 	if !ok {
-		return "", nil
+		return "", "", nil
 	}
-	return sm.WorkDir, bindMounts(&sm)
+	return sm.WorkDir, sm.HostPath, bindMounts(&sm)
 }
 
 // containerMounts caches the one-time resolution of Relay's OWN container's

@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -467,6 +469,55 @@ func TestIntegrationBuildKitResolvesRemoteBaseThroughSession(t *testing.T) {
 	}
 }
 
+// TestIntegrationBuildKitStreamsUnknownLengthContext verifies the streamed
+// ImageBuild request does not stall when BuildKit starts its response before a
+// larger context has been fully uploaded. Moby uses chunked transfer for the
+// io.PipeReader context; the production Docker client sends the standard
+// Expect: 100-continue header to avoid the observed HTTP/1 request/response
+// stall.
+func TestIntegrationBuildKitStreamsUnknownLengthContext(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	m, err := NewManager(
+		testutil.DiscardLogger(), nil, "test-host", WithLifecycleContext(ctx),
+	)
+	if err != nil {
+		t.Fatalf("new runtime manager: %v", err)
+	}
+	image := fmt.Sprintf("relay-buildkit-stream:%d", time.Now().UnixNano())
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		cleanupImage(m.cli, cleanupCtx, image)
+		_ = m.Close()
+	}()
+
+	ctxDir := t.TempDir()
+	writeFile(t, ctxDir, "Dockerfile", "FROM scratch\nCOPY payload.bin /payload.bin\n")
+	payload, err := os.Create(filepath.Join(ctxDir, "payload.bin"))
+	if err != nil {
+		t.Fatalf("create build-context file: %v", err)
+	}
+	if err := payload.Truncate(1 << 20); err != nil {
+		_ = payload.Close()
+		t.Fatalf("size build-context file: %v", err)
+	}
+	if err := payload.Close(); err != nil {
+		t.Fatalf("close build-context file: %v", err)
+	}
+
+	_, err = m.runImageBuild(ctx, "buildkit-stream", image, func(buildCtx context.Context, sessionID string) error {
+		return runImageBuild(buildCtx, m.cli, "buildkit-stream", ctxDir, image, nil, nil, sessionID)
+	})
+	if err != nil {
+		t.Fatalf("streamed BuildKit context should build successfully: %v", err)
+	}
+	if !imageExistsInDaemon(m.cli, ctx, image) {
+		t.Fatalf("image %s should exist after the BuildKit build", image)
+	}
+}
+
 // TestIntegrationConcurrentManagersResolveSameDependencyReference verifies that
 // two independent Managers concurrently preparing identical dependency content
 // both succeed and resolve to the SAME valid content-addressed dependency image
@@ -484,18 +535,6 @@ func TestIntegrationConcurrentManagersResolveSameDependencyReference(t *testing.
 
 	appName := testutil.UniqueName(t, "dep-race")
 	var wg sync.WaitGroup
-	// One cleanup owns the concurrent test's teardown: it joins BOTH Prepare
-	// goroutines (each closes its Manager before signaling done) and only then
-	// removes this test's app image, so no image cleanup can race an active
-	// Prepare. The app name is unique per invocation (both Managers still share
-	// it), so parallel package processes cannot remove or retag each other's app
-	// image. Dependency layers are content-addressed and shared daemon-wide; a
-	// baseline delta is not proof of exclusive ownership, so they are
-	// intentionally retained rather than deleted here.
-	t.Cleanup(func() {
-		wg.Wait()
-		cleanupImagePrefixes(cli, "relay-app-"+appName+":")()
-	})
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -506,9 +545,18 @@ events:
       status: [COMPLETED]
 `)
 	writeFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
-	writeFile(t, dir, "requirements.txt", "six==1.16.0\n")
+	// The marker makes this dependency reference unique to this test invocation,
+	// so a warm daemon cannot turn the concurrent dependency-build assertion into
+	// an app-image-only cache-hit test.
+	writeFile(t, dir, "requirements.txt", "# "+appName+"\nsix==1.16.0\n")
 	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 	wantDep := expectedDependencyRef(t, fn)
+	if imageExistsInDaemon(cli, ctx, wantDep) {
+		t.Fatalf("per-run dependency image %s must not pre-exist", wantDep)
+	}
+	t.Cleanup(func() {
+		cleanupImagePrefixes(cli, "relay-app-"+appName+":", wantDep)()
+	})
 
 	// managerOutcome keeps every failure dimension of one independent Manager
 	// (Prepare, close) together with its index, so diagnostics can name the
@@ -524,15 +572,25 @@ events:
 	// (testutil.NewStateDSN/OpenState) and may t.Fatalf / register cleanup,
 	// which is only safe there. The goroutines keep ONLY Prepare + Close
 	// concurrent; the handles remain fully independent (own State schema, own
-	// Docker client), sharing just the identical app fixture.
+	// Docker client), sharing just the identical app fixture. Their lifecycle is
+	// tied to ctx so a test deadline closes active BuildKit sessions before the
+	// cleanup join waits for both goroutines.
 	mgrs := make([]*Manager, 2)
 	for i := range mgrs {
-		m, err := newCoordinatedRealManager(t, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+		m, err := newCoordinatedRealManager(
+			t, slog.New(slog.NewTextHandler(io.Discard, nil)), nil,
+			WithLifecycleContext(ctx),
+		)
 		if err != nil {
 			t.Fatalf("manager %d: NewManager failed: %v", i, err)
 		}
 		mgrs[i] = m
 	}
+	// Registered after each manager's State cleanup so the join runs before
+	// those handles close. Each Prepare goroutine closes its Manager before it
+	// signals done; image cleanup runs later, after both State handles close.
+	t.Cleanup(func() { wg.Wait() })
+
 	start := make(chan struct{})
 	outcomes := make(chan managerOutcome, 2)
 	wg.Add(2)

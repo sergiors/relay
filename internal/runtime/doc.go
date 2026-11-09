@@ -157,14 +157,21 @@
 //     is not exposed to that tag-movement limitation.
 //   - The package knows nothing about matching or Redis
 //
-// Security baseline: every execution container is hardened. It runs as a
-// non-root user created at build time (the engines set the plan's User/UserSetup),
-// drops all Linux capabilities, is memory/CPU/pids-limited, has a read-only
-// rootfs, and gets a bounded /tmp tmpfs as its only writable path. These are
-// internal defaults, not configuration. Networking stays enabled (outbound
-// access is a legitimate app need; network policy is a documented residual
-// limitation). The app code is unaware of all of this: the hardening is
-// applied entirely by the engines and the container runner.
+// Security baseline: every execution and service container is hardened. It runs
+// as a non-root user created at build time (the engines set the plan's
+// User/UserSetup; external images keep their own USER), drops all Linux
+// capabilities, enables no-new-privileges while preserving Docker's default
+// seccomp profile, uses private PID/IPC/network namespaces, is
+// memory/CPU/pids-limited, has a read-only rootfs, and gets a bounded /tmp tmpfs
+// as its only writable path. A service declaring a port below 1024 adds only
+// NET_BIND_SERVICE. A network labelled relay.control, and the reserved host /
+// container:<id> pseudo-networks, are refused before create. Mounts are limited
+// to the read-only HOT_RELOAD source bind and its read-only tmpfs masks; a
+// container-runtime socket mount is rejected. These are internal defaults, not
+// configuration. Outbound networking stays enabled (a legitimate app need;
+// network policy beyond control-plane isolation is a documented residual
+// limitation). The app code is unaware of all of this: the hardening is applied
+// entirely by the engines and the container runner.
 //
 // Usage: NewManager, then Prepare per app, then Execute per invocation.
 package runtime

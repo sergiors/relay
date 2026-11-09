@@ -148,6 +148,10 @@ state persistent. See
 the configured network exists but does not manage the network itself. See
 [Services](services.md) for routing configuration.
 
+Workload networks must not include Relay's control plane. Relay refuses a
+selected network labelled `relay.control=true` (and the reserved `host` /
+`container:<id>` pseudo-networks) before creating any workload container.
+
 ## Environment owned by other libraries
 
 Relay passes these settings to its clients; it does not parse them as Relay

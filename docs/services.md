@@ -24,8 +24,8 @@ services:
     replicas: 2
 
   - name: gateway
-    image: nginx:1.27-alpine # an external image reference
-    port: 80
+    image: nginxinc/nginx-unprivileged:1.27-alpine # an external image reference
+    port: 8080
     replicas: 1
 ```
 
@@ -45,12 +45,13 @@ Convergence below).
   no whitespace, no absolute paths, and no `..`. Node runs it directly
   (`node <entrypoint>`); Python runs it as a module (`python -m app.main`), so
   package-relative imports work. An `entrypoint` service needs a `runtime`.
-- `image` is an external image reference (e.g. `nginx:1.27`,
-  `ghcr.io/acme/api@sha256:…`). Relay inspects the local image and pulls from its
-  registry when the image is missing locally or the hourly freshness window has
-  elapsed; the image's own `ENTRYPOINT`/`CMD` are preserved. An `image` service
-  does not need a `runtime`. **Relay never removes external images** — cleanup
-  only ever touches its own `relay-app-*` / `relay-dep-*` namespaces.
+- `image` is an external image reference (e.g.
+  `nginxinc/nginx-unprivileged:1.27-alpine`, `ghcr.io/acme/api@sha256:…`). Relay
+  inspects the local image and pulls from its registry when the image is missing
+  locally or the hourly freshness window has elapsed; the image's own
+  `ENTRYPOINT`/`CMD` and `USER` are preserved. An `image` service does not need a
+  `runtime`. **Relay never removes external images** — cleanup only ever touches
+  its own `relay-app-*` / `relay-dep-*` namespaces.
 
 ## Port, host, path, replicas
 
@@ -84,8 +85,22 @@ service container's Docker `Config.Env`. Anyone with Docker daemon access can re
 only the one-way `relay.env_hash` digest.
 
 Per-container `resources` apply to service containers too. The hardening is the
-same as invocation containers: non-root, dropped capabilities, read-only rootfs,
-bounded `/tmp`, memory/CPU/pids limits.
+same as invocation containers: non-root (from the managed runtime image or the
+external image's own `USER`; Relay never forces a UID on an external image),
+all capabilities dropped, `no-new-privileges`, Docker's default seccomp profile,
+private PID/IPC/network namespaces, read-only rootfs, bounded `/tmp`, and
+memory/CPU/pids limits. A service whose declared `port` is below 1024 gets only
+`NET_BIND_SERVICE` added on top of the dropped set, so managed non-root services
+can bind a privileged port even when the daemon sets a nonzero unprivileged-port
+floor. Each service container records the profile in `relay.security_profile`, so
+a tightened baseline replaces a container created under an older profile.
+Workload containers never receive device access, arbitrary host mounts,
+writable app source, or a container-runtime socket.
+
+External images must run under those constraints. Prefer images that already run
+as a non-root user and listen on an unprivileged port (for example
+`nginxinc/nginx-unprivileged`, not the official `nginx`, which expects to chown
+cache directories and setuid its workers).
 
 Service networking: every service container joins the worker-global `NETWORKS`
 set (the same set execution containers join); a **routed** service additionally
@@ -96,7 +111,10 @@ Each service container carries a `relay.networks` label recording the canonical
 (sorted) set so the reconciler can detect a network change and replace the
 container. Relay never creates or removes any of these networks; the global set
 is verified at startup and the routing network before each routed container
-starts (see [configuration.md](configuration.md)). A network deleted from the
+starts (see [configuration.md](configuration.md)). A network labelled
+`relay.control=true` is Relay's control plane and is refused for workload
+containers before create. The reserved `host` and `container:<id>`
+pseudo-networks are also refused. A network deleted from the
 daemon **after** that verification is not re-created: a container that needs
 creating (a replacement or a new replica) fails, the failure is reported for that
 service and retried on the next reconcile, and an already-converged running

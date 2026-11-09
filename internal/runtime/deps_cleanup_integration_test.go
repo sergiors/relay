@@ -320,7 +320,8 @@ func (f *faultingBuildTransport) sawAppBuild() bool {
 // applied BEFORE WithHTTPClient so the client's own host/proto/addr still name
 // the env-configured daemon; the BuildKit session attaches through this client's
 // DialHijack, which does not use the faulting RoundTripper. The RoundTripper
-// itself ignores the request host (its dialer already targets the daemon).
+// itself ignores the request host (its dialer already targets the daemon). The
+// Expect header mirrors production's streamed-build handshake.
 func faultBuildClient(t *testing.T, appImage string) (*client.Client, *faultingBuildTransport) {
 	t.Helper()
 	envCli, err := client.New(client.FromEnv)
@@ -336,6 +337,7 @@ func faultBuildClient(t *testing.T, appImage string) (*client.Client, *faultingB
 	proxy := &faultingBuildTransport{base: base, appImage: appImage}
 	cli, err := client.New(
 		client.FromEnv,
+		client.WithHTTPHeaders(map[string]string{"Expect": "100-continue"}),
 		client.WithHTTPClient(&http.Client{Transport: proxy}),
 	)
 	if err != nil {

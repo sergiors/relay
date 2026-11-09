@@ -951,7 +951,7 @@ func TestExampleExternalImageTemplateParses(t *testing.T) {
 		t.Fatalf("services = %d, want 1", len(tmpl.Services))
 	}
 	s := tmpl.Services[0]
-	if s.Source() != ServiceSourceImage || s.Image != "nginx:1.27-alpine" || s.Port != 80 || s.Replicas != 1 {
-		t.Fatalf("service = %+v, want image nginx:1.27-alpine port=80 replicas=1", s)
+	if s.Source() != ServiceSourceImage || s.Image != "nginxinc/nginx-unprivileged:1.27-alpine" || s.Port != 8080 || s.Replicas != 1 {
+		t.Fatalf("service = %+v, want image nginxinc/nginx-unprivileged:1.27-alpine port=8080 replicas=1", s)
 	}
 }

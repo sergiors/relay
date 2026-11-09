@@ -132,6 +132,11 @@ type ServiceContainer struct {
 	// container created before the label existed, which never equals a desired
 	// fingerprint, so such a container is replaced once.
 	Resources string
+	// SecurityProfile is the hardening profile the container was created with,
+	// parsed from relay.security_profile. It is "" for a container created
+	// before the label existed, which never equals the current profile, so a
+	// pre-profile persistent service is replaced once rather than retained.
+	SecurityProfile string
 	// Networks is the canonical, sorted, comma-separated set of Docker
 	// networks the container was created attached to (the worker-global
 	// NETWORKS set plus the routing network for a routed service), parsed from
@@ -358,6 +363,8 @@ func EnvHash(env []string) string {
 // content-addressed), so a moved external tag is detected. relay.env_hash pins
 // the effective environment's content hash so an env/secret change replaces a
 // container whose image reference is unchanged (see labelEnvHash).
+// relay.security_profile pins the hardening profile so a tightened baseline
+// replaces a persistent container created under an older profile.
 //
 // Extra caller-supplied labels (spec.Labels, e.g. routing labels) are merged
 // on top, then the relay ownership keys are RE-applied last so Relay's
@@ -371,16 +378,17 @@ func serviceLabels(spec ServiceSpec, nodeID string, replica int) map[string]stri
 		sourceID = spec.SourceMount.Identity
 	}
 	labels := map[string]string{
-		labelType:      ContainerTypeService,
-		labelApp:       spec.App,
-		labelService:   spec.Name,
-		labelIdentity:  spec.SourceRef,
-		labelImage:     spec.Image,
-		labelNodeID:    nodeID,
-		labelPort:      strconv.Itoa(spec.Port),
-		labelReplica:   strconv.Itoa(replica),
-		labelEnvHash:   envHash,
-		labelResources: resourceHash,
+		labelType:            ContainerTypeService,
+		labelApp:             spec.App,
+		labelService:         spec.Name,
+		labelIdentity:        spec.SourceRef,
+		labelImage:           spec.Image,
+		labelNodeID:          nodeID,
+		labelPort:            strconv.Itoa(spec.Port),
+		labelReplica:         strconv.Itoa(replica),
+		labelEnvHash:         envHash,
+		labelResources:       resourceHash,
+		labelSecurityProfile: ServiceSecurityProfile,
 	}
 	if spec.ImageID != "" {
 		labels[labelImageID] = spec.ImageID
@@ -402,6 +410,7 @@ func serviceLabels(spec ServiceSpec, nodeID string, replica int) map[string]stri
 	labels[labelReplica] = strconv.Itoa(replica)
 	labels[labelEnvHash] = envHash
 	labels[labelResources] = resourceHash
+	labels[labelSecurityProfile] = ServiceSecurityProfile
 	// The image content ID is an ownership key too; a caller can never spoof it,
 	// and an empty ID (a content-addressed Relay tag) clears any spoofed value.
 	if spec.ImageID != "" {
@@ -481,6 +490,13 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 	callerCtx := ctx
 	ctx = opCtx
 
+	// Refuse a selected control network before any image or container work.
+	// This is the enforcement point shared by every persistent-service create;
+	// the equivalent check for execution containers runs in Manager.startContainer.
+	if err := m.validateWorkloadNetworks(ctx, spec.Networks); err != nil {
+		return "", fmt.Errorf("service: %w", err)
+	}
+
 	// Pin the service image for the whole create+start window. For a Relay-owned
 	// image (an entrypoint-source service runs the app image) this prevents
 	// a concurrent retirement from committing removal between the caller's
@@ -531,17 +547,28 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		Config: cfg,
 		// No AutoRemove: persistent, reconciler-owned (see doc comment). The
 		// resolved resource limits apply exactly as they do to an invocation
-		// container.
-		HostConfig: hardenedHostConfig(false, spec.Resources),
+		// container. A declared privileged port adds only NET_BIND_SERVICE on
+		// top of the shared CapDrop ALL baseline.
+		HostConfig: hardenedServiceHostConfig(spec.Resources, spec.Port),
 		// A unique physical name per start, so the replacement generation can
 		// be created while the generation it replaces is still running.
 		Name: serviceContainerNameForStart(spec.App, spec.Name, replica),
 	}
+	sourceMounts := bindMounts(spec.SourceMount)
+	sourceRoot := ""
+	if spec.SourceMount != nil {
+		sourceRoot = spec.SourceMount.HostPath
+	}
 	// A HOT_RELOAD entrypoint service mounts its live source read-only; an
 	// external `image` service never does, so its HostConfig is byte-for-byte the
 	// pre-HOT_RELOAD shape.
-	if mounts := bindMounts(spec.SourceMount); len(mounts) > 0 {
-		createOps.HostConfig.Mounts = mounts
+	if len(sourceMounts) > 0 {
+		createOps.HostConfig.Mounts = sourceMounts
+	}
+	if err := validateContainerHostConfig(
+		createOps.HostConfig, sourceMounts, spec.Port, sourceRoot,
+	); err != nil {
+		return "", fmt.Errorf("service: unsafe container configuration: %w", err)
 	}
 	if endpoints := serviceEndpoints(spec.Networks); len(endpoints) > 0 {
 		// Join every configured network at create time (containers must belong to
@@ -712,21 +739,22 @@ func (m *Manager) serviceContainerList(ctx context.Context, admit dockerOpAdmitt
 			maps.Copy(labelsCopy, c.Labels)
 		}
 		out = append(out, ServiceContainer{
-			ID:        c.ID,
-			App:       c.Labels[labelApp],
-			Name:      c.Labels[labelService],
-			SourceRef: c.Labels[labelIdentity],
-			Image:     c.Labels[labelImage],
-			ImageID:   c.Labels[labelImageID],
-			NodeID:    c.Labels[labelNodeID],
-			State:     c.State,
-			Replica:   replica,
-			Port:      port,
-			EnvHash:   c.Labels[labelEnvHash],
-			Resources: c.Labels[labelResources],
-			Networks:  c.Labels[labelNetworks],
-			SourceID:  c.Labels[labelSource],
-			Labels:    labelsCopy,
+			ID:              c.ID,
+			App:             c.Labels[labelApp],
+			Name:            c.Labels[labelService],
+			SourceRef:       c.Labels[labelIdentity],
+			Image:           c.Labels[labelImage],
+			ImageID:         c.Labels[labelImageID],
+			NodeID:          c.Labels[labelNodeID],
+			State:           c.State,
+			Replica:         replica,
+			Port:            port,
+			EnvHash:         c.Labels[labelEnvHash],
+			Resources:       c.Labels[labelResources],
+			SecurityProfile: c.Labels[labelSecurityProfile],
+			Networks:        c.Labels[labelNetworks],
+			SourceID:        c.Labels[labelSource],
+			Labels:          labelsCopy,
 		})
 	}
 	return out, nil
@@ -759,6 +787,58 @@ func (m *Manager) NetworkExists(ctx context.Context, network string) (bool, erro
 		return false, fmt.Errorf("network inspect %q: %w", network, m.classifyDockerErr(callerCtx, err))
 	}
 	return true, nil
+}
+
+// controlNetworkLabel marks a Docker network as Relay's control plane. A
+// workload container must never join it: that network is for Relay itself (and
+// operator control-plane services), so an app that names it in NETWORKS or
+// TRAEFIK_NETWORK would otherwise gain a path into Relay's private management
+// surface. An operator-managed control network can carry this label.
+const controlNetworkLabel = "relay.control"
+
+// validateWorkloadNetworks refuses selected networks that would break the
+// container security boundary, BEFORE Docker ContainerCreate. Every workload
+// create path calls it with the exact network set it is about to attach:
+//
+//   - a Docker network labelled relay.control is Relay's control plane and is
+//     never available to workloads;
+//   - the reserved host/container namespace pseudo-networks are refused
+//     explicitly instead of being left for the daemon to interpret.
+//
+// The check is by label, not by a configured name, so a renamed control network
+// stays protected. A missing network is surfaced here as an inspect error; that
+// is the same failure a create would produce, but it happens before create.
+func (m *Manager) validateWorkloadNetworks(ctx context.Context, networks []string) error {
+	for _, name := range NetworkSet(networks) {
+		if err := validateWorkloadNetworkName(name); err != nil {
+			return err
+		}
+		insp, err := m.cli.NetworkInspect(ctx, name, client.NetworkInspectOptions{})
+		if err != nil {
+			return fmt.Errorf("inspect workload network %q: %w", name, err)
+		}
+		if strings.EqualFold(insp.Network.Labels[controlNetworkLabel], "true") {
+			return fmt.Errorf(
+				"network %q is Relay's control network and cannot be joined by workload containers",
+				name,
+			)
+		}
+	}
+	return nil
+}
+
+// validateWorkloadNetworkName rejects Docker's namespace-sharing pseudo-network
+// names. They are not ordinary networks and would move a workload onto the host
+// or another container's namespace.
+func validateWorkloadNetworkName(name string) error {
+	switch {
+	case name == "host":
+		return fmt.Errorf("network %q is not allowed (host networking)", name)
+	case strings.HasPrefix(name, "container:"):
+		return fmt.Errorf("network %q is not allowed (container namespace sharing)", name)
+	default:
+		return nil
+	}
 }
 
 // VerifyNetworks checks that every named Docker network exists, returning the
