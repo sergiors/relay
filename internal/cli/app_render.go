@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 
 	"relay/internal/bytesize"
 	"relay/internal/state"
@@ -35,13 +36,27 @@ func renderAppList(w io.Writer, rows []state.Row) error {
 }
 
 // renderAppDetail renders the full detail record and its persisted per-app
-// stats. A caller that also has live pool gauges appends them with
-// renderRuntimePool. Labels are tab-aligned through a tabwriter so padding
-// matches the longest label without hand-maintained spaces. The Stats, Events,
-// Schedules, and Services sections use a wider padding for visual grouping.
+// stats without image provenance. It is the renderer-only entry point used by
+// focused tests; `app inspect` uses renderAppDetailWithProvenance.
 func renderAppDetail(w io.Writer, detail state.Detail, stats state.AppStats) error {
+	return renderAppDetailWithProvenance(
+		w, detail, stats, appProvenance{})
+}
+
+// renderAppDetailWithProvenance renders the full detail record, its persisted
+// per-app stats, and the active image's provenance. A caller that also has live
+// pool gauges appends them with renderRuntimePool. Labels are tab-aligned
+// through a tabwriter so padding matches the longest label without
+// hand-maintained spaces. The Stats, Events, Schedules, and Services sections
+// use a wider padding for visual grouping.
+func renderAppDetailWithProvenance(
+	w io.Writer,
+	detail state.Detail,
+	stats state.AppStats,
+	provenance appProvenance,
+) error {
 	out := newOutput(w)
-	renderAppOverview(out, detail)
+	renderAppOverview(out, detail, provenance)
 
 	out.blank()
 	out.line("Stats:")
@@ -81,8 +96,11 @@ func renderAppDetail(w io.Writer, detail state.Detail, stats state.AppStats) err
 }
 
 // renderAppOverview renders the identity, lifecycle, and active-generation
-// metadata rows at the top of inspect.
-func renderAppOverview(out *output, detail state.Detail) {
+// metadata rows at the top of inspect. Base image provenance follows Runtime
+// and appears only for an app with an active image.
+func renderAppOverview(
+	out *output, detail state.Detail, provenance appProvenance,
+) {
 	tw := out.table(2)
 	fmt.Fprintf(tw, "Name:\t%s\n", detail.Name)
 
@@ -92,12 +110,20 @@ func renderAppOverview(out *output, detail state.Detail) {
 	}
 	fmt.Fprintf(tw, "Runtime:\t%s\n", runtime)
 
+	if detail.Image != "" {
+		fmt.Fprintf(tw, "Base image:\t%s\n", provenance.display())
+	}
+
 	fmt.Fprintf(tw, "Status:\t%s\n", detail.Status)
 	if detail.Image != "" {
 		fmt.Fprintf(tw, "Image:\t%s\n", detail.Image)
 	}
 	if detail.Fingerprint != "" {
-		fmt.Fprintf(tw, "Fingerprint:\t%s\n", detail.Fingerprint)
+		fmt.Fprintf(
+			tw,
+			"Fingerprint:\t%s\n",
+			displayFingerprint(detail.Fingerprint),
+		)
 	}
 	if detail.PreparedAt != "" {
 		fmt.Fprintf(tw, "Prepared:\t%s (%s)\n",
@@ -117,6 +143,17 @@ func renderAppOverview(out *output, detail state.Detail) {
 			detail.Resources.Pids)
 	}
 	out.flush(tw)
+}
+
+// displayFingerprint renders the persisted application fingerprint with its
+// hash algorithm for readability. The stored value stays unprefixed; an
+// already-prefixed value is not prefixed again.
+func displayFingerprint(fingerprint string) string {
+	const prefix = "sha256:"
+	if strings.HasPrefix(fingerprint, prefix) {
+		return fingerprint
+	}
+	return prefix + fingerprint
 }
 
 // renderAppStatsSection renders the per-app cumulative counters and execution

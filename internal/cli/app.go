@@ -8,22 +8,24 @@ import (
 	"github.com/urfave/cli/v3"
 )
 
-// appCommand builds the `relay app ...` subcommand family. `ls` and
-// `inspect` touch the local state database only — never Redis, Docker, or the
-// /apps loader — so they work with no REDIS_URI and no worker reachable;
-// `invoke` instead dials the RUNNING worker's query socket to execute handlers
-// on its live runtime pool (it has no offline fallback). deps supplies the state
-// database those commands open and the worker socket inspect/invoke dial. It is
-// a pure grouping command, so it uses the shared namespaceAction: a bare
-// `relay app` shows the subcommand help, and an unknown first token is a
-// friendly Docker-style usage error naming the full path.
+// appCommand builds the `relay app ...` subcommand family. `ls` touches only
+// the local state database; `inspect` reads the same state and additionally
+// performs one best-effort, read-only Docker image inspect when the app has an
+// active image, to show that image's provenance. Neither needs Redis or a
+// reachable worker; `invoke` instead dials the RUNNING worker's query socket to
+// execute handlers on its live runtime pool (it has no offline fallback). deps
+// supplies the state database those commands open and the worker socket
+// inspect/invoke dial. It is a pure grouping command, so it uses the shared
+// namespaceAction: a bare `relay app` shows the subcommand help, and an unknown
+// first token is a friendly Docker-style usage error naming the full path.
 func appCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "app",
 		Usage: "Manage apps",
 		Description: "List, inspect, and invoke the apps Relay has discovered " +
-			"and reconciled. list/inspect read the local state database; invoke runs " +
-			"an app's matching handlers on the running worker.",
+			"and reconciled. ls/inspect read the local state database; inspect " +
+			"also reads the active image's provenance from Docker when available; " +
+			"invoke runs an app's matching handlers on the running worker.",
 		Action: namespaceAction(),
 		Commands: []*cli.Command{
 			{
@@ -37,7 +39,8 @@ func appCommand(deps Dependencies) *cli.Command {
 				Usage:     "Show detailed information about an app",
 				UsageText: "relay app inspect NAME",
 				Description: "Show the full detail record for a single app, including " +
-					"its runtime, status, events and schedules, env-var names (values " +
+					"its runtime, base-image provenance read from the active image, " +
+					"status, events and schedules, env-var names (values " +
 					"redacted) and secret reference names, and " +
 					"its cumulative container pool counters.",
 				Arguments: []cli.Argument{
@@ -107,11 +110,14 @@ func appList(ctx context.Context, w io.Writer, deps Dependencies) error {
 	return renderAppList(w, rows)
 }
 
-// appInspect reads one app's detail and persisted stats, resolves the live pool
-// gauges, and renders the full record. An unknown name is a runtime error (exit
-// 1 via main); an unreadable row is a separate error, never reported as an
-// unknown app. The live gauges are best-effort telemetry: an unavailable pool
-// renders as "unknown" without failing the command.
+// appInspect reads one app's detail and persisted stats, resolves the active
+// image's diagnostic provenance, and renders the full record. An unknown name
+// is a runtime error (exit 1 via main); an unreadable row is a separate error,
+// never reported as an unknown app. The image provenance is best-effort and
+// read-only: Docker is consulted only for an active image, and a failed lookup
+// renders as unavailable without failing the command. The live gauges are
+// likewise best-effort telemetry: an unavailable pool renders as "unknown"
+// without failing the command.
 func appInspect(ctx context.Context, w io.Writer, name string, deps Dependencies) error {
 	st, cleanup, err := deps.OpenState(ctx)
 	if err != nil {
@@ -131,7 +137,13 @@ func appInspect(ctx context.Context, w io.Writer, name string, deps Dependencies
 		return fmt.Errorf("app inspect: %w", err)
 	}
 
-	if err := renderAppDetail(w, detail, stats); err != nil {
+	var provenance appProvenance
+	if detail.Image != "" {
+		provenance = lookupAppProvenance(ctx, detail.Image, deps)
+	}
+	if err := renderAppDetailWithProvenance(
+		w, detail, stats, provenance,
+	); err != nil {
 		return err
 	}
 

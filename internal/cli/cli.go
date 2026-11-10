@@ -69,6 +69,15 @@ type OpenRuntimeImageResolver func(
 	ctx context.Context,
 ) (resolver RuntimeImageResolver, cleanup func(), err error)
 
+// ImageProvenanceLookup reads the diagnostic build provenance recorded on one
+// local app image. It is a lazy seam: `app inspect` calls it only when the app
+// has an active image, and any lookup failure is rendered as unavailable
+// provenance rather than failing the command. Production reads the image labels
+// through the local Docker Engine; tests inject a fake without Docker.
+type ImageProvenanceLookup func(
+	ctx context.Context, image string,
+) (runtime.ImageProvenance, error)
+
 // PoolSnapshotProvider is the optional in-process source of live warm-container
 // pool gauges for `relay app inspect`. It reports whether the named app has a
 // live pool in this process and, when it does, the current gauge reading. It
@@ -95,6 +104,13 @@ type Dependencies struct {
 	// contact Docker or a registry. Production: openDistributionResolver. Tests
 	// inject a transport-free fake.
 	OpenRuntimeImageResolver OpenRuntimeImageResolver
+	// ReadImageProvenance reads the provenance labels of the app's ACTIVE
+	// image for `app inspect`. It is lazy: inspect skips it when the app has no
+	// active image, so a pending app needs no Docker connection. A lookup error
+	// is presented as unavailable provenance; it never fails inspect.
+	// Production: readDockerImageProvenance. Tests inject a transport-free
+	// fake.
+	ReadImageProvenance ImageProvenanceLookup
 	// SocketPath is the live worker control socket: `relay health` dials it to
 	// ask whether the running worker is healthy (worker readiness plus live
 	// dependency health), `relay app inspect` dials it for the live
@@ -155,6 +171,7 @@ func DefaultDependencies() Dependencies {
 	return Dependencies{
 		OpenState:                openPostgresState,
 		OpenRuntimeImageResolver: openDistributionResolver,
+		ReadImageProvenance:      readDockerImageProvenance,
 		SocketPath:               worker.SocketPath,
 		LockPath:                 processlock.DefaultPath,
 		GitConfigPath:            git.ConfigPath,

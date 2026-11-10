@@ -240,7 +240,7 @@ func TestAppInspectDetail(t *testing.T) {
 		"Runtime: python3.14",
 		"Status: ready",
 		"Image: relay-app-user-events-python",
-		"Fingerprint: abc123hash",
+		"Fingerprint: sha256:abc123hash",
 		"Prepared:",
 		"Last reconcile:",
 		"Resources: memory=256MiB cpus=0.5 pids=64",

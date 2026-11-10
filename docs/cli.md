@@ -20,16 +20,17 @@ Run `relay <command> --help` for flags. `relay apps` is an alias for
 
 ## Command requirements
 
-| Command                              | Requirements                                   |
-| ------------------------------------ | ---------------------------------------------- |
-| `start`                              | Redis, PostgreSQL, Docker, configured networks |
-| `health`, `app invoke`, `dlq replay` | Running worker                                 |
-| `stats`, `app ls`, `app inspect`     | PostgreSQL (`DATABASE_URL`)                    |
-| `runtime ls`, `runtime inspect`     | PostgreSQL (`DATABASE_URL`)                    |
+| Command                              | Requirements                                    |
+| ------------------------------------ | ----------------------------------------------- |
+| `start`                              | Redis, PostgreSQL, Docker, configured networks  |
+| `health`, `app invoke`, `dlq replay` | Running worker                                  |
+| `stats`, `app ls`                    | PostgreSQL (`DATABASE_URL`)                     |
+| `app inspect`                        | PostgreSQL; Docker optional for provenance      |
+| `runtime ls`, `runtime inspect`      | PostgreSQL (`DATABASE_URL`)                     |
 | `runtime check`, `runtime update`    | PostgreSQL and Docker Engine (Distribution API) |
-| `dlq ls`, `dlq inspect`, `dlq rm`    | PostgreSQL (`DATABASE_URL`)                    |
-| `secret *`                           | Local Relay data directory                     |
-| `git *`                              | Local Git configuration and `/apps`            |
+| `dlq ls`, `dlq inspect`, `dlq rm`    | PostgreSQL (`DATABASE_URL`)                     |
+| `secret *`                           | Local Relay data directory                      |
+| `git *`                              | Local Git configuration and `/apps`             |
 
 `health` and `app invoke` communicate with the worker over its local control
 socket. `relay dlq` commands access PostgreSQL; replay also requires the worker.
@@ -131,10 +132,13 @@ relay app ls
 relay app inspect my-app
 ```
 
-These commands read PostgreSQL state. `inspect` shows app status, handlers,
-schedules, services, environment variable names, secret references, and runtime
-pool information. Some live pool values are unavailable when the worker is not
-running. `relay apps` is equivalent to `relay app ls`.
+These commands read PostgreSQL state. `inspect` also performs one best-effort,
+read-only Docker image inspect when the app has an active image, to show the
+base image that image was built from. Unavailable provenance is reported
+honestly rather than falling back to current configuration. `inspect` shows app
+status, handlers, schedules, services, environment variable names, secret
+references, and runtime pool information. Some live pool values are unavailable
+when the worker is not running. `relay apps` is equivalent to `relay app ls`.
 
 ### relay app invoke
 
