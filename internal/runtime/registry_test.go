@@ -254,7 +254,18 @@ func TestNodeRuntimePnpmCacheIsReusableAcrossVersions(t *testing.T) {
 				if lineStart < 0 {
 					t.Fatalf("%s Dockerfile has no artifact cache mount:\n%s", runtimeID, df)
 				}
-				mount := strings.TrimPrefix(df[lineStart:], "RUN --mount=type=cache,id=")
+				artifact := df[lineStart:]
+				headerEnd := strings.IndexByte(artifact, '\n')
+				if headerEnd < 0 || !strings.HasSuffix(strings.TrimSpace(artifact[:headerEnd]), "<<'RELAY_ARTIFACT'") {
+					t.Fatalf("%s artifact RUN is not a BuildKit heredoc:\n%s", runtimeID, df)
+				}
+				body := artifact[headerEnd+1:]
+				bodyEnd := strings.Index(body, "\nRELAY_ARTIFACT\n")
+				if bodyEnd < 0 {
+					t.Fatalf("%s artifact RUN has no closing heredoc marker:\n%s", runtimeID, df)
+				}
+				body = body[:bodyEnd]
+				mount := strings.TrimPrefix(artifact, "RUN --mount=type=cache,id=")
 				mount = mount[:strings.IndexByte(mount, ' ')]
 				id := mount
 				variant, ok := spec.RuntimeTools[0].Artifact.VariantForArch(arch)
@@ -267,10 +278,11 @@ func TestNodeRuntimePnpmCacheIsReusableAcrossVersions(t *testing.T) {
 				fallback := variant.Fallbacks[0]
 				for _, want := range []string{
 					fallback.URL,
-					fallback.SHA256 + ".tar.gz",
-					"tar -xzf /tmp/relay-tool-0.tar.gz -C /tmp/relay-tool-0.unpack \"$archive_member\"",
+					"use_cached_archive " + fallback.SHA256 + " " + fallback.Member,
+					"try_download_archive " + fallback.URL + " " + fallback.SHA256 + " " + fallback.Member,
+					"tar -xzf \"$artifact_archive\" -C \"$artifact_unpack\" \"$artifact_member\"",
 				} {
-					if !strings.Contains(df, want) {
+					if !strings.Contains(body, want) {
 						t.Errorf("%s %s artifact Dockerfile missing fallback/cache identity %q:\n%s", runtimeID, arch, want, df)
 					}
 				}

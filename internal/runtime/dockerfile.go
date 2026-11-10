@@ -111,88 +111,174 @@ func renderRuntimeTools(b *strings.Builder, p plan.BuildPlan) error {
 		if tool.Destination == "" || !strings.HasPrefix(tool.Destination, "/") {
 			return fmt.Errorf("runtime tool: artifact destination %q must be an absolute path", tool.Destination)
 		}
+		// The destination is emitted into the heredoc body; a control character
+		// such as a newline could terminate the heredoc or split the RUN.
+		if strings.IndexFunc(tool.Destination, unicode.IsControl) >= 0 {
+			return fmt.Errorf("runtime tool: artifact destination %q must not contain control characters", tool.Destination)
+		}
 		b.WriteString(renderArtifactTool(i, tool.Destination, variant))
 	}
 	return nil
 }
 
-// renderArtifactTool renders one fail-closed RUN that retrieves and verifies the
-// pinned archive, extracts exactly the validated member, installs it at
+// renderArtifactTool renders one fail-closed RUN that retrieves and verifies
+// the pinned archive, extracts exactly the validated member, installs it at
 // destination, and removes scratch paths before the layer commits. A
-// checksum-keyed BuildKit cache mount shares verified archives across builds.
-// Locked sharing serializes access while temporary data is verified/published.
-func renderArtifactTool(i int, destination string, variant plan.ArtifactVariant) string {
+// checksum-keyed BuildKit cache mount shares verified archives across builds;
+// sharing=locked serializes access to the deterministic temporary download
+// name.
+func renderArtifactTool(
+	i int,
+	destination string,
+	variant plan.ArtifactVariant,
+) string {
 	archive := fmt.Sprintf("/tmp/relay-tool-%d.tar.gz", i)
 	unpack := fmt.Sprintf("/tmp/relay-tool-%d.unpack", i)
-	destDir := path.Dir(destination)
-	archiveArg := dockerfileShellArg(archive)
-	unpackArg := dockerfileShellArg(unpack)
-	destDirArg := dockerfileShellArg(destDir)
-	destinationArg := dockerfileShellArg(destination)
-	cacheID := "relay-artifact-" + variant.SHA256
 	sources := make([]plan.ArtifactSource, 0, 1+len(variant.Fallbacks))
-	sources = append(sources, plan.ArtifactSource{URL: variant.URL, SHA256: variant.SHA256, Member: variant.Member})
+	sources = append(sources, plan.ArtifactSource{
+		URL: variant.URL, SHA256: variant.SHA256, Member: variant.Member,
+	})
 	sources = append(sources, variant.Fallbacks...)
 
 	var b strings.Builder
 	fmt.Fprintf(&b,
-		"RUN --mount=type=cache,id=%s,target=/var/cache/relay-artifacts,sharing=locked set -eu; ", cacheID)
-	b.WriteString("archive_sha256=; archive_member=; ")
+		"RUN --mount=type=cache,id=relay-artifact-%s,"+
+			"target=/var/cache/relay-artifacts,sharing=locked "+
+			"<<'RELAY_ARTIFACT'\n",
+		variant.SHA256)
+	b.WriteString("set -eu\n\n")
+	b.WriteString("artifact_cache=/var/cache/relay-artifacts\n")
+	fmt.Fprintf(&b, "artifact_archive=%s\n", dockerfileShellArg(archive))
+	fmt.Fprintf(&b, "artifact_unpack=%s\n", dockerfileShellArg(unpack))
+	fmt.Fprintf(&b, "destination=%s\n", dockerfileShellArg(destination))
+	fmt.Fprintf(&b, "destination_dir=%s\n",
+		dockerfileShellArg(path.Dir(destination)))
+	b.WriteString("artifact_sha256=\nartifact_member=\n")
+	b.WriteString(artifactToolShellHelpers)
+
 	// Inspect every source's cache before any network access. The primary wins
-	// when both caches are valid, while a verified fallback cache bypasses a
+	// when multiple caches are valid, while a verified fallback cache bypasses a
 	// temporarily unavailable primary on future builds.
 	for _, source := range sources {
-		cached := artifactCachePath(source.SHA256)
-		fmt.Fprintf(&b,
-			"if [ -f %s ]; then if echo %s | sha256sum -c - >/dev/null 2>&1; then if [ ! -f %s ]; then cp %s %s; archive_sha256=%s; archive_member=%s; fi; else rm -f %s; fi; fi; ",
-			dockerfileShellArg(cached),
-			dockerfileShellArg(source.SHA256+"  "+cached),
-			archiveArg, dockerfileShellArg(cached), archiveArg, source.SHA256, dockerfileShellArg(source.Member),
-			dockerfileShellArg(cached))
+		fmt.Fprintf(&b, "use_cached_archive %s %s\n",
+			dockerfileShellArg(source.SHA256),
+			dockerfileShellArg(source.Member))
 	}
+	b.WriteString("\n")
+
+	// Try sources in plan order, three bounded attempts each. A checksum
+	// mismatch is fatal immediately; only a failed download advances to the
+	// next source.
 	for _, source := range sources {
-		cached := artifactCachePath(source.SHA256)
-		temp := artifactTempPath(source.SHA256)
-		cachedArg := dockerfileShellArg(cached)
-		tempArg := dockerfileShellArg(temp)
-		fmt.Fprintf(&b,
-			"if [ ! -f %s ]; then attempt=1; while [ \"$attempt\" -le 3 ]; do rm -f %s; "+
-				"if busybox timeout -k 2 25 busybox wget -T 20 -O %s %s; then "+
-				"if ! echo %s | sha256sum -c -; then rm -f %s %s %s %s; echo 'artifact SHA-256 mismatch' >&2; exit 1; fi; "+
-				"mv %s %s; cp %s %s; archive_sha256=%s; archive_member=%s; break; fi; rm -f %s; "+
-				"if [ \"$attempt\" -lt 3 ]; then sleep \"$attempt\"; fi; attempt=$((attempt + 1)); done; fi; ",
-			archiveArg, tempArg, tempArg, dockerfileShellArg(source.URL),
-			dockerfileShellArg(source.SHA256+"  "+temp), tempArg, cachedArg, archiveArg, unpackArg,
-			tempArg, cachedArg, cachedArg, archiveArg, source.SHA256, dockerfileShellArg(source.Member), tempArg)
+		fmt.Fprintf(&b, "try_download_archive %s %s %s\n",
+			dockerfileShellArg(source.URL),
+			dockerfileShellArg(source.SHA256),
+			dockerfileShellArg(source.Member))
 	}
-	if len(sources) == 1 {
-		fmt.Fprintf(&b, "if [ ! -f %s ]; then echo 'artifact download failed after 3 attempts' >&2; exit 1; fi; ", archiveArg)
-	} else {
-		fmt.Fprintf(&b, "if [ ! -f %s ]; then echo 'artifact download failed for all sources after 3 attempts each' >&2; exit 1; fi; ", archiveArg)
+	failure := "artifact download failed after 3 attempts"
+	if len(sources) > 1 {
+		failure = "artifact download failed for all sources after 3 attempts each"
 	}
-	fmt.Fprintf(&b,
-		"echo \"$archive_sha256  %s\" | sha256sum -c - && rm -rf %s && mkdir -p %s && ",
-		archiveArg, unpackArg, unpackArg)
-	fmt.Fprintf(&b, "tar -xzf %s -C %s \"$archive_member\" && mkdir -p %s && mv %s/\"$archive_member\" %s && chmod 0755 %s && rm -rf %s %s\n",
-		archiveArg, unpackArg, destDirArg, unpackArg, destinationArg, destinationArg, unpackArg, archiveArg)
+	fmt.Fprintf(&b, "\nrequire_archive %s\n", dockerfileShellArg(failure))
+	b.WriteString(artifactToolShellFinish)
+	b.WriteString("RELAY_ARTIFACT\n")
 	return b.String()
 }
 
-func artifactCachePath(digest string) string {
-	return "/var/cache/relay-artifacts/" + digest + ".tar.gz"
+// artifactToolShellHelpers is the static shell shared by every artifact RUN. Go
+// renders each source as an argument list, so these functions contain no
+// artifact values and the caller keeps the primary-then-fallback order
+// explicit.
+const artifactToolShellHelpers = `
+# use_cached_archive DIGEST MEMBER reuses only a cache entry whose digest
+# still verifies. Sources are inspected in plan order before any network
+# access, so the primary wins when multiple caches are valid and a verified
+# fallback remains usable while the primary is unavailable.
+use_cached_archive() {
+  digest=$1
+  member=$2
+  cached=$artifact_cache/$digest.tar.gz
+  if [ ! -f "$cached" ]; then
+    return 0
+  fi
+  if ! echo "$digest  $cached" | sha256sum -c - >/dev/null 2>&1; then
+    rm -f "$cached"
+    return 0
+  fi
+  if [ -f "$artifact_archive" ]; then
+    return 0
+  fi
+  cp "$cached" "$artifact_archive"
+  artifact_sha256=$digest
+  artifact_member=$member
 }
 
-func artifactTempPath(digest string) string {
-	// sharing=locked makes this deterministic temporary name safe even when
-	// builds for the same artifact arrive concurrently.
-	return "/var/cache/relay-artifacts/." + digest + ".download"
+# try_download_archive URL DIGEST MEMBER makes three bounded attempts
+# against one source. A checksum mismatch is fatal at once; a failed download
+# only advances the retry loop and then the caller's next source.
+try_download_archive() {
+  url=$1
+  digest=$2
+  member=$3
+  cached=$artifact_cache/$digest.tar.gz
+  temp=$artifact_cache/.$digest.download
+  if [ -f "$artifact_archive" ]; then
+    return 0
+  fi
+  attempt=1
+  while [ "$attempt" -le 3 ]; do
+    rm -f "$temp"
+    if busybox timeout -k 2 25 busybox wget -T 20 -O "$temp" "$url"; then
+      if ! echo "$digest  $temp" | sha256sum -c -; then
+        rm -f "$temp" "$cached" "$artifact_archive" "$artifact_unpack"
+        echo 'artifact SHA-256 mismatch' >&2
+        exit 1
+      fi
+      mv "$temp" "$cached"
+      cp "$cached" "$artifact_archive"
+      artifact_sha256=$digest
+      artifact_member=$member
+      return 0
+    fi
+    rm -f "$temp"
+    if [ "$attempt" -lt 3 ]; then
+      sleep "$attempt"
+    fi
+    attempt=$((attempt + 1))
+  done
+  return 0
 }
+
+# require_archive MESSAGE fails closed unless a verified archive was selected
+# from the cache or downloaded from one of the sources.
+require_archive() {
+  if [ ! -f "$artifact_archive" ]; then
+    echo "$1" >&2
+    exit 1
+  fi
+}
+`
+
+// artifactToolShellFinish verifies the selected archive again, extracts
+// exactly the validated member, installs it with executable permissions, and
+// removes the scratch paths before the layer commits.
+const artifactToolShellFinish = `
+echo "$artifact_sha256  $artifact_archive" | sha256sum -c -
+rm -rf "$artifact_unpack"
+mkdir -p "$artifact_unpack"
+tar -xzf "$artifact_archive" -C "$artifact_unpack" "$artifact_member"
+mkdir -p "$destination_dir"
+mv "$artifact_unpack/$artifact_member" "$destination"
+chmod 0755 "$destination"
+rm -rf "$artifact_unpack" "$artifact_archive"
+`
 
 // validateArtifactVariant rejects a variant whose data could produce an unsafe
-// or non-deterministic Dockerfile: a non-HTTPS URL, shell-hostile URL bytes, a
-// malformed digest, or a member that is not a clean relative path. The plan data
-// is trusted (registry constants); this is defense-in-depth against a future
-// tool definition and makes path traversal impossible.
+// or non-deterministic Dockerfile: a non-HTTPS URL, shell-hostile URL bytes
+// (quotes, backslash, whitespace) or any Unicode control character, a malformed
+// digest, or a member that is not a clean relative path. The plan data is
+// trusted (registry constants); this is defense-in-depth against a future tool
+// definition and makes path traversal impossible.
 func validateArtifactVariant(v plan.ArtifactVariant) error {
 	if v.Arch == "" {
 		return fmt.Errorf("artifact variant has no architecture")
@@ -202,6 +288,11 @@ func validateArtifactVariant(v plan.ArtifactVariant) error {
 	}
 	if strings.ContainsAny(v.URL, " \t\r\n\"'`\\") {
 		return fmt.Errorf("artifact variant for %s: url %q contains unsafe characters", v.Arch, v.URL)
+	}
+	// Raw control bytes (notably NUL and ESC) would otherwise reach the
+	// rendered heredoc verbatim; member and destination use the same rule.
+	if strings.IndexFunc(v.URL, unicode.IsControl) >= 0 {
+		return fmt.Errorf("artifact variant for %s: url %q must not contain control characters", v.Arch, v.URL)
 	}
 	if len(v.SHA256) != 64 {
 		return fmt.Errorf("artifact variant for %s: sha256 %q must be 64 hex characters", v.Arch, v.SHA256)
