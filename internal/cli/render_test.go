@@ -87,7 +87,7 @@ func TestRenderDLQListPropagatesWriteFailure(t *testing.T) {
 		dlqTestEntry(dlqUnitID, "1699999999999-0", "alpha", "events.a.handler", `{"a":1}`, "2026-09-23T10:00:00Z"),
 	}
 	requireWriteFailure(t, "renderDLQList", func() error {
-		return renderDLQList(failingWriter{}, entries)
+		return renderDLQList(failingWriter{}, entries, true)
 	})
 }
 

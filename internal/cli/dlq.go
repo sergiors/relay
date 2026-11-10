@@ -33,8 +33,9 @@ func openPostgresDLQStore(ctx context.Context, _ *slog.Logger) (dlq.Store, func(
 // namespaceAction: a bare `relay dlq` shows the subcommand help, and an unknown
 // first token is a friendly Docker-style usage error naming the full path.
 //
-// ls prints the full 64-character ID of each entry; inspect, replay, and rm
-// require that exact full ID.
+// ls abbreviates each entry ID to its first 12 characters for display; the
+// displayed abbreviation is never an identifier. inspect, replay, and rm
+// require the exact full ID, which `ls --no-trunc` prints.
 //
 // PostgreSQL access stays behind the broker-neutral dlq.Store seam and the
 // injected OpenDLQStore opener; the command helpers retrieve entries and pass
@@ -57,15 +58,24 @@ func dlqCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 }
 
 // dlqLsCommand builds `relay dlq ls`: a concise table of the DLQ entries in
-// write order, one row per entry. The row shows the full entry ID, the exact
-// failed app/handler and its handler attempt count, and the entry's age; the
-// full ID can be passed directly to inspect, replay, or rm.
+// write order, one row per entry. IDs are abbreviated to their first 12
+// characters for display only; --no-trunc prints the complete ID. The row also
+// shows the exact failed app/handler and its handler attempt count and age.
+// inspect, replay, and rm require the full ID, so copy it from --no-trunc.
 func dlqLsCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "ls",
 		Usage: "List DLQ entries",
-		Description: "List every DLQ entry in write order: full entry ID, " +
-			"failed app/handler, handler attempts, and age.",
+		Description: "List every DLQ entry in write order: abbreviated entry ID, " +
+			"failed app/handler, handler attempts, and age. The abbreviation is " +
+			"display-only; inspect, replay, and rm require the full ID, which " +
+			"--no-trunc prints.",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:  "no-trunc",
+				Usage: "show complete entry IDs instead of display-only abbreviations",
+			},
+		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.Args().Present() {
 				return cli.Exit("dlq ls: too many arguments", 2)
@@ -75,7 +85,7 @@ func dlqLsCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 				if err != nil {
 					return err
 				}
-				return renderDLQList(cmd.Writer, entries)
+				return renderDLQList(cmd.Writer, entries, !cmd.Bool("no-trunc"))
 			})
 		},
 	}

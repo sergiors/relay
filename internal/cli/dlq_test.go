@@ -349,10 +349,24 @@ func TestDLQHelpFlagsAndUnknownCommand(t *testing.T) {
 	}
 }
 
+// TestDLQListHelpClarifiesIDDisplay verifies the list help explains that
+// abbreviated IDs are display-only and documents --no-trunc.
+func TestDLQListHelpClarifiesIDDisplay(t *testing.T) {
+	out, _, err := runCLI(t, "", "dlq", "ls", "--help")
+	if err != nil {
+		t.Fatalf("dlq ls --help: err = %v, want nil", err)
+	}
+	for _, want := range []string{"--no-trunc", "display-only", "full ID"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("dlq ls --help missing %q:\n%s", want, out)
+		}
+	}
+}
+
 // TestDLQListColumnsAndOrder verifies ls renders one row per entry in stream
-// order with the full entry ID, app, handler, attempts, and age — no ORIGINAL
-// column — and that two
-// entries from the SAME source message ID are listed as distinct rows.
+// order with the display-only abbreviated ID, app, handler, attempts, and age —
+// no ORIGINAL column — and that two entries from the SAME source message ID are
+// listed as distinct rows.
 func TestDLQListColumnsAndOrder(t *testing.T) {
 	store := &fakeDLQStore{entries: []dlq.Entry{
 		dlqTestEntry(dlqUnitID, "1699999999999-0", "alpha", "events.a.handler", `{"a":1}`, "2026-09-23T10:00:00Z"),
@@ -375,10 +389,17 @@ func TestDLQListColumnsAndOrder(t *testing.T) {
 		t.Fatalf("header = %q, want exactly \"ID APP HANDLER ATTEMPTS AGE\"", got)
 	}
 	// Stream order is preserved (not sorted by anything else), and every row
-	// shows the full ID while omitting the original source message.
+	// shows the display-only abbreviated ID while omitting the original source
+	// message.
 	for i, id := range []string{dlqUnitID, dlqUnitSecondID, dlqMissingID} {
-		if !strings.HasPrefix(lines[i+1], id) {
-			t.Fatalf("row %d wrong: %q (want it to start with full ID %q)", i+1, lines[i+1], id)
+		fields := strings.Fields(lines[i+1])
+		gotID := ""
+		if len(fields) > 0 {
+			gotID = fields[0]
+		}
+		if len(fields) < 5 || gotID != id[:12] {
+			t.Fatalf("row %d ID = %q, want exactly the first 12 characters %q",
+				i+1, gotID, id[:12])
 		}
 	}
 	if strings.Contains(out, "1699999999999-0") {
@@ -392,6 +413,49 @@ func TestDLQListColumnsAndOrder(t *testing.T) {
 	}
 	if !strings.Contains(lines[1], "events.a.handler") || !strings.Contains(lines[2], "events.b.handler") {
 		t.Fatalf("rows must carry their distinct handlers:\n%s", out)
+	}
+}
+
+// TestDLQListNoTruncShowsCompleteIDs verifies `dlq ls --no-trunc` renders each
+// entry's complete 64-character ID as its ID cell — the exact identity
+// inspect, replay, and rm require — that the displayed value is usable
+// verbatim as that identifier, and that rendering never rewrites the stored
+// entries. The default abbreviation is pinned in TestDLQListColumnsAndOrder.
+func TestDLQListNoTruncShowsCompleteIDs(t *testing.T) {
+	store := &fakeDLQStore{entries: []dlq.Entry{
+		dlqTestEntry(dlqUnitID, "1699999999999-0", "alpha", "events.a.handler", `{"a":1}`, "2026-09-23T10:00:00Z"),
+		dlqTestEntry(dlqUnitSecondID, "1699999999998-0", "beta", "index.run", `{"b":2}`, "2026-09-23T09:00:00Z"),
+	}}
+	deps := withFakeDLQ(t, store)
+
+	// When: the listing is rendered with --no-trunc.
+	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "ls", "--no-trunc")
+	if err != nil {
+		t.Fatalf("dlq ls --no-trunc: %v", err)
+	}
+	// Then: one row per entry, each row's ID cell the complete ID.
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected header + 2 rows, got %d:\n%s", len(lines), out)
+	}
+	if got := normWS(lines[0]); got != "ID APP HANDLER ATTEMPTS AGE" {
+		t.Fatalf("header = %q, want exactly \"ID APP HANDLER ATTEMPTS AGE\"", got)
+	}
+	for i, id := range []string{dlqUnitID, dlqUnitSecondID} {
+		fields := strings.Fields(lines[i+1])
+		if len(fields) < 5 || fields[0] != id {
+			t.Fatalf("row %d = %q, want its ID cell to be the complete ID %q",
+				i+1, lines[i+1], id)
+		}
+	}
+	// And: the copied value IS the exact identifier inspect accepts.
+	shownID := strings.Fields(lines[1])[0]
+	if _, _, err := runCLIWithDeps(t, deps, "", "dlq", "inspect", shownID); err != nil {
+		t.Fatalf("dlq inspect %s: %v", shownID, err)
+	}
+	// Display-only: the stored entries keep their complete IDs.
+	if store.entries[0].ID != dlqUnitID || store.entries[1].ID != dlqUnitSecondID {
+		t.Fatalf("ls --no-trunc must not modify stored entries: %+v", store.entries)
 	}
 }
 

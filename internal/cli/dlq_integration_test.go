@@ -20,9 +20,10 @@ import (
 )
 
 // TestIntegrationDLQCommandsAgainstPostgres drives the real command path and
-// verifies that listing displays full IDs while inspect and rm require
-// the complete 64-character identity. Malformed and abbreviated IDs take the
-// exact-lookup unknown-entry path, without replay execution or deletion.
+// verifies that listing abbreviates IDs for display unless --no-trunc is given,
+// while inspect and rm require the complete 64-character identity. Malformed
+// and abbreviated IDs take the exact-lookup unknown-entry path, without replay
+// execution or deletion.
 func TestIntegrationDLQCommandsAgainstPostgres(t *testing.T) {
 	dsn := testutil.NewStateDSN(t)
 	ctx := context.Background()
@@ -63,14 +64,27 @@ func TestIntegrationDLQCommandsAgainstPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dlq ls: %v", err)
 	}
-	for _, want := range []string{settled.ID, unsettled.ID, "alpha", "events.a.handler", "5"} {
+	for _, want := range []string{settled.ID[:12], unsettled.ID[:12], "alpha", "events.a.handler", "5"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("ls missing %q:\n%s", want, out)
 		}
 	}
+	if strings.Contains(out, settled.ID) || strings.Contains(out, unsettled.ID) {
+		t.Fatalf("ls must abbreviate entry IDs by default:\n%s", out)
+	}
 	for _, unwanted := range []string{"events-test/1769199999991-0"} {
 		if strings.Contains(out, unwanted) {
 			t.Fatalf("ls must not print %q:\n%s", unwanted, out)
+		}
+	}
+
+	out, _, err = runCLIWithDeps(t, deps, "", "dlq", "ls", "--no-trunc")
+	if err != nil {
+		t.Fatalf("dlq ls --no-trunc: %v", err)
+	}
+	for _, want := range []string{settled.ID, unsettled.ID} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("ls --no-trunc missing %q:\n%s", want, out)
 		}
 	}
 

@@ -139,6 +139,40 @@ func TestRuntimeUpdateArgumentHandling(t *testing.T) {
 	}
 }
 
+// TestRuntimeUpdateShortAllFlagMatchesAll verifies `runtime update -a` is the
+// exact short form of `--all`: it takes the every-runtime path with identical
+// output and the same failure summary, and it inherits the --all argument
+// rules (a runtime argument stays the same usage error).
+func TestRuntimeUpdateShortAllFlagMatchesAll(t *testing.T) {
+	longOut, _, longErr := runCLIWithDeps(t, testDeps(t), "", "runtime", "update", "--all")
+	shortOut, _, shortErr := runCLIWithDeps(t, testDeps(t), "", "runtime", "update", "-a")
+
+	if longErr == nil {
+		t.Fatal("update --all: err = nil against the failing state fixture")
+	}
+	if shortErr == nil {
+		t.Fatal("update -a: err = nil, want the every-runtime failure summary")
+	}
+	// -a reached the every-runtime path, not the missing-runtime usage error.
+	if !strings.Contains(shortErr.Error(), "runtime update --all:") {
+		t.Fatalf("update -a err = %v, want the --all failure summary", shortErr)
+	}
+	if shortErr.Error() != longErr.Error() {
+		t.Fatalf("update -a err = %v, want exactly the --all error %v", shortErr, longErr)
+	}
+	if shortOut != longOut {
+		t.Fatalf("update -a output differs from --all:\n-a:\n%s\n--all:\n%s",
+			shortOut, longOut)
+	}
+	for _, info := range runtime.Runtimes() {
+		if !strings.Contains(shortOut, info.ID) {
+			t.Fatalf("update -a output missing runtime %q:\n%s", info.ID, shortOut)
+		}
+	}
+	_, err := runRuntime(t, "update", "-a", "python3.14")
+	requireExitCode2(t, err, "runtime update: cannot combine --all with a runtime")
+}
+
 // TestRuntimeUnknownRuntimeRejectedWithoutStateAccess pins that resolving an
 // unknown RUNTIME id is an error in inspect, check, and update BEFORE the
 // fixture's OpenState would be consulted (an accidental database open for an

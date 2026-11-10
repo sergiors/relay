@@ -127,8 +127,9 @@ func runtimeUpdateCommand(deps Dependencies) *cli.Command {
 			"reconciliation pass.",
 		Flags: []cli.Flag{
 			&cli.BoolFlag{
-				Name:  "all",
-				Usage: "update every configured runtime independently",
+				Name:    "all",
+				Aliases: []string{"a"},
+				Usage:   "update every configured runtime independently",
 			},
 		},
 		Arguments: []cli.Argument{

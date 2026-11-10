@@ -9,15 +9,26 @@ import (
 	"relay/internal/dlq"
 )
 
-// renderDLQList renders the ls table in the store's write order, showing the
-// full entry ID so it can be copied directly into inspect, replay, or rm.
-func renderDLQList(w io.Writer, entries []dlq.Entry) error {
+// dlqIDDisplayLength is the number of leading ID characters shown by
+// `relay dlq ls` unless --no-trunc is given. Abbreviated IDs are display-only;
+// inspect, replay, and rm always require the complete ID.
+const dlqIDDisplayLength = 12
+
+// renderDLQList renders the ls table in the store's write order. Unless
+// truncate is false, each entry ID is abbreviated to its first
+// dlqIDDisplayLength characters for display only; the entries themselves are
+// never modified and the complete ID is available with --no-trunc.
+func renderDLQList(w io.Writer, entries []dlq.Entry, truncate bool) error {
 	out := newOutput(w)
 	tw := out.table(2)
 	fmt.Fprintln(tw, "ID\tAPP\tHANDLER\tATTEMPTS\tAGE")
 	for _, e := range entries {
+		id := e.ID
+		if truncate && len(id) > dlqIDDisplayLength {
+			id = id[:dlqIDDisplayLength]
+		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n",
-			e.ID,
+			id,
 			e.App,
 			e.Handler,
 			e.HandlerAttempts,
