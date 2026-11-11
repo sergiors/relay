@@ -162,6 +162,39 @@ func readSelections(
 	return out
 }
 
+// requireSelectionsUnchanged fails when two persisted-selection snapshots
+// differ, proving a display-only command path wrote nothing.
+func requireSelectionsUnchanged(
+	t *testing.T, before, after map[string]state.RuntimeImageSelection,
+) {
+	t.Helper()
+	if len(after) != len(before) {
+		t.Fatalf("selection rows changed: before %d rows, after %d: %+v",
+			len(before), len(after), after)
+	}
+	for runtimeID, row := range before {
+		if after[runtimeID] != row {
+			t.Fatalf("selection for %s changed: before %+v, after %+v",
+				runtimeID, row, after[runtimeID])
+		}
+	}
+}
+
+// tableCellFor returns the value cell of one "Label:" line of rendered
+// key/value output (inspect and single-update detail views), so a test can
+// assert the exact displayed value instead of a substring.
+func tableCellFor(t *testing.T, out, label string) string {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == label {
+			return fields[1]
+		}
+	}
+	t.Fatalf("output has no %q line:\n%s", label, out)
+	return ""
+}
+
 // TestRuntimeListReadsSelectionsWithoutResolving pins that `runtime ls`
 // renders persisted selections read-only from PostgreSQL: pinned and unpinned
 // rows are shown, and the resolver opener is never invoked (ls needs no Docker
@@ -179,8 +212,12 @@ func TestRuntimeListReadsSelectionsWithoutResolving(t *testing.T) {
 		t.Fatalf("runtime ls: err = %v", err)
 	}
 	flat := flattened(out)
+	// The default listing abbreviates the digest cell to "sha256:" plus 12 hex
+	// characters; the complete value is pinned with --no-trunc in
+	// TestRuntimeLsTruncatesDigestsUnlessNoTrunc.
 	if !strings.Contains(flat,
-		"nodejs24.x node:24-alpine pinned 1 "+selectedAt+" "+pinnedCLI) {
+		"nodejs24.x node:24-alpine pinned 1 "+selectedAt+" "+
+			abbreviatedDigest(pinnedCLI)) {
 		t.Fatalf("ls does not show the pinned node row:\n%s", out)
 	}
 	if !strings.Contains(flat, "python3.14 python:3.14-slim unpinned - - -") {
@@ -189,6 +226,63 @@ func TestRuntimeListReadsSelectionsWithoutResolving(t *testing.T) {
 	if fixture.opens != 0 {
 		t.Fatalf("ls opened the resolver %d time(s); ls is a local read-only command", fixture.opens)
 	}
+}
+
+// TestRuntimeLsTruncatesDigestsUnlessNoTrunc pins the `runtime ls` digest
+// column through the real command path: by default the pinned digest prints as
+// "sha256:" plus 12 hex characters and never as the complete value,
+// --no-trunc prints the complete digest, the unpinned row's cells read
+// identically in both modes, no resolver is ever opened, and rendering writes
+// nothing.
+func TestRuntimeLsTruncatesDigestsUnlessNoTrunc(t *testing.T) {
+	ctx := context.Background()
+	fixture := &resolverFixture{resolver: &fakeRuntimeResolver{}}
+	deps := runtimeDeps(t, fixture)
+	st := openFixtureState(t, deps)
+	seedSelection(t, ctx, st, "nodejs24.x", pinnedCLI)
+	selectedAt := readSelections(t, ctx, st)["nodejs24.x"].SelectedAt
+	before := readSelections(t, ctx, st)
+
+	// when: the default listing.
+	out, err := runRuntimeCLI(t, deps, "ls")
+	if err != nil {
+		t.Fatalf("runtime ls: err = %v", err)
+	}
+	// then: the digest cell is the display abbreviation, the complete digest
+	// appears nowhere, and the unpinned runtime stays honest.
+	flat := flattened(out)
+	wantRow := "nodejs24.x node:24-alpine pinned 1 " + selectedAt + " " +
+		abbreviatedDigest(pinnedCLI)
+	if !strings.Contains(flat, wantRow) {
+		t.Fatalf("default ls row missing %q:\n%s", wantRow, out)
+	}
+	if strings.Contains(out, pinnedCLI) {
+		t.Fatalf("runtime ls must abbreviate digests by default:\n%s", out)
+	}
+	if !strings.Contains(flat, "python3.14 python:3.14-slim unpinned - - -") {
+		t.Fatalf("default ls does not show python unpinned:\n%s", out)
+	}
+
+	// when: the same listing with --no-trunc.
+	out, err = runRuntimeCLI(t, deps, "ls", "--no-trunc")
+	if err != nil {
+		t.Fatalf("runtime ls --no-trunc: err = %v", err)
+	}
+	// then: the complete digest cell and the same unpinned row.
+	flat = flattened(out)
+	wantRow = "nodejs24.x node:24-alpine pinned 1 " + selectedAt + " " + pinnedCLI
+	if !strings.Contains(flat, wantRow) {
+		t.Fatalf("--no-trunc ls row missing %q:\n%s", wantRow, out)
+	}
+	if !strings.Contains(flat, "python3.14 python:3.14-slim unpinned - - -") {
+		t.Fatalf("--no-trunc ls does not show python unpinned:\n%s", out)
+	}
+
+	// and: display-only — no resolver contact, no state change in either mode.
+	if fixture.opens != 0 {
+		t.Fatalf("ls opened the resolver %d time(s); ls never contacts Docker", fixture.opens)
+	}
+	requireSelectionsUnchanged(t, before, readSelections(t, ctx, st))
 }
 
 // TestRuntimeInspectShowsSelectionAndUnpinnedHonesty pins `runtime inspect`:
@@ -260,14 +354,19 @@ func TestRuntimeCheckComparesWithoutWriting(t *testing.T) {
 		t.Fatalf("runtime check: err = %v", err)
 	}
 	flat := flattened(out)
-	if !strings.Contains(flat, "nodejs24.x matching "+pinnedCLI+" "+pinnedCLI+" -") {
+	// Selected/remote cells show the default 12-hex abbreviation; the
+	// complete-digest mode is pinned in TestRuntimeCheckTruncatesDigestsUnlessNoTrunc.
+	if !strings.Contains(flat, "nodejs24.x matching "+abbreviatedDigest(pinnedCLI)+
+		" "+abbreviatedDigest(pinnedCLI)+" -") {
 		t.Fatalf("check does not report the matching selection:\n%s", out)
 	}
 	if !strings.Contains(flat,
-		"python3.14 different "+pinnedCLI+" "+otherDigestCLI+" -") {
+		"python3.14 different "+abbreviatedDigest(pinnedCLI)+" "+
+			abbreviatedDigest(otherDigestCLI)+" -") {
 		t.Fatalf("check does not report the different digest:\n%s", out)
 	}
-	if !strings.Contains(flat, "python3.15 available unpinned "+thirdDigestCLI+" -") {
+	if !strings.Contains(flat, "python3.15 available unpinned "+
+		abbreviatedDigest(thirdDigestCLI)+" -") {
 		t.Fatalf("check does not report update availability honestly:\n%s", out)
 	}
 
@@ -305,9 +404,12 @@ func TestRuntimeCheckFailsOnRegistryLookups(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "runtime check: 1 runtime(s) failed") {
 		t.Fatalf("pinned check err = %v, want the failed summary", err)
 	}
+	// The selected cell shows the default 12-hex abbreviation of the pinned
+	// digest; the failure detail itself is display-mode-independent.
 	if !strings.Contains(
 		flattened(out),
-		"python3.14 failed "+pinnedCLI+" - registry: registry unreachable",
+		"python3.14 failed "+abbreviatedDigest(pinnedCLI)+
+			" - registry: registry unreachable",
 	) {
 		t.Fatalf("pinned failure row wrong:\n%s", out)
 	}
@@ -373,6 +475,87 @@ func TestRuntimeCheckRendersResolverOpenFailureForEveryRuntime(t *testing.T) {
 	}
 	if fixture.opens != 1 {
 		t.Fatalf("resolver opens = %d, want exactly one failed attempt", fixture.opens)
+	}
+}
+
+// TestRuntimeCheckTruncatesDigestsUnlessNoTrunc pins the `runtime check` table
+// through the real command path: selected and remote digests print as 12-hex
+// abbreviations by default and complete with --no-trunc, while statuses, the
+// "unpinned"/"-" cells, and a registry failure's detail text read
+// byte-identically in both modes; check stays read-only across both runs.
+func TestRuntimeCheckTruncatesDigestsUnlessNoTrunc(t *testing.T) {
+	ctx := context.Background()
+	resolutions := map[string]runtime.BaseImageResolution{
+		"node:24-alpine":   pinnedResolution("node:24-alpine", pinnedCLI),
+		"node:26-alpine":   pinnedResolution("node:26-alpine", otherDigestCLI),
+		"python:3.14-slim": pinnedResolution("python:3.14-slim", otherDigestCLI),
+	}
+	fixture := &resolverFixture{resolver: &fakeRuntimeResolver{
+		resolutions: resolutions,
+		errs: map[string]error{
+			"python:3.15-slim": errors.New("registry unreachable"),
+		},
+	}}
+	deps := runtimeDeps(t, fixture)
+	st := openFixtureState(t, deps)
+	seedSelection(t, ctx, st, "nodejs24.x", pinnedCLI) // == remote: matching
+	seedSelection(t, ctx, st, "python3.14", pinnedCLI) // != remote: different
+	before := readSelections(t, ctx, st)
+	const failureSummary = "runtime check: 1 runtime(s) failed"
+
+	// when: the default check (the scripted registry failure still exits
+	// nonzero, but the table renders first).
+	out, err := runRuntimeCLI(t, deps, "check")
+	if err == nil || !strings.Contains(err.Error(), failureSummary) {
+		t.Fatalf("default check err = %v, want %q", err, failureSummary)
+	}
+	// then: abbreviated selected/remote cells, no complete digest anywhere,
+	// and the failure row's status/detail/labels.
+	flat := flattened(out)
+	for _, want := range []string{
+		"nodejs24.x matching " + abbreviatedDigest(pinnedCLI) + " " +
+			abbreviatedDigest(pinnedCLI) + " -",
+		"python3.14 different " + abbreviatedDigest(pinnedCLI) + " " +
+			abbreviatedDigest(otherDigestCLI) + " -",
+		"python3.15 unpinned unpinned - registry: registry unreachable",
+		"nodejs26.x available unpinned " + abbreviatedDigest(otherDigestCLI) + " -",
+	} {
+		if !strings.Contains(flat, want) {
+			t.Fatalf("default check row missing %q:\n%s", want, out)
+		}
+	}
+	for _, complete := range []string{pinnedCLI, otherDigestCLI} {
+		if strings.Contains(out, complete) {
+			t.Fatalf("default check leaks the complete digest %q:\n%s", complete, out)
+		}
+	}
+	requireSelectionsUnchanged(t, before, readSelections(t, ctx, st))
+
+	// when: the same check with --no-trunc.
+	out, err = runRuntimeCLI(t, deps, "check", "--no-trunc")
+	if err == nil || !strings.Contains(err.Error(), failureSummary) {
+		t.Fatalf("--no-trunc check err = %v, want %q", err, failureSummary)
+	}
+	// then: complete digests, with the failure row byte-identical to the
+	// default run (status, labels, and detail text are mode-independent).
+	flat = flattened(out)
+	for _, want := range []string{
+		"nodejs24.x matching " + pinnedCLI + " " + pinnedCLI + " -",
+		"python3.14 different " + pinnedCLI + " " + otherDigestCLI + " -",
+		"python3.15 unpinned unpinned - registry: registry unreachable",
+		"nodejs26.x available unpinned " + otherDigestCLI + " -",
+	} {
+		if !strings.Contains(flat, want) {
+			t.Fatalf("--no-trunc check row missing %q:\n%s", want, out)
+		}
+	}
+
+	// and: read-only in both modes, one resolver handle opened and released
+	// per run.
+	requireSelectionsUnchanged(t, before, readSelections(t, ctx, st))
+	if fixture.opens != 2 || fixture.closes != 2 {
+		t.Fatalf("resolver opens/closes = %d/%d, want one opened-and-released handle per run",
+			fixture.opens, fixture.closes)
 	}
 }
 
@@ -607,6 +790,69 @@ func TestRuntimeUpdateFailsWithoutWritingWhenOpenerFails(t *testing.T) {
 	}
 }
 
+// TestRuntimeSingleRuntimeCommandsRemainCompleteWithoutNoTrunc pins the
+// single-runtime commands through the real command path: `inspect RUNTIME`
+// and `update RUNTIME` always display complete digests (there is no
+// abbreviated mode for them), --no-trunc is rejected for both before any
+// state or resolver work happens, and the rejected attempts write nothing.
+func TestRuntimeSingleRuntimeCommandsRemainCompleteWithoutNoTrunc(t *testing.T) {
+	ctx := context.Background()
+	resolutions := map[string]runtime.BaseImageResolution{
+		"python:3.14-slim": pinnedResolution("python:3.14-slim", otherDigestCLI),
+	}
+	fixture := &resolverFixture{resolver: &fakeRuntimeResolver{resolutions: resolutions}}
+	deps := runtimeDeps(t, fixture)
+	st := openFixtureState(t, deps)
+	seedSelection(t, ctx, st, "nodejs24.x", pinnedCLI)
+	seedSelection(t, ctx, st, "python3.14", pinnedCLI)
+
+	// inspect shows the complete persisted digest and effective image.
+	out, err := runRuntimeCLI(t, deps, "inspect", "nodejs24.x")
+	if err != nil {
+		t.Fatalf("inspect nodejs24.x: err = %v", err)
+	}
+	if got := tableCellFor(t, out, "Digest:"); got != pinnedCLI {
+		t.Fatalf("inspect Digest cell = %q, want the complete digest %q", got, pinnedCLI)
+	}
+	if !strings.Contains(flattened(out),
+		"Effective image: node:24-alpine@"+pinnedCLI) {
+		t.Fatalf("inspect does not show the complete effective image:\n%s", out)
+	}
+	// --no-trunc does not exist for inspect: rejected before state access.
+	_, rejectErr := runRuntimeCLI(t, deps, "inspect", "nodejs24.x", "--no-trunc")
+	if rejectErr == nil || !strings.Contains(rejectErr.Error(), "no-trunc") {
+		t.Fatalf("inspect --no-trunc err = %v, want a flag rejection", rejectErr)
+	}
+
+	// A single-runtime update shows the complete previous and selected
+	// digests, never an abbreviation.
+	out, err = runRuntimeCLI(t, deps, "update", "python3.14")
+	if err != nil {
+		t.Fatalf("update python3.14: err = %v", err)
+	}
+	if got := tableCellFor(t, out, "Previous:"); got != pinnedCLI {
+		t.Fatalf("update Previous cell = %q, want the complete digest %q", got, pinnedCLI)
+	}
+	if got := tableCellFor(t, out, "Selected:"); got != otherDigestCLI {
+		t.Fatalf("update Selected cell = %q, want the complete digest %q", got, otherDigestCLI)
+	}
+	afterUpdate := readSelections(t, ctx, st)
+	if fixture.opens != 1 {
+		t.Fatalf("resolver opens = %d, want exactly one from the successful update",
+			fixture.opens)
+	}
+
+	// --no-trunc requires --all: the rejected attempt never opens the resolver
+	// and never writes state.
+	_, err = runRuntimeCLI(t, deps, "update", "python3.14", "--no-trunc")
+	requireExitCode2(t, err, "runtime update: --no-trunc requires --all")
+	if fixture.opens != 1 {
+		t.Fatalf("rejected update opened the resolver (%d opens), want no new open",
+			fixture.opens)
+	}
+	requireSelectionsUnchanged(t, afterUpdate, readSelections(t, ctx, st))
+}
+
 // TestRuntimeUpdateAllPinsEveryRuntimeIndependently pins --all on an empty
 // store: every configured runtime is resolved and persisted independently
 // (generation 1 each), per-runtime rows and the summary render honestly, and
@@ -709,8 +955,12 @@ func TestRuntimeUpdateAllShowsUnchangedAndPrevious(t *testing.T) {
 		t.Fatalf("update --all: err = %v", err)
 	}
 	flat := flattened(out)
+	// The unchanged row's previous/new cells show the default 12-hex
+	// abbreviation; the complete digests are pinned with --no-trunc in
+	// TestRuntimeUpdateAllTruncatesDigestsUnlessNoTrunc.
 	if !strings.Contains(flat,
-		"nodejs24.x unchanged "+pinnedCLI+" "+pinnedCLI+" -") {
+		"nodejs24.x unchanged "+abbreviatedDigest(pinnedCLI)+" "+
+			abbreviatedDigest(pinnedCLI)+" -") {
 		t.Fatalf("unchanged row does not show its previous digest:\n%s", out)
 	}
 	if !strings.Contains(flat, "Updated 3, unchanged 1, failed 0.") ||
@@ -721,6 +971,152 @@ func TestRuntimeUpdateAllShowsUnchangedAndPrevious(t *testing.T) {
 	after := readSelections(t, ctx, st)["nodejs24.x"]
 	if after.Generation != 1 {
 		t.Fatalf("unchanged row generation moved: %+v", after)
+	}
+}
+
+// TestRuntimeUpdateAllTruncatesDigestsUnlessNoTrunc pins the `update --all`
+// table through the real command path: previous/new digests print as 12-hex
+// abbreviations by default (the "unpinned" previous label among them stays
+// spelled out) and complete with --no-trunc, and the second, display-different
+// run writes nothing because every selection is already at its resolved digest.
+func TestRuntimeUpdateAllTruncatesDigestsUnlessNoTrunc(t *testing.T) {
+	ctx := context.Background()
+	resolutions := map[string]runtime.BaseImageResolution{
+		"node:24-alpine":   pinnedResolution("node:24-alpine", pinnedCLI),
+		"node:26-alpine":   pinnedResolution("node:26-alpine", otherDigestCLI),
+		"python:3.14-slim": pinnedResolution("python:3.14-slim", thirdDigestCLI),
+		"python:3.15-slim": pinnedResolution("python:3.15-slim", pinnedCLI),
+	}
+	fixture := &resolverFixture{resolver: &fakeRuntimeResolver{resolutions: resolutions}}
+	deps := runtimeDeps(t, fixture)
+	st := openFixtureState(t, deps)
+	seedSelection(t, ctx, st, "nodejs24.x", pinnedCLI) // already at the remote digest
+
+	// when: the default --all (one already-pinned runtime, three fresh pins).
+	out, err := runRuntimeCLI(t, deps, "update", "--all")
+	if err != nil {
+		t.Fatalf("update --all: err = %v", err)
+	}
+	// then: abbreviated previous/new cells, complete digests absent, and the
+	// unpinned previous label untouched by truncation.
+	flat := flattened(out)
+	for _, want := range []string{
+		"nodejs24.x unchanged " + abbreviatedDigest(pinnedCLI) + " " +
+			abbreviatedDigest(pinnedCLI) + " -",
+		"python3.14 updated unpinned " + abbreviatedDigest(thirdDigestCLI) + " -",
+		"python3.15 updated unpinned " + abbreviatedDigest(pinnedCLI) + " -",
+		"Updated 3, unchanged 1, failed 0.",
+	} {
+		if !strings.Contains(flat, want) {
+			t.Fatalf("default update --all row missing %q:\n%s", want, out)
+		}
+	}
+	for _, complete := range []string{pinnedCLI, otherDigestCLI, thirdDigestCLI} {
+		if strings.Contains(out, complete) {
+			t.Fatalf("default update --all leaks the complete digest %q:\n%s",
+				complete, out)
+		}
+	}
+	afterDefault := readSelections(t, ctx, st)
+	if want := len(runtime.Runtimes()); len(afterDefault) != want {
+		t.Fatalf("persisted rows = %d, want %d", len(afterDefault), want)
+	}
+	for runtimeID, row := range afterDefault {
+		if row.Generation != 1 {
+			t.Fatalf("row %s = %+v, want the resolved pin as generation 1", runtimeID, row)
+		}
+	}
+
+	// when: the same --all with --no-trunc (every runtime now unchanged).
+	out, err = runRuntimeCLI(t, deps, "update", "--all", "--no-trunc")
+	if err != nil {
+		t.Fatalf("update --all --no-trunc: err = %v", err)
+	}
+	// then: complete previous/new digests and an all-unchanged summary.
+	flat = flattened(out)
+	for _, want := range []string{
+		"nodejs24.x unchanged " + pinnedCLI + " " + pinnedCLI + " -",
+		"python3.14 unchanged " + thirdDigestCLI + " " + thirdDigestCLI + " -",
+		"python3.15 unchanged " + pinnedCLI + " " + pinnedCLI + " -",
+		"Updated 0, unchanged 4, failed 0.",
+	} {
+		if !strings.Contains(flat, want) {
+			t.Fatalf("--no-trunc update --all row missing %q:\n%s", want, out)
+		}
+	}
+
+	// and: switching display modes wrote nothing.
+	requireSelectionsUnchanged(t, afterDefault, readSelections(t, ctx, st))
+}
+
+// TestRuntimeUpdateShortAllFlagMatchesAllTruncation pins that `update -a` is
+// the exact short form of `update --all` for digest display too: against a
+// fully converged store both spellings render byte-identical tables in the
+// default truncated mode and byte-identical complete-digest tables with
+// --no-trunc, and none of the four runs writes state.
+func TestRuntimeUpdateShortAllFlagMatchesAllTruncation(t *testing.T) {
+	ctx := context.Background()
+	resolutions := map[string]runtime.BaseImageResolution{
+		"node:24-alpine":   pinnedResolution("node:24-alpine", pinnedCLI),
+		"node:26-alpine":   pinnedResolution("node:26-alpine", otherDigestCLI),
+		"python:3.14-slim": pinnedResolution("python:3.14-slim", thirdDigestCLI),
+		"python:3.15-slim": pinnedResolution("python:3.15-slim", pinnedCLI),
+	}
+	fixture := &resolverFixture{resolver: &fakeRuntimeResolver{resolutions: resolutions}}
+	deps := runtimeDeps(t, fixture)
+	st := openFixtureState(t, deps)
+
+	// given: every runtime already persisted at its resolved digest, so every
+	// run below is a pure display pass.
+	for _, info := range runtime.Runtimes() {
+		seedSelection(t, ctx, st, info.ID, resolutions[info.BaseImage].Digest)
+	}
+	before := readSelections(t, ctx, st)
+
+	// when: both spellings in the default mode.
+	longOut, longErr := runRuntimeCLI(t, deps, "update", "--all")
+	shortOut, shortErr := runRuntimeCLI(t, deps, "update", "-a")
+	// then: identical output and no write.
+	if longErr != nil || shortErr != nil {
+		t.Fatalf("update --all / -a errs = (%v, %v), want both nil", longErr, shortErr)
+	}
+	if shortOut != longOut {
+		t.Fatalf("update -a output differs from --all:\n-a:\n%s\n--all:\n%s",
+			shortOut, longOut)
+	}
+	flat := flattened(longOut)
+	if !strings.Contains(flat,
+		"nodejs24.x unchanged "+abbreviatedDigest(pinnedCLI)+" "+
+			abbreviatedDigest(pinnedCLI)+" -") ||
+		strings.Contains(longOut, pinnedCLI) {
+		t.Fatalf("default --all table is not the abbreviated mode:\n%s", longOut)
+	}
+	requireSelectionsUnchanged(t, before, readSelections(t, ctx, st))
+
+	// when: both spellings with --no-trunc.
+	longFullOut, longFullErr := runRuntimeCLI(t, deps, "update", "--all", "--no-trunc")
+	shortFullOut, shortFullErr := runRuntimeCLI(t, deps, "update", "-a", "--no-trunc")
+	// then: identical output showing complete digests.
+	if longFullErr != nil || shortFullErr != nil {
+		t.Fatalf("update --all/-a --no-trunc errs = (%v, %v), want both nil",
+			longFullErr, shortFullErr)
+	}
+	if shortFullOut != longFullOut {
+		t.Fatalf("update -a --no-trunc output differs from --all:\n-a:\n%s\n--all:\n%s",
+			shortFullOut, longFullOut)
+	}
+	if !strings.Contains(flattened(longFullOut),
+		"nodejs24.x unchanged "+pinnedCLI+" "+pinnedCLI+" -") ||
+		!strings.Contains(longFullOut, otherDigestCLI) {
+		t.Fatalf("--no-trunc --all table is not the complete-digest mode:\n%s", longFullOut)
+	}
+
+	// and: none of the four display runs wrote state, and every resolver
+	// handle was released.
+	requireSelectionsUnchanged(t, before, readSelections(t, ctx, st))
+	if fixture.opens != 4 || fixture.closes != 4 {
+		t.Fatalf("resolver opens/closes = %d/%d, want one opened-and-released handle per run",
+			fixture.opens, fixture.closes)
 	}
 }
 

@@ -171,6 +171,32 @@ func TestRuntimeUpdateShortAllFlagMatchesAll(t *testing.T) {
 	}
 	_, err := runRuntime(t, "update", "-a", "python3.14")
 	requireExitCode2(t, err, "runtime update: cannot combine --all with a runtime")
+
+	// The same parity holds for the digest display mode: `-a --no-trunc` takes
+	// the identical `--all --no-trunc` path (the fixture fails before any digest
+	// is printed, so any divergence in flag handling would show up in output or
+	// error). Real-digest parity is pinned against PostgreSQL in
+	// TestRuntimeUpdateShortAllFlagMatchesAllTruncation.
+	noTruncLongOut, _, noTruncLongErr := runCLIWithDeps(t, testDeps(t), "",
+		"runtime", "update", "--all", "--no-trunc")
+	noTruncShortOut, _, noTruncShortErr := runCLIWithDeps(t, testDeps(t), "",
+		"runtime", "update", "-a", "--no-trunc")
+	if noTruncLongErr == nil || noTruncShortErr == nil {
+		t.Fatalf("update --no-trunc errs = (%v, %v), want the every-runtime failure summary",
+			noTruncLongErr, noTruncShortErr)
+	}
+	if !strings.Contains(noTruncShortErr.Error(), "runtime update --all:") {
+		t.Fatalf("update -a --no-trunc err = %v, want the --all failure summary",
+			noTruncShortErr)
+	}
+	if noTruncShortErr.Error() != noTruncLongErr.Error() {
+		t.Fatalf("update -a --no-trunc err = %v, want exactly the --all error %v",
+			noTruncShortErr, noTruncLongErr)
+	}
+	if noTruncShortOut != noTruncLongOut {
+		t.Fatalf("update -a --no-trunc output differs from --all:\n-a:\n%s\n--all:\n%s",
+			noTruncShortOut, noTruncLongOut)
+	}
 }
 
 // TestRuntimeUnknownRuntimeRejectedWithoutStateAccess pins that resolving an
@@ -345,6 +371,90 @@ var (
 	otherDigestCLI = "sha256:" + strings.Repeat("b", 64)
 )
 
+// abbreviatedDigest returns the display-only abbreviation of a valid digest:
+// "sha256:" plus the first 12 hex characters — the exact cell `runtime ls`,
+// `runtime check`, and `runtime update --all` print unless --no-trunc is given.
+// The length is spelled out (never taken from the production helper) so a
+// change to the displayed width fails these tests loudly.
+func abbreviatedDigest(digest string) string {
+	return digest[:len("sha256:")+12]
+}
+
+// TestRuntimeDigestForDisplayPassesThroughSpecialAndNonDigestValues pins the
+// display helper's contract for both modes: a valid digest shortens to 12 hex
+// characters when truncating and stays complete with --no-trunc, while special
+// labels and anything that is not a genuine digest passes through byte-for-byte
+// in both modes (a display rule can never rewrite an identity or a label).
+func TestRuntimeDigestForDisplayPassesThroughSpecialAndNonDigestValues(t *testing.T) {
+	upperHex := "sha256:" + strings.Repeat("A", 64)
+	nonHex := "sha256:" + strings.Repeat("z", 64)
+	cases := []struct {
+		name          string
+		value         string
+		wantTruncated string
+		wantFull      string
+	}{
+		{
+			name:          "valid digest abbreviates to 12 hex characters",
+			value:         pinnedCLI,
+			wantTruncated: abbreviatedDigest(pinnedCLI),
+			wantFull:      pinnedCLI,
+		},
+		{
+			name:          "unknown previous state stays a dash",
+			value:         "-",
+			wantTruncated: "-",
+			wantFull:      "-",
+		},
+		{
+			name:          "unpinned label stays spelled out",
+			value:         "unpinned",
+			wantTruncated: "unpinned",
+			wantFull:      "unpinned",
+		},
+		{
+			name:          "empty value stays empty",
+			value:         "",
+			wantTruncated: "",
+			wantFull:      "",
+		},
+		{
+			name:          "bare tag is not a digest",
+			value:         "python:3.14-slim",
+			wantTruncated: "python:3.14-slim",
+			wantFull:      "python:3.14-slim",
+		},
+		{
+			name:          "short sha256 value keeps its full length",
+			value:         "sha256:abc123",
+			wantTruncated: "sha256:abc123",
+			wantFull:      "sha256:abc123",
+		},
+		{
+			name:          "uppercase hex is not the persisted digest shape",
+			value:         upperHex,
+			wantTruncated: upperHex,
+			wantFull:      upperHex,
+		},
+		{
+			name:          "non-hex characters are not a digest",
+			value:         nonHex,
+			wantTruncated: nonHex,
+			wantFull:      nonHex,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := runtimeDigestForDisplay(tc.value, true); got != tc.wantTruncated {
+				t.Fatalf("truncated display = %q, want %q", got, tc.wantTruncated)
+			}
+			if got := runtimeDigestForDisplay(tc.value, false); got != tc.wantFull {
+				t.Fatalf("--no-trunc display = %q, want %q", got, tc.wantFull)
+			}
+		})
+	}
+}
+
 // infoFor resolves one RuntimeInfo fixture by ID.
 func infoFor(t *testing.T, runtimeID string) runtime.RuntimeInfo {
 	t.Helper()
@@ -377,7 +487,10 @@ func TestRuntimeCheckRenderShowsDigestsAndFailureDetails(t *testing.T) {
 		},
 	}
 	var out strings.Builder
-	if err := renderRuntimeCheck(&out, rows); err != nil {
+	// Default truncated mode: statuses, the "-" label, and detail text must be
+	// unaffected by display truncation; the digest cells themselves are pinned
+	// by TestRuntimeCheckRenderTruncatesDigestsButKeepsDetails.
+	if err := renderRuntimeCheck(&out, rows, true); err != nil {
 		t.Fatalf("render check: %v", err)
 	}
 	for _, want := range []string{
@@ -396,11 +509,88 @@ func TestRuntimeCheckRenderShowsDigestsAndFailureDetails(t *testing.T) {
 	rows[2].Status = "failed"
 	rows[2].SelectionErr = errors.New("selection: source image drift")
 	out.Reset()
-	if err := renderRuntimeCheck(&out, rows); err != nil {
+	if err := renderRuntimeCheck(&out, rows, true); err != nil {
 		t.Fatalf("render check with details: %v", err)
 	}
 	if !strings.Contains(out.String(), "selection: source image drift; registry: registry unreachable") {
 		t.Fatalf("check render does not join both details:\n%s", out.String())
+	}
+}
+
+// TestRuntimeCheckRenderTruncatesDigestsButKeepsDetails pins the `runtime check`
+// table in both display modes: valid selected/remote digests shorten to 12 hex
+// characters by default and print complete with --no-trunc, while statuses,
+// the "unpinned"/"-" cells, a non-digest stored value, and the joined
+// selection/registry detail text read byte-identically in both modes.
+func TestRuntimeCheckRenderTruncatesDigestsButKeepsDetails(t *testing.T) {
+	malformed := "sha256:not-a-digest"
+	pinned := state.RuntimeImageSelection{
+		RuntimeID: "python3.14", SourceImage: "python:3.14-slim", Digest: pinnedCLI,
+	}
+	invalid := state.RuntimeImageSelection{
+		RuntimeID: "python3.14", SourceImage: "python:3.14-slim", Digest: malformed,
+	}
+	rows := []runtimeCheckRow{
+		{
+			Runtime: infoFor(t, "python3.14"), Selection: &pinned, Pinned: true,
+			RemoteDigest: pinnedCLI, Status: "matching",
+		},
+		{
+			Runtime: infoFor(t, "nodejs24.x"), Selection: &pinned, Pinned: true,
+			RemoteErr: errors.New("registry unreachable"), Status: "failed",
+		},
+		{
+			Runtime:      infoFor(t, "python3.15"),
+			RemoteDigest: otherDigestCLI, Status: "available",
+		},
+		{
+			Runtime: infoFor(t, "python3.14"), Selection: &invalid, Pinned: true,
+			SelectionErr: errors.New("selected digest must be sha256:<64 lowercase hex>"),
+			RemoteDigest: otherDigestCLI, Status: "invalid",
+		},
+	}
+	var truncated, full strings.Builder
+	if err := renderRuntimeCheck(&truncated, rows, true); err != nil {
+		t.Fatalf("render check truncated: %v", err)
+	}
+	if err := renderRuntimeCheck(&full, rows, false); err != nil {
+		t.Fatalf("render check --no-trunc: %v", err)
+	}
+	gotTruncated := flattened(truncated.String())
+	gotFull := flattened(full.String())
+
+	for _, want := range []string{
+		"python3.14 matching " + abbreviatedDigest(pinnedCLI) + " " +
+			abbreviatedDigest(pinnedCLI) + " -",
+		"nodejs24.x failed " + abbreviatedDigest(pinnedCLI) +
+			" - registry: registry unreachable",
+		"python3.15 available unpinned " + abbreviatedDigest(otherDigestCLI) + " -",
+		// A non-digest stored value passes through unchanged, never shortened.
+		"python3.14 invalid " + malformed +
+			" " + abbreviatedDigest(otherDigestCLI) +
+			" selection: selected digest must be sha256:<64 lowercase hex>",
+	} {
+		if !strings.Contains(gotTruncated, want) {
+			t.Fatalf("truncated check render missing %q:\n%s", want, gotTruncated)
+		}
+	}
+	for _, complete := range []string{pinnedCLI, otherDigestCLI} {
+		if strings.Contains(gotTruncated, complete) {
+			t.Fatalf("truncated check render leaks the complete digest %q:\n%s",
+				complete, gotTruncated)
+		}
+	}
+
+	for _, want := range []string{
+		"python3.14 matching " + pinnedCLI + " " + pinnedCLI + " -",
+		"nodejs24.x failed " + pinnedCLI + " - registry: registry unreachable",
+		"python3.15 available unpinned " + otherDigestCLI + " -",
+		"python3.14 invalid " + malformed + " " + otherDigestCLI +
+			" selection: selected digest must be sha256:<64 lowercase hex>",
+	} {
+		if !strings.Contains(gotFull, want) {
+			t.Fatalf("--no-trunc check render missing %q:\n%s", want, gotFull)
+		}
 	}
 }
 
@@ -465,7 +655,10 @@ func TestRuntimeUpdateAllRenderCountsAndContinues(t *testing.T) {
 			Err: errors.New("registry unavailable")},
 	}
 	var out strings.Builder
-	if err := renderRuntimeUpdateAll(&out, outcomes); err != nil {
+	// --no-trunc mode: this test pins the complete row layout, including the
+	// full previous/new digest cells; the default truncation is pinned by
+	// TestRuntimeUpdateAllRenderTruncatesDigestsButKeepsDetails.
+	if err := renderRuntimeUpdateAll(&out, outcomes, false); err != nil {
 		t.Fatalf("render update --all: %v", err)
 	}
 	got := flattened(out.String())
@@ -488,7 +681,7 @@ func TestRuntimeUpdateAllRenderCountsAndContinues(t *testing.T) {
 
 	// With no updated row the worker note is omitted.
 	out.Reset()
-	if err := renderRuntimeUpdateAll(&out, outcomes[3:]); err != nil {
+	if err := renderRuntimeUpdateAll(&out, outcomes[3:], false); err != nil {
 		t.Fatalf("render update --all failures only: %v", err)
 	}
 	got = flattened(out.String())
@@ -497,6 +690,66 @@ func TestRuntimeUpdateAllRenderCountsAndContinues(t *testing.T) {
 	}
 	if strings.Contains(got, "Workers apply updated selections") {
 		t.Fatalf("failure-only render claims workers apply updates:\n%s", got)
+	}
+}
+
+// TestRuntimeUpdateAllRenderTruncatesDigestsButKeepsDetails pins the
+// `runtime update --all` table in both display modes: previous/new digests
+// shorten to 12 hex characters by default and print complete with --no-trunc,
+// while the "unpinned"/"-" labels, the per-row failure detail, the summary
+// counts, and the worker note are identical in both modes.
+func TestRuntimeUpdateAllRenderTruncatesDigestsButKeepsDetails(t *testing.T) {
+	outcomes := []runtimeUpdateOutcome{
+		{RuntimeID: "nodejs24.x", Status: runtimeUpdateUpdated, Digest: otherDigestCLI,
+			PreviousKnown: true, PreviousPinned: true, PreviousDigest: pinnedCLI,
+			Changed: true},
+		{RuntimeID: "python3.14", Status: runtimeUpdateUpdated, Digest: pinnedCLI,
+			PreviousKnown: true, Changed: true},
+		{RuntimeID: "python3.15", Status: runtimeUpdateFailed,
+			Err: errors.New("registry unavailable")},
+	}
+	var truncated, full strings.Builder
+	if err := renderRuntimeUpdateAll(&truncated, outcomes, true); err != nil {
+		t.Fatalf("render update --all truncated: %v", err)
+	}
+	if err := renderRuntimeUpdateAll(&full, outcomes, false); err != nil {
+		t.Fatalf("render update --all --no-trunc: %v", err)
+	}
+	gotTruncated := flattened(truncated.String())
+	gotFull := flattened(full.String())
+
+	for _, want := range []string{
+		"nodejs24.x updated " + abbreviatedDigest(pinnedCLI) + " " +
+			abbreviatedDigest(otherDigestCLI) + " -",
+		// The unpinned previous label is not a digest and never shortens.
+		"python3.14 updated unpinned " + abbreviatedDigest(pinnedCLI) + " -",
+		// Unknown previous ("-" for an unreadable state) and the failure
+		// detail are mode-independent, too.
+		"python3.15 failed - - registry unavailable",
+		"Updated 2, unchanged 0, failed 1.",
+		"Workers apply updated selections",
+	} {
+		if !strings.Contains(gotTruncated, want) {
+			t.Fatalf("truncated update --all render missing %q:\n%s", want, gotTruncated)
+		}
+	}
+	for _, complete := range []string{pinnedCLI, otherDigestCLI} {
+		if strings.Contains(gotTruncated, complete) {
+			t.Fatalf("truncated update --all render leaks the complete digest %q:\n%s",
+				complete, gotTruncated)
+		}
+	}
+
+	for _, want := range []string{
+		"nodejs24.x updated " + pinnedCLI + " " + otherDigestCLI + " -",
+		"python3.14 updated unpinned " + pinnedCLI + " -",
+		"python3.15 failed - - registry unavailable",
+		"Updated 2, unchanged 0, failed 1.",
+		"Workers apply updated selections",
+	} {
+		if !strings.Contains(gotFull, want) {
+			t.Fatalf("--no-trunc update --all render missing %q:\n%s", want, gotFull)
+		}
 	}
 }
 
@@ -520,7 +773,10 @@ func TestRuntimeListRenderShowsUnpinnedPinnedAndInvalid(t *testing.T) {
 		},
 	}
 	var out strings.Builder
-	if err := renderRuntimeList(&out, infos, selections); err != nil {
+	// --no-trunc mode: this test pins the complete row layout, including the
+	// full digest cell; the default truncation is pinned by
+	// TestRuntimeListRenderTruncatesDigestsUnlessNoTrunc.
+	if err := renderRuntimeList(&out, infos, selections, false); err != nil {
 		t.Fatalf("render list: %v", err)
 	}
 	got := flattened(out.String())
@@ -535,6 +791,67 @@ func TestRuntimeListRenderShowsUnpinnedPinnedAndInvalid(t *testing.T) {
 	}
 	if !strings.Contains(got, infos[2].ID+" "+infos[2].BaseImage+" invalid 9 ") {
 		t.Fatalf("list does not flag the invalid row:\n%s", got)
+	}
+}
+
+// TestRuntimeListRenderTruncatesDigestsUnlessNoTrunc pins the `runtime ls`
+// digest cell in both display modes: a pinned row's digest shortens to 12 hex
+// characters by default and prints complete with --no-trunc, while the
+// unpinned row's dash cells, an invalid row's label, and a non-digest stored
+// value read byte-identically in both modes.
+func TestRuntimeListRenderTruncatesDigestsUnlessNoTrunc(t *testing.T) {
+	malformed := "sha256:not-a-digest"
+	infos := runtime.Runtimes()
+	if len(infos) < 3 {
+		t.Fatalf("fixture setup: expected at least three managed runtimes, got %d", len(infos))
+	}
+	selections := map[string]state.RuntimeImageSelection{
+		infos[1].ID: {
+			RuntimeID: infos[1].ID, SourceImage: infos[1].BaseImage,
+			Digest: pinnedCLI, Generation: 3, SelectedAt: "2026-11-01T10:00:00Z",
+		},
+		infos[2].ID: {
+			RuntimeID: infos[2].ID, SourceImage: infos[2].BaseImage,
+			Digest: malformed, Generation: 4, SelectedAt: "2026-11-02T10:00:00Z",
+		},
+	}
+	var truncated, full strings.Builder
+	if err := renderRuntimeList(&truncated, infos, selections, true); err != nil {
+		t.Fatalf("render list truncated: %v", err)
+	}
+	if err := renderRuntimeList(&full, infos, selections, false); err != nil {
+		t.Fatalf("render list --no-trunc: %v", err)
+	}
+	gotTruncated := flattened(truncated.String())
+	gotFull := flattened(full.String())
+
+	for _, want := range []string{
+		infos[0].ID + " " + infos[0].BaseImage + " unpinned - - -",
+		infos[1].ID + " " + infos[1].BaseImage + " pinned 3 2026-11-01T10:00:00Z " +
+			abbreviatedDigest(pinnedCLI),
+		// A stored value that is not a digest is displayed verbatim, never
+		// shortened, and the row stays honestly labeled invalid.
+		infos[2].ID + " " + infos[2].BaseImage + " invalid 4 2026-11-02T10:00:00Z " +
+			malformed,
+	} {
+		if !strings.Contains(gotTruncated, want) {
+			t.Fatalf("truncated list render missing %q:\n%s", want, gotTruncated)
+		}
+	}
+	if strings.Contains(gotTruncated, pinnedCLI) {
+		t.Fatalf("truncated list render leaks the complete digest:\n%s", gotTruncated)
+	}
+
+	for _, want := range []string{
+		infos[0].ID + " " + infos[0].BaseImage + " unpinned - - -",
+		infos[1].ID + " " + infos[1].BaseImage + " pinned 3 2026-11-01T10:00:00Z " +
+			pinnedCLI,
+		infos[2].ID + " " + infos[2].BaseImage + " invalid 4 2026-11-02T10:00:00Z " +
+			malformed,
+	} {
+		if !strings.Contains(gotFull, want) {
+			t.Fatalf("--no-trunc list render missing %q:\n%s", want, gotFull)
+		}
 	}
 }
 
@@ -591,4 +908,68 @@ func TestRuntimeInspectRenderPinnedUnpinnedAndInvalid(t *testing.T) {
 		!strings.Contains(got, "does not match configured base image") {
 		t.Fatalf("invalid inspect not reported:\n%s", got)
 	}
+}
+
+// TestRuntimeNoTruncFlagHelpIsScopedToTableCommands pins the documented scope
+// of --no-trunc: the three table commands advertise it, and the single-runtime
+// `inspect` command never mentions it (its digest display is always complete).
+func TestRuntimeNoTruncFlagHelpIsScopedToTableCommands(t *testing.T) {
+	for _, sub := range []string{"ls", "check", "update"} {
+		out, err := runRuntime(t, sub, "--help")
+		if err != nil {
+			t.Fatalf("runtime %s --help: err = %v, want nil", sub, err)
+		}
+		if !strings.Contains(out, "--no-trunc") {
+			t.Fatalf("runtime %s --help does not document --no-trunc:\n%s", sub, out)
+		}
+	}
+	out, err := runRuntime(t, "inspect", "--help")
+	if err != nil {
+		t.Fatalf("runtime inspect --help: err = %v, want nil", err)
+	}
+	if strings.Contains(out, "--no-trunc") {
+		t.Fatalf("runtime inspect --help must not offer a --no-trunc mode:\n%s", out)
+	}
+}
+
+// TestRuntimeNoTruncFlagParsingReachesOnlyTableCommands pins the behavior of
+// --no-trunc before any state or resolver work: `ls` and `check` parse it and
+// reach their state-backed action (the database-free fixture's tripwire proves
+// the flag was accepted), `update --all` takes the every-runtime path, while
+// `inspect RUNTIME` rejects the flag outright and a single-runtime `update`
+// fails with the explicit usage error — neither ever reaches state.
+func TestRuntimeNoTruncFlagParsingReachesOnlyTableCommands(t *testing.T) {
+	// ls and check accept the flag: the action runs and stops at the fixture's
+	// state opener instead of failing flag parsing.
+	for _, sub := range []string{"ls", "check"} {
+		_, err := runRuntime(t, sub, "--no-trunc")
+		if !errors.Is(err, errUnexpectedStateAccess) {
+			t.Fatalf("runtime %s --no-trunc err = %v, want the state-opener tripwire",
+				sub, err)
+		}
+	}
+
+	// update --all --no-trunc reaches the every-runtime path (which reports the
+	// fixture's state failure as failed rows rather than a parse/usage error).
+	_, err := runRuntime(t, "update", "--all", "--no-trunc")
+	if err == nil || !strings.Contains(err.Error(), "runtime update --all:") {
+		t.Fatalf("update --all --no-trunc err = %v, want the --all failure summary", err)
+	}
+
+	// inspect has no --no-trunc mode: the flag is rejected before state access.
+	_, err = runRuntime(t, "inspect", "python3.14", "--no-trunc")
+	if err == nil {
+		t.Fatal("runtime inspect --no-trunc was accepted")
+	}
+	if errors.Is(err, errUnexpectedStateAccess) {
+		t.Fatalf("inspect --no-trunc err = %v, want a flag rejection before state", err)
+	}
+	if !strings.Contains(err.Error(), "no-trunc") {
+		t.Fatalf("inspect --no-trunc err = %v, want the rejected flag named", err)
+	}
+
+	// A single-runtime update never truncates, so --no-trunc is a usage error
+	// (exit 2) before state access.
+	_, err = runRuntime(t, "update", "python3.14", "--no-trunc")
+	requireExitCode2(t, err, "runtime update: --no-trunc requires --all")
 }

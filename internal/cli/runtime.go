@@ -52,13 +52,20 @@ func runtimeListCommand(deps Dependencies) *cli.Command {
 		Name:  "ls",
 		Usage: "List managed runtimes and image selections",
 		Description: "List every runtime this Relay binary supports, its configured base image, " +
-			"and whether an immutable base-image digest is selected. The command reads only " +
-			"PostgreSQL; it does not contact Docker or a registry.",
+			"and whether an immutable base-image digest is selected. Digests are " +
+			"abbreviated to sha256: plus the first 12 hex characters for display; " +
+			"--no-trunc prints the complete digest.",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:  "no-trunc",
+				Usage: "show complete digests instead of display-only abbreviations",
+			},
+		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.Args().Present() {
 				return cli.Exit("runtime ls: too many arguments", 2)
 			}
-			return runtimeList(ctx, cmd.Writer, deps)
+			return runtimeList(ctx, cmd.Writer, deps, !cmd.Bool("no-trunc"))
 		},
 	}
 }
@@ -70,7 +77,7 @@ func runtimeInspectCommand(deps Dependencies) *cli.Command {
 		UsageText: "relay runtime inspect RUNTIME",
 		Description: "Show the configured engine and base image plus the persisted selection " +
 			"(digest, generation, and selection time). A runtime with no row is shown honestly " +
-			"as unpinned. The command reads only PostgreSQL.",
+			"as unpinned.",
 		Arguments: []cli.Argument{
 			&cli.StringArgs{Name: "runtime", Min: 1, Max: 1, UsageText: "RUNTIME"},
 		},
@@ -92,9 +99,17 @@ func runtimeCheckCommand(deps Dependencies) *cli.Command {
 			"registry digest for one runtime, or every configured runtime when no argument " +
 			"is given. It checks the known runtime ID, exact configured source image, and " +
 			"sha256 index digest shape, then resolves the remote digest read-only through the " +
-			"Docker Engine Distribution API. It performs no pull, build, restart, or write. " +
+			"Docker Engine Distribution API. Digests show as sha256: plus the first " +
+			"12 hex characters; --no-trunc prints the complete digests. " +
+			"It performs no pull, build, restart, or write. " +
 			"Unpinned runtimes are reported honestly; all-mode continues across runtimes and " +
 			"fails if any registry lookup or stored selection is invalid.",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:  "no-trunc",
+				Usage: "show complete digests instead of display-only abbreviations",
+			},
+		},
 		Arguments: []cli.Argument{
 			&cli.StringArgs{Name: "runtime", Min: 0, Max: 1, UsageText: "[RUNTIME]"},
 		},
@@ -107,7 +122,8 @@ func runtimeCheckCommand(deps Dependencies) *cli.Command {
 			if len(runtimeIDs) > 0 {
 				runtimeID = runtimeIDs[0]
 			}
-			return runtimeCheck(ctx, cmd.Writer, deps, runtimeID)
+			return runtimeCheck(ctx, cmd.Writer, deps, runtimeID,
+				!cmd.Bool("no-trunc"))
 		},
 	}
 }
@@ -122,7 +138,10 @@ func runtimeUpdateCommand(deps Dependencies) *cli.Command {
 			"compare-and-swap. It requires a valid OCI image index or Docker manifest list and " +
 			"rejects a missing, unknown, or platform-specific manifest. If the current selection " +
 			"already has that digest, nothing is written. --all processes every runtime " +
-			"independently and continues after failures. This does not pull, build, restart, or " +
+			"independently and continues after failures; its table abbreviates " +
+			"digests to sha256: plus the first 12 hex characters unless " +
+			"--no-trunc is given. A single runtime always shows the complete digest. " +
+			"This does not pull, build, restart, or " +
 			"deploy anything; workers apply a new selection during their next periodic " +
 			"reconciliation pass.",
 		Flags: []cli.Flag{
@@ -130,6 +149,10 @@ func runtimeUpdateCommand(deps Dependencies) *cli.Command {
 				Name:    "all",
 				Aliases: []string{"a"},
 				Usage:   "update every configured runtime independently",
+			},
+			&cli.BoolFlag{
+				Name:  "no-trunc",
+				Usage: "with --all, show complete digests instead of abbreviations",
 			},
 		},
 		Arguments: []cli.Argument{
@@ -141,13 +164,16 @@ func runtimeUpdateCommand(deps Dependencies) *cli.Command {
 			}
 			runtimeIDs := cmd.StringArgs("runtime")
 			all := cmd.Bool("all")
+			noTrunc := cmd.Bool("no-trunc")
 			switch {
 			case all && len(runtimeIDs) > 0:
 				return cli.Exit("runtime update: cannot combine --all with a runtime", 2)
 			case !all && len(runtimeIDs) == 0:
 				return cli.Exit("runtime update: missing runtime (or use --all)", 2)
+			case !all && noTrunc:
+				return cli.Exit("runtime update: --no-trunc requires --all", 2)
 			case all:
-				return runtimeUpdateAll(ctx, cmd.Writer, deps)
+				return runtimeUpdateAll(ctx, cmd.Writer, deps, !noTrunc)
 			default:
 				return runtimeUpdate(ctx, cmd.Writer, deps, runtimeIDs[0])
 			}
@@ -186,12 +212,17 @@ func runtimeSelections(
 	return readRuntimeSelections(ctx, st)
 }
 
-func runtimeList(ctx context.Context, w io.Writer, deps Dependencies) error {
+func runtimeList(
+	ctx context.Context,
+	w io.Writer,
+	deps Dependencies,
+	truncate bool,
+) error {
 	selections, err := runtimeSelections(ctx, deps)
 	if err != nil {
 		return err
 	}
-	return renderRuntimeList(w, runtime.Runtimes(), selections)
+	return renderRuntimeList(w, runtime.Runtimes(), selections, truncate)
 }
 
 // resolveRuntimeBaseImage performs one read-only Docker Engine Distribution API
@@ -238,6 +269,7 @@ func runtimeCheck(
 	w io.Writer,
 	deps Dependencies,
 	runtimeID string,
+	truncate bool,
 ) error {
 	var infos []runtime.RuntimeInfo
 	if runtimeID != "" {
@@ -288,7 +320,7 @@ func runtimeCheck(
 		}
 		rows = append(rows, row)
 	}
-	if err := renderRuntimeCheck(w, rows); err != nil {
+	if err := renderRuntimeCheck(w, rows, truncate); err != nil {
 		return err
 	}
 	if failures > 0 {
@@ -363,7 +395,12 @@ func runtimeUpdate(
 	return renderRuntimeUpdateNote(w, outcome.Changed)
 }
 
-func runtimeUpdateAll(ctx context.Context, w io.Writer, deps Dependencies) error {
+func runtimeUpdateAll(
+	ctx context.Context,
+	w io.Writer,
+	deps Dependencies,
+	truncate bool,
+) error {
 	infos := runtime.Runtimes()
 	st, cleanup, stateErr := deps.OpenState(ctx)
 	if stateErr == nil {
@@ -411,7 +448,7 @@ func runtimeUpdateAll(ctx context.Context, w io.Writer, deps Dependencies) error
 		}
 		outcomes = append(outcomes, outcome)
 	}
-	if err := renderRuntimeUpdateAll(w, outcomes); err != nil {
+	if err := renderRuntimeUpdateAll(w, outcomes, truncate); err != nil {
 		return err
 	}
 

@@ -11,6 +11,15 @@ import (
 	"relay/internal/state"
 )
 
+const runtimeDigestDisplayHexLength = 12
+
+func runtimeDigestForDisplay(digest string, truncate bool) string {
+	if !truncate || !runtime.ValidImageDigest(digest) {
+		return digest
+	}
+	return digest[:len("sha256:")+runtimeDigestDisplayHexLength]
+}
+
 // runtimeSelectionFor resolves one persisted row from the complete snapshot. A
 // missing entry is unpinned; the returned pointer is to a copy owned by the
 // caller, never to the state package's internal storage.
@@ -48,6 +57,7 @@ func renderRuntimeList(
 	w io.Writer,
 	infos []runtime.RuntimeInfo,
 	selections map[string]state.RuntimeImageSelection,
+	truncate bool,
 ) error {
 	out := newOutput(w)
 	tw := out.table(2)
@@ -64,7 +74,7 @@ func renderRuntimeList(
 			if selectedAt == "" {
 				selectedAt = "-"
 			}
-			digest = selection.Digest
+			digest = runtimeDigestForDisplay(selection.Digest, truncate)
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
 			info.ID, info.BaseImage, status, generation, selectedAt, digest)
@@ -132,18 +142,24 @@ type runtimeCheckRow struct {
 	Status       string
 }
 
-func renderRuntimeCheck(w io.Writer, rows []runtimeCheckRow) error {
+func renderRuntimeCheck(
+	w io.Writer,
+	rows []runtimeCheckRow,
+	truncate bool,
+) error {
 	out := newOutput(w)
 	tw := out.table(2)
 	fmt.Fprintln(tw, "RUNTIME\tSTATUS\tSELECTED\tREMOTE\tDETAIL")
 	for _, row := range rows {
 		selected := "unpinned"
 		if row.Pinned && row.Selection != nil {
-			selected = row.Selection.Digest
+			selected = runtimeDigestForDisplay(row.Selection.Digest, truncate)
 		}
 		remote := row.RemoteDigest
 		if remote == "" {
 			remote = "-"
+		} else {
+			remote = runtimeDigestForDisplay(remote, truncate)
 		}
 		var details []string
 		if row.SelectionErr != nil {
@@ -211,7 +227,11 @@ func renderRuntimeUpdateNote(w io.Writer, changed bool) error {
 	return out.err
 }
 
-func renderRuntimeUpdateAll(w io.Writer, outcomes []runtimeUpdateOutcome) error {
+func renderRuntimeUpdateAll(
+	w io.Writer,
+	outcomes []runtimeUpdateOutcome,
+	truncate bool,
+) error {
 	out := newOutput(w)
 	tw := out.table(2)
 	fmt.Fprintln(tw, "RUNTIME\tSTATUS\tPREVIOUS\tNEW\tDETAIL")
@@ -235,7 +255,8 @@ func renderRuntimeUpdateAll(w io.Writer, outcomes []runtimeUpdateOutcome) error 
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
 			outcome.RuntimeID, outcome.Status,
-			previousSelectionLabel(outcome), selected, detail)
+			runtimeDigestForDisplay(previousSelectionLabel(outcome), truncate),
+			runtimeDigestForDisplay(selected, truncate), detail)
 	}
 	out.flush(tw)
 	out.blank()
