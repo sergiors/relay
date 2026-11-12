@@ -229,7 +229,7 @@ func openPostgresState(ctx context.Context) (*state.State, func(), error) {
 func New(logger *slog.Logger, writer io.Writer, deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:            "relay",
-		Usage:           "Relay event-driven app runner",
+		Usage:           "Run event-driven apps",
 		HideHelpCommand: true,
 		HideVersion:     true,
 		Writer:          writer,

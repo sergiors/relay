@@ -43,10 +43,10 @@ func openPostgresDLQStore(ctx context.Context, _ *slog.Logger) (dlq.Store, func(
 func dlqCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "dlq",
-		Usage: "Inspect and replay dead-lettered events",
+		Usage: "Manage dead-lettered events",
 		Description: "List, inspect, replay, and remove durable dead-letter entries. " +
-			"Replay re-executes one entry's exact app and handler once on the " +
-			"running worker's live runtime pool.",
+			"ls, inspect, and rm work without a running worker, while replay " +
+			"requires one.",
 		Action: namespaceAction(),
 		Commands: []*cli.Command{
 			dlqLsCommand(logger, deps),
@@ -65,11 +65,10 @@ func dlqCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 func dlqLsCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "ls",
-		Usage: "List DLQ entries",
-		Description: "List every DLQ entry in write order: abbreviated entry ID, " +
-			"failed app/handler, handler attempts, and age. The abbreviation is " +
-			"display-only; inspect, replay, and rm require the full ID, which " +
-			"--no-trunc prints.",
+		Usage: "List dead-letter entries",
+		Description: "List dead-letter entries in write order with their failed app, handler, " +
+			"attempts, and age. IDs are abbreviated for display only; inspect, replay, and rm " +
+			"require the full ID shown by --no-trunc.",
 		Flags: []cli.Flag{
 			&cli.BoolFlag{
 				Name:  "no-trunc",
@@ -97,10 +96,10 @@ func dlqLsCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 func dlqInspectCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:      "inspect",
-		Usage:     "Show one DLQ entry",
+		Usage:     "Show one dead-letter entry",
 		UsageText: "relay dlq inspect ID",
-		Description: "Show a single DLQ entry's metadata and its original " +
-			"transport value, pretty-printed.",
+		Description: "Show a dead-letter entry's metadata and its original message value, " +
+			"pretty-printed. Requires the full entry ID.",
 		Arguments: []cli.Argument{
 			&cli.StringArgs{Name: "id", Min: 1, Max: 1},
 		},
@@ -130,11 +129,12 @@ func dlqInspectCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 func dlqReplayCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:      "replay",
-		Usage:     "Replay one DLQ entry",
+		Usage:     "Replay one dead-letter entry",
 		UsageText: "relay dlq replay ID",
-		Description: "Re-execute one DLQ entry's exact app and handler once on " +
-			"the running worker, then delete the entry on success. The entry is " +
-			"kept on failure.",
+		Description: "Re-execute a dead-letter entry's exact app and handler once on the " +
+			"running worker, then delete it on success. The entry is kept on failure. Replay " +
+			"is at-least-once: if completion cannot be confirmed, the handler may run again, " +
+			"so keep it idempotent. Requires the full entry ID and a running worker.",
 		Arguments: []cli.Argument{
 			&cli.StringArgs{Name: "id", Min: 1, Max: 1},
 		},
@@ -157,10 +157,12 @@ func dlqReplayCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 // recreate the row. An unknown ID is a clear error.
 func dlqRmCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
-		Name:        "rm",
-		Usage:       "Remove one DLQ entry",
-		UsageText:   "relay dlq rm ID",
-		Description: "Delete exactly one DLQ entry by its stable ID.",
+		Name:      "rm",
+		Usage:     "Remove one dead-letter entry",
+		UsageText: "relay dlq rm ID",
+		Description: "Delete one dead-letter entry by its full ID. Only settled entries " +
+			"without an active replay can be removed; a pending source delivery may recreate " +
+			"the entry.",
 		Arguments: []cli.Argument{
 			&cli.StringArgs{Name: "id", Min: 1, Max: 1},
 		},

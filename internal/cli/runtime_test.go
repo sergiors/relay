@@ -60,6 +60,19 @@ func TestRuntimeBareInvocationShowsSubcommandHelp(t *testing.T) {
 	}
 }
 
+// TestRuntimeUpdateHelpUsageSyntax pins `runtime update --help` usage: the
+// single-runtime-or---all choice is the documented invocation, so a rewrite of
+// the UsageText cannot silently drop either form.
+func TestRuntimeUpdateHelpUsageSyntax(t *testing.T) {
+	out, err := runRuntime(t, "update", "--help")
+	if err != nil {
+		t.Fatalf("runtime update --help: err = %v, want nil", err)
+	}
+	if !strings.Contains(out, "relay runtime update RUNTIME | relay runtime update --all") {
+		t.Fatalf("runtime update --help missing usage syntax:\n%s", out)
+	}
+}
+
 // TestRuntimeUnknownSubcommandIsUsageError pins the Docker-style typo error
 // for an unknown `relay runtime <word>` first token.
 func TestRuntimeUnknownSubcommandIsUsageError(t *testing.T) {
@@ -907,6 +920,20 @@ func TestRuntimeInspectRenderPinnedUnpinnedAndInvalid(t *testing.T) {
 	if !strings.Contains(got, "Selection: invalid") ||
 		!strings.Contains(got, "does not match configured base image") {
 		t.Fatalf("invalid inspect not reported:\n%s", got)
+	}
+}
+
+// TestRuntimeLsHelpDocumentsPinStateVocabulary pins the help contract of
+// `runtime ls`: it documents the pin-state vocabulary (pinned, unpinned,
+// invalid) its table reports. The assertion runs on whitespace-flattened
+// output so line wrapping cannot break it.
+func TestRuntimeLsHelpDocumentsPinStateVocabulary(t *testing.T) {
+	out, err := runRuntime(t, "ls", "--help")
+	if err != nil {
+		t.Fatalf("runtime ls --help: err = %v, want nil", err)
+	}
+	if !strings.Contains(flattened(out), "pinned, unpinned, or invalid") {
+		t.Fatalf("runtime ls --help does not document the pin-state statuses:\n%s", out)
 	}
 }
 

@@ -34,8 +34,9 @@ var errStartAlreadyRunning = errors.New("relay start is already running")
 // fake runner directly.
 func startCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
-		Name:  "start",
-		Usage: "Start the runtime",
+		Name:        "start",
+		Usage:       "Start the runtime",
+		Description: "Run in the foreground until stopped.",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.Args().Present() {
 				return cli.Exit("start: too many arguments", 2)

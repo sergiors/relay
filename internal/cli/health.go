@@ -27,11 +27,10 @@ import (
 func healthCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "health",
-		Usage: "Check whether the running worker is healthy",
-		Description: "Ask the running worker (over its control socket) whether it is ready " +
-			"to consume. Exits 0 when ready, 1 when not: no worker is running, the worker " +
-			"is still starting or shutting down, or its live dependencies (Redis consumer, " +
-			"Docker, configured NETWORKS) are currently failing.",
+		Usage: "Check worker health",
+		Description: "Check whether the running worker is ready. Prints 'healthy' and exits 0 " +
+			"when ready; exits 1 with a reason when no worker is running, the worker is " +
+			"starting or shutting down, or a live dependency is unavailable.",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.Args().Present() {
 				return cli.Exit("health: too many arguments", 2)

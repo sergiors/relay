@@ -29,19 +29,19 @@ import (
 func gitCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "git",
-		Usage: "Manage manual Git synchronization",
-		Description: "Generate an SSH deploy key, configure a repository source, and " +
-			"manually sync it into /apps.",
+		Usage: "Manage manual Git sync",
+		Description: "Generate a deploy key, configure an SSH repository, and manually sync " +
+			"its apps into /apps. No running worker is required.",
 		Action: namespaceAction(),
 		Commands: []*cli.Command{
 			{
 				Name:      "keygen",
 				Usage:     "Generate an SSH deploy key",
 				UsageText: "relay git keygen",
-				Description: "Generate a new ed25519 pair under " + deps.GitSSHDir + " (0700/0600) and " +
-					"print the public key in authorized_keys form. Add it as a read-only Deploy " +
-					"Key with your provider; Relay itself never calls a provider API. Fails if a " +
-					"key already exists (remove the file to regenerate).",
+				Description: "Generate an ed25519 deploy key under " + deps.GitSSHDir + " (0700 " +
+					"directory, 0600 key) and print the public key in authorized_keys form. Add " +
+					"it to your Git provider as a read-only deploy key; Relay never calls a " +
+					"provider API. Fails if a key already exists; remove it to regenerate.",
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					if cmd.Args().Present() {
 						return cli.Exit("git keygen: too many arguments", 2)
@@ -53,19 +53,17 @@ func gitCommand(deps Dependencies) *cli.Command {
 				Name:      "set",
 				Usage:     "Set the git source repository",
 				UsageText: "relay git set <repository> [--ref REF] [--path PATH] [--webhook-secret NAME]",
-				Description: "Remember an SSH git repository to sync from. The value must be an SSH " +
-					"URL (scp-like or ssh://). --ref selects the branch/tag/commit (default " + git.DefaultRef + "); " +
-					"--path selects an optional monorepo subdirectory. --webhook-secret names the secret " +
-					"(in Relay's secret store) holding the GitHub webhook secret used to verify deliveries; " +
-					"the webhook endpoint only starts when this is set, and unsigned deliveries are never " +
-					"accepted. Calling set again overwrites the source.",
+				Description: "Configure the SSH repository to sync; the URL may be scp-like or " +
+					"ssh://. Running set again overwrites the source. Sync stays manual unless a " +
+					"webhook secret is configured.",
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "ref", Usage: "branch, tag, or commit to sync (default " + git.DefaultRef + ")"},
-					&cli.StringFlag{Name: "path", Usage: "optional monorepo subdirectory within the repo"},
+					&cli.StringFlag{Name: "path", Usage: "optional monorepo subdirectory within the repository"},
 					&cli.StringFlag{
 						Name: "webhook-secret",
-						Usage: "name of the secret holding the GitHub webhook secret " +
-							"(required to start the webhook endpoint; deliveries must be signed with this secret)",
+						Usage: "name of the stored secret used to verify GitHub webhook " +
+							"signatures; required to enable the webhook endpoint (unsigned " +
+							"deliveries are rejected)",
 					},
 				},
 				Arguments: []cli.Argument{
@@ -89,9 +87,8 @@ func gitCommand(deps Dependencies) *cli.Command {
 			{
 				Name:  "sync",
 				Usage: "Sync the configured source into /apps",
-				Description: "Clone/fetch/checkout the configured repository and materialize its app " +
-					"directories into /apps deterministically. Uses the process context so Ctrl-C " +
-					"propagates.",
+				Description: "Clone or update the configured repository and sync its app " +
+					"directories into /apps, removing apps no longer present.",
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					if cmd.Args().Present() {
 						return cli.Exit("git sync: too many arguments", 2)
@@ -102,8 +99,8 @@ func gitCommand(deps Dependencies) *cli.Command {
 			{
 				Name:  "status",
 				Usage: "Show git sync status",
-				Description: "Show the configured source, whether the SSH key and checkout exist, and the last " +
-					"sync time. Prints no key material.",
+				Description: "Show the configured source, whether the deploy key and checkout " +
+					"exist, and the last sync time. Does not print key material.",
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					if cmd.Args().Present() {
 						return cli.Exit("git status: too many arguments", 2)
@@ -115,9 +112,8 @@ func gitCommand(deps Dependencies) *cli.Command {
 				Name:      "remove",
 				Usage:     "Remove the git source config and checkout",
 				UsageText: "relay git remove [-y]",
-				Description: "Remove the persisted git source config and the managed checkout. Leaves /apps " +
-					"and the SSH key untouched (the key survives because the operator registers it as a Deploy Key). " +
-					"Prompts for confirmation on the terminal with a default of No unless -y/--yes is given (for automation).",
+				Description: "Remove the saved Git source and checkout. Leaves /apps and the " +
+					"deploy key untouched. Prompts for confirmation (default No); use -y to skip.",
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "yes", Aliases: []string{"y"}, Usage: "skip confirmation (for automation)"},
 				},

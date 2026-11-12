@@ -623,16 +623,26 @@ func TestAppInvokeMissingName(t *testing.T) {
 	}
 }
 
-// TestAppInvokeHelp verifies `relay app invoke --help` renders the positional
-// usage and stdin guidance, and advertises neither the removed --event nor
-// --file flags.
+// TestAppInvokeHelp verifies `relay app invoke --help` renders the required
+// event syntax and the user-facing contracts: a JSON-object event, explicit-
+// only stdin, the live-worker requirement, and that manual invocations bypass
+// retries and the dead-letter queue. It advertises neither the removed --event
+// nor --file flags. Phrase assertions run on whitespace-flattened output so
+// line wrapping cannot break them.
 func TestAppInvokeHelp(t *testing.T) {
 	out, _, err := runCLIWithDeps(t, invokeDeps(t), "", "app", "invoke", "--help")
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
-	for _, want := range []string{"relay app invoke NAME [JSON|-]", "stdin", "JSON object"} {
-		if !strings.Contains(out, want) {
+	flat := flattened(out)
+	for _, want := range []string{
+		"relay app invoke NAME JSON|-",
+		"JSON object",
+		"stdin is never read implicitly",
+		"Requires a running worker",
+		"bypass retries and the dead-letter queue",
+	} {
+		if !strings.Contains(flat, want) {
 			t.Fatalf("help missing %q:\n%s", want, out)
 		}
 	}

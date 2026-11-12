@@ -32,20 +32,17 @@ const secretStdinArg = "-"
 func secretCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "secret",
-		Usage: "Manage secrets (list active provider; set/rm local only)",
-		Description: "List secret names from the provider selected by SECRETS_PROVIDER, and create or " +
-			"remove local secret files. `secret ls` reads the active provider (local files by default, " +
-			"or Infisical); `secret set` and `secret rm` write only the local secrets directory and " +
-			"fail without reading a value when an external provider is selected. Secret values are " +
-			"never accepted as positional arguments or printed.",
+		Usage: "Manage secrets",
+		Description: "List names from the active provider, or create and remove local " +
+			"secrets. `secret ls` uses the configured provider; `set` and `rm` require the " +
+			"local provider. Values are never accepted as arguments or printed.",
 		Action: namespaceAction(),
 		Commands: []*cli.Command{
 			{
 				Name:  "ls",
 				Usage: "List secrets from the active provider",
-				Description: "List the names of secrets in the provider selected by SECRETS_PROVIDER " +
-					"(local files by default, or Infisical), sorted. Only names are read: values are " +
-					"never requested from Infisical or printed.",
+				Description: "List secret names from the configured provider. " +
+					"Values are never read or printed.",
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					if cmd.Args().Present() {
 						return cli.Exit("secret ls: too many arguments", 2)
@@ -57,12 +54,9 @@ func secretCommand(deps Dependencies) *cli.Command {
 				Name:      "set",
 				Usage:     "Create or update a local secret (local provider only)",
 				UsageText: "relay secret set NAME [-]",
-				Description: "Create or update a local secret. This command is available only when " +
-					"SECRETS_PROVIDER=local (the default); with an external provider it fails before " +
-					"reading any value and never writes a local file. Without a second argument the value " +
-					"is read from an interactive terminal with echo disabled; use - to read all of " +
-					"stdin instead. A secret value is never accepted as a positional argument " +
-					"and is never printed.",
+				Description: "Enter the value interactively with echo disabled, or use - to " +
+					"read all of stdin. Values are never accepted as positional arguments and " +
+					"are never printed.",
 				Arguments: []cli.Argument{
 					&cli.StringArgs{Name: "name", Min: 1, Max: 1, UsageText: "NAME"},
 					&cli.StringArgs{Name: "source", Min: 0, Max: 1, UsageText: "[-]"},
@@ -89,11 +83,11 @@ func secretCommand(deps Dependencies) *cli.Command {
 				},
 			},
 			{
-				Name:  "rm",
-				Usage: "Remove a local secret (local provider only)",
-				Description: "Remove a local secret. This command is available only when " +
-					"SECRETS_PROVIDER=local (the default); with an external provider it fails before " +
-					"touching the local secrets directory. A missing secret is an error.",
+				Name:      "rm",
+				Usage:     "Remove a local secret",
+				UsageText: "relay secret rm NAME",
+				Description: "Requires the local provider; other providers " +
+					"are rejected. Removing a missing secret is an error.",
 				Arguments: []cli.Argument{
 					&cli.StringArgs{Name: "name", Min: 1, Max: 1},
 				},

@@ -32,11 +32,9 @@ const runtimeImageResolveTimeout = 60 * time.Second
 func runtimeCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "runtime",
-		Usage: "Inspect and pin managed runtime base images",
-		Description: "List configured managed runtimes, inspect their persisted base-image " +
-			"selection, check the selected digest against the current registry digest " +
-			"read-only, and resolve/update a runtime's configured base tag to an immutable " +
-			"multi-platform index digest.",
+		Usage: "Manage runtime base-image pins",
+		Description: "Managed runtimes build from their configured base tag unless it is " +
+			"pinned to an immutable registry digest.",
 		Action: namespaceAction(),
 		Commands: []*cli.Command{
 			runtimeListCommand(deps),
@@ -50,11 +48,12 @@ func runtimeCommand(deps Dependencies) *cli.Command {
 func runtimeListCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "ls",
-		Usage: "List managed runtimes and image selections",
-		Description: "List every runtime this Relay binary supports, its configured base image, " +
-			"and whether an immutable base-image digest is selected. Digests are " +
-			"abbreviated to sha256: plus the first 12 hex characters for display; " +
-			"--no-trunc prints the complete digest.",
+		Usage: "List runtimes and image pins",
+		Description: "List the managed runtimes this Relay binary supports with their configured " +
+			"base images and pin state: pinned, unpinned, or invalid (a stored selection a worker " +
+			"would reject). A stored selection shows its generation, selection time, and digest; " +
+			"digests are abbreviated to sha256: plus the first 12 hex characters unless --no-trunc " +
+			"is given.",
 		Flags: []cli.Flag{
 			&cli.BoolFlag{
 				Name:  "no-trunc",
@@ -73,11 +72,11 @@ func runtimeListCommand(deps Dependencies) *cli.Command {
 func runtimeInspectCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:      "inspect",
-		Usage:     "Show one runtime's configured and selected image",
+		Usage:     "Show one runtime's configuration and image pin",
 		UsageText: "relay runtime inspect RUNTIME",
-		Description: "Show the configured engine and base image plus the persisted selection " +
-			"(digest, generation, and selection time). A runtime with no row is shown honestly " +
-			"as unpinned.",
+		Description: "Show a runtime's engine, base image, target platform, and effective " +
+			"image reference. A pinned runtime also shows its source image, digest, generation, " +
+			"and selection time; an unpinned runtime is shown as unpinned.",
 		Arguments: []cli.Argument{
 			&cli.StringArgs{Name: "runtime", Min: 1, Max: 1, UsageText: "RUNTIME"},
 		},
@@ -93,17 +92,16 @@ func runtimeInspectCommand(deps Dependencies) *cli.Command {
 func runtimeCheckCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:      "check",
-		Usage:     "Check persisted runtime image selections",
+		Usage:     "Check runtime image pins",
 		UsageText: "relay runtime check [RUNTIME]",
-		Description: "Validate the persisted selection and compare it with the current " +
-			"registry digest for one runtime, or every configured runtime when no argument " +
-			"is given. It checks the known runtime ID, exact configured source image, and " +
-			"sha256 index digest shape, then resolves the remote digest read-only through the " +
-			"Docker Engine Distribution API. Digests show as sha256: plus the first " +
-			"12 hex characters; --no-trunc prints the complete digests. " +
-			"It performs no pull, build, restart, or write. " +
-			"Unpinned runtimes are reported honestly; all-mode continues across runtimes and " +
-			"fails if any registry lookup or stored selection is invalid.",
+		Description: "Compare one runtime, or every runtime when RUNTIME is omitted, with " +
+			"the current registry digest. Validates any stored pin and reports it as matching, " +
+			"different, invalid, or failed; unpinned runtimes are reported as available or " +
+			"unpinned, never as matching. Performs no pull, build, restart, or write. " +
+			"In all mode, each runtime is checked " +
+			"independently and failures do not stop later runtimes; per-runtime errors are shown, " +
+			"and the command exits non-zero if any runtime fails. --no-trunc shows complete " +
+			"digests.",
 		Flags: []cli.Flag{
 			&cli.BoolFlag{
 				Name:  "no-trunc",
@@ -131,19 +129,17 @@ func runtimeCheckCommand(deps Dependencies) *cli.Command {
 func runtimeUpdateCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:      "update",
-		Usage:     "Resolve and persist a runtime base-image digest",
+		Usage:     "Pin a runtime base image",
 		UsageText: "relay runtime update RUNTIME | relay runtime update --all",
-		Description: "Resolve the runtime's EXACT configured base tag through the Docker Engine " +
-			"Distribution API and persist the registry's multi-platform index digest with a " +
-			"compare-and-swap. It requires a valid OCI image index or Docker manifest list and " +
-			"rejects a missing, unknown, or platform-specific manifest. If the current selection " +
-			"already has that digest, nothing is written. --all processes every runtime " +
-			"independently and continues after failures; its table abbreviates " +
-			"digests to sha256: plus the first 12 hex characters unless " +
-			"--no-trunc is given. A single runtime always shows the complete digest. " +
-			"This does not pull, build, restart, or " +
-			"deploy anything; workers apply a new selection during their next periodic " +
-			"reconciliation pass.",
+		Description: "Resolve the runtime's configured base tag to its registry digest and " +
+			"persist the multi-platform index digest. The tag must resolve to an OCI image " +
+			"index or Docker manifest list; missing, unknown, or platform-specific manifests " +
+			"are rejected. " +
+			"Writes nothing when the digest is unchanged. A single runtime reports the full " +
+			"digest; --all updates every runtime independently, continues after failures, " +
+			"abbreviates digests unless --no-trunc is given, and exits non-zero if any fail. " +
+			"Does not pull, build, restart, or deploy; workers apply a new pin at their next " +
+			"reconciliation pass, or at startup if no worker is running.",
 		Flags: []cli.Flag{
 			&cli.BoolFlag{
 				Name:    "all",

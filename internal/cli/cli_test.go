@@ -169,8 +169,8 @@ func TestRootHelpContainsStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
-	// Only consider the COMMANDS block; the root Usage line ("Relay
-	// event-driven app runner") also contains the word "app", so an unanchored
+	// Only consider the COMMANDS block; the root Usage line ("Run
+	// event-driven apps") also contains the word "app", so an unanchored
 	// index of the whole output would point at the header.
 	cmds := out
 	if i := strings.Index(cmds, "COMMANDS:"); i >= 0 {
@@ -204,18 +204,19 @@ func TestHelpAndArgumentValidationRunWithoutReachableDatabase(t *testing.T) {
 	}
 }
 
-// TestStartHelp verifies `relay start --help` exits 0 without starting anything.
-func TestStartHelp(t *testing.T) {
+// TestStartHelpDoesNotStartWorker verifies `relay start --help` succeeds
+// (exit 0) without invoking the worker startup callback: help rendering is
+// purely informational, so reaching deps.Start would launch the runtime as a
+// side effect of asking for help. The test deliberately asserts only behavior,
+// not fixed help text.
+func TestStartHelpDoesNotStartWorker(t *testing.T) {
 	deps := testDeps(t)
 	called := false
 	deps.Start = func(l *slog.Logger) error { called = true; return nil }
 
-	out, _, err := runCLIWithDeps(t, deps, "", "start", "--help")
+	_, _, err := runCLIWithDeps(t, deps, "", "start", "--help")
 	if err != nil {
-		t.Fatalf("err = %v, want nil", err)
-	}
-	if !strings.Contains(out, "Start the runtime") {
-		t.Fatalf("stdout missing start usage:\n%s", out)
+		t.Fatalf("start --help: err = %v, want nil", err)
 	}
 	if called {
 		t.Fatal("start --help must not invoke the worker startup path")

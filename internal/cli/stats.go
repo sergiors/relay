@@ -30,9 +30,10 @@ import (
 func statsCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "stats",
-		Usage: "Show current operational statistics",
-		Description: "Show or reset the persisted operational statistics in the local " +
-			"state database.",
+		Usage: "Show operational statistics",
+		Description: "Show the latest persisted counters and backlog gauges; the snapshot may " +
+			"lag live metrics by a few seconds. Requires PostgreSQL and works " +
+			"without a running worker.",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.Args().Present() {
 				return cli.Exit("stats: too many arguments", 2)
@@ -72,10 +73,14 @@ func statsCommand(deps Dependencies) *cli.Command {
 // the process lifetime).
 func statsResetCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
-		Name:        "reset",
-		Usage:       "Reset persisted cumulative statistics",
-		UsageText:   "relay stats reset",
-		Description: "Reset cumulative global and per-app statistics.",
+		Name:      "reset",
+		Usage:     "Reset cumulative statistics",
+		UsageText: "relay stats reset",
+		Description: "Reset cumulative global and per-app counters. Backlog gauges and " +
+			"Prometheus metrics are not reset. Resets through the running worker when " +
+			"reachable; with no worker running it resets the persisted counters directly. A " +
+			"reachable worker is authoritative, so its errors are reported instead of falling " +
+			"back.",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.Args().Present() {
 				return cli.Exit("stats reset: too many arguments", 2)

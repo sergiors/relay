@@ -22,27 +22,24 @@ func appCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "app",
 		Usage: "Manage apps",
-		Description: "List, inspect, and invoke the apps Relay has discovered " +
-			"and reconciled. ls/inspect read the local state database; inspect " +
-			"also reads the active image's provenance from Docker when available; " +
-			"invoke runs an app's matching handlers on the running worker.",
+		Description: "List and inspect discovered apps, or invoke an app's handlers on the " +
+			"running worker. Invoking requires a running worker.",
 		Action: namespaceAction(),
 		Commands: []*cli.Command{
 			{
 				Name:        "ls",
 				Usage:       "List apps",
-				Description: "List all apps Relay has discovered, sorted by name.",
+				Description: "List discovered apps sorted by name.",
 				Action:      appListAction(deps),
 			},
 			{
 				Name:      "inspect",
-				Usage:     "Show detailed information about an app",
+				Usage:     "Show one app's details",
 				UsageText: "relay app inspect NAME",
-				Description: "Show the full detail record for a single app, including " +
-					"its runtime, base-image provenance read from the active image, " +
-					"status, events and schedules, env-var names (values " +
-					"redacted) and secret reference names, and " +
-					"its cumulative container pool counters.",
+				Description: "Show one app's status, handlers, events, schedules, services, " +
+					"environment variable names (values redacted), secret references, and pool " +
+					"counters. Image provenance is shown when " +
+					"available, and live pool gauges require a running worker.",
 				Arguments: []cli.Argument{
 					&cli.StringArgs{Name: "name", Min: 1, Max: 1},
 				},
@@ -68,11 +65,10 @@ func appCommand(deps Dependencies) *cli.Command {
 func appsCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "apps",
-		Usage: "List apps (short form of 'relay app ls')",
-		Description: "Short form of `relay app ls`: list all apps Relay has " +
-			"discovered, sorted by name, from the local state database. It takes no " +
-			"arguments; use `relay app inspect` or `relay app invoke` for the other " +
-			"app operations.",
+		Usage: "List apps (alias for 'relay app ls')",
+		Description: "List discovered apps sorted by name. " +
+			"Takes no arguments; use `relay app inspect` or " +
+			"`relay app invoke` for other app operations.",
 		Action: appListAction(deps),
 	}
 }

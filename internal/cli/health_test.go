@@ -159,6 +159,36 @@ func TestHealthCommandUsesSocketOnly(t *testing.T) {
 	}
 }
 
+// `relay health --help` renders to stdout and exits 0 without a worker or any
+// dependency: the help states the user-facing purpose and the healthy/exit
+// contract (prints 'healthy' and exits 0 when ready, exits 1 with a reason
+// otherwise), and stays free of architecture details (how the CLI reaches the
+// worker is internal). Phrase assertions run on whitespace-flattened output so
+// line wrapping cannot break them.
+func TestHealthHelp(t *testing.T) {
+	out, _, err := runCLI(t, "", "health", "--help")
+	if err != nil {
+		t.Fatalf("health --help: err = %v, want nil", err)
+	}
+	if !strings.Contains(out, "Check worker health") {
+		t.Fatalf("health --help missing purpose:\n%s", out)
+	}
+	flat := flattened(out)
+	for _, want := range []string{
+		"Prints 'healthy' and exits 0",
+		"exits 1 with a reason",
+	} {
+		if !strings.Contains(flat, want) {
+			t.Fatalf("health --help missing %q:\n%s", want, out)
+		}
+	}
+	for _, unwanted := range []string{"control socket", "Redis consumer", "configured networks"} {
+		if strings.Contains(out, unwanted) {
+			t.Fatalf("health --help must not expose architecture details (%q):\n%s", unwanted, out)
+		}
+	}
+}
+
 // The health command exits 2 on extra args.
 func TestHealthArgError(t *testing.T) {
 	_, _, err := runCLI(t, "", "health", "extra")

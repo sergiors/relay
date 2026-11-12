@@ -32,17 +32,16 @@ const invokeStdinArg = "-"
 func appInvokeCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:      "invoke",
-		Usage:     "Invoke an app's matching event handlers",
-		UsageText: "relay app invoke NAME [JSON|-]",
-		Description: "Run every event rule of NAME whose pattern matches the supplied event, " +
-			"synchronously, on the RUNNING worker's live runtime pool. Pass the event as a " +
-			"positional JSON object, or use - to read it from stdin (for example a redirected " +
-			"file). A bare NAME is a usage error; stdin is never read implicitly. The worker " +
-			"reports how many handlers it invoked. Manual invocation never writes " +
-			"stream/retry/DLQ state.",
+		Usage:     "Invoke an app's matching handlers",
+		UsageText: "relay app invoke NAME JSON|-",
+		Description: "Run all handlers of NAME whose patterns match the event, synchronously " +
+			"on the running worker. Pass the event as a JSON object, or use - to read it from " +
+			"stdin; stdin is never read implicitly. Requires a running worker. Manual " +
+			"invocations bypass retries and the dead-letter queue; the worker reports how " +
+			"many handlers ran.",
 		Arguments: []cli.Argument{
 			&cli.StringArgs{Name: "name", Min: 1, Max: 1, UsageText: "NAME"},
-			&cli.StringArgs{Name: "event", Min: 0, Max: 1, UsageText: "[JSON|-]"},
+			&cli.StringArgs{Name: "event", Min: 0, Max: 1, UsageText: "JSON|-"},
 		},
 		StopOnNthArg: stopOnFirstPositional(),
 		Action: func(ctx context.Context, cmd *cli.Command) error {

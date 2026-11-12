@@ -273,18 +273,37 @@ func TestSecretHelp(t *testing.T) {
 	}
 }
 
-// TestSecretSetHelp verifies `secret set --help` documents the stdin marker and
-// the interactive-terminal requirement.
+// TestSecretSetHelp verifies `secret set --help` documents the stdin marker,
+// the interactive value entry, and the local-provider-only scope that guards
+// against assuming values reach an external provider.
 func TestSecretSetHelp(t *testing.T) {
 	deps := newSecretDepsOnly(t)
 	out, _, err := runSecretCLI(t, deps, "", "secret", "set", "--help")
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
-	for _, want := range []string{"relay secret set NAME [-]", "interactive terminal", "stdin"} {
+	for _, want := range []string{
+		"relay secret set NAME [-]",
+		"interactively",
+		"stdin",
+		"local provider only",
+	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("help missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// TestSecretRmHelp pins `secret rm --help` usage syntax: NAME is the required
+// positional and the help stays reachable without a provider configured.
+func TestSecretRmHelp(t *testing.T) {
+	deps := newSecretDepsOnly(t)
+	out, _, err := runSecretCLI(t, deps, "", "secret", "rm", "--help")
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if !strings.Contains(out, "relay secret rm NAME") {
+		t.Fatalf("help missing rm usage syntax:\n%s", out)
 	}
 }
 
