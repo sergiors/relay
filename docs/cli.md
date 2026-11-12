@@ -147,6 +147,7 @@ Runs matching handlers synchronously on the running worker without publishing a
 stream message:
 
 ```sh
+# MongoDB CDC event; use tableName instead for PostgreSQL CDC.
 relay app invoke my-app '{"recordType":"INSERT","collectionName":"users"}'
 relay app invoke my-app - < event.json
 ```

@@ -40,7 +40,9 @@ Use Debezium Server's Redis sink in `extended` format:
 `value`; compact format is not supported. MongoDB and PostgreSQL records may use
 schema-enabled or schemaless JSON.
 
-Relay normalizes supported changes to exactly this handler event:
+Relay normalizes supported changes to a handler event with the same common fields
+for both connectors. The connector-specific name field is `collectionName` for
+MongoDB and `tableName` for PostgreSQL. For example, a MongoDB event is:
 
 ```json
 {
@@ -51,12 +53,24 @@ Relay normalizes supported changes to exactly this handler event:
 }
 ```
 
-`source.collection` (MongoDB) or `source.table` (PostgreSQL) supplies
-`collectionName`. Operations `c`, `u`, and `d` become `INSERT`, `UPDATE`, and
-`DELETE`. Snapshot operation `r` becomes `INSERT`; it represents an existing
-captured row, not a new database write. Each document image is an object or
-`null`; a missing image remains `null`. Invalid recognized changes are
-dead-lettered rather than treated as raw events.
+The corresponding PostgreSQL event uses `tableName` instead:
+
+```json
+{
+  "tableName": "users",
+  "recordType": "UPDATE",
+  "newImage": {},
+  "oldImage": null
+}
+```
+
+`source.collection` (MongoDB) supplies `collectionName`; `source.table`
+(PostgreSQL) supplies `tableName`. The other normalized fields are the same.
+Operations `c`, `u`, and `d` become `INSERT`, `UPDATE`, and `DELETE`. Snapshot
+operation `r` becomes `INSERT`; it represents an existing captured row, not a
+new database write. Each document image is an object or `null`; a missing image
+remains `null`. Invalid recognized changes are dead-lettered rather than treated
+as raw events.
 
 MongoDB Extended JSON values are normalized recursively before matching and
 execution:
@@ -93,7 +107,8 @@ dead-lettered and never matched as ordinary events. The handler receives only
 
 ## Event matching
 
-Declare event rules in an app's `template.yaml`:
+Declare event rules in an app's `template.yaml`. This MongoDB CDC example matches
+`collectionName`; for PostgreSQL CDC, use `tableName` in its place:
 
 ```yaml
 events:

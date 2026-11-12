@@ -177,26 +177,63 @@ func mongoImage(t *testing.T, doc map[string]any) string {
 	return string(compactJSON(t, doc))
 }
 
-// assertFourFieldCDCEvent pins the normalized output shape: exactly
-// collectionName/recordType/newImage/oldImage, with JSON-comparable images.
-func assertFourFieldCDCEvent(t *testing.T, event map[string]any, collection, recordType string, newImage, oldImage any) {
+// The connector-specific location keys of a normalized CDC event: exactly one
+// is exposed per event — PostgreSQL's table or MongoDB's collection, never
+// both and never neither.
+const (
+	pgLocationKey    = "tableName"
+	mongoLocationKey = "collectionName"
+)
+
+// assertFourFieldCDCEvent pins the normalized output shape: exactly four
+// fields — recordType, newImage, oldImage, and the connector-specific location
+// key named by locationKey — with the opposite connector's location key
+// absent and JSON-comparable images.
+func assertFourFieldCDCEvent(t *testing.T, event map[string]any,
+	locationKey, location, recordType string, newImage, oldImage any,
+) {
 	t.Helper()
+	var oppositeKey string
+	switch locationKey {
+	case pgLocationKey:
+		oppositeKey = mongoLocationKey
+	case mongoLocationKey:
+		oppositeKey = pgLocationKey
+	default:
+		t.Fatalf("test bug: unknown connector location key %q", locationKey)
+	}
 	if len(event) != 4 {
 		t.Fatalf("event fields = %d (%v), want exactly the normalized four", len(event), event)
 	}
-	for _, key := range []string{"collectionName", "recordType", "newImage", "oldImage"} {
+	for _, key := range []string{locationKey, "recordType", "newImage", "oldImage"} {
 		if _, ok := event[key]; !ok {
 			t.Fatalf("event is missing the normalized field %q: %v", key, event)
 		}
 	}
-	if event["collectionName"] != collection {
-		t.Fatalf("collectionName = %v, want %q", event["collectionName"], collection)
+	if _, ok := event[oppositeKey]; ok {
+		t.Fatalf("event exposes the opposite connector's key %q (only %q is the location key): %v",
+			oppositeKey, locationKey, event)
+	}
+	if event[locationKey] != location {
+		t.Fatalf("%s = %v, want %q", locationKey, event[locationKey], location)
 	}
 	if event["recordType"] != recordType {
 		t.Fatalf("recordType = %v, want %q", event["recordType"], recordType)
 	}
 	assertImage(t, "newImage", event["newImage"], newImage)
 	assertImage(t, "oldImage", event["oldImage"], oldImage)
+}
+
+// assertNoCDCNormalization pins that a decoded event carries neither
+// connector's location key: it was never CDC-normalized, so no claim-path
+// output field of either connector can appear.
+func assertNoCDCNormalization(t *testing.T, event map[string]any) {
+	t.Helper()
+	for _, key := range []string{pgLocationKey, mongoLocationKey} {
+		if _, ok := event[key]; ok {
+			t.Fatalf("Event = %v, want NO CDC normalization (found %q)", event, key)
+		}
+	}
 }
 
 // assertImage compares one normalized image against the expectation: nil, a
@@ -291,9 +328,7 @@ func TestDecodeFormatRawOverridesStructure(t *testing.T) {
 		if _, ok := res.Event["schema"]; !ok {
 			t.Fatalf("Event = %v, want the whole record including its schema", res.Event)
 		}
-		if _, ok := res.Event["collectionName"]; ok {
-			t.Fatalf("Event = %v, want NO CDC normalization under format=raw", res.Event)
-		}
+		assertNoCDCNormalization(t, res.Event)
 	})
 
 	t.Run("schedule-shaped value stays raw", func(t *testing.T) {
@@ -349,9 +384,7 @@ func TestDecodeFormatRawOverridesStructure(t *testing.T) {
 		if _, ok := res.Event["source"]; !ok {
 			t.Fatalf("Event = %v, want the truncated record verbatim", res.Event)
 		}
-		if _, isCDC := res.Event["collectionName"]; isCDC {
-			t.Fatalf("Event = %v, want NO CDC claim path under format=raw", res.Event)
-		}
+		assertNoCDCNormalization(t, res.Event)
 	})
 }
 
@@ -708,8 +741,9 @@ func TestDecodeTombstoneRequiresExactSentinel(t *testing.T) {
 // TestDecodePostgresSchemaEnabledAndSchemaless pins the full normalized CDC
 // contract for Debezium 3.7 PostgreSQL fixtures: schema-enabled (the sink's
 // converter with `debezium.format.*.schemas.enable=true`) and schemaless
-// records of every operation normalize to exactly the four exposed fields,
-// with the table as the collection name and snapshot reads as INSERTs.
+// records of every operation normalize to exactly the four exposed fields —
+// tableName/recordType/newImage/oldImage, never collectionName — with the
+// table under tableName and snapshot reads as INSERTs.
 func TestDecodePostgresSchemaEnabledAndSchemaless(t *testing.T) {
 	type change struct {
 		name    string
@@ -763,7 +797,7 @@ func TestDecodePostgresSchemaEnabledAndSchemaless(t *testing.T) {
 					if res.Kind != KindEvent {
 						t.Fatalf("Kind = %v, want KindEvent", res.Kind)
 					}
-					assertFourFieldCDCEvent(t, res.Event,
+					assertFourFieldCDCEvent(t, res.Event, pgLocationKey,
 						"customers", ch.recType, ch.newExp, ch.oldExp)
 					// The replay payload is byte-identical to what the handler
 					// receives live: the canonical four-field JSON.
@@ -821,7 +855,8 @@ func TestDecodeMongoSchemaEnabledAndSchemaless(t *testing.T) {
 					if res.Kind != KindEvent {
 						t.Fatalf("Kind = %v", res.Kind)
 					}
-					assertFourFieldCDCEvent(t, res.Event, "orders", tc.rec, tc.newP, tc.oldP)
+					assertFourFieldCDCEvent(t, res.Event, mongoLocationKey,
+						"orders", tc.rec, tc.newP, tc.oldP)
 					if string(res.Payload) != string(compactJSON(t, res.Event)) {
 						t.Fatalf("Payload = %s, want the canonical event", res.Payload)
 					}
@@ -844,18 +879,22 @@ func TestDecodeMongoSchemaEnabledAndSchemaless(t *testing.T) {
 	})
 }
 
-// TestDecodeSourceLocationSelectsCollectionOrTable pins the collection-name
-// rule per connector: MongoDB reads source.collection, PostgreSQL reads
-// source.table.
+// TestDecodeSourceLocationSelectsCollectionOrTable pins the connector-specific
+// location-key rule: PostgreSQL exposes source.table as tableName (never
+// collectionName), MongoDB exposes source.collection as collectionName (never
+// tableName).
 func TestDecodeSourceLocationSelectsCollectionOrTable(t *testing.T) {
-	t.Run("postgresql table becomes collectionName", func(t *testing.T) {
+	t.Run("postgresql table becomes tableName", func(t *testing.T) {
 		res, err := Decode("",
 			compactJSON(t, pgChange("c", nil, pgCustomersRow(1, ""), "shipments")))
 		if err != nil {
 			t.Fatalf("Decode: %v", err)
 		}
-		if res.Event["collectionName"] != "shipments" {
-			t.Fatalf("collectionName = %v, want the table", res.Event["collectionName"])
+		if res.Event[pgLocationKey] != "shipments" {
+			t.Fatalf("tableName = %v, want the table", res.Event[pgLocationKey])
+		}
+		if _, ok := res.Event[mongoLocationKey]; ok {
+			t.Fatalf("a PostgreSQL event must not expose %q: %v", mongoLocationKey, res.Event)
 		}
 	})
 
@@ -865,8 +904,11 @@ func TestDecodeSourceLocationSelectsCollectionOrTable(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Decode: %v", err)
 		}
-		if res.Event["collectionName"] != "shipments" {
-			t.Fatalf("collectionName = %v, want the collection", res.Event["collectionName"])
+		if res.Event[mongoLocationKey] != "shipments" {
+			t.Fatalf("collectionName = %v, want the collection", res.Event[mongoLocationKey])
+		}
+		if _, ok := res.Event[pgLocationKey]; ok {
+			t.Fatalf("a MongoDB event must not expose %q: %v", pgLocationKey, res.Event)
 		}
 	})
 }

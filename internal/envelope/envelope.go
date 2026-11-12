@@ -302,7 +302,7 @@ func decodeDebezium(payload map[string]any, raw []byte) (Result, error) {
 	if !ok {
 		return Result{}, fmt.Errorf("debezium: unsupported op %q", op)
 	}
-	collection, err := collectionName(source, connector)
+	locationField, location, err := sourceLocation(source, connector)
 	if err != nil {
 		return Result{}, err
 	}
@@ -315,10 +315,10 @@ func decodeDebezium(payload map[string]any, raw []byte) (Result, error) {
 		return Result{}, err
 	}
 	event := map[string]any{
-		"collectionName": collection,
-		"recordType":     recordType,
-		"newImage":       newImage,
-		"oldImage":       oldImage,
+		locationField: location,
+		"recordType":  recordType,
+		"newImage":    newImage,
+		"oldImage":    oldImage,
 	}
 	data, err := json.Marshal(event)
 	if err != nil {
@@ -342,24 +342,29 @@ func recordTypeForOp(op string) (string, bool) {
 	}
 }
 
-func collectionName(source map[string]any, connector string) (string, error) {
+// sourceLocation returns the connector-specific output field and value for the
+// normalized source location. MongoDB exposes its collection as collectionName;
+// PostgreSQL exposes its table as tableName. Exactly one is emitted.
+func sourceLocation(source map[string]any, connector string) (
+	field, value string, err error,
+) {
 	switch connector {
 	case connectorMongoDB:
 		collection, ok := source["collection"].(string)
 		if !ok || collection == "" {
-			return "", fmt.Errorf(
+			return "", "", fmt.Errorf(
 				"debezium: mongodb source has no collection name")
 		}
-		return collection, nil
+		return "collectionName", collection, nil
 	case connectorPostgreSQL:
 		table, ok := source["table"].(string)
 		if !ok || table == "" {
-			return "", fmt.Errorf(
+			return "", "", fmt.Errorf(
 				"debezium: postgresql source has no table name")
 		}
-		return table, nil
+		return "tableName", table, nil
 	default:
-		return "", fmt.Errorf(
+		return "", "", fmt.Errorf(
 			"debezium: unsupported source connector %q", connector)
 	}
 }

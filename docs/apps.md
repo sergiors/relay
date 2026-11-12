@@ -28,6 +28,9 @@ or invalid template is logged and skipped without stopping the worker.
 
 ## Template schema
 
+The event rule below shows MongoDB CDC's `collectionName`; for PostgreSQL CDC,
+use `tableName` instead. The other normalized event fields are the same.
+
 ```yaml
 runtime: python3.14 # required for events/schedules and entrypoint services
 concurrency: 2 # optional, default 2

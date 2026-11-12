@@ -549,7 +549,7 @@ func TestMongoRecursiveNormalizationThroughDecode(t *testing.T) {
 		"_id":  "663c9c0f0000000000000ddd",
 		"note": dateOfMillis(1767200000000),
 	}
-	assertFourFieldCDCEvent(t, res.Event, "orders", "UPDATE", wantNew, wantOld)
+	assertFourFieldCDCEvent(t, res.Event, mongoLocationKey, "orders", "UPDATE", wantNew, wantOld)
 
 	// Exact Go types the matcher will see: integers are int64, doubles are
 	// float64, dates are plain strings.
@@ -605,7 +605,7 @@ func TestMongoObjectImageNormalizesPlainNumbers(t *testing.T) {
 	if n, ok := newImage["beyond"].(json.Number); !ok || n.String() != "18446744073709551616" {
 		t.Fatalf("beyond = %v (%T), want exact json.Number", newImage["beyond"], newImage["beyond"])
 	}
-	assertFourFieldCDCEvent(t, res.Event, "orders", "INSERT", newImage, nil)
+	assertFourFieldCDCEvent(t, res.Event, mongoLocationKey, "orders", "INSERT", newImage, nil)
 }
 
 // TestMongoMalformedWrapperInImageFailsNonRetryably pins the image-level error
@@ -648,7 +648,7 @@ func TestMongoMalformedWrapperInImageFailsNonRetryably(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Decode: %v", err)
 		}
-		assertFourFieldCDCEvent(t, res.Event, "orders", "INSERT", want, nil)
+		assertFourFieldCDCEvent(t, res.Event, mongoLocationKey, "orders", "INSERT", want, nil)
 	})
 
 	t.Run("malformed numeric wrappers inside image are preserved, not errors", func(t *testing.T) {
@@ -661,7 +661,7 @@ func TestMongoMalformedWrapperInImageFailsNonRetryably(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Decode: %v", err)
 		}
-		assertFourFieldCDCEvent(t, res.Event, "orders", "INSERT", doc, nil)
+		assertFourFieldCDCEvent(t, res.Event, mongoLocationKey, "orders", "INSERT", doc, nil)
 	})
 
 	t.Run("date-only image is not a document image", func(t *testing.T) {
@@ -702,8 +702,9 @@ func TestMongoNormalizationDoesNotTouchOtherSources(t *testing.T) {
 			t.Fatalf("Decode: %v", err)
 		}
 		// Every wrapper survives: PostgreSQL decoding does not normalize, and
-		// its numbers keep the plain-json.Unmarshal float64 semantics.
-		assertFourFieldCDCEvent(t, res.Event, "customers", "UPDATE", after, pgCustomersRow(1, "old@acme.com"))
+		// its numbers keep the plain-json.Unmarshal float64 semantics. The
+		// table travels under tableName, never collectionName.
+		assertFourFieldCDCEvent(t, res.Event, pgLocationKey, "customers", "UPDATE", after, pgCustomersRow(1, "old@acme.com"))
 	})
 
 	t.Run("raw event wrappers are preserved", func(t *testing.T) {
@@ -733,8 +734,8 @@ func TestMongoNormalizationDoesNotTouchOtherSources(t *testing.T) {
 		if res.Event["after"] != after {
 			t.Fatalf("after image = %v, want the raw JSON string verbatim", res.Event["after"])
 		}
-		if _, isCDC := res.Event["collectionName"]; isCDC {
-			t.Fatalf("Event = %v, want NO CDC normalization under format=raw", res.Event)
-		}
+		// format=raw is not CDC-normalized: neither connector's location
+		// field may be added, whichever connector the payload mimics.
+		assertNoCDCNormalization(t, res.Event)
 	})
 }

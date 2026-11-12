@@ -103,7 +103,9 @@ recovery details, and [Operations](docs/operations.md) for deployment guidance.
 
 Each app is a direct child of `/apps` and contains a `template.yaml`.
 
-A small event-driven app might look like:
+A small event-driven app might look like this MongoDB CDC example. PostgreSQL
+CDC uses `tableName: [users]` instead of `collectionName: [users]`; the other
+normalized event fields are the same.
 
 ```yaml
 runtime: nodejs24.x

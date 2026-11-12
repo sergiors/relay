@@ -5,4 +5,4 @@ events:
   - handler: handler.handler
     pattern:
       recordType: [INSERT]
-      collectionName: [users]
+      tableName: [users]

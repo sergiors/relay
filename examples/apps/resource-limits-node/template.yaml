@@ -15,4 +15,5 @@ events:
   - handler: handler.handler
     pattern:
       recordType: [INSERT]
+      # MongoDB CDC field; PostgreSQL CDC uses tableName instead.
       collectionName: [users]

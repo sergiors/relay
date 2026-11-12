@@ -13,9 +13,11 @@
 //   - Envelope decoding: each entry carries its payload in `value`, with an
 //     optional `format=raw` marker; every other field is ignored. The
 //     internal/envelope package decodes raw JSON, schedule envelopes, and
-//     Debezium changes (normalized to collectionName/recordType/newImage/
-//     oldImage) before this package classifies or matches anything. A confirmed
-//     Debezium tombstone is acknowledged without execution.
+//     Debezium changes (normalized to one connector-specific location field —
+//     collectionName for MongoDB, tableName for PostgreSQL — plus
+//     recordType/newImage/oldImage) before this package classifies or matches
+//     anything. A confirmed Debezium tombstone is acknowledged without
+//     execution.
 //   - Schedule occurrences: messages whose decode is recognized as a schedule
 //     envelope (see internal/schedule) ride this same consumer-group / PEL /
 //     XAUTOCLAIM / retry / DLQ machinery but bypass event matching: when a

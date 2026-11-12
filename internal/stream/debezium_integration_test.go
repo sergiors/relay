@@ -173,8 +173,8 @@ func (e *testEnv) xaddDebezium(
 // TestIntegrationDebeziumPostgresCreateRoutesNormalizedEvent pins the full
 // schema-enabled PostgreSQL path: the entry (the record `key` riding beside
 // `value`/headers, exactly as the sink writes, ignored by Relay) is normalized
-// to the four exposed fields with the table as the collection name, handed to
-// the matcher, and acknowledged.
+// to the four exposed fields with the table exposed as tableName (never
+// collectionName), handed to the matcher, and acknowledged.
 func TestIntegrationDebeziumPostgresCreateRoutesNormalizedEvent(t *testing.T) {
 	testutil.RequireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
@@ -182,10 +182,10 @@ func TestIntegrationDebeziumPostgresCreateRoutesNormalizedEvent(t *testing.T) {
 	value := dbzSchemaValue(t, dbzChange("c", nil,
 		dbzCustomersRow(1, "sally.thomas@acme.com"), dbzPostgresSource("customers")))
 	want := expectEventJSON(t, map[string]any{
-		"collectionName": "customers",
-		"recordType":     "INSERT",
-		"newImage":       dbzCustomersRow(1, "sally.thomas@acme.com"),
-		"oldImage":       nil,
+		"tableName":  "customers",
+		"recordType": "INSERT",
+		"newImage":   dbzCustomersRow(1, "sally.thomas@acme.com"),
+		"oldImage":   nil,
 	})
 
 	id := e.xaddDebezium(t, dbzSchemaKey(t, map[string]any{"id": 1}), value,
@@ -228,7 +228,7 @@ func TestIntegrationDebeziumUpdateAndSnapshotRead(t *testing.T) {
 			name:  "update",
 			value: schemaless(change("u", dbzCustomersRow(11, "old@acme.com"), dbzCustomersRow(11, "new@acme.com"))),
 			want: expectEventJSON(t, map[string]any{
-				"collectionName": "orders", "recordType": "UPDATE",
+				"tableName": "orders", "recordType": "UPDATE",
 				"newImage": dbzCustomersRow(11, "new@acme.com"),
 				"oldImage": dbzCustomersRow(11, "old@acme.com"),
 			}),
@@ -237,7 +237,7 @@ func TestIntegrationDebeziumUpdateAndSnapshotRead(t *testing.T) {
 			name:  "snapshot-read",
 			value: schemaless(change("r", nil, dbzCustomersRow(12, "fred@acme.com"))),
 			want: expectEventJSON(t, map[string]any{
-				"collectionName": "orders", "recordType": "INSERT",
+				"tableName": "orders", "recordType": "INSERT",
 				"newImage": dbzCustomersRow(12, "fred@acme.com"), "oldImage": nil,
 			}),
 		},
@@ -245,7 +245,7 @@ func TestIntegrationDebeziumUpdateAndSnapshotRead(t *testing.T) {
 			name:  "delete",
 			value: schemaless(change("d", dbzCustomersRow(13, "kate@acme.com"), nil)),
 			want: expectEventJSON(t, map[string]any{
-				"collectionName": "orders", "recordType": "DELETE",
+				"tableName": "orders", "recordType": "DELETE",
 				"newImage": nil,
 				"oldImage": dbzCustomersRow(13, "kate@acme.com"),
 			}),
@@ -614,10 +614,10 @@ func TestIntegrationDebeziumExhaustedEntryCarriesReplayPayload(t *testing.T) {
 	value := dbzSchemaValue(t, dbzChange("c", nil,
 		dbzCustomersRow(9, "replay@acme.com"), dbzPostgresSource("customers")))
 	want := expectEventJSON(t, map[string]any{
-		"collectionName": "customers",
-		"recordType":     "INSERT",
-		"newImage":       dbzCustomersRow(9, "replay@acme.com"),
-		"oldImage":       nil,
+		"tableName":  "customers",
+		"recordType": "INSERT",
+		"newImage":   dbzCustomersRow(9, "replay@acme.com"),
+		"oldImage":   nil,
 	})
 	id := e.xaddDebezium(t, dbzSchemaKey(t, map[string]any{"id": 9}), value, nil)
 
