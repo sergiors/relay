@@ -29,7 +29,8 @@ Run `relay <command> --help` for flags. `relay apps` is an alias for
 | `runtime ls`, `runtime inspect`      | PostgreSQL (`DATABASE_URL`)                     |
 | `runtime check`, `runtime update`    | PostgreSQL and Docker Engine (Distribution API) |
 | `dlq ls`, `dlq inspect`, `dlq rm`    | PostgreSQL (`DATABASE_URL`)                     |
-| `secret *`                           | Local Relay data directory                      |
+| `secret ls`                          | Active secret provider and its configuration    |
+| `secret set`, `secret rm`            | Local provider only                             |
 | `git *`                              | Local Git configuration and `/apps`             |
 
 `health` and `app invoke` communicate with the worker over its local control
@@ -198,8 +199,14 @@ printf '%s' 'value' | relay secret set API_KEY -
 docker compose exec -T relay relay secret set API_KEY - < value.txt
 ```
 
-Secret values are never accepted as positional arguments or printed. They are
-stored under `/var/lib/relay/secrets`; templates reference them by name.
+`secret ls` lists names from the single active provider: local files by default,
+or Infisical when configured. It does not display secret values. `secret set` and
+`secret rm` operate only on local files under `/var/lib/relay/secrets` and fail
+when Infisical is active. Manage Infisical secrets in Infisical. Relay uses only
+one provider at a time and does not fall back between providers. Secret values
+are never accepted as positional arguments or printed. See
+[Installation](installation.md#infisical-provider) for Infisical deployment
+guidance and [Configuration](configuration.md) for provider settings.
 
 ## relay git
 

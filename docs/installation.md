@@ -47,6 +47,64 @@ to host root. Workload-container hardening is not protection against a
 compromised Relay process. Consult [configuration](configuration.md) before
 changing the networks.
 
+### Infisical provider
+
+To use Infisical for template secret references:
+
+1. In Infisical, select the project, environment, and secret path Relay should
+   read. Create a Machine Identity, enable Universal Auth, and issue its client
+   ID and client secret.
+2. Grant that identity read-only access limited to the required project,
+   environment, and path. It does not need write access.
+3. Provide the settings below to the Relay service. Keep the client secret in a
+   protected deployment environment or secret manager; do not commit it in
+   Compose files or `.env` files.
+
+Relay uses Infisical Cloud by default. For self-hosted Infisical, set
+`INFISICAL_SITE_URL` to its HTTPS origin; certificate verification remains
+enabled. See [Configuration](configuration.md) for defaults and conditional
+requirements.
+
+Add this environment wiring to the Relay service in Compose:
+
+```yaml
+services:
+  relay:
+    environment:
+      SECRETS_PROVIDER: infisical
+      INFISICAL_SITE_URL: ${INFISICAL_SITE_URL:-https://app.infisical.com}
+      INFISICAL_PROJECT_ID: ${INFISICAL_PROJECT_ID:?required}
+      INFISICAL_ENVIRONMENT: ${INFISICAL_ENVIRONMENT:?required}
+      INFISICAL_SECRET_PATH: ${INFISICAL_SECRET_PATH:-/}
+      INFISICAL_CLIENT_ID: ${INFISICAL_CLIENT_ID:?required}
+      INFISICAL_CLIENT_SECRET: ${INFISICAL_CLIENT_SECRET:?required}
+```
+
+Supply the interpolated values through the deployment environment or its secret
+manager. Compose passes the client secret to the Relay process; protect access
+to the process environment and rendered Compose configuration.
+
+Templates keep the same provider-neutral syntax. The reference is resolved
+from the configured Infisical project, environment, and path:
+
+```yaml
+runtime: nodejs24.x
+
+secrets:
+  API_TOKEN: api-token
+
+events:
+  - handler: handler.handler
+    pattern:
+      recordType: [INSERT]
+```
+
+`relay secret ls` lists names from the selected provider; with Infisical active,
+it lists names from the configured Infisical scope without displaying values.
+`relay secret set` and `relay secret rm` manage local files under
+`/var/lib/relay/secrets` only, and fail when Infisical is selected. Manage
+Infisical secrets in Infisical.
+
 From the repository root, verify all referenced observability sources are
 present and review their contents:
 
@@ -141,13 +199,17 @@ and does not publish to Redis. Event-driven handlers require events to be
 published to the configured Redis stream. `health` and `app invoke` require a
 live worker.
 
-Set a secret with a hidden interactive prompt, then confirm its name is listed
-(secret values are not shown):
+With the local provider active, set a secret with a hidden interactive prompt,
+then confirm its name is listed (secret values are not shown):
 
 ```sh
 docker compose -f compose.prod.yaml exec -it relay relay secret set API_KEY
 docker compose -f compose.prod.yaml exec -T relay relay secret ls
 ```
+
+`relay secret set` applies only to the local provider. With Infisical active,
+`relay secret ls` lists names from Infisical, while `set` and `rm` fail; use
+Infisical itself to manage those secrets. Only one provider is active at a time.
 
 For a dead-letter entry, copy the full ID shown by `relay dlq ls` (64 lowercase
 hexadecimal characters). Run

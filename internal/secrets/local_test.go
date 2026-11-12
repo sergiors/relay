@@ -177,6 +177,49 @@ func TestLocalListMissingDir(t *testing.T) {
 	}
 }
 
+// The LocalProvider exposes listing through the Lister capability: sorted
+// names only, with subdirectories skipped exactly like the store contract.
+func TestLocalProviderListReturnsSortedNames(t *testing.T) {
+	s := newTestStore(t)
+	for _, n := range []string{"zeta", "alpha", "mid"} {
+		if err := s.Set(context.Background(), n, "v-"+n); err != nil {
+			t.Fatalf("set %s: %v", n, err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(s.Dir(), "subdir"), 0o700); err != nil {
+		t.Fatalf("mkdir subdir: %v", err)
+	}
+	p, err := NewLocalProvider(s.Dir())
+	if err != nil {
+		t.Fatalf("new provider: %v", err)
+	}
+
+	names, err := p.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if got := strings.Join(names, ","); got != "alpha,mid,zeta" {
+		t.Fatalf("names = %q, want alpha,mid,zeta", got)
+	}
+}
+
+// A missing directory lists as an empty result, never an error, so `secret
+// ls` renders an empty table on a fresh installation.
+func TestLocalProviderListMissingDirIsEmpty(t *testing.T) {
+	p, err := NewLocalProvider(filepath.Join(t.TempDir(), "missing"))
+	if err != nil {
+		t.Fatalf("new provider: %v", err)
+	}
+
+	names, err := p.List(context.Background())
+	if err != nil {
+		t.Fatalf("List over a missing dir: %v", err)
+	}
+	if len(names) != 0 {
+		t.Fatalf("names = %v, want an empty list", names)
+	}
+}
+
 // pemValue is a canonical PEM-shaped private-key fixture (header/footer,
 // multiple internal newlines, a blank line, and an indented value with double
 // spaces). It is deliberately inert — not a real RSA key — so printing it in a

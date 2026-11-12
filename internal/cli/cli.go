@@ -152,6 +152,12 @@ type Dependencies struct {
 	// SecretsDir is the local secret-store directory the `relay secret`
 	// commands read and write. Production: secrets.SecretsDir.
 	SecretsDir string
+	// OpenSecretProvider constructs the active secret provider for
+	// `relay secret ls`. It is lazy: `secret set` and `secret rm` validate the
+	// selected provider without constructing a client or touching the network.
+	// Nil uses the production configuration loader; production wires
+	// openConfiguredSecretProvider, and tests may inject a fake.
+	OpenSecretProvider func(localDir string) (secrets.Provider, error)
 	// Start runs the long-running Relay lifecycle `relay start` delegates to.
 	// Production: worker.Run.
 	Start StartRun
@@ -179,6 +185,7 @@ func DefaultDependencies() Dependencies {
 		GitSSHDir:                git.SSHDir,
 		GitAppsDir:               app.Dir,
 		SecretsDir:               secrets.SecretsDir,
+		OpenSecretProvider:       openConfiguredSecretProvider,
 		Start:                    worker.Run,
 		OpenDLQ:                  openPostgresDLQStore,
 	}

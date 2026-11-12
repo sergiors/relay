@@ -15,9 +15,11 @@ import (
 
 // Config holds the worker's environment-resolved settings, assembled by Load at
 // worker startup. The administrative CLI commands do not build a Config; they
-// resolve only the values they need through the narrow LoadDatabaseURL loader.
-// Every field maps to a single environment variable,
-// except the always-generated per-process InstanceID (see below). Application
+// resolve only the values they need through the narrow LoadDatabaseURL and
+// LoadSecretsConfig loaders.
+// Most fields map to a single environment variable; the grouped Secrets
+// configuration maps the SECRETS_PROVIDER and INFISICAL_* variables, and the
+// always-generated per-process InstanceID maps to none (see below). Application
 // code should consume resolved values instead of reading environment variables
 // directly.
 //
@@ -25,7 +27,8 @@ import (
 // consumes, the PostgreSQL state DSN (DATABASE_URL), and the worker's stable
 // node identity (NODE_ID, surfaced as NodeID); the address values (MetricsAddr,
 // GitWebhookAddr) are empty when disabled, so gating on non-empty keeps them
-// opt-in.
+// opt-in. Secrets selects the worker-wide secret resolver; only the selected
+// provider's settings are populated.
 type Config struct {
 	RedisURI    string
 	RedisStream string
@@ -103,6 +106,13 @@ type Config struct {
 	// separate git.Sync entry; the webhook server only schedules a sync through
 	// the coalescing trigger in internal/git/webhook, never in the request path.
 	GitWebhookAddr string
+	// Secrets selects where the worker resolves template secret references
+	// (SECRETS_PROVIDER): "local" (the default) reads the local files under
+	// secrets.SecretsDir, while "infisical" resolves names through an
+	// Infisical project using Universal Auth. It is resolved and validated
+	// once by Load; an unknown value fails startup rather than falling back.
+	// Only the selected provider's settings are populated.
+	Secrets SecretsConfig
 	// MaxConcurrentInvocations is the MAX_CONCURRENT_INVOCATIONS value (default
 	// 8): the total number of app invocations executing concurrently in this
 	// single Relay worker. Values below the default fall back in the runner (see
@@ -356,6 +366,14 @@ const (
 // MAX_WARM_CONTAINERS defaults to 8; an invalid (zero, negative, non-integer,
 // or above-limit) value is a returned configuration error. The retention
 // windows instead log-and-disable rather than failing startup.
+//
+// SECRETS_PROVIDER defaults to "local". Selecting "infisical" additionally
+// requires INFISICAL_PROJECT_ID, INFISICAL_ENVIRONMENT, INFISICAL_CLIENT_ID,
+// and INFISICAL_CLIENT_SECRET; INFISICAL_SITE_URL defaults to the Infisical
+// Cloud https origin and INFISICAL_SECRET_PATH to "/". The site URL must be
+// https (Relay never disables certificate verification) and any missing
+// required setting is a returned error naming the variable, never a fallback
+// to local secret files.
 func Load(logger *slog.Logger) (Config, error) {
 	var cfg Config
 
@@ -420,6 +438,12 @@ func Load(logger *slog.Logger) (Config, error) {
 	cfg.StatsRetention = retentionEnv(logger, "STATS_RETENTION", DefaultStatsRetention)
 	cfg.MetricsAddr = getEnv("METRICS_ADDR", "")
 	cfg.GitWebhookAddr = getEnv("GIT_WEBHOOK_ADDR", "")
+
+	secretsCfg, err := LoadSecretsConfig()
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Secrets = secretsCfg
 
 	if _, err := ParseLogLevel(getEnv("LOG_LEVEL", "INFO")); err != nil {
 		return Config{}, err

@@ -27,8 +27,12 @@ func runSecretCLI(t *testing.T, deps Dependencies, stdin string, args ...string)
 // temp dir, together with a store over that dir (for seeding and assertions)
 // and the dir itself. It replaces the former secretsPath package var: the
 // store's directory and the CLI's directory are the same injected value.
+// Provider selection is pinned to the local default so an ambient
+// SECRETS_PROVIDER can never change these fixtures; tests exercising another
+// provider override the environment after this call.
 func newSecretDeps(t *testing.T) (Dependencies, *secrets.LocalStore, string) {
 	t.Helper()
+	pinLocalSecretsProvider(t)
 	dir := filepath.Join(t.TempDir(), "secrets")
 	store, err := secrets.NewLocal(dir)
 	if err != nil {

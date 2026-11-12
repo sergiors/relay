@@ -196,14 +196,38 @@ printing secrets.
 
 ## Secrets
 
-Secrets are stored as local files under `/var/lib/relay/secrets` and referenced
-by name in app templates. Values are not stored in PostgreSQL, images, labels,
-or Relay logs, and `relay app inspect` shows references only. Rotations apply to
-the next function invocation or service reconciliation.
+The default `local` provider reads files under `/var/lib/relay/secrets`. The
+optional Infisical provider uses Universal Auth with a Machine Identity and
+resolves the same provider-neutral secret references used by app templates. See
+[Installation](installation.md#infisical-provider) for setup and
+[Configuration](configuration.md) for its environment variables.
 
+Relay validates Infisical configuration at startup but does not contact
+Infisical until a secret is needed. Each worker has its own provider instance,
+access token, and five-minute cache. A value is refreshed after its cache entry
+expires; an expired value is never served as a fallback. Rotation is therefore
+visible on a subsequent resolution after cache expiry, not immediately. If
+Infisical is unavailable or rejects the request, secret resolution fails closed:
+functions do not run without the value, and service reconciliation preserves a
+healthy existing container when replacement cannot resolve its environment.
+Workers may observe a rotation at different times within that cache window.
+
+Use one shared Machine Identity for the Relay workers, with read-only access
+limited to the required Infisical project, environment, and secret path. Do not
+grant write or broader project access. Supply its credentials only to Relay;
+Relay does not put them in app environments, images, state, or logs. Resolved
+values are not stored in PostgreSQL, images, labels, or Relay logs, and
+`relay app inspect` shows references only. See
+[Apps](apps.md#environment-and-secrets) for workload-specific exposure,
+including service environment variables.
+
+`relay secret ls` lists names from the single active provider: local files by
+default, or Infisical when configured. It does not display secret values.
+`relay secret set` and `relay secret rm` operate only on local files and fail
+when Infisical is active; manage Infisical secrets in Infisical. Relay uses one
+provider at a time and does not fall back between local files and Infisical.
 Anyone with Docker daemon access can inspect container environments and mounted
-data. Treat Docker access as access to Relay's secrets. External secret providers
-are not currently implemented.
+data. Treat Docker access as access to Relay's secrets.
 
 ## Git-managed apps
 

@@ -144,6 +144,33 @@ func logConcurrencyLimits(logger *slog.Logger, cfg config.Config) {
 	)
 }
 
+// newSecretProvider constructs the single worker-wide secret resolver selected
+// by SECRETS_PROVIDER. An empty value is treated as the local default so a
+// programmatically built Config still behaves like Load's default; any other
+// unknown value is rejected rather than silently falling back. It delegates to
+// secrets.NewProvider so the worker and the standalone CLI share one selection
+// and validation path. Provider construction validates configuration only (no
+// network login), so startup stays resilient to a temporarily unavailable
+// Infisical.
+func newSecretProvider(cfg config.Config) (secrets.Provider, error) {
+	provider := cfg.Secrets.Provider
+	if provider == "" {
+		provider = config.SecretsProviderLocal
+	}
+	return secrets.NewProvider(secrets.ProviderOptions{
+		Provider: provider,
+		LocalDir: secrets.SecretsDir,
+		Infisical: secrets.InfisicalOptions{
+			SiteURL:      cfg.Secrets.Infisical.SiteURL,
+			ProjectID:    cfg.Secrets.Infisical.ProjectID,
+			Environment:  cfg.Secrets.Infisical.Environment,
+			SecretPath:   cfg.Secrets.Infisical.SecretPath,
+			ClientID:     cfg.Secrets.Infisical.ClientID,
+			ClientSecret: cfg.Secrets.Infisical.ClientSecret,
+		},
+	})
+}
+
 // errStartupInterrupted marks a fallible startup operation that failed only
 // because the worker lifecycle was cancelled (SIGTERM/SIGINT) while it was in
 // flight. Run converts it to a nil return: the process is shutting down anyway,
@@ -490,12 +517,13 @@ func Run(logger *slog.Logger) (runErr error) {
 		)
 	}
 
-	// One shared secrets provider for the webhook and runner. A missing secret
-	// surfaces per invocation; construction failure is fatal.
-	secretProvider, err := secrets.NewLocalProvider(secrets.SecretsDir)
+	// One shared secrets provider for the webhook, services, and runner. A
+	// missing secret surfaces per invocation; a configuration error is fatal.
+	secretProvider, err := newSecretProvider(cfg)
 	if err != nil {
-		return fmt.Errorf("secrets: new local provider failed: %w", err)
+		return fmt.Errorf("secrets: %w", err)
 	}
+	logger.Info("Startup: secrets provider ready", "provider", cfg.Secrets.Provider)
 
 	// Optional Git webhook, gated on GIT_WEBHOOK_ADDR. NewServer owns assembly
 	// and returns nil when disabled; Run only constructs, starts, and registers

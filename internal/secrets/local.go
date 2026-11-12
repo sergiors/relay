@@ -186,10 +186,11 @@ func (s *LocalStore) Stat(ctx context.Context, name string) (bool, error) {
 	return false, fmt.Errorf("secret %q: stat: %w", name, err)
 }
 
-// LocalProvider is a Provider backed by a LocalStore. It is the production
-// provider the worker wires at startup; it is infallible to construct (the
-// directory is created lazily on Set, never on Resolve), and a missing secret
-// surfaces as a per-invocation Resolve error rather than a startup failure.
+// LocalProvider is a Provider backed by a LocalStore. It is the default
+// provider the worker wires when SECRETS_PROVIDER is unset or "local"; it is
+// infallible to construct (the directory is created lazily on Set, never on
+// Resolve), and a missing secret surfaces as a per-invocation Resolve error
+// rather than a startup failure.
 type LocalProvider struct {
 	store *LocalStore
 }
@@ -208,5 +209,14 @@ func (p *LocalProvider) Resolve(ctx context.Context, name string) (string, error
 	return p.store.Resolve(ctx, name)
 }
 
-// ensure LocalProvider satisfies Provider at compile time.
-var _ Provider = (*LocalProvider)(nil)
+// List implements Lister by returning the sorted names in the store. It reads
+// directory entries only; file contents are never read.
+func (p *LocalProvider) List(ctx context.Context) ([]string, error) {
+	return p.store.List(ctx)
+}
+
+// ensure LocalProvider satisfies Provider and Lister at compile time.
+var (
+	_ Provider = (*LocalProvider)(nil)
+	_ Lister   = (*LocalProvider)(nil)
+)
