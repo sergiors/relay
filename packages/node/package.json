@@ -29,7 +29,7 @@
     "build": "tsc --project tsconfig.json",
     "typecheck:jsdoc": "tsc --project tsconfig.jsdoc.json",
     "check": "pnpm run build && pnpm run typecheck:jsdoc",
-    "test": "pnpm run check && node --test tests/",
+    "test": "pnpm run check && node --test",
     "prepack": "pnpm run build"
   },
   "devDependencies": {
