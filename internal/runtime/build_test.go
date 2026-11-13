@@ -1151,7 +1151,7 @@ func TestCaptureSourceSnapshotSkipsTemplateYaml(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(src, "template.yaml"), []byte("runtime: nodejs24.x\n"), 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(src, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(src, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Join(src, "sub"), 0o755); err != nil {
@@ -1205,7 +1205,7 @@ func TestCaptureSourceSnapshotHonorsSelection(t *testing.T) {
 	}
 	write(".gitignore", "*.log\ntemplate.yaml-ignored\n")
 	write("template.yaml", "runtime: nodejs24.x\n")
-	write("index.js", "export function h(){}\n")
+	write("index.js", "export function h(event, context){}\n")
 	write("debug.log", "noise\n")
 
 	selection, err := source.ForDir(src)

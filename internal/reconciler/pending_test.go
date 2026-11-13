@@ -142,7 +142,7 @@ func writeTemplateDirFor(t *testing.T, root, name, tmpl string) string {
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(tmpl), 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write index: %v", err)
 	}
 	return dir
@@ -292,7 +292,7 @@ func TestReconcileActiveAppV2BlockedKeepsV1ExecutablePendingV2Held(t *testing.T)
 	// changes and a rebuild is warranted.
 	v2 := templateWithEvents("  - handler: handler.created\n    pattern:\n      event_name: [created]\n  - handler: handler.deleted\n    pattern:\n      event_name: [deleted]\n")
 	writeTemplateDirFor(t, root, "alpha", v2)
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2 source: %v", err)
 	}
 
@@ -343,7 +343,7 @@ func TestReconcileActiveAppV2FailureRetainsV1AndPending(t *testing.T) {
 
 	v2 := templateWithEvents("  - handler: handler.created\n    pattern:\n      event_name: [created]\n  - handler: handler.deleted\n    pattern:\n      event_name: [deleted]\n")
 	writeTemplateDirFor(t, root, "alpha", v2)
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2 source: %v", err)
 	}
 
@@ -383,7 +383,7 @@ func TestReconcileRuleAdditionPublishesNewRuleAsPending(t *testing.T) {
 
 	v2 := templateWithEvents("  - handler: handler.created\n    pattern:\n      event_name: [created]\n  - handler: handler.deleted\n    pattern:\n      event_name: [deleted]\n")
 	writeTemplateDirFor(t, root, "users", v2)
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2 source: %v", err)
 	}
 
@@ -428,7 +428,7 @@ func TestReconcileRuleRemovalClearsPending(t *testing.T) {
 	// Remove the deleted rule and change the source so a rebuild happens.
 	v2 := templateWithEvents("  - handler: handler.created\n    pattern:\n      event_name: [created]\n")
 	writeTemplateDirFor(t, root, "shrink", v2)
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2 source: %v", err)
 	}
 
@@ -602,7 +602,7 @@ func TestReconcileSharedRegistryV2BlockedV1ExecutableV2Held(t *testing.T) {
 	// v2 adds a deleted rule AND the source changes, so a rebuild is warranted.
 	v2 := templateWithEvents("  - handler: handler.created\n    pattern:\n      event_name: [created]\n  - handler: handler.deleted\n    pattern:\n      event_name: [deleted]\n")
 	writeTemplateDirFor(t, root, "alpha", v2)
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2 source: %v", err)
 	}
 

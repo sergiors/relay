@@ -126,7 +126,7 @@ func TestPeriodicReconcileRemovesKnownOverSymlinkedDirAndKeepsHealthy(t *testing
 		t.Skipf("symlink unsupported: %v", err)
 	}
 	// Change the valid sibling so it must be rebuilt, proving the pump ran.
-	if err := os.WriteFile(filepath.Join(validDir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(validDir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 
@@ -238,7 +238,7 @@ func TestPeriodicReconcileUnsupportedEntriesRemoveKnownApps(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "stranger"), []byte("noise\n"), 0o644); err != nil {
 		t.Fatalf("write unknown file: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(validDir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(validDir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 
@@ -326,7 +326,7 @@ func TestPeriodicReconcileKeepsAppWhenTemplateIsSymlinked(t *testing.T) {
 	if err := os.Symlink(target, filepath.Join(guardedDir, "template.yaml")); err != nil {
 		t.Skipf("symlink unsupported: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(validDir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(validDir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 
@@ -353,7 +353,7 @@ func TestReloadValidDirectChildStillWorks(t *testing.T) {
 	b := &fakeBuilder{}
 	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 	r.reconcileApp("normal")

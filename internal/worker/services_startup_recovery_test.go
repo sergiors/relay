@@ -21,8 +21,8 @@ import (
 // while Relay was down.
 func TestLiveAppNamesProtectsLoadedAndInvalidCandidates(t *testing.T) {
 	root := t.TempDir()
-	writeWorkerApp(t, root, "valid", "def handler(e): return 1\n")
-	writeWorkerApp(t, root, "invalid-template", "def handler(e): return 1\n")
+	writeWorkerApp(t, root, "valid", "def handler(e, context): return 1\n")
+	writeWorkerApp(t, root, "invalid-template", "def handler(e, context): return 1\n")
 	if err := os.WriteFile(filepath.Join(root, "invalid-template", "template.yaml"), []byte("runtime: python9.9\n"), 0o644); err != nil {
 		t.Fatalf("write invalid template: %v", err)
 	}

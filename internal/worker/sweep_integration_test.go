@@ -24,7 +24,7 @@ func TestStartupImageKeepSetRetainsRecordedImageAfterRediscovery(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	fn := stateApp("fn", dir)

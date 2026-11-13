@@ -17,7 +17,7 @@ import (
 // probe through publication.
 func TestPrepareReuseTransfersImageLease(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 	fn := app.App{Name: "reuse-lease", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
@@ -58,7 +58,7 @@ func TestPrepareReuseTransfersImageLease(t *testing.T) {
 // re-uses an image that ImageRemove is about to delete.
 func TestPrepareRetiringImageRejected(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 	fn := app.App{Name: "retiring-lease", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}

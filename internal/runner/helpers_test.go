@@ -103,17 +103,19 @@ func (f *countingExecutor) setFail(v bool) {
 // invocation's context and arguments: the injected RunMeta, the handler and
 // event JSON, and the per-invocation extra env. Unused fields stay zero.
 type captureExecutor struct {
-	mu       sync.Mutex
-	meta     runtime.RunMeta
-	handler  string
-	payload  []byte
-	extraEnv []string
-	prepared *runtime.Prepared
+	mu         sync.Mutex
+	meta       runtime.RunMeta
+	handlerCtx runtime.HandlerContext
+	handler    string
+	payload    []byte
+	extraEnv   []string
+	prepared   *runtime.Prepared
 }
 
 func (e *captureExecutor) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, eventJSON []byte, extraEnv []string) error {
 	e.mu.Lock()
 	e.meta = runtime.RunMetaFrom(ctx)
+	e.handlerCtx = runtime.HandlerContextFrom(ctx)
 	e.handler = handler
 	e.payload = append([]byte(nil), eventJSON...)
 	e.extraEnv = append([]string(nil), extraEnv...)
@@ -136,6 +138,12 @@ func (e *captureExecutor) gotMeta() runtime.RunMeta {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.meta
+}
+
+func (e *captureExecutor) gotHandlerContext() runtime.HandlerContext {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.handlerCtx
 }
 
 func (e *captureExecutor) got() (string, []byte) {

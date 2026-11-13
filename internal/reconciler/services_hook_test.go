@@ -70,7 +70,7 @@ func writeServicesDir(t *testing.T, root, name string) string {
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(servicesTemplate), 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write index: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "service.js"), []byte("setInterval(() => {}, 1<<30);\n"), 0o644); err != nil {
@@ -100,7 +100,7 @@ func TestReconcileUpdateServicesFiresOnDiscoveryAndUpdate(t *testing.T) {
 	b := &versionedBuilder{version: 1}
 	fn := initialServicesFn("svc-upd", dir, "img-svc-upd-v1", b)
 	r2, _ := newTestReconciler(t, root, b, []*runner.PreparedApp{fn}, withServiceHooks(rec))
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 	r2.reconcileApp("svc-upd")

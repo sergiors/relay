@@ -23,7 +23,7 @@ func writeStageDir(t *testing.T, root, name string) string {
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(template), 0o644); err != nil {
 		t.Fatalf("write stage template: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write stage index: %v", err)
 	}
 	return dir

@@ -653,7 +653,10 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				// returned above never reach it.
 				r.metrics.SetAppTimestamp(pf.fn.Name, metrics.AppTimestampExecution, time.Now().Unix())
 				r.log.Debug("App rule: matched event",
-					handlerLogFields(hasState, pf.fn.Name, rule.Handler, msgID, handlerAttempt, deliveryAttempt)...,
+					handlerLogFields(
+						hasState, pf.fn.Name, rule.Handler, msgID, handlerAttempt,
+						deliveryAttempt,
+					)...,
 				)
 				eventJSON, err := json.Marshal(event)
 				if err != nil {
@@ -667,7 +670,10 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// telemetry-free.
 					if hasState {
 						r.recordHandlerFailure(pf.fn.Name, rule.Handler, 0)
-						return r.recordFailure(ctx, invState, invocation, claim, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
+						return r.recordFailure(
+							ctx, invState, invocation, claim, rule.Retries,
+							pf.fn.Name, rule.Handler, msgID, err,
+						)
 					}
 					return outcomeRetryable, fmt.Errorf("app %q handler %q: marshal event: %w", pf.fn.Name, rule.Handler, err)
 				}
@@ -690,7 +696,10 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// execution failure.
 					if hasState {
 						r.recordHandlerFailure(pf.fn.Name, rule.Handler, 0)
-						return r.recordFailure(ctx, invState, invocation, claim, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
+						return r.recordFailure(
+							ctx, invState, invocation, claim, rule.Retries,
+							pf.fn.Name, rule.Handler, msgID, err,
+						)
 					}
 					return outcomeRetryable, fmt.Errorf("app %q handler %q: %w", pf.fn.Name, rule.Handler, err)
 				}
@@ -717,8 +726,34 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					NodeID:    r.nodeID,
 					Image:     toImage(pf),
 				})
+				// Stamp the handler-visible execution identity. Any source broker
+				// message ID anchors a deterministic request ID, so it survives
+				// retries, redeliveries, and restarts even when this delivery has
+				// no invocation state; only an execution without a broker identity
+				// gets a fresh ID. The attempt is the confirmed claim and stays 1
+				// without one (the Redis delivery count is never an attempt), while
+				// maxAttempts is the rule's configured initial-plus-retries budget.
+				requestID := stateFreeRequestID()
+				if msgID != "" {
+					requestID = brokerRequestID(requestIDSourceEvent, msgID, pf.fn.Name, rule.Handler)
+				}
+				attempt := handlerAttempt
+				if !hasState {
+					attempt = 1
+				}
+				invokeCtx = runtime.WithHandlerContext(invokeCtx, newHandlerContext(
+					requestID, pf.fn.Name, rule.Handler, msgID,
+					attempt, 1+rule.Retries,
+				))
 				start := time.Now()
-				panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv, snap.pinFor(pf), invocationTrace{state: invState, invocation: invocation, attempt: handlerAttempt})
+				panicked, panicValue, err := r.runInvocation(
+					pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv, snap.pinFor(pf),
+					invocationTrace{
+						state:      invState,
+						invocation: invocation,
+						attempt:    handlerAttempt,
+					},
+				)
 				elapsed := time.Since(start)
 				if panicked {
 					// A panicking execution is a misbehaving handler, not a
@@ -727,7 +762,10 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// the SAME failure branch below (metrics + recordFailure) so
 					// retry and exhaustion accounting stay per-invocation.
 					r.log.Error("App handler: PANICKED for event",
-						append(handlerLogFields(hasState, pf.fn.Name, rule.Handler, msgID, handlerAttempt, deliveryAttempt),
+						append(handlerLogFields(
+							hasState, pf.fn.Name, rule.Handler, msgID,
+							handlerAttempt, deliveryAttempt,
+						),
 							"panic_value", fmt.Sprintf("%v", panicValue),
 							"stack", string(debug.Stack()),
 						)...,
@@ -761,7 +799,10 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// metrics as the schedule/manual invocation paths.
 					r.recordHandlerFailure(pf.fn.Name, rule.Handler, elapsed)
 					r.log.Warn("App handler: execution failed for event",
-						append(handlerLogFields(hasState, pf.fn.Name, rule.Handler, msgID, handlerAttempt, deliveryAttempt),
+						append(handlerLogFields(
+							hasState, pf.fn.Name, rule.Handler, msgID,
+							handlerAttempt, deliveryAttempt,
+						),
 							"duration", elapsed,
 							"reason", err,
 						)...,
@@ -775,7 +816,10 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// end-of-loop aggregate, so an invocation may exhaust while
 					// others still run.
 					if hasState {
-						return r.recordFailure(ctx, invState, invocation, claim, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
+						return r.recordFailure(
+							ctx, invState, invocation, claim, rule.Retries,
+							pf.fn.Name, rule.Handler, msgID, err,
+						)
 					}
 					// No invocation state (direct callers/tests): every failure
 					// counts as a retry driver, but there is no Redis-backed
@@ -811,7 +855,8 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				}
 				r.recordHandlerSuccess(pf.fn.Name, rule.Handler, elapsed)
 				r.log.Info("App handler: executed for event",
-					append(handlerLogFields(hasState, pf.fn.Name, rule.Handler, msgID, handlerAttempt, deliveryAttempt),
+					append(handlerLogFields(
+						hasState, pf.fn.Name, rule.Handler, msgID, handlerAttempt, deliveryAttempt),
 						"duration", elapsed,
 					)...,
 				)

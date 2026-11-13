@@ -56,7 +56,7 @@ func TestReconcileServiceStatusPersistedPreparingReconcilingReady(t *testing.T) 
 	r.SeedFencingToken(baseFn.Name, fencingToken)
 
 	// Change content so the rebuild path runs and the update-services hook fires.
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 	r.reconcileApp("svc-persist")
@@ -97,7 +97,7 @@ func TestReconcileServiceFailureStatusRetainsGeneration(t *testing.T) {
 	seedCurrent(r, baseFn)
 	r.SeedFencingToken(baseFn.Name, fencingToken)
 
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 	r.reconcileApp("svc-fail")
@@ -149,13 +149,13 @@ func TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus(t *testing
 	r.SeedFencingToken(baseFn.Name, fencingToken)
 
 	// Generation 1: content change triggers an update; capture its callbacks.
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 	r.reconcileApp("svc-gen")
 
 	// Generation 2: another content change begins before generation 1 completes.
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v3'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v3'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v3: %v", err)
 	}
 	r.reconcileApp("svc-gen")
@@ -196,11 +196,11 @@ func TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus(t *testing
 		seedCurrent(r2, baseFn)
 		r2.SeedFencingToken(baseFn.Name, fencingToken2)
 
-		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v4'); }\n"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v4'); }\n"), 0o644); err != nil {
 			t.Fatalf("write v4: %v", err)
 		}
 		r2.reconcileApp("svc-gen")
-		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v5'); }\n"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v5'); }\n"), 0o644); err != nil {
 			t.Fatalf("write v5: %v", err)
 		}
 		r2.reconcileApp("svc-gen")

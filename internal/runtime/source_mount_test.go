@@ -138,7 +138,7 @@ func TestWithSourceMountResolves(t *testing.T) {
 // with the app dir, engine workdir, and source fingerprint.
 func TestPrepareSourceMountBakesNoSourceAndRecordsMount(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("def handler(event):\n    return 1\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("def handler(event, context):\n    return 1\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 	fn := app.App{Name: "mounted", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
@@ -198,7 +198,7 @@ func TestPrepareSourceMountBakesNoSourceAndRecordsMount(t *testing.T) {
 // mount identity so execution and service generations can recycle.
 func TestPrepareSourceMountReusesImageAcrossSourceOnlyChange(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("def handler(event):\n    return 1\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("def handler(event, context):\n    return 1\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 	fn := app.App{Name: "mounted", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
@@ -236,7 +236,7 @@ func TestPrepareSourceMountReusesImageAcrossSourceOnlyChange(t *testing.T) {
 	}
 
 	// Source-only edit: the image tag must not change, but the fingerprint must.
-	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("def handler(event):\n    return 2\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("def handler(event, context):\n    return 2\n"), 0o644); err != nil {
 		t.Fatalf("edit source: %v", err)
 	}
 	second, err := m.Prepare(context.Background(), fn)
@@ -342,7 +342,7 @@ func TestStartExecutionContainerSerializesNodeSourceMountConfig(t *testing.T) {
 func TestPrepareDependencyFingerprintFailureRemovesSnapshot(t *testing.T) {
 	base := isolatedTmpdir(t)
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("def run(event):\n    return 1\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("def run(event, context):\n    return 1\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte("six==1.16.0\n"), 0o644); err != nil {
@@ -373,7 +373,7 @@ func TestPrepareDependencyFingerprintFailureRemovesSnapshot(t *testing.T) {
 // /app recording.
 func TestPrepareSourceMountNodeUsesDistinctTarget(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "handler.js"), []byte("export function handler(event) {}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "handler.js"), []byte("export function handler(event, context) {}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 	// A host node_modules makes the mount record carry the bounded mask.
@@ -640,7 +640,7 @@ func countBuildsRoute(c *buildCounts, depCtx, appCtx *[]byte) dockerRoute {
 // generation cannot be masked by a source-only reuse.
 func TestPrepareSourceMountDependencyChangeBuildsNewGeneration(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("def handler(event):\n    return 1\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("def handler(event, context):\n    return 1\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte("six==1.16.0\n"), 0o644); err != nil {
@@ -710,7 +710,7 @@ func TestPrepareSourceMountDependencyChangeBuildsNewGeneration(t *testing.T) {
 // can never be mistaken for a dependency rebuild.
 func TestPrepareSourceMountSourceOnlyChangeDoesNotBuildDependency(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("def handler(event):\n    return 1\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("def handler(event, context):\n    return 1\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte("six==1.16.0\n"), 0o644); err != nil {
@@ -737,7 +737,7 @@ func TestPrepareSourceMountSourceOnlyChangeDoesNotBuildDependency(t *testing.T) 
 	}
 
 	// Source-only edit.
-	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("def handler(event):\n    return 2\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("def handler(event, context):\n    return 2\n"), 0o644); err != nil {
 		t.Fatalf("edit source: %v", err)
 	}
 

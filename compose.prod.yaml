@@ -6,7 +6,7 @@ x-logging: &default-logging
 
 services:
   relay:
-    image: ${RELAY_IMAGE:?Set RELAY_IMAGE to a tested release tag or digest}
+    image: ghcr.io/sergiors/relay:latest
     restart: unless-stopped
     logging: *default-logging
 

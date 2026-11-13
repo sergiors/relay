@@ -199,20 +199,21 @@ type ReadyResult struct {
 // synchronously (App is required and Event carries the operator-supplied
 // JSON event object); cmdReplayDLQ re-executes one DLQ entry's exact
 // app/handler (App and Handler are required, Event carries the
-// replayed payload, and Trace optionally carries the entry's compact lineage so
-// the replay can link back to the original failed invocation); cmdReady asks
-// whether the worker is ready to consume. A frame carries
+// replayed payload, Trace optionally carries the entry's compact lineage, and
+// SourceMessageID optionally carries the original source delivery ID); cmdReady
+// asks whether the worker is ready to consume. A frame carries
 // exactly one command, and an absent or unknown command is malformed.
 //
-// Trace is deliberately a SIBLING of Event, not part of it: the trace lineage is
-// control-path metadata, so it never reaches the handler's event map and the
-// replay's own worker-side operation span stays independent of it.
+// Trace and SourceMessageID are control-path metadata, not part of Event. The
+// lineage links the replay operation to its origin, while the source ID is
+// exposed as handler context metadata without making the replay a broker delivery.
 type socketRequest struct {
-	Command string          `json:"command,omitempty"`
-	App     string          `json:"app,omitempty"`
-	Handler string          `json:"handler,omitempty"`
-	Event   json.RawMessage `json:"event,omitempty"`
-	Trace   string          `json:"trace,omitempty"`
+	Command         string          `json:"command,omitempty"`
+	App             string          `json:"app,omitempty"`
+	Handler         string          `json:"handler,omitempty"`
+	Event           json.RawMessage `json:"event,omitempty"`
+	Trace           string          `json:"trace,omitempty"`
+	SourceMessageID string          `json:"source_message_id,omitempty"`
 }
 
 // socketResponse is the newline-JSON response frame. Exactly one of the

@@ -77,7 +77,7 @@ func TestReconcileRetiresOldImageOnSwap(t *testing.T) {
 	})
 
 	// Change source so the fingerprint changes and a rebuild is warranted.
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 
@@ -115,7 +115,7 @@ func TestReconcileNoRetireOnFailedBuild(t *testing.T) {
 		cfg.Retire = rec.add
 	})
 
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v3'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v3'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v3: %v", err)
 	}
 	r.reconcileApp("flaky")
@@ -160,7 +160,7 @@ func TestReconcileRetireRunsAfterServiceConvergence(t *testing.T) {
 	seedCurrent(r, fn.App())
 
 	// Change source so a rebuild (to v2) warrants retiring v1.
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 	r.reconcileApp("svc-retire-order")
@@ -262,7 +262,7 @@ func TestReconcileUpdateSchedulesHookFires(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(updateDir, "template.yaml"), []byte(template), 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(updateDir, "index.js"), []byte("export function hi(e){ console.log('v1'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(updateDir, "index.js"), []byte("export function hi(e, context){ console.log('v1'); }\n"), 0o644); err != nil {
 		t.Fatalf("write index: %v", err)
 	}
 	b := &versionedBuilder{version: 1}
@@ -273,7 +273,7 @@ func TestReconcileUpdateSchedulesHookFires(t *testing.T) {
 	)
 	r2, _ := newTestReconciler(t, root, b, []*runner.PreparedApp{chgFn}, withSchedules)
 	// Change source so an update warrants a rebuild.
-	if err := os.WriteFile(filepath.Join(updateDir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(updateDir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 	r2.reconcileApp("changing")

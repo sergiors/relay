@@ -70,7 +70,7 @@ func TestReplayDLQExecutesExactHandlerOnce(t *testing.T) {
 	}, exec)
 	r := NewWithMetrics([]*PreparedApp{pf}, testutil.DiscardLogger(), metrics.New())
 
-	if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{"event_name":"INSERT"}`), ""); err != nil {
+	if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{"event_name":"INSERT"}`), "", ""); err != nil {
 		t.Fatalf("ReplayDLQ: %v", err)
 	}
 	handlers, payloads := exec.got()
@@ -91,7 +91,7 @@ func TestReplayDLQScheduleHandler(t *testing.T) {
 	exec := &countingExecutor{}
 	r := New([]*PreparedApp{replayFn(t, "fn", exec)}, testutil.DiscardLogger())
 
-	if err := r.ReplayDLQ(context.Background(), "fn", "jobs.cleanup.handler", []byte(`{}`), ""); err != nil {
+	if err := r.ReplayDLQ(context.Background(), "fn", "jobs.cleanup.handler", []byte(`{}`), "", ""); err != nil {
 		t.Fatalf("ReplayDLQ: %v", err)
 	}
 	if exec.count() != 1 {
@@ -136,7 +136,7 @@ func TestReplayDLQUsesCurrentEventRuleTimeout(t *testing.T) {
 	r := New([]*PreparedApp{pf}, testutil.DiscardLogger())
 
 	before := time.Now()
-	if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), ""); err != nil {
+	if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), "", ""); err != nil {
 		t.Fatalf("ReplayDLQ: %v", err)
 	}
 	deadline, ok := exec.got()
@@ -168,7 +168,7 @@ func TestReplayDLQEventRuleTimeoutCap(t *testing.T) {
 	r.SetMaxHandlerTimeout(cap)
 
 	before := time.Now()
-	if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), ""); err != nil {
+	if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), "", ""); err != nil {
 		t.Fatalf("ReplayDLQ: %v", err)
 	}
 	deadline, ok := exec.got()
@@ -193,7 +193,7 @@ func TestReplayDLQUsesCurrentRuntimeAndSecrets(t *testing.T) {
 	r := New([]*PreparedApp{pf}, testutil.DiscardLogger())
 	r.SetSecretProvider(prov)
 
-	if err := r.ReplayDLQ(context.Background(), "fn", "index.run", []byte(`{}`), ""); err != nil {
+	if err := r.ReplayDLQ(context.Background(), "fn", "index.run", []byte(`{}`), "", ""); err != nil {
 		t.Fatalf("ReplayDLQ: %v", err)
 	}
 	joined := strings.Join(exec.gotEnv(), " ")
@@ -208,7 +208,7 @@ func TestReplayDLQUsesCurrentRuntimeAndSecrets(t *testing.T) {
 // from the current registry.
 func TestReplayDLQUnknownApp(t *testing.T) {
 	r := New(nil, testutil.DiscardLogger())
-	err := r.ReplayDLQ(context.Background(), "ghost", "index.run", []byte(`{}`), "")
+	err := r.ReplayDLQ(context.Background(), "ghost", "index.run", []byte(`{}`), "", "")
 	if !errors.Is(err, ErrAppNotFound) {
 		t.Fatalf("err = %v, want ErrAppNotFound", err)
 	}
@@ -222,7 +222,7 @@ func TestReplayDLQUnavailableApp(t *testing.T) {
 		Template: &app.Template{Runtime: "nodejs24.x"},
 	})}, testutil.DiscardLogger())
 
-	err := r.ReplayDLQ(context.Background(), "broken", "index.run", []byte(`{}`), "")
+	err := r.ReplayDLQ(context.Background(), "broken", "index.run", []byte(`{}`), "", "")
 	if !errors.Is(err, ErrAppUnavailable) {
 		t.Fatalf("err = %v, want ErrAppUnavailable", err)
 	}
@@ -235,7 +235,7 @@ func TestReplayDLQRemovedHandler(t *testing.T) {
 	exec := &countingExecutor{}
 	r := New([]*PreparedApp{replayFn(t, "fn", exec)}, testutil.DiscardLogger())
 
-	err := r.ReplayDLQ(context.Background(), "fn", "events.removed.handler", []byte(`{}`), "")
+	err := r.ReplayDLQ(context.Background(), "fn", "events.removed.handler", []byte(`{}`), "", "")
 	if !errors.Is(err, ErrHandlerNotFound) {
 		t.Fatalf("err = %v, want ErrHandlerNotFound", err)
 	}
@@ -252,7 +252,7 @@ func TestReplayDLQRecordsHandlerStats(t *testing.T) {
 	m := metrics.New()
 	ok := &captureExecutor{}
 	r := NewWithMetrics([]*PreparedApp{replayFn(t, "fn", ok)}, testutil.DiscardLogger(), m)
-	if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), ""); err != nil {
+	if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), "", ""); err != nil {
 		t.Fatalf("ReplayDLQ: %v", err)
 	}
 	// Snapshot() renders display names (the relay_ prefix is stripped), so the
@@ -281,7 +281,7 @@ func TestReplayDLQRecordsHandlerStats(t *testing.T) {
 	m2 := metrics.New()
 	bad := &countingExecutor{fail: true}
 	r2 := NewWithMetrics([]*PreparedApp{replayFn(t, "fn", bad)}, testutil.DiscardLogger(), m2)
-	if err := r2.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), ""); err == nil {
+	if err := r2.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), "", ""); err == nil {
 		t.Fatal("expected a failed replay")
 	}
 	got2 := m2.Snapshot()
@@ -357,7 +357,7 @@ func TestReplayDLQWritesNoBrokerState(t *testing.T) {
 
 	state := &noopInvocationState{}
 	ctx := stream.WithInvocationState(context.Background(), state)
-	if err := r.ReplayDLQ(ctx, "fn", "events.created.handler", []byte(`{}`), ""); err != nil {
+	if err := r.ReplayDLQ(ctx, "fn", "events.created.handler", []byte(`{}`), "", ""); err != nil {
 		t.Fatalf("ReplayDLQ: %v", err)
 	}
 	if exec.count() != 1 {
@@ -378,7 +378,7 @@ func TestReplayDLQStampsInvocationMeta(t *testing.T) {
 	exec := &captureExecutor{}
 	r := New([]*PreparedApp{replayFn(t, "fn", exec)}, testutil.DiscardLogger())
 
-	if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), ""); err != nil {
+	if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), "", ""); err != nil {
 		t.Fatalf("ReplayDLQ: %v", err)
 	}
 	meta := exec.gotMeta()

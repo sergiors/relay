@@ -822,16 +822,17 @@ var _ HandlerReplayer = (*runner.Runner)(nil)
 // fakeReplayer records DLQ-replay calls for socket tests, so the replay_dlq
 // command can be exercised without Docker or a live runner.
 type fakeReplayer struct {
-	mu      sync.Mutex
-	calls   int
-	name    string
-	handler string
-	event   []byte
-	trace   string
-	err     error
+	mu              sync.Mutex
+	calls           int
+	name            string
+	handler         string
+	event           []byte
+	trace           string
+	sourceMessageID string
+	err             error
 }
 
-func (f *fakeReplayer) ReplayDLQ(_ context.Context, name, handler string, event []byte, trace string) error {
+func (f *fakeReplayer) ReplayDLQ(_ context.Context, name, handler string, event []byte, trace, sourceMessageID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
@@ -839,13 +840,14 @@ func (f *fakeReplayer) ReplayDLQ(_ context.Context, name, handler string, event 
 	f.handler = handler
 	f.event = append([]byte(nil), event...)
 	f.trace = trace
+	f.sourceMessageID = sourceMessageID
 	return f.err
 }
 
-func (f *fakeReplayer) snapshot() (int, string, string, []byte, string) {
+func (f *fakeReplayer) snapshot() (int, string, string, []byte, string, string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.calls, f.name, f.handler, append([]byte(nil), f.event...), f.trace
+	return f.calls, f.name, f.handler, append([]byte(nil), f.event...), f.trace, f.sourceMessageID
 }
 
 // startTestSocketWithReplayer starts a SocketServer at path with the given DLQ
@@ -867,18 +869,19 @@ func startTestSocketWithReplayer(t *testing.T, path string, replayer HandlerRepl
 }
 
 // TestRuntimeSocketReplayDLQDelegates verifies the replay_dlq command forwards
-// the exact app, handler, event bytes, AND trace metadata (as a control-path
-// sibling of the event) to the wired replayer and answers with replayed=true.
+// the exact app, handler, event bytes, trace, and source ID to the wired replayer
+// as control-path metadata and answers with replayed=true.
 func TestRuntimeSocketReplayDLQDelegates(t *testing.T) {
 	path := testSocketPath(t)
 	rep := &fakeReplayer{}
 	startTestSocketWithReplayer(t, path, rep)
 
 	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-	if err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{"a":1}`), lineage); err != nil {
+	const sourceMessageID = "1757-0"
+	if err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{"a":1}`), lineage, sourceMessageID); err != nil {
 		t.Fatalf("ReplayDLQ: %v", err)
 	}
-	calls, name, handler, event, trace := rep.snapshot()
+	calls, name, handler, event, trace, gotSourceMessageID := rep.snapshot()
 	if calls != 1 || name != "fn" || handler != "index.run" {
 		t.Fatalf("replayer calls/name/handler = %d/%q/%q", calls, name, handler)
 	}
@@ -887,6 +890,9 @@ func TestRuntimeSocketReplayDLQDelegates(t *testing.T) {
 	}
 	if trace != lineage {
 		t.Fatalf("replayer trace = %q, want the control-path lineage %q", trace, lineage)
+	}
+	if gotSourceMessageID != sourceMessageID {
+		t.Fatalf("replayer source message ID = %q, want %q", gotSourceMessageID, sourceMessageID)
 	}
 }
 
@@ -907,7 +913,7 @@ func TestRuntimeSocketReplayDLQErrorCodes(t *testing.T) {
 			path := testSocketPath(t)
 			startTestSocketWithReplayer(t, path, &fakeReplayer{err: tc.err})
 
-			err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{}`), "")
+			err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{}`), "", "")
 			if !errors.Is(err, ErrInvokeFailed) {
 				t.Fatalf("error = %v, want ErrInvokeFailed", err)
 			}
@@ -928,7 +934,7 @@ func TestRuntimeSocketReplayDLQNoReplayer(t *testing.T) {
 	path := testSocketPath(t)
 	startTestSocket(t, path, nil)
 
-	err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{}`), "")
+	err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{}`), "", "")
 	if !errors.Is(err, ErrInvokeUnavailable) {
 		t.Fatalf("error = %v, want ErrInvokeUnavailable", err)
 	}
@@ -1061,7 +1067,7 @@ func TestRuntimeSocketReplayDLQMalformed(t *testing.T) {
 			t.Fatalf("line %q: malformed request must not report a replay", line)
 		}
 	}
-	if calls, _, _, _, _ := rep.snapshot(); calls != 0 {
+	if calls, _, _, _, _, _ := rep.snapshot(); calls != 0 {
 		t.Fatalf("replayer calls = %d, want 0 (malformed requests never replay)", calls)
 	}
 }
@@ -1071,7 +1077,7 @@ func TestRuntimeSocketReplayDLQMalformed(t *testing.T) {
 // definitively not-started: no connection existed, so no request was sent.
 func TestReplayDLQNoSocket(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.sock")
-	err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{}`), "")
+	err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{}`), "", "")
 	if !errors.Is(err, ErrInvokeUnavailable) {
 		t.Fatalf("error = %v, want ErrInvokeUnavailable", err)
 	}
@@ -1099,7 +1105,7 @@ func (ambiguousWriteConn) SetWriteDeadline(time.Time) error { return nil }
 // begun execution before the write error surfaced, so the CLI must retain its
 // replay lease until expiry rather than release it for a concurrent replay.
 func TestReplayDLQWriteFailureIsAmbiguous(t *testing.T) {
-	err := replayDLQConn(context.Background(), ambiguousWriteConn{}, "fn", "index.run", []byte(`{}`), "")
+	err := replayDLQConn(context.Background(), ambiguousWriteConn{}, "fn", "index.run", []byte(`{}`), "", "")
 	if !errors.Is(err, ErrInvokeUnavailable) {
 		t.Fatalf("error = %v, want ErrInvokeUnavailable", err)
 	}

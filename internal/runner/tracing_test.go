@@ -495,7 +495,7 @@ func TestReplayDLQEmitsNewRootOperationWithLink(t *testing.T) {
 	// A caller context with its own span must NOT become the replay's parent.
 	callerCtx, callerSpan := tracing.Start(context.Background(), "cli.replay")
 	defer callerSpan.End()
-	if err := r.ReplayDLQ(callerCtx, "fn", "events.created.handler", []byte(`{}`), lineage); err != nil {
+	if err := r.ReplayDLQ(callerCtx, "fn", "events.created.handler", []byte(`{}`), lineage, ""); err != nil {
 		t.Fatalf("ReplayDLQ: %v", err)
 	}
 
@@ -533,7 +533,7 @@ func TestReplayDLQWithoutLineageIsRootWithoutLink(t *testing.T) {
 	for _, lineage := range []string{"", "not-a-traceparent"} {
 		rec := withSpanRecorder(t)
 		r := New([]*PreparedApp{replayFn(t, "fn", &countingExecutor{})}, testutil.DiscardLogger())
-		if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), lineage); err != nil {
+		if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), lineage, ""); err != nil {
 			t.Fatalf("ReplayDLQ(lineage=%q): %v", lineage, err)
 		}
 		replay := spanByName(t, rec, "dlq.replay")
@@ -551,7 +551,7 @@ func TestReplayDLQWithoutLineageIsRootWithoutLink(t *testing.T) {
 func TestReplayDLQFailingOperationRecordsError(t *testing.T) {
 	rec := withSpanRecorder(t)
 	r := New([]*PreparedApp{replayFn(t, "fn", &countingExecutor{fail: true})}, testutil.DiscardLogger())
-	if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), ""); err == nil {
+	if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), "", ""); err == nil {
 		t.Fatal("expected a failed replay")
 	}
 	replay := spanByName(t, rec, "dlq.replay")
@@ -803,7 +803,7 @@ func TestReplayDLQInvalidStillTraced(t *testing.T) {
 	t.Run("removed function", func(t *testing.T) {
 		rec := withSpanRecorder(t)
 		r := New(nil, testutil.DiscardLogger())
-		err := r.ReplayDLQ(context.Background(), "ghost", "h", []byte(`{}`), "")
+		err := r.ReplayDLQ(context.Background(), "ghost", "h", []byte(`{}`), "", "")
 		if !errors.Is(err, ErrAppNotFound) {
 			t.Fatalf("err = %v, want ErrAppNotFound", err)
 		}
@@ -816,7 +816,7 @@ func TestReplayDLQInvalidStillTraced(t *testing.T) {
 	t.Run("removed handler", func(t *testing.T) {
 		rec := withSpanRecorder(t)
 		r := New([]*PreparedApp{replayFn(t, "fn", &countingExecutor{})}, testutil.DiscardLogger())
-		err := r.ReplayDLQ(context.Background(), "fn", "events.removed.handler", []byte(`{}`), "")
+		err := r.ReplayDLQ(context.Background(), "fn", "events.removed.handler", []byte(`{}`), "", "")
 		if !errors.Is(err, ErrHandlerNotFound) {
 			t.Fatalf("err = %v, want ErrHandlerNotFound", err)
 		}

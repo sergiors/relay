@@ -6,7 +6,13 @@ internal/runtime/protocol.go in the Relay source):
 
   Relay -> stdin:  {"id":"<hex>","handler":"mod.func","event":<raw>,
                     "env":{"K":"V"},
-                    "trace":{"traceparent":"...","tracestate":"...","baggage":"..."}}
+                    "trace":{"traceparent":"...","tracestate":"...",
+                             "baggage":"..."},
+                    "context":{"requestId":"<id>","attempt":1,
+                               "maxAttempts":3,"deadline":"<ISO-8601>",
+                               "messageId":"<optional>",
+                               "traceId":"<optional>","app":"<app>",
+                               "handler":"mod.func"}}
   stdout:          @@RELAY@@{"id":"<id>","ok":true}
                    @@RELAY@@{"id":"<id>","ok":false,"error":"..."}
 
@@ -39,6 +45,11 @@ Process-model notes (intended semantics, not a bug):
     this invocation. It is extracted and attached ONLY around the one handler
     call and always detached afterwards, so one invocation's context never leaks
     into the next despite the warm interpreter (see invoke()).
+  - Every request frame carries a "context" object. The bootstrap builds a
+    fresh HandlerContext for that invocation (never module or global mutable
+    state) and passes it as the handler's second argument. Its deadline is an
+    absolute, timezone-aware instant, and get_remaining_time_ms() reports the
+    time left, clamped at zero.
 
 Lifetime caveat: reuse is a warm-process optimization, never a durability or
 lifetime guarantee. A container is discarded on a timeout, protocol error, or
@@ -50,9 +61,11 @@ Trace propagation:
   managed install). The bootstrap extracts the incoming carrier with the global
   W3C propagator and attaches it for the handler call, so a user-installed OTel
   SDK resolves the SAME global context and creates child spans under Relay's
-  invocation span. The handler signature stays func(event): the context is
-  ambient, never an argument. The import is guarded so a bare interpreter
-  without the API simply skips propagation instead of failing.
+  invocation span. The trace context stays ambient. The invocation metadata is
+  not: every handler call receives a fresh HandlerContext as its second
+  argument, so the signature is func(event, context). The import is guarded so
+  a bare interpreter without the API simply skips propagation instead of
+  failing.
 """
 
 import asyncio
@@ -61,6 +74,8 @@ import inspect
 import json
 import os
 import sys
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
 # Build-time event-loop selector. The Python engine replaces this exact line
 # (with `import zuvloop` and `ZUVLOOP_ENABLED = True`) when the worker-global
@@ -100,6 +115,76 @@ SENTINEL = "@@RELAY@@"
 # multibyte message can never be cut mid-character and the emitted frame is
 # always valid UTF-8.
 MAX_FRAME_BYTES = 3 * 1024
+
+
+@dataclass(frozen=True)
+class HandlerContext:
+    """Metadata for exactly one handler invocation.
+
+    Built fresh from the request frame's "context" object for every call and
+    never shared or mutated across invocations. The deadline is an absolute,
+    timezone-aware instant, so get_remaining_time_ms() is independent of the
+    process's warm lifetime.
+    """
+
+    request_id: str
+    attempt: int
+    max_attempts: int
+    deadline: datetime
+    message_id: str | None
+    trace_id: str | None
+    app: str
+    handler: str
+
+    def get_remaining_time_ms(self) -> int:
+        """Milliseconds until the deadline, clamped at zero once it passes."""
+        remaining = self.deadline - datetime.now(UTC)
+        return max(0, int(remaining.total_seconds() * 1000))
+
+
+def _parse_deadline(value):
+    """Parse the protocol's ISO-8601 deadline into an aware UTC datetime.
+
+    Go emits RFC 3339 with an optional fractional part of up to nanosecond
+    precision and a trailing "Z". Older Pythons' fromisoformat accepts neither,
+    so normalize both here instead of depending on the interpreter version.
+    """
+    if not isinstance(value, str):
+        raise ValueError("context.deadline must be an ISO-8601 string")
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    # datetime stores microseconds. Padding or truncating to six digits also
+    # covers older Pythons that accept only 3 or 6 fractional digits.
+    head, dot, tail = text.partition(".")
+    if dot:
+        digits = 0
+        while digits < len(tail) and tail[digits].isdigit():
+            digits += 1
+        if digits:
+            fraction = (tail[:digits][:6] + "000000")[:6]
+            text = head + "." + fraction + tail[digits:]
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def build_handler_context(raw):
+    """Build a fresh HandlerContext from one request frame's context object."""
+    if not isinstance(raw, dict):
+        raise ValueError("request frame is missing the context object")
+    return HandlerContext(
+        request_id=str(raw.get("requestId", "")),
+        attempt=int(raw.get("attempt", 0)),
+        max_attempts=int(raw.get("maxAttempts", 0)),
+        deadline=_parse_deadline(raw.get("deadline")),
+        message_id=raw.get("messageId"),
+        trace_id=raw.get("traceId"),
+        app=str(raw.get("app", "")),
+        handler=str(raw.get("handler", "")),
+    )
+
 
 # User print() output must reach Relay live (and BEFORE the protocol response
 # of the invocation that printed it): force line buffering on the text layer.
@@ -241,7 +326,7 @@ def detach_context(token):
         pass
 
 
-async def invoke(handler, event, trace=None):
+async def invoke(handler, event, context_frame, trace=None):
     """Runs one handler on the process-lifetime loop. Raises SystemExit-free
     exceptions up to the caller for protocol failure only; handler/user errors
     are converted here.
@@ -251,9 +336,11 @@ async def invoke(handler, event, trace=None):
     a module-level asyncio resource reused by a later invocation is still bound
     to a live loop.
 
-    The invocation's trace context (if any) is attached for the single handler
-    call and detached in a finally, so the warm interpreter's ambient context is
-    restored whatever the handler does (return, raise, or exit)."""
+    A fresh HandlerContext is built from context_frame for this call and passed
+    as the handler's second argument. The invocation's trace context (if any) is
+    attached for the single handler call and detached in a finally, so the warm
+    interpreter's ambient context is restored whatever the handler does (return,
+    raise, or exit)."""
     module_name, _, func_name = handler.rpartition(".")
     if not module_name or not func_name:
         return f"invalid handler {handler!r}"
@@ -267,9 +354,14 @@ async def invoke(handler, event, trace=None):
     if func is None:
         return f"module {module_name!r} has no function {func_name!r}"
 
+    try:
+        context = build_handler_context(context_frame)
+    except (TypeError, ValueError) as exc:
+        return f"invalid handler context: {exc}"
+
     token = extract_context(trace)
     try:
-        result = func(event)
+        result = func(event, context)
         if inspect.isawaitable(result):
             await result  # on the process-lifetime loop, never a fresh one
     except SystemExit as exc:
@@ -319,7 +411,12 @@ async def runtime_loop():
         os.environ["RELAY_HANDLER"] = str(handler)
 
         try:
-            error = await invoke(handler, req.get("event"), req.get("trace"))
+            error = await invoke(
+                handler,
+                req.get("event"),
+                req.get("context"),
+                req.get("trace"),
+            )
         except SystemExit as exc:
             sys.exit(1 if exc.code not in (None, 0, True) else 0)
 

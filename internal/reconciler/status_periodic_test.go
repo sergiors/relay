@@ -140,7 +140,7 @@ func TestActualDesiredChangeRecordsPreparingBeforePrepare(t *testing.T) {
 	r.SeedFencingToken(fn.Name, fencingToken)
 
 	// Change content so the fingerprint changes and a rebuild is warranted.
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 	r.reconcileApp(fn.Name)
@@ -184,7 +184,7 @@ func TestReconcilingReadyOrderingOnChange(t *testing.T) {
 	seedCurrent(r, fn)
 	r.SeedFencingToken(fn.Name, fencingToken)
 
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 	r.reconcileApp(fn.Name)
@@ -269,7 +269,7 @@ func TestServiceLifecycleNeverPublishesBuilding(t *testing.T) {
 	seedCurrent(r, fn)
 	r.SeedFencingToken(fn.Name, fencingToken)
 
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 	r.reconcileApp(fn.Name)
@@ -344,7 +344,7 @@ func TestPeriodicSkipPathStaleCallbacksRemainGuarded(t *testing.T) {
 	// A newer desired generation starts (content changes) and completes before
 	// the pending callbacks run.
 	if err := os.WriteFile(filepath.Join(fn.Dir, "index.js"),
-		[]byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+		[]byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 	r.reconcileApp(fn.Name)

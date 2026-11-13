@@ -42,7 +42,7 @@ events:
     pattern:
       status: [COMPLETED]
 `)
-	writeFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
+	writeFile(t, dir, "handler.py", "def run(event, context):\n    print('ok')\n")
 	writeFile(t, dir, "requirements.txt", "six==1.16.0\n")
 	fn := app.App{Name: "dep-labels", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 
@@ -155,7 +155,7 @@ events:
     pattern:
       status: [COMPLETED]
 `)
-		writeFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
+		writeFile(t, dir, "handler.py", "def run(event, context):\n    print('ok')\n")
 		writeFile(t, dir, "requirements.txt", deps)
 		return app.App{Name: name, Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 	}
@@ -367,7 +367,7 @@ events:
     pattern:
       status: [COMPLETED]
 `)
-	writeFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
+	writeFile(t, dir, "handler.py", "def run(event, context):\n    print('ok')\n")
 	// A per-run manifest marker makes the dependency layer unique to this run, so
 	// asserting its removal never races a sibling test or worker that shares the
 	// canonical six==1.16.0 layer.

@@ -57,7 +57,7 @@ func stagedContextContents(t *testing.T, raw []byte) map[string]string {
 //   - the staged build context contains the ORIGINAL bytes, not the edit.
 func TestPrepareTagAndStagedBytesShareOneSnapshot(t *testing.T) {
 	dir := t.TempDir()
-	original := []byte("export function h(){ return 'original'; }\n")
+	original := []byte("export function h(event, context){ return 'original'; }\n")
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), original, 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestPrepareTagAndStagedBytesShareOneSnapshot(t *testing.T) {
 	// policy it must not be staged either (the snapshot reflects the captured
 	// selection, not a re-walk).
 	m.afterSourceSnapshot = func(_ *app.SourceSnapshot) {
-		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){ return 'mutated'; }\n"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){ return 'mutated'; }\n"), 0o644); err != nil {
 			t.Fatalf("mutate source: %v", err)
 		}
 		if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("*.tmp\n"), 0o644); err != nil {
@@ -131,7 +131,7 @@ func TestPrepareTagAndStagedBytesShareOneSnapshot(t *testing.T) {
 // live-copy fallback exists.
 func TestPrepareSnapshotFailureRejectsBuild(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 	if err := os.Chmod(filepath.Join(dir, "index.js"), 0); err != nil {
@@ -168,7 +168,7 @@ func TestPrepareSnapshotFailureRejectsBuild(t *testing.T) {
 // is blocked, and the build is released only after it lands.
 func TestPrepareMutationDuringBlockedBuildKeepsCapturedIdentity(t *testing.T) {
 	dir := t.TempDir()
-	original := []byte("export function h(){ return 'original'; }\n")
+	original := []byte("export function h(event, context){ return 'original'; }\n")
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), original, 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestPrepareMutationDuringBlockedBuildKeepsCapturedIdentity(t *testing.T) {
 	}
 
 	// Mutate the tracked source while the build is blocked.
-	mutated := []byte("export function h(){ return 'mutated'; }\n")
+	mutated := []byte("export function h(event, context){ return 'mutated'; }\n")
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), mutated, 0o644); err != nil {
 		t.Fatalf("mutate source: %v", err)
 	}
@@ -272,7 +272,7 @@ func TestPrepareReleasesSnapshotOnSuccessAndFailure(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+			if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 				t.Fatalf("write source: %v", err)
 			}
 			cli := newScriptedDockerClient(t,
@@ -321,7 +321,7 @@ func TestPrepareReleasesSnapshotOnSuccessAndFailure(t *testing.T) {
 // Discard call).
 func TestPrepareReleasesSnapshotOnCancellation(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 

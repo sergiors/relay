@@ -233,7 +233,7 @@ func TestDLQReplaySuccessDeleteRequiresCurrentClaimToken(t *testing.T) {
 			t.Fatalf("err = %v, want it to mention %q", err, want)
 		}
 	}
-	if calls, _, _ := rep.got(); calls != 1 {
+	if calls, _, _, _ := rep.got(); calls != 1 {
 		t.Fatalf("replayer calls = %d, want the single superseded execution", calls)
 	}
 	if len(store.entries) != 1 {

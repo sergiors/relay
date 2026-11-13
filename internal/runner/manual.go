@@ -163,6 +163,15 @@ func (r *Runner) InvokeApp(
 				NodeID:    r.nodeID,
 				Image:     toImage(pf),
 			})
+			// A manual invocation is an operator action, never a broker
+			// delivery: there is no source message identity to make the request
+			// ID stable, so each matching handler execution gets a fresh ID. It
+			// is still a well-defined state-free execution context: attempt 1,
+			// with the rule's configured initial-plus-retries budget, and no
+			// message ID.
+			invokeCtx = runtime.WithHandlerContext(invokeCtx, newHandlerContext(
+				stateFreeRequestID(), name, rule.Handler, "", 1, 1+rule.Retries,
+			))
 
 			start := time.Now()
 			panicked, panicValue, err := r.runInvocation(
@@ -246,12 +255,17 @@ func (r *Runner) InvokeApp(
 // a manual invocation does, because those are execution outcomes rather than
 // broker state.
 //
+// sourceMessageID is retained as handler-visible provenance only. The replay
+// still has a fresh request ID and no broker invocation state.
+//
 // The handler timeout follows InvokeHandler's current resolution: the matching
 // schedule entry's timeout when the handler has one, otherwise the CURRENT event
 // rule's timeout for that exact handler, otherwise the app default — always
 // capped by the configured maximum. Resolving the event rule is by exact handler
 // string, never event matching, so the replay still runs exactly one handler.
 // event is the entry's original payload, replayed verbatim.
+// sourceMessageID is optional origin metadata from the entry; it is exposed to
+// the handler but does not participate in request identity or broker state.
 //
 // Tracing: a `dlq.replay` span wraps the whole replay as a NEW ROOT worker
 // operation (independent of the caller's context), carrying a span link to the
@@ -262,7 +276,7 @@ func (r *Runner) InvokeApp(
 // span is opened BEFORE registry/handler validation, so a removed app or
 // handler is still traced (with its error recorded) without changing any return
 // semantics.
-func (r *Runner) ReplayDLQ(ctx context.Context, fnName, handler string, event []byte, lineage string) (err error) {
+func (r *Runner) ReplayDLQ(ctx context.Context, fnName, handler string, event []byte, lineage, sourceMessageID string) (err error) {
 	// The replay operation is a new root worker span; its child function.invoke
 	// (started via InvokeHandler below) inherits this context. It is opened
 	// before validation and records the terminal outcome through the deferred
@@ -284,7 +298,8 @@ func (r *Runner) ReplayDLQ(ctx context.Context, fnName, handler string, event []
 	// TryStart/complete/retry/exhaustion, and no DLQ accounting. The opt-out
 	// makes the guarantee explicit even when the caller's context came from the
 	// stream delivery path.
-	return r.InvokeHandler(stream.WithoutInvocationState(opCtx), "", fnName, "", handler, event)
+	ctx = stream.WithoutInvocationState(opCtx)
+	return r.invokeHandler(ctx, "", fnName, "", handler, event, nil, sourceMessageID)
 }
 
 // templateHasHandler reports whether handler is present in the template's

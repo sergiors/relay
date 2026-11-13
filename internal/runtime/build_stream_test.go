@@ -362,7 +362,7 @@ func (c *countingReader) remaining() int {
 // returns nil, and a large response is bounded and counted without hanging.
 func TestRunImageBuildStreamsOutputAndDrains(t *testing.T) {
 	ctxDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(ctxDir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(ctxDir, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 

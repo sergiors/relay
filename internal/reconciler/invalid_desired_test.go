@@ -437,7 +437,7 @@ func TestReconcileValidReplacementOverwritesInvalidGeneration(t *testing.T) {
 
 	// Fix the template and change source so a rebuild succeeds.
 	writeFnDir(t, root, "recovers")
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 	r.reconcileApp("recovers")

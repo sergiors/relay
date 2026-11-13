@@ -304,7 +304,7 @@ func TestDependencyFingerprintNodePlanDepsPairSensitivity(t *testing.T) {
 	const pkg = `{"type":"module","dependencies":{"picocolors":"^1.0.0"}}`
 	writeNodeTestFile(t, dir, "package.json", pkg)
 	writeNodeTestFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
-	writeNodeTestFile(t, dir, "index.js", "export function handler(e) {}\n")
+	writeNodeTestFile(t, dir, "index.js", "export function handler(e, context) {}\n")
 
 	spec, err := lookup("nodejs24.x")
 	if err != nil {
@@ -363,7 +363,7 @@ func TestDependencyFingerprintNodePlanDepsPairSensitivity(t *testing.T) {
 
 	// A source-only edit is app identity, not dependency input: the dependency
 	// fingerprint must not move.
-	writeNodeTestFile(t, dir, "index.js", "export function handler(e) { return 1; }\n")
+	writeNodeTestFile(t, dir, "index.js", "export function handler(e, context) { return 1; }\n")
 	if got := fingerprint(); got != base {
 		t.Error("a source-only edit must not change the Node dependency fingerprint")
 	}
@@ -542,7 +542,7 @@ func TestTypeScriptEditsInvalidateAppNotDependency(t *testing.T) {
 		t.Fatalf("mkdir src: %v", err)
 	}
 	handlerPath := filepath.Join(dir, "src", "handler.ts")
-	if err := os.WriteFile(handlerPath, []byte("export function handler(e) { return 1; }\n"), 0o644); err != nil {
+	if err := os.WriteFile(handlerPath, []byte("export function handler(e, context) { return 1; }\n"), 0o644); err != nil {
 		t.Fatalf("write handler.ts: %v", err)
 	}
 
@@ -556,7 +556,7 @@ func TestTypeScriptEditsInvalidateAppNotDependency(t *testing.T) {
 	}
 
 	// Edit the TypeScript handler: it is app source, not dependency input.
-	if err := os.WriteFile(handlerPath, []byte("export function handler(e) { return 2; }\n"), 0o644); err != nil {
+	if err := os.WriteFile(handlerPath, []byte("export function handler(e, context) { return 2; }\n"), 0o644); err != nil {
 		t.Fatalf("rewrite handler.ts: %v", err)
 	}
 	if got := fpOf(t, dir); got == funcBefore {
@@ -598,7 +598,7 @@ func TestTypeScriptIgnoredFileChangesNeitherFingerprint(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"type":"module"}`), 0o644); err != nil {
 		t.Fatalf("write package.json: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "handler.ts"), []byte("export function handler(e) {}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "handler.ts"), []byte("export function handler(e, context) {}\n"), 0o644); err != nil {
 		t.Fatalf("write handler.ts: %v", err)
 	}
 	generatedPath := filepath.Join(dir, "scratch.generated.ts")

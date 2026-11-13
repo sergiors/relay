@@ -73,7 +73,7 @@ events:
       status: [COMPLETED]
 `)
 	writeFile(t, dir, "handler.py", `
-def completed(event):
+def completed(event, context):
     print("completed %s" % event.get("event_id"))
 `)
 
@@ -111,7 +111,7 @@ events:
 	writeFile(t, dir, "handler.py", `
 import asyncio
 
-async def completed(event):
+async def completed(event, context):
     print("async completed %s" % event.get("event_id"))
 `)
 
@@ -156,7 +156,7 @@ _loop = None
 _queue = None
 _calls = 0
 
-async def touch(event):
+async def touch(event, context):
     global _loop, _queue, _calls
     _calls += 1
     current = asyncio.get_running_loop()
@@ -198,7 +198,7 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", `
-export async function created(event) {
+export async function created(event, context) {
   console.log("created " + event.event_id);
 }
 `)
@@ -328,7 +328,7 @@ events:
 `)
 	writeFile(t, dir, "index.js", `
 import "missing-package";
-export function run(event) {
+export function run(event, context) {
   console.log("should not run");
 }
 `)
@@ -385,7 +385,7 @@ events:
 `)
 	writeFile(t, dir, "index.ts", `
 import { message } from "./message";
-export function handler(event: { event_id: string }): void {
+export function handler(event: { event_id: string }, context: unknown): void {
   console.log(message(event));
 }
 `)
@@ -435,7 +435,7 @@ events:
 	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	writeFile(t, dir, "index.ts", `
 import colors from "picocolors";
-export function handler(event: { event_id: string }): void {
+export function handler(event: { event_id: string }, context: unknown): void {
   console.log(colors.red("dep " + event.event_id));
 }
 `)
@@ -521,12 +521,12 @@ events:
 		t.Fatalf("mkdir events: %v", err)
 	}
 	writeFile(t, dir, "events/created.ts", `
-export function handler(event: { event_id: string }): void {
+export function handler(event: { event_id: string }, context: unknown): void {
   console.log("created ts " + event.event_id);
 }
 `)
 	writeFile(t, dir, "events/deleted.ts", `
-export function handler(event: { event_id: string }): void {
+export function handler(event: { event_id: string }, context: unknown): void {
   console.log("deleted ts " + event.event_id);
 }
 `)
@@ -570,7 +570,7 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	writeFile(t, dir, "x.js", "export function handler(e) {}\n")
+	writeFile(t, dir, "x.js", "export function handler(e, context) {}\n")
 	writeFile(t, dir, "x.ts", "export function handler(e: unknown): void {}\n")
 
 	fn := app.App{Name: "node-ts-ambiguous-e2e", Dir: dir, Template: tsTemplate("x.handler")}

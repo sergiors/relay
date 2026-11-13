@@ -50,7 +50,7 @@ func stagedContextFiles(t *testing.T, raw []byte) map[string]bool {
 // live tree against this built identity and rebuilds the drift.
 func TestPrepareWithSelectionUsesSuppliedSelection(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 
@@ -166,7 +166,7 @@ func TestEnsureDependencyImageUsesSuppliedFingerprint(t *testing.T) {
 // ensureDependencyImage) would be counted here.
 func TestPrepareComputesDependencyFingerprintOnce(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte("def handler(e): return 1\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte("def handler(e, context): return 1\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte("six==1.16.0\n"), 0o644); err != nil {
@@ -229,7 +229,7 @@ func TestSelectAndFingerprintAppsNoRuntimeNoSelection(t *testing.T) {
 // over it, so the two are coherent by construction.
 func TestSelectAndFingerprintAppsRuntimeReturnsSelection(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 	selection, fp, err := app.SelectAndFingerprintApp(dir, &app.Template{Runtime: "nodejs24.x"})

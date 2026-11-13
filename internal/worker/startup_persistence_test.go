@@ -12,7 +12,7 @@ import (
 // nil token map is not a reason to suppress preparation.
 func TestPrepareAppsWithoutStateSinkNeedsNoToken(t *testing.T) {
 	root := t.TempDir()
-	writeWorkerApp(t, root, "solo", "def handler(e): return 1\n")
+	writeWorkerApp(t, root, "solo", "def handler(e, context): return 1\n")
 	fns, err := app.NewLoader(root, discardLogger()).Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)

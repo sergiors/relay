@@ -140,7 +140,7 @@ func newCrossWorkerReconciler(
 // observes a new desired generation without touching the template.
 func writeServiceSource(t *testing.T, dir, version string) {
 	t.Helper()
-	body := fmt.Sprintf("export function hi(e){ console.log(%q); }\n", version)
+	body := fmt.Sprintf("export function hi(e, context){ console.log(%q); }\n", version)
 	err := os.WriteFile(filepath.Join(dir, "index.js"), []byte(body), 0o644)
 	if err != nil {
 		t.Fatalf("write source %s: %v", version, err)

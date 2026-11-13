@@ -177,11 +177,11 @@ def _observe(tag):
     print(tag)
 
 
-def sync_probe(event):
+def sync_probe(event, context):
     _observe("sync-marker=`+zuvloopStubMarker+`")
 
 
-async def async_probe(event):
+async def async_probe(event, context):
     _observe("async-marker=on-same-stub-loop")
     await _queue.put(event["msg"])
     print("queue=%s" % (await _queue.get()))
@@ -217,7 +217,7 @@ func TestPythonZuvloopEnabledMissingPackageFailsStartup(t *testing.T) {
 	requireLoopFactoryPython(t)
 	dir := t.TempDir()
 	writeOtelStub(t, dir)
-	writeHandler(t, dir, "handler", "def f(event):\n    pass\n")
+	writeHandler(t, dir, "handler", "def f(event, context):\n    pass\n")
 
 	content, err := bootstrapFor(true)
 	if err != nil {
@@ -246,7 +246,7 @@ func TestPythonZuvloopEnabledFactoryFailureFailsStartup(t *testing.T) {
 	dir := t.TempDir()
 	writeOtelStub(t, dir)
 	writeZuvloopStub(t, dir, zuvloopStubFailingSource)
-	writeHandler(t, dir, "handler", "def f(event):\n    pass\n")
+	writeHandler(t, dir, "handler", "def f(event, context):\n    pass\n")
 
 	content, err := bootstrapFor(true)
 	if err != nil {
@@ -280,13 +280,13 @@ import asyncio
 import sys
 
 
-def probe(event):
+def probe(event, context):
     print("zuvloop-imported=%s" % ("zuvloop" in sys.modules))
     loop = asyncio.get_running_loop()
     print("factory-probed=%s" % (hasattr(loop, "relay_test_factory_marker")))
 
 
-async def async_probe(event):
+async def async_probe(event, context):
     await asyncio.sleep(0)
     print("ran-async ok")
 `)
@@ -317,7 +317,7 @@ func TestPythonZuvloopEnabledEOFExitsZero(t *testing.T) {
 	dir := t.TempDir()
 	writeOtelStub(t, dir)
 	writeZuvloopStub(t, dir, zuvloopStubSource)
-	writeHandler(t, dir, "handler", "def f(event):\n    pass\n")
+	writeHandler(t, dir, "handler", "def f(event, context):\n    pass\n")
 	p := startZuvloopBootstrap(t, dir)
 	r := p.invoke(t, "handler.f", `{}`, nil)
 	if !r.OK {

@@ -73,7 +73,7 @@ func TestServicesReconcileIntegration(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(serviceReconcileTemplate(3000, 2)), 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write index: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Join(dir, "app"), 0o755); err != nil {

@@ -90,7 +90,7 @@ events:
     timeout: 25s
 `)
 	writeTestFile(t, fnDir, "index.js", `
-export async function slow(event) {
+export async function slow(event, context) {
   console.log("slow started " + event.event_id);
   await new Promise(r => setTimeout(r, 30000));
   console.log("slow done");

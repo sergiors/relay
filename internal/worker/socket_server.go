@@ -127,7 +127,7 @@ type AppInvoker interface {
 // (ErrAppNotFound / ErrAppUnavailable / ErrHandlerNotFound) onto stable
 // wire codes; that import is for the error contract, not dispatch.
 type HandlerReplayer interface {
-	ReplayDLQ(ctx context.Context, name, handler string, event []byte, trace string) error
+	ReplayDLQ(ctx context.Context, name, handler string, event []byte, trace, sourceMessageID string) error
 }
 
 // ReadinessChecker is the narrow worker-readiness view the health command
@@ -411,7 +411,7 @@ func (s *SocketServer) handle(conn net.Conn) {
 	case cmdInvokeApp:
 		s.handleInvokeApp(conn, req.App, req.Event)
 	case cmdReplayDLQ:
-		s.handleReplayDLQ(conn, req.App, req.Handler, req.Event, req.Trace)
+		s.handleReplayDLQ(conn, req.App, req.Handler, req.Event, req.Trace, req.SourceMessageID)
 	case cmdReady:
 		s.handleReady(conn)
 	default:
@@ -545,7 +545,7 @@ func (s *SocketServer) handleInvokeApp(conn net.Conn, name string, rawEvent json
 // trace optionally carries the entry's compact lineage (a control-path field,
 // not part of the event payload); it is forwarded so the worker can link the
 // replay's new operation span back to the original failed invocation.
-func (s *SocketServer) handleReplayDLQ(conn net.Conn, name, handler string, rawEvent json.RawMessage, trace string) {
+func (s *SocketServer) handleReplayDLQ(conn net.Conn, name, handler string, rawEvent json.RawMessage, trace, sourceMessageID string) {
 	if name == "" || handler == "" || len(rawEvent) == 0 {
 		s.respond(conn, socketResponse{Error: errCodeMalformedRequest})
 		return
@@ -565,7 +565,7 @@ func (s *SocketServer) handleReplayDLQ(conn net.Conn, name, handler string, rawE
 
 	ctx, cancel := context.WithTimeout(s.baseCtx, invokeTimeout)
 	defer cancel()
-	if err := replayer.ReplayDLQ(ctx, name, handler, rawEvent, trace); err != nil {
+	if err := replayer.ReplayDLQ(ctx, name, handler, rawEvent, trace, sourceMessageID); err != nil {
 		code := replayErrorCode(err)
 		s.log.Warn("DLQ replay: handler execution failed",
 			"app", name,

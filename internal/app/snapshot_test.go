@@ -17,7 +17,7 @@ func TestSnapshotFingerprintMatchesFingerprintSelection(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, ".gitignore"), "*.log\n")
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: python3.14\nresources:\n  memory: 1GiB\n")
-	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e): return 1\n")
+	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e, context): return 1\n")
 	writeFile(t, filepath.Join(dir, "debug.log"), "noise\n")
 
 	selection := mustSnapshotSelection(t, dir)
@@ -43,7 +43,7 @@ func TestSnapshotFingerprintMatchesFingerprintSelection(t *testing.T) {
 func TestSnapshotIsImmutableAcrossMutation(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\n")
-	writeFile(t, filepath.Join(dir, "index.js"), "export function h(){ return 1; }\n")
+	writeFile(t, filepath.Join(dir, "index.js"), "export function h(event, context){ return 1; }\n")
 
 	snapshot, err := CaptureSourceSnapshot(mustSnapshotSelection(t, dir))
 	if err != nil {
@@ -52,7 +52,7 @@ func TestSnapshotIsImmutableAcrossMutation(t *testing.T) {
 	defer snapshot.Discard()
 	before := snapshot.Fingerprint()
 
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){ return 2; }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){ return 2; }\n"), 0o644); err != nil {
 		t.Fatalf("mutate: %v", err)
 	}
 	if err := os.Remove(filepath.Join(dir, "index.js")); err != nil {
@@ -123,7 +123,7 @@ func TestSnapshotEntriesCarryStageRelAndContent(t *testing.T) {
 // path without retaining the tree.
 func TestSnapshotDiscardReleasesBytes(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "index.js"), "export function h(){}\n")
+	writeFile(t, filepath.Join(dir, "index.js"), "export function h(event, context){}\n")
 
 	snapshot, err := CaptureSourceSnapshot(mustSnapshotSelection(t, dir))
 	if err != nil {
@@ -146,7 +146,7 @@ func TestSnapshotDiscardReleasesBytes(t *testing.T) {
 // while a non-resource template edit changes it.
 func TestSnapshotTemplateResourcesStripped(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "index.js"), "export function run(e){}\n")
+	writeFile(t, filepath.Join(dir, "index.js"), "export function run(e, context){}\n")
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\nresources:\n  memory: 128MiB\nevents:\n  - handler: index.run\n    pattern:\n      event_name: [INSERT]\n")
 
 	base := snapshotDigest(t, dir)
@@ -165,7 +165,7 @@ func TestSnapshotTemplateResourcesStripped(t *testing.T) {
 // temporary directory, and the fingerprint remains readable after Discard.
 func TestSnapshotDiscardRemovesRoot(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "index.js"), "export function h(){}\n")
+	writeFile(t, filepath.Join(dir, "index.js"), "export function h(event, context){}\n")
 
 	snapshot, err := CaptureSourceSnapshot(mustSnapshotSelection(t, dir))
 	if err != nil {
@@ -201,7 +201,7 @@ func TestSnapshotStagesDiskBackedContentAndFingerprintMatchesSelection(t *testin
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, ".gitignore"), "*.log\n")
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\n")
-	writeFile(t, filepath.Join(dir, "index.js"), "export function h(){}\n")
+	writeFile(t, filepath.Join(dir, "index.js"), "export function h(event, context){}\n")
 	writeFile(t, filepath.Join(dir, "debug.log"), "noise\n")
 
 	selection := mustSnapshotSelection(t, dir)
@@ -217,7 +217,7 @@ func TestSnapshotStagesDiskBackedContentAndFingerprintMatchesSelection(t *testin
 	if got := snapshot.Fingerprint(); got != want {
 		t.Fatalf("snapshot fingerprint = %q, want %q", got, want)
 	}
-	if got := mustRead(t, filepath.Join(snapshot.Root(), "index.js")); got != "export function h(){}\n" {
+	if got := mustRead(t, filepath.Join(snapshot.Root(), "index.js")); got != "export function h(event, context){}\n" {
 		t.Fatalf("staged index.js = %q", got)
 	}
 	if _, err := os.Stat(filepath.Join(snapshot.Root(), "template.yaml")); !os.IsNotExist(err) {
@@ -229,11 +229,11 @@ func TestSnapshotStagesDiskBackedContentAndFingerprintMatchesSelection(t *testin
 
 	// Mutating the source after capture must not touch the digest or the staged
 	// bytes: both come from the single capture.
-	writeFile(t, filepath.Join(dir, "index.js"), "export function h(){ return 'mutated'; }\n")
+	writeFile(t, filepath.Join(dir, "index.js"), "export function h(event, context){ return 'mutated'; }\n")
 	if got := snapshot.Fingerprint(); got != want {
 		t.Fatalf("fingerprint changed after mutation: %q != %q", got, want)
 	}
-	if got := mustRead(t, filepath.Join(snapshot.Root(), "index.js")); got != "export function h(){}\n" {
+	if got := mustRead(t, filepath.Join(snapshot.Root(), "index.js")); got != "export function h(event, context){}\n" {
 		t.Fatalf("staged index.js changed after mutation: %q", got)
 	}
 }
@@ -254,7 +254,7 @@ func mustRead(t *testing.T, path string) string {
 // regular file is staged.
 func TestSnapshotExcludesTemplateDirSubtreeAndNonRegular(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "index.js"), "export function h(){}\n")
+	writeFile(t, filepath.Join(dir, "index.js"), "export function h(event, context){}\n")
 	if err := os.MkdirAll(filepath.Join(dir, "template.yaml"), 0o755); err != nil {
 		t.Fatalf("mkdir template.yaml dir: %v", err)
 	}
@@ -302,7 +302,7 @@ func TestSnapshotExcludesTemplateDirSubtreeAndNonRegular(t *testing.T) {
 // by the session's scavenger.
 func TestCaptureSourceSnapshotInStagesUnderParent(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "index.js"), "export function h(){}\n")
+	writeFile(t, filepath.Join(dir, "index.js"), "export function h(event, context){}\n")
 
 	parent := t.TempDir()
 	snapshot, err := CaptureSourceSnapshotIn(parent, mustSnapshotSelection(t, dir))
@@ -332,7 +332,7 @@ func TestCaptureSourceSnapshotLegacyParentUsesTempDir(t *testing.T) {
 	base := t.TempDir()
 	t.Setenv("TMPDIR", base)
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "index.js"), "export function h(){}\n")
+	writeFile(t, filepath.Join(dir, "index.js"), "export function h(event, context){}\n")
 
 	snapshot, err := CaptureSourceSnapshot(mustSnapshotSelection(t, dir))
 	if err != nil {

@@ -84,7 +84,7 @@ func buildRoute(capture func(*http.Request)) dockerRoute {
 // deadline is observed on the actual ImageBuild HTTP request.
 func TestAppImageBuildGetsIndependentTenMinuteDeadline(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 	fn := app.App{
@@ -135,7 +135,7 @@ const reconcileShort = 30 * time.Second
 // shutdown), while the build remains independently bounded by buildTimeout.
 func TestLifecycleCancellationCancelsActiveBuild(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 	fn := app.App{Name: "cancel-build", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}

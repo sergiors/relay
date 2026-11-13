@@ -33,7 +33,7 @@ func TestMaterializeOnlyChangedAppIsExchanged(t *testing.T) {
 	writeFile(t, filepath.Join(src, "beta", "template.yaml"),
 		hardeningTemplate("beta"))
 	writeFile(t, filepath.Join(src, "beta", "handler.js"),
-		"export function beta(){}\n")
+		"export function beta(event, context){}\n")
 
 	apps := t.TempDir()
 	selection := mustSelect(t, src, src)
@@ -115,7 +115,7 @@ func TestMaterializeOnlyChangedAppIsExchanged(t *testing.T) {
 		t.Fatalf("alpha old file survived the update: %v", err)
 	}
 	betaHandler := mustReadFile(t, filepath.Join(apps, "beta", "handler.js"))
-	if betaHandler != "export function beta(){}\n" {
+	if betaHandler != "export function beta(event, context){}\n" {
 		t.Fatalf("unchanged beta content = %q", betaHandler)
 	}
 
@@ -174,7 +174,7 @@ events:
       event_name: [INSERT]
 `
 	writeFile(t, filepath.Join(src, "res", "template.yaml"), resourceTemplate)
-	writeFile(t, filepath.Join(src, "res", "index.js"), "export function hi(e){}\n")
+	writeFile(t, filepath.Join(src, "res", "index.js"), "export function hi(e, context){}\n")
 
 	apps := t.TempDir()
 	if _, err := materializeApps(mustSelect(t, src, src), apps); err != nil {

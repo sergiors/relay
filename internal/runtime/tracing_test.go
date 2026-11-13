@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
@@ -175,6 +176,151 @@ func TestEncodeInvokeRequestCarriesTraceFrame(t *testing.T) {
 	extracted := tracing.ExtractStrings(context.Background(), decoded.Trace)
 	if got := oteltrace.SpanContextFromContext(extracted).TraceID(); got != span.SpanContext().TraceID() {
 		t.Errorf("extracted trace id = %s, want %s", got, span.SpanContext().TraceID())
+	}
+}
+
+// TestEncodeInvokeRequestCarriesHandlerContext proves the request frame's
+// "context" object carries the complete execution identity: the stable request
+// ID, the confirmed attempt and configured attempt budget, the effective
+// context deadline as RFC 3339, the optional message and trace IDs, and the
+// app/handler. The event payload stays verbatim and the trace ID agrees with
+// the frame's trace carrier.
+func TestEncodeInvokeRequestCarriesHandlerContext(t *testing.T) {
+	withSpanRecorder(t)
+	ctx, span := tracing.Start(context.Background(), "function.invoke")
+	defer span.End()
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+
+	handlerCtx := HandlerContext{
+		RequestID:   "1791234567890-0:app/events.created",
+		Attempt:     2,
+		MaxAttempts: 4,
+		MessageID:   "1791234567890-0",
+		App:         "app",
+		Handler:     "events.created",
+	}
+	ctx = WithHandlerContext(ctx, handlerCtx)
+	ctx = WithRunMeta(ctx, RunMeta{App: "app"})
+
+	const event = `{"event_name":"INSERT","new_image":{"id":1}}`
+	frame, err := encodeInvokeRequest(ctx, "req-1", "events.created", []byte(event), nil)
+	if err != nil {
+		t.Fatalf("encodeInvokeRequest: %v", err)
+	}
+
+	var decoded invokeRequest
+	if err := json.Unmarshal(frame, &decoded); err != nil {
+		t.Fatalf("decode frame: %v", err)
+	}
+	if string(decoded.Event) != event {
+		t.Errorf("event = %s, want verbatim %s", decoded.Event, event)
+	}
+	got := decoded.Context
+	if got == nil {
+		t.Fatal("request frame carries no context object")
+	}
+	if got.RequestID != handlerCtx.RequestID {
+		t.Errorf("requestId = %q, want %q", got.RequestID, handlerCtx.RequestID)
+	}
+	if got.Attempt != 2 || got.MaxAttempts != 4 {
+		t.Errorf("attempt/maxAttempts = %d/%d, want 2/4", got.Attempt, got.MaxAttempts)
+	}
+	if got.MessageID != handlerCtx.MessageID {
+		t.Errorf("messageId = %q, want %q", got.MessageID, handlerCtx.MessageID)
+	}
+	if got.App != "app" || got.Handler != "events.created" {
+		t.Errorf("app/handler = %q/%q, want app/events.created", got.App, got.Handler)
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("test context has no deadline")
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, got.Deadline)
+	if err != nil {
+		t.Fatalf("deadline %q is not RFC 3339: %v", got.Deadline, err)
+	}
+	if !parsed.Equal(deadline) {
+		t.Errorf("deadline = %s, want %s", parsed, deadline)
+	}
+	if got.TraceID != span.SpanContext().TraceID().String() {
+		t.Errorf("traceId = %q, want %s", got.TraceID, span.SpanContext().TraceID())
+	}
+}
+
+// TestEncodeInvokeRequestNormalizesStateFreeContext proves a direct runtime
+// caller that injected no HandlerContext still gets a complete, well-defined
+// state-free execution context: a fresh request ID, attempt 1, maxAttempts 1,
+// the app from RunMeta, the invoked handler, and the zero deadline when the
+// context has none.
+func TestEncodeInvokeRequestNormalizesStateFreeContext(t *testing.T) {
+	ctx := WithRunMeta(context.Background(), RunMeta{App: "fn"})
+	frame, err := encodeInvokeRequest(ctx, "req-2", "index.handler", []byte(`{}`), nil)
+	if err != nil {
+		t.Fatalf("encodeInvokeRequest: %v", err)
+	}
+
+	var decoded invokeRequest
+	if err := json.Unmarshal(frame, &decoded); err != nil {
+		t.Fatalf("decode frame: %v", err)
+	}
+	got := decoded.Context
+	if got == nil {
+		t.Fatal("request frame carries no context object")
+	}
+	if got.RequestID == "" {
+		t.Error("state-free context requestId is empty")
+	}
+	if got.Attempt != 1 || got.MaxAttempts != 1 {
+		t.Errorf("attempt/maxAttempts = %d/%d, want 1/1", got.Attempt, got.MaxAttempts)
+	}
+	if got.MessageID != "" || got.TraceID != "" {
+		t.Errorf("messageId/traceId = %q/%q, want both absent", got.MessageID, got.TraceID)
+	}
+	if got.App != "fn" || got.Handler != "index.handler" {
+		t.Errorf("app/handler = %q/%q, want fn/index.handler", got.App, got.Handler)
+	}
+	if want := (time.Time{}).UTC().Format(time.RFC3339Nano); got.Deadline != want {
+		t.Errorf("deadline = %q, want zero instant %q", got.Deadline, want)
+	}
+}
+
+// TestEncodeInvokeRequestPreservesConfiguredBudget proves the frame reports
+// the CONFIGURED attempt budget even when a config change left the claimed
+// attempt above it: attempt 5 with maxAttempts 2 stays 5/2 (the budget is never
+// clamped up to the attempt), the stable request ID passes through verbatim,
+// and the broker message ID is carried.
+func TestEncodeInvokeRequestPreservesConfiguredBudget(t *testing.T) {
+	ctx := WithRunMeta(context.Background(), RunMeta{App: "fn"})
+	ctx = WithHandlerContext(ctx, HandlerContext{
+		RequestID:   "schedule:9-0:fn/index.run",
+		Attempt:     5,
+		MaxAttempts: 2,
+		MessageID:   "9-0",
+		App:         "fn",
+		Handler:     "index.run",
+	})
+	frame, err := encodeInvokeRequest(ctx, "req-3", "index.run", []byte(`{}`), nil)
+	if err != nil {
+		t.Fatalf("encodeInvokeRequest: %v", err)
+	}
+
+	var decoded invokeRequest
+	if err := json.Unmarshal(frame, &decoded); err != nil {
+		t.Fatalf("decode frame: %v", err)
+	}
+	got := decoded.Context
+	if got == nil {
+		t.Fatal("request frame carries no context object")
+	}
+	if got.Attempt != 5 || got.MaxAttempts != 2 {
+		t.Errorf("attempt/maxAttempts = %d/%d, want 5/2 (the budget is never raised to the attempt)", got.Attempt, got.MaxAttempts)
+	}
+	if got.RequestID != "schedule:9-0:fn/index.run" {
+		t.Errorf("requestId = %q, want the stable schedule identity", got.RequestID)
+	}
+	if got.MessageID != "9-0" {
+		t.Errorf("messageId = %q, want 9-0", got.MessageID)
 	}
 }
 

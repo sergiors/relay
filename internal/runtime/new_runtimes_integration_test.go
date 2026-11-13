@@ -114,11 +114,11 @@ def ver():
     return ".".join(str(v) for v in sys.version_info[:2])
 
 
-def run(event):
+def run(event, context):
     print("sync run ver=" + ver() + " six=" + six.__version__)
 
 
-async def ache(event):
+async def ache(event, context):
     global _loop, _calls
     _calls += 1
     current = asyncio.get_running_loop()
@@ -209,7 +209,7 @@ events:
 	writeFile(t, jsDir, "package.json", `{"type":"module","dependencies":{"picocolors":"^1.0.0"}}`)
 	writeFile(t, jsDir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	writeFile(t, jsDir, "handler.js", `import colors from "picocolors";
-export function on(event) {
+export function on(event, context) {
   console.log(colors.red("js on id=" + event.event_id + " ver=v" + process.versions.node + " pid=" + process.pid));
 }
 `)
@@ -228,7 +228,7 @@ events:
 	writeFile(t, tsDir, "package.json", `{"type":"module","dependencies":{"picocolors":"^1.0.0"}}`)
 	writeFile(t, tsDir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	writeFile(t, tsDir, "index.ts", `import colors from "picocolors";
-export function tick(event: { event_id: string }): void {
+export function tick(event: { event_id: string }, context: unknown): void {
   console.log(colors.red("ts tick n26 " + event.event_id));
 }
 `)
@@ -358,7 +358,7 @@ events:
 		writeFile(t, dir, "requirements.txt", "six==1.16.0\n")
 		writeFile(t, dir, "handler.py", `import six, sys
 
-def run(event):
+def run(event, context):
     print("switch run ver=" + ".".join(str(v) for v in sys.version_info[:2]) + " six=" + six.__version__)
 `)
 		return fn
@@ -460,7 +460,7 @@ events:
 		writeFile(t, dir, "package.json", `{"type":"module","dependencies":{"picocolors":"^1.0.0"}}`)
 		writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 		writeFile(t, dir, "handler.js", `import colors from "picocolors";
-export function run(event) {
+export function run(event, context) {
   console.log(colors.red("switch run ver=v" + process.versions.node + " dep=" + !!event.event_id));
 }
 `)
@@ -566,7 +566,7 @@ events:
     pattern:
       status: [COMPLETED]
 `)
-		writeFile(t, dir, "index.py", "def hi(e):\n    print('hi-15')\n")
+		writeFile(t, dir, "index.py", "def hi(e, context):\n    print('hi-15')\n")
 		writeFileIn(t, dir, "app/__init__.py", "")
 		writeFileIn(t, dir, "app/deps.py", "NAME = 'from-relative-import-ok'\n")
 		// The service entrypoint imports a package-relative NAME (the module
@@ -673,7 +673,7 @@ events:
     pattern:
       status: [COMPLETED]
 `)
-		writeFile(t, dir, "index.js", "export function hi(e){ console.log('hi-26'); }\n")
+		writeFile(t, dir, "index.js", "export function hi(e, context){ console.log('hi-26'); }\n")
 		// Long-lived service entrypoint with a prompt SIGTERM handler, mirroring
 		// the established nodejs24.x service fixtures. The startup proof carries
 		// the CONTAINER's own node version, so a v24 image reaching a
@@ -806,7 +806,7 @@ events:
     pattern:
       status: [COMPLETED]
 `)
-	writeFile(t, dir, "index.py", "def hi(e):\n    return 'hi'\n")
+	writeFile(t, dir, "index.py", "def hi(e, context):\n    return 'hi'\n")
 	// six is a valid requirement; the second line is not a valid requirement
 	// spec, so uv's pip frontend rejects it deterministically BEFORE resolving
 	// anything (a parse failure, not a network failure).
@@ -860,7 +860,7 @@ events:
     pattern:
       status: [COMPLETED]
 `)
-	writeFile(t, dir, "index.js", "export function hi(e){ console.log('hi'); }\n")
+	writeFile(t, dir, "index.js", "export function hi(e, context){ console.log('hi'); }\n")
 	// The committed lock passes the plan-time pnpm-only manifest policy, so the
 	// malformed manifest is exercised at the INSTALL step (deterministically and
 	// before any resolution), not plan time.

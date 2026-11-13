@@ -44,7 +44,7 @@ events:
 	// assert both the injected value and the absence of template.yaml.
 	writeFile(t, dir, "index.js", `
 import { readdirSync } from "node:fs";
-export function env(event) {
+export function env(event, context) {
   console.log("GREETING=" + process.env.GREETING);
   console.log("FILES=" + readdirSync("/app").join(","));
 }
@@ -91,7 +91,7 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", `
-export function secret(event) {
+export function secret(event, context) {
   console.log("TOKEN=" + process.env.TOKEN);
 }
 `)
@@ -154,7 +154,7 @@ events:
 	// The handler logs the value between clear delimiters so the container-side
 	// line is matched exactly.
 	writeFile(t, dir, "index.js", `
-export function secret(event) {
+export function secret(event, context) {
   const v = process.env.PRIVATE_KEY ?? "";
   console.log("PK<begin>" + v + "<end>");
 }
@@ -225,7 +225,7 @@ events:
       event_name: [INSERT]
 `)
 			writeFile(t, dir, "index.js", `
-export function secret(event) {
+export function secret(event, context) {
   console.log("TOKEN=" + process.env.TOKEN);
 }
 `)
@@ -278,7 +278,7 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", `
-export async function emit(event) {
+export async function emit(event, context) {
   console.log("out-first");
   console.log("out-second");
   console.error("err-line");
@@ -330,7 +330,7 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", `
-export function paniclog(event) {
+export function paniclog(event, context) {
   console.log("output before panic");
 }
 `)

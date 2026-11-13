@@ -49,7 +49,7 @@ func TestReconcileStateFailureKeepsActiveAndMarksFailed(t *testing.T) {
 	r, _, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
 	// Change so a rebuild is attempted, then make it fail.
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 	// Seed an active version first (mirrors the startup success path).
@@ -60,7 +60,7 @@ func TestReconcileStateFailureKeepsActiveAndMarksFailed(t *testing.T) {
 	before, _ := st.GetApp("flaky")
 
 	// Change content again so the next pass attempts a rebuild, then fail it.
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v3'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v3'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v3: %v", err)
 	}
 	b.fail = true
@@ -261,7 +261,7 @@ func TestReconcileStateFailedBuildDoesNotRemoveStats(t *testing.T) {
 
 	// Change content so a rebuild is attempted, then seed an active version and
 	// per-app stats, as production would after activity.
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 	b.fail = false
@@ -274,7 +274,7 @@ func TestReconcileStateFailedBuildDoesNotRemoveStats(t *testing.T) {
 	}
 
 	// Change content again so the next pass attempts a rebuild, then fail it.
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v3'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v3'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v3: %v", err)
 	}
 	b.fail = true
@@ -317,7 +317,7 @@ func TestReconcileStateInvalidTemplateDoesNotRemove(t *testing.T) {
 
 	// Change content so a rebuild is attempted, then seed an active version and
 	// per-app stats.
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 	b.fail = false

@@ -79,8 +79,8 @@ func (s *startupSpyPreparer) Execute(context.Context, *runtime.Prepared, string,
 // reuse rather than recompute. No comment inference: resolverCalls is asserted.
 func TestSelectAndFingerprintAppsResolvesOncePerApp(t *testing.T) {
 	root := t.TempDir()
-	writeWorkerApp(t, root, "alpha", "def handler(e): return 1\n")
-	writeWorkerApp(t, root, "beta", "def handler(e): return 2\n")
+	writeWorkerApp(t, root, "alpha", "def handler(e, context): return 1\n")
+	writeWorkerApp(t, root, "beta", "def handler(e, context): return 2\n")
 
 	fns, err := app.NewLoader(root, discardLogger()).Load()
 	if err != nil {
@@ -150,8 +150,8 @@ func TestSelectAndFingerprintAppsResolvesOncePerApp(t *testing.T) {
 // startup does not re-scan the tree nor re-derive the selection policy.
 func TestPrepareAppsHandsStartupIdentityToPrepare(t *testing.T) {
 	root := t.TempDir()
-	writeWorkerApp(t, root, "alpha", "def handler(e): return 1\n")
-	writeWorkerApp(t, root, "beta", "def handler(e): return 2\n")
+	writeWorkerApp(t, root, "alpha", "def handler(e, context): return 1\n")
+	writeWorkerApp(t, root, "beta", "def handler(e, context): return 2\n")
 
 	fns, err := app.NewLoader(root, discardLogger()).Load()
 	if err != nil {

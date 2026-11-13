@@ -55,7 +55,7 @@ func TestPrepareSourceMountNodeSourceOnlyChangeDoesNotBuildDependency(t *testing
 	dir := t.TempDir()
 	writeNodeTestFile(t, dir, "package.json", `{"type":"module","dependencies":{"picocolors":"^1.0.0"}}`)
 	writeNodeTestFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
-	writeNodeTestFile(t, dir, "index.js", "import colors from 'picocolors';\nexport function handler(e){ console.log(colors.red('v1')); }\n")
+	writeNodeTestFile(t, dir, "index.js", "import colors from 'picocolors';\nexport function handler(e, context){ console.log(colors.red('v1')); }\n")
 	fn := app.App{Name: "node-source-only", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 
 	var first buildCounts
@@ -77,7 +77,7 @@ func TestPrepareSourceMountNodeSourceOnlyChangeDoesNotBuildDependency(t *testing
 	}
 
 	// Source-only edit: package.json (the dependency input) is untouched.
-	writeNodeTestFile(t, dir, "index.js", "import colors from 'picocolors';\nexport function handler(e){ console.log(colors.red('v2')); }\n")
+	writeNodeTestFile(t, dir, "index.js", "import colors from 'picocolors';\nexport function handler(e, context){ console.log(colors.red('v2')); }\n")
 
 	// Both the dependency image and the source-independent app image are present
 	// with the current bootstrap label, so Prepare must reuse them.
@@ -119,7 +119,7 @@ func TestPrepareSourceMountNodeDependencyChangeBuildsNewGeneration(t *testing.T)
 	dir := t.TempDir()
 	writeNodeTestFile(t, dir, "package.json", `{"type":"module","dependencies":{"picocolors":"^1.0.0"}}`)
 	writeNodeTestFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
-	writeNodeTestFile(t, dir, "index.js", "import colors from 'picocolors';\nexport function handler(e){ console.log(colors.green('v1')); }\n")
+	writeNodeTestFile(t, dir, "index.js", "import colors from 'picocolors';\nexport function handler(e, context){ console.log(colors.green('v1')); }\n")
 	fn := app.App{Name: "node-dep-change", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 
 	var first buildCounts
@@ -145,7 +145,7 @@ func TestPrepareSourceMountNodeDependencyChangeBuildsNewGeneration(t *testing.T)
 	// Mutate the manifest (a dependency-blocking change) AND the source.
 	writeNodeTestFile(t, dir, "package.json", `{"type":"module","dependencies":{"picocolors":"^1.0.0","ms":"2.1.3"}}`)
 	writeNodeTestFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolorsMs)
-	writeNodeTestFile(t, dir, "index.js", "import colors from 'picocolors';\nimport ms from 'ms';\nexport function handler(e){ console.log(colors.green('v2 ' + ms(1500))); }\n")
+	writeNodeTestFile(t, dir, "index.js", "import colors from 'picocolors';\nimport ms from 'ms';\nexport function handler(e, context){ console.log(colors.green('v2 ' + ms(1500))); }\n")
 
 	var second buildCounts
 	var depCtx, appCtx []byte

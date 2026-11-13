@@ -489,7 +489,7 @@ func nodeHandlerFixture(t *testing.T, name string) (string, app.App) {
 	if err != nil {
 		t.Fatalf("parse template: %v", err)
 	}
-	writeNodeTestFile(t, dir, "index.js", "export function handler(event) { return 1; }\n")
+	writeNodeTestFile(t, dir, "index.js", "export function handler(event, context) { return 1; }\n")
 	return dir, app.App{Name: name, Dir: dir, Template: tmpl}
 }
 
@@ -513,7 +513,7 @@ func pythonHandlerFixture(t *testing.T, dir, name string, withRequirements bool)
 	if err != nil {
 		t.Fatalf("parse template: %v", err)
 	}
-	writeFixtureFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
+	writeFixtureFile(t, dir, "handler.py", "def run(event, context):\n    print('ok')\n")
 	if withRequirements {
 		writeFixtureFile(t, dir, "requirements.txt", "six==1.16.0\n")
 	}

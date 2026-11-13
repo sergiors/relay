@@ -110,7 +110,7 @@ func TestWatcherIgnoresStagingDirEvents(t *testing.T) {
 
 	// Create and populate a staging directory while the watcher is live.
 	writeStageDir(t, root, ".sync-live")
-	if err := os.WriteFile(filepath.Join(root, ".sync-live", "index.js"), []byte("export function hi(e){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, ".sync-live", "index.js"), []byte("export function hi(e, context){}\n"), 0o644); err != nil {
 		t.Fatalf("rewrite stage index: %v", err)
 	}
 	// A sentinel valid app created AFTER the stage on the same root watch:

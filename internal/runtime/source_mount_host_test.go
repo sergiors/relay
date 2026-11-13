@@ -254,7 +254,7 @@ func TestIsSelfContainer(t *testing.T) {
 // test host.
 func TestPrepareRecordsDaemonVisibleSourcePath(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("def handler(event):\n    return 1\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("def handler(event, context):\n    return 1\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 	fn := app.App{Name: "mapped", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}

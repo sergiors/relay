@@ -86,6 +86,35 @@ const SENTINEL = "@@RELAY@@";
 // always valid UTF-8.
 const MAX_FRAME_BYTES = 3 * 1024;
 
+class HandlerContext {
+  constructor({
+    requestId,
+    attempt,
+    maxAttempts,
+    deadline,
+    messageId,
+    traceId,
+    app,
+    handler,
+  } = {}) {
+    this.requestId = requestId;
+    this.attempt = attempt;
+    this.maxAttempts = maxAttempts;
+    this.deadline = deadline;
+    this.messageId = messageId;
+    this.traceId = traceId;
+    this.app = app;
+    this.handler = handler;
+  }
+
+  getRemainingTimeMs() {
+    const deadlineMs = Date.parse(this.deadline);
+    return Number.isFinite(deadlineMs)
+      ? Math.max(0, deadlineMs - Date.now())
+      : 0;
+  }
+}
+
 // moduleCache caches, per resolved file path, the dynamic import() promise so
 // a module is imported exactly once and its state persists.
 const moduleCache = new Map();
@@ -367,6 +396,14 @@ async function handle(line) {
 
   let error = null;
   try {
+    if (
+      req.context === null ||
+      typeof req.context !== "object" ||
+      Array.isArray(req.context)
+    ) {
+      throw new Error("invalid request context: expected an object");
+    }
+
     const idx = handler.lastIndexOf(".");
     const modulePart = idx > 0 ? handler.slice(0, idx) : "";
     const funcName =
@@ -398,7 +435,8 @@ async function handle(line) {
     // context.with restores the warm process's previous context on both
     // resolution and rejection, so one invocation cannot leak into the next.
     const parent = propagation.extract(context.active(), req.trace ?? {});
-    await context.with(parent, () => fn(req.event ?? null));
+    const handlerContext = new HandlerContext(req.context);
+    await context.with(parent, () => fn(req.event ?? null, handlerContext));
   } catch (e) {
     // Module resolution, import errors, and handler errors are all
     // invocation failures (ok:false): the container stays healthy.

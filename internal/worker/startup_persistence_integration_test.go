@@ -23,8 +23,8 @@ func TestPersistStartupDiscoveryCriticalDiscoveryFailure(t *testing.T) {
 	dsn := testutil.NewStateDSN(t)
 	st := testutil.OpenState(t, dsn)
 	root := t.TempDir()
-	writeWorkerApp(t, root, "good", "def handler(e): return 1\n")
-	writeWorkerApp(t, root, "failing", "def handler(e): return 2\n")
+	writeWorkerApp(t, root, "good", "def handler(e, context): return 1\n")
+	writeWorkerApp(t, root, "failing", "def handler(e, context): return 2\n")
 
 	fns, err := app.NewLoader(root, discardLogger()).Load()
 	if err != nil {
@@ -173,7 +173,7 @@ func TestPersistStartupDiscoveryRebuildFailureKeepsObservationsConsistent(t *tes
 	dsn := testutil.NewStateDSN(t)
 	st := testutil.OpenState(t, dsn)
 	root := t.TempDir()
-	writeWorkerApp(t, root, "seed-fail", "def handler(e): return 1\n")
+	writeWorkerApp(t, root, "seed-fail", "def handler(e, context): return 1\n")
 	broken := invalidIssue(t, root, "broken")
 
 	fn, err := app.LoadSingle(root, "seed-fail")
@@ -208,8 +208,8 @@ func TestPersistStartupDiscoveryRebuildFailureKeepsObservationsConsistent(t *tes
 // an app that has one is prepared normally.
 func TestPrepareAppsFailsClosedWithoutFencingToken(t *testing.T) {
 	root := t.TempDir()
-	writeWorkerApp(t, root, "alpha", "def handler(e): return 1\n")
-	writeWorkerApp(t, root, "beta", "def handler(e): return 2\n")
+	writeWorkerApp(t, root, "alpha", "def handler(e, context): return 1\n")
+	writeWorkerApp(t, root, "beta", "def handler(e, context): return 2\n")
 
 	fns, err := app.NewLoader(root, discardLogger()).Load()
 	if err != nil {

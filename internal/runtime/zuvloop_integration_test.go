@@ -58,7 +58,7 @@ def _observe():
     return current, _queue, _calls
 
 
-def sync_probe(event):
+def sync_probe(event, context):
     # A synchronous handler is invoked INLINE on the running loop: this plain
     # function has no coroutine of its own, yet asyncio.get_running_loop()
     # succeeds and must already be the REAL pinned zuvloop loop. That is the
@@ -77,7 +77,7 @@ def sync_probe(event):
     print("sync loopmod=%s call=%d" % (_loopmod(loop), calls))
 
 
-async def touch(event):
+async def touch(event, context):
     loop, queue, calls = _observe()
     await queue.put(event["tag"])
     await queue.get()
@@ -85,7 +85,7 @@ async def touch(event):
         _loopmod(loop), calls, queue._get_loop() is loop))
 
 
-async def tick(event):
+async def tick(event, context):
     # The schedule path: the runner invokes a cron occurrence's handler through
     # the same invocation protocol, so this name must run on the same
     # process-lifetime loop as the event handler above.
@@ -352,7 +352,7 @@ func TestIntegrationPythonZuvloopModeFlipRebuildsImage(t *testing.T) {
 		}},
 	}
 	svcDir := fn.Dir
-	writeFile(t, svcDir, "svc-handlers.py", "def noop(event):\n    pass\n")
+	writeFile(t, svcDir, "svc-handlers.py", "def noop(event, context):\n    pass\n")
 	writeFile(t, svcDir, "service.py", "def main():\n    pass\n")
 	svcFn := app.App{Name: "py-zuvloop-svc", Dir: svcDir, Template: svcTemplate}
 	svcFp, err := app.FingerprintApp(svcFn.Dir, svcFn.Template)
@@ -398,7 +398,7 @@ func TestIntegrationPythonZuvloopDependencyImageUnchanged(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "requirements.txt", "six==1.16.0\n")
-	writeFile(t, dir, "handler.py", "def completed(event):\n    print('ok')\n")
+	writeFile(t, dir, "handler.py", "def completed(event, context):\n    print('ok')\n")
 	fn := app.App{
 		Name: "py-zuvloop-deps",
 		Dir:  dir,

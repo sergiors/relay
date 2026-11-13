@@ -114,7 +114,7 @@ func (p *permitPark) releaseAll() {
 func writeBuildApp(t *testing.T, name string) app.App {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){ return 'ok'; }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){ return 'ok'; }\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 	return app.App{Name: name, Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}

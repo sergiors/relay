@@ -171,7 +171,9 @@ func (p *pyProc) stderrString() string {
 
 // invoke writes one request frame and reads stdout until a sentinel protocol
 // response line arrives, collecting any interleaved user output. It fails the
-// test on protocol EOF (the process died mid-invocation).
+// test on protocol EOF (the process died mid-invocation). The frame carries a
+// default handler context so the invocation exercises the production
+// two-argument call.
 func (p *pyProc) invoke(t *testing.T, handler string, event string, env map[string]string) invokeResult {
 	return p.invokeTrace(t, handler, event, env, nil)
 }
@@ -179,9 +181,16 @@ func (p *pyProc) invoke(t *testing.T, handler string, event string, env map[stri
 // invokeTrace is invoke with the optional W3C "trace" carrier the frame carries.
 func (p *pyProc) invokeTrace(t *testing.T, handler string, event string, env, trace map[string]string) invokeResult {
 	t.Helper()
+	return p.invokeFrame(t, handler, event, env, trace, defaultHandlerContext(handler))
+}
+
+// invokeFrame is invokeTrace with an explicit "context" frame object; a nil
+// ctxFrame omits the field entirely (an invalid frame the bootstrap must reject).
+func (p *pyProc) invokeFrame(t *testing.T, handler string, event string, env, trace map[string]string, ctxFrame map[string]any) invokeResult {
+	t.Helper()
 	id := fmt.Sprintf("t%d", p.seq)
 	p.seq++
-	frame, err := json.Marshal(reqFrame{ID: id, Handler: handler, Event: json.RawMessage(event), Env: env, Trace: trace})
+	frame, err := json.Marshal(reqFrame{ID: id, Handler: handler, Event: json.RawMessage(event), Env: env, Trace: trace, Context: ctxFrame})
 	if err != nil {
 		t.Fatalf("build request frame: %v", err)
 	}
@@ -212,12 +221,28 @@ func (p *pyProc) invokeTrace(t *testing.T, handler string, event string, env, tr
 	}
 }
 
+// defaultHandlerContext returns a complete per-request context frame in the
+// protocol's camelCase shape, with a live future deadline, so an invocation
+// test that does not care about the context still runs the production
+// handler(event, context) path.
+func defaultHandlerContext(handler string) map[string]any {
+	return map[string]any{
+		"requestId":   "test-request",
+		"attempt":     1,
+		"maxAttempts": 3,
+		"deadline":    time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
+		"app":         "testapp",
+		"handler":     handler,
+	}
+}
+
 type reqFrame struct {
 	ID      string            `json:"id"`
 	Handler string            `json:"handler"`
 	Event   json.RawMessage   `json:"event"`
 	Env     map[string]string `json:"env"`
 	Trace   map[string]string `json:"trace,omitempty"`
+	Context map[string]any    `json:"context,omitempty"`
 }
 
 type respFrame struct {
@@ -263,11 +288,11 @@ func TestPythonRuntimeTwoInvocationsAndModuleState(t *testing.T) {
 	writeHandler(t, dir, "handler", `
 _counter = {"n": 0}
 
-def count(event):
+def count(event, context):
     _counter["n"] += 1
     print("count=%d" % _counter["n"])
 
-def completed(event):
+def completed(event, context):
     print("completed %s" % event["msg"])
 `)
 	p := startPython(t, dir)
@@ -320,16 +345,16 @@ def _remember():
     assert not _loop.is_closed(), "event loop was closed between invocations"
     return current
 
-def sync_count(event):
+def sync_count(event, context):
     _remember()
     print("sync=on-persistent-loop")
 
-async def async_touch(event):
+async def async_touch(event, context):
     _remember()
     await _queue.put(event["msg"])
     print("async=%s" % (await _queue.get()))
 
-async def async_boom(event):
+async def async_boom(event, context):
     _remember()
     await asyncio.sleep(0)
     raise RuntimeError("async-kaboom")
@@ -385,7 +410,7 @@ func TestPythonRuntimeAwaitableReturningHandler(t *testing.T) {
 	writeHandler(t, dir, "handler", `
 import asyncio
 
-def returns_coroutine(event):
+def returns_coroutine(event, context):
     async def inner():
         await asyncio.sleep(0)
         print("awaited %s" % event["msg"])
@@ -400,19 +425,19 @@ class Awaitable:
             print("object %s" % self._msg)
         return run().__await__()
 
-def returns_awaitable_object(event):
+def returns_awaitable_object(event, context):
     return Awaitable(event["msg"])
 
 def decorate(fn):
-    def wrapper(event):
+    def wrapper(event, context):
         async def run():
             await asyncio.sleep(0)
-            fn(event)
+            fn(event, context)
         return run()
     return wrapper
 
 @decorate
-def decorated(event):
+def decorated(event, context):
     print("decorated %s" % event["msg"])
 `)
 	p := startPython(t, dir)
@@ -441,7 +466,7 @@ func TestPythonRuntimeAsyncHandler(t *testing.T) {
 	writeHandler(t, dir, "handler", `
 import asyncio
 
-async def async_handler(event):
+async def async_handler(event, context):
     await asyncio.sleep(0)
     print("async %s" % event["msg"])
 `)
@@ -467,7 +492,7 @@ func TestPythonRuntimeTraceContextIsolatedAcrossInvocations(t *testing.T) {
 import asyncio
 from opentelemetry import context
 
-async def inspect(event):
+async def inspect(event, context):
     await asyncio.sleep(0)
     print("trace=" + str(context.get_current()))
     if event.get("fail"):
@@ -501,7 +526,7 @@ async def inspect(event):
 func TestPythonRuntimeTraceWithoutOtelIsBestEffort(t *testing.T) {
 	requirePython(t)
 	dir := t.TempDir()
-	writeHandler(t, dir, "handler", "def f(event):\n    print('ran %s' % event['msg'])\n")
+	writeHandler(t, dir, "handler", "def f(event, context):\n    print('ran %s' % event['msg'])\n")
 	p := startPythonWithoutOtel(t, dir)
 
 	r := p.invokeTrace(t, "handler.f", `{"msg":"hi"}`, nil, map[string]string{
@@ -518,11 +543,11 @@ func TestPythonRuntimeHandlerErrorKeepsProcessAlive(t *testing.T) {
 	writeHandler(t, dir, "handler", `
 _counter = {"n": 0}
 
-def count(event):
+def count(event, context):
     _counter["n"] += 1
     print("count=%d" % _counter["n"])
 
-def boom(event):
+def boom(event, context):
     raise ValueError("kaboom")
 `)
 	p := startPython(t, dir)
@@ -561,7 +586,7 @@ func TestPythonRuntimeEnvRotation(t *testing.T) {
 	writeHandler(t, dir, "handler", `
 import os
 
-def showenv(event):
+def showenv(event, context):
     print("VAR=" + os.environ.get("VAR", ""))
 `)
 	p := startPython(t, dir)
@@ -587,7 +612,7 @@ func TestPythonRuntimeEnvAppliedExactlyAcrossInvocations(t *testing.T) {
 	writeHandler(t, dir, "handler", `
 import os
 
-def show(event):
+def show(event, context):
     print("FOO=" + os.environ.get("FOO", "<unset>"))
     print("BAR=" + os.environ.get("BAR", "<unset>"))
     print("BASELINE=" + os.environ.get("RELAY_TEST_BASELINE", "<unset>"))
@@ -643,10 +668,10 @@ func TestPythonRuntimeEnvCleanupAfterHandlerFailure(t *testing.T) {
 	writeHandler(t, dir, "handler", `
 import os
 
-def boom(event):
+def boom(event, context):
     raise ValueError("kaboom")
 
-def show(event):
+def show(event, context):
     print("TOKEN=" + os.environ.get("TOKEN", "<unset>"))
 `)
 	p := startPython(t, dir)
@@ -673,7 +698,7 @@ func TestPythonRuntimeNoEnvValueLeaks(t *testing.T) {
 	writeHandler(t, dir, "handler", `
 import os
 
-def leak(event):
+def leak(event, context):
     print("value=" + os.environ.get("SUPER_SECRET", ""))
     raise ValueError("handler failed")
 `)
@@ -698,7 +723,7 @@ def leak(event):
 func TestPythonRuntimeEOFExitsZero(t *testing.T) {
 	requirePython(t)
 	dir := t.TempDir()
-	writeHandler(t, dir, "handler", "def f(event):\n    pass\n")
+	writeHandler(t, dir, "handler", "def f(event, context):\n    pass\n")
 	p := startPython(t, dir)
 	r := p.invoke(t, "handler.f", `{}`, nil)
 	if !r.OK {
@@ -716,7 +741,7 @@ func TestPythonRuntimeEOFExitsZero(t *testing.T) {
 func TestPythonRuntimeMalformedFrameIsFatal(t *testing.T) {
 	requirePython(t)
 	dir := t.TempDir()
-	writeHandler(t, dir, "handler", "def f(event):\n    pass\n")
+	writeHandler(t, dir, "handler", "def f(event, context):\n    pass\n")
 	if err := os.MkdirAll(filepath.Join(dir, "relay"), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -735,7 +760,7 @@ func TestPythonRuntimeMalformedFrameIsFatal(t *testing.T) {
 func TestPythonRuntimeFrameShape(t *testing.T) {
 	requirePython(t)
 	dir := t.TempDir()
-	writeHandler(t, dir, "handler", "def f(event):\n    pass\n")
+	writeHandler(t, dir, "handler", "def f(event, context):\n    pass\n")
 	p := startPython(t, dir)
 	r := p.invoke(t, "handler.f", `{}`, nil)
 	if !r.OK {
@@ -766,22 +791,22 @@ func TestPythonRuntimeErrorFrameBound(t *testing.T) {
 	requirePython(t)
 	dir := t.TempDir()
 	writeHandler(t, dir, "handler", `
-def short(event):
+def short(event, context):
     raise ValueError("short ascii")
 
-def long(event):
+def long(event, context):
     raise ValueError("x" * 20000)
 
-def multi(event):
+def multi(event, context):
     raise ValueError("é" * 20000)
 
-def emoji(event):
+def emoji(event, context):
     raise ValueError("😀" * 8000)
 
-def accented(event):
+def accented(event, context):
     raise ValueError("àéîõü" * 5000)
 
-def control(event):
+def control(event, context):
     raise ValueError("\t\n\x00\x07" * 5000)
 `)
 	p := startPython(t, dir)
@@ -828,5 +853,245 @@ def control(event):
 				t.Fatal("expected the short handler to also fail")
 			}
 		})
+	}
+}
+
+// TestPythonRuntimeHandlerContextValues verifies the handler's second argument
+// carries the frame's execution identity as snake_case fields: the stable
+// request ID, the confirmed attempt and configured budget, an aware deadline
+// parsed from the protocol's ISO-8601 string (nanosecond input truncated to
+// microseconds), the optional message and trace IDs, and the app/handler. The
+// event payload stays verbatim.
+func TestPythonRuntimeHandlerContextValues(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", `
+def show(event, context):
+    print("event=%s" % event["msg"])
+    print("request_id=" + context.request_id)
+    print("attempt=%d" % context.attempt)
+    print("max_attempts=%d" % context.max_attempts)
+    print("deadline=" + context.deadline.isoformat())
+    print("aware=" + str(context.deadline.tzinfo is not None))
+    print("message_id=" + str(context.message_id))
+    print("trace_id=" + str(context.trace_id))
+    print("app=" + context.app)
+    print("handler=" + context.handler)
+`)
+	p := startPython(t, dir)
+
+	r := p.invokeFrame(t, "handler.show", `{"msg":"hi"}`, nil, nil, map[string]any{
+		"requestId":   "event:m-7:app/events.created",
+		"attempt":     2,
+		"maxAttempts": 4,
+		"deadline":    "2031-04-05T06:07:08.123456789Z",
+		"messageId":   "m-7",
+		"traceId":     "4bf92f3577b34da6a3ce929d0e0e4736",
+		"app":         "app",
+		"handler":     "events.created",
+	})
+	if !r.OK {
+		t.Fatalf("invoke failed: %s", r.Err)
+	}
+	for _, want := range []string{
+		"event=hi",
+		"request_id=event:m-7:app/events.created",
+		"attempt=2",
+		"max_attempts=4",
+		"deadline=2031-04-05T06:07:08.123456+00:00",
+		"aware=True",
+		"message_id=m-7",
+		"trace_id=4bf92f3577b34da6a3ce929d0e0e4736",
+		"app=app",
+		"handler=events.created",
+	} {
+		if !strings.Contains(r.Out, want) {
+			t.Errorf("out = %q, want it to contain %q", r.Out, want)
+		}
+	}
+}
+
+// TestPythonRuntimeHandlerContextOptionalMetadataAbsent verifies the optional
+// broker and trace identities stay None when the frame omits them (a state-free
+// execution): they are optional, never fabricated by the bootstrap.
+func TestPythonRuntimeHandlerContextOptionalMetadataAbsent(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", `
+def opt(event, context):
+    print("message_id=" + str(context.message_id))
+    print("trace_id=" + str(context.trace_id))
+`)
+	p := startPython(t, dir)
+
+	r := p.invokeFrame(t, "handler.opt", `{}`, nil, nil, map[string]any{
+		"requestId":   "manual-1",
+		"attempt":     1,
+		"maxAttempts": 1,
+		"deadline":    "2031-01-01T00:00:00Z",
+		"app":         "fn",
+		"handler":     "handler.opt",
+	})
+	if !r.OK {
+		t.Fatalf("invoke failed: %s", r.Err)
+	}
+	if !strings.Contains(r.Out, "message_id=None") {
+		t.Errorf("out = %q, want message_id=None when the frame omits messageId", r.Out)
+	}
+	if !strings.Contains(r.Out, "trace_id=None") {
+		t.Errorf("out = %q, want trace_id=None when the frame omits traceId", r.Out)
+	}
+}
+
+// TestPythonRuntimeHandlerContextRemainingTime verifies get_remaining_time_ms()
+// against a future deadline (positive and bounded by the configured span), an
+// expired deadline (clamped to zero), and the zero instant the protocol emits
+// for a context with no deadline (also zero, never negative).
+func TestPythonRuntimeHandlerContextRemainingTime(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", `
+def remain(event, context):
+    print("ms=%d" % context.get_remaining_time_ms())
+`)
+	p := startPython(t, dir)
+
+	ctxFor := func(deadline string) map[string]any {
+		return map[string]any{
+			"requestId":   "req-1",
+			"attempt":     1,
+			"maxAttempts": 1,
+			"deadline":    deadline,
+			"app":         "fn",
+			"handler":     "handler.remain",
+		}
+	}
+	remaining := func(t *testing.T, deadline string) int {
+		t.Helper()
+		r := p.invokeFrame(t, "handler.remain", `{}`, nil, nil, ctxFor(deadline))
+		if !r.OK {
+			t.Fatalf("invoke with deadline %q failed: %s", deadline, r.Err)
+		}
+		msText, ok := strings.CutPrefix(strings.TrimSpace(r.Out), "ms=")
+		if !ok {
+			t.Fatalf("out = %q, want ms=<int>", r.Out)
+		}
+		ms, err := strconv.Atoi(msText)
+		if err != nil {
+			t.Fatalf("remaining %q is not an integer: %v", msText, err)
+		}
+		return ms
+	}
+
+	futureDeadline := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	future := remaining(t, futureDeadline)
+	if future <= 3_590_000 || future > 3_600_000 {
+		t.Errorf("remaining for a +1h deadline = %d ms, want within (3590000, 3600000]", future)
+	}
+	if got := remaining(t, "2000-01-01T00:00:00Z"); got != 0 {
+		t.Errorf("remaining for an expired deadline = %d, want 0 (clamped)", got)
+	}
+	if got := remaining(t, "0001-01-01T00:00:00Z"); got != 0 {
+		t.Errorf("remaining for the zero instant = %d, want 0 (clamped)", got)
+	}
+}
+
+// TestPythonRuntimeHandlerContextFreshPerInvocation proves the warm, reused
+// process builds a fresh context per request: each invocation sees its own
+// frame's request ID (no leakage from the previous one) and a distinct object
+// identity even though the interpreter and module state persist.
+func TestPythonRuntimeHandlerContextFreshPerInvocation(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", `
+_prev = {"ctx": None}
+
+def remember(event, context):
+    print("fresh=%s" % (context is not _prev["ctx"]))
+    print("request_id=" + context.request_id)
+    _prev["ctx"] = context
+`)
+	p := startPython(t, dir)
+
+	ctxFor := func(requestID string) map[string]any {
+		return map[string]any{
+			"requestId":   requestID,
+			"attempt":     1,
+			"maxAttempts": 3,
+			"deadline":    "2031-01-01T00:00:00Z",
+			"app":         "fn",
+			"handler":     "handler.remember",
+		}
+	}
+	r1 := p.invokeFrame(t, "handler.remember", `{}`, nil, nil, ctxFor("event:m-a:fn/remember"))
+	if !r1.OK {
+		t.Fatalf("first invoke failed: %s", r1.Err)
+	}
+	r2 := p.invokeFrame(t, "handler.remember", `{}`, nil, nil, ctxFor("event:m-b:fn/remember"))
+	if !r2.OK {
+		t.Fatalf("second invoke failed: %s", r2.Err)
+	}
+	for i, r := range []invokeResult{r1, r2} {
+		if !strings.Contains(r.Out, "fresh=True") {
+			t.Errorf("invoke %d out = %q, want fresh=True (a new context object per invocation)", i+1, r.Out)
+		}
+	}
+	if !strings.Contains(r1.Out, "request_id=event:m-a:fn/remember") {
+		t.Errorf("first out = %q, want its own request ID", r1.Out)
+	}
+	if !strings.Contains(r2.Out, "request_id=event:m-b:fn/remember") {
+		t.Errorf("second out = %q, want its own request ID (no leakage from the first)", r2.Out)
+	}
+}
+
+// TestPythonRuntimeSingleArgHandlerRejected pins the fixed two-argument
+// calling convention: the bootstrap always calls handler(event, context), so a
+// legacy single-argument handler fails its invocation with a TypeError instead
+// of Relay adapting to it.
+func TestPythonRuntimeSingleArgHandlerRejected(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", "def one(event):\n    pass\n")
+	p := startPython(t, dir)
+
+	r := p.invoke(t, "handler.one", `{}`, nil)
+	if r.OK {
+		t.Fatal("a single-argument handler must be rejected, not adapted to")
+	}
+	if !strings.Contains(r.Err, "positional argument") {
+		t.Errorf("error = %q, want the two-argument TypeError", r.Err)
+	}
+}
+
+// TestPythonRuntimeMissingContextFrameRejected pins the required per-request
+// context object: a frame without "context" (or with a context missing its
+// required deadline) fails the invocation with a protocol-level context error,
+// never a partial or fabricated context.
+func TestPythonRuntimeMissingContextFrameRejected(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", "def sink(event, context):\n    print('ran')\n")
+	p := startPython(t, dir)
+
+	r := p.invokeFrame(t, "handler.sink", `{}`, nil, nil, nil)
+	if r.OK {
+		t.Fatal("a frame without the context object must be rejected")
+	}
+	if !strings.Contains(r.Err, "missing the context object") {
+		t.Errorf("error = %q, want the missing-context rejection", r.Err)
+	}
+
+	r2 := p.invokeFrame(t, "handler.sink", `{}`, nil, nil, map[string]any{
+		"requestId":   "req-1",
+		"attempt":     1,
+		"maxAttempts": 1,
+		"app":         "fn",
+		"handler":     "handler.sink",
+	})
+	if r2.OK {
+		t.Fatal("a context without a deadline must be rejected")
+	}
+	if !strings.Contains(r2.Err, "invalid handler context") {
+		t.Errorf("error = %q, want the invalid-context rejection", r2.Err)
 	}
 }

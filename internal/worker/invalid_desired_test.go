@@ -44,7 +44,7 @@ func TestPersistStartupDiscoveryIgnoresStagingDir(t *testing.T) {
 	root := t.TempDir()
 
 	// A valid neighbor and a genuinely invalid user directory on disk.
-	writeWorkerApp(t, root, "good", "def handler(e): return 1\n")
+	writeWorkerApp(t, root, "good", "def handler(e, context): return 1\n")
 	badDir := filepath.Join(root, "bad")
 	if err := os.MkdirAll(badDir, 0o755); err != nil {
 		t.Fatalf("mkdir bad: %v", err)
@@ -165,7 +165,7 @@ func TestPersistStartupDiscoveryRecordsInvalidPresent(t *testing.T) {
 	// Both invalid apps (and their directories) are present on disk with a
 	// malformed template.yaml, so prune must not remove them; only their desired
 	// definitions are invalid, and a fresh invalid name has no prior row.
-	writeWorkerApp(t, root, "prior", "def handler(e): return 1\n")
+	writeWorkerApp(t, root, "prior", "def handler(e, context): return 1\n")
 	for _, name := range []string{"now-invalid", "brand-new-bad"} {
 		dir := filepath.Join(root, name)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -241,8 +241,8 @@ func TestPersistStartupDiscoveryRecordsInvalidPresent(t *testing.T) {
 // returned among the valid apps the loader produced.
 func TestPersistStartupDiscoveryInvalidAbsentFromRegistrySet(t *testing.T) {
 	root := t.TempDir()
-	writeWorkerApp(t, root, "good", "def handler(e): return 1\n")
-	writeWorkerApp(t, root, "bad", "def handler(e): return 1\n")
+	writeWorkerApp(t, root, "good", "def handler(e, context): return 1\n")
+	writeWorkerApp(t, root, "bad", "def handler(e, context): return 1\n")
 	// Break "bad"'s template so the loader reports it invalid while "good" loads.
 	if err := os.WriteFile(filepath.Join(root, "bad", "template.yaml"), []byte("runtime: python9.9\n"), 0o644); err != nil {
 		t.Fatalf("write bad template: %v", err)

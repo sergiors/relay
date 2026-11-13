@@ -200,7 +200,7 @@ events:
 	nonce := time.Now().UnixNano()
 	versions := []string{"v1", "v2"}
 	for _, ver := range versions {
-		writeFile(t, dir, "index.js", "export function hi(e){ console.log('"+ver+"-"+strconv.FormatInt(nonce, 10)+"'); }\n")
+		writeFile(t, dir, "index.js", "export function hi(e, context){ console.log('"+ver+"-"+strconv.FormatInt(nonce, 10)+"'); }\n")
 
 		// Remove this version's target image first (it is this test's own
 		// relay-app-rebuild-int:* namespace) so each Prepare is a REAL build, not
@@ -324,7 +324,7 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	writeFile(t, dir, "index.js", "export function hi(e){ console.log('hi'); }\n")
+	writeFile(t, dir, "index.js", "export function hi(e, context){ console.log('hi'); }\n")
 	// A committed pnpm lock is required for a package.json to reach the install
 	// step; the malformed manifest then fails `pnpm install --frozen-lockfile`
 	// deterministically (instead of the engine's missing-lock plan error).
@@ -544,7 +544,7 @@ events:
     pattern:
       status: [COMPLETED]
 `)
-	writeFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
+	writeFile(t, dir, "handler.py", "def run(event, context):\n    print('ok')\n")
 	// The marker makes this dependency reference unique to this test invocation,
 	// so a warm daemon cannot turn the concurrent dependency-build assertion into
 	// an app-image-only cache-hit test.

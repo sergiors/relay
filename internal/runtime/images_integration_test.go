@@ -52,7 +52,7 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	writeFile(t, dir, "index.js", "export function hi(e){ console.log('v1'); }\n")
+	writeFile(t, dir, "index.js", "export function hi(e, context){ console.log('v1'); }\n")
 
 	fn := app.App{Name: "fn-ver", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	fp1, err := app.Fingerprint(dir)
@@ -76,7 +76,7 @@ events:
 	}
 
 	// Change source -> distinct fingerprint -> distinct image.
-	writeFile(t, dir, "index.js", "export function hi(e){ console.log('v2'); }\n")
+	writeFile(t, dir, "index.js", "export function hi(e, context){ console.log('v2'); }\n")
 	fp2, err := app.Fingerprint(dir)
 	if err != nil {
 		t.Fatalf("fingerprint v2: %v", err)
@@ -209,7 +209,7 @@ events:
 	}
 
 	// v1 source.
-	writeFile(t, dir, "handler.py", "def run(event):\n    print('v1')\n")
+	writeFile(t, dir, "handler.py", "def run(event, context):\n    print('v1')\n")
 	fp1, err := app.Fingerprint(dir)
 	if err != nil {
 		t.Fatalf("fingerprint v1: %v", err)
@@ -242,7 +242,7 @@ events:
 	// manifest, not the handler source, so re-deriving it must yield the SAME
 	// reference. A regression that folded source into the dependency identity
 	// would change it here and fail immediately (no daemon race involved).
-	writeFile(t, dir, "handler.py", "def run(event):\n    print('v2')\n")
+	writeFile(t, dir, "handler.py", "def run(event, context):\n    print('v2')\n")
 	if depRef2 := expectedDependencyRef(t, fn); depRef2 != depRef {
 		t.Fatalf("dependency reference changed across a pure source change: %s -> %s", depRef, depRef2)
 	}
@@ -343,7 +343,7 @@ events:
     pattern:
       status: [COMPLETED]
 `)
-	writeFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
+	writeFile(t, dir, "handler.py", "def run(event, context):\n    print('ok')\n")
 	fn := app.App{Name: "dep-change", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 
 	// v1 manifest.

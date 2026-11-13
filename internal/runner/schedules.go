@@ -165,10 +165,11 @@ func (r *Runner) rejectAppAbsent(invState stream.InvocationState, fnName, schedu
 // handler-based ("<app>/<handler>"); the descriptor adds schedule provenance
 // only.
 //
-// When scheduleName is empty (the state-free DLQ-replay path, which knows only a
-// recorded app/handler), resolution falls back to the first schedule entry
-// matching the handler, then to that exact event rule (never event matching), and
-// the no-state path executes a single attempt exactly as before.
+// When scheduleName is empty (the state-free DLQ-replay path, which knows the
+// recorded app/handler and optional source ID), resolution falls back to the
+// first schedule entry matching the handler, then to that exact event rule
+// (never event matching), and the no-state path executes a single attempt exactly
+// as before.
 //
 // InvokeHandler takes only the app/schedule/handler strings; it does not carry
 // the occurrence's scheduled instant, so it performs no semantic validation.
@@ -178,7 +179,7 @@ func (r *Runner) rejectAppAbsent(invState stream.InvocationState, fnName, schedu
 func (r *Runner) InvokeHandler(
 	ctx context.Context, msgID, fnName, scheduleName, handler string, payload []byte,
 ) error {
-	return r.invokeHandler(ctx, msgID, fnName, scheduleName, handler, payload, nil)
+	return r.invokeHandler(ctx, msgID, fnName, scheduleName, handler, payload, nil, msgID)
 }
 
 // InvokeOccurrence executes one schedule occurrence routed through the stream.
@@ -203,7 +204,7 @@ func (r *Runner) InvokeOccurrence(
 	ctx context.Context, msgID string, occ schedule.Occurrence, payload []byte,
 ) error {
 	return r.invokeHandler(ctx, msgID, occ.App, occ.Schedule, occ.Handler, payload,
-		func(tmpl *app.Template) error { return validateOccurrence(tmpl, occ) })
+		func(tmpl *app.Template) error { return validateOccurrence(tmpl, occ) }, msgID)
 }
 
 // invokeHandler is the shared implementation of InvokeHandler and
@@ -215,7 +216,7 @@ func (r *Runner) InvokeOccurrence(
 // occurrence is authoritative and never re-validated.
 func (r *Runner) invokeHandler(
 	ctx context.Context, msgID, fnName, scheduleName, handler string, payload []byte,
-	validate func(tmpl *app.Template) error,
+	validate func(tmpl *app.Template) error, handlerMessageID string,
 ) error {
 	// Invocation state (when present) distinguishes the production stream path
 	// from direct callers/tests: obsolete-removal and descriptor pinning only
@@ -311,6 +312,20 @@ func (r *Runner) invokeHandler(
 		if cap := time.Duration(r.maxHandlerTimeout.Load()); cap > 0 && desc.Timeout > cap {
 			desc.Timeout = cap
 		}
+		// A broker-backed occurrence keeps its deterministic request ID even
+		// without invocation state: the message ID plus app/handler identifies
+		// the same logical invocation on every direct delivery. A DLQ replay
+		// passes its origin ID separately so it retains fresh execution identity.
+		// Attempt stays 1 because no claim was confirmed, and maxAttempts is the
+		// resolved schedule's configured initial-plus-retries budget.
+		requestID := stateFreeRequestID()
+		if msgID != "" {
+			requestID = brokerRequestID(requestIDSourceSchedule, msgID, pf.fn.Name, desc.Handler)
+		}
+		schedCtx = runtime.WithHandlerContext(schedCtx, newHandlerContext(
+			requestID, pf.fn.Name, desc.Handler, handlerMessageID,
+			1, 1+desc.Retries,
+		))
 		return r.invokeOnce(schedCtx, pf, desc.Handler, payload, desc.Timeout, pin, nil, "", stream.InvocationClaim{}, msgID)
 	}
 
@@ -586,6 +601,17 @@ func (r *Runner) invokeHandler(
 			}},
 		}
 	}
+
+	// Stamp the broker-backed execution identity before the attempt runs. The
+	// admitted descriptor pins the handler and retry budget, and the occurrence's
+	// message ID is its stable source identity, so the request ID is the same on
+	// every retry/redelivery (including after a restart). The attempt is the
+	// confirmed claim; maxAttempts is the admitted budget even when a config
+	// change leaves the claimed attempt above it.
+	schedCtx = runtime.WithHandlerContext(schedCtx, newHandlerContext(
+		brokerRequestID(requestIDSourceSchedule, msgID, fnName, handler), fnName, handler, handlerMessageID,
+		admission.Claim.Attempt, 1+retries,
+	))
 
 	err = r.invokeOnce(schedCtx, pf, handler, payload, timeout, pin, invState, invocation, admission.Claim, msgID)
 	if err != nil {

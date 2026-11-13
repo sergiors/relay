@@ -594,7 +594,7 @@ func TestDLQCommandsTreatArbitraryUnknownIDsAsUnknown(t *testing.T) {
 			}
 		}
 	}
-	if calls, _, _ := replayer.got(); calls != 0 {
+	if calls, _, _, _ := replayer.got(); calls != 0 {
 		t.Fatalf("unknown replay IDs reached the worker %d times", calls)
 	}
 	if len(store.deleted) != 0 || len(store.entries) != 0 {
@@ -706,18 +706,20 @@ func TestDLQNoOpenerConfigured(t *testing.T) {
 // concurrent-admission tests use to interleave a competing store operation at
 // exactly the moment the handler is running.
 type recordingReplayer struct {
-	mu       sync.Mutex
-	calls    int
-	trace    string
-	event    []byte
-	onReplay func()
+	mu              sync.Mutex
+	calls           int
+	trace           string
+	sourceMessageID string
+	event           []byte
+	onReplay        func()
 }
 
-func (r *recordingReplayer) ReplayDLQ(_ context.Context, _, _ string, event []byte, trace string) error {
+func (r *recordingReplayer) ReplayDLQ(_ context.Context, _, _ string, event []byte, trace, sourceMessageID string) error {
 	r.mu.Lock()
 	r.calls++
 	r.event = append([]byte(nil), event...)
 	r.trace = trace
+	r.sourceMessageID = sourceMessageID
 	if r.onReplay != nil {
 		hook := r.onReplay
 		r.mu.Unlock()
@@ -728,10 +730,10 @@ func (r *recordingReplayer) ReplayDLQ(_ context.Context, _, _ string, event []by
 	return nil
 }
 
-func (r *recordingReplayer) got() (int, []byte, string) {
+func (r *recordingReplayer) got() (int, []byte, string, string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.calls, append([]byte(nil), r.event...), r.trace
+	return r.calls, append([]byte(nil), r.event...), r.trace, r.sourceMessageID
 }
 
 // TestDLQReplayUnsettledEntryDoesNotExecute verifies the settlement preflight
@@ -778,12 +780,15 @@ func TestDLQReplayForwardsTraceControlPath(t *testing.T) {
 	if strings.TrimSpace(out) != "Replayed handler successfully" {
 		t.Fatalf("stdout = %q", out)
 	}
-	calls, event, trace := rep.got()
+	calls, event, trace, sourceMessageID := rep.got()
 	if calls != 1 {
 		t.Fatalf("replayer calls = %d, want 1", calls)
 	}
 	if trace != lineage {
 		t.Fatalf("forwarded trace = %q, want %q", trace, lineage)
+	}
+	if sourceMessageID != entry.SourceMessageID {
+		t.Fatalf("forwarded source message ID = %q, want %q", sourceMessageID, entry.SourceMessageID)
 	}
 	if strings.Contains(string(event), lineage) {
 		t.Fatalf("lineage leaked into the event payload: %q", event)
@@ -1143,7 +1148,7 @@ func TestDLQReplayScheduleStoredPayloadForwardsTrace(t *testing.T) {
 	if _, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", dlqUnitID); err != nil {
 		t.Fatalf("dlq replay: %v", err)
 	}
-	calls, event, trace := rep.got()
+	calls, event, trace, _ := rep.got()
 	if calls != 1 {
 		t.Fatalf("replayer calls = %d, want 1", calls)
 	}
@@ -1191,7 +1196,7 @@ func TestDLQReplayScheduleClaimWithoutPayloadKeepsEntryPreDial(t *testing.T) {
 		!strings.Contains(err.Error(), "no stored handler payload") {
 		t.Fatalf("err = %v, want the no-stored-payload replay error naming the resolved entry", err)
 	}
-	if calls, _, _ := rep.got(); calls != 0 {
+	if calls, _, _, _ := rep.got(); calls != 0 {
 		t.Fatalf("a payload-less claim must fail before the replayer: calls = %d", calls)
 	}
 	if len(store.entries) != 1 {
@@ -1222,7 +1227,7 @@ func TestDLQReplayNonReplayablePayloadlessEventKeepsEntryPreDial(t *testing.T) {
 	if strings.Contains(err.Error(), "invocation unavailable") {
 		t.Fatalf("err = %v, must not report a misleading worker unavailability", err)
 	}
-	if calls, _, _ := rep.got(); calls != 0 {
+	if calls, _, _, _ := rep.got(); calls != 0 {
 		t.Fatalf("a payload-less event must fail before the replayer: calls = %d", calls)
 	}
 	if len(store.entries) != 1 {

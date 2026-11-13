@@ -42,7 +42,7 @@ func TestPrepareLogsInspectionTimingOnReuseAndMiss(t *testing.T) {
 	// --- Reuse: the image exists with a matching bootstrap label. ---
 	t.Run("reuse", func(t *testing.T) {
 		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 			t.Fatalf("write source: %v", err)
 		}
 		fn := app.App{Name: "reuse-timing", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
@@ -67,7 +67,7 @@ func TestPrepareLogsInspectionTimingOnReuseAndMiss(t *testing.T) {
 	// --- Miss/build: the image is absent, so the probe misses and a build runs. ---
 	t.Run("miss", func(t *testing.T) {
 		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 			t.Fatalf("write source: %v", err)
 		}
 		// A second content file so a per-file logging bug would be visible: the

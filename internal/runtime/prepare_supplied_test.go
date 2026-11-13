@@ -23,7 +23,7 @@ import (
 // tag.
 func TestPrepareWithFingerprintRuntimeUsesSnapshotIdentity(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 	const supplied = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

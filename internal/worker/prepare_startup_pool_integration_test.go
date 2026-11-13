@@ -37,8 +37,8 @@ func (acceptStartupPublisher) RuntimeImageSelectionIdentity(string) string { ret
 // blocks its neighbor's convergence.
 func TestPrepareAppsStartupUsesExactPerAppFencingToken(t *testing.T) {
 	root := t.TempDir()
-	writeWorkerApp(t, root, "fence-alpha", "def handler(e): return 1\n")
-	writeWorkerApp(t, root, "fence-beta", "def handler(e): return 2\n")
+	writeWorkerApp(t, root, "fence-alpha", "def handler(e, context): return 1\n")
+	writeWorkerApp(t, root, "fence-beta", "def handler(e, context): return 2\n")
 
 	fns, err := app.NewLoader(root, discardLogger()).Load()
 	if err != nil {
@@ -141,7 +141,7 @@ func TestPrepareAppsStartupUsesExactPerAppFencingToken(t *testing.T) {
 // generation it already lost.
 func TestPrepareAppsStartupStaleFencingTokenSuppressesFailureWrite(t *testing.T) {
 	root := t.TempDir()
-	writeWorkerApp(t, root, "fence-gamma", "def handler(e): return 3\n")
+	writeWorkerApp(t, root, "fence-gamma", "def handler(e, context): return 3\n")
 
 	fns, err := app.NewLoader(root, discardLogger()).Load()
 	if err != nil {

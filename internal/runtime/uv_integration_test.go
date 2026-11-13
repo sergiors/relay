@@ -128,7 +128,7 @@ dependencies = ["six==1.16.0"]
 // the bootstrap uses (system site-packages).
 const uvDependencyHandler = `import six
 
-def run(event):
+def run(event, context):
     print("six version " + six.__version__)
 `
 
@@ -234,7 +234,7 @@ events:
     pattern:
       status: [COMPLETED]
 `)
-	writeFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
+	writeFile(t, dir, "handler.py", "def run(event, context):\n    print('ok')\n")
 	fn := app.App{Name: "uv-nodeps", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 
 	m, _ := newManager(t)

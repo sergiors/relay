@@ -94,7 +94,7 @@ func writeNodeFn(t *testing.T, root, name, output string) {
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(tmpl), 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
 	}
-	src := "export function hi(e){ console.log(\"" + output + "\"); }\n"
+	src := "export function hi(e, context){ console.log(\"" + output + "\"); }\n"
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte(src), 0o644); err != nil {
 		t.Fatalf("write index: %v", err)
 	}

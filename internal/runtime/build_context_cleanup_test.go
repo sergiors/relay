@@ -57,7 +57,7 @@ func isolatedTmpdir(t *testing.T) string {
 func TestBuildContextTempDirRemovedOnBuildSuccess(t *testing.T) {
 	base := isolatedTmpdir(t)
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 
@@ -90,7 +90,7 @@ func TestBuildContextTempDirRemovedOnBuildSuccess(t *testing.T) {
 func TestBuildContextTempDirRemovedOnBuildFailure(t *testing.T) {
 	base := isolatedTmpdir(t)
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 
@@ -124,7 +124,7 @@ func TestBuildContextTempDirRemovedOnBuildFailure(t *testing.T) {
 func TestBuildContextTempDirRemovedOnBuildCancellation(t *testing.T) {
 	base := isolatedTmpdir(t)
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 

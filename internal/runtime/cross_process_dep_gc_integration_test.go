@@ -273,7 +273,7 @@ events:
     pattern:
       status: [COMPLETED]
 `)
-	writeFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
+	writeFile(t, dir, "handler.py", "def run(event, context):\n    print('ok')\n")
 	writeFile(t, dir, "requirements.txt", marker+"six==1.16.0\n")
 	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 

@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"strings"
 	"sync"
+	"time"
+
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"relay/internal/observability/tracing"
 )
@@ -16,7 +19,8 @@ import (
 // invocation is one request/response frame exchange over that container's stdin
 // and stdout. The bootstrap is a line-JSON server side:
 //
-//	Relay → stdin:   {"id":"<8-16 hex>","handler":"mod.func","event":<raw>,"env":{"K":"V"}}
+//	Relay → stdin:   {"id":"<8-16 hex>","handler":"mod.func","event":<raw>,
+//	                  "env":{"K":"V"},"context":{"requestId":"…",…}}
 //	stdin → stdout:  @@RELAY@@{"id":"<id>","ok":true}            (line)
 //	                 @@RELAY@@{"id":"<id>","ok":false,"error":"…"}
 //
@@ -56,15 +60,63 @@ const (
 // baggage) injected from the invocation's context under the single "trace"
 // object field. It is omitempty, so a byte-compatible frame is written when
 // there is no trace context (tracing disabled, or no recording span): existing
-// bootstraps that do not read "trace" are unaffected, and the Python bootstrap
-// simply ignores the unknown field until it opts in. The Node bootstrap already
-// extracts it via propagation.extract(context.active(), req.trace ?? {}).
+// bootstraps that do not read "trace" are unaffected. The Node bootstrap
+// extracts it via propagation.extract(context.active(), req.trace ?? {}) and the
+// Python bootstrap does the same through its global propagator.
+//
+// Context is the always-present per-invocation execution metadata (see
+// HandlerContext), including the stable request ID, attempt/budget, effective
+// deadline, and the optional source message and trace IDs.
 type invokeRequest struct {
-	ID      string            `json:"id"`
-	Handler string            `json:"handler"`
-	Event   json.RawMessage   `json:"event"`
-	Env     map[string]string `json:"env"`
-	Trace   *traceFrame       `json:"trace,omitempty"`
+	ID      string               `json:"id"`
+	Handler string               `json:"handler"`
+	Event   json.RawMessage      `json:"event"`
+	Env     map[string]string    `json:"env"`
+	Trace   *traceFrame          `json:"trace,omitempty"`
+	Context *handlerContextFrame `json:"context"`
+}
+
+// handlerContextFrame is the per-invocation execution metadata nested under the
+// request frame's "context" field (see HandlerContext). Deadline is the
+// invocation context's effective deadline formatted as RFC 3339/ISO-8601; a
+// context with no deadline carries the zero instant, which the handler side
+// treats as already expired. MessageID and TraceID are omitted when absent, so
+// state-free executions do not invent broker or trace identities.
+type handlerContextFrame struct {
+	RequestID   string `json:"requestId"`
+	Attempt     int    `json:"attempt"`
+	MaxAttempts int    `json:"maxAttempts"`
+	Deadline    string `json:"deadline"`
+	MessageID   string `json:"messageId,omitempty"`
+	TraceID     string `json:"traceId,omitempty"`
+	App         string `json:"app"`
+	Handler     string `json:"handler"`
+}
+
+// newHandlerContextFrame renders the HandlerContext carried by ctx into the
+// request frame's "context" object. Missing fields are normalized so the frame
+// object is always complete: direct runtime callers that never injected a
+// HandlerContext get a fresh state-free identity (attempt 1, maxAttempts 1),
+// while the runner's broker-backed paths supply the stable values. The deadline
+// is read from ctx itself (not from HandlerContext) so it always matches the
+// context that cancels the execution, and the trace ID is the current span's
+// W3C trace ID so it agrees with the "trace" carrier.
+func newHandlerContextFrame(ctx context.Context, handler string) *handlerContextFrame {
+	hc := HandlerContextFrom(ctx).normalized(RunMetaFrom(ctx).App, handler)
+	deadline, _ := ctx.Deadline()
+	frame := &handlerContextFrame{
+		RequestID:   hc.RequestID,
+		Attempt:     hc.Attempt,
+		MaxAttempts: hc.MaxAttempts,
+		Deadline:    deadline.UTC().Format(time.RFC3339Nano),
+		MessageID:   hc.MessageID,
+		App:         hc.App,
+		Handler:     hc.Handler,
+	}
+	if spanCtx := oteltrace.SpanContextFromContext(ctx); spanCtx.IsValid() {
+		frame.TraceID = spanCtx.TraceID().String()
+	}
+	return frame
 }
 
 // traceFrame is the W3C trace-context carrier nested under the request frame's
@@ -97,10 +149,12 @@ func newTraceFrame(ctx context.Context) *traceFrame {
 
 // encodeInvokeRequest renders one request frame (without the trailing newline)
 // from the invocation identity, the verbatim event payload, the per-invocation
-// env, and the trace context carried by ctx. The event JSON is passed through
-// untouched (json.RawMessage) and the trace object is omitted when ctx carries
-// no trace context, keeping the frame byte-compatible for bootstraps that never
-// read it.
+// env, the trace context carried by ctx, and ctx's HandlerContext metadata. The
+// event JSON is passed through untouched (json.RawMessage) and the trace object
+// is omitted when ctx carries no trace context, keeping the frame
+// byte-compatible for bootstraps that never read it. The context object is
+// always present: it is execution metadata, not payload, and a handler side may
+// depend on its identity fields.
 func encodeInvokeRequest(ctx context.Context, id, handler string, eventJSON []byte, env map[string]string) ([]byte, error) {
 	return json.Marshal(invokeRequest{
 		ID:      id,
@@ -108,6 +162,7 @@ func encodeInvokeRequest(ctx context.Context, id, handler string, eventJSON []by
 		Event:   json.RawMessage(eventJSON),
 		Env:     env,
 		Trace:   newTraceFrame(ctx),
+		Context: newHandlerContextFrame(ctx, handler),
 	})
 }
 

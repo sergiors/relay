@@ -475,7 +475,7 @@ func TestWatchExchangeRegistrationFailureRetriedOnCurrentTree(t *testing.T) {
 	root := t.TempDir()
 	golfPath := filepath.Join(root, "golf")
 	golfAttic := filepath.Join(golfPath, "attic")
-	buildTree(t, root, "golf", "export function hi(e){}\n", "attic")
+	buildTree(t, root, "golf", "export function hi(e, context){}\n", "attic")
 
 	r := fixtureWithoutLoops(t, root, &fakeBuilder{}, nil)
 	b := r.builder.(*fakeBuilder)
@@ -487,7 +487,7 @@ func TestWatchExchangeRegistrationFailureRetriedOnCurrentTree(t *testing.T) {
 	// permission failure is planted while the replacement tree is still in the
 	// staging root and travels with the rotation.
 	staging := t.TempDir()
-	newTree := buildTree(t, staging, "golf", "export function hi(e){ console.log('v2'); }\n", "vault")
+	newTree := buildTree(t, staging, "golf", "export function hi(e, context){ console.log('v2'); }\n", "vault")
 	if err := os.Chmod(filepath.Join(newTree, "vault"), 0o000); err != nil {
 		t.Fatalf("chmod vault: %v", err)
 	}
@@ -622,7 +622,7 @@ func TestWatchRepeatedExchangeNotificationsConvergeWithoutDuplicates(t *testing.
 	root := t.TempDir()
 	golfPath := filepath.Join(root, "golf")
 	golfAttic := filepath.Join(golfPath, "attic")
-	buildTree(t, root, "golf", "export function hi(e){}\n", "attic")
+	buildTree(t, root, "golf", "export function hi(e, context){}\n", "attic")
 
 	b := &fakeBuilder{}
 	r := fixtureWithoutLoops(t, root, b, nil)
@@ -633,7 +633,7 @@ func TestWatchRepeatedExchangeNotificationsConvergeWithoutDuplicates(t *testing.
 	// The replacement tree is a different inode at the same path, with a
 	// different subtree layout (attic gone, annex added).
 	staging := t.TempDir()
-	newTree := buildTree(t, staging, "golf", "export function hi(e){}\n", "annex")
+	newTree := buildTree(t, staging, "golf", "export function hi(e, context){}\n", "annex")
 	golfAnnex := filepath.Join(golfPath, "annex")
 	exchangeAppDirectory(t, golfPath, newTree)
 
@@ -707,7 +707,7 @@ func TestWatchExchangeRefreshReconcilesDetachedChanges(t *testing.T) {
 	// The replacement tree carries v2 content that the currently installed
 	// watches can never notify about: it existed before the site was rotated.
 	staging := t.TempDir()
-	newTree := buildTree(t, staging, "golf", "export function hi(e){ console.log('v2'); }\n", "annex")
+	newTree := buildTree(t, staging, "golf", "export function hi(e, context){ console.log('v2'); }\n", "annex")
 	golfAnnex := filepath.Join(golfPath, "annex")
 	exchangeAppDirectory(t, golfPath, newTree)
 
@@ -765,7 +765,7 @@ func TestWatchExchangeRefreshReconcilesDetachedChanges(t *testing.T) {
 // but fsnotify has dropped its watch before Relay handles the refresh event.
 func TestWatchRefreshRestoresLostBackendWatchForSameInode(t *testing.T) {
 	root := t.TempDir()
-	golfPath := buildTree(t, root, "golf", "export function hi(e){}\n", "attic")
+	golfPath := buildTree(t, root, "golf", "export function hi(e, context){}\n", "attic")
 	atticPath := filepath.Join(golfPath, "attic")
 	nestedFile := filepath.Join(atticPath, "nested.txt")
 	if err := os.WriteFile(nestedFile, []byte("before"), 0o644); err != nil {
@@ -860,7 +860,7 @@ func TestWatchRecoveryReconcilesChangeLandedDuringDegradation(t *testing.T) {
 	// The desired generation is ALREADY in place while the site's registration
 	// is degraded: no watch ever delivered these bytes.
 	if err := os.WriteFile(filepath.Join(hotelPath, "index.js"),
-		[]byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+		[]byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write degraded-window content: %v", err)
 	}
 	// The seed is seeded from the FULL current tree first (as the worker's
@@ -965,7 +965,7 @@ func TestWatchGapErrorRestoresWatchAndReconciles(t *testing.T) {
 	// Content changes during the gap: a plain overwrite is invisible to the
 	// remaining watches, so observing it at all requires the gap recovery.
 	if err := os.WriteFile(filepath.Join(indiaDir, "index.js"),
-		[]byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+		[]byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2 during the gap: %v", err)
 	}
 
@@ -1253,7 +1253,7 @@ func TestWatchNoDuplicateRegistrationsOrGoroutineLeaks(t *testing.T) {
 	root := t.TempDir()
 	golfPath := filepath.Join(root, "golf")
 	golfAttic := filepath.Join(golfPath, "attic")
-	oldTree := buildTree(t, root, "golf", "export function hi(e){}\n", "attic")
+	oldTree := buildTree(t, root, "golf", "export function hi(e, context){}\n", "attic")
 	_ = oldTree
 
 	r := fixtureWithoutLoops(t, root, &fakeBuilder{}, nil)
@@ -1263,7 +1263,7 @@ func TestWatchNoDuplicateRegistrationsOrGoroutineLeaks(t *testing.T) {
 	for round := 1; round <= rounds; round++ {
 		staging := t.TempDir()
 		sub := fmt.Sprintf("annex-%d", round)
-		newTree := buildTree(t, staging, "golf", "export function hi(e){}\n", sub)
+		newTree := buildTree(t, staging, "golf", "export function hi(e, context){}\n", sub)
 		exchangeAppDirectory(t, golfPath, newTree)
 		driveExchangeNotification(r, golfPath)
 	}

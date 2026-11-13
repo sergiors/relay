@@ -339,7 +339,7 @@ func TestSyncHonorsGitignore(t *testing.T) {
 	writeFile(t, filepath.Join(e.work, "fn", ".gitignore"), "*.tmp\n")
 	writeFile(t, filepath.Join(e.work, "fn", "debug.log"), "noise\n")
 	writeFile(t, filepath.Join(e.work, "fn", "scratch.tmp"), "noise\n")
-	writeFile(t, filepath.Join(e.work, "fn", "handler.js"), "export function h(){}\n")
+	writeFile(t, filepath.Join(e.work, "fn", "handler.js"), "export function h(event, context){}\n")
 	for _, p := range []string{".gitignore", "fn/.gitignore", "fn/debug.log", "fn/scratch.tmp", "fn/handler.js"} {
 		if _, err := wt.Add(p); err != nil {
 			t.Fatalf("add %s: %v", p, err)

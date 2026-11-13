@@ -102,14 +102,14 @@ func TestMaterializeUpdateNeverExposesAbsence(t *testing.T) {
 	writeFile(t, filepath.Join(src, "alpha", "template.yaml"),
 		hardeningTemplate("new-alpha"))
 	writeFile(t, filepath.Join(src, "alpha", "handler.js"),
-		"export function newHandler(){}\n")
+		"export function newHandler(event, context){}\n")
 	writeFile(t, filepath.Join(src, "alpha", "new-only.txt"), "new only\n")
 
 	apps := t.TempDir()
 	writeFile(t, filepath.Join(apps, "alpha", "template.yaml"),
 		hardeningTemplate("old-alpha"))
 	writeFile(t, filepath.Join(apps, "alpha", "handler.js"),
-		"export function oldHandler(){}\n")
+		"export function oldHandler(event, context){}\n")
 	writeFile(t, filepath.Join(apps, "alpha", "old-only.txt"), "old only\n")
 
 	liveExchanges := 0

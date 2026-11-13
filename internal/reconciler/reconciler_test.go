@@ -60,7 +60,7 @@ func writeFnDir(t *testing.T, root, name string) string {
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(template), 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write index: %v", err)
 	}
 	return dir
@@ -131,7 +131,7 @@ func TestReconcileChangedAppRebuilt(t *testing.T) {
 	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
 	// Change source content.
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 
@@ -217,7 +217,7 @@ func TestReconcileFailedBuildRetainsOld(t *testing.T) {
 	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
 	// Change content so a rebuild is warranted, then make it fail.
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 	b.fail = true
@@ -300,7 +300,7 @@ func TestReconcileAllDiscoversAndRemoves(t *testing.T) {
 		t.Fatalf("removeall gone: %v", err)
 	}
 	// Delete "live" content so the fingerprint changes and it must be rebuilt.
-	if err := os.WriteFile(filepath.Join(liveDir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(liveDir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 
@@ -372,7 +372,7 @@ func TestReconcileSameImageRetireSkipped(t *testing.T) {
 
 	// Change content so a rebuild is warranted; the builder returns the SAME
 	// image, so the retire must be skipped.
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 	r.reconcileApp("same")

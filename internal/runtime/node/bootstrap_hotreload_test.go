@@ -17,7 +17,7 @@ func TestNodeRuntimeSourceMountRunsEditedSourceOnFreshProcess(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
 	writeMountedModule(t, root, "index.mjs", `
-export function handler(event) {
+export function handler(event, context) {
   console.log("src V1 " + event.msg);
 }
 `)
@@ -33,7 +33,7 @@ export function handler(event) {
 	// Edit the LIVE mounted source. The image is unchanged, so the reload takes
 	// effect by recycling the warm process: a fresh bootstrap reads the mount.
 	writeMountedModule(t, root, "index.mjs", `
-export function handler(event) {
+export function handler(event, context) {
   console.log("src V2 " + event.msg);
 }
 `)

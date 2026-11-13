@@ -21,7 +21,7 @@ func writeAppsDir(t *testing.T, root string) {
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(twoHandlerTmpl), 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte("def handler(e): return e\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte("def handler(e, context): return e\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 }

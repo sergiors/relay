@@ -106,7 +106,7 @@ func TestReconcileRealBuiltGenerationsTrackSourceAndConverge(t *testing.T) {
 	}
 
 	// Edit -> distinct generation B.
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('B'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('B'); }\n"), 0o644); err != nil {
 		t.Fatalf("write B: %v", err)
 	}
 	genB, err := app.FingerprintApp(dir, fn.App().Template)
@@ -146,7 +146,7 @@ func TestReconcileRealBuiltGenerationsTrackSourceAndConverge(t *testing.T) {
 	}
 
 	// Edit -> distinct generation C.
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('C'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('C'); }\n"), 0o644); err != nil {
 		t.Fatalf("write C: %v", err)
 	}
 	genC, err := app.FingerprintApp(dir, fn.App().Template)

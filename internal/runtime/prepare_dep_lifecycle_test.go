@@ -144,7 +144,7 @@ func (g *countingRaceGate) parked(req *http.Request, slot <-chan struct{}) {
 func dependencyLifecycleFixture(t *testing.T, name string) (app.App, string, string) {
 	t.Helper()
 	dir := t.TempDir()
-	writeRaceSource(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
+	writeRaceSource(t, dir, "handler.py", "def run(event, context):\n    print('ok')\n")
 	writeRaceSource(t, dir, "requirements.txt", "six==1.16.0\n")
 	fn := app.App{Name: name, Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 	fp, err := app.Fingerprint(dir)

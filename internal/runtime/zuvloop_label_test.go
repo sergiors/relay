@@ -272,7 +272,7 @@ func TestPythonZuvloopSourceMountedTagIdentity(t *testing.T) {
 func zuvloopReuseApp(t *testing.T) (app.App, string, string) {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("def completed(event):\n    print('ok')\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("def completed(event, context):\n    print('ok')\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 	fn := app.App{Name: "zuvloop-reuse", Dir: dir, Template: &app.Template{

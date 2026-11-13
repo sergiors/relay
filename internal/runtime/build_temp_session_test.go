@@ -56,7 +56,7 @@ func TestPrepareStagesBuildRootsInsideBuildTempSession(t *testing.T) {
 	t.Setenv("TMPDIR", base)
 
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 

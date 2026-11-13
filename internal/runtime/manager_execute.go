@@ -193,6 +193,12 @@ func (m *Manager) Execute(
 	if meta.App == "" {
 		meta.App = prepared.Name
 	}
+	// Complete the handler-visible execution identity before any container
+	// work: a direct caller that supplied no HandlerContext gets a fresh
+	// state-free one (attempt 1, maxAttempts 1), and the app/handler are always
+	// the ones actually being executed. The effective deadline and trace ID are
+	// added by the frame encoder from the context at write time.
+	ctx = WithHandlerContext(ctx, HandlerContextFrom(ctx).normalized(prepared.Name, handler))
 
 	// Pin the image for the whole execution. An execution admitted before the
 	// image's retirement carries that admitted lease on ctx (the runner passes a

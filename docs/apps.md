@@ -167,6 +167,64 @@ occurrence. In either case, exit code
 `0` is success and any non-zero code is failure. See
 [events.md](events.md) and [schedules.md](schedules.md).
 
+#### Invocation context
+
+The invocation metadata has the same values for event and schedule functions,
+with language-specific property names and types:
+
+| TypeScript property    | Python property         | TypeScript type       | Python type               | Meaning                                                |
+| ---------------------- | ----------------------- | --------------------- | ------------------------- | ------------------------------------------------------ |
+| `requestId`            | `request_id`            | `string`              | `str`                     | Unique identifier for this handler invocation.         |
+| `attempt`              | `attempt`               | `number`              | `int`                     | One-based attempt number.                              |
+| `maxAttempts`          | `max_attempts`          | `number`              | `int`                     | Total allowed attempts, including the initial attempt. |
+| `deadline`             | `deadline`              | ISO-8601 `string`     | timezone-aware `datetime` | Invocation deadline.                                   |
+| `messageId` (optional) | `message_id` (optional) | `string \| undefined` | `str \| None`             | Stream message ID, when the invocation has one.        |
+| `traceId` (optional)   | `trace_id` (optional)   | `string \| undefined` | `str \| None`             | Trace ID, when tracing context is available.           |
+| `app`                  | `app`                   | `string`              | `str`                     | App name.                                              |
+| `handler`              | `handler`               | `string`              | `str`                     | Configured handler name (`module.function`).           |
+
+Node.js and TypeScript handlers receive the event first and a fresh context object
+second: `handler(event, context)`. Its fields use the names shown above, and
+`context.getRemainingTimeMs()` returns the non-negative number of milliseconds
+until `deadline` (zero after the deadline). For TypeScript, the context can be
+typed locally without an SDK dependency:
+
+```ts
+interface HandlerContext {
+  requestId: string;
+  attempt: number;
+  maxAttempts: number;
+  deadline: string;
+  messageId?: string;
+  traceId?: string;
+  app: string;
+  handler: string;
+  getRemainingTimeMs(): number;
+}
+
+export function handler(event: unknown, context: HandlerContext): void {
+  console.log(
+    `request ${context.requestId} has ${context.getRemainingTimeMs()}ms left`,
+  );
+}
+```
+
+Python handlers also receive the event and context as their first and second
+arguments: `handler(event, context)`. The context carries the fields listed above;
+`context.get_remaining_time_ms()` returns the non-negative number of milliseconds
+until `deadline` (zero after the deadline):
+
+```python
+def handler(event, context):
+    print(
+        f"request {context.request_id} "
+        f"has {context.get_remaining_time_ms()}ms left"
+    )
+```
+
+OpenTelemetry trace propagation remains available ambiently during the handler
+call in both runtimes.
+
 Event handler names must be **unique across an app's event rules**,
 regardless of pattern, timeout, or retries: the invocation identity is
 `(app, handler)`, so a repeated handler is a template error (it would race

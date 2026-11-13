@@ -46,7 +46,9 @@ import (
 // normalized Debezium event, or Occurrence.Payload for a schedule). There is no
 // fallback to the diagnostic Event body: an entry with no stored payload is an
 // explicit pre-dial error and releases the claim.
-func replayDLQEntry(ctx context.Context, w io.Writer, store dlq.Store, socketPath, id string) error {
+func replayDLQEntry(
+	ctx context.Context, w io.Writer, store dlq.Store, socketPath, id string,
+) error {
 	claim, err := store.ClaimDLQReplay(ctx, id, dlq.ReplayLease)
 	if err != nil {
 		switch {
@@ -80,7 +82,9 @@ func replayDLQEntry(ctx context.Context, w io.Writer, store dlq.Store, socketPat
 	}
 	payload := entry.ReplayPayload
 
-	if err := worker.ReplayDLQ(ctx, socketPath, entry.App, entry.Handler, payload, entry.Trace); err != nil {
+	if err := worker.ReplayDLQ(
+		ctx, socketPath, entry.App, entry.Handler, payload, entry.Trace, entry.SourceMessageID,
+	); err != nil {
 		replayErr := fmt.Errorf("replay %s: %w", id, err)
 		// A definitive worker answer means no handler is still running. A
 		// request that never started is equally safe to release. Everything

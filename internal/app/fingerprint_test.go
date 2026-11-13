@@ -89,7 +89,7 @@ func TestFingerprintAppNarrowsRuntimeLessToTemplate(t *testing.T) {
 func TestFingerprintUnchangedStable(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: python3.14\n")
-	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e):\n")
+	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e, context):\n")
 
 	got := fp(t, dir)
 	for i := 0; i < 3; i++ {
@@ -103,7 +103,7 @@ func TestFingerprintUnchangedStable(t *testing.T) {
 func TestFingerprintDeterministicAcrossOrdering(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\n")
-	writeFile(t, filepath.Join(dir, "index.js"), "export function hi(e){}\n")
+	writeFile(t, filepath.Join(dir, "index.js"), "export function hi(e, context){}\n")
 
 	first := fp(t, dir)
 	second := fp(t, dir)
@@ -115,10 +115,10 @@ func TestFingerprintDeterministicAcrossOrdering(t *testing.T) {
 func TestFingerprintContentChangeDetected(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: python3.14\n")
-	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e): return 1\n")
+	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e, context): return 1\n")
 	before := fp(t, dir)
 
-	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e): return 2\n")
+	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e, context): return 2\n")
 	after := fp(t, dir)
 	if after == before {
 		t.Fatal("content change should change fingerprint")
@@ -164,7 +164,7 @@ func TestFingerprintNativeUvPairDetected(t *testing.T) {
 func TestFingerprintTemplateChangeDetected(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: python3.14\n")
-	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e): pass\n")
+	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e, context): pass\n")
 	before := fp(t, dir)
 
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\n")
@@ -263,7 +263,7 @@ func TestFingerprintIgnoresIgnoredSource(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, ".gitignore"), "*.log\n")
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: python3.14\n")
-	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e): return 1\n")
+	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e, context): return 1\n")
 	writeFile(t, filepath.Join(dir, "debug.log"), "noise v1\n")
 	base := fp(t, dir)
 
@@ -295,7 +295,7 @@ func TestFingerprintTracksIgnoreRuleContent(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, ".gitignore"), "*.log\n")
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: python3.14\n")
-	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e): return 1\n")
+	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e, context): return 1\n")
 	base := fp(t, dir)
 
 	writeFile(t, filepath.Join(dir, ".gitignore"), "*.log\n*.tmp\n")
@@ -392,7 +392,7 @@ events:
 	// Full-source (runtime) path.
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "template.yaml"), baseTmpl)
-	writeFile(t, filepath.Join(dir, "index.js"), "export function run(e){}\n")
+	writeFile(t, filepath.Join(dir, "index.js"), "export function run(e, context){}\n")
 	base := fp(t, dir)
 
 	writeFile(t, filepath.Join(dir, "template.yaml"), changedResources)
@@ -477,13 +477,13 @@ func TestFingerprintTracksTypeScriptSources(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\n")
 	writeFile(t, filepath.Join(dir, "tsconfig.json"), `{"compilerOptions":{"strict":true}}`+"\n")
 	writeFile(t, filepath.Join(dir, "src", "handler.ts"),
-		"import { msg } from \"./msg\";\nexport function handler(e) { console.log(msg(e)); }\n")
+		"import { msg } from \"./msg\";\nexport function handler(e, context) { console.log(msg(e)); }\n")
 	writeFile(t, filepath.Join(dir, "src", "msg.ts"), "export function msg(e) { return \"v1\"; }\n")
 	base := fp(t, dir)
 
 	// Editing the handler source.
 	writeFile(t, filepath.Join(dir, "src", "handler.ts"),
-		"import { msg } from \"./msg\";\nexport function handler(e) { console.log(msg(e) + \"!\"); }\n")
+		"import { msg } from \"./msg\";\nexport function handler(e, context) { console.log(msg(e) + \"!\"); }\n")
 	if got := fp(t, dir); got == base {
 		t.Fatal("editing a .ts handler must change the fingerprint")
 	}
@@ -511,7 +511,7 @@ func TestFingerprintIgnoresIgnoredTypeScript(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, ".gitignore"), "*.generated.ts\n")
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\n")
-	writeFile(t, filepath.Join(dir, "handler.ts"), "export function handler(e) {}\n")
+	writeFile(t, filepath.Join(dir, "handler.ts"), "export function handler(e, context) {}\n")
 	writeFile(t, filepath.Join(dir, "scratch.generated.ts"), "export const scratch = 1\n")
 	base := fp(t, dir)
 
@@ -564,7 +564,7 @@ func TestFingerprintSelectionMatchesOldReadFileAlgorithm(t *testing.T) {
 	writeFile(t, filepath.Join(root, ".gitignore"), "*.generated\n")
 	writeFile(t, filepath.Join(dir, ".gitignore"), "*.tmp\n")
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: python3.14\nresources:\n  memory: 1GiB\n")
-	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e): return 1\n")
+	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e, context): return 1\n")
 	writeFile(t, filepath.Join(dir, "pkg", "mod.py"), "x = 1\n")
 	writeFile(t, filepath.Join(dir, "pkg", "sub", "deep.py"), "y = 2\n")
 	writeFile(t, filepath.Join(dir, "scratch.tmp"), "ignored by nested rule\n")

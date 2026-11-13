@@ -37,7 +37,7 @@ func TestIntegrationSourceMountPythonReflectsSourceChange(t *testing.T) {
 	defer cancel()
 
 	dir := t.TempDir()
-	writeFile(t, dir, "handler.py", "def run(event):\n    raise ValueError('V1')\n")
+	writeFile(t, dir, "handler.py", "def run(event, context):\n    raise ValueError('V1')\n")
 
 	fn := app.App{Name: "src-mount-it", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 	m, err := newCoordinatedRealManager(t, testutil.DiscardLogger(), nil, WithSourceMount(true))
@@ -60,7 +60,7 @@ func TestIntegrationSourceMountPythonReflectsSourceChange(t *testing.T) {
 	// Edit the live source. The image must be reused (source is not baked) and
 	// the advanced fingerprint must rotate the warm generation so the next
 	// invocation runs the new code from the mount.
-	writeFile(t, dir, "handler.py", "def run(event):\n    raise ValueError('V2')\n")
+	writeFile(t, dir, "handler.py", "def run(event, context):\n    raise ValueError('V2')\n")
 
 	second, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -94,7 +94,7 @@ func TestIntegrationSourceMountNodeJSReflectsSourceChange(t *testing.T) {
 	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	writeFile(t, dir, "index.js", `
 import colors from "picocolors";
-export function handler(event) {
+export function handler(event, context) {
   console.log(colors.red("js V1 " + event.event_id));
 }
 `)
@@ -142,7 +142,7 @@ export function handler(event) {
 	// that imports the edited mounted code.
 	writeFile(t, dir, "index.js", `
 import colors from "picocolors";
-export function handler(event) {
+export function handler(event, context) {
   console.log(colors.red("js V2 " + event.event_id));
 }
 `)
@@ -178,7 +178,7 @@ func TestIntegrationSourceMountNodeCJSReflectsSourceChange(t *testing.T) {
 	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	writeFile(t, dir, "index.js", `
 const colors = require("picocolors");
-exports.handler = function (event) {
+exports.handler = function (event, context) {
   console.log(colors.red("cjs V1 " + event.event_id));
 };
 `)
@@ -211,7 +211,7 @@ exports.handler = function (event) {
 	// advanced fingerprint rotates the warm generation onto the edited code.
 	writeFile(t, dir, "index.js", `
 const colors = require("picocolors");
-exports.handler = function (event) {
+exports.handler = function (event, context) {
   console.log(colors.red("cjs V2 " + event.event_id));
 };
 `)
@@ -252,7 +252,7 @@ export function message(event: { event_id: string }): string {
 import colors from "picocolors";
 import { context } from "@opentelemetry/api";
 import { message } from "./message";
-export function handler(event: { event_id: string }): void {
+export function handler(event: { event_id: string }, context: unknown): void {
   console.log(colors.red(message(event)) + " otel=" + (typeof context.active === "function"));
 }
 `)
@@ -348,7 +348,7 @@ export function where(): string {
 	writeFile(t, dir, "index.ts", `
 import colors from "picocolors";
 import { where } from "selfref-app/lib/util";
-export function handler(event: { event_id: string }): void {
+export function handler(event: { event_id: string }, context: unknown): void {
   console.log(colors.red(where() + " " + event.event_id));
 }
 `)
@@ -424,7 +424,7 @@ func TestIntegrationSourceMountNodeHostNodeModulesDoesNotShadow(t *testing.T) {
 	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	writeFile(t, dir, "index.js", `
 import colors from "picocolors";
-export function handler(event) {
+export function handler(event, context) {
   console.log("shadow=" + colors.red("V1") + " id=" + event.event_id);
 }
 `)
@@ -488,7 +488,7 @@ func TestIntegrationSourceMountNodeLateHostNodeModulesDoesNotShadow(t *testing.T
 	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	writeFile(t, dir, "index.js", `
 import colors from "picocolors";
-export function handler(event) {
+export function handler(event, context) {
   console.log("late=" + colors.red("V1") + " id=" + event.event_id);
 }
 `)
@@ -565,7 +565,7 @@ func TestIntegrationSourceMountNodeWorkingDirIsAppRoot(t *testing.T) {
 	writeFile(t, dir, "data.txt", "relative-ok\n")
 	writeFile(t, dir, "index.js", `
 import { readFileSync } from "node:fs";
-export function handler(event) {
+export function handler(event, context) {
   console.log("cwd=" + process.cwd());
   console.log("data=" + readFileSync("./data.txt", "utf8").trim());
 }
@@ -857,7 +857,7 @@ func TestIntegrationSourceMountNodeDependencyChangeBuildsAndExecutes(t *testing.
 	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	writeFile(t, dir, "index.js", `
 import colors from "picocolors";
-export function handler(event) {
+export function handler(event, context) {
   console.log(colors.green("dep-v1 " + event.event_id));
 }
 `)
@@ -895,7 +895,7 @@ export function handler(event) {
 	writeFile(t, dir, "index.js", `
 import colors from "picocolors";
 import ms from "ms";
-export function handler(event) {
+export function handler(event, context) {
   console.log(colors.green("dep-v2 " + event.event_id + " ms=" + ms(1500)));
 }
 `)
@@ -948,7 +948,7 @@ func writeSourceMountGateApp(t *testing.T) string {
 	writeFile(t, dir, "gate.txt", sourceMountGateClosed)
 	writeFile(t, dir, "index.js", `
 import { readFileSync } from "node:fs";
-export async function run(event) {
+export async function run(event, context) {
   console.log("START v1");
   while (readFileSync("gate.txt", "utf8").trim() !== "`+sourceMountGateOpen+`") {
     await new Promise((r) => setTimeout(r, 5));
@@ -965,7 +965,7 @@ export async function run(event) {
 func writeSourceMountGateAppV2(t *testing.T, dir string) {
 	t.Helper()
 	writeFile(t, dir, "index.js", `
-export function run(event) {
+export function run(event, context) {
   console.log("v2 " + event.event_id);
 }
 `)
@@ -1628,7 +1628,7 @@ export function message(event: { event_id: string }): string {
 	writeFile(t, dir, "index.ts", `
 import colors from "picocolors";
 import { message } from "@app/lib/msg";
-export function handler(event: { event_id: string }): void {
+export function handler(event: { event_id: string }, context: unknown): void {
   console.log(colors.green(message(event)));
 }
 `)

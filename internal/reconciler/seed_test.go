@@ -62,7 +62,7 @@ func TestSeedStaleFingerprintForcesRebuild(t *testing.T) {
 		t.Fatalf("fingerprint: %v", err)
 	}
 	r.Seed(fn.App(), orig)
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 
@@ -140,7 +140,7 @@ func TestPrepareWatchThenSeedDetectsSubsequentChange(t *testing.T) {
 	go r.Start(ctx)
 
 	// A change after the seed must reach the reconciler through the watcher.
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 

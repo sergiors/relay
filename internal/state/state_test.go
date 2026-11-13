@@ -715,7 +715,7 @@ func TestRecordDiscoveredWithFingerprintPersistsCallerFingerprint(t *testing.T) 
 
 	// Change the source after the fingerprint was computed. A recompute would
 	// now yield a different value.
-	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte("def handler(e): return 999\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte("def handler(e, context): return 999\n"), 0o644); err != nil {
 		t.Fatalf("rewrite source: %v", err)
 	}
 	changed, err := app.Fingerprint(dir)

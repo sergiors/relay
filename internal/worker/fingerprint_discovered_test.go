@@ -16,8 +16,8 @@ import (
 // and the value is the same one the state phase persists.
 func TestFingerprintDiscoveredNamespacedByApp(t *testing.T) {
 	root := t.TempDir()
-	writeWorkerApp(t, root, "alpha", "def handler(e): return 1\n")
-	writeWorkerApp(t, root, "beta", "def handler(e): return 2\n")
+	writeWorkerApp(t, root, "alpha", "def handler(e, context): return 1\n")
+	writeWorkerApp(t, root, "beta", "def handler(e, context): return 2\n")
 
 	fns, err := app.NewLoader(root, discardLogger()).Load()
 	if err != nil {
@@ -48,7 +48,7 @@ func TestFingerprintDiscoveredNamespacedByApp(t *testing.T) {
 // verbatim.
 func TestDiscoveredFromStartupDropsSelection(t *testing.T) {
 	root := t.TempDir()
-	writeWorkerApp(t, root, "demo", "def handler(e): return 1\n")
+	writeWorkerApp(t, root, "demo", "def handler(e, context): return 1\n")
 	fns, err := app.NewLoader(root, discardLogger()).Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -68,8 +68,8 @@ func TestDiscoveredFromStartupDropsSelection(t *testing.T) {
 // runtime-backed one carries the selection it hashed.
 func TestSelectAndFingerprintAppsNoRuntimeYieldsNoSelection(t *testing.T) {
 	root := t.TempDir()
-	writeWorkerApp(t, root, "runtime-fn", "def handler(e): return 1\n")
-	writeWorkerApp(t, root, "external-fn", "def handler(e): return 1\n")
+	writeWorkerApp(t, root, "runtime-fn", "def handler(e, context): return 1\n")
+	writeWorkerApp(t, root, "external-fn", "def handler(e, context): return 1\n")
 	fns, err := app.NewLoader(root, discardLogger()).Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)

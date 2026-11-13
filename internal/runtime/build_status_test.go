@@ -24,7 +24,7 @@ import (
 func TestAppBuildObserverFiresOnlyOnActualBuild(t *testing.T) {
 	t.Run("real build fires the observer once", func(t *testing.T) {
 		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 			t.Fatalf("write source: %v", err)
 		}
 		fn := app.App{Name: "build-fires", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
@@ -74,7 +74,7 @@ func TestAppBuildObserverFiresOnlyOnActualBuild(t *testing.T) {
 
 	t.Run("nil observer is a no-op", func(t *testing.T) {
 		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(event, context){}\n"), 0o644); err != nil {
 			t.Fatalf("write source: %v", err)
 		}
 		fn := app.App{Name: "nil-observer", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}

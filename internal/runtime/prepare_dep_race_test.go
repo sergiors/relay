@@ -96,7 +96,7 @@ func (g *raceGate) parked(req *http.Request) {
 // delay used to order the test. There are no sleeps.
 func TestPrepareDependencyLeaseSpansBuildVsGC(t *testing.T) {
 	dir := t.TempDir()
-	writeRaceSource(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
+	writeRaceSource(t, dir, "handler.py", "def run(event, context):\n    print('ok')\n")
 	writeRaceSource(t, dir, "requirements.txt", "six==1.16.0\n")
 
 	fn := app.App{

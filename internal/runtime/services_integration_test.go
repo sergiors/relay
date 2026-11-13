@@ -39,7 +39,7 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	writeFile(t, dir, "index.js", "export function hi(e){ console.log('hi'); }\n")
+	writeFile(t, dir, "index.js", "export function hi(e, context){ console.log('hi'); }\n")
 	// Long-lived service entrypoint in a nested subdirectory: an interval keeps
 	// node alive indefinitely. The file lives at <dir>/app/service.js, which the
 	// image COPYies to /app/app/service.js (the app dir is the /app root).
@@ -99,7 +99,7 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	writeFile(t, dir, "index.py", "def hi(e): return 'hi'\n")
+	writeFile(t, dir, "index.py", "def hi(e, context): return 'hi'\n")
 	if err := os.MkdirAll(filepath.Join(dir, "app"), 0o755); err != nil {
 		t.Fatalf("mkdir app: %v", err)
 	}
@@ -368,7 +368,7 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	writeFile(t, dir1, "index.js", "export function hi(e){ console.log('v1'); }\n")
+	writeFile(t, dir1, "index.js", "export function hi(e, context){ console.log('v1'); }\n")
 	// SIGTERM handler so the daemon's stop is prompt (node as PID 1 ignores the
 	// default SIGTERM action; without this every stop pays the full 10s grace).
 	writeFile(t, dir1, "service.js", "process.on('SIGTERM', () => process.exit(0));\nsetInterval(() => {}, 1 << 30);\n")
@@ -397,7 +397,7 @@ events:
 	waitForContainerRunning(t, ctx, cli, svc1)
 
 	// Now create a SECOND fingerprint v2 (touch a file) and build it -> new image.
-	writeFile(t, dir1, "index.js", "export function hi(e){ console.log('v2'); }\n")
+	writeFile(t, dir1, "index.js", "export function hi(e, context){ console.log('v2'); }\n")
 	p2, err := m.Prepare(ctx, fn1)
 	if err != nil {
 		t.Fatalf("prepare v2: %v", err)
@@ -457,7 +457,7 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	writeFile(t, dir2, "index.js", "export function hi(e){ console.log('other'); }\n")
+	writeFile(t, dir2, "index.js", "export function hi(e, context){ console.log('other'); }\n")
 	fn2 := app.App{Name: "svc-other", Dir: dir2, Template: &app.Template{Runtime: "nodejs24.x"}}
 	pOther, err := m.Prepare(ctx, fn2)
 	if err != nil {

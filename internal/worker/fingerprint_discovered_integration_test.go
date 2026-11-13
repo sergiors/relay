@@ -25,7 +25,7 @@ import (
 // on the record so Prepare can stage the exact policy the hash came from.
 func TestFingerprintDiscoveredReusedAcrossStatePhase(t *testing.T) {
 	root := t.TempDir()
-	writeWorkerApp(t, root, "demo", "def handler(e): return 1\n")
+	writeWorkerApp(t, root, "demo", "def handler(e, context): return 1\n")
 
 	loader := app.NewLoader(root, discardLogger())
 	fns, err := loader.Load()
@@ -54,7 +54,7 @@ func TestFingerprintDiscoveredReusedAcrossStatePhase(t *testing.T) {
 
 	// Mutate the source after the fingerprint was computed: any recompute now
 	// yields a different digest.
-	if err := os.WriteFile(filepath.Join(root, "demo", "main.py"), []byte("def handler(e): return 2\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "demo", "main.py"), []byte("def handler(e, context): return 2\n"), 0o644); err != nil {
 		t.Fatalf("rewrite source: %v", err)
 	}
 	changed, err := app.Fingerprint(filepath.Join(root, "demo"))
@@ -99,7 +99,7 @@ func TestFingerprintDiscoveredReusedAcrossStatePhase(t *testing.T) {
 // reconciler's audit detects the drift instead.
 func TestStartupBuiltFingerprintIsReturnedIdentity(t *testing.T) {
 	root := t.TempDir()
-	writeWorkerApp(t, root, "runtime-fn", "def handler(e): return 1\n")
+	writeWorkerApp(t, root, "runtime-fn", "def handler(e, context): return 1\n")
 
 	fns, err := app.NewLoader(root, discardLogger()).Load()
 	if err != nil {
@@ -115,7 +115,7 @@ func TestStartupBuiltFingerprintIsReturnedIdentity(t *testing.T) {
 	// then mutated so any rescan would differ.
 	const builtIdentity = "snapshot-built-identity"
 	spy := &startupSpyPreparer{overrideFingerprint: builtIdentity}
-	if err := os.WriteFile(filepath.Join(root, "runtime-fn", "main.py"), []byte("def handler(e): return 2\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "runtime-fn", "main.py"), []byte("def handler(e, context): return 2\n"), 0o644); err != nil {
 		t.Fatalf("rewrite source: %v", err)
 	}
 	onDisk, err := app.FingerprintApp(filepath.Join(root, "runtime-fn"), startup[0].App.Template)

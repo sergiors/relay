@@ -13,7 +13,7 @@ import (
 // with no issue for the staging name.
 func TestLoaderIgnoresStagingDirAtStartup(t *testing.T) {
 	root := t.TempDir()
-	writeWorkerApp(t, root, "good", "def handler(e): return 1\n")
+	writeWorkerApp(t, root, "good", "def handler(e, context): return 1\n")
 	if err := os.MkdirAll(filepath.Join(root, ".sync-xyz"), 0o755); err != nil {
 		t.Fatalf("mkdir stage: %v", err)
 	}

@@ -282,7 +282,7 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	writeFile(t, dir, "index.js", "export function run(e){ console.log('must not run'); }\n")
+	writeFile(t, dir, "index.js", "export function run(e, context){ console.log('must not run'); }\n")
 	fn := app.App{Name: "ctl-exec", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -328,7 +328,7 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	writeFile(t, dir, "index.js", "export function hi(e){ console.log('hi'); }\n")
+	writeFile(t, dir, "index.js", "export function hi(e, context){ console.log('hi'); }\n")
 	writeFile(t, dir, "service.js", `
 import http from "node:http";
 process.on("SIGTERM", () => process.exit(0));

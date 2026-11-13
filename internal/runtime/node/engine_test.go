@@ -337,8 +337,8 @@ func TestPlanJSHandlersNoBuild(t *testing.T) {
 	for _, spec := range testSpecs {
 		t.Run(spec.Name, func(t *testing.T) {
 			dir := t.TempDir()
-			writeSource(t, dir, "handler.js", "export function handler(e) {}\n")
-			writeSource(t, dir, "src/order.js", "export function handler(e) {}\n")
+			writeSource(t, dir, "handler.js", "export function handler(e, context) {}\n")
+			writeSource(t, dir, "src/order.js", "export function handler(e, context) {}\n")
 
 			for _, handlers := range [][]string{nil, {"handler"}, {"handler", "src.order"}} {
 				p, err := Engine{}.Plan(spec, dir, handlers)
@@ -360,7 +360,7 @@ func TestPlanJSHandlersNoBuild(t *testing.T) {
 // tooling and the pnpm store in the same layer.
 func TestPlanTSHandlerBuilds(t *testing.T) {
 	dir := t.TempDir()
-	writeSource(t, dir, "src/order.ts", "export function handler(e) {}\n")
+	writeSource(t, dir, "src/order.ts", "export function handler(e, context) {}\n")
 
 	p, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{"src.order"})
 	if err != nil {
@@ -438,7 +438,7 @@ func TestPlanTSTargetFromManagedNodeIdentifier(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			writeSource(t, dir, "index.ts", "export function handler(e) {}\n")
+			writeSource(t, dir, "index.ts", "export function handler(e, context) {}\n")
 			spec := plan.Spec{
 				Name:      tc.name,
 				Engine:    plan.EngineNode,
@@ -507,7 +507,7 @@ func TestPlanTSResolutionAndPrecedence(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			for _, f := range tc.files {
-				writeSource(t, dir, f, "export function handler(e) {}\n")
+				writeSource(t, dir, f, "export function handler(e, context) {}\n")
 			}
 			p, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{tc.module})
 			if err != nil {
@@ -542,7 +542,7 @@ func TestPlanJSResolutionUnchanged(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			for _, f := range tc.files {
-				writeSource(t, dir, f, "export function handler(e) {}\n")
+				writeSource(t, dir, f, "export function handler(e, context) {}\n")
 			}
 			p, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{tc.module})
 			if err != nil {
@@ -558,7 +558,7 @@ func TestPlanJSResolutionUnchanged(t *testing.T) {
 // compilerOptions from it.
 func TestPlanTSWithTsconfig(t *testing.T) {
 	dir := t.TempDir()
-	writeSource(t, dir, "index.ts", "export function handler(e) {}\n")
+	writeSource(t, dir, "index.ts", "export function handler(e, context) {}\n")
 	writeSource(t, dir, "tsconfig.json", `{"compilerOptions":{"strict":true}}`)
 
 	p, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{"index"})
@@ -579,8 +579,8 @@ func TestPlanTSWithTsconfig(t *testing.T) {
 // --source-mount flag. A mixed JS+TS handler set produces no build-time bundle.
 func TestPlanSourceMountedPersistsEsbuildAndMountsSource(t *testing.T) {
 	dir := t.TempDir()
-	writeSource(t, dir, "src/order.ts", "export function handler(e) {}\n")
-	writeSource(t, dir, "src/plain.js", "export function handler(e) {}\n")
+	writeSource(t, dir, "src/order.ts", "export function handler(e, context) {}\n")
+	writeSource(t, dir, "src/plain.js", "export function handler(e, context) {}\n")
 	// A host node_modules triggers the bounded node_modules mask (the path Docker
 	// can mount over because the bind carries it).
 	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755); err != nil {
@@ -646,7 +646,7 @@ func TestPlanSourceMountedPersistsEsbuildAndMountsSource(t *testing.T) {
 // baked plan byte-for-byte.
 func TestPlanSourceMountedShipsSharedResolveHook(t *testing.T) {
 	dir := t.TempDir()
-	writeSource(t, dir, "index.js", "export function handler(e) {}\n")
+	writeSource(t, dir, "index.js", "export function handler(e, context) {}\n")
 
 	mounted := specByName(t, "nodejs24.x")
 	mounted.SourceMounted = true
@@ -689,7 +689,7 @@ func TestPlanSourceMountedShipsSharedResolveHook(t *testing.T) {
 // Dockerfile and container create shape are byte-for-byte the historical one.
 func TestPlanBakedHasNoSourceMountLayout(t *testing.T) {
 	dir := t.TempDir()
-	writeSource(t, dir, "index.js", "export function handler(e) {}\n")
+	writeSource(t, dir, "index.js", "export function handler(e, context) {}\n")
 	p, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{"index"})
 	if err != nil {
 		t.Fatalf("plan: %v", err)
@@ -710,7 +710,7 @@ func TestPlanSourceMountedMasksHostNodeModulesOnlyWhenPresent(t *testing.T) {
 	spec.SourceMounted = true
 
 	absent := t.TempDir()
-	writeSource(t, absent, "index.js", "export function handler(e) {}\n")
+	writeSource(t, absent, "index.js", "export function handler(e, context) {}\n")
 	p, err := Engine{}.Plan(spec, absent, []string{"index"})
 	if err != nil {
 		t.Fatalf("plan without node_modules: %v", err)
@@ -720,7 +720,7 @@ func TestPlanSourceMountedMasksHostNodeModulesOnlyWhenPresent(t *testing.T) {
 	}
 
 	present := t.TempDir()
-	writeSource(t, present, "index.js", "export function handler(e) {}\n")
+	writeSource(t, present, "index.js", "export function handler(e, context) {}\n")
 	if err := os.MkdirAll(filepath.Join(present, "node_modules", "dep"), 0o755); err != nil {
 		t.Fatalf("mkdir node_modules: %v", err)
 	}
@@ -773,14 +773,14 @@ func TestPlanSourceMountedStillValidatesHandlers(t *testing.T) {
 	spec.SourceMounted = true
 
 	dir := t.TempDir()
-	writeSource(t, dir, "x.ts", "export function handler(e) {}\n")
+	writeSource(t, dir, "x.ts", "export function handler(e, context) {}\n")
 	if _, err := (Engine{}).Plan(spec, dir, []string{"missing"}); err == nil {
 		t.Error("expected a missing-module error under HOT_RELOAD")
 	}
 
 	ambiguous := t.TempDir()
-	writeSource(t, ambiguous, "x.js", "export function handler(e) {}\n")
-	writeSource(t, ambiguous, "x.ts", "export function handler(e) {}\n")
+	writeSource(t, ambiguous, "x.js", "export function handler(e, context) {}\n")
+	writeSource(t, ambiguous, "x.ts", "export function handler(e, context) {}\n")
 	if _, err := (Engine{}).Plan(spec, ambiguous, []string{"x"}); err == nil {
 		t.Error("expected an ambiguity error under HOT_RELOAD")
 	}
@@ -791,8 +791,8 @@ func TestPlanSourceMountedStillValidatesHandlers(t *testing.T) {
 // list is compiled in order.
 func TestPlanMultipleHandlersOneInstallDedup(t *testing.T) {
 	dir := t.TempDir()
-	writeSource(t, dir, "events/created.ts", "export function handler(e) {}\n")
-	writeSource(t, dir, "events/deleted.ts", "export function handler(e) {}\n")
+	writeSource(t, dir, "events/created.ts", "export function handler(e, context) {}\n")
+	writeSource(t, dir, "events/deleted.ts", "export function handler(e, context) {}\n")
 
 	p, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{"events.created", "events.deleted"})
 	if err != nil {
@@ -828,7 +828,7 @@ func TestPlanAmbiguousHandlerErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			for _, f := range tc.files {
-				writeSource(t, dir, f, "export function handler(e) {}\n")
+				writeSource(t, dir, f, "export function handler(e, context) {}\n")
 			}
 			_, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{tc.module})
 			if err == nil {
@@ -846,7 +846,7 @@ func TestPlanAmbiguousHandlerErrors(t *testing.T) {
 // every invocation failing later with module-not-found.
 func TestPlanMissingHandlerErrors(t *testing.T) {
 	dir := t.TempDir()
-	writeSource(t, dir, "index.ts", "export function handler(e) {}\n")
+	writeSource(t, dir, "index.ts", "export function handler(e, context) {}\n")
 
 	_, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{"missing"})
 	if err == nil {
@@ -880,7 +880,7 @@ func TestPlanInvalidModuleErrors(t *testing.T) {
 // auto-injected into the plan files.
 func TestPlanTSDoesNotInjectTsconfig(t *testing.T) {
 	dir := t.TempDir()
-	writeSource(t, dir, "index.ts", "export function handler(e) {}\n")
+	writeSource(t, dir, "index.ts", "export function handler(e, context) {}\n")
 
 	p, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{"index"})
 	if err != nil {
@@ -931,7 +931,7 @@ func TestShellQuoteArg(t *testing.T) {
 // split it nor start a new command. Nested TS/JS paths remain byte-identical to
 // the previous bare form when they contain no metacharacters.
 func TestPlanShellQuotesHandlerDerivedPaths(t *testing.T) {
-	const source = "export function handler(e) {}\n"
+	const source = "export function handler(e, context) {}\n"
 	cases := []struct {
 		name   string
 		rel    string
@@ -976,7 +976,7 @@ func TestPlanShellQuotesHandlerDerivedPaths(t *testing.T) {
 // exactly as before.
 func TestPlanShellQuoteNestedJSAndTSUnchanged(t *testing.T) {
 	dir := t.TempDir()
-	writeSource(t, dir, "src/deep/order.ts", "export function handler(e) {}\n")
+	writeSource(t, dir, "src/deep/order.ts", "export function handler(e, context) {}\n")
 
 	p, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{"src.deep.order"})
 	if err != nil {

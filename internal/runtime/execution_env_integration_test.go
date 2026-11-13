@@ -57,7 +57,7 @@ events:
 	// The handler prints both values and blocks so the test can inspect the
 	// container while the invocation is in flight.
 	writeFile(t, dir, "index.js", `
-export async function env(event) {
+export async function env(event, context) {
   console.log("GREETING=" + (process.env.GREETING ?? ""));
   console.log("TOKEN=" + (process.env.TOKEN ?? ""));
   await new Promise(r => setTimeout(r, event.blockMs ?? 0));

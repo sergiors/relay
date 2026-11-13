@@ -531,9 +531,10 @@ func (c *executionContainer) Invoke(
 	defer c.demux.clearPending()
 
 	// The request frame carries the invocation identity, the verbatim event
-	// payload, the per-invocation env, and the optional W3C trace carrier
-	// (see encodeInvokeRequest) so a container-side propagator can parent its
-	// spans to this invocation.
+	// payload, the per-invocation env, the optional W3C trace carrier, and the
+	// per-invocation HandlerContext metadata (see encodeInvokeRequest) so a
+	// container-side propagator can parent its spans to this invocation and the
+	// handler sees the execution identity.
 	frame, err := encodeInvokeRequest(ctx, id, handler, eventJSON, env)
 	if err != nil {
 		// Event JSON is always marshalled by the runner before reaching here;

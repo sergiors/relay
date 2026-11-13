@@ -85,7 +85,7 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", `
-export async function die(event) {
+export async function die(event, context) {
   // Give the poll below time to observe the running container, then die
   // BEFORE any response frame is written: process.exit terminates the process
   // immediately (PID 1 in a container cannot be killed by signals — the
@@ -93,7 +93,7 @@ export async function die(event) {
   await new Promise(r => setTimeout(r, 250));
   process.exit(1);
 }
-export function run(event) {
+export function run(event, context) {
   console.log("resurrected");
 }
 `)
@@ -158,7 +158,7 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	writeFile(t, dir, "index.js", "export function run(e){ console.log('v1'); }\n")
+	writeFile(t, dir, "index.js", "export function run(e, context){ console.log('v1'); }\n")
 	fn := app.App{Name: "img-change", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 
 	p1, err := m.Prepare(ctx, fn)
@@ -177,7 +177,7 @@ events:
 	}
 
 	// Change the source: new fingerprint -> new image.
-	writeFile(t, dir, "index.js", "export function run(e){ console.log('v2'); }\n")
+	writeFile(t, dir, "index.js", "export function run(e, context){ console.log('v2'); }\n")
 	p2, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare v2: %v", err)
@@ -216,7 +216,7 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-		writeFile(t, dir, "index.js", "export function run(e){ console.log('"+name+"'); }\n")
+		writeFile(t, dir, "index.js", "export function run(e, context){ console.log('"+name+"'); }\n")
 		fn := app.App{Name: name, Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 		prepared, err := m.Prepare(ctx, fn)
 		if err != nil {
@@ -300,17 +300,17 @@ events:
 	// markers are the observable barrier: seeing START a and START b means both
 	// pool slots are leased and both handlers are mid-flight, so C must wait.
 	writeFile(t, dir, "index.js", `
-export async function a(event) {
+export async function a(event, context) {
   console.log("START a");
   await new Promise(r => setTimeout(r, event.blockMs));
   console.log("END a");
 }
-export async function b(event) {
+export async function b(event, context) {
   console.log("START b");
   await new Promise(r => setTimeout(r, event.blockMs));
   console.log("END b");
 }
-export async function c(event) {
+export async function c(event, context) {
   console.log("START c");
 }
 `)
@@ -404,7 +404,7 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", `
-export async function run(event) {
+export async function run(event, context) {
   await new Promise(r => setTimeout(r, 150));
 }
 `)
@@ -457,7 +457,7 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	writeFile(t, dir, "index.js", "export function run(e){ console.log('ok'); }\n")
+	writeFile(t, dir, "index.js", "export function run(e, context){ console.log('ok'); }\n")
 	fn := app.App{Name: "invalidate-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -514,7 +514,7 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	writeFile(t, dir, "index.js", "export function run(e){ console.log('ok'); }\n")
+	writeFile(t, dir, "index.js", "export function run(e, context){ console.log('ok'); }\n")
 	fn := app.App{Name: "idle-evict-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -577,7 +577,7 @@ events:
 	// v1 blocks (printing START/END v1 around a delay) so the test can hold an
 	// old-image invocation in flight while v2 is prepared and executed.
 	writeFile(t, dir, "index.js", `
-export async function run(event) {
+export async function run(event, context) {
   console.log("START v1");
   await new Promise(r => setTimeout(r, event.blockMs));
   console.log("END v1");
@@ -600,7 +600,7 @@ export async function run(event) {
 	}
 
 	// Change source -> v2 image while v1 is busy.
-	writeFile(t, dir, "index.js", "export function run(e){ console.log('v2'); }\n")
+	writeFile(t, dir, "index.js", "export function run(e, context){ console.log('v2'); }\n")
 	p2, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare v2: %v", err)
@@ -654,7 +654,7 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	writeFile(t, dir, "index.js", "export function run(e){ console.log('ok'); }\n")
+	writeFile(t, dir, "index.js", "export function run(e, context){ console.log('ok'); }\n")
 	fn := app.App{Name: "remove-fn-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -716,8 +716,8 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", `
-export async function ok(event) { console.log("ok"); }
-export async function slow(event) {
+export async function ok(event, context) { console.log("ok"); }
+export async function slow(event, context) {
   await new Promise(r => setTimeout(r, 10000));
 }
 `)
@@ -809,7 +809,7 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", `
-export async function sleep(event) {
+export async function sleep(event, context) {
   // Long enough that the busy==2 poll below observes both leases before either
   // handler releases; the poll interval is 25ms, so 1500ms is a wide margin.
   await new Promise(r => setTimeout(r, 1500));
@@ -882,7 +882,7 @@ func TestIntegrationPrepareResizesLivePool(t *testing.T) {
 	defer cancel()
 
 	dir := t.TempDir()
-	writeFile(t, dir, "index.js", "export function run(e){ console.log('ok'); }\n")
+	writeFile(t, dir, "index.js", "export function run(e, context){ console.log('ok'); }\n")
 	writeFile(t, dir, "template.yaml", `
 runtime: nodejs24.x
 concurrency: 1
@@ -963,7 +963,7 @@ func TestIntegrationPrepareClipsConcurrencyToGlobal(t *testing.T) {
 	defer cancel()
 
 	dir := t.TempDir()
-	writeFile(t, dir, "index.js", "export function run(e){ console.log('ok'); }\n")
+	writeFile(t, dir, "index.js", "export function run(e, context){ console.log('ok'); }\n")
 	writeFile(t, dir, "template.yaml", `
 runtime: nodejs24.x
 concurrency: 15
@@ -1041,7 +1041,7 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", `
-export function ok(event) {
+export function ok(event, context) {
   console.log("ok " + event.event_id);
 }
 `)
@@ -1196,7 +1196,7 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", `
-export async function slow(event) {
+export async function slow(event, context) {
   await new Promise(r => setTimeout(r, 1500));
   console.log("completed " + event.event_id);
 }
@@ -1308,11 +1308,11 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", `
-export function fail(event) {
+export function fail(event, context) {
   console.error("boom");
   throw new Error("kaboom");
 }
-export function ok(event) {
+export function ok(event, context) {
   console.log("recovered " + event.n);
 }
 `)
@@ -1381,13 +1381,13 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", `
-export async function sleeper(event) {
+export async function sleeper(event, context) {
   // 5s is ample for the 1s invocation timeout to fire and kill the container;
   // the handler never needs to reach its end.
   await new Promise(r => setTimeout(r, 5000));
   console.log("done");
 }
-export function quick(event) {
+export function quick(event, context) {
   console.log("quick done");
 }
 `)
@@ -1450,7 +1450,7 @@ events:
 import os
 import tempfile
 
-def check(event):
+def check(event, context):
     # Non-root: the runtime user is uid 10001.
     if os.geteuid() != 10001:
         raise SystemExit("expected euid 10001, got %d" % os.geteuid())
@@ -1508,7 +1508,7 @@ import { writeFileSync, readFileSync, unlinkSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-export function check(event) {
+export function check(event, context) {
   // Non-root: the runtime user is uid 10001.
   if (process.getuid() !== 10001) {
     throw new Error("expected uid 10001, got " + process.getuid());

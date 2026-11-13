@@ -21,7 +21,7 @@ import (
 // a successful Execute proves the dependency was installed into
 // /app/node_modules by pnpm and resolves at runtime.
 const pnpmDependencyHandler = `import colors from "picocolors";
-export function run(event) {
+export function run(event, context) {
   console.log(colors.red("pnpm dep " + event.event_id));
 }
 `
@@ -72,7 +72,7 @@ events:
     pattern:
       status: [COMPLETED]
 `)
-	writeFile(t, dir, "handler.js", "export function run(event) { console.log('ok'); }\n")
+	writeFile(t, dir, "handler.js", "export function run(event, context) { console.log('ok'); }\n")
 	fn := app.App{Name: appName, Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 
 	m, _ := newManager(t)

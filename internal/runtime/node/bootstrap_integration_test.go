@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -279,6 +280,22 @@ type reqFrame struct {
 	Event   json.RawMessage   `json:"event"`
 	Env     map[string]string `json:"env"`
 	Trace   map[string]string `json:"trace,omitempty"`
+	Context any               `json:"context,omitempty"`
+}
+
+// defaultHandlerContext returns a complete per-request context frame in the
+// protocol's camelCase shape, with a live future deadline, so an invocation
+// test that does not care about the context still runs the production
+// handler(event, context) path.
+func defaultHandlerContext(handler string) map[string]any {
+	return map[string]any{
+		"requestId":   "test-request",
+		"attempt":     1,
+		"maxAttempts": 3,
+		"deadline":    time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
+		"app":         "testapp",
+		"handler":     handler,
+	}
 }
 
 type respFrame struct {
@@ -293,16 +310,24 @@ func quote(s string) string {
 }
 
 // invoke writes one request frame and reads stdout until a sentinel protocol
-// response line arrives.
+// response line arrives. The frame carries a default handler context so the
+// invocation exercises the production two-argument call.
 func (p *nodeProc) invoke(t *testing.T, handler string, event string, env map[string]string) invokeResult {
 	return p.invokeTrace(t, handler, event, env, nil)
 }
 
 func (p *nodeProc) invokeTrace(t *testing.T, handler string, event string, env, trace map[string]string) invokeResult {
 	t.Helper()
+	return p.invokeFrame(t, handler, event, env, trace, defaultHandlerContext(handler))
+}
+
+// invokeFrame is invokeTrace with an explicit "context" frame object; a nil
+// ctxFrame omits the field entirely.
+func (p *nodeProc) invokeFrame(t *testing.T, handler string, event string, env, trace map[string]string, ctxFrame any) invokeResult {
+	t.Helper()
 	id := fmt.Sprintf("t%d", p.seq)
 	p.seq++
-	frame, err := json.Marshal(reqFrame{ID: id, Handler: handler, Event: json.RawMessage(event), Env: env, Trace: trace})
+	frame, err := json.Marshal(reqFrame{ID: id, Handler: handler, Event: json.RawMessage(event), Env: env, Trace: trace, Context: ctxFrame})
 	if err != nil {
 		t.Fatalf("build request frame: %v", err)
 	}
@@ -357,12 +382,12 @@ func TestNodeRuntimeTwoInvocationsAndModuleState(t *testing.T) {
 	writeModule(t, root, "index.mjs", `
 const counter = { n: 0 };
 
-export function count() {
+export function count(event, context) {
   counter.n += 1;
   console.log("count=" + counter.n);
 }
 
-export function send(event) {
+export function send(event, context) {
   console.log("send " + event.msg);
 }
 `)
@@ -391,7 +416,7 @@ func TestNodeRuntimeNestedModule(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
 	writeModule(t, root, "src/email.mjs", `
-export function send(event) {
+export function send(event, context) {
   console.log("send " + event.msg);
 }
 `)
@@ -416,7 +441,7 @@ func TestNodeRuntimeSourceMountResolvesFromMountedRootAndDeps(t *testing.T) {
 	root := appRoot(t)
 	writeMountedModule(t, root, "index.mjs", `
 import { context } from "@opentelemetry/api";
-export function show(event) {
+export function show(event, context) {
   console.log("mounted " + event.msg + " " + (context.active().parent ?? "root"));
 }
 `)
@@ -464,7 +489,7 @@ func TestNodeRuntimeSourceMountResolveHookPrefersDependencyImage(t *testing.T) {
 import { marker } from "shadowpkg";
 import { where } from "./local.mjs";
 import { context } from "@opentelemetry/api";
-export function show(event) {
+export function show(event, context) {
   console.log("pkg=" + marker + " local=" + where + " otel=" + (typeof context.active === "function"));
 }
 `)
@@ -509,7 +534,7 @@ func TestNodeRuntimeSourceMountResolveHookHonorsImportConditions(t *testing.T) {
 	}
 	writeMountedModule(t, root, "index.mjs", `
 import { kind } from "condpkg";
-export function show(event) { console.log("kind=" + kind); }
+export function show(event, context) { console.log("kind=" + kind); }
 `)
 	p := startNodeMounted(t, root)
 	r := p.invoke(t, "index.show", `{}`, nil)
@@ -527,7 +552,7 @@ export function show(event) { console.log("kind=" + kind); }
 func TestNodeRuntimeSourceMountDoesNotSeeBakedRoot(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
-	writeModule(t, root, "only-baked.mjs", `export function f(event) {}`)
+	writeModule(t, root, "only-baked.mjs", `export function f(event, context) {}`)
 	p := startNodeMounted(t, root)
 	r := p.invoke(t, "only-baked.f", `{}`, nil)
 	if r.OK {
@@ -548,7 +573,7 @@ func TestNodeRuntimeSourceMountSharesOtelSingleton(t *testing.T) {
 	root := appRoot(t)
 	writeMountedModule(t, root, "index.mjs", `
 import { context } from "@opentelemetry/api";
-export function inspect(event) {
+export function inspect(event, context) {
   console.log("trace=" + (context.active().parent ?? "root"));
 }
 `)
@@ -638,7 +663,7 @@ func TestNodeRuntimeSourceMountCommonJSRequirePrefersDependencyImage(t *testing.
 	writeMountedModule(t, root, "index.js", `
 const { marker } = require("shadowpkg");
 const local = require("./local.cjs");
-exports.handler = function (event) {
+exports.handler = function (event, context) {
   console.log("cjs=" + marker + " local=" + local.where);
 };
 `)
@@ -670,7 +695,7 @@ func TestNodeRuntimeSourceMountCommonJSRequireNestedPrefersDependencyImage(t *te
 	writeMountedCJSPackage(t, root)
 	writeMountedModule(t, root, "sub/index.js", `
 const { marker } = require("shadowpkg");
-exports.handler = function (event) { console.log("nested=" + marker); };
+exports.handler = function (event, context) { console.log("nested=" + marker); };
 `)
 	p := startNodeMounted(t, root)
 	r := p.invoke(t, "sub.index.handler", `{}`, nil)
@@ -696,11 +721,11 @@ func TestNodeRuntimeSourceMountCommonJSRequireLateHostNodeModulesDoesNotShadow(t
 	writeMountedCJSPackage(t, root)
 	writeMountedModule(t, root, "index.js", `
 const { marker } = require("shadowpkg");
-exports.handler = function (event) { console.log("late=" + marker); };
+exports.handler = function (event, context) { console.log("late=" + marker); };
 `)
 	writeMountedModule(t, root, "sub/index.js", `
 const { marker } = require("shadowpkg");
-exports.handler = function (event) { console.log("late-nested=" + marker); };
+exports.handler = function (event, context) { console.log("late-nested=" + marker); };
 `)
 	p := startNodeMounted(t, root)
 
@@ -738,7 +763,7 @@ func TestNodeRuntimeSourceMountCommonJSRequireKeepsRelativeAbsoluteAndBuiltinNat
 const fs = require("fs");
 const local = require("./local.cjs");
 const abs = require(process.argv[process.argv.length - 1]);
-exports.handler = function (event) {
+exports.handler = function (event, context) {
   console.log("fs=" + (typeof fs.readFileSync) + " local=" + local.where + " abs=" + abs.where);
 };
 `)
@@ -776,11 +801,11 @@ func TestNodeRuntimeSourceMountPackageImportsStayNative(t *testing.T) {
 	writeMountedModule(t, root, "util.mjs", `export const where = "MOUNT_UTIL";`)
 	writeMountedModule(t, root, "cjs.js", `
 const util = require("#util");
-exports.handler = function (event) { console.log("cjs-imports=" + util.where); };
+exports.handler = function (event, context) { console.log("cjs-imports=" + util.where); };
 `)
 	writeMountedModule(t, root, "esm.mjs", `
 import { where } from "#util";
-export function handler(event) { console.log("esm-imports=" + where); }
+export function handler(event, context) { console.log("esm-imports=" + where); }
 `)
 	p := startNodeMounted(t, root)
 	r1 := p.invoke(t, "cjs.handler", `{}`, nil)
@@ -816,11 +841,11 @@ func TestNodeRuntimeSourceMountConditionsDifferForRequireAndImport(t *testing.T)
 	writeMountedCJSPackage(t, root)
 	writeMountedModule(t, root, "cjs.js", `
 const { kind } = require("condpkg");
-exports.handler = function (event) { console.log("require-kind=" + kind); };
+exports.handler = function (event, context) { console.log("require-kind=" + kind); };
 `)
 	writeMountedModule(t, root, "esm.mjs", `
 import { kind } from "condpkg";
-export function handler(event) { console.log("import-kind=" + kind); }
+export function handler(event, context) { console.log("import-kind=" + kind); }
 `)
 	p := startNodeMounted(t, root)
 	r1 := p.invoke(t, "cjs.handler", `{}`, nil)
@@ -877,7 +902,7 @@ func TestNodeRuntimeSourceMountTranspilesTSWithMountedTsconfigToTmp(t *testing.T
 	writeMountedModule(t, root, "tsconfig.json",
 		`{"compilerOptions":{"strict":true,"paths":{"@app/*":["./*"]}}}`)
 	writeMountedModule(t, root, "index.ts", `
-export function handler(event: { msg: string }): void {
+export function handler(event: { msg: string }, context: unknown): void {
   console.log("source-ts " + event.msg);
 }
 `)
@@ -894,7 +919,7 @@ export function handler(event: { msg: string }): void {
 		"  case \"$a\" in --outfile=*) OUT=\"${a#--outfile=}\" ;; esac\n" +
 		"done\n" +
 		"mkdir -p \"$(dirname \"$OUT\")\"\n" +
-		"printf '%s\\n' 'export function handler(event) { console.log(\"fake-ts-ok \" + event.msg); }' > \"$OUT\"\n" +
+		"printf '%s\\n' 'export function handler(event, context) { console.log(\"fake-ts-ok \" + event.msg); }' > \"$OUT\"\n" +
 		"exit 0\n"
 	if err := os.WriteFile(filepath.Join(root, "esbuild"), []byte(esbuild), 0o755); err != nil {
 		t.Fatalf("write fake esbuild: %v", err)
@@ -997,7 +1022,7 @@ func TestNodeRuntimeSourceMountESMSelfReferenceUsesMountedExports(t *testing.T) 
 	writeMountedModule(t, root, "index.mjs", `
 import { where } from "@scope/app/lib/util";
 import { marker } from "shadowpkg";
-export function show(event) {
+export function show(event, context) {
   console.log("self=" + where + " pkg=" + marker);
 }
 `)
@@ -1033,7 +1058,7 @@ func TestNodeRuntimeSourceMountSelfReferenceWithoutExportsAnchorsToDependency(t 
 	writeMountedModule(t, root, "package.json", `{"name":"@scope/noexp","type":"module"}`)
 	writeMountedModule(t, root, "index.mjs", `
 import { marker } from "@scope/noexp";
-export function show(event) { console.log("noexp=" + marker); }
+export function show(event, context) { console.log("noexp=" + marker); }
 `)
 	p := startNodeMounted(t, root)
 	r := p.invoke(t, "index.show", `{}`, nil)
@@ -1062,7 +1087,7 @@ func TestNodeRuntimeSourceMountCommonJSSelfReferenceUsesMountedExports(t *testin
 	writeMountedModule(t, root, "lib/impl/real.cjs", `module.exports = { where: "CJS-REAL" };`)
 	writeMountedModule(t, root, "index.js", `
 const { where } = require("@scope/appc/lib/util");
-exports.handler = function (event) { console.log("cjs=" + where); };
+exports.handler = function (event, context) { console.log("cjs=" + where); };
 `)
 	p := startNodeMounted(t, root)
 	r := p.invoke(t, "index.handler", `{}`, nil)
@@ -1093,12 +1118,12 @@ func TestNodeRuntimeSourceMountGeneratedTSSelfReferenceUsesMountedExports(t *tes
 	writeMountedModule(t, root, "lib/impl/real-util.js", `export const where = "TS-REAL";`)
 	writeMountedModule(t, root, "index.ts", `
 import { where } from "@scope/appts/lib/util";
-export function handler(event: { msg: string }): void { console.log("gen=" + where); }
+export function handler(event: { msg: string }, context: unknown): void { console.log("gen=" + where); }
 `)
 	logPath := filepath.Join(root, "esbuild-args.txt")
 	writeBodyEsbuild(t, root, logPath,
 		"import { where } from \"@scope/appts/lib/util\";\n"+
-			"export function handler(event) { console.log(\"gen=\" + where); }\n")
+			"export function handler(event, context) { console.log(\"gen=\" + where); }\n")
 
 	p := startNodeMounted(t, root)
 	r := p.invoke(t, "index.handler", `{"msg":"live"}`, nil)
@@ -1144,12 +1169,12 @@ func TestNodeRuntimeSourceMountGeneratedBareDependencyAnchorsToDependency(t *tes
 	writeMountedModule(t, root, "package.json", `{"type":"module"}`)
 	writeMountedModule(t, root, "index.ts", `
 import { marker } from "shadowpkg";
-export function handler(event: { msg: string }): void { console.log("gendep=" + marker); }
+export function handler(event: { msg: string }, context: unknown): void { console.log("gendep=" + marker); }
 `)
 	logPath := filepath.Join(root, "esbuild-args.txt")
 	writeBodyEsbuild(t, root, logPath,
 		"import { marker } from \"shadowpkg\";\n"+
-			"export function handler(event) { console.log(\"gendep=\" + marker); }\n")
+			"export function handler(event, context) { console.log(\"gendep=\" + marker); }\n")
 
 	p := startNodeMounted(t, root)
 	r := p.invoke(t, "index.handler", `{"msg":"live"}`, nil)
@@ -1202,7 +1227,7 @@ func TestNodeRuntimeAsyncHandler(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
 	writeModule(t, root, "index.mjs", `
-export async function async_handler(event) {
+export async function async_handler(event, context) {
   await new Promise((r) => setTimeout(r, 0));
   console.log("async " + event.msg);
 }
@@ -1222,7 +1247,7 @@ func TestNodeRuntimeTraceContextIsolatedAcrossInvocations(t *testing.T) {
 	root := appRoot(t)
 	writeModule(t, root, "index.mjs", `
 import { context } from "@opentelemetry/api";
-export async function inspect(event) {
+export async function inspect(event, context) {
   await new Promise((resolve) => setTimeout(resolve, 0));
   console.log("trace=" + (context.active().parent ?? "root"));
   if (event.fail) throw new Error("trace failure");
@@ -1254,12 +1279,12 @@ func TestNodeRuntimeHandlerErrorKeepsProcessAlive(t *testing.T) {
 	writeModule(t, root, "index.mjs", `
 const counter = { n: 0 };
 
-export function count() {
+export function count(event, context) {
   counter.n += 1;
   console.log("count=" + counter.n);
 }
 
-export function boom() {
+export function boom(event, context) {
   throw new Error("kaboom");
 }
 `)
@@ -1307,7 +1332,7 @@ func TestNodeRuntimeBrokenImport(t *testing.T) {
 	root := appRoot(t)
 	writeModule(t, root, "index.mjs", `
 import "missing-package";
-export function f(event) {}
+export function f(event, context) {}
 `)
 	p := startNode(t, root)
 	r := p.invoke(t, "index.f", `{}`, nil)
@@ -1330,7 +1355,7 @@ func TestNodeRuntimeEnvRotation(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
 	writeModule(t, root, "index.mjs", `
-export function env() {
+export function env(event, context) {
   console.log("VAR=" + (process.env.VAR ?? ""));
 }
 `)
@@ -1355,7 +1380,7 @@ func TestNodeRuntimeEnvAppliedExactlyAcrossInvocations(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
 	writeModule(t, root, "index.mjs", `
-export function show() {
+export function show(event, context) {
   const e = process.env;
   console.log("FOO=" + (e.FOO ?? "<unset>"));
   console.log("BAR=" + (e.BAR ?? "<unset>"));
@@ -1411,10 +1436,10 @@ func TestNodeRuntimeEnvCleanupAfterHandlerFailure(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
 	writeModule(t, root, "index.mjs", `
-export function boom() {
+export function boom(event, context) {
   throw new Error("kaboom");
 }
-export function show() {
+export function show(event, context) {
   console.log("TOKEN=" + (process.env.TOKEN ?? "<unset>"));
 }
 `)
@@ -1440,7 +1465,7 @@ func TestNodeRuntimeNoEnvValueLeaks(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
 	writeModule(t, root, "index.mjs", `
-export function leak() {
+export function leak(event, context) {
   console.log("value=" + (process.env.SUPER_SECRET ?? ""));
   throw new Error("handler failed");
 }
@@ -1466,7 +1491,7 @@ export function leak() {
 func TestNodeRuntimeEOFExitsZero(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
-	writeModule(t, root, "index.mjs", `export function f(event) {}`)
+	writeModule(t, root, "index.mjs", `export function f(event, context) {}`)
 	p := startNode(t, root)
 	r := p.invoke(t, "index.f", `{}`, nil)
 	if !r.OK {
@@ -1484,7 +1509,7 @@ func TestNodeRuntimeEOFExitsZero(t *testing.T) {
 func TestNodeRuntimeMalformedFrameIsFatal(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
-	writeModule(t, root, "index.mjs", `export function f(event) {}`)
+	writeModule(t, root, "index.mjs", `export function f(event, context) {}`)
 	if err := os.WriteFile(filepath.Join(root, "relay", "bootstrap.mjs"), []byte(bootstrapFor(root)), 0o644); err != nil {
 		t.Fatalf("write bootstrap: %v", err)
 	}
@@ -1501,7 +1526,7 @@ func TestNodeRuntimeMalformedFrameIsFatal(t *testing.T) {
 func TestNodeRuntimeFrameShape(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
-	writeModule(t, root, "index.mjs", `export function f(event) {}`)
+	writeModule(t, root, "index.mjs", `export function f(event, context) {}`)
 	p := startNode(t, root)
 	r := p.invoke(t, "index.f", `{}`, nil)
 	if !r.OK {
@@ -1532,12 +1557,12 @@ func TestNodeRuntimeErrorFrameBound(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
 	writeModule(t, root, "index.mjs", `
-export function short() { throw new Error("short ascii"); }
-export function long() { throw new Error("x".repeat(20000)); }
-export function multi() { throw new Error("é".repeat(20000)); }
-export function emoji() { throw new Error("😀".repeat(8000)); }
-export function accented() { throw new Error("àéîõü".repeat(5000)); }
-export function control() { throw new Error("\t\n\u0000\u0007".repeat(5000)); }
+export function short(event, context) { throw new Error("short ascii"); }
+export function long(event, context) { throw new Error("x".repeat(20000)); }
+export function multi(event, context) { throw new Error("é".repeat(20000)); }
+export function emoji(event, context) { throw new Error("😀".repeat(8000)); }
+export function accented(event, context) { throw new Error("àéîõü".repeat(5000)); }
+export function control(event, context) { throw new Error("\t\n\u0000\u0007".repeat(5000)); }
 `)
 	p := startNode(t, root)
 
@@ -1583,5 +1608,231 @@ export function control() { throw new Error("\t\n\u0000\u0007".repeat(5000)); }
 				t.Fatal("expected the short handler to also fail")
 			}
 		})
+	}
+}
+
+// TestNodeRuntimeHandlerContextValues verifies the handler's second argument
+// carries the frame's execution identity as camelCase fields: the stable
+// request ID, the confirmed attempt and configured budget, the ISO-8601
+// deadline passed through verbatim, the optional message and trace IDs, and
+// the app/handler. The event payload stays verbatim and the handler is always
+// called with exactly two arguments.
+func TestNodeRuntimeHandlerContextValues(t *testing.T) {
+	requireNode(t)
+	root := appRoot(t)
+	writeModule(t, root, "index.mjs", `
+export function show(event, context) {
+  console.log("event=" + event.msg);
+  console.log("requestId=" + context.requestId);
+  console.log("attempt=" + context.attempt);
+  console.log("maxAttempts=" + context.maxAttempts);
+  console.log("deadline=" + context.deadline);
+  console.log("messageId=" + context.messageId);
+  console.log("traceId=" + context.traceId);
+  console.log("app=" + context.app);
+  console.log("handler=" + context.handler);
+  console.log("argc=" + arguments.length);
+}
+`)
+	p := startNode(t, root)
+
+	r := p.invokeFrame(t, "index.show", `{"msg":"hi"}`, nil, nil, map[string]any{
+		"requestId":   "event:m-7:app/index.show",
+		"attempt":     2,
+		"maxAttempts": 4,
+		"deadline":    "2031-04-05T06:07:08.123456789Z",
+		"messageId":   "m-7",
+		"traceId":     "4bf92f3577b34da6a3ce929d0e0e4736",
+		"app":         "app",
+		"handler":     "index.show",
+	})
+	if !r.OK {
+		t.Fatalf("invoke failed: %s", r.Err)
+	}
+	for _, want := range []string{
+		"event=hi",
+		"requestId=event:m-7:app/index.show",
+		"attempt=2",
+		"maxAttempts=4",
+		"deadline=2031-04-05T06:07:08.123456789Z",
+		"messageId=m-7",
+		"traceId=4bf92f3577b34da6a3ce929d0e0e4736",
+		"app=app",
+		"handler=index.show",
+		"argc=2",
+	} {
+		if !strings.Contains(r.Out, want) {
+			t.Errorf("out = %q, want it to contain %q", r.Out, want)
+		}
+	}
+}
+
+func TestNodeRuntimeHandlerContextRequired(t *testing.T) {
+	requireNode(t)
+	root := appRoot(t)
+	writeModule(t, root, "index.mjs", `
+export function shouldNotRun(event, context) {
+  console.log("handler-ran");
+}
+`)
+	p := startNode(t, root)
+
+	for _, tc := range []struct {
+		name    string
+		context any
+	}{
+		{name: "missing"},
+		{name: "null", context: json.RawMessage("null")},
+		{name: "string", context: "invalid"},
+		{name: "array", context: []any{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := p.invokeFrame(t, "index.shouldNotRun", `{}`, nil, nil, tc.context)
+			if r.OK {
+				t.Fatal("invocation succeeded without an object context")
+			}
+			if !strings.Contains(r.Err, "request context") {
+				t.Errorf("error = %q, want a clear request-context error", r.Err)
+			}
+			if strings.Contains(r.Out, "handler-ran") {
+				t.Errorf("handler ran despite invalid context: %q", r.Out)
+			}
+		})
+	}
+}
+
+// TestNodeRuntimeHandlerContextOptionalMetadataAbsent verifies the optional
+// broker and trace identities stay undefined when the frame omits them (a
+// state-free execution): they are optional, never fabricated by the bootstrap.
+func TestNodeRuntimeHandlerContextOptionalMetadataAbsent(t *testing.T) {
+	requireNode(t)
+	root := appRoot(t)
+	writeModule(t, root, "index.mjs", `
+export function opt(event, context) {
+  console.log("messageId=" + context.messageId);
+  console.log("traceId=" + context.traceId);
+}
+`)
+	p := startNode(t, root)
+
+	r := p.invokeFrame(t, "index.opt", `{}`, nil, nil, map[string]any{
+		"requestId":   "manual-1",
+		"attempt":     1,
+		"maxAttempts": 1,
+		"deadline":    "2031-01-01T00:00:00Z",
+		"app":         "fn",
+		"handler":     "index.opt",
+	})
+	if !r.OK {
+		t.Fatalf("invoke failed: %s", r.Err)
+	}
+	if !strings.Contains(r.Out, "messageId=undefined") {
+		t.Errorf("out = %q, want messageId=undefined when the frame omits messageId", r.Out)
+	}
+	if !strings.Contains(r.Out, "traceId=undefined") {
+		t.Errorf("out = %q, want traceId=undefined when the frame omits traceId", r.Out)
+	}
+}
+
+// TestNodeRuntimeHandlerContextRemainingTime verifies getRemainingTimeMs()
+// against a future deadline (positive and bounded by the configured span), an
+// expired deadline (clamped to zero), and the zero instant the protocol emits
+// for a context with no deadline (also zero, never negative).
+func TestNodeRuntimeHandlerContextRemainingTime(t *testing.T) {
+	requireNode(t)
+	root := appRoot(t)
+	writeModule(t, root, "index.mjs", `
+export function remain(event, context) {
+  console.log("ms=" + context.getRemainingTimeMs());
+}
+`)
+	p := startNode(t, root)
+
+	ctxFor := func(deadline string) map[string]any {
+		return map[string]any{
+			"requestId":   "req-1",
+			"attempt":     1,
+			"maxAttempts": 1,
+			"deadline":    deadline,
+			"app":         "fn",
+			"handler":     "index.remain",
+		}
+	}
+	remaining := func(t *testing.T, deadline string) int {
+		t.Helper()
+		r := p.invokeFrame(t, "index.remain", `{}`, nil, nil, ctxFor(deadline))
+		if !r.OK {
+			t.Fatalf("invoke with deadline %q failed: %s", deadline, r.Err)
+		}
+		msText, ok := strings.CutPrefix(strings.TrimSpace(r.Out), "ms=")
+		if !ok {
+			t.Fatalf("out = %q, want ms=<int>", r.Out)
+		}
+		ms, err := strconv.Atoi(msText)
+		if err != nil {
+			t.Fatalf("remaining %q is not an integer: %v", msText, err)
+		}
+		return ms
+	}
+
+	futureDeadline := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	future := remaining(t, futureDeadline)
+	if future <= 3_590_000 || future > 3_600_000 {
+		t.Errorf("remaining for a +1h deadline = %d ms, want within (3590000, 3600000]", future)
+	}
+	if got := remaining(t, "2000-01-01T00:00:00Z"); got != 0 {
+		t.Errorf("remaining for an expired deadline = %d, want 0 (clamped)", got)
+	}
+	if got := remaining(t, "0001-01-01T00:00:00Z"); got != 0 {
+		t.Errorf("remaining for the zero instant = %d, want 0 (clamped)", got)
+	}
+}
+
+// TestNodeRuntimeHandlerContextFreshPerInvocation proves the warm, reused
+// process builds a fresh context per request: each invocation sees its own
+// frame's request ID (no leakage from the previous one) and a distinct object
+// identity even though the module state persists.
+func TestNodeRuntimeHandlerContextFreshPerInvocation(t *testing.T) {
+	requireNode(t)
+	root := appRoot(t)
+	writeModule(t, root, "index.mjs", `
+let prev = null;
+
+export function remember(event, context) {
+  console.log("fresh=" + (context !== prev));
+  console.log("requestId=" + context.requestId);
+  prev = context;
+}
+`)
+	p := startNode(t, root)
+
+	ctxFor := func(requestID string) map[string]any {
+		return map[string]any{
+			"requestId":   requestID,
+			"attempt":     1,
+			"maxAttempts": 3,
+			"deadline":    "2031-01-01T00:00:00Z",
+			"app":         "fn",
+			"handler":     "index.remember",
+		}
+	}
+	r1 := p.invokeFrame(t, "index.remember", `{}`, nil, nil, ctxFor("event:m-a:fn/remember"))
+	if !r1.OK {
+		t.Fatalf("first invoke failed: %s", r1.Err)
+	}
+	r2 := p.invokeFrame(t, "index.remember", `{}`, nil, nil, ctxFor("event:m-b:fn/remember"))
+	if !r2.OK {
+		t.Fatalf("second invoke failed: %s", r2.Err)
+	}
+	for i, r := range []invokeResult{r1, r2} {
+		if !strings.Contains(r.Out, "fresh=true") {
+			t.Errorf("invoke %d out = %q, want fresh=true (a new context object per invocation)", i+1, r.Out)
+		}
+	}
+	if !strings.Contains(r1.Out, "requestId=event:m-a:fn/remember") {
+		t.Errorf("first out = %q, want its own request ID", r1.Out)
+	}
+	if !strings.Contains(r2.Out, "requestId=event:m-b:fn/remember") {
+		t.Errorf("second out = %q, want its own request ID (no leakage from the first)", r2.Out)
 	}
 }
