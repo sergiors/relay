@@ -93,7 +93,7 @@ CI DSN), Redis (`REDIS_TEST_ADDR`, default `localhost:6379`), and Docker (client
 uses `FromEnv`), plus Node 24, Python 3.14, and Git on the runner.
 
 For behavior and detailed contracts, consult `README.md`, `docs/*.md`, relevant
-`internal/*/doc.go` files, `Makefile`, and `.github/workflows/tests.yml`. In
+`internal/*/doc.go` files, `Makefile`, and `.github/workflows/ci.yaml`. In
 particular, see the `app`, `source`, `event`, `runner`, `stream`, `schedule`,
 `cron`, `runtime`, `reconciler`, and `state` package docs rather than duplicating
 their implementation details here.
