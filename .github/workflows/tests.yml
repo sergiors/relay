@@ -9,6 +9,68 @@ permissions:
   contents: read
 
 jobs:
+  python-public-types:
+    name: Python library checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.26"
+
+      - name: Sync
+        working-directory: packages/python
+        run: uv sync --locked
+
+      - name: Type check
+        working-directory: packages/python
+        run: uv run mypy
+
+      - name: Build
+        working-directory: packages/python
+        run: uv build
+
+      - name: Test
+        working-directory: packages/python
+        run: uv run pytest
+
+  node-public-types:
+    name: Node.js package checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Set up pnpm
+        run: npm install --global pnpm@12.15.0
+
+      - name: Install
+        working-directory: packages/node
+        run: pnpm install --frozen-lockfile
+
+      - name: Test package
+        working-directory: packages/node
+        run: pnpm test
+
+      - name: Verify package contents
+        working-directory: packages/node
+        run: pnpm pack --dry-run
+
   unit:
     name: Unit tests
     runs-on: ubuntu-latest

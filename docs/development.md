@@ -44,8 +44,18 @@ and `make test-race` runs both suites with the race detector. Formatting uses
 
 Unit tests require only Go. Integration tests require PostgreSQL
 (`TEST_DATABASE_URL`, defaulting to the CI DSN), Redis (`REDIS_TEST_ADDR`,
-defaulting to `localhost:6379`), Docker, Node 24, Python 3.14, and Git. The
+defaulting to `localhost:6379`), Docker, Node 24+, Python 3.14+, and Git. The
 integration suite fails if a required dependency is unavailable.
+
+The public handler libraries are independently managed and have no monorepo
+workspace. They are optional for Relay's execution, but should be normal
+application dependencies when handlers import their public interfaces.
+
+- [Python library](../packages/python): run `uv sync --locked`, `uv run mypy`,
+  `uv build`, and `uv run pytest`.
+- [Node.js library](../packages/node): run `pnpm install --frozen-lockfile`,
+  `pnpm test`, and `pnpm pack --dry-run` to validate the declarations,
+  TypeScript/JSDoc examples, and publishable package.
 
 See the repository's [`AGENTS.md`](../AGENTS.md) for additional development
 conventions and focused test guidance.

@@ -1,0 +1,43 @@
+{
+  "name": "@sergiors/relay-runtime",
+  "version": "0.1.0",
+  "description": "Official Node.js library and public handler interfaces for Relay applications",
+  "keywords": ["relay", "nodejs", "application-development", "handlers"],
+  "license": "GPL-3.0-or-later",
+  "engines": {
+    "node": ">=24"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sergiors/relay.git",
+    "directory": "packages/node"
+  },
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "examples",
+    "README.md",
+    "LICENSE.md"
+  ],
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "typecheck:jsdoc": "tsc --project tsconfig.jsdoc.json",
+    "check": "pnpm run build && pnpm run typecheck:jsdoc",
+    "test": "pnpm run check && node --test tests/",
+    "prepack": "pnpm run build"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  },
+  "packageManager": "pnpm@12.15.0",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}

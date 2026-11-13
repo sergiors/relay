@@ -186,23 +186,20 @@ with language-specific property names and types:
 Node.js and TypeScript handlers receive the event first and a fresh context object
 second: `handler(event, context)`. Its fields use the names shown above, and
 `context.getRemainingTimeMs()` returns the non-negative number of milliseconds
-until `deadline` (zero after the deadline). For TypeScript, the context can be
-typed locally without an SDK dependency:
+until `deadline` (zero after the deadline). The official Node.js library
+publishes the `HandlerContext` declaration. Install it as an application
+dependency with `pnpm add @sergiors/relay-runtime` when handlers import it;
+Relay's Node.js bootstrap constructs the actual context object. The library
+supports Node.js 24 and newer.
 
 ```ts
-interface HandlerContext {
-  requestId: string;
-  attempt: number;
-  maxAttempts: number;
-  deadline: string;
-  messageId?: string;
-  traceId?: string;
-  app: string;
-  handler: string;
-  getRemainingTimeMs(): number;
-}
+import type { HandlerContext } from "@sergiors/relay-runtime";
 
-export function handler(event: unknown, context: HandlerContext): void {
+export async function handler(
+  event: Record<string, unknown>,
+  context: HandlerContext,
+): Promise<void> {
+  void event;
   console.log(
     `request ${context.requestId} has ${context.getRemainingTimeMs()}ms left`,
   );
@@ -210,12 +207,18 @@ export function handler(event: unknown, context: HandlerContext): void {
 ```
 
 Python handlers also receive the event and context as their first and second
-arguments: `handler(event, context)`. The context carries the fields listed above;
-`context.get_remaining_time_ms()` returns the non-negative number of milliseconds
+arguments: `handler(event, context)`. The `relay-runtime` package provides the
+public `HandlerContext` interface; install it as an application dependency when
+handlers import it. The library supports Python 3.14 and newer. Relay's Python
+bootstrap constructs the actual context. Its
+`get_remaining_time_ms()` method returns the non-negative number of milliseconds
 until `deadline` (zero after the deadline):
 
 ```python
-def handler(event, context):
+from relay_runtime.typing import HandlerContext
+
+
+async def handler(event: dict, context: HandlerContext) -> None:
     print(
         f"request {context.request_id} "
         f"has {context.get_remaining_time_ms()}ms left"
