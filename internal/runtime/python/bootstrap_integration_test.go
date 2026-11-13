@@ -490,11 +490,11 @@ func TestPythonRuntimeTraceContextIsolatedAcrossInvocations(t *testing.T) {
 	dir := t.TempDir()
 	writeHandler(t, dir, "handler", `
 import asyncio
-from opentelemetry import context
+from opentelemetry import context as otel_context
 
 async def inspect(event, context):
     await asyncio.sleep(0)
-    print("trace=" + str(context.get_current()))
+    print("trace=" + str(otel_context.get_current()))
     if event.get("fail"):
         raise ValueError("trace failure")
 `)

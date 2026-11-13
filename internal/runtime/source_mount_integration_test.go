@@ -250,10 +250,10 @@ export function message(event: { event_id: string }): string {
 `)
 	writeFile(t, dir, "index.ts", `
 import colors from "picocolors";
-import { context } from "@opentelemetry/api";
+import { context as otelContext } from "@opentelemetry/api";
 import { message } from "./message";
 export function handler(event: { event_id: string }, context: unknown): void {
-  console.log(colors.red(message(event)) + " otel=" + (typeof context.active === "function"));
+  console.log(colors.red(message(event)) + " otel=" + (typeof otelContext.active === "function"));
 }
 `)
 

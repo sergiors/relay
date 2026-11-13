@@ -440,9 +440,9 @@ func TestNodeRuntimeSourceMountResolvesFromMountedRootAndDeps(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
 	writeMountedModule(t, root, "index.mjs", `
-import { context } from "@opentelemetry/api";
+import { context as otelContext } from "@opentelemetry/api";
 export function show(event, context) {
-  console.log("mounted " + event.msg + " " + (context.active().parent ?? "root"));
+  console.log("mounted " + event.msg + " " + (otelContext.active().parent ?? "root"));
 }
 `)
 	p := startNodeMounted(t, root)
@@ -488,9 +488,9 @@ func TestNodeRuntimeSourceMountResolveHookPrefersDependencyImage(t *testing.T) {
 	writeMountedModule(t, root, "index.mjs", `
 import { marker } from "shadowpkg";
 import { where } from "./local.mjs";
-import { context } from "@opentelemetry/api";
+import { context as otelContext } from "@opentelemetry/api";
 export function show(event, context) {
-  console.log("pkg=" + marker + " local=" + where + " otel=" + (typeof context.active === "function"));
+  console.log("pkg=" + marker + " local=" + where + " otel=" + (typeof otelContext.active === "function"));
 }
 `)
 	p := startNodeMounted(t, root)
@@ -572,9 +572,9 @@ func TestNodeRuntimeSourceMountSharesOtelSingleton(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
 	writeMountedModule(t, root, "index.mjs", `
-import { context } from "@opentelemetry/api";
+import { context as otelContext } from "@opentelemetry/api";
 export function inspect(event, context) {
-  console.log("trace=" + (context.active().parent ?? "root"));
+  console.log("trace=" + (otelContext.active().parent ?? "root"));
 }
 `)
 	p := startNodeMounted(t, root)
@@ -1246,10 +1246,10 @@ func TestNodeRuntimeTraceContextIsolatedAcrossInvocations(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
 	writeModule(t, root, "index.mjs", `
-import { context } from "@opentelemetry/api";
+import { context as otelContext } from "@opentelemetry/api";
 export async function inspect(event, context) {
   await new Promise((resolve) => setTimeout(resolve, 0));
-  console.log("trace=" + (context.active().parent ?? "root"));
+  console.log("trace=" + (otelContext.active().parent ?? "root"));
   if (event.fail) throw new Error("trace failure");
 }
 `)
