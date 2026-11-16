@@ -655,9 +655,9 @@ func exitEvent(info exitInfo) error {
 //
 // Cancellation must also release the synchronous request write and the long-lived
 // reader: both block on the connection, which observes no context. A cancellation
-// callback registered at the channel boundary closes the conn while this
-// invocation is unresolved; once it completes, the callback is suppressed (see
-// settle).
+// callback registered at the channel boundary claims the timeout discard and
+// closes the conn while this invocation is unresolved; once it completes, the
+// callback is suppressed (see settle).
 func (c *executionContainer) Invoke(
 	ctx context.Context,
 	handler string, eventJSON []byte,
@@ -699,16 +699,14 @@ func (c *executionContainer) Invoke(
 			len(frame), maxRequestFrame)
 	}
 
-	// Cancellation unblocker (see the method comment). The callback closes the
-	// connection FIRST so a Write blocked sending the request frame and the
-	// reader blocked in readFrame are both released promptly, then poisons the
-	// container with the timeout semantics. discard closes the conn again, which
-	// is harmless.
+	// Cancellation unblocker (see the method comment). The callback claims the
+	// timeout teardown BEFORE closing the connection, then closes it to release
+	// both a Write blocked sending the request frame and the reader blocked in
+	// readFrame, without waiting for the Docker teardown.
 	cbDone := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
 		defer close(cbDone)
-		_ = c.conn.Close()
-		c.discard("timeout")
+		c.discardCancelled()
 	})
 	// settle unregisters the cancellation callback exactly once. It reports
 	// whether cancellation won: false when the callback was suppressed (stop
@@ -864,6 +862,34 @@ func (c *executionContainer) discard(reason string) bool {
 	return c.discardContext(opCtx, reason)
 }
 
+// discardCancelled is the invocation-cancellation teardown. It CLAIMS the
+// timeout teardown before closing the connection: closing the connection wakes
+// the protocol reader, whose transport failure the monitor reports as
+// protocol_error, so a claim taken after the close could lose the discard race
+// and label a known timeout as a protocol error. The claim is authoritative for
+// the reason (see claimDiscard), and the close right after it releases the
+// blocked protocol write/read ahead of the Docker teardown.
+//
+// It admits the teardown as a NORMAL Manager operation, exactly like discard. If
+// normal admission has already closed, no Docker call is issued and the blocked
+// I/O is simply released: the container stays owned by its pool for the
+// shutdown-owned cache teardown phase.
+func (c *executionContainer) discardCancelled() {
+	opCtx, release, ok := c.ops.admitNormal(c.ops.opCtx())
+	if !ok {
+		_ = c.conn.Close()
+		return
+	}
+	defer release()
+	claimed := c.claimDiscard(reasonTimeout)
+	// Closing is safe either way: a container whose teardown is claimed (by this
+	// callback or by a genuine death path) is never reused.
+	_ = c.conn.Close()
+	if claimed {
+		c.teardown(opCtx, reasonTimeout)
+	}
+}
+
 // discardContext runs the teardown on ctx. It performs NO admission: the caller
 // owns that. A pool-initiated discard passes the Manager operation it reserved
 // BEFORE removing the container from the pool (or the cache-teardown phase's
@@ -880,12 +906,32 @@ func (c *executionContainer) discard(reason string) bool {
 // can tell a torn-down-and-gone container from one whose physical removal failed
 // and keep the latter's global warm-budget slot reserved.
 func (c *executionContainer) discardContext(ctx context.Context, reason string) bool {
+	if !c.claimDiscard(reason) {
+		return false
+	}
+	return c.teardown(ctx, reason)
+}
+
+// claimDiscard atomically claims this container's single teardown and records
+// its reason. Only the CAS winner owns the teardown (see teardown); it records
+// the reason BEFORE any connection close, so a teardown that will wake the
+// protocol reader (and thus the monitor) cannot have its reason overwritten by
+// the resulting transport failure. Race losers change nothing, keeping the
+// first cause authoritative for the pool's discard metric.
+func (c *executionContainer) claimDiscard(reason string) bool {
 	if !c.dying.CompareAndSwap(false, true) {
 		return false
 	}
 	c.reasonMu.Lock()
 	c.reason = reason
 	c.reasonMu.Unlock()
+	return true
+}
+
+// teardown performs an already-claimed teardown: kill, remove, close the
+// execution channel, publish the discard, and join the protocol reader. Only a
+// claimDiscard winner may call it.
+func (c *executionContainer) teardown(ctx context.Context, reason string) bool {
 	killContainerContext(ctx, c.cli, c.id)
 	if err := removeContainerContext(ctx, c.cli, c.id); err != nil {
 		// A genuine removal failure: the container may survive as an orphan.

@@ -660,6 +660,7 @@ events:
 	writeFile(t, dir, "index.js", `
 export async function ok(event, context) { console.log("ok"); }
 export async function slow(event, context) {
+  console.log("slow start");
   await new Promise(r => setTimeout(r, 10000));
 }
 `)
@@ -702,13 +703,28 @@ export async function slow(event, context) {
 		t.Fatalf("capacity gauge = %v, want %d", got, app.DefaultConcurrency)
 	}
 
-	// Timeout discards the container with the timeout reason.
-	if err := exec("index.slow", 1*time.Second); err == nil {
-		t.Fatal("expected the slow handler to time out")
+	// Timeout discards the container with the timeout reason. The slow handler
+	// must be observably RUNNING before the 1s deadline can fire, so the
+	// deadline provably interrupts an in-flight invocation (never the pool
+	// acquire or dispatch), and the invocation reports the context deadline —
+	// never a mislabelled protocol failure.
+	slowDone := make(chan error, 1)
+	go func() { slowDone <- exec("index.slow", 1*time.Second) }()
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "slow start")
+	timeoutErr := <-slowDone
+	if !errors.Is(timeoutErr, context.DeadlineExceeded) {
+		t.Fatalf("timeout execute = %v, want context.DeadlineExceeded", timeoutErr)
+	}
+	if !strings.HasPrefix(timeoutErr.Error(), "docker run: ") {
+		t.Fatalf("timeout execute = %q, want the one-shot wrapped form", timeoutErr)
 	}
 	if got := reg.CounterLabels(metrics.MetricRuntimeContainerDiscards,
 		[]metrics.Label{{Name: "app", Value: "pool-metrics-e2e"}, {Name: "reason", Value: "timeout"}}); got != 1 {
 		t.Fatalf("timeout discards = %d, want 1", got)
+	}
+	if got := reg.CounterLabels(metrics.MetricRuntimeContainerDiscards,
+		[]metrics.Label{{Name: "app", Value: "pool-metrics-e2e"}, {Name: "reason", Value: "protocol_error"}}); got != 0 {
+		t.Fatalf("protocol_error discards = %d, want 0 (a deadline must not be mislabelled)", got)
 	}
 	if !waitForContainerGone(ctx, m.cli, labelApp, "pool-metrics-e2e") {
 		t.Error("timed-out container should have been discarded")
@@ -1323,7 +1339,7 @@ export function quick(event, context) {
 		t.Fatalf("prepare: %v", err)
 	}
 
-	// Timeout the invocation after 1s: the handler sleeps 10s, so the ctx
+	// Timeout the invocation after 1s: the handler sleeps 5s, so the ctx
 	// timeout path must kill and discard the container.
 	timeoutMeta := RunMeta{NodeID: "test-host", App: "timeout-e2e", Handler: "index.sleeper", Image: prepared.Image}
 	invokeCtx, invokeCancel := context.WithTimeout(
@@ -1333,8 +1349,11 @@ export function quick(event, context) {
 	if err == nil {
 		t.Fatal("expected execute to fail on timeout")
 	}
-	if !strings.Contains(err.Error(), "docker run:") {
-		t.Errorf("expected the wrapped ctx error wording, got: %v", err)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("execute error = %v, want context.DeadlineExceeded", err)
+	}
+	if !strings.HasPrefix(err.Error(), "docker run: ") {
+		t.Errorf("execute error = %q, want the one-shot wrapped form", err)
 	}
 	if !waitForContainerGone(ctx, m.cli, labelApp, "timeout-e2e") {
 		t.Error("timed-out container should have been killed and removed (discarded)")

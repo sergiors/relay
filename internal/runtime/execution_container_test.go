@@ -46,6 +46,33 @@ func (o *observingConn) Write(b []byte) (int, error) {
 	return o.Conn.Write(b)
 }
 
+// gatedCloseConn wraps the client end of the pipe so a test can gate the exact
+// connection Close issued by a discard path. Close signals its entry (the
+// connection barrier), performs the REAL close — which wakes the protocol
+// reader, whose EOF is the monitor's connection-loss wakeup — and only then
+// parks until the test releases it. That freezes the discard state at the
+// moment the close begins and lets the test force a competing monitor discard
+// to fully complete before the closing discarder can proceed.
+type gatedCloseConn struct {
+	net.Conn
+	entered   chan struct{}
+	released  chan struct{}
+	watchdog  time.Duration
+	closeOnce sync.Once
+}
+
+func (g *gatedCloseConn) Close() error {
+	g.closeOnce.Do(func() { close(g.entered) })
+	err := g.Conn.Close()
+	// Bounded watchdog only: the test's release signal is the ordering
+	// mechanism, this merely prevents a leaked parked goroutine on failure.
+	select {
+	case <-g.released:
+	case <-time.After(g.watchdog):
+	}
+	return err
+}
+
 // executionContainerHarness wires a real *executionContainer to a net.Pipe
 // stand-in for its long-lived control-channel connection and a scripted Docker
 // client for the kill/remove teardown. The pipe lets a test block the
@@ -61,6 +88,17 @@ type executionContainerHarness struct {
 	reader       <-chan struct{} // c.readerDone
 	writeEntered <-chan struct{}
 	cleanup      func()
+
+	// Gated-Close barriers (set only by the gated harness): closeEntered
+	// signals when a discard path enters the connection Close; closeRelease is
+	// closed by the test to let a parked Close proceed.
+	closeEntered <-chan struct{}
+	closeRelease chan struct{}
+
+	// killSignal closes on the first scripted Docker kill, so a test can wait
+	// for a teardown's kill without polling the counter.
+	killSignal chan struct{}
+	killOnce   sync.Once
 
 	mu     sync.Mutex
 	kills  int
@@ -79,9 +117,26 @@ func newExecutionContainerHarness(t *testing.T) *executionContainerHarness {
 // accounted.
 func newExecutionContainerHarnessWithRemove(t *testing.T, removeStatus int) *executionContainerHarness {
 	t.Helper()
+	return buildExecutionContainerHarness(t, removeStatus, false)
+}
+
+// newGatedExecutionContainerHarness is newExecutionContainerHarness with the
+// connection Close gated behind the closeEntered/closeRelease barriers, for the
+// cancellation-vs-monitor discard-race regression.
+func newGatedExecutionContainerHarness(t *testing.T) *executionContainerHarness {
+	t.Helper()
+	return buildExecutionContainerHarness(t, 0, true)
+}
+
+func buildExecutionContainerHarness(t *testing.T, removeStatus int, gatedClose bool) *executionContainerHarness {
+	t.Helper()
 	clientEnd, peerEnd := net.Pipe()
 	conn := &observingConn{Conn: clientEnd, writeEntered: make(chan struct{})}
-	h := &executionContainerHarness{peer: peerEnd, writeEntered: conn.writeEntered}
+	h := &executionContainerHarness{
+		peer:         peerEnd,
+		writeEntered: conn.writeEntered,
+		killSignal:   make(chan struct{}),
+	}
 
 	rmBody := "{}"
 	if removeStatus >= 400 {
@@ -92,6 +147,7 @@ func newExecutionContainerHarnessWithRemove(t *testing.T, removeStatus int) *exe
 			h.mu.Lock()
 			h.kills++
 			h.mu.Unlock()
+			h.killOnce.Do(func() { close(h.killSignal) })
 		}},
 		dockerRoute{method: http.MethodDelete, path: "/containers/", status: removeStatus, body: rmBody, onMatch: func() {
 			h.mu.Lock()
@@ -100,13 +156,26 @@ func newExecutionContainerHarnessWithRemove(t *testing.T, removeStatus int) *exe
 		}},
 	)
 
+	var channelConn net.Conn = conn
+	if gatedClose {
+		h.closeRelease = make(chan struct{})
+		gated := &gatedCloseConn{
+			Conn:     conn,
+			entered:  make(chan struct{}),
+			released: h.closeRelease,
+			watchdog: execChannelWatchdog,
+		}
+		h.closeEntered = gated.entered
+		channelConn = gated
+	}
+
 	c := &executionContainer{
 		cli:        cli,
 		log:        testutil.DiscardLogger(),
 		fn:         "test-fn",
 		image:      "test-image",
 		id:         "test-container",
-		conn:       conn,
+		conn:       channelConn,
 		fail:       make(chan failEvent, 4),
 		exitInfo:   make(chan exitInfo, 1),
 		connErr:    make(chan error, 1),
@@ -432,6 +501,83 @@ func TestExecutionContainerInvokeBlockedReadCancelled(t *testing.T) {
 		t.Fatalf("discard reason = %q, want %q", got, "timeout")
 	}
 	h.assertTornDown(t)
+	waitReaderExit(t, h)
+}
+
+// TestExecutionContainerCancelClaimsTimeoutBeforeMonitorDiscard pins the
+// cancellation/monitor discard race (regression): the teardown claim MUST be
+// recorded before the connection close that wakes the monitor, so the
+// monitor's transport-loss discard loses the once-only dying CAS and the
+// recorded reason stays "timeout" instead of being mislabelled
+// "protocol_error".
+//
+// Given an in-flight invocation (request written and consumed, result never
+// coming) with the monitor running, when the invocation context is cancelled,
+// then the invocation reports cancellation, the container is discarded exactly
+// once with reason "timeout" (one kill, one remove), and the reader is joined.
+//
+// The ordering is enforced by channels, never by timing: closeEntered is the
+// connection barrier (the callback has reached the Close), and the branch on
+// the recorded reason forces a COMPLETE monitor discard — its kill is the
+// observable — before a claim taken after the close may proceed. The watchdog
+// bounds only, it never orders.
+func TestExecutionContainerCancelClaimsTimeoutBeforeMonitorDiscard(t *testing.T) {
+	h := newGatedExecutionContainerHarness(t)
+	h.startMonitor()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- h.c.Invoke(ctx, "index.run", []byte(`{"event_name":"INSERT"}`), nil)
+	}()
+
+	// Barrier: the request frame was written and consumed, so the invocation
+	// is registered and pending a result that will never come — the exact
+	// state a real cancellation interrupts.
+	waitRead(t, readRequestAsync(h.peer))
+
+	cancel()
+
+	// Barrier: the cancellation callback has reached the connection Close.
+	select {
+	case <-h.closeEntered:
+	case <-time.After(execChannelWatchdog):
+		t.Fatal("cancellation never reached the connection close")
+	}
+	if got := h.c.discardReason(); got != reasonTimeout {
+		// The teardown claim was not recorded before the connection close
+		// (the regression shape). Park the callback inside its Close and force
+		// a full monitor discard — the kill proves the monitor's dying CAS
+		// completed — so any claim the callback takes afterwards provably
+		// loses, and the reason assertion below fails deterministically
+		// instead of intermittently.
+		select {
+		case <-h.killSignal:
+		case <-time.After(execChannelWatchdog):
+			t.Fatal("monitor did not discard a container it was woken from")
+		}
+	}
+	close(h.closeRelease)
+
+	err := waitInvoke(t, done)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("invoke error = %v, want context.Canceled", err)
+	}
+	if !strings.HasPrefix(err.Error(), "docker run: ") {
+		t.Fatalf("invoke error = %q, want the one-shot wrapped form", err)
+	}
+	if !h.c.dead() {
+		t.Fatal("a cancelled invocation must discard the container")
+	}
+	if got := h.c.discardReason(); got != reasonTimeout {
+		t.Fatalf("discard reason = %q, want %q (the monitor must not relabel a cancellation)",
+			got, reasonTimeout)
+	}
+	if kills, removes := h.killsDone(), h.removesDone(); kills != 1 || removes != 1 {
+		t.Fatalf("teardown calls: kills=%d removes=%d, want exactly one of each",
+			kills, removes)
+	}
 	waitReaderExit(t, h)
 }
 
