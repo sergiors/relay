@@ -233,6 +233,12 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 		t.Fatalf("runtime manager: %v", err)
 	}
 	t.Cleanup(func() { _ = manager.Close() })
+	// Mirror Run's preflight: the execution control network is provisioned
+	// after manager creation and before any Prepare, readiness probe, or
+	// Consume, so the harness fails under the same conditions production does.
+	if err := manager.EnsureControlNetwork(context.Background()); err != nil {
+		t.Fatalf("ensure control network: %v", err)
+	}
 
 	// Conservative startup orphan sweep, nodeID-scoped so it never touches the
 	// real relay container (hostname "relay-relay") or another worker's.

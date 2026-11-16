@@ -564,10 +564,12 @@ export async function run(event, context) {
 	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "v2")
 
 	// Let v1 finish: its container is drained (discarded) rather than pooled.
+	// The Docker-native "END v1" line lives in that container's logs, which are
+	// removed together with it on release, so only the drained container count
+	// below is observable after this point.
 	if err := <-v1Done; err != nil {
 		t.Fatalf("v1 execute: %v", err)
 	}
-	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "END v1")
 	// Exactly the v2 container remains: the v1 container is gone.
 	if !waitForContainersCount(ctx, m.cli, labelApp, "busy-change", 1) {
 		t.Errorf("expected exactly one pooled container after drain, got %d",

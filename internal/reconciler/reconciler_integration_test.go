@@ -308,14 +308,21 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 		t.Fatalf("write broken template: %v", err)
 	}
 	r.reconcileApp(name)
-	if pf := reg.GetByName(name); pf == nil || pf.Prepared() == nil {
+	// Old image still runs (v2) because the running snapshot is unchanged.
+	// Execute the RETAINED prepared v2 snapshot from the registry rather than
+	// calling Prepare against the deliberately broken source, so the stage
+	// proves the old generation is still served. The WARM container already
+	// logged hello-v2 in stage (b): the count>=2 requirement proves THIS stage
+	// re-executed the old version rather than satisfying the assertion from
+	// stale logs.
+	pf := reg.GetByName(name)
+	if pf == nil || pf.Prepared() == nil {
 		t.Fatal("broken template must not drop the active version")
 	}
-	// Old image still runs (v2) because the running snapshot is unchanged.
-	// The WARM container already logged hello-v2 in stage (b): the count>=2
-	// requirement proves THIS stage re-executed the old version rather than
-	// satisfying the assertion from stale logs.
-	runHandlerWith(t, m, fn, "index.hi", `{"event_name":"INSERT"}`)
+	if err := m.Execute(context.Background(), pf.Prepared(), "index.hi",
+		[]byte(`{"event_name":"INSERT"}`), nil); err != nil {
+		t.Fatalf("execute retained v2 snapshot: %v", err)
+	}
 	_ = awaitReconcilerAppLogs(t, ctx, cleanupCli, name, "hello-v2", 2)
 
 	// d) Fix template -> rebuild succeeds.

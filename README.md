@@ -33,13 +33,15 @@ do not expose this stack to untrusted networks.
 - **Event-driven functions** — Redis Streams, declarative event matching,
   at-least-once delivery, automatic retries, pending-message recovery, and
   dead-letter queues.
-- **Managed runtimes** — Python 3.14/3.15 and Node.js 24/26, with JavaScript,
-  TypeScript support, reusable warm containers, and bounded concurrency.
+- **Managed runtimes** — Python 3.14/3.15 and Node.js 24/26, with JavaScript
+  and TypeScript support, reusable warm containers, and bounded concurrency.
 - **Cron schedules** — Minute-precision scheduling, IANA timezones,
   cluster-wide deduplication, publication recovery, and startup catch-up.
 - **Persistent services** — Run APIs, workers, gateways, and other long-running
   processes using managed runtimes or container images, with replicas,
   networking, and optional Traefik routing.
+- **Git-based deployments** — Connect a Git repository, synchronize application
+  code, and deploy updates without rebuilding or restarting Relay.
 - **Resource controls** — Per-container memory, CPU, and PID limits for
   functions and services.
 - **Configuration and secrets** — Environment variables and secret references
@@ -47,7 +49,7 @@ do not expose this stack to untrusted networks.
 - **Observability** — Prometheus metrics, structured logs, persisted
   statistics, and OpenTelemetry tracing.
 - **Operations** — Health checks, manual invocation, DLQ inspection and replay,
-  Git synchronization, and graceful shutdown.
+  and graceful shutdown.
 - **Flexible deployment** — Run the Relay process under Docker, systemd,
   Kubernetes, or another process manager.
 

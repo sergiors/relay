@@ -1082,12 +1082,14 @@ func TestIntegrationSourceMountBusyGenerationAdvanceDrains(t *testing.T) {
 	}
 
 	// Release the busy v1: it completes under its admitted generation, then its
-	// superseded container is discarded on release.
+	// superseded container is discarded on release. The Docker-native "END v1"
+	// line lives in that container's logs, which are removed together with it,
+	// so only the container-gone and count assertions below remain observable
+	// after the release.
 	releaseSourceMountGate(t, dir)
 	if err := <-v1Done; err != nil {
 		t.Fatalf("v1 execute: %v", err)
 	}
-	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "END v1")
 	if !waitForContainerIDGone(ctx, m.cli, id1) {
 		t.Errorf("the drained v1 container %s should have been discarded on release", id1)
 	}

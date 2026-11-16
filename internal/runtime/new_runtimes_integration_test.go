@@ -406,17 +406,18 @@ def run(event, context):
 	}
 
 	// Each execution prints the container's OWN interpreter version, so a
-	// wrong-version cache would be caught in the output.
+	// wrong-version cache would be caught in the output. The 3.14 generation's
+	// output is asserted immediately after its own Execute while its container
+	// is still alive: switching to 3.15 supersedes (and discards) the old
+	// generation, so its Docker-native logs are gone afterward.
 	if err := m.Execute(ctx, prepared14, "handler.run", []byte(`{"status":"COMPLETED","event_id":"sw-14"}`), nil); err != nil {
 		t.Fatalf("execute python3.14: %v", err)
 	}
+	awaitAppLogsFor(t, ctx, m.cli, fnName, "switch run ver=3.14 six=1.16.0")
 	if err := m.Execute(ctx, prepared15, "handler.run", []byte(`{"status":"COMPLETED","event_id":"sw-15"}`), nil); err != nil {
 		t.Fatalf("execute python3.15: %v", err)
 	}
-	awaitAppLogsFor(t, ctx, m.cli, fnName,
-		"switch run ver=3.14 six=1.16.0",
-		"switch run ver=3.15 six=1.16.0",
-	)
+	awaitAppLogsFor(t, ctx, m.cli, fnName, "switch run ver=3.15 six=1.16.0")
 
 	// Isolation is stable: re-preparing the 3.14 app resolves the SAME image
 	// and dependency identities again (the 3.15 build changed nothing about
@@ -507,16 +508,18 @@ export function run(event, context) {
 		t.Errorf("dependency layers must be distinct CONTENT across the runtime switch (both %s)", insp24.ID)
 	}
 
+	// The v24 output is asserted right after its own Execute while the v24
+	// generation is still alive; switching to v26 discards that generation and
+	// its Docker-native logs with it, so only the current generation's output
+	// is observable after the switch.
 	if err := m.Execute(ctx, prepared24, "handler.run", []byte(`{"status":"COMPLETED","event_id":"sw-24"}`), nil); err != nil {
 		t.Fatalf("execute nodejs24.x: %v", err)
 	}
+	awaitAppLogsFor(t, ctx, m.cli, fnName, "switch run ver=v24.")
 	if err := m.Execute(ctx, prepared26, "handler.run", []byte(`{"status":"COMPLETED","event_id":"sw-26"}`), nil); err != nil {
 		t.Fatalf("execute nodejs26.x: %v", err)
 	}
-	awaitAppLogsFor(t, ctx, m.cli, fnName,
-		"switch run ver=v24.",
-		"switch run ver=v26.",
-	)
+	awaitAppLogsFor(t, ctx, m.cli, fnName, "switch run ver=v26.")
 
 	again, err := m.Prepare(ctx, fn24)
 	if err != nil {
