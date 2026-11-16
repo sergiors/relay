@@ -2,11 +2,8 @@
 
 Relay is an event-driven serverless runtime for apps that combine functions,
 scheduled jobs, and persistent services. It runs on infrastructure you control
-and uses Redis Streams[^1] for external events.
-
-[^1]:
-    Support for additional brokers is planned
-    ([#9](https://github.com/sergiors/relay/issues/9)).
+and uses Redis Streams[^1] for external events and Docker[^2] for workload
+execution.
 
 Functions execute handlers triggered by event patterns or schedules, with
 automatic retries and dead-letter queues for failed executions. Persistent
@@ -51,11 +48,12 @@ do not expose this stack to untrusted networks.
   statistics, and OpenTelemetry tracing.
 - **Operations** — Health checks, manual invocation, DLQ inspection and replay,
   Git synchronization, and graceful shutdown.
-- **Flexible deployment** — Run Relay under Docker, systemd, Kubernetes, or
-  another process manager.
+- **Flexible deployment** — Run the Relay process under Docker, systemd,
+  Kubernetes, or another process manager.
 
-See [Apps](docs/apps.md), [Events](docs/events.md), [Schedules](docs/schedules.md),
-and [Services](docs/services.md) for workload behavior.
+See [Apps](docs/apps.md), [Events](docs/events.md),
+[Schedules](docs/schedules.md), and [Services](docs/services.md) for workload
+behavior.
 
 ## Guarantees
 
@@ -91,10 +89,10 @@ events:
       collectionName: [users]
 ```
 
-See [Apps](docs/apps.md) for the template reference, [Events](docs/events.md) for
-matching and delivery, [Schedules](docs/schedules.md) for cron triggers, and
-[Services](docs/services.md) for long-running workloads. Changes under `/apps`
-are applied live; see
+See [Apps](docs/apps.md) for the template reference, [Events](docs/events.md)
+for matching and delivery, [Schedules](docs/schedules.md) for cron triggers,
+and [Services](docs/services.md) for long-running workloads. Changes under
+`/apps` are applied live; see
 [Configuration](docs/configuration.md#hot-reload).
 
 ## Commands
@@ -142,25 +140,25 @@ relay app invoke my-app '{"recordType":"INSERT"}'
 relay app invoke my-app - < event.json
 
 # -T keeps stdin a pipe instead of an allocated pseudo-TTY.
-docker compose exec -T relay app invoke my-app - < event.json
+docker compose exec -T relay relay app invoke my-app - < event.json
 
-relay secret set API_KEY                          # hidden prompt (requires a terminal)
-printf '%s' 'value' | relay secret set API_KEY -  # read all of stdin
-docker compose exec -T relay secret set API_KEY - < value.txt
+relay secret set API_KEY  # hidden prompt (requires a terminal)
+printf '%s' 'value' | relay secret set API_KEY -
+docker compose exec -T relay relay secret set API_KEY - < value.txt
 ```
 
 ## Documentation
 
-| Document                                       | Covers                                                                                 |
-| ---------------------------------------------- | -------------------------------------------------------------------------------------- |
-| [docs/installation.md](docs/installation.md)   | Self-hosted deployment, configuration, and operations                                  |
-| [docs/configuration.md](docs/configuration.md) | Relay environment variables, defaults, and process-level configuration                 |
-| [docs/apps.md](docs/apps.md)                   | App layout, templates, runtimes, environment, secrets, resources, and warm containers  |
-| [docs/events.md](docs/events.md)               | Event matching, dispatch, retries, ACK semantics, invocation state, and DLQ            |
-| [docs/schedules.md](docs/schedules.md)         | Cron syntax, timezones, occurrence identity, publication deduplication, and recovery   |
-| [docs/services.md](docs/services.md)           | Persistent services, external images, routing, networks, replicas, and resources       |
-| [docs/operations.md](docs/operations.md)       | Lifecycle, state, recovery, metrics, tracing, logs, Git sync, and operational behavior |
-| [docs/cli.md](docs/cli.md)                     | Commands, flags, and prerequisites                                                     |
+| Document                               | Covers                                      |
+| -------------------------------------- | ------------------------------------------- |
+| [Installation](docs/installation.md)   | Deployment and setup                        |
+| [Configuration](docs/configuration.md) | Environment variables and defaults          |
+| [Apps](docs/apps.md)                   | Templates, runtimes, secrets, and resources |
+| [Events](docs/events.md)               | Event matching, retries, delivery, and DLQ  |
+| [Schedules](docs/schedules.md)         | Cron, timezones, and recovery               |
+| [Services](docs/services.md)           | Services, replicas, networking, and routing |
+| [Operations](docs/operations.md)       | Monitoring, recovery, logs, and Git sync    |
+| [CLI](docs/cli.md)                     | Commands, flags, and prerequisites          |
 
 ## Contributing
 
@@ -172,3 +170,11 @@ instructions.
 Relay is licensed under the GNU General Public License v3.0.
 
 See [LICENSE.md](LICENSE.md).
+
+[^1]:
+    Support for additional event brokers is planned
+    ([#9](https://github.com/sergiors/relay/issues/9)).
+
+[^2]:
+    Support for additional runtime backends, including Kubernetes, is planned
+    ([#10](https://github.com/sergiors/relay/issues/10)).
