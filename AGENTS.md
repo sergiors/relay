@@ -25,8 +25,7 @@ worker; admin commands communicate with it or read persistent state.
   catch-up, and durable publication retry. `reconciler` owns reload and service
   convergence. `runtime` owns Docker integration; language engines live in
   `runtime/python` and `runtime/node`. `state` owns PostgreSQL, including the
-  durable dead-letter rows; `observability`
-  owns telemetry.
+  durable dead-letter rows; `observability` owns telemetry.
 
 ## Invariants to preserve
 
@@ -76,6 +75,33 @@ worker; admin commands communicate with it or read persistent state.
 - Prefer existing abstractions and seams over parallel frameworks. Internal APIs
   and persisted internal state have no compatibility promise unless documented.
 - `relay apps` aliases `relay app ls`.
+
+## Documentation guidelines
+
+Public documentation (`README.md` and `docs/`) is written for Relay users and
+operators, not for its implementers.
+
+- Document how to install, configure, use, and operate Relay.
+- Focus on user-facing behavior, configuration, guarantees, limitations, and
+  actionable troubleshooting.
+- Explain what Relay does and what users should expect, not how its internals
+  implement that behavior.
+- Avoid internal algorithms, ownership protocols, implementation-specific
+  labels, resource naming, and lifecycle details unless they are necessary for
+  an operational task.
+- Keep implementation details in code, comments, and tests rather than
+  duplicating them in public documentation.
+- Avoid repeating explanations across documents. Keep each topic in its most
+  relevant document and link to it elsewhere.
+- Prefer concise, practical explanations and examples over exhaustive
+  descriptions.
+- When implementing a feature, update the relevant user-facing documentation
+  without documenting every internal change.
+
+If an internal implementation changes without affecting users, public
+documentation should generally not need to change. Document operational
+requirements and limitations when they affect installation, configuration,
+or troubleshooting.
 
 ## Validation
 

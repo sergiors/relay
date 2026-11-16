@@ -172,7 +172,6 @@ async def touch(event, context):
 
 	fn := app.App{Name: "py-warm-loop", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -183,7 +182,7 @@ async def touch(event, context):
 			t.Fatalf("execute %s: %v", id, err)
 		}
 	}
-	awaitAppOutput(t, ctx, out, "touch 1757-0 call=1 reused=True", "touch 1757-1 call=2 reused=True")
+	awaitAppLogsFor(t, ctx, m.cli, fn.Name, "touch 1757-0 call=1 reused=True", "touch 1757-1 call=2 reused=True")
 }
 
 func TestIntegrationNodeEndToEnd(t *testing.T) {
@@ -237,7 +236,6 @@ func TestIntegrationRealUserEventsPythonEndToEnd(t *testing.T) {
 	dir, tmpl := readRealTemplate(t, "user-events-python")
 	fn := app.App{Name: "user-events-python", Dir: dir, Template: tmpl}
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -275,7 +273,7 @@ func TestIntegrationRealUserEventsPythonEndToEnd(t *testing.T) {
 		t.Fatalf("execute events.deleted.handler: %v", err)
 	}
 
-	logs := awaitAppOutput(t, ctx, out,
+	logs := awaitAppLogsFor(t, ctx, m.cli, fn.Name,
 		"User created: user_123",
 		"User updated: user_123",
 		"User deleted: user_123",
@@ -294,7 +292,6 @@ func TestIntegrationRealWelcomeEmailNodeEndToEnd(t *testing.T) {
 	dir, tmpl := readRealTemplate(t, "welcome-email-node")
 	fn := app.App{Name: "welcome-email-node", Dir: dir, Template: tmpl}
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -308,7 +305,7 @@ func TestIntegrationRealWelcomeEmailNodeEndToEnd(t *testing.T) {
 		t.Fatalf("execute handler.handler: %v", err)
 	}
 
-	logs := awaitAppOutput(t, ctx, out, "Sending welcome email to john@example.com")
+	logs := awaitAppLogsFor(t, ctx, m.cli, fn.Name, "Sending welcome email to john@example.com")
 	t.Logf("captured handler output:\n%s", logs)
 }
 
@@ -335,7 +332,6 @@ export function run(event, context) {
 
 	fn := app.App{Name: "node-broken-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -353,7 +349,7 @@ export function run(event, context) {
 	if strings.Contains(err.Error(), "not found") {
 		t.Errorf("broken dependency must NOT be reported as module not found, got: %v", err)
 	}
-	logs := awaitAppOutput(t, ctx, out, "missing-package")
+	logs := awaitAppLogsFor(t, ctx, m.cli, fn.Name, "missing-package")
 	t.Logf("execute error: %v", err)
 	t.Logf("container logs: %s", logs)
 }
@@ -398,7 +394,6 @@ export function message(event: { event_id: string }): string {
 
 	fn := app.App{Name: "node-ts-e2e", Dir: dir, Template: tsTemplate("index.handler")}
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -410,8 +405,8 @@ export function message(event: { event_id: string }): string {
 	if err := m.Execute(ctx, prepared, "index.handler", []byte(`{"event_id":"1757-0","event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	// The transpiled handler's stdout reaches the app-output sink.
-	awaitAppOutput(t, ctx, out, "ts created 1757-0")
+	// The transpiled handler's stdout is observable in the container's native Docker logs.
+	awaitAppLogsFor(t, ctx, m.cli, fn.Name, "ts created 1757-0")
 }
 
 // TestIntegrationNodeTSDepsEndToEnd proves packages left external by the bundler
@@ -442,7 +437,6 @@ export function handler(event: { event_id: string }, context: unknown): void {
 
 	fn := app.App{Name: "node-ts-deps-e2e", Dir: dir, Template: tsTemplate("index.handler")}
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -459,7 +453,7 @@ export function handler(event: { event_id: string }, context: unknown): void {
 	}
 	// picocolors.red wraps the text in ANSI escapes; match the inner text. The
 	// import resolves at runtime from the dependency layer's node_modules.
-	awaitAppOutput(t, ctx, out, "dep 1757-0")
+	awaitAppLogsFor(t, ctx, m.cli, fn.Name, "dep 1757-0")
 }
 
 // TestIntegrationNodeTSExampleEndToEnd drives the real
@@ -472,7 +466,6 @@ func TestIntegrationNodeTSExampleEndToEnd(t *testing.T) {
 	dir, tmpl := readRealTemplate(t, "order-confirmation-typescript")
 	fn := app.App{Name: "order-confirmation-typescript", Dir: dir, Template: tmpl}
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -492,7 +485,7 @@ func TestIntegrationNodeTSExampleEndToEnd(t *testing.T) {
 		t.Fatalf("execute src.handler.handler: %v", err)
 	}
 
-	logs := awaitAppOutput(t, ctx, out,
+	logs := awaitAppLogsFor(t, ctx, m.cli, fn.Name,
 		"confirmation sent to jane@example.com",
 		"ord_42",
 		"$99.50",
@@ -537,7 +530,6 @@ export function handler(event: { event_id: string }, context: unknown): void {
 		Template: tsTemplate("events.created.handler", "events.deleted.handler"),
 	}
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -553,7 +545,7 @@ export function handler(event: { event_id: string }, context: unknown): void {
 		t.Fatalf("execute events.deleted.handler: %v", err)
 	}
 
-	awaitAppOutput(t, ctx, out, "created ts 1", "deleted ts 2")
+	awaitAppLogsFor(t, ctx, m.cli, fn.Name, "created ts 1", "deleted ts 2")
 }
 
 // TestIntegrationNodeTSAmbiguousFailsPrepare pins the build-time ambiguity error:

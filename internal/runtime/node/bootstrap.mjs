@@ -1,23 +1,19 @@
 // Relay's Node.js function bootstrap.
 //
-// One execution container per function STAYS ALIVE between
-// invocations and serves a persistent, line-delimited JSON protocol on
-// stdin/stdout (see internal/runtime/protocol.go in the Relay source):
+// One execution container per function STAYS ALIVE between invocations and
+// serves Relay's authenticated, length-prefixed JSON protocol over TCP on
+// 0.0.0.0:7000. Application stdout/stderr remain native Docker logs:
 //
-//   Relay -> stdin:  {"id":"<hex>","handler":"mod.func","event":<raw>,"env":{...}}
-//   stdout:          @@RELAY@@{"id":"<id>","ok":true}
-//                    @@RELAY@@{"id":"<id>","ok":false,"error":"..."}
-//
-// Everything not sentinel-prefixed is user output, proxied by Relay as-is.
+//   Relay -> TCP: framed hello, then framed invoke requests
+//   TCP -> Relay: framed auth, then framed invocation results
 //
 // Process-model notes (intended semantics, not a bug):
 //   - Handler errors (including async rejections caught at the await) fail
 //     THAT invocation (ok:false) and the loop continues: the container is
 //     kept healthy.
-//   - A malformed request line is a fatal protocol failure: process.exit(1)
-//     so Relay discards the container. No uncaughtException/unhandledRejection
-//     handlers are installed: a fatal crash must crash the process.
-//   - EOF on stdin means Relay is done with the container; exit 0 cleanly.
+//   - Malformed authenticated protocol input is fatal so Relay discards the
+//     container. No uncaughtException/unhandledRejection handlers are installed.
+//   - Once the authenticated connection ends, the bootstrap exits cleanly.
 //   - A dynamic import() promise is CACHED per resolved module path, so
 //     module-level state persists across invocations; per-request env is
 //     applied EXACTLY per invocation: a key absent from the new frame is
@@ -26,9 +22,33 @@
 //     RELAY_HANDLER is reserved and overwritten every invocation.
 
 import { statSync, mkdirSync, symlinkSync } from "node:fs";
-import * as readline from "node:readline";
 import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createServer } from "node:net";
+
+const executionSecret = process.env.RELAY_EXECUTION_SECRET;
+const executionPortValue = process.env.RELAY_EXECUTION_PORT;
+delete process.env.RELAY_EXECUTION_SECRET;
+
+if (!/^[0-9a-f]{64}$/.test(executionSecret ?? "")) {
+  throw new Error("invalid Relay execution configuration");
+}
+if (!/^\d+$/.test(executionPortValue ?? "")) {
+  throw new Error("invalid Relay execution configuration");
+}
+const executionPort = Number(executionPortValue);
+if (!Number.isInteger(executionPort) || executionPort < 1 || executionPort > 65535) {
+  throw new Error("invalid Relay execution configuration");
+}
+
+const MAX_HANDSHAKE_BYTES = 4 * 1024;
+const MAX_INVOKE_BYTES = 8 * 1024 * 1024;
+const MAX_RESPONSE_BYTES = 1024 * 1024;
+const MAX_ERROR_BYTES = 64 * 1024;
+const HANDSHAKE_TIMEOUT_MS = 2000;
+const MAX_PENDING_HANDSHAKES = 8;
+const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
 // Source-mount (HOT_RELOAD) support, mirroring internal/runtime/node/engine.go
 // (SourceMountTarget, the mounted esbuild path, and the pinned esbuild version).
@@ -72,19 +92,6 @@ const NODE_TARGET = "node" + process.versions.node.split(".")[0];
 const { context, propagation } = createRequire(BAKED_ROOT + "/package.json")(
   "@opentelemetry/api",
 );
-
-// Must match the Relay-side constant "@@RELAY@@" (internal/runtime/protocol.go).
-const SENTINEL = "@@RELAY@@";
-
-// Response error strings are operator log text only; bound them. The cap is the
-// UTF-8 byte length of the WHOLE response frame — the sentinel, the JSON
-// envelope, and the error — so a frame can never exceed the cap and be split
-// mid-line by Relay's 4 KiB stdout line demuxer (Go's maxPending). It matches the
-// Go bootstrap-side cap maxResponseFrame (3 KiB), leaving ~1 KiB of margin under
-// the demuxer limit. Truncation is applied on a Unicode code-point boundary, so a
-// multibyte message can never be cut mid-character and the emitted frame is
-// always valid UTF-8.
-const MAX_FRAME_BYTES = 3 * 1024;
 
 class HandlerContext {
   constructor({
@@ -142,9 +149,11 @@ function applyEnv(env) {
   const incoming = new Map();
   if (env && typeof env === "object") {
     for (const [k, v] of Object.entries(env)) {
+      if (k === "RELAY_EXECUTION_SECRET") continue;
       incoming.set(String(k), String(v));
     }
   }
+  delete process.env.RELAY_EXECUTION_SECRET;
   for (const key of Array.from(appliedEnv)) {
     if (!incoming.has(key)) {
       if (baselineEnv.get(key) === MISSING || !baselineEnv.has(key)) {
@@ -322,68 +331,37 @@ async function loadModule(modPath) {
   return await moduleCache.get(cacheKey);
 }
 
-function respond(id, ok, error) {
-  const frame = { id, ok };
-  if (!ok) {
-    frame["error"] = boundErrorFrame(id, String(error ?? ""));
-  }
-  process.stdout.write(SENTINEL + JSON.stringify(frame) + "\n");
-}
-
-// boundErrorFrame returns an error string such that the whole serialized
-// response frame (sentinel + JSON envelope + error) fits in MAX_FRAME_BYTES
-// UTF-8 bytes, while always remaining valid UTF-8.
-//
-// The budget is the frame cap minus the exact size of the sentinel, the envelope
-// with an empty error, and the trailing newline. The message is then accumulated
-// one Unicode code point at a time (for...of iterates code points, never UTF-16
-// halves, so a surrogate pair or multibyte character is never split). Each code
-// point's contribution is its EXACT serialized length — including any JSON
-// escaping of quotes, backslashes, and control characters — computed with
-// JSON.stringify, so the frame is bounded precisely and the result always
-// round-trips through JSON.stringify (the emitted frame is parseable).
-function boundErrorFrame(id, message) {
-  const overhead = Buffer.byteLength(
-    SENTINEL + JSON.stringify({ id, ok: false, error: "" }) + "\n",
-    "utf8",
+function boundedError(id, message) {
+  const emptyResult = JSON.stringify({ type: "result", id, ok: false, error: "" });
+  const budget = Math.min(
+    MAX_ERROR_BYTES,
+    MAX_RESPONSE_BYTES - Buffer.byteLength(emptyResult, "utf8"),
   );
-  const budget = MAX_FRAME_BYTES - overhead;
-  if (budget <= 0) {
-    return "";
-  }
-  let msg = "";
+  if (budget <= 0) return "";
+
+  let result = "";
   let used = 0;
   for (const cp of message) {
-    const n = jsonEscapedBytes(cp);
-    if (used + n > budget) {
-      break;
-    }
-    msg += cp;
-    used += n;
+    const quoted = JSON.stringify(cp);
+    const bytes = Buffer.byteLength(quoted.slice(1, -1), "utf8");
+    if (used + bytes > budget) break;
+    result += cp;
+    used += bytes;
   }
-  return msg;
+  return result;
 }
 
-// jsonEscapedBytes is the number of UTF-8 bytes one code point contributes
-// inside a JSON string (its escaped form, without the surrounding quotes).
-// JSON escaping is per-character, so summing these is exactly the error field's
-// serialized contribution.
-function jsonEscapedBytes(cp) {
-  const quoted = JSON.stringify(cp);
-  return Buffer.byteLength(quoted.slice(1, -1), "utf8");
+function makeResult(id, ok, error) {
+  if (ok) return { type: "result", id, ok: true };
+  return {
+    type: "result",
+    id,
+    ok: false,
+    error: boundedError(id, String(error ?? "")),
+  };
 }
 
-async function handle(line) {
-  let req;
-  try {
-    req = JSON.parse(line);
-  } catch (e) {
-    // Malformed request frame: fatal protocol failure (the id is not
-    // recoverable, so no response is possible). Terminate so Relay discards.
-    console.error("invalid request frame: " + (e && e.message ? e.message : e));
-    process.exit(1);
-  }
-
+async function handle(req) {
   const id = typeof req.id === "string" ? req.id : "";
   const handler = typeof req.handler === "string" ? req.handler : "";
 
@@ -452,32 +430,245 @@ async function handle(line) {
     );
   }
 
-  respond(id, error === null, error ?? undefined);
+  return makeResult(id, error === null, error ?? undefined);
 }
 
-const rl = readline.createInterface({ input: process.stdin });
+class ProtocolError extends Error {}
 
-// Process request lines strictly sequentially: the handler chain serializes
-// on itself, so a pipelined burst still runs one invocation at a time.
-let chain = Promise.resolve();
-rl.on("line", (line) => {
-  if (line === "") return; // ignore blank lines rather than dying on them
-  chain = chain
-    .then(() => handle(line))
-    .catch((e) => {
-      // A error escaping the handler's own try/catch (e.g. the env loop) is a
-      // fatal protocol failure: crash the process so Relay discards.
-      console.error(
-        "bootstrap internal error: " + (e && e.stack ? e.stack : e),
-      );
-      process.exit(1);
+class ChunkReader {
+  constructor(socket) {
+    this.iterator = socket[Symbol.asyncIterator]();
+    this.chunk = null;
+    this.offset = 0;
+  }
+
+  async readExact(size, allowCleanEnd = false) {
+    const result = Buffer.allocUnsafe(size);
+    let received = 0;
+    while (received < size) {
+      if (this.chunk === null || this.offset === this.chunk.length) {
+        const next = await this.iterator.next();
+        if (next.done) {
+          if (received === 0 && allowCleanEnd) return null;
+          throw new ProtocolError("incomplete frame");
+        }
+        this.chunk = next.value;
+        this.offset = 0;
+        continue;
+      }
+      const length = Math.min(size - received, this.chunk.length - this.offset);
+      this.chunk.copy(result, received, this.offset, this.offset + length);
+      this.offset += length;
+      received += length;
+    }
+    return result;
+  }
+}
+
+async function readFrame(reader, limit, allowCleanEnd = false) {
+  const header = await reader.readExact(4, allowCleanEnd);
+  if (header === null) return null;
+  const size = header.readUInt32BE(0);
+  if (size === 0 || size > limit) throw new ProtocolError("invalid frame size");
+  const payload = await reader.readExact(size);
+  let text;
+  try {
+    text = utf8Decoder.decode(payload);
+    return JSON.parse(text);
+  } catch {
+    throw new ProtocolError("invalid JSON frame");
+  }
+}
+
+async function writeFrame(socket, value, limit) {
+  const payload = Buffer.from(JSON.stringify(value), "utf8");
+  if (payload.length === 0 || payload.length > limit) {
+    throw new ProtocolError("response frame too large");
+  }
+  const frame = Buffer.allocUnsafe(payload.length + 4);
+  frame.writeUInt32BE(payload.length, 0);
+  payload.copy(frame, 4);
+  await new Promise((resolve, reject) => {
+    socket.write(frame, (error) => (error ? reject(error) : resolve()));
+  });
+}
+
+function isObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseInvoke(value) {
+  if (
+    !isObject(value) ||
+    value.type !== "invoke" ||
+    typeof value.id !== "string" ||
+    value.id.length === 0 ||
+    typeof value.handler !== "string" ||
+    (value.env !== null && !isObject(value.env)) ||
+    !Object.hasOwn(value, "event") ||
+    !isObject(value.context)
+  ) {
+    throw new ProtocolError("invalid invocation request");
+  }
+  const contextFields = [
+    "requestId",
+    "attempt",
+    "maxAttempts",
+    "deadline",
+    "app",
+    "handler",
+  ];
+  if (
+    contextFields.some((field) => !(field in value.context)) ||
+    value.context.handler !== value.handler ||
+    typeof value.context.requestId !== "string" ||
+    !Number.isInteger(value.context.attempt) ||
+    !Number.isInteger(value.context.maxAttempts) ||
+    typeof value.context.deadline !== "string" ||
+    typeof value.context.app !== "string" ||
+    (Object.hasOwn(value.context, "messageId") &&
+      typeof value.context.messageId !== "string") ||
+    (Object.hasOwn(value.context, "traceId") &&
+      typeof value.context.traceId !== "string")
+  ) {
+    throw new ProtocolError("invalid invocation context");
+  }
+  if (value.trace !== undefined && !isObject(value.trace)) {
+    throw new ProtocolError("invalid trace carrier");
+  }
+  if (
+    Buffer.byteLength(
+      JSON.stringify({ type: "result", id: value.id, ok: false, error: "" }),
+      "utf8",
+    ) > MAX_RESPONSE_BYTES
+  ) {
+    throw new ProtocolError("invocation id exceeds response limit");
+  }
+  return value;
+}
+
+function macFor(prefix, nonce) {
+  return createHmac("sha256", Buffer.from(executionSecret, "ascii"))
+    .update(prefix + nonce, "ascii")
+    .digest();
+}
+
+function validMac(candidate, expected) {
+  if (typeof candidate !== "string" || !/^[0-9a-f]{64}$/.test(candidate)) {
+    return false;
+  }
+  return timingSafeEqual(Buffer.from(candidate, "hex"), expected);
+}
+
+let server;
+let activeSocket = null;
+let shuttingDown = false;
+let pendingHandshakes = 0;
+const sockets = new Set();
+
+function stop(exitCode) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  process.exitCode = exitCode;
+  if (server.listening) server.close();
+  for (const socket of sockets) socket.destroy();
+}
+
+async function serve(socket, onAuthenticated) {
+  socket.setNoDelay(true);
+  const reader = new ChunkReader(socket);
+  const handshakeTimer = setTimeout(
+    () => socket.destroy(),
+    HANDSHAKE_TIMEOUT_MS,
+  );
+  try {
+    const hello = await readFrame(reader, MAX_HANDSHAKE_BYTES);
+    if (
+      !isObject(hello) ||
+      hello.type !== "hello" ||
+      hello.version !== 1 ||
+      typeof hello.nonce !== "string" ||
+      !/^[0-9a-f]{64}$/.test(hello.nonce)
+    ) {
+      throw new ProtocolError("invalid handshake");
+    }
+
+    const nonce = randomBytes(32).toString("hex");
+    await writeFrame(
+      socket,
+      {
+        type: "auth",
+        version: 1,
+        mac: macFor("relay-bootstrap-auth-v1:", hello.nonce).toString("hex"),
+        nonce,
+      },
+      MAX_HANDSHAKE_BYTES,
+    );
+
+    const ready = await readFrame(reader, MAX_HANDSHAKE_BYTES);
+    if (
+      !isObject(ready) ||
+      ready.type !== "ready" ||
+      ready.version !== 1 ||
+      !validMac(ready.mac, macFor("relay-client-auth-v1:", nonce))
+    ) {
+      throw new ProtocolError("invalid authentication");
+    }
+
+    if (activeSocket !== null) throw new ProtocolError("connection already active");
+    activeSocket = socket;
+    clearTimeout(handshakeTimer);
+    onAuthenticated();
+    for (const pendingSocket of sockets) {
+      if (pendingSocket !== socket) pendingSocket.destroy();
+    }
+    socket.once("close", () => {
+      if (activeSocket === socket) stop(0);
+    });
+
+    while (!socket.destroyed) {
+      const raw = await readFrame(reader, MAX_INVOKE_BYTES, true);
+      if (raw === null) return;
+      const req = parseInvoke(raw);
+      const result = await handle(req);
+      await writeFrame(socket, result, MAX_RESPONSE_BYTES);
+    }
+  } finally {
+    clearTimeout(handshakeTimer);
+  }
+}
+
+server = createServer((socket) => {
+  if (shuttingDown || activeSocket !== null || pendingHandshakes >= MAX_PENDING_HANDSHAKES) {
+    socket.destroy();
+    return;
+  }
+  pendingHandshakes++;
+  sockets.add(socket);
+  socket.on("close", () => sockets.delete(socket));
+  let authenticated = false;
+  serve(socket, () => {
+    authenticated = true;
+    pendingHandshakes--;
+  })
+    .catch(() => {
+      if (activeSocket === socket) stop(1);
+      else socket.destroy();
+    })
+    .finally(() => {
+      if (!authenticated) pendingHandshakes--;
+      if (activeSocket === socket) {
+        activeSocket = null;
+        stop(0);
+      }
     });
 });
-rl.on("close", () => {
-  // Relay closed stdin (container discard or shutdown): exit cleanly once the
-  // in-flight chain completes.
-  chain.then(
-    () => process.exit(0),
-    () => process.exit(1),
-  );
+
+server.on("error", () => {
+  stop(1);
+});
+
+await new Promise((resolve, reject) => {
+  server.once("error", reject);
+  server.listen(executionPort, "0.0.0.0", resolve);
 });

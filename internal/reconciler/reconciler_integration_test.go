@@ -15,13 +15,16 @@ package reconciler
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/client"
 
 	"relay/internal/app"
@@ -30,6 +33,75 @@ import (
 	"relay/internal/source"
 	"relay/internal/testutil"
 )
+
+// createReconcilerNetwork creates a DEDICATED user-defined bridge network for
+// this test — tests act as the operator that owns the worker-global NETWORKS
+// set, which the persistent execution channel requires (every execution start
+// fails closed without a configured shared network). The label is relay.test
+// (never the execution-control role, which the workload guard rejects) and no
+// ports are published. Removal is registered FIRST so it runs LAST
+// (t.Cleanup is LIFO), after the deferred Manager.Close has discarded attached
+// containers; a removal failure is logged, never fatal.
+func createReconcilerNetwork(t *testing.T, cli *client.Client) string {
+	t.Helper()
+	name := fmt.Sprintf("relay-test-exec-%08x", rand.Uint32())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := cli.NetworkCreate(ctx, name, client.NetworkCreateOptions{
+		Driver: "bridge",
+		Labels: map[string]string{"relay.test": "execution"},
+	}); err != nil {
+		t.Fatalf("create reconciler test network %s: %v", name, err)
+	}
+	t.Cleanup(func() {
+		rctx, rcancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer rcancel()
+		if _, err := cli.NetworkRemove(rctx, name, client.NetworkRemoveOptions{}); err != nil {
+			t.Logf("cleanup: remove reconciler test network %s: %v", name, err)
+		}
+	})
+	return name
+}
+
+// awaitReconcilerAppLogs polls the app's NATIVE Docker logs (stdout+stderr
+// across every container carrying relay.app=appName, resolved fresh each poll)
+// until want appears at least min times, then returns the combined text. The
+// count is the freshness proof for stages that reuse a warm container: re-
+// execution must ADD an occurrence rather than satisfy the assertion from
+// stale logs.
+func awaitReconcilerAppLogs(t *testing.T, ctx context.Context, cli *client.Client, appName, want string, min int) string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	combined := ""
+	for time.Now().Before(deadline) {
+		list, err := cli.ContainerList(ctx, client.ContainerListOptions{All: true})
+		if err == nil {
+			combined = ""
+			for _, c := range list.Items {
+				if c.Labels["relay.app"] != appName {
+					continue
+				}
+				res, lerr := cli.ContainerLogs(ctx, c.ID, client.ContainerLogsOptions{
+					ShowStdout: true,
+					ShowStderr: true,
+				})
+				if lerr != nil {
+					continue
+				}
+				var buf bytes.Buffer
+				_, _ = stdcopy.StdCopy(&buf, &buf, res)
+				_ = res.Close()
+				combined += buf.String()
+			}
+			if strings.Count(combined, want) >= min {
+				return combined
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("app %q logs missing %q x%d within 10s; logs:\n%s", appName, want, min, combined)
+	return ""
+}
 
 // dockerManagerAdapter wraps a runtime.Manager to satisfy the reconciler's
 // Builder interface (the Manager already has the methods). It also implements
@@ -100,11 +172,11 @@ func writeNodeFn(t *testing.T, root, name, output string) {
 	}
 }
 
-// runHandlerWith builds the image and executes one event, capturing stdout.
+// runHandlerWith builds the image and executes one event; handler output is
+// then observed through the container's native Docker logs by the caller.
 func runHandlerWith(
 	t *testing.T,
 	m *runtime.Manager,
-	out *testutil.SyncBuffer,
 	fn app.App,
 	hndlr,
 	eventJSON string,
@@ -137,25 +209,27 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 	name := testutil.UniqueName(t, "recon")
 
 	var buf bytes.Buffer
-	// Relay-operational logger. Container stdout/stderr is NO LONGER routed
-	// through the logger (it is forwarded as a raw transport to the
-	// app-output sink; see runtime/output.go), so the assertions below that
-	// match handler output read from the sink buffer installed via
-	// SetAppOutput, not from this operational log buffer.
+	// Relay-operational logger. App stdout/stderr are the container's NATIVE
+	// Docker logs — Relay never forwards them — so the handler-output
+	// assertions below read those logs (see awaitReconcilerAppLogs), not from
+	// this operational log buffer (which the secret-leak assertions read).
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	m, err := runtime.NewManager(logger, nil, "test-host")
+	// The worker-global NETWORKS set is optional application connectivity;
+	// this test owns a dedicated one as the operator would. The execution
+	// channel instead runs over the manager's internal control network,
+	// provisioned below exactly like the worker preflight.
+	networkName := createReconcilerNetwork(t, testutil.RequireDocker(t))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	m, err := runtime.NewManager(logger, nil, "test-host",
+		runtime.WithNetworks([]string{networkName}))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
 	defer m.Close()
-
-	// App-output sink: handler stdout is transport-forwarded here (not to
-	// the logger), so handler-output assertions read from this buffer. It is
-	// written by SetAppOutput goroutines, so a mutex-guarded buffer is used
-	// under -race.
-	outBuf := &testutil.SyncBuffer{}
-	outPrev := runtime.SetAppOutput(outBuf)
-	defer runtime.SetAppOutput(outPrev)
+	if err := m.EnsureControlNetwork(ctx); err != nil {
+		t.Fatalf("ensure control network: %v", err)
+	}
 
 	// Track the relay-app-<name>:* images this test builds (v1/v2/v3 via
 	// fingerprint-tagged refs) so t.Cleanup removes them; the reconciler's
@@ -216,25 +290,19 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 	}
 	// Execute the freshly built image for v1.
 	fn := app.App{Name: name, Dir: filepath.Join(root, name), Template: mustParse(templateWithInsert())}
-	runHandlerWith(t, m, outBuf, fn, "index.hi", `{"event_name":"INSERT"}`)
-	if !bytes.Contains(outBuf.Bytes(), []byte("hello-v1")) {
-		t.Fatalf("expected v1 output, got: %s", outBuf.String())
-	}
+	runHandlerWith(t, m, fn, "index.hi", `{"event_name":"INSERT"}`)
+	_ = awaitReconcilerAppLogs(t, ctx, cleanupCli, name, "hello-v1", 1)
 
 	// b) Change source; unchanged template. Fingerprint changes -> rebuild.
-	outBuf.Reset()
 	writeNodeFn(t, root, name, "hello-v2")
 	r.reconcileApp(name)
-	runHandlerWith(t, m, outBuf, fn, "index.hi", `{"event_name":"INSERT"}`)
-	if !bytes.Contains(outBuf.Bytes(), []byte("hello-v2")) {
-		t.Fatalf("expected v2 output after reload, got: %s", outBuf.String())
-	}
+	runHandlerWith(t, m, fn, "index.hi", `{"event_name":"INSERT"}`)
+	_ = awaitReconcilerAppLogs(t, ctx, cleanupCli, name, "hello-v2", 1)
 	if pf := reg.GetByName(name); pf == nil || pf.Prepared() == nil {
 		t.Fatal("function must stay prepared after reload")
 	}
 
 	// c) Break template -> old version retained, not removed.
-	outBuf.Reset()
 	tmplPath := filepath.Join(root, name, "template.yaml")
 	if err := os.WriteFile(tmplPath, []byte("runtime: python9.9\n"), 0o644); err != nil {
 		t.Fatalf("write broken template: %v", err)
@@ -244,19 +312,17 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 		t.Fatal("broken template must not drop the active version")
 	}
 	// Old image still runs (v2) because the running snapshot is unchanged.
-	runHandlerWith(t, m, outBuf, fn, "index.hi", `{"event_name":"INSERT"}`)
-	if !bytes.Contains(outBuf.Bytes(), []byte("hello-v2")) {
-		t.Fatalf("old version must keep running after broken template, got: %s", outBuf.String())
-	}
+	// The WARM container already logged hello-v2 in stage (b): the count>=2
+	// requirement proves THIS stage re-executed the old version rather than
+	// satisfying the assertion from stale logs.
+	runHandlerWith(t, m, fn, "index.hi", `{"event_name":"INSERT"}`)
+	_ = awaitReconcilerAppLogs(t, ctx, cleanupCli, name, "hello-v2", 2)
 
 	// d) Fix template -> rebuild succeeds.
-	outBuf.Reset()
 	writeNodeFn(t, root, name, "hello-v3")
 	r.reconcileApp(name)
-	runHandlerWith(t, m, outBuf, fn, "index.hi", `{"event_name":"INSERT"}`)
-	if !bytes.Contains(outBuf.Bytes(), []byte("hello-v3")) {
-		t.Fatalf("expected v3 output after fix, got: %s", outBuf.String())
-	}
+	runHandlerWith(t, m, fn, "index.hi", `{"event_name":"INSERT"}`)
+	_ = awaitReconcilerAppLogs(t, ctx, cleanupCli, name, "hello-v3", 1)
 
 	// e) Remove dir -> app dropped.
 	if err := os.RemoveAll(filepath.Join(root, name)); err != nil {

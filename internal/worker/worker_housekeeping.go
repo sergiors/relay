@@ -324,6 +324,30 @@ func sweepStartupServiceOrphans(
 	)
 }
 
+// controlNetworkProvisioner is the narrow view of the runtime Manager that the
+// startup control-network pre-flight needs. *runtime.Manager satisfies it; a
+// test fake can implement it, so provisioning error semantics are unit-testable
+// without Docker.
+type controlNetworkProvisioner interface {
+	EnsureControlNetwork(ctx context.Context) error
+}
+
+// ensureNodeControlNetwork provisions or reuses this node's persistent internal
+// control network and, when Relay runs in a container, attaches Relay to it.
+// The check is bounded by the worker lifecycle and reconcileTimeout so a hung
+// daemon cannot stall startup forever.
+func ensureNodeControlNetwork(
+	ctx context.Context,
+	manager controlNetworkProvisioner,
+) error {
+	provisionCtx, cancel := context.WithTimeout(ctx, reconcileTimeout)
+	defer cancel()
+	if err := manager.EnsureControlNetwork(provisionCtx); err != nil {
+		return fmt.Errorf("ensure control network: %w", err)
+	}
+	return nil
+}
+
 // networkVerifier is the narrow view of the runtime Manager that the startup
 // NETWORKS pre-flight needs. *runtime.Manager satisfies it; a test fake can
 // implement it, so the verification error semantics are unit-testable without a
@@ -332,14 +356,17 @@ type networkVerifier interface {
 	VerifyNetworks(ctx context.Context, networks []string) (string, bool, error)
 }
 
-// verifyConfiguredNetworks verifies every network in the worker-global NETWORKS
-// set exists on the Docker daemon before any app is prepared or any
-// container created. A missing network, or a verify error (a broken daemon), is
-// a fatal startup failure: Relay never creates networks, and an execution
+// verifyConfiguredNetworks verifies every network in the optional worker-global
+// NETWORKS set before any app is prepared or any container created: each must
+// exist and satisfy the same workload-safe policy as creates (no reserved
+// host/container pseudo-networks, no execution-control network). A missing
+// network, a policy violation, or a verify error (a broken daemon) is a fatal
+// startup failure: Relay never creates operator networks, and an execution
 // container silently created on the wrong network would be a latent runtime
-// fault. It is a no-op when networks is empty, so an unset NETWORKS keeps the
-// default bridge behavior. The check is bounded by the worker lifecycle and a
-// reconcileTimeout so a hung daemon cannot stall startup forever.
+// fault. It is a no-op when networks is empty; empty NETWORKS is valid because
+// execution containers still join the internal control network. The check is
+// bounded by the worker lifecycle and a reconcileTimeout so a hung daemon
+// cannot stall startup forever.
 func verifyConfiguredNetworks(ctx context.Context, manager networkVerifier, networks []string) error {
 	if len(networks) == 0 {
 		return nil

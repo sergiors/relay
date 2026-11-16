@@ -1,12 +1,27 @@
 //go:build integration
 
+// Direct-process tests for the Node bootstrap's authenticated, length-prefixed
+// execution channel (see internal/runtime/node/bootstrap.mjs and
+// internal/runtime/protocol.go). The real embedded bootstrap runs as a child
+// process on a HOST-LOCAL reserved loopback port (RELAY_EXECUTION_PORT is
+// test-overridable; production pins 7000 inside isolated containers), and the
+// test speaks the wire contract as the Relay client: framed hello/auth/ready
+// HMAC handshake, then sequential framed invoke/result exchanges. App output is
+// the child's native stdout/stderr — never protocol data — and is observed
+// directly on those pipes. The python and node packages may run concurrently
+// under `go test ./...`, so each child gets its OWN reserved port.
 package node
 
 import (
-	"bufio"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,22 +33,38 @@ import (
 	"unicode/utf8"
 )
 
-// relaySentinel is the protocol response prefix. It is hardcoded here (rather
-// than imported) to avoid an import cycle with the Go runtime package.
-const relaySentinel = "@@RELAY@@"
+// Frame caps from the wire contract (payload bytes, excluding the 4-byte
+// header). Hardcoded to avoid an import cycle with the Go runtime package.
+const (
+	channelHandshakeCap = 4 << 10  // 4 KiB
+	channelRequestCap   = 8 << 20  // 8 MiB
+	channelResultCap    = 1 << 20  // 1 MiB
+	channelErrorCap     = 64 << 10 // 64 KiB
 
-// nodeProc is a live bootstrap process driven by the tests.
+	bootstrapAuthContext = "relay-bootstrap-auth-v1:"
+	clientAuthContext    = "relay-client-auth-v1:"
+)
+
+// nodeProc is a live bootstrap process driven over its authenticated channel:
+// invoke frames are written to the connection, result frames are read from it,
+// and stdout/stderr (native app output) are collected separately.
 type nodeProc struct {
 	cmd      *exec.Cmd
-	stdin    io.WriteCloser
-	stdout   *bufio.Reader
+	port     int
+	secret   string
+	conn     net.Conn
 	seq      int
+	exitDone chan struct{}
+	waitErr  error
+
+	stdoutMu sync.Mutex
+	stdout   strings.Builder
 	stderrMu sync.Mutex
 	stderr   strings.Builder
 }
 
-// invokeResult is one protocol response plus any user output that arrived
-// while waiting for it.
+// invokeResult is one result frame plus the native stdout produced while the
+// invocation ran.
 type invokeResult struct {
 	OK    bool
 	Err   string
@@ -42,6 +73,80 @@ type invokeResult struct {
 }
 
 func (r invokeResult) hasErrorText(frag string) bool { return strings.Contains(r.Err, frag) }
+
+func (p *nodeProc) Write(b []byte) (int, error) {
+	p.stderrMu.Lock()
+	defer p.stderrMu.Unlock()
+	_, _ = p.stderr.Write(b)
+	return len(b), nil
+}
+
+func (p *nodeProc) stderrString() string {
+	p.stderrMu.Lock()
+	defer p.stderrMu.Unlock()
+	return p.stderr.String()
+}
+
+func (p *nodeProc) stdoutLen() int {
+	p.stdoutMu.Lock()
+	defer p.stdoutMu.Unlock()
+	return p.stdout.Len()
+}
+
+func (p *nodeProc) stdoutSince(off int) string {
+	p.stdoutMu.Lock()
+	defer p.stdoutMu.Unlock()
+	return p.stdout.String()[off:]
+}
+
+func (p *nodeProc) stdoutString() string {
+	return p.stdoutSince(0)
+}
+
+// awaitStdoutQuiet waits until the child's stdout has stopped growing (stable
+// across a 30ms window) so an invocation's prints are observable right after
+// its result frame, bounded by 2s. The protocol arrives on the connection
+// while app output arrives on the stdout pipe; the two schedulings are not
+// ordered relative to each other.
+func (p *nodeProc) awaitStdoutQuiet() {
+	deadline := time.Now().Add(2 * time.Second)
+	last := -1
+	stable := 0
+	for time.Now().Before(deadline) {
+		n := p.stdoutLen()
+		if n == last {
+			stable++
+			if stable >= 2 {
+				return
+			}
+		} else {
+			stable = 0
+			last = n
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+}
+
+// closeChannel closes the authenticated connection (Relay being done).
+func (p *nodeProc) closeChannel() error {
+	if p.conn == nil {
+		return nil
+	}
+	return p.conn.Close()
+}
+
+// waitExit waits for the process to exit within bound and returns its error
+// (nil for exit 0).
+func (p *nodeProc) waitExit(t *testing.T, bound time.Duration) error {
+	t.Helper()
+	select {
+	case <-p.exitDone:
+		return p.waitErr
+	case <-time.After(bound):
+		t.Fatalf("bootstrap did not exit within %v; stderr:\n%s", bound, p.stderrString())
+		return nil
+	}
+}
 
 func appRoot(t *testing.T) string {
 	t.Helper()
@@ -220,21 +325,66 @@ func startNodeScript(t *testing.T, root, bs string) *nodeProc {
 	return startNodeScriptArgs(t, root, bs)
 }
 
+// startNodeScriptArgs writes bs to root/relay/bootstrap.mjs and runs it as a
+// live process on its OWN reserved loopback port, completing one authenticated
+// channel before returning. The spawn retries with a fresh port when the child
+// loses the bind race with another concurrent test package.
 func startNodeScriptArgs(t *testing.T, root, bs string, args ...string) *nodeProc {
 	t.Helper()
 	bsPath := filepath.Join(root, "relay", "bootstrap.mjs")
 	if err := os.WriteFile(bsPath, []byte(bs), 0o644); err != nil {
 		t.Fatalf("write bootstrap: %v", err)
 	}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		p := spawnNodeProcess(t, bsPath, args)
+		conn := p.dialChannel(t, 10*time.Second)
+		if err := clientHandshake(t, conn, p.secret); err != nil {
+			_ = conn.Close()
+			select {
+			case <-p.exitDone:
+				lastErr = fmt.Errorf("attempt %d: process exited during handshake: %v (%v)",
+					attempt+1, p.waitErr, err)
+				continue
+			default:
+				t.Fatalf("handshake: %v; stderr:\\n%s", err, p.stderrString())
+			}
+		}
+		p.conn = conn
+		return p
+	}
+	t.Fatalf("could not start the bootstrap channel after retries: %v", lastErr)
+	return nil
+}
+
+// startNodeUnauthenticated writes the standard rewritten bootstrap and spawns
+// it WITHOUT opening a channel: the listener is idle, so the test can drive
+// the raw handshake itself and prove the listener-stays contract — a rejected
+// peer is followed by a valid one on the SAME still-running process (once a
+// session is authenticated, admission closes every further connection).
+func startNodeUnauthenticated(t *testing.T, root string) *nodeProc {
+	t.Helper()
+	bsPath := filepath.Join(root, "relay", "bootstrap.mjs")
+	if err := os.WriteFile(bsPath, []byte(bootstrapFor(root)), 0o644); err != nil {
+		t.Fatalf("write bootstrap: %v", err)
+	}
+	return spawnNodeProcess(t, bsPath, nil)
+}
+
+// spawnNodeProcess starts node <bsPath> with the Relay-owned channel
+// environment plus the test's controlled baseline/system env. Exit is tracked
+// exactly once; no connection is made yet.
+func spawnNodeProcess(t *testing.T, bsPath string, args []string) *nodeProc {
+	t.Helper()
+	port := reserveLoopbackPort(t)
+	secret := testSecret(t)
 	cmd := exec.Command("node", append([]string{bsPath}, args...)...)
 	cmd.Env = append(os.Environ(),
+		"RELAY_EXECUTION_PORT="+strconv.Itoa(port),
+		"RELAY_EXECUTION_SECRET="+secret,
 		"RELAY_TEST_BASELINE=process-baseline",
 		"RELAY_TEST_SYSTEM=system-value",
 	)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		t.Fatalf("stdin pipe: %v", err)
-	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatalf("stdout pipe: %v", err)
@@ -243,38 +393,219 @@ func startNodeScriptArgs(t *testing.T, root, bs string, args ...string) *nodePro
 	if err != nil {
 		t.Fatalf("stderr pipe: %v", err)
 	}
-	p := &nodeProc{cmd: cmd, stdin: stdin, stdout: bufio.NewReader(stdout)}
+	p := &nodeProc{
+		cmd:      cmd,
+		port:     port,
+		secret:   secret,
+		exitDone: make(chan struct{}),
+	}
 	go func() {
-		p.writeErr(stderr)
+		_, _ = io.Copy(&p.stdout, stdout)
+	}()
+	go func() {
+		_, _ = io.Copy(p, stderr)
 	}()
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start bootstrap: %v", err)
 	}
+	go func() {
+		p.waitErr = cmd.Wait()
+		close(p.exitDone)
+	}()
 	t.Cleanup(func() {
-		_ = stdin.Close()
-		_ = cmd.Wait()
+		_ = p.closeChannel()
+		select {
+		case <-p.exitDone:
+		case <-time.After(3 * time.Second):
+			_ = cmd.Process.Kill()
+			<-p.exitDone
+		}
 	})
 	return p
 }
 
-func (p *nodeProc) writeErr(r io.Reader) {
-	_, _ = io.Copy(p, r)
+// reserveLoopbackPort reserves an ephemeral port bound on ALL interfaces (the
+// bootstrap listens on 0.0.0.0), then releases it for the child to bind. The
+// spawn/connect path retries with a fresh port if another process wins the
+// race, so parallel test packages never collide on a fixed port.
+func reserveLoopbackPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("reserve loopback port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	if err := ln.Close(); err != nil {
+		t.Fatalf("release reserved port: %v", err)
+	}
+	return port
 }
 
-func (p *nodeProc) Write(b []byte) (int, error) {
-	p.stderrMu.Lock()
-	defer p.stderrMu.Unlock()
-	_, _ = p.stderr.Write(b)
-	return len(b), nil
+// testSecret returns a fresh 64-lowercase-hex channel credential.
+func testSecret(t *testing.T) string {
+	t.Helper()
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatalf("generate secret: %v", err)
+	}
+	return hex.EncodeToString(b[:])
 }
 
-func (p *nodeProc) stderrString() string {
-	p.stderrMu.Lock()
-	defer p.stderrMu.Unlock()
-	return p.stderr.String()
+// channelWriteFrame writes one 4-byte big-endian length-prefixed frame.
+func channelWriteFrame(w io.Writer, payload []byte) error {
+	if len(payload) == 0 {
+		return fmt.Errorf("empty frame")
+	}
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
+	if _, err := w.Write(header[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(payload)
+	return err
+}
+
+// channelReadFrame reads one frame with the contract's zero/oversize/truncated
+// checks against max payload bytes.
+func channelReadFrame(r io.Reader, max int) ([]byte, error) {
+	var header [4]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return nil, err
+	}
+	size := binary.BigEndian.Uint32(header[:])
+	if size == 0 {
+		return nil, fmt.Errorf("empty frame")
+	}
+	if int64(size) > int64(max) {
+		return nil, fmt.Errorf("frame of %d bytes exceeds the %d-byte limit", size, max)
+	}
+	payload := make([]byte, int(size))
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+// channelChallengeMAC is the handshake MAC: HMAC-SHA256 keyed by the ASCII
+// secret over the direction context plus the nonce.
+func channelChallengeMAC(secret, contextPrefix, nonce string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(contextPrefix + nonce))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// dialChannel dials the child's reserved loopback port, retrying while the
+// process is alive (the listener binds slightly after startup) and failing as
+// soon as the process dies, within bound.
+func (p *nodeProc) dialChannel(t *testing.T, bound time.Duration) net.Conn {
+	t.Helper()
+	deadline := time.Now().Add(bound)
+	addr := fmt.Sprintf("127.0.0.1:%d", p.port)
+	for {
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			return conn
+		}
+		select {
+		case <-p.exitDone:
+			t.Fatalf("bootstrap exited before accepting a connection (port %d): %v; stderr:\\n%s",
+				p.port, p.waitErr, p.stderrString())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no connection to the bootstrap on %s within %v; stderr:\\n%s",
+				addr, bound, p.stderrString())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// clientHandshake performs the Relay side of the contract handshake on conn:
+// hello with a fresh nonce, verify the bootstrap's auth MAC, answer its
+// challenge with ready, then clear the handshake deadline.
+func clientHandshake(t *testing.T, conn net.Conn, secret string) error {
+	t.Helper()
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set handshake deadline: %v", err)
+	}
+	var nonceBytes [32]byte
+	if _, err := rand.Read(nonceBytes[:]); err != nil {
+		t.Fatalf("hello nonce: %v", err)
+	}
+	relayNonce := hex.EncodeToString(nonceBytes[:])
+	hello, err := json.Marshal(map[string]any{
+		"type": "hello", "version": 1, "nonce": relayNonce,
+	})
+	if err != nil {
+		t.Fatalf("marshal hello: %v", err)
+	}
+	if err := channelWriteFrame(conn, hello); err != nil {
+		return fmt.Errorf("write hello: %w", err)
+	}
+	raw, err := channelReadFrame(conn, channelHandshakeCap)
+	if err != nil {
+		return fmt.Errorf("read auth: %w", err)
+	}
+	var auth struct {
+		Type    string `json:"type"`
+		Version int    `json:"version"`
+		MAC     string `json:"mac"`
+		Nonce   string `json:"nonce"`
+	}
+	if err := json.Unmarshal(raw, &auth); err != nil {
+		return fmt.Errorf("malformed auth frame: %w", err)
+	}
+	if auth.Type != "auth" || auth.Version != 1 || len(auth.Nonce) != 64 {
+		return fmt.Errorf("unexpected auth frame: %q", raw)
+	}
+	want := channelChallengeMAC(secret, bootstrapAuthContext, relayNonce)
+	if !hmac.Equal([]byte(want), []byte(auth.MAC)) {
+		return fmt.Errorf("auth MAC does not verify (got %q)", auth.MAC)
+	}
+	ready, err := json.Marshal(map[string]any{
+		"type": "ready", "version": 1,
+		"mac": channelChallengeMAC(secret, clientAuthContext, auth.Nonce),
+	})
+	if err != nil {
+		t.Fatalf("marshal ready: %v", err)
+	}
+	if err := channelWriteFrame(conn, ready); err != nil {
+		return fmt.Errorf("write ready: %w", err)
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear handshake deadline: %v", err)
+	}
+	return nil
+}
+
+// reconnect opens a fresh connection to the same still-running process and
+// completes the handshake — the proof that a rejected peer did not kill the
+// listener.
+func (p *nodeProc) reconnect(t *testing.T) net.Conn {
+	t.Helper()
+	conn := p.dialChannel(t, 5*time.Second)
+	if err := clientHandshake(t, conn, p.secret); err != nil {
+		t.Fatalf("reconnect handshake: %v; stderr:\\n%s", err, p.stderrString())
+	}
+	return conn
+}
+
+// expectFrameReadFails asserts the next read fails within bound with ANY
+// error (the bootstrap closed the channel).
+func expectFrameReadFails(t *testing.T, conn net.Conn, bound time.Duration) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(bound)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	if _, err := channelReadFrame(conn, channelResultCap); err == nil {
+		t.Fatal("expected a read failure (closed channel), got a frame")
+	} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		t.Fatalf("channel stayed open after %v (no close observed)", bound)
+	}
 }
 
 type reqFrame struct {
+	Type    string            `json:"type"`
 	ID      string            `json:"id"`
 	Handler string            `json:"handler"`
 	Event   json.RawMessage   `json:"event"`
@@ -299,6 +630,7 @@ func defaultHandlerContext(handler string) map[string]any {
 }
 
 type respFrame struct {
+	Type  string `json:"type"`
 	ID    string `json:"id"`
 	OK    bool   `json:"ok"`
 	Error string `json:"error"`
@@ -309,9 +641,10 @@ func quote(s string) string {
 	return string(b)
 }
 
-// invoke writes one request frame and reads stdout until a sentinel protocol
-// response line arrives. The frame carries a default handler context so the
-// invocation exercises the production two-argument call.
+// invoke writes one framed invoke request on the authenticated channel, reads
+// the result frame, and collects the native stdout produced meanwhile. A dead
+// channel surfaces as invokeResult without OK instead of failing the test; the
+// frame contract (type, id echo) is validated on every exchange.
 func (p *nodeProc) invoke(t *testing.T, handler string, event string, env map[string]string) invokeResult {
 	return p.invokeTrace(t, handler, event, env, nil)
 }
@@ -322,40 +655,51 @@ func (p *nodeProc) invokeTrace(t *testing.T, handler string, event string, env, 
 }
 
 // invokeFrame is invokeTrace with an explicit "context" frame object; a nil
-// ctxFrame omits the field entirely.
+// ctxFrame omits the field entirely (a protocol violation the bootstrap must
+// reject by closing the channel).
 func (p *nodeProc) invokeFrame(t *testing.T, handler string, event string, env, trace map[string]string, ctxFrame any) invokeResult {
 	t.Helper()
+	if p.conn == nil {
+		t.Fatalf("invoke on a process without a channel")
+	}
 	id := fmt.Sprintf("t%d", p.seq)
 	p.seq++
-	frame, err := json.Marshal(reqFrame{ID: id, Handler: handler, Event: json.RawMessage(event), Env: env, Trace: trace, Context: ctxFrame})
+	frame, err := json.Marshal(reqFrame{
+		Type: "invoke", ID: id, Handler: handler,
+		Event: json.RawMessage(event), Env: env, Trace: trace, Context: ctxFrame,
+	})
 	if err != nil {
 		t.Fatalf("build request frame: %v", err)
 	}
-	if _, err := p.stdin.Write(append(frame, '\n')); err != nil {
-		t.Fatalf("write request frame: %v", err)
+	off := p.stdoutLen()
+	if err := p.conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set invoke deadline: %v", err)
 	}
-	var res invokeResult
-	for {
-		line, err := p.stdout.ReadBytes('\n')
-		if err != nil {
-			t.Fatalf("stdout EOF before a protocol response (process died): %v; stderr:\n%s", err, p.stderrString())
-		}
-		s := strings.TrimRight(string(line), "\n")
-		if strings.HasPrefix(s, relaySentinel) {
-			res.Frame = s
-			var resp respFrame
-			if err := json.Unmarshal([]byte(strings.TrimPrefix(s, relaySentinel)), &resp); err != nil {
-				t.Fatalf("response frame is not parseable JSON: %q", s)
-			}
-			if resp.ID != id {
-				t.Fatalf("response id = %q, want %q", resp.ID, id)
-			}
-			res.OK = resp.OK
-			res.Err = resp.Error
-			return res
-		}
-		res.Out += s + "\n"
+	if err := channelWriteFrame(p.conn, frame); err != nil {
+		return invokeResult{Err: "write invoke frame: " + err.Error()}
 	}
+	raw, err := channelReadFrame(p.conn, channelResultCap)
+	if err != nil {
+		return invokeResult{Err: "read result frame: " + err.Error()}
+	}
+	if err := p.conn.SetDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear invoke deadline: %v", err)
+	}
+	p.awaitStdoutQuiet()
+	res := invokeResult{Frame: string(raw), Out: p.stdoutSince(off)}
+	var resp respFrame
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("result frame is not parseable JSON: %q", raw)
+	}
+	if resp.Type != "result" {
+		t.Errorf("result type = %q, want %q", resp.Type, "result")
+	}
+	if resp.ID != id {
+		t.Errorf("result id = %q, want the echoed request id %q", resp.ID, id)
+	}
+	res.OK = resp.OK
+	res.Err = resp.Error
+	return res
 }
 
 func requireNode(t *testing.T) {
@@ -1488,7 +1832,9 @@ export function leak(event, context) {
 	}
 }
 
-func TestNodeRuntimeEOFExitsZero(t *testing.T) {
+// TestNodeRuntimeChannelCloseExitsZero pins the lifecycle: after Relay is
+// done with its authenticated connection the container exits 0 cleanly.
+func TestNodeRuntimeChannelCloseExitsZero(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
 	writeModule(t, root, "index.mjs", `export function f(event, context) {}`)
@@ -1497,72 +1843,94 @@ func TestNodeRuntimeEOFExitsZero(t *testing.T) {
 	if !r.OK {
 		t.Fatalf("invoke failed: %s", r.Err)
 	}
-	if err := p.stdin.Close(); err != nil {
-		t.Fatalf("close stdin: %v", err)
+	if err := p.closeChannel(); err != nil {
+		t.Fatalf("close channel: %v", err)
 	}
-	err := p.cmd.Wait()
-	if err != nil {
-		t.Fatalf("bootstrap did not exit 0 on stdin EOF: %v; stderr:\n%s", err, p.stderrString())
+	if err := p.waitExit(t, 10*time.Second); err != nil {
+		t.Fatalf("bootstrap did not exit 0 on channel close: %v; stderr:\n%s", err, p.stderrString())
 	}
 }
 
+// TestNodeRuntimeMalformedFrameIsFatal pins authenticated-phase framing: a
+// malformed JSON payload on the authenticated channel is a fatal protocol
+// failure — the channel closes, no result arrives, and the process exits
+// NONZERO so Relay discards the container (mjs stop(1)).
 func TestNodeRuntimeMalformedFrameIsFatal(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
 	writeModule(t, root, "index.mjs", `export function f(event, context) {}`)
-	if err := os.WriteFile(filepath.Join(root, "relay", "bootstrap.mjs"), []byte(bootstrapFor(root)), 0o644); err != nil {
-		t.Fatalf("write bootstrap: %v", err)
+	p := startNode(t, root)
+	if err := channelWriteFrame(p.conn, []byte("this is not json")); err != nil {
+		t.Fatalf("write malformed frame: %v", err)
 	}
-	cmd := exec.Command("node", filepath.Join(root, "relay", "bootstrap.mjs"))
-	cmd.Env = os.Environ()
-	cmd.Stdin = strings.NewReader("this is not json\n")
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("expected nonzero exit for a malformed request frame, out: %s", out)
+	expectFrameReadFails(t, p.conn, 5*time.Second)
+	_ = p.closeChannel()
+	if err := p.waitExit(t, 10*time.Second); err == nil {
+		t.Fatalf("a malformed authenticated frame must exit nonzero; stderr:\n%s", p.stderrString())
 	}
 }
 
-// TestNodeRuntimeFrameShape asserts one line, sentinel-prefix, valid JSON.
-func TestNodeRuntimeFrameShape(t *testing.T) {
+// TestNodeRuntimeResultFrameContract pins the result frame itself: a single
+// line (no in-band newline delimiter), parseable JSON, type=result, and the
+// echoed request id — validated on every exchange by the invoke helper and
+// re-asserted on the raw payload here.
+func TestNodeRuntimeResultFrameContract(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
-	writeModule(t, root, "index.mjs", `export function f(event, context) {}`)
+	writeModule(t, root, "index.mjs", `export function f(event, context) { console.log("print-line"); }`)
 	p := startNode(t, root)
 	r := p.invoke(t, "index.f", `{}`, nil)
 	if !r.OK {
 		t.Fatalf("invoke failed: %s", r.Err)
 	}
 	if strings.Contains(r.Frame, "\n") {
-		t.Errorf("response frame %q must be EXACTLY one line", r.Frame)
+		t.Errorf("result frame %q must be EXACTLY one line", r.Frame)
 	}
-	if !strings.HasPrefix(r.Frame, relaySentinel) {
-		t.Errorf("response frame %q must start with the sentinel %q", r.Frame, relaySentinel)
+	if !json.Valid([]byte(r.Frame)) {
+		t.Errorf("result frame payload %q must be valid JSON", r.Frame)
 	}
-	if !json.Valid([]byte(strings.TrimPrefix(r.Frame, relaySentinel))) {
-		t.Errorf("response frame payload %q must be valid JSON", r.Frame)
+	var resp respFrame
+	if err := json.Unmarshal([]byte(r.Frame), &resp); err != nil {
+		t.Fatalf("result frame must unmarshal: %v", err)
+	}
+	if resp.Type != "result" || resp.ID == "" {
+		t.Errorf("resp = %+v, want type=result with a non-empty id", resp)
+	}
+	// Channel/log separation: the protocol never touches stdout.
+	if strings.Contains(p.stdoutString(), `"type":"result"`) ||
+		strings.Contains(p.stdoutString(), `"type":"invoke"`) ||
+		strings.Contains(p.stdoutString(), `"mac"`) ||
+		strings.Contains(p.stdoutString(), "@@RELAY@@") {
+		t.Errorf("protocol data leaked to stdout:\n%s", p.stdoutString())
+	}
+	if !strings.Contains(r.Out, "print-line") {
+		t.Errorf("stdout out = %q, want the native print", r.Out)
+	}
+	if !utf8.ValidString(p.stdoutString()) {
+		t.Error("stdout must remain valid text (no binary frame headers)")
 	}
 }
 
-// goFrameCap is the Go bootstrap-side frame cap (internal/runtime
-// maxResponseFrame = 3 KiB), hardcoded here to avoid an import cycle. A
-// bootstrap response frame must always fit within it in UTF-8 bytes.
-const goFrameCap = 3 << 10
+// resultFrameCap is the contract's result payload cap (1 MiB), mirrored here
+// to avoid an import cycle with the Go runtime package; the error string itself
+// is additionally bounded by channelErrorCap (64 KiB).
+const resultFrameCap = 1 << 20
 
-// TestNodeRuntimeErrorFrameBound pins the error-frame byte cap across ASCII,
-// multibyte, emoji, accented, and control/escaped text: the emitted frame is at
-// most the Go cap in UTF-8 bytes, is valid UTF-8, is still parseable JSON with
-// the expected id, and remains a handler error (ok:false) rather than a
-// malformed response.
+// TestNodeRuntimeErrorFrameBound pins the error-frame bounds across ASCII,
+// multibyte, emoji, accented, and control/escaped text: the emitted frame stays
+// within the 1 MiB result cap in UTF-8 bytes, its error field within 64 KiB,
+// it remains parseable JSON with a non-empty id and ok:false, and the process
+// stays healthy afterwards.
 func TestNodeRuntimeErrorFrameBound(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
 	writeModule(t, root, "index.mjs", `
 export function short(event, context) { throw new Error("short ascii"); }
-export function long(event, context) { throw new Error("x".repeat(20000)); }
-export function multi(event, context) { throw new Error("é".repeat(20000)); }
-export function emoji(event, context) { throw new Error("😀".repeat(8000)); }
-export function accented(event, context) { throw new Error("àéîõü".repeat(5000)); }
-export function control(event, context) { throw new Error("\t\n\u0000\u0007".repeat(5000)); }
+export function long(event, context) { throw new Error("x".repeat(100000)); }
+export function multi(event, context) { throw new Error("é".repeat(100000)); }
+export function emoji(event, context) { throw new Error("😀".repeat(40000)); }
+export function accented(event, context) { throw new Error("àéîõü".repeat(30000)); }
+export function control(event, context) { throw new Error("\t\n\u0000\u0007".repeat(30000)); }
 `)
 	p := startNode(t, root)
 
@@ -1582,25 +1950,24 @@ export function control(event, context) { throw new Error("\t\n\u0000\u0007".rep
 			if r.OK {
 				t.Fatal("expected the raising handler to fail the invocation")
 			}
-			if len(r.Frame) > goFrameCap {
-				t.Fatalf("frame length %d exceeds the Go cap %d", len(r.Frame), goFrameCap)
+			if len(r.Frame) > resultFrameCap {
+				t.Fatalf("frame length %d exceeds the result cap %d", len(r.Frame), resultFrameCap)
 			}
 			if !utf8.ValidString(r.Frame) {
 				t.Fatal("frame must be valid UTF-8")
 			}
-			payload := strings.TrimPrefix(r.Frame, relaySentinel)
-			if !json.Valid([]byte(payload)) {
-				t.Fatalf("frame payload must be valid JSON: %q", payload)
-			}
 			var resp respFrame
-			if err := json.Unmarshal([]byte(payload), &resp); err != nil {
-				t.Fatalf("frame payload must unmarshal: %v", err)
+			if err := json.Unmarshal([]byte(r.Frame), &resp); err != nil {
+				t.Fatalf("frame must be valid parseable JSON: %v (%q)", err, r.Frame)
 			}
 			if resp.ID == "" || resp.OK {
 				t.Fatalf("resp = %+v, want a non-empty id and ok:false for the handler error", resp)
 			}
 			if resp.Error == "" {
 				t.Fatal("expected a non-empty bounded error string")
+			}
+			if len(resp.Error) > channelErrorCap {
+				t.Fatalf("error length %d exceeds the %d-byte diagnostic cap", len(resp.Error), channelErrorCap)
 			}
 			// The process must stay healthy after an oversized error.
 			ok := p.invoke(t, "index.short", `{}`, nil)
@@ -1667,6 +2034,11 @@ export function show(event, context) {
 	}
 }
 
+// TestNodeRuntimeHandlerContextRequired pins the strict context contract: a
+// frame whose context is missing or not an object is a PROTOCOL violation —
+// the authenticated channel closes before any handler runs (no result, no side
+// effect), and the process exits nonzero so Relay discards the container. Each
+// case needs a fresh process because one violation ends the session.
 func TestNodeRuntimeHandlerContextRequired(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
@@ -1675,8 +2047,6 @@ export function shouldNotRun(event, context) {
   console.log("handler-ran");
 }
 `)
-	p := startNode(t, root)
-
 	for _, tc := range []struct {
 		name    string
 		context any
@@ -1687,15 +2057,19 @@ export function shouldNotRun(event, context) {
 		{name: "array", context: []any{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			p := startNode(t, root)
 			r := p.invokeFrame(t, "index.shouldNotRun", `{}`, nil, nil, tc.context)
 			if r.OK {
 				t.Fatal("invocation succeeded without an object context")
 			}
-			if !strings.Contains(r.Err, "request context") {
-				t.Errorf("error = %q, want a clear request-context error", r.Err)
+			// No result frame arrives: the channel closes instead.
+			expectFrameReadFails(t, p.conn, 5*time.Second)
+			if strings.Contains(p.stdoutString(), "handler-ran") {
+				t.Errorf("handler ran despite invalid context: %q", p.stdoutString())
 			}
-			if strings.Contains(r.Out, "handler-ran") {
-				t.Errorf("handler ran despite invalid context: %q", r.Out)
+			_ = p.closeChannel()
+			if err := p.waitExit(t, 10*time.Second); err == nil {
+				t.Errorf("a context violation must exit nonzero; stderr:\n%s", p.stderrString())
 			}
 		})
 	}
@@ -1834,5 +2208,385 @@ export function remember(event, context) {
 	}
 	if !strings.Contains(r2.Out, "requestId=event:m-b:fn/remember") {
 		t.Errorf("second out = %q, want its own request ID (no leakage from the first)", r2.Out)
+	}
+}
+
+// writeMarkerModule writes a handler that records its execution in a marker
+// file, so a rejection test can prove NO handler side effect occurred.
+func writeMarkerModule(t *testing.T, root string) string {
+	t.Helper()
+	marker := filepath.Join(root, "RAN-marker")
+	writeModule(t, root, "index.mjs", fmt.Sprintf(`
+import { writeFileSync } from "node:fs";
+export function mark(event, context) {
+  writeFileSync(%q, "ran");
+}
+`, marker))
+	return marker
+}
+
+// TestNodeRuntimeHelloVersionBooleanRejected pins strict version typing: the
+// JSON boolean true is `!== 1` in JS, so a hello carrying it is rejected
+// before authentication, the listener survives, and a valid peer connects.
+func TestNodeRuntimeHelloVersionBooleanRejected(t *testing.T) {
+	requireNode(t)
+	root := appRoot(t)
+	writeModule(t, root, "index.mjs", `export function f(event, context) {}`)
+	p := startNodeUnauthenticated(t, root)
+
+	conn := p.dialChannel(t, 5*time.Second)
+	raw := fmt.Sprintf(`{"type":"hello","version":true,"nonce":%q}`, strings.Repeat("a", 64))
+	if err := channelWriteFrame(conn, []byte(raw)); err != nil {
+		t.Fatalf("write boolean-version hello: %v", err)
+	}
+	expectFrameReadFails(t, conn, 5*time.Second)
+	_ = conn.Close()
+
+	conn2 := p.reconnect(t)
+	defer conn2.Close()
+	p.conn = conn2
+	r := p.invoke(t, "index.f", `{}`, nil)
+	if !r.OK {
+		t.Fatalf("invoke after the rejected hello failed: %s", r.Err)
+	}
+}
+
+// TestNodeRuntimeReadyVersionBooleanRejected pins the same strict typing on
+// Relay's ready frame: version:true fails authentication, the peer is closed,
+// and the listener survives for the correct ready.
+func TestNodeRuntimeReadyVersionBooleanRejected(t *testing.T) {
+	requireNode(t)
+	root := appRoot(t)
+	writeModule(t, root, "index.mjs", `export function f(event, context) {}`)
+	p := startNodeUnauthenticated(t, root)
+
+	conn := p.dialChannel(t, 5*time.Second)
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	hello, _ := json.Marshal(map[string]any{
+		"type": "hello", "version": 1, "nonce": strings.Repeat("b", 64),
+	})
+	if err := channelWriteFrame(conn, hello); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+	if _, err := channelReadFrame(conn, channelHandshakeCap); err != nil {
+		t.Fatalf("read auth: %v", err)
+	}
+	ready := fmt.Sprintf(`{"type":"ready","version":true,"mac":%q}`, strings.Repeat("c", 64))
+	if err := channelWriteFrame(conn, []byte(ready)); err != nil {
+		t.Fatalf("write boolean-version ready: %v", err)
+	}
+	expectFrameReadFails(t, conn, 5*time.Second)
+	_ = conn.Close()
+
+	conn2 := p.reconnect(t)
+	defer conn2.Close()
+	p.conn = conn2
+	r := p.invoke(t, "index.f", `{}`, nil)
+	if !r.OK {
+		t.Fatalf("invoke after the rejected ready failed: %s", r.Err)
+	}
+}
+
+// TestNodeRuntimeWrongSecretRejectedNoInvocation pins the credential check: a
+// peer that answers the challenge under the WRONG secret is closed before any
+// handler runs, and the listener stays available for Relay's correct secret.
+func TestNodeRuntimeWrongSecretRejectedNoInvocation(t *testing.T) {
+	requireNode(t)
+	root := appRoot(t)
+	marker := writeMarkerModule(t, root)
+	p := startNodeUnauthenticated(t, root)
+
+	conn := p.dialChannel(t, 5*time.Second)
+	wrong := testSecret(t)
+	if err := clientHandshake(t, conn, wrong); err == nil {
+		t.Fatal("a handshake under the wrong secret must fail")
+	}
+	expectFrameReadFails(t, conn, 5*time.Second)
+	_ = conn.Close()
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the unauthenticated peer must never reach a handler")
+	}
+
+	conn2 := p.reconnect(t)
+	defer conn2.Close()
+	p.conn = conn2
+	r := p.invoke(t, "index.mark", `{}`, nil)
+	if !r.OK {
+		t.Fatalf("invoke with the correct secret failed: %s", r.Err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("correct peer's handler did not run: %v", err)
+	}
+}
+
+// TestNodeRuntimeNonStandardJSONConstantsRejectedBeforeHandler pins the JSON
+// extension rejection parity with Python: NaN / Infinity / -Infinity (which
+// JSON.parse rejects natively) fail at frame decode BEFORE any handler side
+// effect, closing the channel with a nonzero exit. Sibling test: standard
+// exponent numbers remain valid.
+func TestNodeRuntimeNonStandardJSONConstantsRejectedBeforeHandler(t *testing.T) {
+	requireNode(t)
+	root := appRoot(t)
+	marker := writeMarkerModule(t, root)
+	ctxJSON, err := json.Marshal(defaultHandlerContext("index.mark"))
+	if err != nil {
+		t.Fatalf("marshal context: %v", err)
+	}
+	for _, constant := range []string{"NaN", "Infinity", "-Infinity"} {
+		t.Run(constant, func(t *testing.T) {
+			p := startNode(t, root)
+			raw := fmt.Sprintf(
+				`{"type":"invoke","id":"bad-const","handler":"index.mark","event":{"v":%s},"env":{},"context":%s}`,
+				constant, ctxJSON,
+			)
+			if err := channelWriteFrame(p.conn, []byte(raw)); err != nil {
+				t.Fatalf("write nonstandard frame: %v", err)
+			}
+			expectFrameReadFails(t, p.conn, 5*time.Second)
+			_ = p.closeChannel()
+			if _, err := os.Stat(marker); err == nil {
+				t.Fatalf("%s must be rejected before any handler side effect", constant)
+			}
+			if err := p.waitExit(t, 10*time.Second); err == nil {
+				t.Errorf("a nonstandard JSON constant must exit nonzero; stderr:\n%s", p.stderrString())
+			}
+		})
+	}
+}
+
+// TestNodeRuntimeValidNumericPayloadPreserved keeps the standard half of the
+// contract green: exponents, negatives, and plain integers in the event decode
+// and reach the handler unchanged.
+func TestNodeRuntimeValidNumericPayloadPreserved(t *testing.T) {
+	requireNode(t)
+	root := appRoot(t)
+	writeModule(t, root, "index.mjs", `
+export function nums(event, context) {
+  console.log("sci=" + event.sci);
+  console.log("tiny=" + event.tiny);
+  console.log("int=" + event.int);
+}
+`)
+	p := startNode(t, root)
+	r := p.invoke(t, "index.nums", `{"sci":1.5e3,"tiny":-2.51e-8,"int":42}`, nil)
+	if !r.OK {
+		t.Fatalf("standard numeric payload rejected: %s", r.Err)
+	}
+	for _, want := range []string{"sci=1500", "tiny=-2.51e-8", "int=42"} {
+		if !strings.Contains(r.Out, want) {
+			t.Errorf("out = %q, want %q", r.Out, want)
+		}
+	}
+}
+
+// TestNodeRuntimeContextHandlerMismatchClosesChannel pins the strict routing
+// identity: context.handler must equal the invocation's handler. A mismatch is
+// a protocol violation that closes the authenticated channel BEFORE handler
+// execution — no result, no side effect, nonzero exit.
+func TestNodeRuntimeContextHandlerMismatchClosesChannel(t *testing.T) {
+	requireNode(t)
+	root := appRoot(t)
+	marker := writeMarkerModule(t, root)
+	p := startNode(t, root)
+
+	r := p.invokeFrame(t, "index.mark", `{}`, nil, nil, defaultHandlerContext("index.other"))
+	if r.OK {
+		t.Fatal("a context.handler mismatch must close the channel, not return a result")
+	}
+	expectFrameReadFails(t, p.conn, 5*time.Second)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the mismatch must be rejected before the handler runs")
+	}
+	_ = p.closeChannel()
+	if err := p.waitExit(t, 10*time.Second); err == nil {
+		t.Errorf("a context.handler mismatch must exit nonzero; stderr:\n%s", p.stderrString())
+	}
+}
+
+// TestNodeRuntimeSecondConnectionRejectedWhileActive pins the single-session
+// admission: while Relay's authenticated session is active a second connection
+// can never drive handlers — whatever it attempts, its channel closes without
+// any handler side effect — and the active session keeps serving untouched.
+func TestNodeRuntimeSecondConnectionRejectedWhileActive(t *testing.T) {
+	requireNode(t)
+	root := appRoot(t)
+	writeModule(t, root, "index.mjs", `
+const counter = { n: 0 };
+export function count(event, context) {
+  counter.n += 1;
+  console.log("count=" + counter.n);
+}
+`)
+	p := startNode(t, root)
+
+	r1 := p.invoke(t, "index.count", `{}`, nil)
+	if !r1.OK || !strings.Contains(r1.Out, "count=1") {
+		t.Fatalf("first invoke = %+v, want count=1", r1)
+	}
+
+	// A second connection: depending on the admission point it is closed before
+	// or just after its handshake, but an invoke attempt on it must never
+	// complete and no handler may run through it.
+	intruder := p.dialChannel(t, 5*time.Second)
+	_ = clientHandshake(t, intruder, p.secret) // may fail if admission closed early
+	frame, err := json.Marshal(reqFrame{
+		Type: "invoke", ID: "intruder", Handler: "index.count",
+		Event: json.RawMessage(`{}`), Env: map[string]string{},
+		Context: defaultHandlerContext("index.count"),
+	})
+	if err != nil {
+		t.Fatalf("marshal intruder frame: %v", err)
+	}
+	_ = channelWriteFrame(intruder, frame) // may fail on an already-closed socket
+	expectFrameReadFails(t, intruder, 5*time.Second)
+	_ = intruder.Close()
+
+	// The active session is untouched: the counter proves NO handler ran for
+	// the intruder and the channel still serves invocations.
+	r2 := p.invoke(t, "index.count", `{}`, nil)
+	if !r2.OK || !strings.Contains(r2.Out, "count=2") {
+		t.Fatalf("invoke after the rejected second connection = %+v, want count=2 (no extra handler, session intact)", r2)
+	}
+}
+
+// TestNodeRuntimeOversizeHelloRejected pins the handshake frame cap: a
+// declared length over 4 KiB is refused before allocation, the peer is closed
+// unauthenticated, and the listener survives.
+func TestNodeRuntimeOversizeHelloRejected(t *testing.T) {
+	requireNode(t)
+	root := appRoot(t)
+	writeModule(t, root, "index.mjs", `export function f(event, context) {}`)
+	p := startNodeUnauthenticated(t, root)
+
+	conn := p.dialChannel(t, 5*time.Second)
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], uint32(channelHandshakeCap+1))
+	if _, err := conn.Write(header[:]); err != nil {
+		t.Fatalf("write oversize header: %v", err)
+	}
+	expectFrameReadFails(t, conn, 5*time.Second)
+	_ = conn.Close()
+
+	conn2 := p.reconnect(t)
+	defer conn2.Close()
+	p.conn = conn2
+	r := p.invoke(t, "index.f", `{}`, nil)
+	if !r.OK {
+		t.Fatalf("invoke after the oversize rejection failed: %s", r.Err)
+	}
+}
+
+// TestNodeRuntimePartialHelloFrameTimesOut pins the exact-read rule: a frame
+// whose payload never completes gets the peer closed by the 2s handshake
+// deadline, with no handler side effect and the listener left standing.
+func TestNodeRuntimePartialHelloFrameTimesOut(t *testing.T) {
+	requireNode(t)
+	root := appRoot(t)
+	writeModule(t, root, "index.mjs", `export function f(event, context) {}`)
+	p := startNodeUnauthenticated(t, root)
+
+	conn := p.dialChannel(t, 5*time.Second)
+	var header [4]byte
+	header[3] = 100 // declares 100 bytes, delivers only a few
+	if _, err := conn.Write(header[:]); err != nil {
+		t.Fatalf("write partial header: %v", err)
+	}
+	if _, err := conn.Write([]byte(`{"type":"he`)); err != nil {
+		t.Fatalf("write partial payload: %v", err)
+	}
+	expectFrameReadFails(t, conn, 6*time.Second)
+	_ = conn.Close()
+
+	conn2 := p.reconnect(t)
+	defer conn2.Close()
+	p.conn = conn2
+	r := p.invoke(t, "index.f", `{}`, nil)
+	if !r.OK {
+		t.Fatalf("invoke after the partial-frame timeout failed: %s", r.Err)
+	}
+}
+
+// TestNodeRuntimePartialInvokeFrameClosesChannelWithoutHandler is the
+// authenticated-phase counterpart of the partial-hello regression: a framed
+// invoke whose HEADER or whose PAYLOAD arrives truncated (split writes) must
+// never busy-spin the event loop, must never produce a result or reach the
+// handler on truncated JSON, and — once the peer stops sending and closes —
+// must terminate the channel/process within a bounded wait, exactly as the
+// contract requires (a malformed/incomplete authenticated frame closes the
+// connection and the bootstrap exits so Relay discards the container).
+//
+// The bounded waits are the busy-spin detector: a spinning read loop never
+// processes the peer's close, so waitExit would exceed its bound and fail.
+func TestNodeRuntimePartialInvokeFrameClosesChannelWithoutHandler(t *testing.T) {
+	requireNode(t)
+	root := appRoot(t)
+	marker := writeMarkerModule(t, root)
+	frame, err := json.Marshal(reqFrame{
+		Type: "invoke", ID: "partial-frame", Handler: "index.mark",
+		Event: json.RawMessage(`{}`), Env: map[string]string{},
+		Context: defaultHandlerContext("index.mark"),
+	})
+	if err != nil {
+		t.Fatalf("marshal invoke frame: %v", err)
+	}
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], uint32(len(frame)))
+
+	for _, tc := range []struct {
+		name string
+		// writes performs the truncated send on the authenticated connection.
+		writes func(t *testing.T, conn net.Conn)
+	}{
+		{
+			name: "split header",
+			writes: func(t *testing.T, conn net.Conn) {
+				if _, err := conn.Write(header[:2]); err != nil { // 2 of 4 header bytes
+					t.Fatalf("write partial header: %v", err)
+				}
+			},
+		},
+		{
+			name: "split payload",
+			writes: func(t *testing.T, conn net.Conn) {
+				if _, err := conn.Write(header[:]); err != nil { // full length header...
+					t.Fatalf("write header: %v", err)
+				}
+				if _, err := conn.Write(frame[:len(frame)/2]); err != nil { // ...half the JSON
+					t.Fatalf("write partial payload: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// A protocol failure ends the session: each case needs a fresh
+			// authenticated process.
+			p := startNode(t, root)
+			tc.writes(t, p.conn)
+
+			// 1) No result frame may come back for truncated input (the
+			// bootstrap either awaits the remainder or tears the channel
+			// down — it must never answer a half-frame).
+			if err := p.conn.SetReadDeadline(time.Now().Add(1500 * time.Millisecond)); err != nil {
+				t.Fatalf("set read deadline: %v", err)
+			}
+			raw, rerr := channelReadFrame(p.conn, channelResultCap)
+			if rerr == nil {
+				t.Fatalf("a truncated frame must never produce a result: %q", raw)
+			}
+			_ = p.conn.SetReadDeadline(time.Time{})
+
+			// 2) Close our side and require bounded termination: a busy-spinning
+			// read loop would never observe this close and waitExit would fail
+			// its bound.
+			_ = p.closeChannel()
+			_ = p.waitExit(t, 10*time.Second)
+
+			// 3) Truncated JSON must never reach the handler.
+			if _, err := os.Stat(marker); err == nil {
+				t.Fatal("handler ran on a truncated invocation frame")
+			}
+		})
 	}
 }

@@ -289,7 +289,7 @@ func TestBatchDiscardStaysTrackedUntilAllItemsComplete(t *testing.T) {
 			image:  "img",
 			id:     id,
 			ops:    m.containerOps(),
-			attach: &client.ContainerAttachResult{HijackedResponse: client.NewHijackedResponse(clientEnd, "application/vnd.docker.multiplexed-stream")},
+			conn:   clientEnd,
 			closed: make(chan struct{}),
 		}
 		lease, err := m.containers.acquire(context.Background(), "fn", "img", 2, func() (reusableContainer, error) { return c, nil })
@@ -577,7 +577,7 @@ func TestManagerStartContainerCleansCreateAfterShutdown(t *testing.T) {
 			image:  "img",
 			id:     "cid",
 			ops:    ops,
-			attach: &client.ContainerAttachResult{HijackedResponse: client.NewHijackedResponse(clientEnd, "application/vnd.docker.multiplexed-stream")},
+			conn:   clientEnd,
 			closed: make(chan struct{}),
 		}, nil
 	}
@@ -719,7 +719,7 @@ func TestExecutionContainerDiscardRunsUnderManagerOps(t *testing.T) {
 			image:  "img",
 			id:     "cid",
 			ops:    containerOps{lifecycle: o.context(), gate: o},
-			attach: &client.ContainerAttachResult{HijackedResponse: client.NewHijackedResponse(clientEnd, "application/vnd.docker.multiplexed-stream")},
+			conn:   clientEnd,
 			closed: make(chan struct{}),
 		}
 	}
@@ -788,7 +788,7 @@ func TestPoolDiscardRefusedLeavesContainerForTeardown(t *testing.T) {
 		image:  "img",
 		id:     "cid",
 		ops:    containerOps{lifecycle: o.context(), gate: o},
-		attach: &client.ContainerAttachResult{HijackedResponse: client.NewHijackedResponse(clientEnd, "application/vnd.docker.multiplexed-stream")},
+		conn:   clientEnd,
 		closed: make(chan struct{}),
 	}
 

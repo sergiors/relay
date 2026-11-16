@@ -14,14 +14,15 @@ import (
 
 // TestStartContainerRejectsControlNetworkBeforeCreate proves the execution
 // create path applies the same control-network guard as services, before Docker
-// ContainerCreate: a worker-global set pointing at a labelled control network
-// fails the cold start and no create request is issued.
+// ContainerCreate: a worker-global set pointing at a network carrying only
+// relay.network.role=execution-control fails the cold start and no create
+// request is issued.
 func TestStartContainerRejectsControlNetworkBeforeCreate(t *testing.T) {
 	creates := 0
 	cli := newScriptedDockerClient(t,
 		dockerRoute{
 			method: http.MethodGet, path: "/networks/control",
-			body: `{"Name":"control","Labels":{"relay.control":"true"}}`,
+			body: `{"Name":"control","Labels":{"relay.network.role":"execution-control"}}`,
 		},
 		dockerRoute{
 			method: http.MethodPost, path: "/containers/create",
@@ -66,7 +67,8 @@ func TestStartExecutionContainerRejectsUnsafeMountBeforeCreate(t *testing.T) {
 	})
 	m := &Manager{cli: cli, log: testutil.DiscardLogger()}
 
-	_, err := startExecutionContainer(context.Background(), containerOps{}, m.cli, m.log,
+	_, err := startExecutionContainer(context.Background(),
+		containerOps{controlNetwork: unitControlNetwork}, m.cli, m.log,
 		"fn", "img", nil, nil, app.ResourceLimits{}, RunMeta{}, "", "/apps/fn",
 		mount.Mount{Type: mount.TypeBind, Source: "/apps/fn", Target: "/app/src"})
 	if err == nil {
@@ -83,8 +85,12 @@ func TestStartExecutionContainerRejectsUnsafeMountBeforeCreate(t *testing.T) {
 // TestStartExecutionContainerNetworkingConfig drives the real
 // startExecutionContainer client path against the scripted daemon and inspects
 // the ACTUAL serialized /containers/create request (not the pure helper), so
-// the worker-global NETWORKS set is proven to reach Docker's
-// NetworkingConfig.EndpointsConfig on the wire.
+// the join set is proven to reach Docker's NetworkingConfig.EndpointsConfig on
+// the wire. In production the Manager passes executionNetworks() — the
+// internal control network plus the optional NETWORKS set — so an empty
+// NETWORKS still yields the control endpoint (see
+// TestStartContainerJoinsControlNetworkPlusNetworks for the Manager-level
+// composition) and no NETWORKS value ever becomes the execution IPC path.
 //
 // The create route is scripted to FAIL, which makes startExecutionContainer
 // return before attach/start; the request body is still captured, and no real
@@ -92,7 +98,7 @@ func TestStartExecutionContainerRejectsUnsafeMountBeforeCreate(t *testing.T) {
 // the test on an unhandled request, any unexpected call (in particular a
 // network create) surfaces as a failure.
 func TestStartExecutionContainerNetworkingConfig(t *testing.T) {
-	t.Run("global networks serialized exactly once", func(t *testing.T) {
+	t.Run("join set serialized exactly once", func(t *testing.T) {
 		var createBody []byte
 		cli := newScriptedDockerClient(t, dockerRoute{
 			method: http.MethodGet, path: "/images/img/json", body: `{"Id":"sha256:img","Config":{}}`,
@@ -104,7 +110,8 @@ func TestStartExecutionContainerNetworkingConfig(t *testing.T) {
 		})
 		m := &Manager{cli: cli, log: testutil.DiscardLogger()}
 
-		_, err := startExecutionContainer(context.Background(), containerOps{}, m.cli, m.log,
+		_, err := startExecutionContainer(context.Background(),
+			containerOps{controlNetwork: unitControlNetwork}, m.cli, m.log,
 			"fn", "img", nil, []string{"backend", "frontend", "backend"}, app.ResourceLimits{}, RunMeta{}, "", "")
 		if err == nil {
 			t.Fatal("expected the scripted create failure")
@@ -127,29 +134,17 @@ func TestStartExecutionContainerNetworkingConfig(t *testing.T) {
 		}
 	})
 
-	t.Run("no networks sends no NetworkingConfig", func(t *testing.T) {
-		var createBody []byte
-		cli := newScriptedDockerClient(t, dockerRoute{
-			method: http.MethodGet, path: "/images/img/json", body: `{"Id":"sha256:img","Config":{}}`,
-		}, dockerRoute{
-			method: http.MethodPost, path: "/containers/create",
-			status: http.StatusInternalServerError,
-			body:   `{"message":"scripted create failure"}`,
-			onBody: func(b []byte) { createBody = append([]byte(nil), b...) },
-		})
-		m := &Manager{cli: cli, log: testutil.DiscardLogger()}
-
-		_, err := startExecutionContainer(context.Background(), containerOps{}, m.cli, m.log,
-			"fn", "img", nil, nil, app.ResourceLimits{}, RunMeta{}, "", "")
-		if err == nil {
-			t.Fatal("expected the scripted create failure")
-		}
-		if len(createBody) == 0 {
-			t.Fatal("no /containers/create body captured")
-		}
-		req := decodeCreateRequest(t, createBody)
-		if req.NetworkingConfig != nil {
-			t.Fatalf("expected no NetworkingConfig, got %v", req.NetworkingConfig)
+	// The control identity is REQUIRED on every execution create: a container
+	// ops value without one is refused before any daemon call — there is no
+	// NETWORKS-or-default-bridge fallback anymore. The scripted daemon has no
+	// routes at all, so even an image inspect would fail the test through the
+	// harness; the error text proves the refusal happened before any work.
+	t.Run("missing control identity is refused before create", func(t *testing.T) {
+		cli := newScriptedDockerClient(t)
+		_, err := startExecutionContainer(context.Background(), containerOps{}, cli, testutil.DiscardLogger(),
+			"fn", "img", nil, []string{"backend"}, app.ResourceLimits{}, RunMeta{}, "", "")
+		if err == nil || !strings.Contains(err.Error(), "internal control network is not configured") {
+			t.Fatalf("error = %v, want the required-control-network refusal", err)
 		}
 	})
 
@@ -174,7 +169,8 @@ func TestStartExecutionContainerNetworkingConfig(t *testing.T) {
 		)
 		m := &Manager{cli: cli, log: testutil.DiscardLogger()}
 
-		_, err := startExecutionContainer(context.Background(), containerOps{}, m.cli, m.log,
+		_, err := startExecutionContainer(context.Background(),
+			containerOps{controlNetwork: unitControlNetwork}, m.cli, m.log,
 			"fn", "img", nil, []string{"backend"}, app.ResourceLimits{}, RunMeta{}, "", "")
 		if err == nil {
 			t.Fatal("a missing network must surface as a container create error")

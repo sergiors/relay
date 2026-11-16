@@ -166,7 +166,6 @@ func TestIntegrationRequirementsInstalledWithUvAndExecutes(t *testing.T) {
 		"requirements.txt": "six==1.16.0\n",
 	})
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -178,9 +177,7 @@ func TestIntegrationRequirementsInstalledWithUvAndExecutes(t *testing.T) {
 	if err := m.Execute(ctx, prepared, "handler.run", []byte(`{"status":"COMPLETED"}`), nil); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	if logs := out.String(); !strings.Contains(logs, "six version 1.16.0") {
-		t.Errorf("expected the requirements dependency to be importable at runtime, got: %s", logs)
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "six version 1.16.0")
 }
 
 // TestIntegrationNativeUvProjectExecutes verifies the native uv path end to end:
@@ -199,7 +196,6 @@ func TestIntegrationNativeUvProjectExecutes(t *testing.T) {
 		"uv.lock":        uvLockFixture,
 	})
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -211,9 +207,7 @@ func TestIntegrationNativeUvProjectExecutes(t *testing.T) {
 	if err := m.Execute(ctx, prepared, "handler.run", []byte(`{"status":"COMPLETED"}`), nil); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	if logs := out.String(); !strings.Contains(logs, "six version 1.16.0") {
-		t.Errorf("expected the locked native dependency to be importable at runtime, got: %s", logs)
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "six version 1.16.0")
 }
 
 // TestIntegrationPythonNoDepsHasUvBinary verifies uv is copied into a Python

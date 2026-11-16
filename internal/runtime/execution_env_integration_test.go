@@ -31,9 +31,6 @@ import (
 func TestIntegrationExecutionConfigEnvExcludesDynamicEnv(t *testing.T) {
 	testutil.RequireDocker(t)
 	m, _ := newManager(t)
-	sink := &pollingSink{}
-	prev := SetAppOutput(sink)
-	t.Cleanup(func() { SetAppOutput(prev) })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -80,12 +77,8 @@ export async function env(event, context) {
 	}()
 
 	// Wait for both values to be observed, then inspect the live container.
-	if !waitForSinkContains(ctx, sink, "GREETING="+envValue) {
-		t.Fatalf("handler did not observe GREETING via the frame; sink:\n%s", sink.String())
-	}
-	if !waitForSinkContains(ctx, sink, "TOKEN="+secretValue) {
-		t.Fatalf("handler did not observe TOKEN via the frame; sink:\n%s", sink.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "GREETING="+envValue)
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "TOKEN="+secretValue)
 
 	id := findContainerByLabel(ctx, m.cli, labelApp, "env-boundary-e2e")
 	if id == "" {

@@ -1,10 +1,3 @@
-"""Public handler interfaces for Python applications running on Relay.
-
-The initial release exposes ``HandlerContext``, a Protocol describing the
-context object Relay passes to each handler. Relay's Python bootstrap
-constructs the concrete per-invocation value.
-"""
-
 from datetime import datetime
 from typing import Protocol
 
@@ -12,13 +5,6 @@ __all__ = ["HandlerContext"]
 
 
 class HandlerContext(Protocol):
-    """Metadata Relay supplies for exactly one handler invocation.
-
-    A handler receives a fresh instance as its second argument. Implementations
-    are structural: any object with these attributes and method satisfies the
-    contract, and handlers should treat the values as read-only.
-    """
-
     @property
     def request_id(self) -> str:
         """Stable identity for one logical invocation.

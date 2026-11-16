@@ -1,39 +1,12 @@
 # Relay
 
-Relay is an event-driven runtime for declarative apps — with serverless functions,
-schedules, and persistent services. Run it on infrastructure you control.
+Relay is an event-driven serverless runtime for apps that combine functions,
+scheduled jobs, and persistent services. It runs on infrastructure you control
+and uses Redis Streams for external events.
 
-It executes short-lived functions in isolated runtimes, publishes scheduled
-occurrences to the same Redis Stream and consumer group as external events, and
-continuously reconciles long-running services from the same declarative model.
-
-For external events, Relay consumes stream messages, classifies each event
-against declarative patterns, executes the matching functions, retries failures,
-and dead-letters exhausted invocations. Scheduled occurrences use a separate
-dispatch path that resolves the schedule's handler directly, without ordinary
-event classification or pattern matching.
-
-Persistent services use the same runtime, configuration, secrets, networking,
-resource controls, and container infrastructure without requiring them to
-participate in the event pipeline.
-
-**An app is the unit of source, configuration, and deployment.** Within an
-app, event-driven **functions**, schedules, and optional persistent services
-share one declarative model. A handler is the execution target for a one-shot
-function; an event pattern or schedule trigger determines when that function
-runs. Services are separate persistent workloads.
-
-Functions remain a first-class Relay workload. Start with a function.
-Add a service when you need one.
-
-Relay does not care where events originate:
-
-```text
-Producer → Redis Stream → Relay → App → Function (handler)
-```
-
-Functions, schedules, and persistent services are declared within an app and share
-the same deployment model while keeping their execution semantics independent.
+Functions execute handlers triggered by event patterns or schedules, with
+automatic retries and dead-letter queues for failed executions. Persistent
+services run continuously and are reconciled to their declared configuration.
 
 ## Getting Started
 
@@ -56,30 +29,29 @@ do not expose this stack to untrusted networks.
 
 ## What you get
 
-- **Event-driven execution** — Redis Streams, declarative matching, retries, reclaim, dead-lettering, and at-least-once delivery.
-- **Managed runtimes** — Python 3.14/3.15 (`python3.14`/`python3.15`) and
-  Node.js 24/26 (`nodejs24.x`/`nodejs26.x`), with TypeScript support, reusable
-  warm containers, and bounded concurrency.
-- **Cron schedules** — minute-precision cron with IANA timezones, deterministic occurrence identity, cluster-wide publication deduplication, bounded retries with a durable local outbox, and startup catch-up.
-- **Persistent services** — run APIs, workers, gateways, consumers, and other long-running processes from managed-runtime entrypoints or external container images, with replicas, Docker networks, resource limits, environment configuration, secrets, and optional Traefik routing.
-- **Resource controls** — per-container memory, CPU, and PID limits.
-- **Configuration and secrets** — environment values and secret references shared across apps, schedules, and services.
-- **Observability** — persisted statistics, Prometheus metrics, structured logs, and OpenTelemetry tracing.
-- **Operations** — health checks, manual invocation, DLQ inspection/replay, and Git synchronization. Dependency barriers may extend graceful shutdown while in-flight work finishes.
-- **One runtime process** — `relay start` runs in the foreground and leaves supervision to Docker, systemd, Kubernetes, or another process manager.
+- **Event-driven functions** — Redis Streams, declarative event matching,
+  at-least-once delivery, automatic retries, pending-message recovery, and
+  dead-letter queues.
+- **Managed runtimes** — Python 3.14/3.15 and Node.js 24/26, with JavaScript,
+  TypeScript support, reusable warm containers, and bounded concurrency.
+- **Cron schedules** — Minute-precision scheduling, IANA timezones,
+  cluster-wide deduplication, publication recovery, and startup catch-up.
+- **Persistent services** — Run APIs, workers, gateways, and other long-running
+  processes using managed runtimes or container images, with replicas,
+  networking, and optional Traefik routing.
+- **Resource controls** — Per-container memory, CPU, and PID limits for
+  functions and services.
+- **Configuration and secrets** — Environment variables and secret references
+  for applications, functions, and services.
+- **Observability** — Prometheus metrics, structured logs, persisted
+  statistics, and OpenTelemetry tracing.
+- **Operations** — Health checks, manual invocation, DLQ inspection and replay,
+  Git synchronization, and graceful shutdown.
+- **Flexible deployment** — Run Relay under Docker, systemd, Kubernetes, or
+  another process manager.
 
-## How it works
-
-Relay supports event-driven **functions**, scheduled functions, and persistent
-**services**. Event messages contain a JSON object in Redis Stream `value`; Relay
-matches decoded events against app patterns and runs every matching handler.
-Schedule occurrences use a separate dispatch path and bypass event matching.
-Services are long-running containers reconciled to their app configuration.
-
-See [Events](docs/events.md), [Schedules](docs/schedules.md), and
-[Services](docs/services.md) for the public behavior of each workload. Relay
-applies app changes from `/apps` live; see
-[Configuration](docs/configuration.md#hot-reload) for source handling.
+See [Apps](docs/apps.md), [Events](docs/events.md), [Schedules](docs/schedules.md),
+and [Services](docs/services.md) for workload behavior.
 
 ## Guarantees
 
@@ -101,165 +73,25 @@ recovery details, and [Operations](docs/operations.md) for deployment guidance.
 
 ## Apps
 
-Each app is a direct child of `/apps` and contains a `template.yaml`.
-
-A small event-driven app might look like this MongoDB CDC example. PostgreSQL
-CDC uses `tableName: [users]` instead of `collectionName: [users]`; the other
-normalized event fields are the same.
+An app is a direct child of `/apps` with a `template.yaml`. A template can
+combine event handlers, schedules, and persistent services. This MongoDB CDC
+rule matches inserts to the `users` collection (use `tableName` for PostgreSQL):
 
 ```yaml
 runtime: nodejs24.x
-concurrency: 4
-
-resources:
-  memory: 256MiB
-  cpus: 0.5
-  pids: 256
 
 events:
   - handler: handler.handler
     pattern:
       recordType: [INSERT]
       collectionName: [users]
-    timeout: 10s
-    retries: 2
 ```
 
-Relay-managed runtime apps are prepared as reusable container images and executed through the runtime pool.
-
-The same template can also declare:
-
-- environment variables
-- secret references
-- schedules
-- persistent services
-- resource limits
-- routing
-
-See [docs/apps.md](docs/apps.md) for the full app model and [docs/events.md](docs/events.md) for matching, retries, ACK, and DLQ behavior.
-
-## Persistent services
-
-Relay can manage long-running workloads alongside event-driven functions and schedules.
-
-A service is continuously reconciled toward its declared state rather than invoked by an event. This makes services suitable for HTTP APIs, background workers, gateways, consumers, and other processes expected to remain running.
-
-Services can either reuse Relay's managed runtime or run an external container image directly.
-
-### Managed runtime services
-
-A managed service uses the same source tree and runtime image model as an event-driven app.
-
-For example:
-
-```yaml
-runtime: python3.14
-
-env:
-  APP_ENV: production
-
-resources:
-  memory: 512MiB
-  cpus: 1
-
-services:
-  - name: api
-    entrypoint: app/main.py
-    port: 8000
-    replicas: 2
-```
-
-Relay prepares the runtime image and keeps the declared service replicas running.
-
-This is useful when the same app contains both event-driven functions and long-running processes:
-
-```text
-app
-├── functions triggered by events or schedules
-└── persistent API / worker
-```
-
-They can share the runtime, source tree, environment, secrets, resources, and deployment model while still having different execution semantics.
-
-### External image services
-
-A service may also run an existing container image:
-
-```yaml
-services:
-  - name: gateway
-    image: nginxinc/nginx-unprivileged:1.27-alpine
-    port: 8080
-```
-
-External images keep their own `USER` and `ENTRYPOINT`; Relay never forces a
-UID on them. The shared hardening still drops capabilities, sets
-`no-new-privileges`, and uses a read-only rootfs, so prefer images that already
-run as a non-root user and listen on an unprivileged port. The official
-`nginx` image expects to chown and setuid as root, which the hardened baseline
-does not permit. An image whose config declares Docker `VOLUME` destinations is
-rejected before create, because the daemon would materialize those as implicit
-anonymous writable volumes even with a read-only rootfs.
-
-These are intentionally different ownership models:
-
-```text
-Managed runtime entrypoint
-  Relay prepares the runtime image
-  Relay owns the managed image lifecycle
-  Relay runs and reconciles the service
-
-External image
-  Relay pulls and runs the image as-is
-  Relay reconciles the service containers
-  Relay does not build or own that image
-```
-
-Services may use app-level environment variables, secrets, the worker-global `NETWORKS`, resources, replicas, and routing configuration.
-
-Routed services may additionally use `TRAEFIK_NETWORK`.
-
-In short:
-
-```text
-Functions are invoked.
-Services are converged.
-```
-
-Start with a function. Add a service when you need one.
-
-See [docs/services.md](docs/services.md).
-
-## Schedules
-
-Schedule publication is deduplicated cluster-wide by occurrence. A durable
-outbox retries unresolved publications across restarts; handler execution remains
-at least once. See [docs/schedules.md](docs/schedules.md).
-
-## Managed images and external images
-
-Relay distinguishes between image identity and container configuration.
-
-Managed runtime images may be shared by event-driven apps and managed-runtime services.
-
-They are rebuilt only when their build inputs change.
-
-Changes such as:
-
-- memory limits
-- CPU limits
-- PID limits
-- networks
-- runtime environment
-- service replicas
-- routing
-- other container-only configuration
-
-may require new containers without requiring a new image.
-
-External service images are not built or garbage-collected as Relay-owned runtime images.
-
-This separation keeps build lifecycle and runtime convergence independent.
+See [Apps](docs/apps.md) for the template reference, [Events](docs/events.md) for
+matching and delivery, [Schedules](docs/schedules.md) for cron triggers, and
+[Services](docs/services.md) for long-running workloads. Changes under `/apps`
+are applied live; see
+[Configuration](docs/configuration.md#hot-reload).
 
 ## Commands
 

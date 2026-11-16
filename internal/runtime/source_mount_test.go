@@ -275,7 +275,8 @@ func TestStartExecutionContainerSerializesSourceMount(t *testing.T) {
 	m := &Manager{cli: cli, log: testutil.DiscardLogger()}
 
 	mounts := bindMounts(&SourceMount{HostPath: "/apps/fn", Target: "/app"})
-	_, err := startExecutionContainer(context.Background(), containerOps{}, m.cli, m.log,
+	_, err := startExecutionContainer(context.Background(),
+		containerOps{controlNetwork: unitControlNetwork}, m.cli, m.log,
 		"fn", "img", nil, nil, app.ResourceLimits{}, RunMeta{}, "", "/apps/fn", mounts...)
 	if err == nil {
 		t.Fatal("expected the scripted create failure")
@@ -317,7 +318,8 @@ func TestStartExecutionContainerSerializesNodeSourceMountConfig(t *testing.T) {
 		HostPath: "/apps/fn", Target: "/app/src", WorkDir: "/app/src",
 		Masks: []string{"/app/src/node_modules"},
 	})
-	_, err := startExecutionContainer(context.Background(), containerOps{}, m.cli, m.log,
+	_, err := startExecutionContainer(context.Background(),
+		containerOps{controlNetwork: unitControlNetwork}, m.cli, m.log,
 		"fn", "img", nil, nil, app.ResourceLimits{}, RunMeta{}, workDir, "/apps/fn", mounts...)
 	if err == nil {
 		t.Fatal("expected the scripted create failure")

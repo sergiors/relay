@@ -11,12 +11,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/client"
@@ -31,6 +33,51 @@ func writeFile(t *testing.T, dir, name, content string) {
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
 		t.Fatalf("write %s: %v", name, err)
 	}
+}
+
+// newTestExecutionNetwork creates a DEDICATED user-defined bridge network for
+// one integration manager and returns its name. Tests act as the operator that
+// owns the worker-global NETWORKS set in production: NETWORKS is OPTIONAL
+// application connectivity, separate from the always-present internal control
+// network (relay-control-<NODE_ID>, provisioned by EnsureControlNetwork in the
+// helpers below — never by this function). The network carries a relay.test
+// label (never the execution-control role, which the workload guard rejects)
+// and no ports are published.
+//
+// Each network belongs to exactly one test: its removal is registered FIRST so
+// it runs LAST (t.Cleanup is LIFO) — after the manager cleanup that discards
+// attached containers — and parallel tests can never remove a network still in
+// use because they never share one. A removal failure is logged, not fatal:
+// cleanup must not fail a passing test, and an orphaned empty bridge network is
+// reported for the operator instead.
+func newTestExecutionNetwork(t *testing.T) string {
+	t.Helper()
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		t.Fatalf("docker client for test network: %v", err)
+	}
+	t.Cleanup(func() { _ = cli.Close() })
+	name := fmt.Sprintf("relay-test-exec-%08x", rand.Uint32())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := cli.NetworkCreate(ctx, name, client.NetworkCreateOptions{
+		Driver: "bridge",
+		Labels: map[string]string{"relay.test": "execution"},
+	}); err != nil {
+		t.Fatalf("create test execution network %s: %v", name, err)
+	}
+	// Registered after the client cleanup above, so LIFO runs this FIRST while
+	// the client is still open; the manager cleanup (registered by the caller
+	// after this function returns) runs before both, removing attached
+	// containers before the network.
+	t.Cleanup(func() {
+		rctx, rcancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer rcancel()
+		if _, err := cli.NetworkRemove(rctx, name, client.NetworkRemoveOptions{}); err != nil {
+			t.Logf("cleanup: remove test execution network %s: %v", name, err)
+		}
+	})
+	return name
 }
 
 // newManager returns a Manager wired to a logger that writes into the returned
@@ -48,23 +95,52 @@ func writeFile(t *testing.T, dir, name, content string) {
 // integration suite; a missing database fails here rather than silently
 // running an uncoordinated manager.
 //
-// Handler stdout/stderr is NO LONGER routed through the logger (it is forwarded
-// as a raw transport to the app-output sink; see output.go and
-// newAppOutputSink), so handler-output assertions must read from that sink,
-// not from this operational log buffer. The logger level is nevertheless kept at
-// DEBUG here so the operational-line assertions these tests make are unaffected.
+// The manager also joins a dedicated per-test execution network via
+// WithNetworks (see newTestExecutionNetwork) for OPTIONAL application
+// connectivity, and provisions this node's persistent internal control network
+// through EnsureControlNetwork — the same call the worker startup preflight
+// makes, before which no execution container may be created. The control
+// network (relay-control-test-host) is shared and persistent across tests and
+// runs, exactly like production; it is never removed here. On a host-run Linux
+// test process the direct-route proof holds (the Docker bridge lives in this
+// namespace); on Docker Desktop the bridge lives in the VM, so provisioning —
+// and therefore every execution test — fails closed with the documented
+// guidance. Handler stdout/stderr are native Docker logs (never
+// Relay-forwarded), so handler-output assertions read the container's logs, not
+// this operational log buffer. The logger level is nevertheless kept at DEBUG
+// here so the operational-line assertions these tests make are unaffected.
 func newManager(t *testing.T) (*Manager, *bytes.Buffer) {
 	t.Helper()
 	var buf bytes.Buffer
 	l := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	dsn := testutil.NewStateDSN(t)
 	coord := stateDepCoordinator{st: testutil.OpenState(t, dsn)}
-	m, err := NewManager(l, nil, "test-host", WithDependencyImageCoordinator(coord))
+	network := newTestExecutionNetwork(t)
+	m, err := NewManager(l, nil, "test-host",
+		WithNetworks([]string{network}),
+		WithDependencyImageCoordinator(coord),
+	)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
+	ensureControlNetwork(t, m)
+	// Registered after the network/client cleanups, so it runs BEFORE them:
+	// Close discards attached containers first, then the network is removable.
 	t.Cleanup(func() { _ = m.Close() })
 	return m, &buf
+}
+
+// ensureControlNetwork provisions (or reuses) the manager's node control
+// network exactly like the worker preflight does, failing the test with the
+// actionable error when the topology cannot prove a route (see the host-run
+// constraint documented on newManager).
+func ensureControlNetwork(t *testing.T, m *Manager) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := m.EnsureControlNetwork(ctx); err != nil {
+		t.Fatalf("ensure control network: %v", err)
+	}
 }
 
 // cleanupImage removes an image, best-effort.
@@ -372,6 +448,152 @@ func assertHardenedHostConfig(t *testing.T, hc *container.HostConfig) {
 	}
 }
 
+// --- Native Docker log observation -----------------------------------------
+//
+// App stdout/stderr belong to the container's native Docker logs (the channel
+// contract): Relay never forwards them, so integration tests observe them with
+// the Docker SDK's ContainerLogs + stdcopy — never a Relay-side sink.
+// Observation is APP-wide (every container carrying the app's label, resolved
+// freshly on each poll), because a warm pool runs several containers and their
+// output is spread across them.
+
+// containerIDsForApp returns the ids of every running-or-exited container
+// carrying relay.app=appName, resolved fresh on every call.
+func containerIDsForApp(ctx context.Context, cli *client.Client, appName string) []string {
+	list, err := cli.ContainerList(ctx, client.ContainerListOptions{All: true})
+	if err != nil {
+		return nil
+	}
+	var ids []string
+	for _, c := range list.Items {
+		if c.Labels[labelApp] == appName {
+			ids = append(ids, c.ID)
+		}
+	}
+	return ids
+}
+
+// appLogsSnapshot returns the app's combined native stdout and stderr across
+// all its containers (fresh container resolution; empty on a list failure).
+func appLogsSnapshot(ctx context.Context, cli *client.Client, appName string) (stdout, stderr string) {
+	for _, id := range containerIDsForApp(ctx, cli, appName) {
+		out, errOut, err := fetchAppLogs(ctx, cli, id)
+		if err != nil {
+			continue
+		}
+		stdout += out
+		stderr += errOut
+	}
+	return stdout, stderr
+}
+
+// fetchAppLogs returns one container's full native stdout and stderr streams
+// (non-following snapshot), demultiplexed exactly like the daemon emits them.
+func fetchAppLogs(ctx context.Context, cli *client.Client, id string) (stdout, stderr string, err error) {
+	res, err := cli.ContainerLogs(ctx, id, client.ContainerLogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+	})
+	if err != nil {
+		return "", "", err
+	}
+	defer res.Close()
+	var outBuf, errBuf bytes.Buffer
+	if _, err := stdcopy.StdCopy(&outBuf, &errBuf, res); err != nil {
+		return outBuf.String(), errBuf.String(), err
+	}
+	return outBuf.String(), errBuf.String(), nil
+}
+
+// awaitAppLogsFor polls the app's native logs until every wanted substring
+// appears on either stream of any of its containers, then returns the combined
+// text. Handler output trails the invocation asynchronously, so presence is
+// polled (never asserted on the first snapshot). It fails the test with the
+// full log dump after 10s.
+func awaitAppLogsFor(t *testing.T, ctx context.Context, cli *client.Client, appName string, wants ...string) string {
+	t.Helper()
+	stdout, stderr := awaitAppStreamsFor(t, ctx, cli, appName, wants...)
+	return stdout + stderr
+}
+
+// awaitAppStreamsFor is awaitAppLogsFor split by native stream, for assertions
+// that care which stream carried the output (console.error vs console.log).
+func awaitAppStreamsFor(t *testing.T, ctx context.Context, cli *client.Client, appName string, wants ...string) (stdout, stderr string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		stdout, stderr = appLogsSnapshot(ctx, cli, appName)
+		combined := stdout + stderr
+		all := true
+		for _, want := range wants {
+			if !strings.Contains(combined, want) {
+				all = false
+				break
+			}
+		}
+		if all {
+			return stdout, stderr
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("app logs for %q missing %v within 10s; stdout:\n%s\nstderr:\n%s",
+		appName, wants, stdout, stderr)
+	return "", ""
+}
+
+// awaitAppLogOccurrences polls until want appears at least min times across the
+// app's native logs. The count is the freshness proof when a reused container
+// already logged the same marker in an earlier stage: re-execution must ADD an
+// occurrence rather than satisfy the assertion from stale logs.
+func awaitAppLogOccurrences(t *testing.T, ctx context.Context, cli *client.Client, appName, want string, min int) string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	combined := ""
+	for time.Now().Before(deadline) {
+		stdout, stderr := appLogsSnapshot(ctx, cli, appName)
+		combined = stdout + stderr
+		if strings.Count(combined, want) >= min {
+			return combined
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("marker %q occurred %d time(s), want >= %d; logs:\n%s",
+		want, strings.Count(combined, want), min, combined)
+	return ""
+}
+
+// appLogsContain reports whether the app's native logs currently contain sub —
+// for ABSENCE-window assertions (assert "not yet present") that cannot block
+// on a helper.
+func appLogsContain(ctx context.Context, cli *client.Client, appName, sub string) (bool, error) {
+	stdout, stderr := appLogsSnapshot(ctx, cli, appName)
+	if stdout == "" && stderr == "" && len(containerIDsForApp(ctx, cli, appName)) == 0 {
+		return false, ctx.Err()
+	}
+	return strings.Contains(stdout+stderr, sub), nil
+}
+
+// assertNoProtocolFramesInLogs pins the channel/log separation: native Docker
+// logs carry application output ONLY — no framed protocol JSON (invoke/result/
+// hello/auth/ready), no legacy sentinel — while the same responses travel
+// exclusively on the TCP control channel.
+func assertNoProtocolFramesInLogs(t *testing.T, stdout, stderr string) {
+	t.Helper()
+	combined := stdout + stderr
+	for _, forbidden := range []string{
+		`"type":"invoke"`,
+		`"type":"result"`,
+		`"type":"hello"`,
+		`"type":"auth"`,
+		`"type":"ready"`,
+		"@@RELAY@@",
+	} {
+		if strings.Contains(combined, forbidden) {
+			t.Errorf("protocol frame data %q leaked into native container logs:\n%s", forbidden, combined)
+		}
+	}
+}
+
 // isLowPortCapability reports whether a daemon-normalized capability string is
 // the single service low-port capability. Create requests use the unprefixed
 // name; inspect responses use CAP_ prefixed names.
@@ -404,6 +626,16 @@ func mPrepare(ctx context.Context, t *testing.T, fn app.App) (*Prepared, error) 
 // wiring (the worker always injects the State-backed coordinator). The test
 // binary must have a reachable Postgres, exactly like the state integration
 // suite: a missing database fails rather than skipping.
+//
+// The manager joins a dedicated per-test execution network (see
+// newTestExecutionNetwork) for optional application connectivity and
+// provisions this node's internal control network via EnsureControlNetwork,
+// mirroring production preflight wiring (the worker always injects the
+// State-backed coordinator and ensures the control network before any
+// execution). The test binary must have a reachable Postgres, exactly like the
+// state integration suite: a missing database fails rather than skipping, and
+// an unprovable control-network route fails with the documented host-run
+// guidance.
 func newCoordinatedRealManager(
 	t *testing.T,
 	logger *slog.Logger,
@@ -413,10 +645,19 @@ func newCoordinatedRealManager(
 	t.Helper()
 	dsn := testutil.NewStateDSN(t)
 	coord := stateDepCoordinator{st: testutil.OpenState(t, dsn)}
-	return NewManager(
+	network := newTestExecutionNetwork(t)
+	m, err := NewManager(
 		logger, registry, "test-host",
-		append([]ManagerOption{WithDependencyImageCoordinator(coord)}, opts...)...,
+		append([]ManagerOption{
+			WithNetworks([]string{network}),
+			WithDependencyImageCoordinator(coord),
+		}, opts...)...,
 	)
+	if err != nil {
+		return nil, err
+	}
+	ensureControlNetwork(t, m)
+	return m, nil
 }
 
 // buildTestImage builds a tiny image with the given tag and an inline Dockerfile

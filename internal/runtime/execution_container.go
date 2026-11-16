@@ -4,14 +4,15 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/api/types/network"
@@ -20,12 +21,13 @@ import (
 	"relay/internal/app"
 )
 
-// executionEndpoints builds the Docker NetworkingConfig EndpointsConfig for an
-// execution (event/schedule) container from the worker-global network set
-// (WithNetworks): each named network exactly once. An empty/nil list yields
-// nil, so a worker with no NETWORKS sends no NetworkingConfig (unchanged
-// default bridge/network behavior). It shares NetworkSet with the service path,
-// so both normalize identically.
+// executionEndpoints builds the Docker NetworkingConfig EndpointsConfig from
+// the given network set: each named network exactly once. Production passes the
+// managed internal control network plus the optional NETWORKS application set,
+// so empty NETWORKS still yields the control endpoint; an empty/nil list yields
+// nil only for a caller that supplies no networks at all (direct construction /
+// tests), never for the production execution path. It shares NetworkSet with the
+// service path, so both normalize identically.
 func executionEndpoints(networks []string) map[string]*network.EndpointSettings {
 	set := NetworkSet(networks)
 	if len(set) == 0 {
@@ -50,10 +52,13 @@ func executionEndpoints(networks []string) map[string]*network.EndpointSettings 
 //
 // A zero value (directly constructed test containers, callers without a manager)
 // falls back to context.Background and no gate, preserving the historical
-// detached behavior.
+// detached behavior. controlNetwork is REQUIRED and names the internal network
+// the execution channel uses for its bootstrap address; it is never substituted
+// with an application network.
 type containerOps struct {
-	lifecycle context.Context
-	gate      *managerOps
+	lifecycle      context.Context
+	gate           *managerOps
+	controlNetwork string
 }
 
 // opCtx returns the container's operation lifecycle, or context.Background when
@@ -82,20 +87,22 @@ func (o containerOps) admitNormal(ctx context.Context) (context.Context, func(),
 	return opCtx, release, true
 }
 
-// executionContainer is one reused execution container for an app. It holds
-// a long-running bootstrap process (python/node) speaking the line-JSON
-// invocation protocol (see protocol.go): Start creates and starts the container
-// and its output demultiplexers, Invoke performs one sequential
-// request/response exchange. All protocol I/O is serialized: the owning
-// Manager's per-app pool leases a container to exactly one invocation at a
-// time (distinct invocations of the same app run on distinct containers),
-// and ioMu below is the belt-and-braces guard inside the container itself.
+// executionContainer is one reused execution container for an app. It holds a
+// long-running bootstrap process (python/node) serving the persistent
+// execution-channel protocol (see protocol.go): Start creates and starts the
+// container, establishes and authenticates ONE TCP connection to its bootstrap,
+// and Invoke performs one sequential request/response exchange over that
+// connection. All protocol I/O is serialized: the owning Manager's per-app pool
+// leases a container to exactly one invocation at a time (distinct invocations of
+// the same app run on distinct containers), and ioMu below is the belt-and-braces
+// guard inside the container itself.
 //
-// Discard semantics: the container is discarded (killed, removed, and poisoned
-// against reuse) on timeout, process exit, protocol error, image change, or
-// shutdown. A handler failure (ok:false response) is NOT a discard — the
-// container stays healthy for the next invocation. On any discard the pool
-// observes (or drops) the container on release and starts a fresh one on demand.
+// Discard semantics: the container is discarded (killed, removed, its channel
+// closed, and poisoned against reuse) on timeout, process exit, transport loss,
+// protocol error, image change, or shutdown. A handler failure (ok:false
+// response) is NOT a discard — the container stays healthy for the next
+// invocation. On any discard the pool observes (or drops) the container on
+// release and starts a fresh one on demand.
 type executionContainer struct {
 	cli   *client.Client
 	log   *slog.Logger
@@ -108,27 +115,35 @@ type executionContainer struct {
 	ops containerOps
 	// meta is the creation-time RunMeta stamped as labels. Identity fields
 	// (Type/App/NodeID/Image) are set; per-invocation fields
-	// (Handler/MessageID/EventID/EventName) are left EMPTY because
-	// container labels are immutable at creation while this container
-	// outlives individual invocations — per-invocation attribution moves to
-	// the per-invocation output prefix and the request frame instead.
-	meta   RunMeta
-	id     string
-	attach *client.ContainerAttachResult
+	// (Handler/MessageID/EventID/EventName) are left EMPTY because container
+	// labels are immutable at creation while this container outlives individual
+	// invocations — per-invocation attribution moves to the request frame.
+	meta RunMeta
+	id   string
+	conn net.Conn
 
-	demux *protocolDemuxer
-
-	// fail carries container-death events for a pending Invoke. The exit
-	// monitor sends only when an invocation is pending; an idle container's
-	// death is handled (and discarded) by the monitor itself.
+	// fail carries container-death events for a pending Invoke. The monitor
+	// sends only when an invocation is pending; an idle container's death is
+	// handled (and discarded) by the monitor itself.
 	fail     chan failEvent
 	exitInfo chan exitInfo // wait watcher → status/error, cap 1
-	eof      chan struct{} // stdout EOF signal from the reader goroutine
-	protoErr chan struct{} // unexpected protocol frame signal, cap 1
+	connErr  chan error    // channel transport failure from the reader, cap 1
+	protoErr chan error    // protocol-violation signal from the reader, cap 1
 	closed   chan struct{} // closed exactly once when discarded
+
+	// readerDone is closed when the connection reader goroutine exits. Discard
+	// joins it after closing the connection, so a container teardown leaves no
+	// live protocol reader behind.
+	readerDone chan struct{}
 
 	// dying is the discard CAS: only the first discarder closes/tears down.
 	dying atomic.Bool
+	// fatal records that the reader or monitor observed a
+	// container-death/channel-failure event. An invocation that resolves from an
+	// already-buffered result while a failure is being delivered must still
+	// report that result (it is unambiguous) but must never return the container
+	// to the pool for reuse.
+	fatal atomic.Bool
 	// removed records that the physical Docker container is CONFIRMED gone
 	// (removed, or already absent because AutoRemove/not-found won the race). It
 	// is set at most once, only when the first discarder's remove succeeds; a
@@ -139,8 +154,20 @@ type executionContainer struct {
 	reasonMu sync.Mutex
 	reason   string
 
-	ioMu       sync.Mutex // serializes request writes per container
+	ioMu       sync.Mutex // serializes request/response exchanges per container
 	invocation int        // invocation ordinal within this container (ioMu-guarded)
+
+	// pendingMu guards the result correlation state below. The single reader
+	// goroutine is the only sender; Invoke registers and clears.
+	pendingMu sync.Mutex
+	pendingID string
+	pendingCh chan invokeResponse
+	hasPend   bool
+	// pendingDelivered records that the first matching result was already
+	// accepted for the current pending invocation. It is reset with the pending
+	// registration so a later result with the same id is always a protocol
+	// violation, even after Invoke consumed the first one from the channel.
+	pendingDelivered bool
 }
 
 type exitInfo struct {
@@ -156,11 +183,11 @@ type failEvent struct {
 	err    error
 }
 
-// startExecutionContainer creates, attaches, demultiplexes, starts, and
-// registers the wait watcher for one reused execution container. Create and
-// start failures are plain errors (there is no container to discard); after a
-// successful start the container cleans itself up via AutoRemove the moment
-// its process exits, or via an explicit kill/remove on our discard paths.
+// startExecutionContainer creates, starts, connects, and registers the wait
+// watcher for one reused execution container. Create and start failures are plain
+// errors (there is no container to discard); after a successful start the
+// container cleans itself up via AutoRemove the moment its process exits, or via
+// an explicit kill/remove on our discard paths.
 //
 // ops is the Manager-owned operation lifecycle the container's detached Docker
 // work is rooted in: the exit wait request and a self-initiated discard derive
@@ -168,12 +195,23 @@ type failEvent struct {
 // than letting them outlive the Docker client. A zero value preserves the
 // detached behavior for callers (tests) without a manager.
 //
-// networks is the worker-global network set (NETWORKS): every execution
-// container joins them at create time so it can reach (and be reached on) those
-// Docker networks. The networks are infrastructure owned OUTSIDE Relay — Relay
-// never creates them — and the worker verifies they exist at startup (see
-// Manager.VerifyNetworks); a network that disappears between verification and
+// networks is the full network set the container joins at create time: the
+// internal control network first, then the optional worker-global NETWORKS set
+// (application connectivity). ops.controlNetwork is REQUIRED and identifies the
+// network the execution channel dials; NETWORKS is never used as an IPC
+// fallback. NETWORKS is infrastructure owned OUTSIDE Relay and is validated
+// separately by the worker. A network that disappears between verification and
 // create surfaces as a create error here.
+//
+// The execution channel requires a usable address on the INTERNAL CONTROL
+// network in the just-started container; an application network is never used
+// as an IPC fallback. That is checked from the daemon's inspect data and the
+// start FAILS CLOSED when no such address exists. Docker membership alone is not
+// proof that this Relay process can route to the address: a containerized Relay
+// attaches itself to the control network at startup, while a direct host
+// process must have native bridge routing (verified at startup). A dial failure
+// also fails the start; Relay never falls back to published ports or
+// stdin/stdout.
 func startExecutionContainer(
 	ctx context.Context,
 	ops containerOps,
@@ -188,6 +226,10 @@ func startExecutionContainer(
 	sourceRoot string,
 	mounts ...mount.Mount,
 ) (*executionContainer, error) {
+	if ops.controlNetwork == "" {
+		return nil, errors.New(
+			"docker run: internal control network is not configured")
+	}
 	hostConfig := hardenedHostConfig(true, limits)
 	// A HOT_RELOAD app mounts its live source read-only at the engine workdir
 	// (managed by the caller). An empty list is the historical no-mount shape.
@@ -211,25 +253,28 @@ func startExecutionContainer(
 	if err := validateRecursiveReadOnlyMountSupport(cli, mounts); err != nil {
 		return nil, fmt.Errorf("docker run: unsafe container configuration: %w", err)
 	}
+	// The credential is fresh for every container create, so a replacement
+	// container can never be authenticated with a previous container's secret.
+	credential, err := newExecutionCredential()
+	if err != nil {
+		return nil, fmt.Errorf("docker run: %w", err)
+	}
 	createOps := client.ContainerCreateOptions{
 		Config: &container.Config{
 			Image: createImage,
-			Env:   env,
+			// The app plan env plus Relay's channel port/credential. The
+			// credential is a per-container channel secret, not an invocation
+			// secret; it is never logged or framed.
+			Env: executionBootstrapEnv(env, credential),
 			// workDir is the HOT_RELOAD app root (Node's /app/src) so
 			// process.cwd() and relative filesystem operations see the app's
 			// source; empty preserves the image WORKDIR (/app) exactly.
 			WorkingDir: workDir,
-			// OpenStdin stays true; StdinOnce must be FALSE — the container is
-			// reused across invocations, so stdin must stay open for its
-			// lifetime and must not be auto-closed after the daemon sees one
-			// write+session-end.
-			OpenStdin:    true,
-			StdinOnce:    false,
-			AttachStdin:  true,
-			AttachStdout: true,
-			AttachStderr: true,
-			Tty:          false,
-			Labels:       runLabels(meta),
+			// The bootstrap communicates over TCP only. stdin/stdout are not
+			// attached and carry no protocol traffic; app output is not
+			// forwarded by Relay.
+			Tty:    false,
+			Labels: runLabels(meta),
 		},
 		// hardenedHostConfig(true, limits) unchanged in its SECURITY baseline:
 		// AutoRemove still removes the container the moment it exits (crash
@@ -250,84 +295,104 @@ func startExecutionContainer(
 	}
 	id := createResp.ID
 
-	// Attach once before start; the hijacked conn is kept for the container's
-	// LIFETIME (requests are written to it per invocation). CloseWrite is
-	// NEVER called while healthy: EOF on stdin is reserved for process death
-	// semantics.
-	attach, err := cli.ContainerAttach(ctx, id, client.ContainerAttachOptions{
-		Stream: true,
-		Stdin:  true,
-		Stdout: true,
-		Stderr: true,
-	})
-	if err != nil {
-		// Created but never started: AutoRemove can never fire, so remove it
-		// before returning.
-		if err := removeContainer(cli, id); err != nil {
-			log.Warn("Runtime container: remove container failed", "container", id, "error", err)
-		}
-		return nil, fmt.Errorf("docker run: attach: %w", err)
-	}
-
-	c := &executionContainer{
-		cli:      cli,
-		log:      log,
-		fn:       fn,
-		image:    image,
-		ops:      ops,
-		meta:     meta,
-		id:       id,
-		attach:   &attach,
-		demux:    newProtocolDemuxer(fn),
-		fail:     make(chan failEvent, 4),
-		exitInfo: make(chan exitInfo, 1),
-		eof:      make(chan struct{}, 1),
-		protoErr: make(chan struct{}, 1),
-		closed:   make(chan struct{}),
-	}
-	// Unexpected parseable protocol responses (no matching pending id) are
-	// protocol violations: signal, never silently multiplex.
-	c.demux.protoFail = func() { signal(c.protoErr) }
-
-	// Long-lived reader goroutine: demultiplex the attach stream for the
-	// container's whole lifetime. Reading runs concurrently so a chatty
-	// container cannot dead-lock on a full socket while a request is written.
-	readerDone := c.startOutputReader()
-
-	// Start. The not-running wait below is only meaningful once running.
-	if _, err := cli.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
+	removeFailedContainer := func() {
 		killContainer(cli, id)
 		if err := removeContainer(cli, id); err != nil {
 			log.Warn("Runtime container: remove container failed", "container", id, "error", err)
 		}
-		attach.Close()
-		<-readerDone
+	}
+
+	if _, err := cli.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
+		removeFailedContainer()
 		return nil, fmt.Errorf("docker run: start: %w", err)
 	}
 
-	// Exit watcher: the container is expected to keep running between
-	// invocations, so the wait request lives for the container's whole
-	// lifetime and is detached from any single invocation's ctx.
-	go c.watchExit()
-
-	// Exit monitor: reacts to process exit, stdout EOF, and unexpected
-	// protocol frames. An idle container death discards immediately; a death
-	// while an Invoke is pending is delivered to that Invoke and discarded
-	// there (single owner).
-	go c.monitor()
+	c, err := connectExecutionContainer(
+		ctx, ops, cli, log, fn, image, id, credential, meta,
+	)
+	if err != nil {
+		removeFailedContainer()
+		return nil, err
+	}
 
 	c.log.Debug("Runtime container: started",
 		"app", c.fn, "image", c.image, "container", c.id)
 	return c, nil
 }
 
-// signal delivers a single struct{} signal, non-blocking (the channel is
-// buffered, cap 1; repeated signals are not meaningful).
-func signal(ch chan struct{}) {
-	select {
-	case ch <- struct{}{}:
-	default:
+// connectExecutionContainer discovers the container's control-network address
+// candidates, dials and authenticates the first reachable bootstrap, and starts
+// the long-lived connection reader, exit watcher, and monitor. Only the
+// explicitly configured internal control network is considered; an application
+// network is never used as the execution IPC path. Any failure leaves the
+// caller to remove the started container; a connection established before a
+// later failure is closed here so no resource escapes.
+func connectExecutionContainer(
+	ctx context.Context,
+	ops containerOps,
+	cli *client.Client,
+	log *slog.Logger,
+	fn, image, id, credential string,
+	meta RunMeta,
+) (*executionContainer, error) {
+	if ops.controlNetwork == "" {
+		return nil, errors.New(
+			"docker run: internal control network is not configured")
 	}
+	insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("docker run: inspect execution container: %w", err)
+	}
+	if insp.Container.State == nil || !insp.Container.State.Running {
+		return nil, errors.New("docker run: execution container is not running")
+	}
+	var settings map[string]*network.EndpointSettings
+	if insp.Container.NetworkSettings != nil {
+		settings = insp.Container.NetworkSettings.Networks
+	}
+	addresses, err := executionAddresses(
+		[]string{ops.controlNetwork}, settings, executionPort,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"docker run: execution control network %q: %w",
+			ops.controlNetwork, err,
+		)
+	}
+	conn, err := connectExecutionChannel(ctx, addresses, credential)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"docker run: execution control network %q is unreachable from this Relay process "+
+				"(a containerized Relay must be attached to it; a host process needs native bridge routing): %w",
+			ops.controlNetwork, err,
+		)
+	}
+	c := &executionContainer{
+		cli:        cli,
+		log:        log,
+		fn:         fn,
+		image:      image,
+		ops:        ops,
+		meta:       meta,
+		id:         id,
+		conn:       conn,
+		fail:       make(chan failEvent, 4),
+		exitInfo:   make(chan exitInfo, 1),
+		connErr:    make(chan error, 1),
+		protoErr:   make(chan error, 1),
+		closed:     make(chan struct{}),
+		readerDone: make(chan struct{}),
+	}
+	go c.readResponses()
+	// Exit watcher: the container is expected to keep running between
+	// invocations, so the wait request lives for the container's whole
+	// lifetime and is detached from any single invocation's ctx.
+	go c.watchExit()
+	// Exit monitor: reacts to process exit and execution-channel failure. An
+	// idle container death discards immediately; a death while an Invoke is
+	// pending is delivered to that Invoke and discarded there (single owner).
+	go c.monitor()
+	return c, nil
 }
 
 func signalExit(ch chan exitInfo, info exitInfo) {
@@ -337,25 +402,118 @@ func signalExit(ch chan exitInfo, info exitInfo) {
 	}
 }
 
-// startOutputReader launches the container's long-lived stdout/stderr
-// demultiplexer goroutine and returns a channel closed when it exits. Reading
-// runs concurrently with request writes so a chatty container cannot dead-lock
-// on a full socket; the goroutine exits when the attach stream reaches EOF or
-// the hijacked conn is closed (the cancellation path), so it is the single
-// long-lived reader for the container's whole lifetime.
-func (c *executionContainer) startOutputReader() <-chan struct{} {
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_, _ = stdcopy.StdCopy(c.demux, &stderrSink{d: c.demux}, c.attach.Reader)
-		// EOF on stdout: flush any trailing partial (user) line, then signal
-		// EOF so the exit monitor (or a pending Invoke) reacts immediately
-		// rather than waiting for the wait-result delivery.
-		c.demux.flushPending()
-		c.demux.flushForwarders()
-		signal(c.eof)
-	}()
-	return done
+// readResponses is the container's single long-lived protocol reader. It reads
+// result frames for the whole connection lifetime, delivering each to the
+// registered invocation and treating any malformed, unexpected, duplicate, or
+// uncorrelated frame as a fatal channel failure. It exits when the connection is
+// closed (discard) or the peer closes it, and discard joins it.
+func (c *executionContainer) readResponses() {
+	defer close(c.readerDone)
+	for {
+		raw, err := readFrame(c.conn, maxResponseFrame)
+		if err != nil {
+			c.signalConnErr(err)
+			return
+		}
+		var resp invokeResponse
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			c.signalProtocolErr(fmt.Errorf("malformed response frame: %w", err))
+			return
+		}
+		if err := c.deliverResponse(resp); err != nil {
+			c.signalProtocolErr(err)
+			return
+		}
+	}
+}
+
+// signalConnErr reports one channel transport failure to the monitor. The
+// channel is buffered; the first failure is the only useful one.
+func (c *executionContainer) signalConnErr(err error) {
+	c.fatal.Store(true)
+	select {
+	case c.connErr <- err:
+	default:
+	}
+}
+
+// signalProtocolErr reports a protocol violation (malformed, unexpected,
+// duplicate, or uncorrelated frame) to the monitor. It is distinct from a
+// transport failure because it needs no process-exit grace period.
+func (c *executionContainer) signalProtocolErr(err error) {
+	c.fatal.Store(true)
+	select {
+	case c.protoErr <- err:
+	default:
+	}
+}
+
+// setPending registers the in-flight invocation's result channel. It must be
+// called before the request frame is written.
+func (c *executionContainer) setPending(id string, ch chan invokeResponse) {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	c.pendingID = id
+	c.pendingCh = ch
+	c.hasPend = true
+	c.pendingDelivered = false
+}
+
+// clearPending unregisters the in-flight invocation. A result arriving after
+// this point is uncorrelated and therefore a protocol error.
+func (c *executionContainer) clearPending() {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	c.pendingID = ""
+	c.pendingCh = nil
+	c.hasPend = false
+	c.pendingDelivered = false
+}
+
+// pending reports whether an invocation is currently registered. The monitor
+// uses pendingAwaitingResult, not this method, to decide whether a failure must
+// also be queued for the invocation.
+func (c *executionContainer) pending() bool {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	return c.hasPend
+}
+
+// pendingAwaitingResult reports whether an invocation is registered and no
+// matching result has been delivered yet. When true, a death/failure must wake
+// the invocation; when false, an already-buffered result (or the closed channel)
+// already resolves it, so queuing a fail would only strand a monitor event.
+func (c *executionContainer) pendingAwaitingResult() bool {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	return c.hasPend && !c.pendingDelivered
+}
+
+// deliverResponse correlates one result frame with the pending invocation. The
+// first matching result is accepted exactly once: pendingDelivered rejects every
+// later result for that same pending id even after Invoke consumed the first
+// value from the channel, so a duplicate cannot be silently stranded. A
+// duplicate or an uncorrelated/wrong-id result is a protocol error, never
+// silently dropped.
+func (c *executionContainer) deliverResponse(resp invokeResponse) error {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	if !c.hasPend {
+		return errors.New("result frame with no pending invocation")
+	}
+	if resp.ID != c.pendingID {
+		return errors.New("result frame id does not match the pending invocation")
+	}
+	if c.pendingDelivered {
+		return errors.New("duplicate result frame for the pending invocation")
+	}
+	c.pendingDelivered = true
+	select {
+	case c.pendingCh <- resp:
+		return nil
+	default:
+		return errors.New("result frame channel is unexpectedly full")
+	}
 }
 
 // watchExit runs the container's exit wait request for its whole lifetime. The
@@ -428,9 +586,9 @@ func (c *executionContainer) watchExit() {
 	}
 }
 
-// monitor funnels container-death events: exit status, stdout EOF, unexpected
-// protocol frames. A pending invocation is notified via fail (and performs the
-// discard itself); an idle container's death discards directly.
+// monitor funnels container-death events: exit status and execution-channel
+// failure. A pending invocation is notified via fail (and performs the discard
+// itself); an idle container's death discards directly.
 func (c *executionContainer) monitor() {
 	for {
 		select {
@@ -438,35 +596,40 @@ func (c *executionContainer) monitor() {
 			return
 		case info := <-c.exitInfo:
 			c.onDeath("process_exit", exitEvent(info))
-		case <-c.eof:
-			// stdout ended: the process is gone or about to be reported. Give
-			// the wait delivery a short grace period so the reason is
-			// process_exit (with the exact status) rather than a vaguer
-			// protocol error.
-			var info exitInfo
+		case err := <-c.protoErr:
+			c.onDeath("protocol_error", err)
+		case err := <-c.connErr:
+			// A transport loss can leave the process alive, so it must poison
+			// immediately rather than wait out a process-exit grace period. Take
+			// an ALREADY-DELIVERED exit status non-blockingly so the discard
+			// reason stays process_exit when possible; otherwise the transport
+			// failure is the reason.
 			select {
-			case info = <-c.exitInfo:
+			case info := <-c.exitInfo:
 				c.onDeath("process_exit", exitEvent(info))
-			case <-time.After(3 * time.Second):
-				c.onDeath("protocol_error", fmt.Errorf("container stdout ended before a response"))
+			default:
+				c.onDeath("protocol_error", fmt.Errorf("execution channel failed: %w", err))
 			}
-		case <-c.protoErr:
-			c.onDeath("protocol_error", fmt.Errorf("unexpected protocol response from container"))
 		}
 	}
 }
 
-// onDeath routes one container-death event: to the pending Invoke (which
-// discards), or — when idle — to a direct discard.
+// onDeath routes one container-death event. Teardown is ALWAYS performed here:
+// a protocol violation, transport loss, or process exit must physically discard
+// the container even when an invocation has just consumed a valid result, or the
+// container could remain alive with a queued failure and be reused. A death that
+// arrives before any result was delivered also queues a fail for the pending
+// invocation; once a result was delivered, respCh (or closed) resolves the
+// invocation, so no fail is queued.
 func (c *executionContainer) onDeath(reason string, err error) {
-	if c.demux.pending() {
+	c.fatal.Store(true)
+	if c.pendingAwaitingResult() {
 		// Buffered send; if the channel is full (a burst of events) the
 		// waiting Invoke still sees the discard through closed below.
 		select {
 		case c.fail <- failEvent{reason: reason, err: err}:
 		default:
 		}
-		return
 	}
 	c.discard(reason)
 }
@@ -480,22 +643,21 @@ func exitEvent(info exitInfo) error {
 }
 
 // Invoke performs one invocation against the reuse container: registers the
-// response channel, writes one request frame line to stdin, and blocks for the
-// response, the container's death, the unexpected-protocol signal, or ctx
+// result channel, writes one request frame to the persistent connection, and
+// blocks for the result, the container's death, a channel failure, or ctx
 // cancellation. It is called by the pool on a container leased to exactly one
-// invocation; ioMu additionally prevents any racing writer on this container.
+// invocation; ioMu additionally prevents any racing exchange on this container.
 //
-// Timeout: ctx.Done while in flight kills + removes + discards the container
-// (reason "timeout") and returns the ctx error wrapped exactly like the
-// one-shot path ("docker run: <ctx err>"), preserving retry/log semantics.
+// Timeout: ctx.Done while in flight closes the connection, kills + removes +
+// discards the container (reason "timeout"), and returns the ctx error wrapped
+// exactly like the one-shot path ("docker run: <ctx err>"), preserving retry/log
+// semantics.
 //
-// Cancellation must also release the SYNCHRONOUS request write and the
-// long-lived demux reader: both block on the attach's shared hijacked
-// net.Conn, which observes no context, so a ctx.Done select branch alone is
-// unreachable while the write is stuck. A cancellation callback registered at
-// the attach boundary closes that conn — the SDK-supported lifecycle action
-// that releases both operations — but only while this invocation is
-// unresolved; once it completes, the callback is suppressed (see settle).
+// Cancellation must also release the synchronous request write and the long-lived
+// reader: both block on the connection, which observes no context. A cancellation
+// callback registered at the channel boundary closes the conn while this
+// invocation is unresolved; once it completes, the callback is suppressed (see
+// settle).
 func (c *executionContainer) Invoke(
 	ctx context.Context,
 	handler string, eventJSON []byte,
@@ -516,19 +678,8 @@ func (c *executionContainer) Invoke(
 
 	id := newRequestID()
 	respCh := make(chan invokeResponse, 1)
-	// The in-flight output prefix must carry THIS invocation's handler even for
-	// direct callers that injected no RunMeta (the old one-shot path took the
-	// prefix handler from the Execute argument). Fall back to the handler
-	// argument when the ctx meta leaves it empty; the idle fallback below the
-	// demuxer keeps "[fn/]" for asynchronous output between invocations.
-	meta := RunMetaFrom(ctx)
-	if meta.Handler == "" {
-		meta.Handler = handler
-	}
-	c.demux.begin(meta)
-	defer c.demux.end()
-	c.demux.setPending(id, respCh)
-	defer c.demux.clearPending()
+	c.setPending(id, respCh)
+	defer c.clearPending()
 
 	// The request frame carries the invocation identity, the verbatim event
 	// payload, the per-invocation env, the optional W3C trace carrier, and the
@@ -541,16 +692,22 @@ func (c *executionContainer) Invoke(
 		// a failure is a bug in the caller's contract, not container state.
 		return fmt.Errorf("docker run: marshal request frame: %w", err)
 	}
+	if len(frame) > maxRequestFrame {
+		// Caller-contract failure, not container state: report it without
+		// poisoning a healthy container.
+		return fmt.Errorf("docker run: request frame of %d bytes exceeds the %d-byte limit",
+			len(frame), maxRequestFrame)
+	}
 
 	// Cancellation unblocker (see the method comment). The callback closes the
-	// shared hijacked conn FIRST so a Write blocked sending the request frame
-	// and the demux reader blocked in stdcopy.StdCopy are both released
-	// promptly, then poisons the container with the timeout semantics. Its own
-	// attach.Close in discard is a harmless second close.
+	// connection FIRST so a Write blocked sending the request frame and the
+	// reader blocked in readFrame are both released promptly, then poisons the
+	// container with the timeout semantics. discard closes the conn again, which
+	// is harmless.
 	cbDone := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
 		defer close(cbDone)
-		c.attach.Close()
+		_ = c.conn.Close()
 		c.discard("timeout")
 	})
 	// settle unregisters the cancellation callback exactly once. It reports
@@ -574,9 +731,9 @@ func (c *executionContainer) Invoke(
 	}
 	defer settle()
 
-	if _, err := c.attach.Conn.Write(append(frame, '\n')); err != nil {
+	if err := writeFrame(c.conn, frame, maxRequestFrame); err != nil {
 		if settle() {
-			// The cancellation callback closed the attach under us: report the
+			// The cancellation callback closed the channel under us: report the
 			// invocation as the timeout with the wrapped ctx error, never a
 			// write failure — the close surfaces here as an I/O error.
 			return fmt.Errorf("docker run: %w", ctx.Err())
@@ -590,7 +747,6 @@ func (c *executionContainer) Invoke(
 	const (
 		outcomeResponse = iota
 		outcomeFail
-		outcomeProtoErr
 		outcomeCancel
 		outcomeClosed
 	)
@@ -604,8 +760,6 @@ func (c *executionContainer) Invoke(
 		outcome = outcomeResponse
 	case ev = <-c.fail:
 		outcome = outcomeFail
-	case <-c.protoErr:
-		outcome = outcomeProtoErr
 	case <-ctx.Done():
 		outcome = outcomeCancel
 	case <-c.closed:
@@ -614,14 +768,40 @@ func (c *executionContainer) Invoke(
 	if settle() {
 		// The cancellation callback started before this invocation resolved:
 		// cancellation wins consistently, whichever branch the select happened
-		// to pick. The callback has already closed the attach and poisoned the
+		// to pick. The callback has already closed the channel and poisoned the
 		// container with reason "timeout". stop() reporting false implies ctx
 		// is done, so ctx.Err() is non-nil.
 		return fmt.Errorf("docker run: %w", ctx.Err())
 	}
+	// A valid result may have been delivered just before the reader observed
+	// EOF and queued a failure, making both respCh and c.fail ready; Go's
+	// select may then have picked the failure. Prefer an ALREADY-BUFFERED
+	// result over a failure/closed branch so a confirmed handler outcome is not
+	// converted into a retry that repeats side effects. Cancellation remains
+	// authoritative (settle above and outcomeCancel below), and a response that
+	// is not already buffered at this point remains ambiguous and fails.
+	if outcome != outcomeResponse && outcome != outcomeCancel {
+		select {
+		case resp = <-respCh:
+			outcome = outcomeResponse
+		default:
+		}
+	}
+	// Unregister the result channel before acting on the outcome. An
+	// already-delivered result may be reported unambiguously, but a death or
+	// channel failure that raced the select must not be left queued against a
+	// still-"pending" invocation; clearing here also lets a monitor that has not
+	// yet inspected pending state take the idle discard path itself. The
+	// deferred clear remains for every earlier return.
+	c.clearPending()
 	switch outcome {
 	case outcomeResponse:
-		if !first {
+		if c.fatal.Load() {
+			// A death/channel failure was observed while this result was in
+			// flight. The result is unambiguous, so report it, but the container
+			// itself is not reusable.
+			c.discard("protocol_error")
+		} else if !first {
 			// An actual reuse: this container already served an invocation and
 			// just served another one. DEBUG only — never noisy INFO.
 			c.log.Debug("Runtime container: reused",
@@ -631,15 +811,11 @@ func (c *executionContainer) Invoke(
 			return nil
 		}
 		// Handler failure: the PROCESS is healthy; the container is kept.
-		// The error string is bounded (see clampResponseError) so the frame can
-		// never exceed the demuxer's line cap.
+		// The error string is bounded (see clampResponseError).
 		return fmt.Errorf("handler %q failed: %s", handler, clampResponseError(resp.Error))
 	case outcomeFail:
 		c.discard(ev.reason)
 		return fmt.Errorf("docker run: %s", ev.err)
-	case outcomeProtoErr:
-		c.discard("protocol_error")
-		return fmt.Errorf("docker run: unexpected protocol response from container")
 	case outcomeCancel:
 		// Defensive: a ctx.Done selection normally means the callback already
 		// ran and settle reported true above. If the callback was suppressed in
@@ -666,11 +842,12 @@ func newRequestID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// discard kills, removes, and poisons the container against reuse. It is
-// idempotent: only the first caller tears down (closing closed) and logs; race
-// losers are no-ops. Removal is idempotent w.r.t. AutoRemove having already
-// deleted the container (benign not-found/conflict). A genuine removal failure
-// is logged Warn (a discard that could not remove anything is worth surfacing).
+// discard kills, removes, closes the execution channel, and poisons the
+// container against reuse. It is idempotent: only the first caller tears down
+// (closing closed) and logs; race losers are no-ops. Removal is idempotent w.r.t.
+// AutoRemove having already deleted the container (benign not-found/conflict). A
+// genuine removal failure is logged Warn (a discard that could not remove
+// anything is worth surfacing).
 //
 // It admits the teardown as a NORMAL Manager operation first, so a
 // self-initiated teardown (a death observed while idle, a protocol error) is
@@ -719,15 +896,23 @@ func (c *executionContainer) discardContext(ctx context.Context, reason string) 
 	} else {
 		c.removed.Store(true)
 	}
-	c.attach.Close()
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
 	close(c.closed)
+	if c.readerDone != nil {
+		<-c.readerDone
+	}
 	c.log.Debug("Runtime container: discarded",
 		"app", c.fn, "image", c.image, "container", c.id, "reason", reason)
 	return true
 }
 
-// dead reports whether the container has been discarded (poisoned).
-func (c *executionContainer) dead() bool { return c.dying.Load() }
+// dead reports whether the container has been discarded or poisoned by a
+// death/channel-failure event. A fatal event is recorded by the reader/monitor
+// before teardown completes, so the pool can never lease a container whose
+// connection has failed even if the invocation is still unwinding.
+func (c *executionContainer) dead() bool { return c.dying.Load() || c.fatal.Load() }
 
 // removalConfirmed reports whether the physical Docker container is CONFIRMED
 // gone: removeContainerContext succeeded (removed, or already absent because

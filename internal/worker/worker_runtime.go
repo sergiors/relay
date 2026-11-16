@@ -14,10 +14,9 @@ import (
 // openRuntimeManager constructs the Docker runtime manager and registers its
 // context-aware cleanup immediately on a successful open. It is the
 // preflight's OpenManager step: the manager is opened with deferred maintenance
-// so no manager background loop runs before NETWORKS verification, and its
-// cleanup step is registered BEFORE runExternalPreflight returns so a later
-// preflight failure (NETWORKS verification) still converges through the
-// deferred shutdown.
+// so no manager background loop runs before the control network and NETWORKS are
+// ready, and its cleanup step is registered BEFORE runExternalPreflight returns
+// so a later preflight failure still converges through the deferred shutdown.
 //
 // st is the REQUIRED state handle opened earlier in Run. The manager's
 // cross-process dependency-image coordination is built on it: dependency layers
@@ -67,10 +66,11 @@ func openRuntimeManager(
 		// containers are outside it. It is startup configuration; a
 		// change requires a worker restart.
 		runtime.WithMaxWarmContainers(cfg.MaxWarmContainers),
-		// The worker-global Docker networks (NETWORKS) every execution
-		// container joins at create time. They are verified by the next
-		// preflight step before any app is prepared or any container
-		// created.
+		// The OPTIONAL worker-global Docker networks (NETWORKS) every
+		// execution container joins for application connectivity, in
+		// addition to the internally owned control network. They are
+		// verified by a later preflight step before any app is prepared
+		// or any container created. Empty NETWORKS is valid.
 		runtime.WithNetworks(cfg.Networks),
 		// HOT_RELOAD: bind-mount the live app source read-only for a
 		// runtime whose dependency layout permits it (Python and Node),
@@ -114,13 +114,13 @@ func openRuntimeManager(
 		// README/docs/operations.md).
 		runtime.WithDependencyImageCoordinator(newStateDependencyImageCoordinator(st)),
 		// Do NOT start the warm-container maintenance loop in the
-		// constructor: the manager is opened before NETWORKS is
-		// verified, and the request is that all configured networks
-		// validate before ANY background loop starts. The loop is
-		// started by the final preflight step (StartMaintenance) only
-		// after verification succeeds; if it fails, the manager (and its
-		// Docker client) is still torn down by the registered shutdown
-		// step with no loop ever started.
+		// constructor: the manager is opened before the control network
+		// and NETWORKS are ready, and the request is that every
+		// prerequisite validate before ANY background loop starts. The
+		// loop is started by the final preflight step (StartMaintenance)
+		// only after provisioning and verification succeed; if either
+		// fails, the manager (and its Docker client) is still torn down by
+		// the registered shutdown step with no loop ever started.
 		runtime.WithDeferredMaintenance(),
 	)
 	if err != nil {

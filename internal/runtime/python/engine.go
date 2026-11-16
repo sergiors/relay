@@ -61,9 +61,10 @@ func bootstrapFor(zuvloop bool) ([]byte, error) {
 
 type Engine struct{}
 
-// entrypoint runs the bootstrap unbuffered (-u): user print() output must
-// keep streaming live through the attach pipe while the reused container
-// stays running, instead of block-buffering into the pipe for its lifetime.
+// entrypoint runs the bootstrap unbuffered (-u): handler output should reach the
+// container's native Docker logs live while the reused container stays running,
+// instead of block-buffering for its lifetime. Relay itself does not read or
+// forward that output.
 var entrypoint = []string{"python", "-u", "/relay/bootstrap.py"}
 
 const (

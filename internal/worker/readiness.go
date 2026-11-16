@@ -28,13 +28,23 @@ type consumerHealth interface {
 
 // dockerReadinessProbe is the narrow runtime-manager view the readiness probe
 // needs: a bounded Docker daemon ping and verification that every configured
-// NETWORKS network still exists. *runtime.Manager satisfies it. A missing
-// network is a real dependency failure — Relay never creates networks, so one
-// disappearing after startup means execution containers can no longer be
-// created correctly.
+// NETWORKS network still exists and remains workload-safe (not missing, not
+// execution-control, not a reserved host/container pseudo-network).
+// *runtime.Manager satisfies it. A network that disappears or becomes invalid
+// after startup is a real dependency failure — Relay never creates operator
+// networks, and creates would otherwise fail only when events are consumed.
 type dockerReadinessProbe interface {
 	Ping(ctx context.Context) error
 	VerifyNetworks(ctx context.Context, networks []string) (string, bool, error)
+}
+
+// controlNetworkReadiness is the OPTIONAL runtime-manager capability that
+// verifies the internal control network still exists and is still Relay-owned.
+// It is optional so existing narrow test probes stay valid; *runtime.Manager
+// implements it, and production readiness therefore fails closed when the
+// control network is deleted or reconfigured while the worker is running.
+type controlNetworkReadiness interface {
+	VerifyControlNetwork(ctx context.Context) error
 }
 
 // The production seams must satisfy the readiness probe's narrow views.
@@ -66,10 +76,10 @@ var (
 //
 // Once the flag is true and the lifecycle is live, `Ready` additionally runs
 // the live dependency probe so a steady-state query reflects current dependency
-// health (Redis consumer health, a bounded Docker ping, and NETWORKS
-// verification) rather than only the startup boundary. The probe never mutates
-// the flag and never terminates the worker, so a dependency recovering makes
-// readiness recover.
+// health (Redis consumer health, a bounded Docker ping, control-network
+// validity, and NETWORKS verification) rather than only the startup boundary.
+// The probe never mutates the flag and never terminates the worker, so a
+// dependency recovering makes readiness recover.
 type readiness struct {
 	ready atomic.Bool
 
@@ -199,12 +209,12 @@ func (r *readiness) Ready(ctx context.Context) (bool, string) {
 // probeReadiness runs the live dependency checks for an already-ready worker:
 // Redis consumer health first (a cheap in-process read that avoids a Docker
 // round trip during a Redis outage), then ONE bounded window covering a Docker
-// daemon ping and verification of every configured NETWORKS network. A nil
-// consumer or manager is a hard dependency failure, not a pass. The returned
-// reason is a fixed, low-cardinality string that never carries a dependency's
-// raw error, so a readiness response cannot leak operator detail. It is a pure
-// app of its injected seams, so it is unit-testable with deterministic
-// fakes and no sleeps.
+// daemon ping, the internal control network, and verification of every
+// configured NETWORKS network's existence and workload-safe policy. A nil
+// consumer or manager is a hard dependency failure, not a pass. The returned reason is a fixed, low-cardinality string
+// that never carries a dependency's raw error, so a readiness response cannot
+// leak operator detail. It is a pure app of its injected seams, so it is
+// unit-testable with deterministic fakes and no sleeps.
 func probeReadiness(
 	ctx context.Context,
 	consumer consumerHealth,
@@ -225,6 +235,11 @@ func probeReadiness(
 	defer cancel()
 	if err := manager.Ping(pctx); err != nil {
 		return false, "docker unavailable"
+	}
+	if control, ok := manager.(controlNetworkReadiness); ok {
+		if err := control.VerifyControlNetwork(pctx); err != nil {
+			return false, "control network unavailable"
+		}
 	}
 	missing, ok, err := manager.VerifyNetworks(pctx, networks)
 	switch {

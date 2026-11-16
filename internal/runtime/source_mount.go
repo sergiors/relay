@@ -213,17 +213,10 @@ func (m *Manager) daemonMounts(ctx context.Context) []container.MountPoint {
 	}
 	// Locate Relay's own container by its OCI hostname (the Docker-assigned
 	// container ID by default), which is distinct from the node ownership
-	// identity stamped as relay.node_id. No self hostname means self-inspection
-	// is unavailable.
-	self := m.selfHostname
-	if self == "" {
-		return nil
-	}
-	detect := m.containerDetect
-	if detect == nil {
-		detect = func() bool { return isContainerIDLike(self) }
-	}
-	if !detect() {
+	// identity stamped as relay.node_id. No plausible self hostname means
+	// self-inspection is unavailable.
+	self, ok := m.selfContainerName()
+	if !ok {
 		return nil
 	}
 	m.selfMounts.mu.Lock()
@@ -251,6 +244,32 @@ func (m *Manager) daemonMounts(ctx context.Context) []container.MountPoint {
 	m.Logger().Debug("Runtime: resolved Relay's own container mounts for HOT_RELOAD",
 		"mounts", len(m.selfMounts.mounts))
 	return m.selfMounts.mounts
+}
+
+// selfContainerName returns the process's OCI hostname when it is a plausible
+// self-container identity. The production predicate accepts only Docker's
+// default container-ID-like hostname; a custom hostname never causes an
+// arbitrary container inspect, because it could resolve to an unrelated
+// container and is not proof that this process is a container at all.
+//
+// It deliberately does NOT fall back to the node identity: nodeID is the
+// node's stable ownership identity (NODE_ID), not an OCI hostname.
+func (m *Manager) selfContainerName() (string, bool) {
+	if m == nil || m.cli == nil {
+		return "", false
+	}
+	self := m.selfHostname
+	if self == "" {
+		return "", false
+	}
+	detect := m.containerDetect
+	if detect == nil {
+		detect = func() bool { return isContainerIDLike(self) }
+	}
+	if !detect() {
+		return "", false
+	}
+	return self, true
 }
 
 // osHostname resolves this process's OCI hostname (os.Hostname) for HOT_RELOAD

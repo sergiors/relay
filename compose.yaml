@@ -1,6 +1,7 @@
 services:
   relay:
-    image: ghcr.io/sergiors/relay:latest
+    build:
+      context: .
     container_name: relay
     stop_grace_period: 3m
 
@@ -31,8 +32,11 @@ services:
 
     volumes:
       - relay-data:/var/lib/relay
-      - ./apps:/apps:ro
+      - ./examples/apps:/apps:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
+
+    networks:
+      - default
 
     healthcheck:
       test: ["CMD", "relay", "health"]

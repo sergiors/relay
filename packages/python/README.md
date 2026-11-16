@@ -4,9 +4,7 @@ The official Python library for developing Relay applications and using Relay's
 public handler interfaces.
 
 The package is optional for Relay's execution. Add it as a normal application
-dependency when your handlers import it. Its initial release publishes the
-`HandlerContext` structural Protocol; Relay's Python bootstrap constructs the
-actual context object for each invocation and passes it to the handler.
+dependency when your handlers import it.
 
 ## Install
 
@@ -42,8 +40,7 @@ async def handler(event: dict, context: HandlerContext) -> None:
 
 `HandlerContext` is a public `typing.Protocol`, not the concrete context
 implementation. Relay's Python bootstrap creates and supplies that actual
-per-invocation object. The current release provides `HandlerContext`; later
-releases may add application-development utilities.
+per-invocation object.
 
 ## Contract
 

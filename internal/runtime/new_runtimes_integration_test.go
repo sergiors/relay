@@ -130,7 +130,6 @@ async def ache(event, context):
 `)
 
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 	depRef := expectedDependencyRef(t, fn)
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -172,7 +171,7 @@ async def ache(event, context):
 	if err := m.Execute(ctx, prepared, "handler.ache", []byte(`{"status":"COMPLETED","event_id":"a2"}`), nil); err != nil {
 		t.Fatalf("execute async 2: %v", err)
 	}
-	awaitAppOutput(t, ctx, out,
+	awaitAppLogsFor(t, ctx, m.cli, fn.Name,
 		"sync run ver=3.15 six=1.16.0",
 		"async ache call=1 reused=True ver=3.15 six=1.16.0",
 		"async ache call=2 reused=True ver=3.15 six=1.16.0",
@@ -234,7 +233,6 @@ export function tick(event: { event_id: string }, context: unknown): void {
 `)
 
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 
 	jsDep := expectedDependencyRef(t, jsFn)
 	prepared, err := m.Prepare(ctx, jsFn)
@@ -291,7 +289,7 @@ export function tick(event: { event_id: string }, context: unknown): void {
 	// the interpreter-version proof), so both lines are guaranteed present
 	// before the pid assertion: two identical prefixes would let one line
 	// satisfy both awaits and race the two-pid regex below.
-	logs := awaitAppOutput(t, ctx, out,
+	logs := awaitAppLogsFor(t, ctx, m.cli, jsFn.Name,
 		"id=n26-0 ver=v26.",
 		"id=n26-1 ver=v26.",
 	)
@@ -328,7 +326,7 @@ export function tick(event: { event_id: string }, context: unknown): void {
 	if err := m.Execute(ctx, tsPrepared, "index.tick", []byte(`{"event_id":"n26-ts0","status":"COMPLETED"}`), nil); err != nil {
 		t.Fatalf("execute ts: %v", err)
 	}
-	awaitAppOutput(t, ctx, out, "ts tick n26 n26-ts0")
+	awaitAppLogsFor(t, ctx, m.cli, tsFn.Name, "ts tick n26 n26-ts0")
 }
 
 // TestIntegrationPythonRuntimeSwitchIsolatesIdentities proves 3.14<->3.15
@@ -367,7 +365,6 @@ def run(event, context):
 	fn14 := mkApp("python3.14")
 	fn15 := mkApp("python3.15")
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 
 	dep14 := expectedDependencyRef(t, fn14)
 	dep15 := expectedDependencyRef(t, fn15)
@@ -416,7 +413,7 @@ def run(event, context):
 	if err := m.Execute(ctx, prepared15, "handler.run", []byte(`{"status":"COMPLETED","event_id":"sw-15"}`), nil); err != nil {
 		t.Fatalf("execute python3.15: %v", err)
 	}
-	awaitAppOutput(t, ctx, out,
+	awaitAppLogsFor(t, ctx, m.cli, fnName,
 		"switch run ver=3.14 six=1.16.0",
 		"switch run ver=3.15 six=1.16.0",
 	)
@@ -470,7 +467,6 @@ export function run(event, context) {
 	fn24 := mkApp("nodejs24.x")
 	fn26 := mkApp("nodejs26.x")
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 
 	dep24 := expectedDependencyRef(t, fn24)
 	dep26 := expectedDependencyRef(t, fn26)
@@ -517,7 +513,7 @@ export function run(event, context) {
 	if err := m.Execute(ctx, prepared26, "handler.run", []byte(`{"status":"COMPLETED","event_id":"sw-26"}`), nil); err != nil {
 		t.Fatalf("execute nodejs26.x: %v", err)
 	}
-	awaitAppOutput(t, ctx, out,
+	awaitAppLogsFor(t, ctx, m.cli, fnName,
 		"switch run ver=v24.",
 		"switch run ver=v26.",
 	)
@@ -593,7 +589,6 @@ def keep_alive():
 keep_alive()
 `)
 		m, _ := newManager(t)
-		out := newAppOutputSink(t)
 
 		prepared, err := m.Prepare(ctx, fn)
 		if err != nil {
@@ -643,7 +638,7 @@ keep_alive()
 		if err := m.Execute(ctx, prepared, "index.hi", []byte(`{"status":"COMPLETED"}`), nil); err != nil {
 			t.Fatalf("execute on service image: %v", err)
 		}
-		awaitAppOutput(t, ctx, out, "hi-15")
+		awaitAppLogsFor(t, ctx, m.cli, fn.Name, "hi-15")
 
 		// The reconcile stop path removes exactly this service's containers.
 		removed, err := m.RemoveAppServiceContainers(ctx, fn.Name)
@@ -683,7 +678,6 @@ console.log("svc26 started node=" + process.version);
 setInterval(() => {}, 1 << 30);
 `)
 		m, _ := newManager(t)
-		out := newAppOutputSink(t)
 
 		prepared, err := m.Prepare(ctx, fn)
 		if err != nil {
@@ -730,7 +724,7 @@ setInterval(() => {}, 1 << 30);
 		if err := m.Execute(ctx, prepared, "index.hi", []byte(`{"status":"COMPLETED"}`), nil); err != nil {
 			t.Fatalf("execute on service image: %v", err)
 		}
-		awaitAppOutput(t, ctx, out, "hi-26")
+		awaitAppLogsFor(t, ctx, m.cli, fn.Name, "hi-26")
 
 		removed, err := m.RemoveAppServiceContainers(ctx, fn.Name)
 		if err != nil {

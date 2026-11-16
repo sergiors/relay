@@ -573,27 +573,32 @@ func TestRunInvalidRedisDSNReturnsError(t *testing.T) {
 }
 
 // preflightSpy records the exact order in which the preflight steps ran, so the
-// fixed Redis -> manager -> NETWORKS -> maintenance order and the
-// stop-at-first-failure boundary are provable without Redis or Docker. Each
-// step's error is scripted.
+// fixed Redis -> manager -> control network -> NETWORKS -> maintenance order
+// and the stop-at-first-failure boundary are provable without Redis or Docker.
+// Each step's error is scripted.
 type preflightSpy struct {
 	order []string
 	group error
 	open  error
-	net   error
-	// opens records how many times OpenManager was invoked; netManager records
-	// the manager instance the NETWORKS step received (nil when not reached);
-	// maintManager records the manager the maintenance step received (nil when
-	// not reached).
-	opens        int
-	netManager   *runtime.Manager
-	maintManager *runtime.Manager
+	// control is the error the control-network provisioning step returns.
+	control error
+	net     error
+	// opens records how many times OpenManager was invoked; controlManager
+	// records the manager the control step received (nil when not reached);
+	// netManager records the manager instance the NETWORKS step received (nil
+	// when not reached); maintManager records the manager the maintenance step
+	// received (nil when not reached).
+	opens          int
+	controlManager *runtime.Manager
+	netManager     *runtime.Manager
+	maintManager   *runtime.Manager
 }
 
 // deps builds the preflightDeps the production Run wires, with each step
-// recording itself. A non-nil manager is returned so a reached NETWORKS step
-// receives a non-nil manager (the production contract); tests that need to
-// observe the manager instance can do so via netManager/maintManager.
+// recording itself. A non-nil manager is returned so a reached
+// control/NETWORKS step receives a non-nil manager (the production contract);
+// tests that need to observe the manager instance can do so via
+// controlManager/netManager/maintManager.
 func (s *preflightSpy) deps() preflightDeps {
 	manager := &runtime.Manager{}
 	return preflightDeps{
@@ -609,6 +614,11 @@ func (s *preflightSpy) deps() preflightDeps {
 			}
 			return manager, nil
 		},
+		EnsureControlNetwork: func(_ context.Context, m *runtime.Manager) error {
+			s.order = append(s.order, "control")
+			s.controlManager = m
+			return s.control
+		},
 		VerifyNetworks: func(_ context.Context, m *runtime.Manager) error {
 			s.order = append(s.order, "networks")
 			s.netManager = m
@@ -622,13 +632,13 @@ func (s *preflightSpy) deps() preflightDeps {
 }
 
 // TestExternalPreflightOrder proves the external-dependency preflight runs its
-// four steps in exactly the documented order — Redis stream/group readiness,
-// then Docker runtime-manager readiness, then NETWORKS verification, then the
-// manager's deferred maintenance loop — on the success path, and yields the
-// manager the later phases use. A "load" sentinel appended only after the call
-// succeeds stands in for app loading/fingerprinting, proving the whole
-// preflight completes (including starting the manager loop LAST) before any
-// later phase starts.
+// five steps in exactly the documented order — Redis stream/group readiness,
+// then Docker runtime-manager readiness, then this node's control-network
+// provisioning, then NETWORKS verification, then the manager's deferred
+// maintenance loop — on the success path, and yields the manager the later
+// phases use. A "load" sentinel appended only after the call succeeds stands
+// in for app loading/fingerprinting, proving the whole preflight completes
+// (including starting the manager loop LAST) before any later phase starts.
 func TestExternalPreflightOrder(t *testing.T) {
 	spy := &preflightSpy{}
 	manager, err := runExternalPreflight(context.Background(), discardLogger(), spy.deps())
@@ -640,7 +650,7 @@ func TestExternalPreflightOrder(t *testing.T) {
 	}
 	// App loading/preparation begins only once the preflight succeeds.
 	spy.order = append(spy.order, "load")
-	want := []string{"group", "manager", "networks", "maintenance", "load"}
+	want := []string{"group", "manager", "control", "networks", "maintenance", "load"}
 	if len(spy.order) != len(want) {
 		t.Fatalf("preflight order = %v, want %v", spy.order, want)
 	}
@@ -648,6 +658,9 @@ func TestExternalPreflightOrder(t *testing.T) {
 		if spy.order[i] != want[i] {
 			t.Fatalf("preflight step %d = %q, want %q (full order %v)", i, spy.order[i], want[i], spy.order)
 		}
+	}
+	if spy.controlManager != manager {
+		t.Fatalf("control step received manager %p, want the opened %p", spy.controlManager, manager)
 	}
 	if spy.netManager != manager {
 		t.Fatalf("NETWORKS step received manager %p, want the opened %p", spy.netManager, manager)
@@ -659,10 +672,12 @@ func TestExternalPreflightOrder(t *testing.T) {
 
 // TestExternalPreflightShortCircuitsOnFailure proves each preflight failure
 // stops every later step: a Redis/group failure never opens the manager, a
-// manager failure never verifies networks, and a network failure never starts
-// the manager's maintenance loop. Each failure is returned (not merely logged).
-// This is the boundary that keeps app loading, every later phase, and any
-// manager background loop from running against a broken external dependency.
+// manager failure never provisions the control network, a control-network
+// failure never verifies NETWORKS or starts the maintenance loop, and a
+// NETWORKS failure never starts the manager's maintenance loop. Each failure
+// is returned (not merely logged). This is the boundary that keeps app
+// loading, every later phase, and any manager background loop from running
+// against a broken external dependency.
 func TestExternalPreflightShortCircuitsOnFailure(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -683,10 +698,30 @@ func TestExternalPreflightShortCircuitsOnFailure(t *testing.T) {
 			wantErrSub: "runtime: new manager failed",
 		},
 		{
+			name: "control network failure stops at control",
+			spy: &preflightSpy{control: errors.New(
+				"ensure control network: relay-control-node already exists without relay.network.role=execution-control")},
+			wantSteps:  []string{"group", "manager", "control"},
+			wantErrSub: "ensure control network",
+		},
+		{
 			name:       "network failure stops at networks",
 			spy:        &preflightSpy{net: errors.New("verify NETWORKS: daemon exploded")},
-			wantSteps:  []string{"group", "manager", "networks"},
+			wantSteps:  []string{"group", "manager", "control", "networks"},
 			wantErrSub: "verify NETWORKS",
+		},
+		{
+			// The tightened policy's rejection of an invalid user-selected
+			// NETWORKS entry (here the reserved host mode; a control-labelled
+			// entry flows the same path) aborts the preflight AT the networks
+			// step: maintenance never starts, no app is loaded or prepared, and
+			// no handler can execute. Startup fails with both the step context
+			// and the policy message for an actionable operator error.
+			name: "invalid user-selected NETWORKS fails before any later phase",
+			spy: &preflightSpy{net: fmt.Errorf(
+				"verify NETWORKS: network %q is not allowed (host networking)", "host")},
+			wantSteps:  []string{"group", "manager", "control", "networks"},
+			wantErrSub: "not allowed",
 		},
 	}
 	for _, tc := range cases {
@@ -749,13 +784,13 @@ func TestExternalPreflightCancellationIsGraceful(t *testing.T) {
 }
 
 // TestExternalPreflightNetworkCancellationIsGraceful proves the same graceful
-// classification when the lifecycle is cancelled during the LAST preflight step:
-// group and manager succeed, NETWORKS returns an error wrapping
-// context.Canceled while the lifecycle context is cancelled, and the result is
-// errStartupInterrupted with a nil manager — never a NETWORKS failure. The
-// recorded step order is exactly the three preflight steps, proving no later
-// phase (app loading/fingerprinting) continued after the interrupted
-// network step.
+// classification when the lifecycle is cancelled during the NETWORKS step:
+// group, manager, and control provisioning succeed, NETWORKS returns an error
+// wrapping context.Canceled while the lifecycle context is cancelled, and the
+// result is errStartupInterrupted with a nil manager — never a NETWORKS
+// failure. The recorded step order is exactly the four preceding steps plus
+// the interrupted one, proving no later phase (app loading/fingerprinting)
+// continued after the interrupted network step.
 func TestExternalPreflightNetworkCancellationIsGraceful(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -763,9 +798,9 @@ func TestExternalPreflightNetworkCancellationIsGraceful(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	// group and manager succeed; only the network verify observes cancellation,
-	// so the test isolates the last step's classification rather than an early
-	// short-circuit.
+	// group, manager, and control succeed; only the network verify observes
+	// cancellation, so the test isolates that step's classification rather than
+	// an earlier short-circuit.
 	spy := &preflightSpy{net: fmt.Errorf("verify NETWORKS: %w", context.Canceled)}
 	manager, err := runExternalPreflight(ctx, logger, spy.deps())
 	if !errors.Is(err, errStartupInterrupted) {
@@ -777,13 +812,53 @@ func TestExternalPreflightNetworkCancellationIsGraceful(t *testing.T) {
 	if got := startupResult(err); got != nil {
 		t.Fatalf("startupResult(network cancellation) = %v, want nil (graceful shutdown)", got)
 	}
-	// The cancellation happened at the last step, so all three steps ran; a
-	// later phase appending after the call would show up here as a fourth entry.
-	if len(spy.order) != 3 || spy.order[0] != "group" || spy.order[1] != "manager" || spy.order[2] != "networks" {
-		t.Fatalf("steps before the interrupted network step = %v, want [group manager networks]", spy.order)
+	// The cancellation happened at the NETWORKS step, so the preceding steps
+	// ran; a later phase appending after the call would show up here as an
+	// extra entry.
+	want := []string{"group", "manager", "control", "networks"}
+	if len(spy.order) != len(want) {
+		t.Fatalf("steps before the interrupted network step = %v, want %v", spy.order, want)
+	}
+	for i := range want {
+		if spy.order[i] != want[i] {
+			t.Fatalf("preflight step %d = %q, want %q (full order %v)", i, spy.order[i], want[i], spy.order)
+		}
 	}
 	if !strings.Contains(logs.String(), "NETWORKS verification interrupted by shutdown") {
 		t.Errorf("expected an Info log recording the interrupted NETWORKS step, got:\n%s", logs.String())
+	}
+}
+
+// TestExternalPreflightControlCancellationIsGraceful proves the same graceful
+// classification for the control-network provisioning step: group and manager
+// succeed, the control step returns an error wrapping context.Canceled while
+// the lifecycle is cancelled, and the result is errStartupInterrupted with a
+// nil manager — never a control-network failure — with exactly the three
+// preceding steps recorded (NETWORKS and maintenance never ran).
+func TestExternalPreflightControlCancellationIsGraceful(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	spy := &preflightSpy{control: fmt.Errorf("ensure control network: %w", context.Canceled)}
+	manager, err := runExternalPreflight(ctx, logger, spy.deps())
+	if !errors.Is(err, errStartupInterrupted) {
+		t.Fatalf("preflight control cancellation = %v, want errStartupInterrupted", err)
+	}
+	if manager != nil {
+		t.Fatalf("preflight control cancellation returned manager %p, want nil", manager)
+	}
+	if got := startupResult(err); got != nil {
+		t.Fatalf("startupResult(control cancellation) = %v, want nil (graceful shutdown)", got)
+	}
+	if len(spy.order) != 3 ||
+		spy.order[0] != "group" || spy.order[1] != "manager" || spy.order[2] != "control" {
+		t.Fatalf("steps before the interrupted control step = %v, want [group manager control]", spy.order)
+	}
+	if !strings.Contains(logs.String(), "control network provisioning interrupted by shutdown") {
+		t.Errorf("expected an Info log recording the interrupted control step, got:\n%s", logs.String())
 	}
 }
 

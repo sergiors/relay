@@ -162,7 +162,6 @@ func TestIntegrationPythonZuvloopEndToEndWarmLoop(t *testing.T) {
 	defer cancel()
 
 	fn := writeZuvloopApp(t)
-	out := newAppOutputSink(t)
 	m, err := newCoordinatedRealManager(t, testutil.DiscardLogger(), nil, WithPythonZuvloop(true))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
@@ -190,7 +189,7 @@ func TestIntegrationPythonZuvloopEndToEndWarmLoop(t *testing.T) {
 		t.Fatalf("execute schedule handler: %v", err)
 	}
 
-	logs := awaitAppOutput(t, ctx, out,
+	logs := awaitAppLogsFor(t, ctx, m.cli, fn.Name,
 		"sync loopmod=zuvloop",
 		"event loopmod=zuvloop",
 		"schedule loopmod=zuvloop",
@@ -216,7 +215,6 @@ func TestIntegrationPythonZuvloopDisabledKeepsAsyncio(t *testing.T) {
 	defer cancel()
 
 	fn := writeZuvloopApp(t)
-	out := newAppOutputSink(t)
 	m, _ := newManager(t)
 
 	prepared, err := m.Prepare(ctx, fn)
@@ -230,10 +228,11 @@ func TestIntegrationPythonZuvloopDisabledKeepsAsyncio(t *testing.T) {
 		t.Fatalf("execute schedule handler: %v", err)
 	}
 
-	logs := awaitAppOutput(t, ctx, out, "event loopmod=asyncio", "schedule loopmod=asyncio")
-	// The negative assertion must target the loop-family MARKER, not arbitrary
-	// sink text: the app name and forwarding prefixes can legitimately contain
-	// the substring "zuvloop" while every invocation reports loopmod=asyncio.
+	logs := awaitAppLogsFor(t, ctx, m.cli, fn.Name, "event loopmod=asyncio", "schedule loopmod=asyncio")
+	// The negative assertion must target the loop-family MARKER, not
+	// arbitrary container-log text: the app name or surrounding output can
+	// legitimately contain the substring "zuvloop" while every invocation
+	// reports loopmod=asyncio.
 	for _, line := range strings.Split(logs, "\n") {
 		if strings.Contains(line, "loopmod=zuvloop") {
 			t.Errorf("the disabled mode must never select a zuvloop loop, got %q in:\n%s", strings.TrimSpace(line), logs)

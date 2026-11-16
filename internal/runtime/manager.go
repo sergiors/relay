@@ -163,15 +163,30 @@ type Manager struct {
 	// initialization without a data race.
 	buildLimit     atomic.Pointer[buildLimiter]
 	buildLimitInit sync.Once
-	// networks is the worker-global Docker network set (NETWORKS) every
-	// execution container this manager creates joins at create time. It is set
-	// once at construction (WithNetworks; the worker wires config's resolved
-	// value) and read without the lock: it is startup configuration and is NOT
-	// hot-reloadable, so a global change requires a worker restart. Empty means
-	// no NetworkingConfig is sent (default bridge behavior). The networks are
-	// infrastructure owned OUTSIDE Relay — the worker verifies they exist at
-	// startup and Relay never creates them.
+	// networks is the OPTIONAL worker-global Docker network set (NETWORKS) that
+	// every execution container this manager creates joins at create time for
+	// application connectivity, alongside the managed internal control network.
+	// It is set once at construction (WithNetworks; the worker wires config's
+	// resolved value) and read without the lock: it is startup configuration and
+	// is NOT hot-reloadable, so a global change requires a worker restart. Empty
+	// NETWORKS is valid: the managed normal bridge still provides outbound
+	// egress. The networks are infrastructure owned OUTSIDE Relay — the worker
+	// verifies they exist at startup and Relay never creates them.
 	networks []string
+	// controlNetwork is this node's persistent internal control-network name,
+	// resolved by EnsureControlNetwork during worker startup preflight. It is
+	// derived from NODE_ID but is never treated as a container ID. Written once
+	// before the worker becomes ready and read-only afterwards; execution
+	// containers join it alongside the optional NETWORKS set so Relay can open
+	// its authenticated execution channel without relying on an application
+	// network. It is REQUIRED: an empty value fails every execution create.
+	controlNetwork string
+	// controlSelfID is the full inspected ID of Relay's own container when this
+	// process is running in one and was attached to the control network. It is
+	// empty in direct-route mode (a host process or an operator-pre-attached
+	// custom-hostname container). It is never derived from NODE_ID, and readiness
+	// uses it to re-verify the actual endpoint.
+	controlSelfID string
 	// containers caches the per-app reusable execution containers.
 	containers *containerCache
 	// leases is the single ownership authority for Relay-owned images: it
@@ -352,8 +367,8 @@ type Manager struct {
 	// call inside Manager.startContainer. It is nil in production and set only by
 	// in-package tests so the create-window operation admission, the
 	// shutdown-race cleanup, and the release path can be exercised
-	// deterministically without a Docker attach hijack (which the scripted
-	// daemon cannot perform).
+	// deterministically without a live bootstrap TCP channel (which the scripted
+	// daemon cannot provide).
 	startExecutionContainerFn func(ctx context.Context, ops containerOps, cli *client.Client, log *slog.Logger, fn, image string, env []string, networks []string, limits app.ResourceLimits, meta RunMeta, workDir, sourceRoot string, mounts ...mount.Mount) (reusableContainer, error)
 	// afterSourceSnapshot is the deterministic seam around the captured source
 	// snapshot: Prepare calls it (test-only) ONCE, immediately after
@@ -411,9 +426,10 @@ type managerOptions struct {
 	// containers (MAX_WARM_CONTAINERS). Zero means the package default
 	// (DefaultMaxWarmContainers), never "unbounded".
 	maxWarmContainers int
-	// networks is the worker-global Docker network set every execution container
-	// joins at create time (see WithNetworks). Nil/empty means no extra
-	// networks (default bridge behavior).
+	// networks is the OPTIONAL worker-global Docker network set (NETWORKS) every
+	// execution container joins at create time in addition to the managed
+	// control network (see WithNetworks). Nil/empty means no extra application
+	// networks; the managed normal bridge still provides outbound egress.
 	networks []string
 	// now is the injectable clock seam for deterministic tests. Nil means the
 	// wall clock.
@@ -500,14 +516,15 @@ func WithMaxWarmContainers(n int) ManagerOption {
 	return func(o *managerOptions) { o.maxWarmContainers = n }
 }
 
-// WithNetworks sets the worker-global Docker network set (NETWORKS) that every
-// execution container this manager creates joins at create time. The worker
-// wires config's resolved list; a direct NewManager caller that omits it creates
-// containers with no NetworkingConfig (default bridge behavior). The list is
-// copied so a caller cannot mutate the manager's configuration after
-// construction, and it is startup configuration: changing it requires a worker
-// restart. The worker verifies the networks exist at startup; Relay never
-// creates them.
+// WithNetworks sets the OPTIONAL worker-global Docker network set (NETWORKS)
+// that every execution container this manager creates joins for application
+// connectivity, in addition to the internal control network. An empty list is
+// valid: execution containers still join the control network, so their
+// authenticated execution channel is reachable without an operator-managed
+// application network. The list is copied so a caller cannot mutate the
+// manager's configuration after construction, and it is startup configuration:
+// changing it requires a worker restart. The worker verifies the networks exist
+// at startup; Relay never creates them.
 func WithNetworks(networks []string) ManagerOption {
 	return func(o *managerOptions) {
 		o.networks = append([]string(nil), networks...)
@@ -598,6 +615,11 @@ func withPing(ping pingFunc) ManagerOption {
 // Close. WithDeferredMaintenance suppresses that eager start so the caller can
 // StartMaintenance it explicitly once its own startup prerequisites hold; Close
 // remains safe in either case.
+//
+// A manager requires EnsureControlNetwork to provision (or validate) this
+// node's persistent internal control network before any execution container
+// can be created; the worker calls it during startup preflight. There is no
+// fallback to NETWORKS as the execution IPC path.
 func NewManager(
 	logger *slog.Logger,
 	registry *metrics.Registry,

@@ -32,7 +32,7 @@ func uniqueControlNetwork(t *testing.T, ctx context.Context, cli *client.Client)
 	name := "relay-test-control-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	if _, err := cli.NetworkCreate(ctx, name, client.NetworkCreateOptions{
 		Driver: "bridge",
-		Labels: map[string]string{controlNetworkLabel: "true"},
+		Labels: map[string]string{networkRoleLabel: executionControlNetworkRole},
 	}); err != nil {
 		t.Fatalf("create control network: %v", err)
 	}
@@ -45,8 +45,9 @@ func uniqueControlNetwork(t *testing.T, ctx context.Context, cli *client.Client)
 }
 
 // TestIntegrationServiceControlNetworkRejected proves the persistent-service
-// create path refuses a network labelled relay.control before Docker
-// ContainerCreate: no container is ever created for the rejected replica.
+// create path refuses a network carrying only relay.network.role=execution-control
+// before Docker ContainerCreate: no container is ever created for the rejected
+// replica.
 func TestIntegrationServiceControlNetworkRejected(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	m, _ := newManager(t)

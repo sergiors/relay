@@ -75,19 +75,22 @@
 //     daemon binds the same live tree read-only. See source_mount.go.
 //   - Execute: a leased container from the app's warm pool (bounded by the
 //     app's resolved concurrency, and by the worker-global MAX_WARM_CONTAINERS
-//     bound across all apps), event JSON on stdin, stdout/stderr
-//     forwarded verbatim to the process output sink as a raw transport (not
-//     slog); healthy idle containers are evicted by a single maintenance loop
-//     once idle longer than the configured timeout, and a removed app's
-//     warm state is discarded (see container_cache.go and warm_budget.go).
+//     bound across all apps), event JSON in one length-prefixed request frame
+//     over that container's persistent, authenticated TCP execution channel.
+//     Application stdout/stderr stay inside the container and are never
+//     forwarded by Relay. Healthy idle containers are evicted by a single
+//     maintenance loop once idle longer than the configured timeout, and a
+//     removed app's warm state is discarded (see container_cache.go,
+//     execution_channel.go, and warm_budget.go).
 //     NewManager starts that
 //     loop eagerly; WithDeferredMaintenance suppresses it so a caller that must
 //     verify its own prerequisites first (the worker's NETWORKS preflight)
 //     starts it explicitly with StartMaintenance, and Close is safe either way.
 //
 // Env and secrets injection: an execution container's Docker Config.Env is only
-// the app's plan env (runtime needs, e.g. PYTHONDONTWRITEBYTECODE) — never
-// the template's literal env values and never a resolved secret. Per-invocation
+// the app's plan env (runtime needs, e.g. PYTHONDONTWRITEBYTECODE) plus Relay's
+// per-container execution-channel port and credential — never the template's
+// literal env values and never a resolved secret. Per-invocation
 // values (template env + resolved secrets) are carried in the request frame's
 // "env" object and applied by the reused bootstrap process (python/ and node/),
 // resolved by the runner immediately before each execution. They are never in
@@ -95,6 +98,16 @@
 // label, metric, log, or trace, and never in the state database. template.yaml
 // is excluded from the build context so env values and secret references are
 // never baked into image layers.
+//
+// The execution-channel credential is NOT an invocation secret: it authenticates
+// the container's own bootstrap process (which the handler can already read) and
+// is fresh for every container create. It is never logged, framed, or used as a
+// metric/label value. The channel uses the managed internal control network, so
+// NETWORKS is optional application connectivity rather than an IPC requirement.
+// Docker membership alone is not proof of Relay's own IP connectivity: a
+// containerized Relay attaches itself to the control network at startup, while a
+// host process must prove its local bridge route. No address, a missing route, or
+// a failed dial fails closed.
 //
 // Persistent service containers are the deliberate exception: a long-lived
 // service process needs its environment at process START, so StartService
@@ -157,6 +170,20 @@
 //     is not exposed to that tag-movement limitation.
 //   - The package knows nothing about matching or Redis
 //
+// Internal control networking: each node owns one persistent user-defined
+// bridge network named deterministically from NODE_ID
+// (`relay-control-<NODE_ID>`). Execution containers join that network plus the
+// optional NETWORKS application set; persistent services join only NETWORKS
+// (and TRAEFIK_NETWORK when routed). The execution channel's address is always
+// taken from the control network, never an application network. The network is
+// created or revalidated by EnsureControlNetwork during worker startup
+// preflight: a same-name network is reused only when its Relay ownership labels
+// and bridge configuration match, a conflicting one fails startup closed, and
+// Relay never removes it on shutdown. A containerized Relay inspects and
+// attaches its own verified container; a host process must prove native bridge
+// routing from its own namespace. No host ports are published; the HMAC
+// execution channel remains the authentication boundary.
+//
 // Security baseline: every execution and service container is hardened. It runs
 // as a non-root user created at build time (the engines set the plan's
 // User/UserSetup; external images keep their own USER), drops all Linux
@@ -169,9 +196,11 @@
 // policy as template parsing); each target and existing parent component is
 // proven from the immutable image layers to be a non-symlink directory before
 // create, because Docker follows rootfs symlinks when applying HostConfig.Tmpfs.
-// Execution containers never add tmpfs destinations. A network labelled
-// relay.control, and the reserved host /
-// container:<id> pseudo-networks, are refused before create. Mounts are limited
+// Execution containers never add tmpfs destinations. An operator-selected
+// network carrying the execution-control role label, and the reserved host /
+// container:<id> pseudo-networks, are refused before create; the internally
+// owned control network is the only execution-container exception. Mounts are
+// limited
 // to the read-only HOT_RELOAD source bind and its read-only tmpfs masks; a
 // container-runtime socket mount is rejected. An image whose Config declares
 // Docker VOLUME destinations is refused before create, because the daemon would

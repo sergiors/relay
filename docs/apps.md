@@ -78,76 +78,24 @@ combine schedules with at least one event rule or service.
 
 ### Runtime
 
-`runtime` is one of `python3.14`, `python3.15`, `nodejs24.x`, or `nodejs26.x`;
-any other value fails validation. These identifiers mirror the AWS Lambda
-runtime names. `runtime` is required whenever Relay must launch work through a
-runtime:
+Supported runtimes are `python3.14`, `python3.15`, `nodejs24.x`, and
+`nodejs26.x`. A runtime is required for event and schedule handlers or services
+that use an `entrypoint`. A template containing only external-image services
+can omit it.
 
-- any `events` or `schedules` entry, or
-- any service using an `entrypoint` source.
+Apps use locked dependencies: Python uses `uv.lock` with `pyproject.toml`, or
+`requirements.txt`; Node.js requires `package.json` and `pnpm-lock.yaml`. Node
+supports JavaScript and TypeScript handlers; Relay bundles TypeScript, so apps
+do not need to add a bundler. Mismatched or missing lock/manifests are rejected.
 
-A services-only template whose services **all** use the external `image` source
-needs no `runtime` at all — those images carry their own `ENTRYPOINT`/`CMD`. An
-explicitly configured runtime is always validated, so a typo in an otherwise
-image-only template is still a parse error.
+By default, app source is included in the runtime image. With `HOT_RELOAD`,
+Python and Node use the live app source read-only; source edits take effect
+without rebuilding the image. Other runtimes continue using baked source. See
+[Configuration](configuration.md#hot-reload).
 
-The managed runtimes and their official base images are:
-
-| Runtime      | Base image         |
-| ------------ | ------------------ |
-| `python3.14` | `python:3.14-slim` |
-| `python3.15` | `python:3.15-slim` |
-| `nodejs24.x` | `node:24-alpine`   |
-| `nodejs26.x` | `node:26-alpine`   |
-
-Dependency handling:
-
-- **Python** installs `uv.lock` + `pyproject.toml` as a native uv project
-  (locked); otherwise it installs `requirements.txt` with
-  `uv pip install --system`.
-- **Node.js** installs `pnpm-lock.yaml` + `package.json` with
-  `pnpm install --prod --frozen-lockfile`. A `package.json` without
-  `pnpm-lock.yaml` is an error, and `package-lock.json` is rejected.
-  TypeScript is bundled at build time (or at container startup under
-  `HOT_RELOAD`).
-
-Python dependencies are installed with uv, never pip. Node dependencies are
-installed with pnpm, never npm: a committed `pnpm-lock.yaml` is mandatory
-whenever the app has a `package.json`, and an npm `package-lock.json` is
-rejected rather than silently used. A `uv.lock` without `pyproject.toml` (or
-vice versa) is an error rather than a guess, and the same holds for
-`pnpm-lock.yaml` without `package.json`. Node runtimes accept JavaScript **and**
-TypeScript handlers; TypeScript is transpiled and bundled by Relay — at build
-time for a baked image, or at container startup from the live mount under
-`HOT_RELOAD` — so esbuild is never needed in your `package.json`.
-
-Relay materializes each runtime's pinned tool in every image it builds, so you
-never declare it: Python copies the uv binary from its official distroless
-image, and Node downloads the checksum-verified pnpm standalone binary for the
-image's target architecture (only Linux `amd64` and `arm64` are supported; any
-other architecture fails the build rather than installing a mismatched binary).
-
-By default the app's source is **baked into the immutable runtime image**. With
-`HOT_RELOAD` enabled, a mountable runtime (Python and Node) is instead built
-without the source and **source-mounts** the live app directory from `/apps`
-read-only: a source-only edit reuses the app and dependency images (neither is
-rebuilt), managed entrypoint services restart in place, and the app's warm
-execution containers are recycled onto the live source. Python mounts the source
-at `/app` because its dependencies live in the system site-packages outside the
-app directory; Node mounts at `/app/src` so the dependency image's
-`/app/node_modules` stays available. See
-[configuration.md](configuration.md#hot-reload).
-
-For Python only, the worker-global `PYTHON_ZUVLOOP` setting (default `false`)
-selects the event loop used by **event and schedule handler** invocations. When
-enabled, an app image that declares at least one such handler installs the pinned
-`zuvloop==0.0.17` package through Relay's managed uv build step and its
-invocation bootstrap uses `asyncio.run(..., loop_factory=zuvloop.new_event_loop)`;
-when disabled, the standard asyncio loop is used and nothing extra is installed.
-It has no per-app override, does not change Node, and never changes a managed
-service's command, startup, or event loop. A service-only Python app installs
-nothing extra. See
-[configuration.md](configuration.md#python-event-loop).
+For Python event and schedule handlers, `PYTHON_ZUVLOOP` selects the event loop
+used for invocations. It does not affect services. See
+[Configuration](configuration.md#python-event-loop).
 
 ### Handlers
 
@@ -157,15 +105,12 @@ Handlers may live in nested modules (for example the `events/` package), not
 only top-level files. On a Node runtime a module may be `.js`/`.mjs` or
 `.ts`/`.mts`; the handler string never carries an extension.
 
-Both event and schedule handlers run as one-shot functions through the managed
-runtime. For an event function, Relay sets `RELAY_HANDLER` to the matched rule's
-handler and sends the external event JSON on stdin. For a schedule-triggered
-function invocation, it sets `RELAY_HANDLER` to the configured (or
-already-admitted) schedule handler and sends the occurrence payload on stdin;
-schedule dispatch selects this handler directly rather than pattern-matching the
-occurrence. In either case, exit code
-`0` is success and any non-zero code is failure. See
-[events.md](events.md) and [schedules.md](schedules.md).
+Event and schedule handlers run as one-shot functions through the managed
+runtime. Event handlers receive the matching event; scheduled handlers receive
+the schedule payload and are selected by the schedule rather than event matching.
+A zero exit status is success; a non-zero status is failure. Handler output is
+available in Docker container logs. See [Events](events.md) and
+[Schedules](schedules.md).
 
 #### Invocation context
 
@@ -228,15 +173,10 @@ async def handler(event: dict, context: HandlerContext) -> None:
 OpenTelemetry trace propagation remains available ambiently during the handler
 call in both runtimes.
 
-Event handler names must be **unique across an app's event rules**,
-regardless of pattern, timeout, or retries: the invocation identity is
-`(app, handler)`, so a repeated handler is a template error (it would race
-for the same per-invocation retry/DLQ state). Schedule handler names are not
-constrained by this rule, but every schedule and every service must carry a
-unique **name** (see [schedules.md](schedules.md) and [services.md](services.md)):
-those names are their stable identities. A schedule or service name follows the
-same conservative rule as an app name (`[a-z0-9][a-z0-9._-]*`, ≤ 63 chars,
-no trailing `.`).
+Event handler names must be unique across an app's event rules. Every schedule
+and service also needs a unique, stable name within its app; names follow the
+same format as app names (`[a-z0-9][a-z0-9._-]*`, up to 63 characters, no
+trailing dot). See [Schedules](schedules.md) and [Services](services.md).
 
 ### Timeouts and retries
 
@@ -260,40 +200,27 @@ cap of `8` is capped at `8`). It must be a positive integer; omitted templates
 default to `2`. A hot-swapped change is applied live without a restart;
 `MAX_CONCURRENT_INVOCATIONS` is startup configuration.
 
-The same effective value sizes both the app's runner semaphore and its warm
-container pool, so admission, the pool capacity gauge, and `app inspect`
-agree.
-
 ### Environment and secrets
 
 - `env` maps an env-var name to a **literal** value injected into every
   container. Values are never masked. Empty values are allowed.
-- `secrets` maps an env-var name to a **secret reference** (`relay secret`
-  store). The reference is resolved to a value immediately before each
-  execution.
+- `secrets` maps an env-var name to a **secret reference**. The active secret
+  provider resolves it when needed.
 - Env-var names must match `[A-Za-z_][A-Za-z0-9_]*`; secret references must be
   lowercase letters/digits/`.`/`_`/`-`, ≤ 63 chars. A variable may not appear in
   both maps. `RELAY_HANDLER` is reserved and cannot be set.
-- **Never put secret values in `template.yaml`** — the template participates in
-  the fingerprint and is read at reconcile time. (The template is deliberately
-  **never** copied into the runtime image build context, so env values and secret
-  references cannot leak into an image layer.)
+- **Never put secret values in `template.yaml`.** The template is not copied
+  into the runtime image.
 
 Injection and confidentiality — be precise about the boundaries:
 
-- For **ephemeral event/schedule functions**, template env values and resolved secrets
-  travel in the per-invocation request frame applied by the reused bootstrap
-  process. They are never written to the execution container's Docker
-  `Config.Env`, a Docker label, a metric, a log, a trace, or the state database.
-  That is a Relay-surface guarantee, **not** confidentiality from your own
-  handler: the handler runs in the container and can read and print the values
-  it was given.
-- For **persistent service containers**, a long-lived process needs its
-  environment at start, so the effective environment (plan env + template env +
-  resolved secrets + `PORT`) **is** written to the service container's Docker
-  `Config.Env`. Anyone with Docker daemon access can read it via
-  `docker inspect`. The `relay.environment` label stores an environment
-  fingerprint for reconciliation; it is not a confidentiality boundary.
+- For **event and schedule functions**, values are provided to the handler but
+  are not written to Docker container configuration, labels, metrics, logs,
+  traces, or Relay state. The handler can read and expose any value it receives.
+- For **persistent services**, the effective environment (including resolved
+  secrets and `PORT`) is set when the container starts. Anyone with Docker
+  daemon access can read it with `docker inspect`; Docker access therefore
+  includes access to service secrets.
 
 `relay app inspect` always shows env **names** with values redacted and
 secret **reference** names only.
@@ -319,179 +246,57 @@ number of concurrently running containers.
 
 ### Builds and image reuse
 
-Relay builds **one image per app**, versioned by source fingerprint:
-
-- The fingerprint hashes the app's selected source (files after applying
-  the app's `.gitignore` rules) plus `template.yaml` **verbatim**; applicable
-  `.gitignore` files are hashed too, so a rule edit counts as a source change.
-  The fingerprint and the image build context are derived from **one immutable
-  snapshot** of the selected source, so the image tag can never describe bytes
-  other than the ones baked into the image; `template.yaml` participates in the
-  fingerprint but is never copied into the image.
-- `resources` is deliberately **excluded** from the fingerprint. Editing only
-  `resources` does **not** rebuild or retag the image; Relay rotates containers
-  to the new limits instead (idle ones discarded immediately, busy ones drained
-  after their current invocation). The same applies to a resource change on a
-  persistent service: the container is replaced, the image is not.
-- A rebuild produces a new immutable image; the old version keeps serving until
-  the new one is prepared and swapped in.
-- A template that needs no runtime (its only services use the `image` source)
-  builds **no app image at all**; its fingerprint is computed over
-  `template.yaml` alone, and Relay does not scan the source tree for it.
-- With `HOT_RELOAD` enabled, a mountable runtime (Python and Node) instead
-  builds an image **without** the source and **source-mounts** the live app
-  directory read-only (Python at `/app`; Node at `/app/src`, so
-  `/app/node_modules` stays visible and TypeScript is bundled at container
-  startup); the image tag is then derived from the runtime, dependency, and
-  bootstrap only, and a source-only edit reuses the app and dependency images
-  (neither is rebuilt) while restarting managed services in place — the same
-  container ID, same image, same bind, with a brief stop/start — and recycling
-  the app's warm execution containers, whose busy invocations drain (finish
-  before replacement). A Node
-  source-mounted container runs with `/app/src` as its working directory (so
-  `process.cwd()` and relative paths see the app root). A source-mounted Node
-  image also carries a shared resolve hook (`/relay/resolve-hook.mjs`) that
-  the invocation bootstrap imports and a mounted Node entrypoint service
-  preloads with `node --import`, so bare imports and CommonJS requires always
-  resolve from the dependency image's `/app/node_modules` rather than a host
-  copy — even when a host `node_modules` appears only after preparation. A host
-  `node_modules` present at preparation time is additionally masked with an empty
-  read-only filesystem at `/app/src/node_modules`. See
-  [configuration.md](configuration.md#hot-reload).
-
-Relay manages only its own labeled images in the `relay-app-*` / `relay-dep-*`
-namespaces (ownership is the strict `relay.type=app`/`dependency` label, not
-the name) and never prunes other images or layers. An unlabeled image that merely
-looks like a Relay image is left alone. Dependency images are content-addressed
-and shared across apps; the fingerprint keys on the base image **tag**, not
-its digest, so a newer pull of the same tag reuses the cached layer (operators
-wanting a refresh must remove those images).
-
-#### Build resource use
-
-Build input and output are streamed or bounded so they do not scale in worker
-heap with the total size of the source tree:
-
-- **Build input is streamed, not buffered.** The selected source is staged to a
-  private on-disk directory (the snapshot above) and the fingerprint is
-  computed in the same single pass; ordinary source bodies and dependency
-  manifests (e.g. a large `pnpm-lock.yaml`) are copied/hashed with bounded
-  buffers and file metadata, not held in the worker heap. That directory is the
-  build context, and the context tar is streamed directly to the Docker daemon
-  through a pipe; the whole tar is never materialized in the worker heap. The
-  one exception is the app's top-level `template.yaml`: Relay parses and
-  rewrites that document to drop `resources` from the fingerprint, so that
-  single YAML file is read into memory, proportional to the document size.
-  Memory usage is therefore independent of the total build-context size, while
-  disk use still scales with the context (the staged snapshot plus the
-  daemon's own build storage). This is not a host-wide resource limit.
-- **Build output is retained up to 1 MiB.** A failed build's diagnostic is
-  capped at 1 MiB as a whole — the retained stream output plus the Docker error
-  message together; the remainder is still fully drained from the daemon
-  (never abandoned mid-stream) and discarded, and the retained text is marked
-  `[build output truncated]`. Reading the daemon's JSON message stream
-  transiently materializes one decoded Docker JSON message value (a `stream` or
-  an error message string) before the cap is applied, so peak memory for that
-  one message tracks the size of that message, not the whole response; the
-  retained diagnostic stays at 1 MiB plus the fixed marker. The truncation is
-  counted by the unlabeled `relay_app_build_output_truncated_total` metric. A
-  successful build returns no diagnostic output.
+Relay prepares managed runtime images from an app's source and dependencies.
+Changes to source, dependencies, or the template may require a new image;
+resource-only changes replace containers without rebuilding it. Relay keeps the
+previous working version available until a replacement is ready. External
+service images are run as supplied and are not removed by Relay. See
+[Services](services.md) for external image requirements.
 
 ### Warm execution containers
 
-Each app keeps a bounded warm pool of reused containers, up to its
-effective concurrency, per image version. Containers are created lazily on
-concurrent demand and reused for later invocations. Concurrent invocations of
-the same app lease distinct containers; each container processes one
-invocation at a time.
+Relay reuses a bounded pool of containers for one-shot functions. Each container
+runs one invocation at a time; module-level state can persist between requests,
+but container reuse is an optimization, not a durability guarantee. Relay
+replaces unhealthy or outdated containers and evicts idle containers after
+`WARM_CONTAINER_IDLE_TIMEOUT` (default `5m`). The worker-wide
+`MAX_WARM_CONTAINERS` cap applies across apps; persistent services are not
+included. When all pooled containers are busy at the cap, work remains pending
+until capacity is available. See
+[Configuration](configuration.md#warm-container-bound).
 
-Because the interpreter process persists, module-level state may survive between
-invocations. Per-invocation env values are applied exactly per request: a key a
-new request no longer carries is restored to its pre-Relay value (or removed), so
-a rotated or removed secret never leaks into a later invocation.
+Python handlers in a reused process share its event loop. Async handlers are
+supported; a synchronous handler must not try to drive a coroutine with
+`asyncio.run()` while that loop is running. Use an async handler for asynchronous
+work. Container replacement ends the process and any in-memory state.
 
-For Python, the warm process also owns **one event loop for its whole lifetime**.
-By default that is the standard asyncio loop; when the worker-global
-`PYTHON_ZUVLOOP` is enabled the bootstrap selects the pinned zuvloop event loop
-once at process startup instead (see
-[configuration.md](configuration.md#python-event-loop)). Managed `entrypoint`
-services are outside this process and keep their own command and event loop.
-Synchronous handlers are called inline on that loop while it is running, and an
-async handler (or any handler that returns an awaitable) is awaited on it.
-Because that loop is already running, a synchronous handler must not call
-`asyncio.run()` or `run_until_complete()` — both are errors on an
-already-running loop. This constrains only a handler that itself needs to drive
-a coroutine; a plain synchronous handler is unaffected, and a handler that needs
-asynchronous work should be written as an async handler (or return an
-awaitable), which Relay awaits on the same loop. A module-level asyncio
-resource — a lock, a queue, an HTTP client session — therefore binds to one
-stable loop and stays usable across invocations, instead of being orphaned when a
-per-invocation loop would have been created and closed. This is a **reuse
-optimization, not a durability or lifetime guarantee**: a container is discarded
-on a timeout, a protocol error, or an image change, and the process — with its
-module state and any loop-bound resource — ends when Relay stops the container.
+Handlers share the execution container's trust boundary and are not isolated
+from that container's runtime bootstrap. Treat handlers within an app as trusted
+code.
 
-A container is pooled only while healthy; timeouts, process exits, protocol
-errors, image changes, and shutdown invalidate it. A healthy idle container is
-evicted after `WARM_CONTAINER_IDLE_TIMEOUT` (default `5m`). A container's
-**version** is its resolved image content, so the same tag whose content changed
-is a new generation that drains the old one.
-
-Each app's pool is bounded by its resolved `concurrency`, but those bounds are
-per app. Across all apps a worker also enforces a single global hard bound,
-`MAX_WARM_CONTAINERS` (default `8`), on the number of warm **execution**
-containers it keeps: when a new container is needed and the bound is reached, the
-globally oldest **idle** container is evicted to make room; if every container is
-busy, the invocation stays pending (backpressure) rather than exceeding the bound
-or killing a busy container. Persistent service containers are outside this bound.
-See [configuration.md](configuration.md#warm-container-bound).
-
-Every execution container is hardened: non-root (uid 10001), all Linux
-capabilities dropped, read-only root filesystem with a bounded `/tmp` tmpfs,
-per-container memory/CPU/PID limits, outbound networking enabled. An image whose
-config declares Docker `VOLUME` destinations is refused before create (including
-declarations inherited from a base image), because the daemon would materialize
-them as implicit anonymous writable volumes outside the bounded `/tmp`. (A
-persistent service can explicitly cover an image volume with a configured
-`tmpfs`; see [services.md](services.md#additional-writable-tmpfs).)
+Execution containers run as non-root with a read-only root filesystem, bounded
+`/tmp`, and per-container memory, CPU, and PID limits. Images declaring Docker
+`VOLUME` destinations are rejected because they would add writable storage
+outside those limits.
 
 ### Docker networks
 
-`NETWORKS` attaches every **execution** container this worker creates to
-operator-provided Docker networks (comma-separated, verified at startup; Relay
-never creates them). The same set is applied to every **persistent service**
-container too; a routed service additionally joins `TRAEFIK_NETWORK`, and an
-unrouted service with no global networks joins no extra network. A network
-removed from the daemon after startup verification surfaces as a create failure
-(execution or service) — Relay never re-creates it. Changing `NETWORKS` requires
-a worker restart.
+`NETWORKS` adds optional connectivity for execution and service containers;
+listed networks must already exist. Routed services also require
+`TRAEFIK_NETWORK`. Changing `NETWORKS` requires a worker restart. See
+[Configuration](configuration.md) for networking behavior.
 
 ### Hot reload
 
-Relay watches `/apps` and reconciles changes live: a new directory is
-built and becomes available to event matching and schedule dispatch; edits to
-template/source/dependencies rebuild only that app; a failed rebuild keeps the
-previous working version and retries on the next change or the 30s periodic pass.
-A readable template with deterministic parse or validation errors is marked
-`degraded` when a usable version is active, otherwise `unavailable`; the active
-runtime and its handlers remain in service during a live invalid update. Relay
-persists a SHA-256 identity of the bytes read from a deterministic invalid
-template in PostgreSQL, so identical input is not repeatedly parsed, logged,
-written to PostgreSQL, or
-assigned a new fencing token. Changed bytes are revalidated. Read, filesystem,
-and source
-fingerprinting failures are operational and continue retrying. The identity and
-original error survive restarts; however, startup does not reconstruct a runtime
-from an invalid template, even if PostgreSQL still records a previously active
-image.
-Under `HOT_RELOAD`, the source is source-mounted from `/apps` instead of baked,
-so a source-only edit does not rebuild the app or dependency image: the advanced
-fingerprint restarts the app's entrypoint service containers in place (same
-container ID, brief stop/start) and recycles its warm execution containers —
-idle ones discarded, busy ones drained so an in-flight invocation finishes
-before replacement — so the new code takes effect.
-An app whose image cannot be built
-is marked unavailable but is still **matched**: an event matching only an
-unavailable app counts as matched and stays pending (never DLQ'd for
-unavailability alone) until the app is rebuilt. `/apps` is read-only
-to Relay.
+Relay watches `/apps` and applies valid app changes live. If a build or update
+fails, the previous working version remains available. Matching events and
+valid schedule occurrences remain pending until an unavailable app recovers;
+unavailability alone does not acknowledge or dead-letter them. Invalid
+templates are reported in app status. See
+[Events](events.md#execution-retries-and-delivery) for delivery behavior.
+
+With `HOT_RELOAD`, Python and Node read source from `/apps` instead of baking it
+into the image. Source edits restart managed services and recycle execution
+containers so new invocations use the updated code. The source directory is
+read-only inside those containers. Relay does not modify `/apps`. See
+[Configuration](configuration.md#hot-reload).

@@ -72,7 +72,6 @@ func reusedContainerID(t *testing.T, ctx context.Context, m *Manager, fnName str
 func TestIntegrationProcessExitDiscardsContainer(t *testing.T) {
 	testutil.RequireDocker(t)
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -133,9 +132,7 @@ export function run(event, context) {
 	if id2 == "" || id2 == id1 {
 		t.Errorf("expected a FRESH container after process exit: id1=%s id2=%s", id1, id2)
 	}
-	if !strings.Contains(out.String(), "resurrected") {
-		t.Errorf("expected handler output after restart, got: %s", out.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "resurrected")
 }
 
 // TestIntegrationImageChangeDiscardsContainer verifies the image_changed
@@ -145,7 +142,6 @@ export function run(event, context) {
 func TestIntegrationImageChangeDiscardsContainer(t *testing.T) {
 	testutil.RequireDocker(t)
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -193,9 +189,7 @@ events:
 	if id2 == "" || id2 == id1 {
 		t.Errorf("expected a NEW container for the new image: id1=%s id2=%s", id1, id2)
 	}
-	if !strings.Contains(out.String(), "v2") {
-		t.Errorf("expected v2 output, got: %s", out.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "v2")
 }
 
 // TestIntegrationTwoAppsDistinctContainers verifies no cross-app
@@ -234,40 +228,6 @@ events:
 	}
 }
 
-// pollingSink is a concurrency-safe app-output sink that lets a test
-// observe handler progress WHILE invocations are in flight. newAppOutputSink's
-// bytes.Buffer cannot be read concurrently with the container output reader
-// goroutines (and would race under -race), so this sink guards every write and
-// read with a mutex.
-type pollingSink struct {
-	mu  sync.Mutex
-	buf strings.Builder
-}
-
-func (s *pollingSink) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.buf.Write(p)
-}
-
-func (s *pollingSink) contains(sub string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return strings.Contains(s.buf.String(), sub)
-}
-
-func (s *pollingSink) String() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.buf.String()
-}
-
-// waitForSinkContains polls until the sink holds sub or the deadline passes. It
-// bridges container start plus output-forwarding latency without a fixed sleep.
-func waitForSinkContains(ctx context.Context, sink *pollingSink, sub string) bool {
-	return pollUntil(ctx, 15*time.Second, func() bool { return sink.contains(sub) })
-}
-
 // TestIntegrationConcurrentInvocationsDistinctContainers verifies the warm pool
 // at the app's resolved concurrency (2): two concurrent Execute calls for
 // the SAME app lease DISTINCT containers and run concurrently, and a THIRD
@@ -280,9 +240,6 @@ func waitForSinkContains(ctx context.Context, sink *pollingSink, sub string) boo
 func TestIntegrationConcurrentInvocationsDistinctContainers(t *testing.T) {
 	testutil.RequireDocker(t)
 	m, _ := newManager(t)
-	sink := &pollingSink{}
-	prev := SetAppOutput(sink)
-	t.Cleanup(func() { SetAppOutput(prev) })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -337,12 +294,10 @@ export async function c(event, context) {
 	go func() { aErr <- exec("index.a", `{"event_name":"INSERT","blockMs":3000}`) }()
 	go func() { bErr <- exec("index.b", `{"event_name":"INSERT","blockMs":3000}`) }()
 
-	if !waitForSinkContains(ctx, sink, "START a") || !waitForSinkContains(ctx, sink, "START b") {
-		t.Fatalf("expected both handlers to start concurrently; sink:\n%s", sink.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "START a", "START b")
 	if !waitForContainersCount(ctx, m.cli, labelApp, "concurrent-e2e", 2) {
-		t.Fatalf("expected 2 pooled containers while A and B run, got %d:\n%s",
-			countContainersByLabel(ctx, m.cli, labelApp, "concurrent-e2e"), sink.String())
+		t.Fatalf("expected 2 pooled containers while A and B run, got %d",
+			countContainersByLabel(ctx, m.cli, labelApp, "concurrent-e2e"))
 	}
 
 	// C is the third concurrent invocation. Both slots are leased and blocked,
@@ -356,8 +311,8 @@ export async function c(event, context) {
 	// app's concurrency. pollUntil re-runs the check on the shared cadence
 	// for the barrier window.
 	pollUntil(ctx, 900*time.Millisecond, func() bool {
-		if sink.contains("START c") {
-			t.Fatalf("C started before A or B released:\n%s", sink.String())
+		if present, _ := appLogsContain(ctx, m.cli, fn.Name, "START c"); present {
+			t.Fatalf("C started before A or B released")
 		}
 		if got := countContainersByLabel(ctx, m.cli, labelApp, "concurrent-e2e"); got != 2 {
 			t.Fatalf("pool exceeded its concurrency bound while C waited: %d containers", got)
@@ -371,17 +326,14 @@ export async function c(event, context) {
 			t.Fatalf("concurrent execute %d failed: %v", i, err)
 		}
 	}
-	if !sink.contains("START c") {
-		t.Errorf("C never ran after A or B released:\n%s", sink.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "START c")
 	// Exactly the two pooled containers remain: C reused a released one rather
 	// than starting a third.
 	if got := countContainersByLabel(ctx, m.cli, labelApp, "concurrent-e2e"); got != 2 {
 		t.Errorf("pooled containers after execution = %d, want 2", got)
 	}
-	if strings.Contains(sink.String(), relayProtocolSentinel) {
-		t.Errorf("protocol frames leaked to the function-output sink:\n%s", sink.String())
-	}
+	logOut, logErr := appLogsSnapshot(ctx, m.cli, fn.Name)
+	assertNoProtocolFramesInLogs(t, logOut, logErr)
 }
 
 // TestIntegrationPoolBoundedByConcurrency verifies the pool max is the
@@ -502,7 +454,6 @@ events:
 func TestIntegrationIdleEviction(t *testing.T) {
 	testutil.RequireDocker(t)
 	m := newManagerWithIdleTimeout(t, time.Second)
-	out := newAppOutputSink(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -545,9 +496,7 @@ events:
 	if id2 == "" || id2 == id1 {
 		t.Errorf("expected a FRESH container after eviction: id1=%s id2=%s", id1, id2)
 	}
-	if !strings.Contains(out.String(), "ok") {
-		t.Errorf("expected handler output after re-execution, got: %s", out.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "ok")
 }
 
 // TestIntegrationBusyImageChangeDrains verifies the generation/draining model
@@ -558,9 +507,6 @@ events:
 func TestIntegrationBusyImageChangeDrains(t *testing.T) {
 	testutil.RequireDocker(t)
 	m, _ := newManager(t)
-	sink := &pollingSink{}
-	prev := SetAppOutput(sink)
-	t.Cleanup(func() { SetAppOutput(prev) })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -595,9 +541,7 @@ export async function run(event, context) {
 	go func() {
 		v1Done <- m.Execute(v1Ctx, p1, "index.run", []byte(`{"event_name":"INSERT","blockMs":4000}`), nil)
 	}()
-	if !waitForSinkContains(ctx, sink, "START v1") {
-		t.Fatalf("v1 did not start; sink:\n%s", sink.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "START v1")
 
 	// Change source -> v2 image while v1 is busy.
 	writeFile(t, dir, "index.js", "export function run(e, context){ console.log('v2'); }\n")
@@ -617,21 +561,17 @@ export async function run(event, context) {
 	if err := m.Execute(v2Ctx, p2, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute v2 while v1 busy: %v", err)
 	}
-	if !sink.contains("v2") {
-		t.Errorf("v2 did not run; sink:\n%s", sink.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "v2")
 
 	// Let v1 finish: its container is drained (discarded) rather than pooled.
 	if err := <-v1Done; err != nil {
 		t.Fatalf("v1 execute: %v", err)
 	}
-	if !sink.contains("END v1") {
-		t.Errorf("expected v1 to complete; sink:\n%s", sink.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "END v1")
 	// Exactly the v2 container remains: the v1 container is gone.
 	if !waitForContainersCount(ctx, m.cli, labelApp, "busy-change", 1) {
-		t.Errorf("expected exactly one pooled container after drain, got %d:\n%s",
-			countContainersByLabel(ctx, m.cli, labelApp, "busy-change"), sink.String())
+		t.Errorf("expected exactly one pooled container after drain, got %d",
+			countContainersByLabel(ctx, m.cli, labelApp, "busy-change"))
 	}
 }
 
@@ -1028,7 +968,6 @@ events:
 func TestIntegrationSuccessfulRunKeepsContainer(t *testing.T) {
 	testutil.RequireDocker(t)
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -1064,9 +1003,7 @@ export function ok(event, context) {
 	if id1 == "" {
 		t.Fatal("reused execution container not found while healthy")
 	}
-	if !strings.Contains(out.String(), "ok evt_1") {
-		t.Errorf("expected handler output, got: %s", out.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "ok evt_1")
 
 	// The behavioral evidence of reuse is the container-id equality below (and
 	// Close removing it at the end); the id is the real contract, not the log
@@ -1082,9 +1019,7 @@ export function ok(event, context) {
 	if id2 != id1 {
 		t.Errorf("second invocation must REUSE the same container: id1=%s id2=%s", id1, id2)
 	}
-	if !strings.Contains(out.String(), "ok evt_2") {
-		t.Errorf("expected second invocation output on the reused container, got: %s", out.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "ok evt_2")
 
 	// Close discards (reason "shutdown"); the container must then vanish.
 	if err := m.Close(); err != nil {
@@ -1183,7 +1118,6 @@ func TestIntegrationRemoveContainerTwiceBenign(t *testing.T) {
 func TestIntegrationContainerCreationLabels(t *testing.T) {
 	testutil.RequireDocker(t)
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -1265,16 +1199,10 @@ export async function slow(event, context) {
 	if err := <-done; err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	if !strings.Contains(out.String(), "completed evt_777") {
-		t.Errorf("expected stdout to contain %q, got: %s", "completed evt_777", out.String())
-	}
-	// The per-invocation output prefix was applied while in flight: the line
-	// carrying the handler output also carries this invocation's message id. The
-	// exact bracket formatting is covered by the unit prefix tests; here the
-	// integration contract is that MessageID is attributed in flight.
-	if !lineHasAll(out.String(), "completed evt_777", "1791234567890-0") {
-		t.Errorf("expected the in-flight output line to carry the invocation message id, got:\n%s", out.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "completed evt_777")
+	// Native Docker logs carry no per-line Relay prefix: invocation attribution
+	// lives on the creation-time container labels asserted above and in the
+	// invoke frame, not in the log text.
 
 	// ... and the container persists for reuse: a second invocation must use
 	// the SAME container.
@@ -1295,7 +1223,6 @@ export async function slow(event, context) {
 func TestIntegrationHandlerErrorKeepsContainer(t *testing.T) {
 	testutil.RequireDocker(t)
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -1331,11 +1258,11 @@ export function ok(event, context) {
 	if !strings.Contains(err.Error(), `handler "index.fail" failed`) {
 		t.Errorf("expected handler-failure error, got: %v", err)
 	}
-	// stderr (console.error) is forwarded to the app-output sink on a line
-	// carrying the handler context; the exact prefix format is unit-tested, so
-	// this asserts the transport contract only.
-	if !lineHasAll(out.String(), "boom", "stderr") {
-		t.Errorf("expected stderr 'boom' forwarded on a stderr line, got: %q", out.String())
+	// console.error output belongs to the container's NATIVE stderr stream
+	// (Relay never forwards app output), so this asserts the stream contract.
+	_, errStream := awaitAppStreamsFor(t, ctx, m.cli, fn.Name, "boom")
+	if !strings.Contains(errStream, "boom") {
+		t.Errorf("console.error output must arrive on the native stderr stream, stderr: %q", errStream)
 	}
 	// The container is healthy and RETAINED after a handler error.
 	id1 := waitForContainerByLabel(ctx, m.cli, labelApp, "fail-e2e")
@@ -1353,13 +1280,10 @@ export function ok(event, context) {
 	if id2 != id1 {
 		t.Errorf("post-error invocation must reuse the same container: id1=%s id2=%s", id1, id2)
 	}
-	if !strings.Contains(out.String(), "recovered 1") {
-		t.Errorf("expected 'recovered 1', got: %s", out.String())
-	}
-	// Protocol frames must never leak to the app-output sink.
-	if strings.Contains(out.String(), relayProtocolSentinel) {
-		t.Errorf("protocol frames leaked into the function output sink:\n%s", out.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "recovered 1")
+	// Protocol frames must never appear in native container logs.
+	recOut, recErr := appLogsSnapshot(ctx, m.cli, fn.Name)
+	assertNoProtocolFramesInLogs(t, recOut, recErr)
 }
 
 // TestIntegrationTimeoutDiscardsContainer verifies the per-rule timeout path:
@@ -1560,7 +1484,6 @@ export function check(event, context) {
 		t.Run(tc.name, func(t *testing.T) {
 			fn := app.App{Name: "harden-" + tc.name, Dir: tc.dir, Template: &app.Template{Runtime: tc.runtime}}
 			m, _ := newManager(t)
-			out := newAppOutputSink(t)
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			defer cancel()
 
@@ -1605,9 +1528,7 @@ export function check(event, context) {
 			if err := <-done; err != nil {
 				t.Fatalf("execute: %v", err)
 			}
-			if !strings.Contains(out.String(), tc.name+" hardening ok") {
-				t.Errorf("expected in-handler hardening assertions to pass, got logs:\n%s", out.String())
-			}
+			_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, tc.name+" hardening ok")
 		})
 	}
 }

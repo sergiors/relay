@@ -2,9 +2,16 @@ package runtime
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"strings"
-	"sync"
 	"time"
 
 	oteltrace "go.opentelemetry.io/otel/trace"
@@ -12,62 +19,169 @@ import (
 	"relay/internal/observability/tracing"
 )
 
-// The persistent invocation protocol. Execution containers are
-// REUSED across invocations for the same app: each pooled container (up to
-// the app's concurrency, per image version) stays alive as a long-running
-// bootstrap process and is leased to one invocation at a time, and each
-// invocation is one request/response frame exchange over that container's stdin
-// and stdout. The bootstrap is a line-JSON server side:
+// The persistent execution-channel protocol.
 //
-//	Relay → stdin:   {"id":"<8-16 hex>","handler":"mod.func","event":<raw>,
-//	                  "env":{"K":"V"},"context":{"requestId":"…",…}}
-//	stdin → stdout:  @@RELAY@@{"id":"<id>","ok":true}            (line)
-//	                 @@RELAY@@{"id":"<id>","ok":false,"error":"…"}
+// Each execution container runs ONE long-lived bootstrap process. Relay opens
+// ONE TCP connection to that process when the container starts, authenticates
+// it, and then reuses the same connection for every invocation served by the
+// container. There is no stdin/stdout attach, no sentinel, and no line-oriented
+// demultiplexing: a frame is length-prefixed JSON in both directions. The
+// bootstrap's stdout/stderr are application output owned by the container; Relay
+// neither reads nor forwards them.
 //
-// stdout lines that do NOT start with the sentinel are user output and are
-// forwarded to the app-output sink exactly as before (a raw transport);
-// sentinel lines that do not parse as a response frame are likewise treated as
-// user output (a program that happens to print the sentinel is not a framing
-// failure, but a PARSEABLE response carrying an unexpected id is a protocol
-// error and discards the container).
+// # Transport
 //
-// Error strings in the response are operator-facing log text only (truncated
-// bootstrap-side to a bounded size); handler failures keep the container, so
-// the protocol never turns a user error into an infrastructure failure.
-
-// relayProtocolSentinel prefixes every bootstrap protocol response line on
-// stdout. It must stay in sync with the bootstraps in python/ and node/ (the
-// interpreter tests hardcode it; a shared Go constant cannot be imported there
-// without an import cycle through internal/runtime).
-const relayProtocolSentinel = "@@RELAY@@"
-
-// maxResponseFrame is the size bound every response frame is guaranteed to
-// respect. The bootstraps bound the WHOLE serialized frame (sentinel + JSON
-// envelope + error) to this many UTF-8 bytes, so a frame always stays below the
-// demuxer's maxPending (4 KiB) line cap: an oversized line would be split off as
-// user output mid-frame and the response would be destroyed. Keeping frame <
-// maxPending is therefore a protocol invariant, not an optimization.
+// The bootstrap listens on 0.0.0.0:<RELAY_EXECUTION_PORT> (currently 7000). The
+// port is internal to the container's private network namespace, is never
+// published, and is reserved for the bootstrap (handler code must not bind it).
+// Relay reaches it over one of the worker-global shared Docker
+// networks (NETWORKS) the container was created on and the worker is expected
+// to be attached to (see execution_channel.go). Each container gets a fresh
+// random credential in RELAY_EXECUTION_SECRET; it is never logged and never
+// appears in a frame. The bootstrap should read both variables at startup (and
+// may remove the secret from its own environment before running handlers, though
+// handler code is not isolated from its own bootstrap process).
+//
+// # Framing
+//
+// Every message is:
+//
+//	4-byte big-endian uint32 N, then N bytes of UTF-8 JSON
+//
+// N must be non-zero and at most the limit for that message (below). There is no
+// newline or other in-band delimiter; readers use io.ReadFull and writers loop
+// over partial writes. A frame larger than its limit, a zero length, or malformed
+// JSON is a fatal protocol error and the container is discarded.
+//
+// Handshake (once per connection, before any invocation)
+//
+//	Relay    -> bootstrap: {"type":"hello","version":1,
+//	                        "nonce":"<64 lowercase hex chars>"}
+//	bootstrap -> Relay:    {"type":"auth","version":1,
+//	                        "mac":"<64 lowercase hex chars>",
+//	                        "nonce":"<64 lowercase hex chars>"}
+//	Relay    -> bootstrap: {"type":"ready","version":1,
+//	                        "mac":"<64 lowercase hex chars>"}
+//
+// Both MACs use HMAC-SHA256 with the SAME key: the ASCII bytes of
+// RELAY_EXECUTION_SECRET (64 lowercase hex chars). The messages differ:
+//
+//	auth.mac  = HMAC("relay-bootstrap-auth-v1:" + Relay hello nonce)
+//	ready.mac = HMAC("relay-client-auth-v1:" + bootstrap auth nonce)
+//
+// Both values are lowercase hex. The bootstrap must send "auth" only after it
+// has accepted the connection and is ready to read invocation frames; a verified
+// auth response is Relay's readiness check. The bootstrap must verify the
+// "ready" MAC before accepting any invocation frame, so a sibling container on
+// the control network cannot invoke handlers without the credential. It may close
+// unauthenticated connections (with a short handshake deadline) and accept
+// again, but it serves exactly one authenticated connection at a time. A wrong
+// MAC, wrong version, unexpected frame, or handshake timeout fails the start.
+//
+// Invocation (sequential; one request/response at a time on the connection)
+//
+//	Relay    -> bootstrap: {"type":"invoke","id":"<id>","handler":"mod.func",
+//	                        "event":<raw JSON>,"env":{"K":"V"},
+//	                        "trace":{"traceparent":"…","tracestate":"…",
+//	                                 "baggage":"…"},
+//	                        "context":{"requestId":"…","attempt":1,
+//	                                   "maxAttempts":3,
+//	                                   "deadline":"<RFC 3339>",
+//	                                   "messageId":"…","traceId":"…",
+//	                                   "app":"…","handler":"mod.func"}}
+//	bootstrap -> Relay:    {"type":"result","id":"<id>","ok":true}
+//	                       {"type":"result","id":"<id>","ok":false,"error":"…"}
+//
+// event is passed through verbatim. trace is omitted when there is no trace
+// context; context is always present. The bootstrap must echo the request id
+// exactly and must not put Docker/container identifiers into any frame. A result
+// must carry type "result", a nonempty id, and an explicit boolean "ok"; a
+// missing/null "ok" is a malformed frame, never an implied handler failure.
+//
+// A handler exception is a normal ok:false result and the container stays
+// healthy. A malformed frame, a duplicate result, a result with no pending
+// invocation, or a result whose id does not match the in-flight request is a
+// protocol violation: Relay discards the container and never reports success for
+// that invocation. Transport loss while an invocation is unresolved is the same
+// discard. Relay cancellation closes the connection and discards the container.
+//
+// Limits
+//
+//	maxHandshakeFrame 4 KiB
+//	maxRequestFrame   8 MiB
+//	maxResponseFrame  1 MiB
+//	maxResponseError  64 KiB (Relay's diagnostic truncation of an error string)
+//
+// Limits are the JSON payload size, excluding the 4-byte header.
 const (
-	maxResponseFrame = 3 << 10 // 3 KiB — bootstrap-side frame cap
-	maxResponseError = maxResponseFrame - 256
+	// executionPort is the fixed internal bootstrap port. Network namespaces are
+	// isolated, so no port publishing or per-container allocation is involved.
+	executionPort = 7000
+
+	// executionEnvPort and executionEnvSecret are the bootstrap's two Relay-owned
+	// environment variables. They are appended after the app's plan env (and any
+	// same-named plan entry is removed), so an app cannot override the channel
+	// address or credential.
+	executionEnvPort   = "RELAY_EXECUTION_PORT"
+	executionEnvSecret = "RELAY_EXECUTION_SECRET"
+
+	// executionProtocolVersion is carried by every handshake frame.
+	executionProtocolVersion = 1
+
+	maxHandshakeFrame = 4 << 10  // 4 KiB
+	maxRequestFrame   = 8 << 20  // 8 MiB
+	maxResponseFrame  = 1 << 20  // 1 MiB
+	maxResponseError  = 64 << 10 // 64 KiB
+
+	frameTypeHello  = "hello"
+	frameTypeAuth   = "auth"
+	frameTypeReady  = "ready"
+	frameTypeInvoke = "invoke"
+	frameTypeResult = "result"
+
+	executionBootstrapAuthContext = "relay-bootstrap-auth-v1:"
+	executionClientAuthContext    = "relay-client-auth-v1:"
 )
 
-// invokeRequest is one request frame Relay writes to the container's stdin as a
-// single JSON line. Event is the raw event JSON passed through verbatim
-// (json.RawMessage), so Relay never re-encodes or mutates the payload.
+// handshakeRequest is Relay's hello frame.
+type handshakeRequest struct {
+	Type    string `json:"type"`
+	Version int    `json:"version"`
+	Nonce   string `json:"nonce"`
+}
+
+// handshakeResponse is the bootstrap's challenge response. MAC authenticates
+// the bootstrap over Relay's hello nonce; Nonce is the bootstrap's own challenge
+// that Relay must answer with the ready frame.
+type handshakeResponse struct {
+	Type    string `json:"type"`
+	Version int    `json:"version"`
+	MAC     string `json:"mac"`
+	Nonce   string `json:"nonce"`
+}
+
+// handshakeReady is Relay's answer to the bootstrap's challenge.
+type handshakeReady struct {
+	Type    string `json:"type"`
+	Version int    `json:"version"`
+	MAC     string `json:"mac"`
+}
+
+// invokeRequest is one request frame. Event is the raw event JSON passed through
+// verbatim (json.RawMessage), so Relay never re-encodes or mutates the payload.
 //
 // Trace is the optional W3C trace-context carrier (traceparent/tracestate/
 // baggage) injected from the invocation's context under the single "trace"
-// object field. It is omitempty, so a byte-compatible frame is written when
-// there is no trace context (tracing disabled, or no recording span): existing
-// bootstraps that do not read "trace" are unaffected. The Node bootstrap
-// extracts it via propagation.extract(context.active(), req.trace ?? {}) and the
-// Python bootstrap does the same through its global propagator.
+// object field. It is omitempty, so no trace object is emitted when there is no
+// trace context. The Node bootstrap extracts it via
+// propagation.extract(context.active(), req.trace ?? {}) and the Python
+// bootstrap does the same through its global propagator.
 //
 // Context is the always-present per-invocation execution metadata (see
 // HandlerContext), including the stable request ID, attempt/budget, effective
 // deadline, and the optional source message and trace IDs.
 type invokeRequest struct {
+	Type    string               `json:"type"`
 	ID      string               `json:"id"`
 	Handler string               `json:"handler"`
 	Event   json.RawMessage      `json:"event"`
@@ -147,16 +261,16 @@ func newTraceFrame(ctx context.Context) *traceFrame {
 	}
 }
 
-// encodeInvokeRequest renders one request frame (without the trailing newline)
-// from the invocation identity, the verbatim event payload, the per-invocation
-// env, the trace context carried by ctx, and ctx's HandlerContext metadata. The
-// event JSON is passed through untouched (json.RawMessage) and the trace object
-// is omitted when ctx carries no trace context, keeping the frame
-// byte-compatible for bootstraps that never read it. The context object is
-// always present: it is execution metadata, not payload, and a handler side may
-// depend on its identity fields.
+// encodeInvokeRequest renders one request frame payload from the invocation
+// identity, the verbatim event payload, the per-invocation env, the trace context
+// carried by ctx, and ctx's HandlerContext metadata. The event JSON is passed
+// through untouched (json.RawMessage) and the trace object is omitted when ctx
+// carries no trace context. The context object is always present: it is
+// execution metadata, not payload, and a handler side may depend on its identity
+// fields.
 func encodeInvokeRequest(ctx context.Context, id, handler string, eventJSON []byte, env map[string]string) ([]byte, error) {
 	return json.Marshal(invokeRequest{
+		Type:    frameTypeInvoke,
 		ID:      id,
 		Handler: handler,
 		Event:   json.RawMessage(eventJSON),
@@ -166,19 +280,52 @@ func encodeInvokeRequest(ctx context.Context, id, handler string, eventJSON []by
 	})
 }
 
-// invokeResponse is one response frame line the bootstrap writes on stdout.
+// invokeResponse is one result frame payload.
 type invokeResponse struct {
+	Type  string `json:"type"`
 	ID    string `json:"id"`
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
 }
 
-// clampResponseError bounds a response error string to maxResponseError bytes so
-// a frame built from it stays below the demuxer's 4 KiB line cap (see
-// maxResponseFrame). The Go side truncates what the bootstraps already bound:
-// belt and braces for hand-written or future bootstraps. Truncation happens on a
-// Unicode code-point boundary so the result is always valid UTF-8 (a byte-slice
-// could otherwise split a multibyte character).
+// UnmarshalJSON decodes a result frame strictly enough that a missing required
+// field can never be mistaken for a handler failure. In particular, a missing or
+// null "ok" would otherwise leave the bool false and look like a normal
+// ok:false response, keeping a malformed frame's container alive. Type, a
+// nonempty id, and a present boolean ok are required; unknown fields remain
+// forward-compatible.
+func (r *invokeResponse) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Type  *string `json:"type"`
+		ID    *string `json:"id"`
+		OK    *bool   `json:"ok"`
+		Error string  `json:"error,omitempty"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	switch {
+	case wire.Type == nil || *wire.Type != frameTypeResult:
+		return errors.New("result frame has an invalid type")
+	case wire.ID == nil || *wire.ID == "":
+		return errors.New("result frame has no id")
+	case wire.OK == nil:
+		return errors.New("result frame has no ok field")
+	}
+	*r = invokeResponse{
+		Type:  *wire.Type,
+		ID:    *wire.ID,
+		OK:    *wire.OK,
+		Error: wire.Error,
+	}
+	return nil
+}
+
+// clampResponseError bounds a response error string to maxResponseError bytes.
+// The Go side truncates what the bootstraps already bound: belt and braces for
+// hand-written or future bootstraps. Truncation happens on a Unicode code-point
+// boundary so the result is always valid UTF-8 (a byte-slice could otherwise
+// split a multibyte character).
 func clampResponseError(s string) string {
 	if len(s) <= maxResponseError {
 		return s
@@ -186,277 +333,102 @@ func clampResponseError(s string) string {
 	return strings.ToValidUTF8(s[:maxResponseError], "")
 }
 
-// protocolDemuxer is the stdout demultiplexer for a reused execution container:
-// it splits the container's stdout into lines, forwards user output to the
-// stdout stream forwarder (wrapped by output.go, which prefixes it), and routes
-// sentinel-prefixed response frames to the pending invocation. It implements
-// io.Writer feeding stdcopy.StdCopy from the container's long-lived reader
-// goroutine. All state is mutex-guarded because the swap in/out of the
-// per-invocation forwarder happens on the Invoke goroutine while the reader
-// goroutine writes lines.
-//
-// A line starting with the sentinel is a protocol CANDIDATE, not an automatic
-// protocol frame: it must parse as JSON response AND match the pending
-// invocation's registered id to be delivered. An unparseable sentinel line is
-// forwarded as user output (it cannot be a response — reporting it as a failure
-// would let handler noise break invocations). A parseable response that does
-// not match the registered id is a protocol violation: it triggers protoFail
-// (the container discard path) instead of being silently dropped, so
-// multiplexing can never silently mis-route responses.
-//
-// The line buffer is bounded exactly like streamForwarder's (maxPending): a
-// line longer than the cap is flushed as user output, bounding memory; a
-// trailing partial line at EOF is flushed too.
-type protocolDemuxer struct {
-	fn string // app name for the idle fallback prefix
-
-	// mu guards everything below. The reader goroutine (Write/processLine) and
-	// the Invoke goroutine (setPending/clearPending/begin/end) both take it;
-	// contention is one swap per invocation plus one lock per stdout chunk.
-	mu sync.Mutex
-
-	// pendingID/pendingCh register the invocation currently awaiting a
-	// response. Registered by Invoke just before the request is written and
-	// cleared when it returns; the single-reader goroutine is the only sender.
-	pendingID string
-	pendingCh chan invokeResponse
-	hasPend   bool
-
-	// stdoutFwd/stderrFwd are the CURRENT forwarders: swapped to
-	// per-invocation prefixed instances (begin) while an Invoke is in flight
-	// and back to the idle fallback (end) after. One forwarder pair exists per
-	// stream; swapping whole instances is how the per-invocation prefix
-	// (app/handler[@id]) is applied without mutating shared state.
-	stdoutFwd *streamForwarder
-	stderrFwd *streamForwarder
-
-	// idleStdout/idleStderr are the STABLE fallback forwarders used while no
-	// invocation is in flight (asynchronous user output, e.g. daemon threads).
-	// They are created once: a fresh forwarder per write would drop the
-	// buffered partial line of a stderr line split across stdcopy chunks.
-	idleStdout *streamForwarder
-	idleStderr *streamForwarder
-
-	// pendingBuf holds an incomplete trailing line between Write calls.
-	pendingBuf []byte
-
-	// protoFail is invoked on the reader goroutine when a parseable response
-	// arrives with no registered (or with a mismatched) id. Nil in tests.
-	protoFail func()
-}
-
-// newProtocolDemuxer returns a demuxer whose idle forwarding falls back to
-// stable "[<fn>/] stdout/stderr: " prefixed forwarders.
-func newProtocolDemuxer(fn string) *protocolDemuxer {
-	idle := RunMeta{App: fn}
-	return &protocolDemuxer{
-		fn:         fn,
-		idleStdout: newStreamForwarder("stdout", fn, "", idle),
-		idleStderr: newStreamForwarder("stderr", fn, "", idle),
+// writeFrame writes one length-prefixed frame. It loops over partial writes, so
+// a caller never loses the tail of a frame on a short write.
+func writeFrame(w io.Writer, payload []byte, max int) error {
+	if len(payload) == 0 {
+		return errors.New("protocol: empty frame")
 	}
-}
-
-// begin swaps in per-invocation forwarders so forwarded lines carry the
-// [app/handler[@id]] prefix for this invocation.
-func (d *protocolDemuxer) begin(meta RunMeta) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.stdoutFwd = newStreamForwarder("stdout", d.fn, meta.Handler, meta)
-	d.stderrFwd = newStreamForwarder("stderr", d.fn, meta.Handler, meta)
-}
-
-// end removes the per-invocation forwarders, falling back to the stable idle
-// "[app/] stream:" prefixes for asynchronous output between invocations.
-// The outgoing forwarders are flushed first so any buffered partial line they
-// hold (a line split across stdcopy chunks) is delivered under their own
-// prefix rather than leaking into the next prefix.
-func (d *protocolDemuxer) end() {
-	d.mu.Lock()
-	stdout, stderr := d.stdoutFwd, d.stderrFwd
-	d.stdoutFwd, d.stderrFwd = nil, nil
-	d.mu.Unlock()
-	if stdout != nil {
-		stdout.flush()
+	if len(payload) > max {
+		return fmt.Errorf("protocol: frame of %d bytes exceeds the %d-byte limit", len(payload), max)
 	}
-	if stderr != nil {
-		stderr.flush()
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
+	if err := writeFull(w, header[:]); err != nil {
+		return err
 	}
+	return writeFull(w, payload)
 }
 
-// setPending registers the pending invocation (id → response channel). It must
-// be called before the request line is written.
-func (d *protocolDemuxer) setPending(id string, ch chan invokeResponse) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.pendingID = id
-	d.pendingCh = ch
-	d.hasPend = true
-}
-
-// clearPending unregisters the pending invocation. Buffered undelivered
-// responses are dropped: after a timeout the container is discarded anyway.
-func (d *protocolDemuxer) clearPending() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.pendingID = ""
-	d.pendingCh = nil
-	d.hasPend = false
-}
-
-// curForwarders returns the forwarder pair for user output, falling back to
-// the stable idle forwarders (create-time identity prefix with an empty
-// handler) when no invocation is in flight. Called with d.mu held.
-func (d *protocolDemuxer) curForwardersW() (stdout, stderr *streamForwarder) {
-	if d.stdoutFwd != nil {
-		return d.stdoutFwd, d.stderrFwd
-	}
-	return d.idleStdout, d.idleStderr
-}
-
-// stderrSink adapts the demuxer's stderr forwarder into the io.Writer
-// stdcopy.StdCopy wants for the stderr stream: the demuxer holds the CURRENT
-// stderr forwarder and delegates writes to it.
-type stderrSink struct{ d *protocolDemuxer }
-
-// Write delegates to the current (or idle-fallback) stderr forwarder. stderr
-// is pure user forwarding — no protocol lines ever appear on it.
-func (s *stderrSink) Write(p []byte) (int, error) {
-	s.d.mu.Lock()
-	defer s.d.mu.Unlock()
-	_, fwd := s.d.curForwardersW()
-	_, _ = fwd.Write(p)
-	return len(p), nil
-}
-
-// Write implements io.Writer for stdcopy: it splits p into lines and routes
-// each. It always consumes the whole buffer (nil error) so stdcopy never
-// aborts on forwarding.
-func (d *protocolDemuxer) Write(p []byte) (int, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	d.pendingBuf = append(d.pendingBuf, p...)
-	for {
-		i := indexOfByte(d.pendingBuf, '\n')
-		if i < 0 {
-			break
+// writeFull writes all of p, handling short writes.
+func writeFull(w io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		if n > 0 {
+			p = p[n:]
 		}
-		line := d.pendingBuf[:i]
-		d.pendingBuf = d.pendingBuf[i+1:]
-		d.route(append([]byte(nil), line...))
-	}
-	if len(d.pendingBuf) > maxPending {
-		// Line longer than the cap: flush it as user output so memory stays
-		// bounded (the remainder of the line continues streaming below).
-		d.fwdUser(d.pendingBuf)
-		d.pendingBuf = d.pendingBuf[:0]
-	}
-	return len(p), nil
-}
-
-// flushPending delivers any buffered trailing partial line as user output. It
-// is called when the stdout stream reaches EOF.
-func (d *protocolDemuxer) flushPending() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if len(d.pendingBuf) > 0 {
-		d.fwdUser(d.pendingBuf)
-		d.pendingBuf = d.pendingBuf[:0]
-	}
-}
-
-// route classifies one complete stdout line. Called with d.mu held; line must
-// not be aliased.
-func (d *protocolDemuxer) route(line []byte) {
-	if !hasPrefix(line, relayProtocolSentinel) {
-		d.fwdUser(line)
-		return
-	}
-	payload := line[len(relayProtocolSentinel):]
-	var resp invokeResponse
-	if err := unmarshalLine(payload, &resp); err != nil {
-		// A sentinel-looking line that does not parse is user output — do NOT
-		// fail on it.
-		d.fwdUser(line)
-		return
-	}
-	// Parseable response: it must match the registered pending id.
-	if !d.hasPend || resp.ID != d.pendingID {
-		d.protocolError()
-		return
-	}
-	ch := d.pendingCh
-	// Non-blocking send: the channel is buffered (cap 1) and the pending
-	// Invoke is its sole receiver. A second frame with the same id before the
-	// Invoke consumed the first means the bootstrap sent two responses for one
-	// request — a protocol violation (never silently multiplexed): drop the
-	// frame and signal the discard path instead of deadlocking the sole reader
-	// goroutine on a blocking send under d.mu.
-	select {
-	case ch <- resp:
-	default:
-		d.protocolError()
-	}
-}
-
-// protocolError reports an unexpected protocol frame (a parseable response
-// with no matching pending invocation). The callback (wired by
-// executionContainer) discards the container; nothing is silently allowed.
-func (d *protocolDemuxer) protocolError() {
-	if d.protoFail != nil {
-		d.protoFail()
-	}
-}
-
-// fwdUser forwards a raw line (without the trailing newline) to the current
-// stdout forwarder, falling back to the idle forwarder when no invocation is
-// in flight. The swap is done under d.mu; a user print landing exactly across
-// the swap boundary may be attributed to the adjacent prefix — acceptable
-// diagnostic imprecision (see the comment on swap-attribution in
-// execution_container.go).
-func (d *protocolDemuxer) fwdUser(line []byte) {
-	if len(line) > 0 && line[len(line)-1] == '\r' {
-		line = line[:len(line)-1]
-	}
-	fwd, _ := d.curForwardersW()
-	fwd.emit(line, true)
-}
-
-// flushForwarders flushes the trailing partial buffers of both current stream
-// forwarders. It is called when the container's streams reach EOF, after
-// flushPending delivered the stdout remainder.
-func (d *protocolDemuxer) flushForwarders() {
-	d.mu.Lock()
-	stdout, stderr := d.curForwardersW()
-	d.mu.Unlock()
-	stdout.flush()
-	stderr.flush()
-}
-
-// hasPendingIdle reports whether an invocation currently has a pending
-// response registered. It is read by the exit monitor to decide whether a
-// process-death event belongs to the invocation or to the idle container.
-func (d *protocolDemuxer) pending() bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.hasPend
-}
-
-// indexOfByte is bytes.IndexByte for a single byte without importing bytes at
-// call sites (the demuxer only ever splits on '\n').
-func indexOfByte(b []byte, c byte) int {
-	for i := 0; i < len(b); i++ {
-		if b[i] == c {
-			return i
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
 		}
 	}
-	return -1
+	return nil
 }
 
-func hasPrefix(b []byte, s string) bool {
-	return len(b) >= len(s) && string(b[:len(s)]) == s
+// readFrame reads one length-prefixed frame and enforces max. io.ReadFull makes
+// partial reads harmless; a zero length, an oversized length, or a truncated
+// frame is an error.
+func readFrame(r io.Reader, max int) ([]byte, error) {
+	var header [4]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return nil, err
+	}
+	size := binary.BigEndian.Uint32(header[:])
+	if size == 0 {
+		return nil, errors.New("protocol: empty frame")
+	}
+	if int64(size) > int64(max) {
+		return nil, fmt.Errorf("protocol: frame of %d bytes exceeds the %d-byte limit", size, max)
+	}
+	payload := make([]byte, int(size))
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
 }
 
-func unmarshalLine(data []byte, v any) error {
-	return json.Unmarshal(data, v)
+// newExecutionCredential returns a fresh 32-byte credential rendered as 64
+// lowercase hex chars. It fails closed: a credential must never fall back to a
+// predictable value.
+func newExecutionCredential() (string, error) {
+	return newRandomHex(32)
+}
+
+// newHandshakeNonce returns a fresh challenge nonce rendered as 64 lowercase hex
+// chars.
+func newHandshakeNonce() (string, error) {
+	return newRandomHex(32)
+}
+
+func newRandomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("protocol: generate random value: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// executionChallengeMAC computes one handshake MAC. The key is the ASCII bytes
+// of the 64-character credential; the message is the direction-specific context
+// prefix plus the nonce string exactly as sent.
+func executionChallengeMAC(secret, authContext, nonce string) []byte {
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(authContext + nonce))
+	return mac.Sum(nil)
+}
+
+// executionChallengeHex renders one challenge MAC in the protocol's lowercase
+// hex form.
+func executionChallengeHex(secret, authContext, nonce string) string {
+	return hex.EncodeToString(executionChallengeMAC(secret, authContext, nonce))
+}
+
+// verifyExecutionChallenge compares a received MAC with the expected value in
+// constant time. The received value is compared as the lowercase-hex ASCII form
+// the contract requires.
+func verifyExecutionChallenge(secret, authContext, nonce, got string) bool {
+	expected := executionChallengeHex(secret, authContext, nonce)
+	return hmac.Equal([]byte(expected), []byte(got))
 }

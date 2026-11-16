@@ -1,46 +1,69 @@
 """Relay's Python function bootstrap.
 
 One execution container per function STAYS ALIVE between invocations and serves
-a persistent, line-delimited JSON protocol on stdin/stdout (see
-internal/runtime/protocol.go in the Relay source):
+Relay's authenticated, length-prefixed JSON protocol over TCP on
+0.0.0.0:$RELAY_EXECUTION_PORT (7000). Relay owns exactly one long-lived
+connection per container and exchanges one invocation/result at a time over it.
+Application stdout/stderr stay native container logs: no protocol traffic uses
+them, and Relay neither reads nor forwards them.
 
-  Relay -> stdin:  {"id":"<hex>","handler":"mod.func","event":<raw>,
-                    "env":{"K":"V"},
-                    "trace":{"traceparent":"...","tracestate":"...",
-                             "baggage":"..."},
-                    "context":{"requestId":"<id>","attempt":1,
-                               "maxAttempts":3,"deadline":"<ISO-8601>",
-                               "messageId":"<optional>",
-                               "traceId":"<optional>","app":"<app>",
-                               "handler":"mod.func"}}
-  stdout:          @@RELAY@@{"id":"<id>","ok":true}
-                   @@RELAY@@{"id":"<id>","ok":false,"error":"..."}
+Wire format (both directions):
+  4-byte big-endian unsigned payload length, then that many UTF-8 JSON bytes.
+  There is no newline or sentinel. Handshake frames are capped at 4 KiB, invoke
+  requests at 8 MiB, and results at 1 MiB. A zero or oversized length is
+  rejected before allocation; reads are exact and writes complete.
 
-Everything that is not a sentinel-prefixed response line is user output and is
-proxied by Relay to the function-output sink as-is.
+Handshake (once per connection, before any invocation):
+  Relay    -> {"type":"hello","version":1,"nonce":"<64 lowercase hex>"}
+  bootstrap-> {"type":"auth","version":1,"mac":"<64 lowercase hex>",
+               "nonce":"<64 lowercase hex>"}
+  Relay    -> {"type":"ready","version":1,"mac":"<64 lowercase hex>"}
+  Both MACs are HMAC-SHA256 keyed by the ASCII bytes of RELAY_EXECUTION_SECRET
+  (64 lowercase hex chars): auth signs "relay-bootstrap-auth-v1:" plus the
+  Relay nonce, ready signs "relay-client-auth-v1:" plus the bootstrap nonce.
+  The bootstrap sends auth only once it is ready to read invocations and
+  verifies ready with hmac.compare_digest before accepting an invoke frame.
+  Unauthenticated peers are closed after a short deadline without running a
+  handler; the listener stays available for Relay.
+
+Invocation:
+  Relay    -> {"type":"invoke","id":"<id>","handler":"mod.func",
+               "event":<raw JSON>,"env":{"K":"V"},
+               "trace":{"traceparent":"...","tracestate":"...",
+                        "baggage":"..."},
+               "context":{"requestId":"<id>","attempt":1,
+                          "maxAttempts":3,"deadline":"<ISO-8601>",
+                          "messageId":"<optional>","traceId":"<optional>",
+                          "app":"<app>","handler":"mod.func"}}
+  bootstrap-> {"type":"result","id":"<same id>","ok":true}
+              {"type":"result","id":"<same id>","ok":false,"error":"..."}
+  The id is echoed exactly. "trace" is omitted when Relay has no trace context;
+  "context" is always present. Error text is bounded so the serialized result
+  stays within the 1 MiB response cap (and never exceeds 64 KiB), with
+  truncation on a Unicode code-point boundary.
 
 Process-model notes (intended semantics, not a bug):
   - Handler errors (Exceptions, SystemExit) fail THAT invocation (ok:false,
     stderr log) and the loop continues: the container is kept healthy.
-  - A malformed request line is a fatal protocol failure: the process exits
-    nonzero so Relay discards the container.
-  - EOF on stdin means Relay is done with the container; exit 0 cleanly.
+  - A malformed frame, wrong frame type, bad authentication, or EOF after the
+    channel is authenticated closes that connection. The bootstrap then exits
+    cleanly so Relay detects the loss and discards the container.
   - The whole process owns ONE event loop, created once by asyncio.run() (with
     zuvloop's loop factory when the image was built with PYTHON_ZUVLOOP for an
     app that serves event or schedule handlers) and alive until the container
     exits. Requests are read and processed on that loop, one at a time (see
-    runtime_loop). Sync handlers are called inline on the loop; an async handler
-    (or any awaitable the handler returns) is awaited on that SAME loop.
-    Module-level asyncio resources (a lock, a queue, an HTTP client session)
-    therefore bind to one stable loop and stay usable across invocations; relay
-    never runs a per-invocation loop, so a warm resource is not "attached to a
-    different event loop" on its second use.
+    serve_invocations). Sync handlers are called inline on the loop; an async
+    handler (or any awaitable the handler returns) is awaited on that SAME
+    loop. Module-level asyncio resources (a lock, a queue, an HTTP client
+    session) therefore bind to one stable loop and stay usable across
+    invocations; Relay never runs a per-invocation loop, so a warm resource is
+    not "attached to a different event loop" on its second use.
   - sys.modules caches imported modules, so module-level state (a cache dict,
     a client, a connection) persists across invocations. Per-request env is
     applied EXACTLY per invocation: a key absent from the new frame is restored
     to its pre-Relay baseline (or removed) and unrelated OS/system/container
     variables are preserved (see apply_env). RELAY_HANDLER is reserved and
-    overwritten every invocation.
+    overwritten every invocation, and the channel secret is never applied.
   - The optional "trace" object carries the W3C trace context Relay injected for
     this invocation. It is extracted and attached ONLY around the one handler
     call and always detached afterwards, so one invocation's context never leaks
@@ -52,9 +75,10 @@ Process-model notes (intended semantics, not a bug):
     time left, clamped at zero.
 
 Lifetime caveat: reuse is a warm-process optimization, never a durability or
-lifetime guarantee. A container is discarded on a timeout, protocol error, or
-image change, and the process exits when Relay closes stdin; module state and
-any loop-bound resource created by a handler are released with it.
+lifetime guarantee. A container is discarded on a timeout, protocol error,
+channel loss, or image change, and the process exits when its authenticated
+connection ends; module state and any loop-bound resource created by a handler
+are released with it.
 
 Trace propagation:
   The runtime image installs the OpenTelemetry API (see the Python engine's
@@ -69,10 +93,14 @@ Trace propagation:
 """
 
 import asyncio
+import hashlib
+import hmac
 import importlib
 import inspect
 import json
 import os
+import secrets
+import struct
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -97,24 +125,85 @@ except ImportError:  # pragma: no cover - the runtime image always ships the API
     otel_context = None
     otel_propagate = None
 
-# Must match the Relay-side constant @@RELAY@@ (internal/runtime/protocol.go);
-# the tests hardcode it because importing a Go constant from Python is not a
-# thing.
 # The function sources live in /app; put it on sys.path so imports resolve
 # regardless of where this bootstrap script is located.
 sys.path.insert(0, "/app")
 
-SENTINEL = "@@RELAY@@"
+# Relay's execution-channel contract (see internal/runtime/protocol.go in the
+# Relay source). The limits bound the JSON payload only, excluding the 4-byte
+# length header.
+EXECUTION_PORT_ENV = "RELAY_EXECUTION_PORT"
+EXECUTION_SECRET_ENV = "RELAY_EXECUTION_SECRET"
+PROTOCOL_VERSION = 1
+MAX_HANDSHAKE_BYTES = 4 * 1024
+MAX_REQUEST_BYTES = 8 * 1024 * 1024
+MAX_RESPONSE_BYTES = 1 * 1024 * 1024
+MAX_ERROR_BYTES = 64 * 1024
+HANDSHAKE_TIMEOUT_SECONDS = 2.0
+MAX_CONCURRENT_HANDSHAKES = 8
+BOOTSTRAP_AUTH_CONTEXT = "relay-bootstrap-auth-v1:"
+CLIENT_AUTH_CONTEXT = "relay-client-auth-v1:"
 
-# Response error strings are operator log text only; bound them. The cap is the
-# UTF-8 byte length of the WHOLE response frame — the sentinel, the JSON
-# envelope, and the error — so a frame can never exceed the cap and be split
-# mid-line by Relay's 4 KiB stdout line demuxer (Go's maxPending). It matches the
-# Go bootstrap-side cap maxResponseFrame (3 KiB), leaving ~1 KiB of margin under
-# the demuxer limit. Truncation is applied on a Unicode code-point boundary, so a
-# multibyte message can never be cut mid-character and the emitted frame is
-# always valid UTF-8.
-MAX_FRAME_BYTES = 3 * 1024
+
+class ProtocolError(Exception):
+    """A fatal violation of the authenticated execution-channel protocol."""
+
+
+class ConnectionAdmission:
+    """Process-local admission for the container's single execution channel.
+
+    Only one authenticated connection is served. Handshakes are bounded rather
+    than queued: a sibling container cannot leave unbounded tasks or sockets
+    waiting behind the warm authenticated session, and once Relay is
+    authenticated every additional connection is closed immediately. The
+    counters are only mutated on the event loop, with no awaits between the
+    admission check and its update.
+    """
+
+    __slots__ = ("handshakes", "authenticated")
+
+    def __init__(self):
+        self.handshakes = 0
+        self.authenticated = False
+
+
+def _is_lower_hex_64(value):
+    """Whether value is the protocol's 64-character lowercase hex form."""
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    return all(ch in "0123456789abcdef" for ch in value)
+
+
+def _is_protocol_version(value):
+    """Whether value is the integer protocol version. JSON true compares equal
+    to 1 in Python but is not a version and must be rejected."""
+    return type(value) is int and value == PROTOCOL_VERSION
+
+
+def _load_execution_config():
+    """Read and validate Relay's channel configuration, then remove the secret
+    from this process's environment before any handler module can be imported.
+
+    Both values are Relay-owned and fail closed: a missing or malformed port or
+    secret means the container must not start. The secret is the ASCII HMAC key
+    and is never logged or framed.
+    """
+    secret = os.environ.get(EXECUTION_SECRET_ENV)
+    port_text = os.environ.get(EXECUTION_PORT_ENV)
+    os.environ.pop(EXECUTION_SECRET_ENV, None)
+    if not _is_lower_hex_64(secret):
+        raise RuntimeError("invalid Relay execution configuration")
+    if (
+        not isinstance(port_text, str)
+        or not port_text.isascii()
+        or not port_text.isdigit()
+        or not 1 <= int(port_text) <= 65535
+    ):
+        raise RuntimeError("invalid Relay execution configuration")
+    return secret, int(port_text)
+
+
+EXECUTION_SECRET, EXECUTION_PORT = _load_execution_config()
 
 
 @dataclass(frozen=True)
@@ -170,24 +259,60 @@ def _parse_deadline(value):
     return parsed
 
 
+# Go's handlerContextFrame always emits these fields (MessageID and TraceID are
+# omitempty). A context that omits one is not a complete invocation identity.
+REQUIRED_CONTEXT_FIELDS = (
+    "requestId",
+    "attempt",
+    "maxAttempts",
+    "deadline",
+    "app",
+    "handler",
+)
+
+
 def build_handler_context(raw):
-    """Build a fresh HandlerContext from one request frame's context object."""
+    """Build a fresh HandlerContext from one request frame's context object.
+
+    The required identity fields must be present and correctly typed; the
+    optional source message and trace IDs may be absent, but when present they
+    must be strings. A malformed context fails only this invocation (ok:false),
+    so the container stays reusable.
+    """
     if not isinstance(raw, dict):
         raise ValueError("request frame is missing the context object")
+    missing = [name for name in REQUIRED_CONTEXT_FIELDS if name not in raw]
+    if missing:
+        raise ValueError(
+            "context is missing required field(s): " + ", ".join(missing)
+        )
+    for name in ("requestId", "deadline", "app", "handler"):
+        if not isinstance(raw[name], str):
+            raise ValueError(f"context.{name} must be a string")
+    for name in ("attempt", "maxAttempts"):
+        value = raw[name]
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"context.{name} must be an integer")
+    message_id = raw.get("messageId")
+    if "messageId" in raw and not isinstance(message_id, str):
+        raise ValueError("context.messageId must be a string when present")
+    trace_id = raw.get("traceId")
+    if "traceId" in raw and not isinstance(trace_id, str):
+        raise ValueError("context.traceId must be a string when present")
     return HandlerContext(
-        request_id=str(raw.get("requestId", "")),
-        attempt=int(raw.get("attempt", 0)),
-        max_attempts=int(raw.get("maxAttempts", 0)),
-        deadline=_parse_deadline(raw.get("deadline")),
-        message_id=raw.get("messageId"),
-        trace_id=raw.get("traceId"),
-        app=str(raw.get("app", "")),
-        handler=str(raw.get("handler", "")),
+        request_id=raw["requestId"],
+        attempt=raw["attempt"],
+        max_attempts=raw["maxAttempts"],
+        deadline=_parse_deadline(raw["deadline"]),
+        message_id=message_id,
+        trace_id=trace_id,
+        app=raw["app"],
+        handler=raw["handler"],
     )
 
 
-# User print() output must reach Relay live (and BEFORE the protocol response
-# of the invocation that printed it): force line buffering on the text layer.
+# User print() output is the container's native log, not protocol data. Keep the
+# text layer line-buffered so it appears live while the container stays warm.
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except (AttributeError, ValueError):
@@ -208,7 +333,8 @@ except (AttributeError, ValueError):
 # present key is set to the new value (its baseline captured once, on first
 # application), and every unrelated variable is left untouched. Cleanup runs at
 # the top of each request, before the next env is applied, so it is robust even
-# when the previous handler raised or called SystemExit.
+# when the previous handler raised or called SystemExit. The channel secret is
+# never applied or restored, so a frame can never reintroduce it.
 _MISSING = object()
 _applied = set()
 _baseline = {}
@@ -223,7 +349,11 @@ def apply_env(env):
     incoming = {}
     if isinstance(env, dict):
         for key, value in env.items():
-            incoming[str(key)] = str(value)
+            name = str(key)
+            if name == EXECUTION_SECRET_ENV:
+                continue
+            incoming[name] = str(value)
+    os.environ.pop(EXECUTION_SECRET_ENV, None)
     for key in list(_applied):
         if key not in incoming:
             prior = _baseline.pop(key, _MISSING)
@@ -239,6 +369,11 @@ def apply_env(env):
         _applied.add(key)
 
 
+def _dumps(value):
+    """Serialize one frame payload without incidental whitespace."""
+    return json.dumps(value, separators=(",", ":"))
+
+
 def _json_escaped_bytes(ch):
     """Number of UTF-8 bytes one Unicode character contributes inside a JSON
     string (its escaped form, without the surrounding quotes). JSON escaping is
@@ -247,27 +382,24 @@ def _json_escaped_bytes(ch):
     return len(json.dumps(ch)[1:-1].encode("utf-8"))
 
 
-def _bound_error_frame(req_id, message):
-    """Return an error string such that the whole serialized response frame
-    (sentinel + JSON envelope + error) fits in MAX_FRAME_BYTES UTF-8 bytes,
+def _bounded_error(req_id, message):
+    """Return an error string such that the whole serialized result payload
+    fits in MAX_RESPONSE_BYTES and the error itself stays within MAX_ERROR_BYTES,
     while always remaining valid UTF-8.
 
-    The budget is the frame cap minus the exact size of the sentinel, the
-    envelope with an empty error, and the trailing newline. The message is then
+    The budget is the smaller of the diagnostic cap and the response cap minus
+    the exact size of the envelope with an empty error. The message is then
     accumulated one Unicode character at a time (including any JSON escaping of
-    quotes, backslashes, and control characters), so the frame is bounded
+    quotes, backslashes, and control characters), so the payload is bounded
     precisely, a multibyte character is never cut mid-byte, and the result always
     round-trips through json.dumps (the emitted frame is parseable).
     """
-    overhead = (
-        len(
-            (SENTINEL + json.dumps({"id": req_id, "ok": False, "error": ""})).encode(
-                "utf-8"
-            )
+    overhead = len(
+        _dumps({"type": "result", "id": req_id, "ok": False, "error": ""}).encode(
+            "utf-8"
         )
-        + 1
-    )  # +1 for the trailing newline respond writes
-    budget = MAX_FRAME_BYTES - overhead
+    )
+    budget = min(MAX_ERROR_BYTES, MAX_RESPONSE_BYTES - overhead)
     if budget <= 0:
         return ""
     parts = []
@@ -281,18 +413,116 @@ def _bound_error_frame(req_id, message):
     return "".join(parts)
 
 
-def respond(req_id, ok, error=None):
-    # Flush pending user-layer output first so the byte order on stdout keeps
-    # user print lines ahead of the protocol frame.
+def _result_payload(req_id, ok, error=None):
+    """Build one result payload, bounding the error and enforcing the response
+    cap. A result that cannot fit is a protocol failure: Relay would reject an
+    oversized frame anyway."""
+    if ok:
+        frame = {"type": "result", "id": req_id, "ok": True}
+    else:
+        frame = {
+            "type": "result",
+            "id": req_id,
+            "ok": False,
+            "error": _bounded_error(req_id, "" if error is None else str(error)),
+        }
+    payload = _dumps(frame).encode("utf-8")
+    if len(payload) > MAX_RESPONSE_BYTES:
+        raise ProtocolError("result payload exceeds the response frame limit")
+    return payload
+
+
+async def _read_frame(reader, max_bytes):
+    """Read one length-prefixed frame, rejecting zero and oversized lengths
+    before allocating, and requiring the complete payload."""
+    header = await reader.readexactly(4)
+    (size,) = struct.unpack(">I", header)
+    if size == 0:
+        raise ProtocolError("empty frame")
+    if size > max_bytes:
+        raise ProtocolError(
+            f"frame of {size} bytes exceeds the {max_bytes}-byte limit"
+        )
+    return await reader.readexactly(size)
+
+
+async def _write_frame(writer, payload, max_bytes):
+    """Write one length-prefixed frame completely, then wait for the transport
+    to drain its buffer."""
+    if not payload:
+        raise ProtocolError("empty frame")
+    if len(payload) > max_bytes:
+        raise ProtocolError(
+            f"frame of {len(payload)} bytes exceeds the {max_bytes}-byte limit"
+        )
+    writer.write(struct.pack(">I", len(payload)) + payload)
+    await writer.drain()
+
+
+def _reject_json_constant(value):
+    """Reject JSON extensions Python accepts but the wire contract (and
+    JSON.parse) does not: NaN, Infinity, and -Infinity."""
+    raise ValueError(f"non-standard JSON constant {value}")
+
+
+def _decode_json(payload):
+    """Decode one UTF-8 JSON frame payload, rejecting malformed input and
+    non-standard constants before any handler can run."""
     try:
-        sys.stdout.flush()
-    except Exception:
-        pass
-    frame = {"id": req_id, "ok": ok}
-    if error is not None:
-        frame["error"] = _bound_error_frame(req_id, str(error))
-    sys.stdout.buffer.write(SENTINEL.encode() + json.dumps(frame).encode() + b"\n")
-    sys.stdout.buffer.flush()
+        return json.loads(payload.decode("utf-8"), parse_constant=_reject_json_constant)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ProtocolError(f"invalid JSON frame: {exc}") from exc
+
+
+def _challenge_mac(secret, auth_context, nonce):
+    """Compute one handshake MAC in the protocol's lowercase hex form. The key
+    is the ASCII secret and the message is the direction-specific context prefix
+    plus the nonce exactly as sent."""
+    message = (auth_context + nonce).encode("ascii")
+    return hmac.new(secret.encode("ascii"), message, hashlib.sha256).hexdigest()
+
+
+async def handshake(reader, writer, secret):
+    """Authenticate Relay and leave the connection ready for invoke frames.
+
+    The bootstrap answers Relay's hello with its own nonce and MAC, then requires
+    Relay to prove knowledge of the secret over the bootstrap nonce before any
+    handler can run. Both MAC checks use constant-time comparison. Raise
+    ProtocolError (or an I/O error) on any mismatch or unexpected frame.
+    """
+    hello = _decode_json(await _read_frame(reader, MAX_HANDSHAKE_BYTES))
+    if (
+        not isinstance(hello, dict)
+        or hello.get("type") != "hello"
+        or not _is_protocol_version(hello.get("version"))
+    ):
+        raise ProtocolError("unexpected bootstrap hello frame")
+    relay_nonce = hello.get("nonce")
+    if not _is_lower_hex_64(relay_nonce):
+        raise ProtocolError("malformed Relay nonce")
+
+    bootstrap_nonce = secrets.token_hex(32)
+    auth = {
+        "type": "auth",
+        "version": PROTOCOL_VERSION,
+        "mac": _challenge_mac(secret, BOOTSTRAP_AUTH_CONTEXT, relay_nonce),
+        "nonce": bootstrap_nonce,
+    }
+    await _write_frame(writer, _dumps(auth).encode("utf-8"), MAX_HANDSHAKE_BYTES)
+
+    ready = _decode_json(await _read_frame(reader, MAX_HANDSHAKE_BYTES))
+    if (
+        not isinstance(ready, dict)
+        or ready.get("type") != "ready"
+        or not _is_protocol_version(ready.get("version"))
+    ):
+        raise ProtocolError("unexpected Relay ready frame")
+    mac = ready.get("mac")
+    if not _is_lower_hex_64(mac):
+        raise ProtocolError("Relay authentication failed")
+    expected = _challenge_mac(secret, CLIENT_AUTH_CONTEXT, bootstrap_nonce)
+    if not hmac.compare_digest(mac, expected):
+        raise ProtocolError("Relay authentication failed")
 
 
 def extract_context(trace):
@@ -327,14 +557,14 @@ def detach_context(token):
 
 
 async def invoke(handler, event, context_frame, trace=None):
-    """Runs one handler on the process-lifetime loop. Raises SystemExit-free
-    exceptions up to the caller for protocol failure only; handler/user errors
-    are converted here.
+    """Runs one handler on the process-lifetime loop. Handler/user errors are
+    converted to an error string here; the caller reports them as an ok:false
+    result and keeps the container reusable.
 
     The import, the handler lookup, a sync handler's call, and the await of an
-    async handler all happen on the SAME loop (the one runtime_loop runs on), so
-    a module-level asyncio resource reused by a later invocation is still bound
-    to a live loop.
+    async handler all happen on the SAME loop (the one serve_invocations runs
+    on), so a module-level asyncio resource reused by a later invocation is still
+    bound to a live loop.
 
     A fresh HandlerContext is built from context_frame for this call and passed
     as the handler's second argument. The invocation's trace context (if any) is
@@ -369,8 +599,12 @@ async def invoke(handler, event, context_frame, trace=None):
         if code is None or code is True:
             return f"handler {handler!r} exited"
         return f"handler {handler!r} exited with code {code}"
+    except asyncio.CancelledError:
+        # Task cancellation is control flow, not a handler failure: re-raise so
+        # asyncio.run can shut the connection loop down and join its tasks.
+        raise
     except BaseException as exc:
-        # BaseException: SystemExit is hand led above, KeyboardInterrupt and
+        # BaseException: SystemExit is handled above, KeyboardInterrupt and
         # anything the handler raises is a failed INVOCATION, not a fatality.
         return f"handler {handler!r} failed: {exc}"
     finally:
@@ -378,52 +612,187 @@ async def invoke(handler, event, context_frame, trace=None):
     return None
 
 
-async def runtime_loop():
-    """The process's request loop, running on its one event loop. Reads one
-    request frame at a time, applies it, runs the handler, and responds before
-    reading again (Relay serializes warm-container use, so there is never more
-    than one in flight).
+def _parse_invoke_request(request):
+    """Validate one invoke frame and return its routing/execution fields.
 
-    stdin is read in a worker thread (asyncio.to_thread) so the blocking read
-    never stalls the loop that owns the handlers' asyncio resources."""
+    The frame is Relay's complete invocation contract: a non-empty id, a string
+    handler, an optional object/null env, a present event of any JSON value, an
+    optional trace object, and a context object with every required identity
+    field. A structural violation is a protocol error (the channel closes); it
+    never runs a handler. The required context fields are validated here rather
+    than defaulted, so a malformed identity is never fabricated from a partial
+    frame.
+    """
+    if not isinstance(request, dict):
+        raise ProtocolError("request frame is not a JSON object")
+    if request.get("type") != "invoke":
+        raise ProtocolError("unexpected execution-channel frame type")
+
+    req_id = request.get("id")
+    if not isinstance(req_id, str) or not req_id:
+        raise ProtocolError("invocation id must be a non-empty string")
+    handler = request.get("handler")
+    if not isinstance(handler, str):
+        raise ProtocolError("invocation handler must be a string")
+    env = request.get("env")
+    if env is not None and not isinstance(env, dict):
+        raise ProtocolError("request env must be an object or null")
+    if "event" not in request:
+        raise ProtocolError("invocation frame is missing the event")
+    trace = request.get("trace")
+    if "trace" in request and not isinstance(trace, dict):
+        raise ProtocolError("trace carrier must be an object")
+
+    context = request.get("context")
+    if not isinstance(context, dict):
+        raise ProtocolError("request context must be an object")
+    missing = [name for name in REQUIRED_CONTEXT_FIELDS if name not in context]
+    if missing:
+        raise ProtocolError(
+            "request context is missing required field(s): " + ", ".join(missing)
+        )
+    for name in ("requestId", "deadline", "app", "handler"):
+        if not isinstance(context[name], str):
+            raise ProtocolError(f"context.{name} must be a string")
+    for name in ("attempt", "maxAttempts"):
+        value = context[name]
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ProtocolError(f"context.{name} must be an integer")
+    for name in ("messageId", "traceId"):
+        if name in context and not isinstance(context[name], str):
+            raise ProtocolError(f"context.{name} must be a string when present")
+    if context["handler"] != handler:
+        raise ProtocolError("context.handler does not match the invocation handler")
+
+    # Reject an id that cannot fit any result envelope before a handler runs, so
+    # an impossible response is a protocol failure with no execution side effect.
+    if (
+        len(
+            _dumps(
+                {"type": "result", "id": req_id, "ok": False, "error": ""}
+            ).encode("utf-8")
+        )
+        > MAX_RESPONSE_BYTES
+    ):
+        raise ProtocolError("invocation id exceeds the response limit")
+
+    return req_id, handler, env, context, trace
+
+
+async def serve_invocations(reader, writer):
+    """Serve invoke/result exchanges sequentially on one authenticated
+    connection.
+
+    Relay serializes warm-container use, so there is never more than one
+    invocation in flight. The handler runs on this process's one event loop;
+    reading awaits the connection, never a worker thread. Any protocol or
+    transport failure propagates so the channel is closed and the process exits.
+    """
     while True:
-        line = await asyncio.to_thread(sys.stdin.buffer.readline)
-        if not line:
-            # Relay closed stdin (container discard or shutdown): exit cleanly.
-            break
-        try:
-            req = json.loads(line)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            # Malformed request frame: a fatal protocol failure. There is no
-            # recoverable id (the line does not parse), so respond nothing and
-            # terminate so Relay discards the container.
-            print(f"invalid request frame: {exc}", file=sys.stderr)
-            sys.exit(1)
-
-        req_id = req.get("id", "")
-        handler = req.get("handler", "")
+        request = _decode_json(await _read_frame(reader, MAX_REQUEST_BYTES))
+        req_id, handler, env, context, trace = _parse_invoke_request(request)
 
         # Per-request environment: applied EXACTLY (see apply_env). Keys this
         # invocation no longer carries are restored to their pre-Relay baseline
         # (or removed), so a rotated/removed value never leaks forward; every
-        # unrelated OS/system/container variable is preserved.
-        apply_env(req.get("env"))
-        os.environ["RELAY_HANDLER"] = str(handler)
+        # unrelated OS/system/container variable is preserved. A null or absent
+        # env is empty.
+        apply_env(env)
+        os.environ["RELAY_HANDLER"] = handler
 
-        try:
-            error = await invoke(
-                handler,
-                req.get("event"),
-                req.get("context"),
-                req.get("trace"),
-            )
-        except SystemExit as exc:
-            sys.exit(1 if exc.code not in (None, 0, True) else 0)
+        error = await invoke(
+            handler,
+            request.get("event"),
+            context,
+            trace,
+        )
 
         if error is not None:
             print(f"handler {handler!r} failed: {error}", file=sys.stderr)
 
-        respond(req_id, error is None, error)
+        await _write_frame(
+            writer, _result_payload(req_id, error is None, error), MAX_RESPONSE_BYTES
+        )
+
+
+# Admission is checked before any await: while Relay's authenticated session is
+# active, an extra connection is closed immediately instead of being left queued
+# behind the long-lived handler. Handshakes are bounded for the same reason; an
+# unauthorized peer can only occupy a slot until HANDSHAKE_TIMEOUT_SECONDS.
+async def _handle_connection(reader, writer, admission, shutdown):
+    try:
+        if (
+            admission.authenticated
+            or admission.handshakes >= MAX_CONCURRENT_HANDSHAKES
+        ):
+            return
+
+        admission.handshakes += 1
+        try:
+            try:
+                await asyncio.wait_for(
+                    handshake(reader, writer, EXECUTION_SECRET),
+                    timeout=HANDSHAKE_TIMEOUT_SECONDS,
+                )
+            except (
+                asyncio.TimeoutError,
+                asyncio.IncompleteReadError,
+                ProtocolError,
+                OSError,
+            ):
+                # Reject the peer without running a handler and keep the
+                # listener available for Relay. Log no frame or MAC values.
+                print("execution channel: handshake rejected", file=sys.stderr)
+                return
+        finally:
+            admission.handshakes -= 1
+
+        # No await since the handshake completed: this claim is atomic on the
+        # event loop, so at most one authenticated session can ever be served.
+        if admission.authenticated or shutdown.is_set():
+            return
+        admission.authenticated = True
+        try:
+            try:
+                await serve_invocations(reader, writer)
+            except asyncio.IncompleteReadError:
+                # Relay closed the channel: a clean, expected end.
+                pass
+            except ProtocolError as exc:
+                print(f"execution channel: {exc}", file=sys.stderr)
+            except OSError as exc:
+                print(f"execution channel: transport failure: {exc}", file=sys.stderr)
+            except Exception as exc:
+                print(f"execution channel: internal failure: {exc}", file=sys.stderr)
+            finally:
+                shutdown.set()
+        finally:
+            admission.authenticated = False
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def runtime_loop():
+    """Bind the execution listener and run until the authenticated channel ends.
+
+    The listener starts before any handler module is imported, so Relay's
+    handshake is also the container's readiness signal. Relay and the workload
+    share a private container network; this port is never published."""
+    admission = ConnectionAdmission()
+    shutdown = asyncio.Event()
+
+    async def handle_connection(reader, writer):
+        await _handle_connection(reader, writer, admission, shutdown)
+
+    server = await asyncio.start_server(
+        handle_connection, host="0.0.0.0", port=EXECUTION_PORT
+    )
+    async with server:
+        await shutdown.wait()
 
 
 def main():

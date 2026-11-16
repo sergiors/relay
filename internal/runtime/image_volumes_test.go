@@ -43,7 +43,8 @@ func TestExecutionContainerCreatesFromInspectedImageID(t *testing.T) {
 	)
 	m := &Manager{cli: cli, log: testutil.DiscardLogger()}
 
-	_, err := startExecutionContainer(context.Background(), containerOps{}, m.cli, m.log,
+	_, err := startExecutionContainer(context.Background(),
+		containerOps{controlNetwork: unitControlNetwork}, m.cli, m.log,
 		"fn", ref, nil, nil, app.ResourceLimits{}, RunMeta{}, "", "")
 	if err == nil {
 		t.Fatal("expected the scripted create failure")
@@ -222,7 +223,8 @@ func TestWorkloadCreateRejectsImageDeclaredVolumesBeforeCreate(t *testing.T) {
 			name:  "execution",
 			image: "volume-image",
 			start: func(t *testing.T, m *Manager) error {
-				_, err := startExecutionContainer(context.Background(), containerOps{}, m.cli, m.log,
+				_, err := startExecutionContainer(context.Background(),
+					containerOps{controlNetwork: unitControlNetwork}, m.cli, m.log,
 					"fn", "volume-image", nil, nil, app.ResourceLimits{}, RunMeta{}, "", "")
 				return err
 			},
@@ -274,7 +276,8 @@ func TestImageWithoutDeclaredVolumesStillReachesContainerCreate(t *testing.T) {
 			name:  "execution",
 			image: "relay-app-fn:empty-volumes",
 			start: func(_ *testing.T, m *Manager, image string) error {
-				_, err := startExecutionContainer(context.Background(), containerOps{}, m.cli, m.log,
+				_, err := startExecutionContainer(context.Background(),
+					containerOps{controlNetwork: unitControlNetwork}, m.cli, m.log,
 					"fn", image, nil, nil, app.ResourceLimits{}, RunMeta{}, "", "")
 				return err
 			},

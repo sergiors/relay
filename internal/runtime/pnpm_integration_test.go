@@ -124,7 +124,6 @@ func TestIntegrationNodePnpmInstallsDependencyAndExecutes(t *testing.T) {
 		"pnpm-lock.yaml": nodePnpmLockPicocolors,
 	})
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -141,7 +140,7 @@ func TestIntegrationNodePnpmInstallsDependencyAndExecutes(t *testing.T) {
 	if err := m.Execute(ctx, prepared, "handler.run", []byte(`{"status":"COMPLETED","event_id":"42"}`), nil); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	awaitAppOutput(t, ctx, out, "pnpm dep 42")
+	awaitAppLogsFor(t, ctx, m.cli, fn.Name, "pnpm dep 42")
 }
 
 // TestIntegrationNodeMissingPnpmLockFailsPrepare pins the actionable

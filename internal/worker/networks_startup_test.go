@@ -30,8 +30,10 @@ func (f *fakeNetworkVerifier) VerifyNetworks(ctx context.Context, networks []str
 // TestVerifyConfiguredNetworks pins the worker's startup pre-flight semantics
 // for the worker-global NETWORKS set: an empty set is a no-op (the verifier is
 // never called), all-present passes through, a missing network is a fatal error
-// naming the network and stating Relay never creates networks, and an inspect
-// failure is surfaced as a genuine error.
+// naming the network and stating Relay never creates networks, an inspect
+// failure is surfaced as a genuine error, and the runtime's tightened policy
+// rejection (reserved host/container mode, control-labelled network) surfaces
+// wrapped with its step context so startup fails closed before any later phase.
 func TestVerifyConfiguredNetworks(t *testing.T) {
 	t.Run("empty set is a no-op", func(t *testing.T) {
 		f := &fakeNetworkVerifier{}
@@ -72,6 +74,25 @@ func TestVerifyConfiguredNetworks(t *testing.T) {
 		err := verifyConfiguredNetworks(context.Background(), f, []string{"backend"})
 		if err == nil || !errors.Is(err, boom) {
 			t.Fatalf("verify = %v, want the wrapped inspect error", err)
+		}
+	})
+
+	// The runtime's tightened NETWORKS policy (reserved host/container modes,
+	// networks carrying the execution-control role) reaches the worker as a
+	// verification error and is wrapped with the step context, so preflight
+	// fails closed naming both the step and the offending policy message —
+	// before maintenance, app loading, readiness, or any handler execution.
+	t.Run("policy rejection surfaces wrapped with the step context", func(t *testing.T) {
+		policyErr := errors.New(`network "host" is not allowed (host networking)`)
+		f := &fakeNetworkVerifier{missing: "host", ok: false, err: policyErr}
+		err := verifyConfiguredNetworks(context.Background(), f, []string{"host"})
+		if err == nil || !errors.Is(err, policyErr) {
+			t.Fatalf("verify = %v, want the wrapped policy rejection", err)
+		}
+		for _, want := range []string{"verify NETWORKS", "not allowed"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("error %q does not contain %q", err, want)
+			}
 		}
 	})
 }

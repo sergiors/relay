@@ -1,9 +1,3 @@
-/**
- * Public invocation context interface for Relay Node.js applications.
- *
- * Relay's Node.js bootstrap constructs the actual per-invocation context.
- * This declaration describes that object for application development.
- */
 export interface HandlerContext {
   requestId: string;
   attempt: number;

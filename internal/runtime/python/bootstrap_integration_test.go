@@ -2,11 +2,30 @@
 
 package python
 
+// Direct-process tests for the Python bootstrap's authenticated, length-
+// prefixed execution channel (see internal/runtime/python/bootstrap.py and
+// internal/runtime/protocol.go). The real embedded bootstrap runs as a child
+// process on a HOST-LOCAL reserved loopback port (RELAY_EXECUTION_PORT is
+// test-overridable; production pins 7000 inside isolated containers), and the
+// test speaks the wire contract as the Relay client: framed hello/auth/ready
+// HMAC handshake, then sequential framed invoke/result exchanges. App output is
+// the child's native stdout/stderr — never protocol data — and is observed
+// directly on those pipes.
+//
+// Both bootstrap packages (python, node) may run concurrently under
+// `go test ./...`, so each child gets its OWN reserved ephemeral port instead
+// of assuming host :7000 is free.
+
 import (
-	"bufio"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,24 +37,359 @@ import (
 	"unicode/utf8"
 )
 
-// relaySentinel is the protocol response prefix. It is hardcoded here (rather
-// than imported) to avoid an import cycle with the Go runtime package.
-const relaySentinel = "@@RELAY@@"
+// Frame caps from the wire contract (payload bytes, excluding the 4-byte
+// header). Hardcoded to avoid an import cycle with the Go runtime package.
+const (
+	channelHandshakeCap = 4 << 10  // 4 KiB
+	channelRequestCap   = 8 << 20  // 8 MiB
+	channelResultCap    = 1 << 20  // 1 MiB
+	channelErrorCap     = 64 << 10 // 64 KiB
 
-// pyProc is a live bootstrap process driven by the tests: request lines are
-// written to its stdin, protocol responses are read from its stdout, and any
-// other stdout output (user prints) plus stderr are collected.
+	bootstrapAuthContext = "relay-bootstrap-auth-v1:"
+	clientAuthContext    = "relay-client-auth-v1:"
+)
+
+// reserveLoopbackPort reserves an ephemeral port bound on ALL interfaces (the
+// bootstrap listens on 0.0.0.0), then releases it for the child to bind. The
+// spawn/connect path retries with a fresh port if another process wins the
+// race, so parallel test packages never collide on a fixed port.
+func reserveLoopbackPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("reserve loopback port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	if err := ln.Close(); err != nil {
+		t.Fatalf("release reserved port: %v", err)
+	}
+	return port
+}
+
+// testSecret returns a fresh 64-lowercase-hex channel credential.
+func testSecret(t *testing.T) string {
+	t.Helper()
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatalf("generate secret: %v", err)
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// channelWriteFrame writes one 4-byte big-endian length-prefixed frame.
+func channelWriteFrame(w io.Writer, payload []byte) error {
+	if len(payload) == 0 {
+		return fmt.Errorf("empty frame")
+	}
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
+	if _, err := w.Write(header[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(payload)
+	return err
+}
+
+// channelReadFrame reads one frame with the contract's zero/oversize/truncated
+// checks against max payload bytes.
+func channelReadFrame(r io.Reader, max int) ([]byte, error) {
+	var header [4]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return nil, err
+	}
+	size := binary.BigEndian.Uint32(header[:])
+	if size == 0 {
+		return nil, fmt.Errorf("empty frame")
+	}
+	if int64(size) > int64(max) {
+		return nil, fmt.Errorf("frame of %d bytes exceeds the %d-byte limit", size, max)
+	}
+	payload := make([]byte, int(size))
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+// channelChallengeMAC is the handshake MAC: HMAC-SHA256 keyed by the ASCII
+// secret over the direction context plus the nonce.
+func channelChallengeMAC(secret, contextPrefix, nonce string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(contextPrefix + nonce))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// pyProc is a live bootstrap process driven over its authenticated channel:
+// invoke frames are written to the connection, result frames are read from it,
+// and stdout/stderr (native app output) are collected separately.
 type pyProc struct {
 	cmd      *exec.Cmd
-	stdin    io.WriteCloser
-	stdout   *bufio.Reader
+	port     int
+	secret   string
+	conn     net.Conn
 	seq      int
+	exitDone chan struct{}
+	waitErr  error
+
+	stdoutMu sync.Mutex
+	stdout   strings.Builder
 	stderrMu sync.Mutex
 	stderr   strings.Builder
 }
 
-// invokeResult is one protocol response plus any user output that arrived
-// while waiting for it.
+func (p *pyProc) Write(b []byte) (int, error) {
+	p.stderrMu.Lock()
+	defer p.stderrMu.Unlock()
+	_, _ = p.stderr.Write(b)
+	return len(b), nil
+}
+
+func (p *pyProc) stderrString() string {
+	p.stderrMu.Lock()
+	defer p.stderrMu.Unlock()
+	return p.stderr.String()
+}
+
+func (p *pyProc) stdoutLen() int {
+	p.stdoutMu.Lock()
+	defer p.stdoutMu.Unlock()
+	return p.stdout.Len()
+}
+
+func (p *pyProc) stdoutSince(off int) string {
+	p.stdoutMu.Lock()
+	defer p.stdoutMu.Unlock()
+	return p.stdout.String()[off:]
+}
+
+func (p *pyProc) stdoutString() string {
+	return p.stdoutSince(0)
+}
+
+// awaitStdoutQuiet waits until the child's stdout has stopped growing (stable
+// across a 30ms window) so an invocation's prints are observable right after
+// its result frame, bounded by 2s. The protocol arrives on the connection
+// while app output arrives on the stdout pipe; the two schedulings are not
+// ordered relative to each other.
+func (p *pyProc) awaitStdoutQuiet() {
+	deadline := time.Now().Add(2 * time.Second)
+	last := -1
+	stable := 0
+	for time.Now().Before(deadline) {
+		n := p.stdoutLen()
+		if n == last {
+			stable++
+			if stable >= 2 {
+				return
+			}
+		} else {
+			stable = 0
+			last = n
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+}
+
+// closeChannel closes the authenticated connection (Relay being done).
+func (p *pyProc) closeChannel() error {
+	if p.conn == nil {
+		return nil
+	}
+	return p.conn.Close()
+}
+
+// waitExit waits for the process to exit within bound and returns its error
+// (nil for exit 0).
+func (p *pyProc) waitExit(t *testing.T, bound time.Duration) error {
+	t.Helper()
+	select {
+	case <-p.exitDone:
+		return p.waitErr
+	case <-time.After(bound):
+		t.Fatalf("bootstrap did not exit within %v; stderr:\n%s", bound, p.stderrString())
+		return nil
+	}
+}
+
+// dialChannel dials the child's reserved loopback port, retrying while the
+// process is alive (the listener binds slightly after startup) and failing as
+// soon as the process dies (e.g. it lost the port race), within bound.
+func (p *pyProc) dialChannel(t *testing.T, bound time.Duration) net.Conn {
+	t.Helper()
+	deadline := time.Now().Add(bound)
+	addr := fmt.Sprintf("127.0.0.1:%d", p.port)
+	for {
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			return conn
+		}
+		select {
+		case <-p.exitDone:
+			t.Fatalf("bootstrap exited before accepting a connection (port %d): %v; stderr:\n%s",
+				p.port, p.waitErr, p.stderrString())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no connection to the bootstrap on %s within %v; stderr:\n%s",
+				addr, bound, p.stderrString())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// clientHandshake performs the Relay side of the contract handshake on conn:
+// hello with a fresh nonce, verify the bootstrap's auth MAC, answer its
+// challenge with ready, then clear the handshake deadline.
+func clientHandshake(t *testing.T, conn net.Conn, secret string) error {
+	t.Helper()
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set handshake deadline: %v", err)
+	}
+	var nonceBytes [32]byte
+	if _, err := rand.Read(nonceBytes[:]); err != nil {
+		t.Fatalf("hello nonce: %v", err)
+	}
+	relayNonce := hex.EncodeToString(nonceBytes[:])
+	hello, err := json.Marshal(map[string]any{
+		"type": "hello", "version": 1, "nonce": relayNonce,
+	})
+	if err != nil {
+		t.Fatalf("marshal hello: %v", err)
+	}
+	if err := channelWriteFrame(conn, hello); err != nil {
+		return fmt.Errorf("write hello: %w", err)
+	}
+	raw, err := channelReadFrame(conn, channelHandshakeCap)
+	if err != nil {
+		return fmt.Errorf("read auth: %w", err)
+	}
+	var auth struct {
+		Type    string `json:"type"`
+		Version int    `json:"version"`
+		MAC     string `json:"mac"`
+		Nonce   string `json:"nonce"`
+	}
+	if err := json.Unmarshal(raw, &auth); err != nil {
+		return fmt.Errorf("malformed auth frame: %w", err)
+	}
+	if auth.Type != "auth" || auth.Version != 1 || len(auth.Nonce) != 64 {
+		return fmt.Errorf("unexpected auth frame: %q", raw)
+	}
+	want := channelChallengeMAC(secret, bootstrapAuthContext, relayNonce)
+	if !hmac.Equal([]byte(want), []byte(auth.MAC)) {
+		return fmt.Errorf("auth MAC does not verify (got %q)", auth.MAC)
+	}
+	ready, err := json.Marshal(map[string]any{
+		"type": "ready", "version": 1,
+		"mac": channelChallengeMAC(secret, clientAuthContext, auth.Nonce),
+	})
+	if err != nil {
+		t.Fatalf("marshal ready: %v", err)
+	}
+	if err := channelWriteFrame(conn, ready); err != nil {
+		return fmt.Errorf("write ready: %w", err)
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear handshake deadline: %v", err)
+	}
+	return nil
+}
+
+// startBootstrap spawns the embedded bootstrap and completes one authenticated
+// channel. It retries with a fresh reserved port when the child loses the
+// bind race to another process.
+func startBootstrap(t *testing.T, dir string) *pyProc {
+	t.Helper()
+	return startEmbeddedBootstrap(t, dir, Bootstrap, nil)
+}
+
+// startEmbeddedBootstrap is startBootstrap for explicit content and extra
+// child environment (used by the zuvloop variant tests).
+func startEmbeddedBootstrap(t *testing.T, dir string, content []byte, extraEnv []string) *pyProc {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "bootstrap.py"), content, 0o644); err != nil {
+		t.Fatalf("write bootstrap: %v", err)
+	}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		p := spawnProcessEnv(t, dir, extraEnv)
+		conn := p.dialChannel(t, 10*time.Second)
+		if err := clientHandshake(t, conn, p.secret); err != nil {
+			_ = conn.Close()
+			select {
+			case <-p.exitDone:
+				lastErr = fmt.Errorf("attempt %d: process exited during handshake: %v (%v)",
+					attempt+1, p.waitErr, err)
+				continue // lost the port race; try a fresh port
+			default:
+				t.Fatalf("handshake: %v; stderr:\n%s", err, p.stderrString())
+			}
+		}
+		p.conn = conn
+		return p
+	}
+	t.Fatalf("could not start the bootstrap channel after retries: %v", lastErr)
+	return nil
+}
+
+// spawnProcessEnv starts the already-written bootstrap.py in dir on a fresh
+// reserved port with the Relay-owned channel environment, the test's controlled
+// baseline/system env, and any caller extras (e.g. the zuvloop variant's
+// environment). The process exit is tracked exactly once. No connection is
+// made yet.
+func spawnProcessEnv(t *testing.T, dir string, extraEnv []string) *pyProc {
+	t.Helper()
+	port := reserveLoopbackPort(t)
+	secret := testSecret(t)
+	cmd := exec.Command("python3", filepath.Join(dir, "bootstrap.py"))
+	cmd.Env = append(append(os.Environ(),
+		"PYTHONPATH="+dir,
+		"RELAY_EXECUTION_PORT="+strconv.Itoa(port),
+		"RELAY_EXECUTION_SECRET="+secret,
+		"RELAY_TEST_BASELINE=process-baseline",
+		"RELAY_TEST_SYSTEM=system-value",
+	), extraEnv...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatalf("stderr pipe: %v", err)
+	}
+	p := &pyProc{
+		cmd:      cmd,
+		port:     port,
+		secret:   secret,
+		exitDone: make(chan struct{}),
+	}
+	go func() {
+		_, _ = io.Copy(&p.stdout, stdout)
+	}()
+	go func() {
+		_, _ = io.Copy(p, stderr)
+	}()
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start bootstrap: %v", err)
+	}
+	go func() {
+		p.waitErr = cmd.Wait()
+		close(p.exitDone)
+	}()
+	t.Cleanup(func() {
+		_ = p.closeChannel()
+		select {
+		case <-p.exitDone:
+		case <-time.After(3 * time.Second):
+			_ = cmd.Process.Kill()
+			<-p.exitDone
+		}
+	})
+	return p
+}
+
+// invokeResult is one result frame plus the native stdout produced while the
+// invocation ran.
 type invokeResult struct {
 	OK    bool
 	Err   string
@@ -46,7 +400,7 @@ type invokeResult struct {
 // writeOtelStub writes a minimal stand-in for the OpenTelemetry API the runtime
 // image installs, into dir (the test PYTHONPATH). The real embedded bootstrap
 // imports `opentelemetry.context` and `opentelemetry.propagate`; this stub
-// provides just those two with the same attach/detach/extract contract backed by
+// provides just those with the same attach/detach/extract contract backed by
 // contextvars, so the process-behavior tests can observe the managed invocation
 // context without a network OTel install. Mirrors the Node bootstrap test's stub.
 func writeOtelStub(t *testing.T, dir string) {
@@ -111,120 +465,43 @@ func startPythonWithoutOtel(t *testing.T, dir string) *pyProc {
 	return startBootstrap(t, dir)
 }
 
-// startBootstrap runs the embedded bootstrap in dir as a live process. Two
-// controlled variables are seeded into the child environment so the
-// exact-per-invocation env tests can prove baseline restoration and system-var
-// preservation:
-//
-//	RELAY_TEST_BASELINE=process-baseline  (a key Relay may override then restore)
-//	RELAY_TEST_SYSTEM=system-value        (a key Relay never touches)
-func startBootstrap(t *testing.T, dir string) *pyProc {
+// startUnauthenticatedPython spawns the embedded bootstrap WITHOUT opening a
+// channel: the listener is idle, so the test can drive the raw handshake itself
+// and prove the listener-stays contract — a rejected peer is followed by a
+// valid one on the SAME still-running process (once a session is
+// authenticated, admission closes every further connection before its
+// handshake).
+func startUnauthenticatedPython(t *testing.T, dir string) *pyProc {
 	t.Helper()
+	writeOtelStub(t, dir)
 	if err := os.WriteFile(filepath.Join(dir, "bootstrap.py"), Bootstrap, 0o644); err != nil {
 		t.Fatalf("write bootstrap: %v", err)
 	}
-	cmd := exec.Command("python3", filepath.Join(dir, "bootstrap.py"))
-	cmd.Env = append(os.Environ(),
-		"PYTHONPATH="+dir,
-		"RELAY_TEST_BASELINE=process-baseline",
-		"RELAY_TEST_SYSTEM=system-value",
-	)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		t.Fatalf("stdin pipe: %v", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatalf("stdout pipe: %v", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		t.Fatalf("stderr pipe: %v", err)
-	}
-	p := &pyProc{cmd: cmd, stdin: stdin, stdout: bufio.NewReader(stdout)}
-	go func() {
-		_, _ = io.Copy(p.stderrWriter(), stderr)
-	}()
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start bootstrap: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = stdin.Close()
-		_ = cmd.Wait()
-	})
-	return p
+	return spawnProcessEnv(t, dir, nil)
 }
 
-func (p *pyProc) stderrWriter() io.Writer { return p }
-func (p *pyProc) Write(b []byte) (int, error) {
-	p.stderrMu.Lock()
-	defer p.stderrMu.Unlock()
-	_, _ = p.stderr.Write(b)
-	return len(b), nil
+type reqFrame struct {
+	Type    string            `json:"type"`
+	ID      string            `json:"id"`
+	Handler string            `json:"handler"`
+	Event   json.RawMessage   `json:"event"`
+	Env     map[string]string `json:"env"`
+	Trace   map[string]string `json:"trace,omitempty"`
+	Context map[string]any    `json:"context,omitempty"`
 }
 
-func (p *pyProc) stderrString() string {
-	p.stderrMu.Lock()
-	defer p.stderrMu.Unlock()
-	return p.stderr.String()
-}
-
-// invoke writes one request frame and reads stdout until a sentinel protocol
-// response line arrives, collecting any interleaved user output. It fails the
-// test on protocol EOF (the process died mid-invocation). The frame carries a
-// default handler context so the invocation exercises the production
-// two-argument call.
-func (p *pyProc) invoke(t *testing.T, handler string, event string, env map[string]string) invokeResult {
-	return p.invokeTrace(t, handler, event, env, nil)
-}
-
-// invokeTrace is invoke with the optional W3C "trace" carrier the frame carries.
-func (p *pyProc) invokeTrace(t *testing.T, handler string, event string, env, trace map[string]string) invokeResult {
-	t.Helper()
-	return p.invokeFrame(t, handler, event, env, trace, defaultHandlerContext(handler))
-}
-
-// invokeFrame is invokeTrace with an explicit "context" frame object; a nil
-// ctxFrame omits the field entirely (an invalid frame the bootstrap must reject).
-func (p *pyProc) invokeFrame(t *testing.T, handler string, event string, env, trace map[string]string, ctxFrame map[string]any) invokeResult {
-	t.Helper()
-	id := fmt.Sprintf("t%d", p.seq)
-	p.seq++
-	frame, err := json.Marshal(reqFrame{ID: id, Handler: handler, Event: json.RawMessage(event), Env: env, Trace: trace, Context: ctxFrame})
-	if err != nil {
-		t.Fatalf("build request frame: %v", err)
-	}
-	if _, err := p.stdin.Write(append(frame, '\n')); err != nil {
-		t.Fatalf("write request frame: %v", err)
-	}
-	var res invokeResult
-	for {
-		line, err := p.stdout.ReadBytes('\n')
-		if err != nil {
-			t.Fatalf("stdout EOF before a protocol response (process died): %v; stderr:\n%s", err, p.stderrString())
-		}
-		s := strings.TrimRight(string(line), "\n")
-		if strings.HasPrefix(s, relaySentinel) {
-			res.Frame = s
-			var resp respFrame
-			if err := json.Unmarshal([]byte(strings.TrimPrefix(s, relaySentinel)), &resp); err != nil {
-				t.Fatalf("response frame is not parseable JSON: %q", s)
-			}
-			if resp.ID != id {
-				t.Fatalf("response id = %q, want %q", resp.ID, id)
-			}
-			res.OK = resp.OK
-			res.Err = resp.Error
-			return res
-		}
-		res.Out += s + "\n"
-	}
+type respFrame struct {
+	Type  string `json:"type"`
+	ID    string `json:"id"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error"`
 }
 
 // defaultHandlerContext returns a complete per-request context frame in the
-// protocol's camelCase shape, with a live future deadline, so an invocation
-// test that does not care about the context still runs the production
-// handler(event, context) path.
+// protocol's camelCase shape, with a live future deadline and a handler name
+// MATCHING the invocation (the bootstrap rejects a mismatch as a protocol
+// violation), so an invocation test that does not care about the context still
+// runs the production handler(event, context) path.
 func defaultHandlerContext(handler string) map[string]any {
 	return map[string]any{
 		"requestId":   "test-request",
@@ -236,19 +513,106 @@ func defaultHandlerContext(handler string) map[string]any {
 	}
 }
 
-type reqFrame struct {
-	ID      string            `json:"id"`
-	Handler string            `json:"handler"`
-	Event   json.RawMessage   `json:"event"`
-	Env     map[string]string `json:"env"`
-	Trace   map[string]string `json:"trace,omitempty"`
-	Context map[string]any    `json:"context,omitempty"`
+// invoke writes one framed invoke request on the authenticated channel, reads
+// the result frame, and collects the native stdout produced meanwhile. A dead
+// channel surfaces as invokeResult without OK (Closed set) instead of failing
+// the test; every other call validates the frame contract (type, id echo).
+func (p *pyProc) invoke(t *testing.T, handler string, event string, env map[string]string) invokeResult {
+	return p.invokeTrace(t, handler, event, env, nil)
 }
 
-type respFrame struct {
-	ID    string `json:"id"`
-	OK    bool   `json:"ok"`
-	Error string `json:"error"`
+func (p *pyProc) invokeTrace(t *testing.T, handler string, event string, env, trace map[string]string) invokeResult {
+	return p.invokeFrame(t, handler, event, env, trace, defaultHandlerContext(handler))
+}
+
+func (p *pyProc) invokeFrame(t *testing.T, handler string, event string, env, trace map[string]string, ctxFrame map[string]any) invokeResult {
+	t.Helper()
+	if p.conn == nil {
+		t.Fatalf("invoke on a process without a channel")
+	}
+	id := fmt.Sprintf("t%d", p.seq)
+	p.seq++
+	frame, err := json.Marshal(reqFrame{
+		Type: "invoke", ID: id, Handler: handler,
+		Event: json.RawMessage(event), Env: env, Trace: trace, Context: ctxFrame,
+	})
+	if err != nil {
+		t.Fatalf("build request frame: %v", err)
+	}
+	off := p.stdoutLen()
+	if err := p.conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set invoke deadline: %v", err)
+	}
+	if err := channelWriteFrame(p.conn, frame); err != nil {
+		return invokeResult{Err: "write invoke frame: " + err.Error()}
+	}
+	raw, err := channelReadFrame(p.conn, channelResultCap)
+	if err != nil {
+		return invokeResult{Err: "read result frame: " + err.Error()}
+	}
+	if err := p.conn.SetDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear invoke deadline: %v", err)
+	}
+	p.awaitStdoutQuiet()
+	res := invokeResult{Frame: string(raw), Out: p.stdoutSince(off)}
+	var resp respFrame
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("result frame is not parseable JSON: %q", raw)
+	}
+	if resp.Type != "result" {
+		t.Errorf("result type = %q, want %q", resp.Type, "result")
+	}
+	if resp.ID != id {
+		t.Errorf("result id = %q, want the echoed request id %q", resp.ID, id)
+	}
+	res.OK = resp.OK
+	res.Err = resp.Error
+	return res
+}
+
+// expectChannelClosed asserts the channel reads EOF (or a reset) within bound —
+// the bootstrap closed the authenticated connection.
+func (p *pyProc) expectChannelClosed(t *testing.T, bound time.Duration) {
+	t.Helper()
+	if p.conn == nil {
+		t.Fatal("no channel to observe closed")
+	}
+	if err := p.conn.SetReadDeadline(time.Now().Add(bound)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	var buf [4]byte
+	if _, err := io.ReadFull(p.conn, buf[:]); err == nil {
+		t.Fatal("expected the channel to be closed, but a frame arrived")
+	} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		t.Fatalf("channel still open after %v (no close observed)", bound)
+	}
+	// EOF / reset / closed pipe: the bootstrap closed its side.
+}
+
+// expectFrameClosed asserts the next read fails within bound with ANY error
+// (used right after writing a frame that must get the connection torn down).
+func expectFrameReadFails(t *testing.T, conn net.Conn, bound time.Duration) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(bound)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	if _, err := channelReadFrame(conn, channelResultCap); err == nil {
+		t.Fatal("expected a read failure (closed channel), got a frame")
+	} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		t.Fatalf("channel stayed open after %v (no close observed)", bound)
+	}
+}
+
+// reconnect opens a fresh connection to the same still-running process and
+// completes the handshake — the proof that a rejected peer did not kill the
+// listener.
+func (p *pyProc) reconnect(t *testing.T) net.Conn {
+	t.Helper()
+	conn := p.dialChannel(t, 5*time.Second)
+	if err := clientHandshake(t, conn, p.secret); err != nil {
+		t.Fatalf("reconnect handshake: %v; stderr:\n%s", err, p.stderrString())
+	}
+	return conn
 }
 
 // writeHandler writes a handler module into the test PYTHONPATH dir.
@@ -403,7 +767,7 @@ async def async_boom(event, context):
 // an awaitable is awaited on the persistent loop: both a plain sync def
 // returning a coroutine and the common decorator shape (a sync wrapper around
 // an async body) complete, and the awaited body's output is still emitted before
-// the protocol response.
+// the invocation's result.
 func TestPythonRuntimeAwaitableReturningHandler(t *testing.T) {
 	requirePython(t)
 	dir := t.TempDir()
@@ -481,10 +845,11 @@ async def async_handler(event, context):
 }
 
 // TestPythonRuntimeTraceContextIsolatedAcrossInvocations proves the managed
-// invocation context: the frame's "trace" carrier is attached for the handler
-// call only, an async handler observes it across an await, a raising handler
-// still restores the previous context, and an untraced invocation sees no
-// leaked context. The stub OTel API mirrors the real attach/detach contract.
+// invocation context: the frame's "trace" carrier is ATTACHED for the handler
+// call only and DETACHED afterwards — an async handler observes it across an
+// await, a raising handler still restores the previous context, and an
+// untraced invocation sees no leaked context. The stub OTel API mirrors the
+// real attach/detach contract.
 func TestPythonRuntimeTraceContextIsolatedAcrossInvocations(t *testing.T) {
 	requirePython(t)
 	dir := t.TempDir()
@@ -516,13 +881,13 @@ async def inspect(event, context):
 
 	r3 := p.invoke(t, "handler.inspect", `{}`, nil)
 	if !r3.OK || !strings.Contains(r3.Out, "trace=root") {
-		t.Fatalf("post-failure untraced invoke = %+v, want the restored root context", r3)
+		t.Fatalf("post-failure untraced invoke = %+v, want the restored (detached) root context", r3)
 	}
 }
 
 // TestPythonRuntimeTraceWithoutOtelIsBestEffort proves the guarded import: when
 // the OpenTelemetry API is unavailable the bootstrap still runs the handler with
-// the trace field present, degrading to no propagation instead of crashing.
+// the trace field present, degrading to no propagation instead of failing.
 func TestPythonRuntimeTraceWithoutOtelIsBestEffort(t *testing.T) {
 	requirePython(t)
 	dir := t.TempDir()
@@ -714,13 +1079,19 @@ def leak(event, context):
 	if !strings.Contains(r.Out, "value="+secret) {
 		t.Fatalf("handler must observe its own env value; out = %q", r.Out)
 	}
-	// stderr carries the handler failure text only, never the env value.
+	// stderr carries the handler failure text only, never the env value, and
+	// the channel secret never appears anywhere.
 	if strings.Contains(p.stderrString(), secret) {
 		t.Fatalf("stderr leaked the secret value:\n%s", p.stderrString())
 	}
+	if strings.Contains(p.stderrString(), p.secret) || strings.Contains(p.stdoutString(), p.secret) {
+		t.Fatal("the channel secret must never appear on stdout/stderr")
+	}
 }
 
-func TestPythonRuntimeEOFExitsZero(t *testing.T) {
+// TestPythonRuntimeChannelCloseExitsZero pins the lifecycle: after Relay is
+// done with its authenticated connection the container exits 0 cleanly.
+func TestPythonRuntimeChannelCloseExitsZero(t *testing.T) {
 	requirePython(t)
 	dir := t.TempDir()
 	writeHandler(t, dir, "handler", "def f(event, context):\n    pass\n")
@@ -729,64 +1100,482 @@ func TestPythonRuntimeEOFExitsZero(t *testing.T) {
 	if !r.OK {
 		t.Fatalf("invoke failed: %s", r.Err)
 	}
-	if err := p.stdin.Close(); err != nil {
-		t.Fatalf("close stdin: %v", err)
+	if err := p.closeChannel(); err != nil {
+		t.Fatalf("close channel: %v", err)
 	}
-	err := p.cmd.Wait()
+	if err := p.waitExit(t, 10*time.Second); err != nil {
+		t.Fatalf("bootstrap did not exit 0 on channel close: %v; stderr:\n%s", err, p.stderrString())
+	}
+}
+
+// TestPythonRuntimeHelloMalformedFrameRejectedAndListenerStays pins the
+// unauthenticated rejection half of the contract: garbage as the first frame
+// gets the peer closed WITHOUT running a handler, and the listener stays
+// available — a subsequent valid connection completes the handshake and
+// invokes normally.
+func TestPythonRuntimeHelloMalformedFrameRejectedAndListenerStays(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "RAN")
+	writeHandler(t, dir, "handler", fmt.Sprintf(`
+def mark(event, context):
+    with open(%q, "w") as fh:
+        fh.write("ran")
+`, marker))
+	p := startUnauthenticatedPython(t, dir)
+
+	conn := p.dialChannel(t, 5*time.Second)
+	if err := channelWriteFrame(conn, []byte("definitely not a response")); err != nil {
+		t.Fatalf("write malformed hello: %v", err)
+	}
+	expectFrameReadFails(t, conn, 5*time.Second)
+	_ = conn.Close()
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("a malformed hello must be rejected before any handler runs")
+	}
+
+	// The listener accepts again: a valid peer authenticates and invokes.
+	conn2 := p.reconnect(t)
+	defer conn2.Close()
+	p.conn = conn2
+	r := p.invoke(t, "handler.mark", `{}`, nil)
+	if !r.OK {
+		t.Fatalf("invoke after a rejected peer failed: %s", r.Err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("handler did not run on the valid connection: %v", err)
+	}
+}
+
+// TestPythonRuntimeHelloVersionBooleanRejected pins strict version typing: the
+// JSON boolean true compares equal to 1 in Python but is NOT the integer
+// protocol version, so a hello carrying it is rejected before authentication.
+func TestPythonRuntimeHelloVersionBooleanRejected(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", "def f(event, context):\n    pass\n")
+	p := startUnauthenticatedPython(t, dir)
+
+	conn := p.dialChannel(t, 5*time.Second)
+	nonce := strings.Repeat("a", 64)
+	raw := fmt.Sprintf(`{"type":"hello","version":true,"nonce":%q}`, nonce)
+	if err := channelWriteFrame(conn, []byte(raw)); err != nil {
+		t.Fatalf("write boolean-version hello: %v", err)
+	}
+	// Rejected before auth: the connection closes with no auth frame.
+	expectFrameReadFails(t, conn, 5*time.Second)
+	_ = conn.Close()
+
+	// Process stays healthy; an integer-version hello authenticates.
+	conn2 := p.reconnect(t)
+	defer conn2.Close()
+	p.conn = conn2
+	r := p.invoke(t, "handler.f", `{}`, nil)
+	if !r.OK {
+		t.Fatalf("invoke after the rejected hello failed: %s", r.Err)
+	}
+}
+
+// TestPythonRuntimeReadyVersionBooleanRejected pins the same strict typing on
+// Relay's ready frame: version:true fails authentication, the peer is closed,
+// and the listener survives for the correct ready.
+func TestPythonRuntimeReadyVersionBooleanRejected(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", "def f(event, context):\n    pass\n")
+	p := startUnauthenticatedPython(t, dir)
+
+	conn := p.dialChannel(t, 5*time.Second)
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	nonce := strings.Repeat("b", 64)
+	hello, _ := json.Marshal(map[string]any{"type": "hello", "version": 1, "nonce": nonce})
+	if err := channelWriteFrame(conn, hello); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+	if _, err := channelReadFrame(conn, channelHandshakeCap); err != nil {
+		t.Fatalf("read auth: %v", err)
+	}
+	ready := fmt.Sprintf(`{"type":"ready","version":true,"mac":%q}`, strings.Repeat("c", 64))
+	if err := channelWriteFrame(conn, []byte(ready)); err != nil {
+		t.Fatalf("write boolean-version ready: %v", err)
+	}
+	expectFrameReadFails(t, conn, 5*time.Second)
+	_ = conn.Close()
+
+	conn2 := p.reconnect(t)
+	defer conn2.Close()
+	p.conn = conn2
+	r := p.invoke(t, "handler.f", `{}`, nil)
+	if !r.OK {
+		t.Fatalf("invoke after the rejected ready failed: %s", r.Err)
+	}
+}
+
+// TestPythonRuntimeWrongSecretRejectedNoInvocation pins the credential check:
+// a peer that answers the challenge under the WRONG secret is closed before any
+// handler runs, and the listener stays available for Relay's correct secret.
+func TestPythonRuntimeWrongSecretRejectedNoInvocation(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "RAN")
+	writeHandler(t, dir, "handler", fmt.Sprintf(`
+def mark(event, context):
+    with open(%q, "w") as fh:
+        fh.write("ran")
+`, marker))
+	p := startUnauthenticatedPython(t, dir)
+
+	conn := p.dialChannel(t, 5*time.Second)
+	wrong := testSecret(t)
+	if err := clientHandshake(t, conn, wrong); err == nil {
+		t.Fatal("a handshake under the wrong secret must fail")
+	}
+	expectFrameReadFails(t, conn, 5*time.Second)
+	_ = conn.Close()
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the unauthenticated peer must never reach a handler")
+	}
+
+	conn2 := p.reconnect(t)
+	defer conn2.Close()
+	p.conn = conn2
+	r := p.invoke(t, "handler.mark", `{}`, nil)
+	if !r.OK {
+		t.Fatalf("invoke with the correct secret failed: %s", r.Err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("correct peer's handler did not run: %v", err)
+	}
+}
+
+// TestPythonRuntimeSecondConnectionRejectedWhileActive pins the single-session
+// admission: while Relay's authenticated session is active a second connection
+// is closed immediately — no handshake completes on it, no handler can be
+// invoked through it, its resources are released — and the active session keeps
+// working untouched.
+func TestPythonRuntimeSecondConnectionRejectedWhileActive(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", `
+_counter = {"n": 0}
+
+def count(event, context):
+    _counter["n"] += 1
+    print("count=%d" % _counter["n"])
+`)
+	p := startPython(t, dir)
+
+	// The authenticated session serves one invocation.
+	r1 := p.invoke(t, "handler.count", `{}`, nil)
+	if !r1.OK || !strings.Contains(r1.Out, "count=1") {
+		t.Fatalf("first invoke = %+v, want count=1", r1)
+	}
+
+	// A second connection is closed immediately, before any handshake frame:
+	// the admission check rejects it without ever reaching a handler.
+	intruder := p.dialChannel(t, 5*time.Second)
+	expectFrameReadFails(t, intruder, 5*time.Second)
+	_ = intruder.Close()
+
+	// The active session is untouched: the counter proves NO handler ran for
+	// the intruder and the channel still serves invocations.
+	r2 := p.invoke(t, "handler.count", `{}`, nil)
+	if !r2.OK || !strings.Contains(r2.Out, "count=2") {
+		t.Fatalf("invoke after the rejected second connection = %+v, want count=2 (no extra handler, session intact)", r2)
+	}
+}
+
+// TestPythonRuntimeNonStandardJSONConstantsRejectedBeforeHandler pins the JSON
+// extension rejection: NaN / Infinity / -Infinity (which Python's json accepts
+// but JSON.parse does not) are refused at frame decode, BEFORE any handler side
+// effect, and the channel closes — matching Node behavior. Standard numbers
+// with exponents remain valid and are covered by the sibling test.
+func TestPythonRuntimeNonStandardJSONConstantsRejectedBeforeHandler(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "RAN")
+	writeHandler(t, dir, "handler", fmt.Sprintf(`
+def mark(event, context):
+    with open(%q, "w") as fh:
+        fh.write("ran")
+`, marker))
+	ctxJSON, err := json.Marshal(defaultHandlerContext("handler.mark"))
 	if err != nil {
-		t.Fatalf("bootstrap did not exit 0 on stdin EOF: %v; stderr:\n%s", err, p.stderrString())
+		t.Fatalf("marshal context: %v", err)
+	}
+	for _, constant := range []string{"NaN", "Infinity", "-Infinity"} {
+		t.Run(constant, func(t *testing.T) {
+			p := startPython(t, dir)
+			raw := fmt.Sprintf(
+				`{"type":"invoke","id":"bad-const","handler":"handler.mark","event":{"v":%s},"env":{},"context":%s}`,
+				constant, ctxJSON,
+			)
+			if err := channelWriteFrame(p.conn, []byte(raw)); err != nil {
+				t.Fatalf("write nonstandard frame: %v", err)
+			}
+			expectFrameReadFails(t, p.conn, 5*time.Second)
+			_ = p.closeChannel()
+			if _, err := os.Stat(marker); err == nil {
+				t.Fatalf("%s must be rejected before any handler side effect", constant)
+			}
+			// The protocol failure closes the channel; the process must exit
+			// (Relay then discards the container), not hang.
+			_ = p.waitExit(t, 10*time.Second)
+		})
 	}
 }
 
-func TestPythonRuntimeMalformedFrameIsFatal(t *testing.T) {
+// TestPythonRuntimeValidNumericPayloadPreserved keeps the standard half of the
+// contract green: exponents, negatives, and plain integers in the event decode
+// and reach the handler unchanged.
+func TestPythonRuntimeValidNumericPayloadPreserved(t *testing.T) {
 	requirePython(t)
 	dir := t.TempDir()
-	writeHandler(t, dir, "handler", "def f(event, context):\n    pass\n")
-	if err := os.MkdirAll(filepath.Join(dir, "relay"), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "relay", "bootstrap.py"), Bootstrap, 0o644); err != nil {
-		t.Fatalf("write bootstrap: %v", err)
-	}
-	cmd := exec.Command("python3", filepath.Join(dir, "bootstrap.py"))
-	cmd.Env = append(os.Environ(), "PYTHONPATH="+dir)
-	cmd.Stdin = strings.NewReader("this is not json\n")
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("expected nonzero exit for a malformed request frame, out: %s", out)
-	}
-}
-
-func TestPythonRuntimeFrameShape(t *testing.T) {
-	requirePython(t)
-	dir := t.TempDir()
-	writeHandler(t, dir, "handler", "def f(event, context):\n    pass\n")
+	writeHandler(t, dir, "handler", `
+def nums(event, context):
+    print("sci=%r" % event["sci"])
+    print("tiny=%r" % event["tiny"])
+    print("int=%r" % event["int"])
+`)
 	p := startPython(t, dir)
+	r := p.invoke(t, "handler.nums",
+		`{"sci":1.5e3,"tiny":-2.51e-8,"int":42}`, nil)
+	if !r.OK {
+		t.Fatalf("standard numeric payload rejected: %s", r.Err)
+	}
+	for _, want := range []string{"sci=1500.0", "tiny=-2.51e-08", "int=42"} {
+		if !strings.Contains(r.Out, want) {
+			t.Errorf("out = %q, want %q", r.Out, want)
+		}
+	}
+}
+
+// TestPythonRuntimeContextHandlerMismatchClosesChannel pins the strict routing
+// identity: context.handler must equal the invocation's handler. A mismatch is
+// a protocol violation that closes the authenticated channel BEFORE handler
+// execution — no result, no side effect.
+func TestPythonRuntimeContextHandlerMismatchClosesChannel(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "RAN")
+	writeHandler(t, dir, "handler", fmt.Sprintf(`
+def mark(event, context):
+    with open(%q, "w") as fh:
+        fh.write("ran")
+`, marker))
+	p := startPython(t, dir)
+
+	r := p.invokeFrame(t, "handler.mark", `{}`, nil, nil, map[string]any{
+		"requestId":   "req-1",
+		"attempt":     1,
+		"maxAttempts": 1,
+		"deadline":    "2031-01-01T00:00:00Z",
+		"app":         "fn",
+		"handler":     "handler.other", // MISMATCH with handler.mark
+	})
+	if r.OK {
+		t.Fatal("a context.handler mismatch must close the channel, not return a result")
+	}
+	// The write succeeded but no result arrives: the channel closes instead.
+	expectFrameReadFails(t, p.conn, 5*time.Second)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the mismatch must be rejected before the handler runs")
+	}
+	_ = p.closeChannel()
+	_ = p.waitExit(t, 10*time.Second)
+}
+
+// TestPythonRuntimeMissingContextClosesChannel pins the required context
+// object: a frame without "context" (or with a context missing a required
+// identity field) is a protocol violation — the channel closes before the
+// handler runs, never a partial or fabricated context.
+func TestPythonRuntimeMissingContextClosesChannel(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "RAN")
+	writeHandler(t, dir, "handler", fmt.Sprintf(`
+def sink(event, context):
+    with open(%q, "w") as fh:
+        fh.write("ran")
+`, marker))
+	p := startPython(t, dir)
+
+	raw := `{"type":"invoke","id":"no-ctx","handler":"handler.sink","event":{},"env":{}}`
+	if err := channelWriteFrame(p.conn, []byte(raw)); err != nil {
+		t.Fatalf("write context-less frame: %v", err)
+	}
+	expectFrameReadFails(t, p.conn, 5*time.Second)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("a frame without the context object must not run the handler")
+	}
+	_ = p.closeChannel()
+	_ = p.waitExit(t, 10*time.Second)
+}
+
+// TestPythonRuntimeUnparseableDeadlineFailsInvocation pins the invocation-level
+// half: a context with every required field but an unparseable deadline fails
+// ONLY that invocation with an ok:false context error, and the container stays
+// reusable for the next request.
+func TestPythonRuntimeUnparseableDeadlineFailsInvocation(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", "def sink(event, context):\n    print('ran')\n")
+	p := startPython(t, dir)
+
+	r := p.invokeFrame(t, "handler.sink", `{}`, nil, nil, map[string]any{
+		"requestId":   "req-1",
+		"attempt":     1,
+		"maxAttempts": 1,
+		"deadline":    "not-a-date",
+		"app":         "fn",
+		"handler":     "handler.sink",
+	})
+	if r.OK {
+		t.Fatal("an unparseable deadline must fail the invocation")
+	}
+	if !strings.Contains(r.Err, "invalid handler context") {
+		t.Errorf("error = %q, want the invalid-context rejection", r.Err)
+	}
+	// The container stays healthy: the next invocation succeeds.
+	ok := p.invoke(t, "handler.sink", `{}`, nil)
+	if !ok.OK || !strings.Contains(ok.Out, "ran") {
+		t.Fatalf("post-context-error invoke = %+v, want a healthy container", ok)
+	}
+}
+
+// TestPythonRuntimeInvokeMalformedFrameClosesChannel pins authenticated-phase
+// framing: a malformed JSON payload on the authenticated channel is a protocol
+// failure — the channel closes, the process exits (Relay discards the
+// container), and no handler runs.
+func TestPythonRuntimeInvokeMalformedFrameClosesChannel(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "RAN")
+	writeHandler(t, dir, "handler", fmt.Sprintf(`
+def mark(event, context):
+    with open(%q, "w") as fh:
+        fh.write("ran")
+`, marker))
+	p := startPython(t, dir)
+
+	if err := channelWriteFrame(p.conn, []byte("this is not json")); err != nil {
+		t.Fatalf("write malformed frame: %v", err)
+	}
+	expectFrameReadFails(t, p.conn, 5*time.Second)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("a malformed frame must not run a handler")
+	}
+	_ = p.closeChannel()
+	_ = p.waitExit(t, 10*time.Second)
+}
+
+// TestPythonRuntimeOversizeHelloRejected pins the handshake frame cap: a
+// declared length over 4 KiB is refused before allocation, the peer is closed
+// unauthenticated, and the listener survives.
+func TestPythonRuntimeOversizeHelloRejected(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", "def f(event, context):\n    pass\n")
+	p := startUnauthenticatedPython(t, dir)
+
+	conn := p.dialChannel(t, 5*time.Second)
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], uint32(channelHandshakeCap+1))
+	if _, err := conn.Write(header[:]); err != nil {
+		t.Fatalf("write oversize header: %v", err)
+	}
+	expectFrameReadFails(t, conn, 5*time.Second)
+	_ = conn.Close()
+
+	conn2 := p.reconnect(t)
+	defer conn2.Close()
+	p.conn = conn2
+	r := p.invoke(t, "handler.f", `{}`, nil)
+	if !r.OK {
+		t.Fatalf("invoke after the oversize rejection failed: %s", r.Err)
+	}
+}
+
+// TestPythonRuntimePartialHelloFrameTimesOut pins the exact-read rule: a frame
+// whose payload never completes gets the peer closed by the handshake deadline,
+// with no handler side effect and the listener left standing.
+func TestPythonRuntimePartialHelloFrameTimesOut(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", "def f(event, context):\n    pass\n")
+	p := startUnauthenticatedPython(t, dir)
+
+	conn := p.dialChannel(t, 5*time.Second)
+	var header [4]byte
+	header[3] = 100 // declares 100 bytes, delivers only a few
+	if _, err := conn.Write(header[:]); err != nil {
+		t.Fatalf("write partial header: %v", err)
+	}
+	if _, err := conn.Write([]byte(`{"type":"he`)); err != nil {
+		t.Fatalf("write partial payload: %v", err)
+	}
+	// The bootstrap's handshake timeout tears the half-frame peer down.
+	expectFrameReadFails(t, conn, 6*time.Second)
+	_ = conn.Close()
+
+	conn2 := p.reconnect(t)
+	defer conn2.Close()
+	p.conn = conn2
+	r := p.invoke(t, "handler.f", `{}`, nil)
+	if !r.OK {
+		t.Fatalf("invoke after the partial-frame timeout failed: %s", r.Err)
+	}
+}
+
+// TestPythonRuntimeProtocolFramesNeverOnStdout pins the channel/log
+// separation: everything the protocol exchanges lives on the connection, while
+// the child's stdout carries ONLY native application output — no result/auth/
+// invoke frame JSON and no legacy sentinel ever appears there.
+func TestPythonRuntimeProtocolFramesNeverOnStdout(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", "def f(event, context):\n    print('native-output-line')\n")
+	p := startPython(t, dir)
+
 	r := p.invoke(t, "handler.f", `{}`, nil)
 	if !r.OK {
 		t.Fatalf("invoke failed: %s", r.Err)
 	}
-	if got, want := strings.Count(r.Frame, "\n"), 0; got != want {
-		t.Errorf("response frame %q must be EXACTLY one line", r.Frame)
+	if !strings.Contains(r.Out, "native-output-line") {
+		t.Fatalf("stdout out = %q, want the native print", r.Out)
 	}
-	if !strings.HasPrefix(r.Frame, relaySentinel) {
-		t.Errorf("response frame %q must start with the sentinel %q", r.Frame, relaySentinel)
+	stdout := p.stdoutString()
+	for _, forbidden := range []string{
+		`"type":"result"`,
+		`"type":"invoke"`,
+		`"type":"auth"`,
+		`"type":"ready"`,
+		`"mac"`,
+		"@@RELAY@@",
+	} {
+		if strings.Contains(stdout, forbidden) {
+			t.Errorf("protocol data %q leaked to stdout:\n%s", forbidden, stdout)
+		}
 	}
-	if !json.Valid([]byte(strings.TrimPrefix(r.Frame, relaySentinel))) {
-		t.Errorf("response frame payload %q must be valid JSON", r.Frame)
+	if !utf8.ValidString(stdout) {
+		t.Error("stdout must remain valid text (no binary frame headers)")
 	}
 }
 
-// goFrameCap is the Go bootstrap-side frame cap (internal/runtime
-// maxResponseFrame = 3 KiB), hardcoded here to avoid an import cycle. A
-// bootstrap response frame must always fit within it in UTF-8 bytes.
-const goFrameCap = 3 << 10
+// maxResultFrame is the contract's result payload cap (1 MiB), mirrored here to
+// avoid an import cycle with the Go runtime package.
+const maxResultFrame = 1 << 20
 
-// TestPythonRuntimeErrorFrameBound pins the error-frame byte cap across ASCII,
-// multibyte, emoji, accented, and control/escaped text: the emitted frame is at
-// most the Go cap in UTF-8 bytes, is valid UTF-8, is still parseable JSON with
-// the expected id, and remains a handler error (ok:false) rather than a
-// malformed response.
+// maxErrorBytes is the contract's diagnostic error-string cap (64 KiB).
+const maxErrorBytes = 64 << 10
+
+// TestPythonRuntimeErrorFrameBound pins the error-frame bounds across ASCII,
+// multibyte, emoji, accented, and control/escaped text: the emitted frame stays
+// within the 1 MiB result cap in UTF-8 bytes, its error field within 64 KiB,
+// it remains parseable JSON with the echoed id and ok:false, and the process
+// stays healthy afterwards.
 func TestPythonRuntimeErrorFrameBound(t *testing.T) {
 	requirePython(t)
 	dir := t.TempDir()
@@ -795,19 +1584,19 @@ def short(event, context):
     raise ValueError("short ascii")
 
 def long(event, context):
-    raise ValueError("x" * 20000)
+    raise ValueError("x" * 100000)
 
 def multi(event, context):
-    raise ValueError("é" * 20000)
+    raise ValueError("é" * 100000)
 
 def emoji(event, context):
-    raise ValueError("😀" * 8000)
+    raise ValueError("\U0001F600" * 40000)
 
 def accented(event, context):
-    raise ValueError("àéîõü" * 5000)
+    raise ValueError("àéîõü" * 30000)
 
 def control(event, context):
-    raise ValueError("\t\n\x00\x07" * 5000)
+    raise ValueError("\t\n\x00\x07" * 30000)
 `)
 	p := startPython(t, dir)
 
@@ -827,25 +1616,24 @@ def control(event, context):
 			if r.OK {
 				t.Fatal("expected the raising handler to fail the invocation")
 			}
-			if len(r.Frame) > goFrameCap {
-				t.Fatalf("frame length %d exceeds the Go cap %d", len(r.Frame), goFrameCap)
+			if len(r.Frame) > maxResultFrame {
+				t.Fatalf("frame length %d exceeds the result cap %d", len(r.Frame), maxResultFrame)
 			}
 			if !utf8.ValidString(r.Frame) {
 				t.Fatal("frame must be valid UTF-8")
 			}
-			payload := strings.TrimPrefix(r.Frame, relaySentinel)
-			if !json.Valid([]byte(payload)) {
-				t.Fatalf("frame payload must be valid JSON: %q", payload)
-			}
 			var resp respFrame
-			if err := json.Unmarshal([]byte(payload), &resp); err != nil {
-				t.Fatalf("frame payload must unmarshal: %v", err)
+			if err := json.Unmarshal([]byte(r.Frame), &resp); err != nil {
+				t.Fatalf("frame must be valid parseable JSON: %v (%q)", err, r.Frame)
 			}
 			if resp.ID == "" || resp.OK {
 				t.Fatalf("resp = %+v, want a non-empty id and ok:false for the handler error", resp)
 			}
 			if resp.Error == "" {
 				t.Fatal("expected a non-empty bounded error string")
+			}
+			if len(resp.Error) > maxErrorBytes {
+				t.Fatalf("error length %d exceeds the %d-byte diagnostic cap", len(resp.Error), maxErrorBytes)
 			}
 			// The process must stay healthy after an oversized error.
 			ok := p.invoke(t, "handler.short", `{}`, nil)
@@ -860,8 +1648,9 @@ def control(event, context):
 // carries the frame's execution identity as snake_case fields: the stable
 // request ID, the confirmed attempt and configured budget, an aware deadline
 // parsed from the protocol's ISO-8601 string (nanosecond input truncated to
-// microseconds), the optional message and trace IDs, and the app/handler. The
-// event payload stays verbatim.
+// microseconds), the optional message and trace IDs, and the app/handler —
+// with context.handler MATCHING the invocation handler (a mismatch is a
+// protocol violation). The event payload stays verbatim.
 func TestPythonRuntimeHandlerContextValues(t *testing.T) {
 	requirePython(t)
 	dir := t.TempDir()
@@ -888,7 +1677,7 @@ def show(event, context):
 		"messageId":   "m-7",
 		"traceId":     "4bf92f3577b34da6a3ce929d0e0e4736",
 		"app":         "app",
-		"handler":     "events.created",
+		"handler":     "handler.show", // must match the invocation handler
 	})
 	if !r.OK {
 		t.Fatalf("invoke failed: %s", r.Err)
@@ -903,7 +1692,7 @@ def show(event, context):
 		"message_id=m-7",
 		"trace_id=4bf92f3577b34da6a3ce929d0e0e4736",
 		"app=app",
-		"handler=events.created",
+		"handler=handler.show",
 	} {
 		if !strings.Contains(r.Out, want) {
 			t.Errorf("out = %q, want it to contain %q", r.Out, want)
@@ -1063,35 +1852,64 @@ func TestPythonRuntimeSingleArgHandlerRejected(t *testing.T) {
 	}
 }
 
-// TestPythonRuntimeMissingContextFrameRejected pins the required per-request
-// context object: a frame without "context" (or with a context missing its
-// required deadline) fails the invocation with a protocol-level context error,
-// never a partial or fabricated context.
-func TestPythonRuntimeMissingContextFrameRejected(t *testing.T) {
+// TestPythonRuntimeCancelledErrorIsNotNormalFailure pins the review fix in
+// invoke(): an async handler raising asyncio.CancelledError must RE-RAISE
+// (task cancellation is control flow, not a handler failure) so asyncio
+// shutdown can join its tasks — the cancelled invocation must NOT receive a
+// normal ok:false result frame, and the authenticated channel/process must
+// terminate promptly under a bounded wait (no hang). The control half runs an
+// ordinary Exception first on the SAME session: still a normal ok:false
+// carrying the handler error, with the process kept alive.
+func TestPythonRuntimeCancelledErrorIsNotNormalFailure(t *testing.T) {
 	requirePython(t)
 	dir := t.TempDir()
-	writeHandler(t, dir, "handler", "def sink(event, context):\n    print('ran')\n")
+	writeHandler(t, dir, "handler", `
+import asyncio
+
+async def boom(event, context):
+    raise ValueError("ordinary-kaboom")
+
+async def cancelled(event, context):
+    raise asyncio.CancelledError()
+`)
 	p := startPython(t, dir)
 
-	r := p.invokeFrame(t, "handler.sink", `{}`, nil, nil, nil)
-	if r.OK {
-		t.Fatal("a frame without the context object must be rejected")
+	// Control: an ordinary Exception is still a NORMAL invocation failure —
+	// a result frame with ok:false carrying the handler error — and the same
+	// authenticated session keeps serving (two failures prove the process and
+	// channel stayed alive between and after them).
+	for i := 1; i <= 2; i++ {
+		r := p.invoke(t, "handler.boom", `{}`, nil)
+		if r.OK {
+			t.Fatalf("ordinary failure %d: an Exception must be a normal ok:false result", i)
+		}
+		if !strings.Contains(r.Err, "ordinary-kaboom") {
+			t.Fatalf("ordinary failure %d error = %q, want the handler error text", i, r.Err)
+		}
+		if r.Frame == "" {
+			t.Fatalf("ordinary failure %d must arrive as a result frame", i)
+		}
 	}
-	if !strings.Contains(r.Err, "missing the context object") {
-		t.Errorf("error = %q, want the missing-context rejection", r.Err)
+	select {
+	case <-p.exitDone:
+		t.Fatalf("process exited after ordinary handler errors: %v", p.waitErr)
+	default:
 	}
 
-	r2 := p.invokeFrame(t, "handler.sink", `{}`, nil, nil, map[string]any{
-		"requestId":   "req-1",
-		"attempt":     1,
-		"maxAttempts": 1,
-		"app":         "fn",
-		"handler":     "handler.sink",
-	})
-	if r2.OK {
-		t.Fatal("a context without a deadline must be rejected")
+	// The regression: a CancelledError invocation must not be converted into a
+	// normal handler failure. If invoke() swallows the cancellation, a result
+	// frame arrives here and the assertion fails with the exact frame.
+	r := p.invoke(t, "handler.cancelled", `{}`, nil)
+	if r.Frame != "" {
+		t.Fatalf("a CancelledError invocation must not receive a result frame, got: %s", r.Frame)
 	}
-	if !strings.Contains(r2.Err, "invalid handler context") {
-		t.Errorf("error = %q, want the invalid-context rejection", r2.Err)
+	if !strings.Contains(r.Err, "read result frame") {
+		t.Errorf("want the cancelled channel surfaced as a read-side close, got %q", r.Err)
+	}
+
+	// Prompt termination: the shutdown path must join and exit under a bounded
+	// wait — a hang fails here rather than stalling the suite.
+	if err := p.waitExit(t, 10*time.Second); err != nil {
+		t.Logf("bootstrap exit status after cancellation: %v (termination is the contract; code not pinned)", err)
 	}
 }

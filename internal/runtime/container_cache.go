@@ -191,7 +191,7 @@ var errPoolClosed = errors.New("runtime: container pool closed")
 // release. Distinct invocations of the same app therefore run
 // concurrently on distinct containers (each container still serializes its own
 // protocol I/O), which is what makes the reused request/response frames
-// well-defined on a shared stdin/stdout pair.
+// well-defined on each container's own persistent execution-channel connection.
 //
 // The pool's bound is the app's concurrency, the SAME value the runner's
 // per-app semaphore is sized to. It is deliberately NOT a second
@@ -899,7 +899,7 @@ func (cc *containerCache) executeVersion(
 	// panics, so release discards rather than reuses a possibly-corrupt one.
 	defer lease.release()
 	// The invocation protocol exchange: one request/response frame over the
-	// leased container's stdin/stdout.
+	// leased container's persistent authenticated execution channel.
 	invokeCtx, invokeSpan := startRuntimeSpan(ctx, "runtime.invoke", fnName, spanImage)
 	defer func() { finishRuntimeSpan(invokeSpan, retErr) }()
 	return lease.invoke(invokeCtx, handler, eventJSON, env)

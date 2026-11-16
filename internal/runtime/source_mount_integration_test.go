@@ -108,7 +108,6 @@ export function handler(event, context) {
 		t.Fatalf("new manager: %v", err)
 	}
 	defer func() { _ = m.Close() }()
-	out := newAppOutputSink(t)
 
 	first, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -124,7 +123,7 @@ export function handler(event, context) {
 	// picocolors.red wraps the text in ANSI escapes; match the inner text, which
 	// also proves the bare import resolved from the dependency layer's
 	// node_modules (the mount does not hide it).
-	awaitAppOutput(t, ctx, out, "js V1 1")
+	awaitAppLogsFor(t, ctx, m.cli, fn.Name, "js V1 1")
 	// The source-mounted image must explicitly CLEAR the relay.fingerprint label:
 	// it is built FROM a dependency image that carries its own, and Docker
 	// inherits labels through FROM. An inherited constant label would freeze the
@@ -159,7 +158,7 @@ export function handler(event, context) {
 	if err := m.Execute(ctx, second, "index.handler", []byte(`{"event_id":"2"}`), nil); err != nil {
 		t.Fatalf("second execute: %v", err)
 	}
-	awaitAppOutput(t, ctx, out, "js V2 2")
+	awaitAppLogsFor(t, ctx, m.cli, fn.Name, "js V2 2")
 }
 
 // TestIntegrationSourceMountNodeCJSReflectsSourceChange is the CommonJS
@@ -192,7 +191,6 @@ exports.handler = function (event, context) {
 		t.Fatalf("new manager: %v", err)
 	}
 	defer func() { _ = m.Close() }()
-	out := newAppOutputSink(t)
 
 	first, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -205,7 +203,7 @@ exports.handler = function (event, context) {
 	if err := m.Execute(ctx, first, "index.handler", []byte(`{"event_id":"1"}`), nil); err != nil {
 		t.Fatalf("first execute: %v", err)
 	}
-	awaitAppOutput(t, ctx, out, "cjs V1 1")
+	awaitAppLogsFor(t, ctx, m.cli, fn.Name, "cjs V1 1")
 
 	// Source-only edit: the image is reused (the source is mounted) and the
 	// advanced fingerprint rotates the warm generation onto the edited code.
@@ -225,7 +223,7 @@ exports.handler = function (event, context) {
 	if err := m.Execute(ctx, second, "index.handler", []byte(`{"event_id":"2"}`), nil); err != nil {
 		t.Fatalf("second execute: %v", err)
 	}
-	awaitAppOutput(t, ctx, out, "cjs V2 2")
+	awaitAppLogsFor(t, ctx, m.cli, fn.Name, "cjs V2 2")
 }
 
 // TestIntegrationSourceMountNodeTSReflectsSourceChange is the end-to-end proof of
@@ -269,7 +267,6 @@ export function handler(event: { event_id: string }, context: unknown): void {
 		t.Fatalf("new manager: %v", err)
 	}
 	defer func() { _ = m.Close() }()
-	out := newAppOutputSink(t)
 
 	first, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -284,7 +281,7 @@ export function handler(event: { event_id: string }, context: unknown): void {
 	}
 	// "otel=true" proves the bundle's external @opentelemetry/api import resolved
 	// from the managed /app/node_modules through the generated overlay's symlink.
-	awaitAppOutput(t, ctx, out, "ts V1 1 otel=true")
+	awaitAppLogsFor(t, ctx, m.cli, fn.Name, "ts V1 1 otel=true")
 
 	// Edit the local .ts module graph. The image is reused and the fresh container
 	// re-bundles from the mount.
@@ -306,7 +303,7 @@ export function message(event: { event_id: string }): string {
 	if err := m.Execute(ctx, second, "index.handler", []byte(`{"event_id":"2"}`), nil); err != nil {
 		t.Fatalf("second execute: %v", err)
 	}
-	awaitAppOutput(t, ctx, out, "ts V2 2")
+	awaitAppLogsFor(t, ctx, m.cli, fn.Name, "ts V2 2")
 }
 
 // TestIntegrationSourceMountNodeTSSelfReference proves a mounted TypeScript
@@ -365,7 +362,6 @@ export function handler(event: { event_id: string }, context: unknown): void {
 		t.Fatalf("new manager: %v", err)
 	}
 	defer func() { _ = m.Close() }()
-	out := newAppOutputSink(t)
 
 	first, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -378,7 +374,7 @@ export function handler(event: { event_id: string }, context: unknown): void {
 	if err := m.Execute(ctx, first, "index.handler", []byte(`{"event_id":"1"}`), nil); err != nil {
 		t.Fatalf("first execute: %v", err)
 	}
-	logs := awaitAppOutput(t, ctx, out, "SELF V1 1")
+	logs := awaitAppLogsFor(t, ctx, m.cli, fn.Name, "SELF V1 1")
 	if strings.Contains(logs, "DECOY LAYOUT") {
 		t.Fatalf("self-reference resolved by filesystem layout instead of the manifest exports:\n%s", logs)
 	}
@@ -403,7 +399,7 @@ export function where(): string {
 	if err := m.Execute(ctx, second, "index.handler", []byte(`{"event_id":"2"}`), nil); err != nil {
 		t.Fatalf("second execute: %v", err)
 	}
-	awaitAppOutput(t, ctx, out, "SELF V2 2")
+	awaitAppLogsFor(t, ctx, m.cli, fn.Name, "SELF V2 2")
 }
 
 // TestIntegrationSourceMountNodeHostNodeModulesDoesNotShadow is the end-to-end
@@ -445,7 +441,6 @@ export function handler(event, context) {
 		t.Fatalf("new manager: %v", err)
 	}
 	defer func() { _ = m.Close() }()
-	out := newAppOutputSink(t)
 
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -458,7 +453,7 @@ export function handler(event, context) {
 	if err := m.Execute(ctx, prepared, "index.handler", []byte(`{"event_id":"1"}`), nil); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	logs := awaitAppOutput(t, ctx, out, "shadow=", "V1")
+	logs := awaitAppLogsFor(t, ctx, m.cli, fn.Name, "shadow=", "V1")
 	if strings.Contains(logs, "HOST_MODULE_SHADOW") {
 		t.Fatalf("host node_modules shadowed the dependency image:\n%s", logs)
 	}
@@ -507,7 +502,6 @@ export function handler(event, context) {
 		t.Fatalf("new manager: %v", err)
 	}
 	defer func() { _ = m.Close() }()
-	out := newAppOutputSink(t)
 
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -546,7 +540,7 @@ export function handler(event, context) {
 	if err := m.Execute(ctx, prepared, "index.handler", []byte(`{"event_id":"1"}`), nil); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	logs := awaitAppOutput(t, ctx, out, "late=", "V1")
+	logs := awaitAppLogsFor(t, ctx, m.cli, fn.Name, "late=", "V1")
 	if strings.Contains(logs, "LATE_HOST_MODULE_SHADOW") {
 		t.Fatalf("late host node_modules shadowed the dependency image:\n%s", logs)
 	}
@@ -580,7 +574,6 @@ export function handler(event, context) {
 		t.Fatalf("new manager: %v", err)
 	}
 	defer func() { _ = m.Close() }()
-	out := newAppOutputSink(t)
 
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -590,7 +583,7 @@ export function handler(event, context) {
 	if err := m.Execute(ctx, prepared, "index.handler", []byte(`{}`), nil); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	awaitAppOutput(t, ctx, out, "cwd=/app/src", "data=relative-ok")
+	awaitAppLogsFor(t, ctx, m.cli, fn.Name, "cwd=/app/src", "data=relative-ok")
 }
 
 // TestIntegrationSourceMountNodeServiceLateHostNodeModulesDoesNotShadow is the
@@ -871,7 +864,6 @@ export function handler(event, context) {
 		t.Fatalf("new manager: %v", err)
 	}
 	defer func() { _ = m.Close() }()
-	out := newAppOutputSink(t)
 
 	first, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -884,7 +876,7 @@ export function handler(event, context) {
 	if err := m.Execute(ctx, first, "index.handler", []byte(`{"event_id":"1"}`), nil); err != nil {
 		t.Fatalf("first execute: %v", err)
 	}
-	awaitAppOutput(t, ctx, out, "dep-v1 1")
+	awaitAppLogsFor(t, ctx, m.cli, fn.Name, "dep-v1 1")
 
 	// Change the manifest (add a new dependency) AND the source (import it).
 	writeFile(t, dir, "package.json", `{
@@ -919,7 +911,7 @@ export function handler(event, context) {
 	}
 	// ms(1500) => "2s"; its resolution proves the new dependency image is in
 	// use, and "dep-v2 2" proves the replacement ran the current mounted source.
-	awaitAppOutput(t, ctx, out, "dep-v2 2 ms=2s")
+	awaitAppLogsFor(t, ctx, m.cli, fn.Name, "dep-v2 2 ms=2s")
 }
 
 // sourceMountGateClosed and sourceMountGateOpen are the gate-file contents a
@@ -1037,9 +1029,6 @@ func TestIntegrationSourceMountBusyGenerationAdvanceDrains(t *testing.T) {
 
 	m, _ := newSourceMountWarmManager(t, DefaultMaxWarmContainers)
 	releaseSourceMountGateOnCleanup(t, dir)
-	sink := &pollingSink{}
-	prev := SetAppOutput(sink)
-	t.Cleanup(func() { SetAppOutput(prev) })
 
 	first, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -1055,9 +1044,7 @@ func TestIntegrationSourceMountBusyGenerationAdvanceDrains(t *testing.T) {
 
 	// Output gate: START v1 means the handler is mid-flight and its container is
 	// leased (busy).
-	if !waitForSinkContains(ctx, sink, "START v1") {
-		t.Fatalf("v1 did not start; sink:\n%s", sink.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "START v1")
 	id1 := reusedContainerID(t, ctx, m, fn.Name)
 	if id1 == "" {
 		t.Fatal("expected the busy v1 container to be running")
@@ -1085,15 +1072,13 @@ func TestIntegrationSourceMountBusyGenerationAdvanceDrains(t *testing.T) {
 	if err := m.Execute(v2Ctx, second, "index.run", []byte(`{"event_id":"2"}`), nil); err != nil {
 		t.Fatalf("execute v2 while v1 busy: %v", err)
 	}
-	if !waitForSinkContains(ctx, sink, "v2 2") {
-		t.Fatalf("v2 did not run on the advanced generation; sink:\n%s", sink.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "v2 2")
 	if !waitForContainersCount(ctx, m.cli, labelApp, fn.Name, 2) {
-		t.Fatalf("expected the busy v1 and the v2 container to coexist, got %d:\n%s",
-			countContainersByLabel(ctx, m.cli, labelApp, fn.Name), sink.String())
+		t.Fatalf("expected the busy v1 and the v2 container to coexist, got %d",
+			countContainersByLabel(ctx, m.cli, labelApp, fn.Name))
 	}
-	if sink.contains("END v1") {
-		t.Fatalf("v1 was terminated mid-invocation:\n%s", sink.String())
+	if present, _ := appLogsContain(ctx, m.cli, fn.Name, "END v1"); present {
+		t.Fatalf("v1 was terminated mid-invocation")
 	}
 
 	// Release the busy v1: it completes under its admitted generation, then its
@@ -1102,9 +1087,7 @@ func TestIntegrationSourceMountBusyGenerationAdvanceDrains(t *testing.T) {
 	if err := <-v1Done; err != nil {
 		t.Fatalf("v1 execute: %v", err)
 	}
-	if !waitForSinkContains(ctx, sink, "END v1") {
-		t.Fatalf("v1 did not complete under its generation; sink:\n%s", sink.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "END v1")
 	if !waitForContainerIDGone(ctx, m.cli, id1) {
 		t.Errorf("the drained v1 container %s should have been discarded on release", id1)
 	}
@@ -1117,9 +1100,7 @@ func TestIntegrationSourceMountBusyGenerationAdvanceDrains(t *testing.T) {
 	if err := m.Execute(v2Ctx, second, "index.run", []byte(`{"event_id":"3"}`), nil); err != nil {
 		t.Fatalf("execute after drain: %v", err)
 	}
-	if !waitForSinkContains(ctx, sink, "v2 3") {
-		t.Fatalf("a post-drain invocation must run the updated mounted source; sink:\n%s", sink.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "v2 3")
 }
 
 // TestIntegrationSourceMountWarmBoundBackpressuresBusyGeneration proves the
@@ -1146,9 +1127,6 @@ func TestIntegrationSourceMountWarmBoundBackpressuresBusyGeneration(t *testing.T
 	if got := m.WarmBudgetCapacity(); got != 1 {
 		t.Fatalf("WarmBudgetCapacity = %d, want 1", got)
 	}
-	sink := &pollingSink{}
-	prev := SetAppOutput(sink)
-	t.Cleanup(func() { SetAppOutput(prev) })
 
 	first, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -1162,9 +1140,7 @@ func TestIntegrationSourceMountWarmBoundBackpressuresBusyGeneration(t *testing.T
 	v1Done := make(chan error, 1)
 	go func() { v1Done <- m.Execute(v1Ctx, first, "index.run", []byte(`{"event_id":"1"}`), nil) }()
 
-	if !waitForSinkContains(ctx, sink, "START v1") {
-		t.Fatalf("v1 did not start; sink:\n%s", sink.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "START v1")
 	id1 := reusedContainerID(t, ctx, m, fn.Name)
 	if id1 == "" {
 		t.Fatal("expected the busy v1 container to be running")
@@ -1219,8 +1195,8 @@ func TestIntegrationSourceMountWarmBoundBackpressuresBusyGeneration(t *testing.T
 	if got := reg.Gauge(metrics.MetricRuntimeWarmContainers); got != 1 {
 		t.Fatalf("global warm count while v2 waited = %v, want 1", got)
 	}
-	if sink.contains("v2 2") {
-		t.Fatalf("v2 bypassed backpressure and ran while the sole warm slot was held:\n%s", sink.String())
+	if present, _ := appLogsContain(ctx, m.cli, fn.Name, "v2 2"); present {
+		t.Fatalf("v2 bypassed backpressure and ran while the sole warm slot was held")
 	}
 
 	// Release the busy v1: it completes, the old generation retires, and the
@@ -1229,15 +1205,11 @@ func TestIntegrationSourceMountWarmBoundBackpressuresBusyGeneration(t *testing.T
 	if err := <-v1Done; err != nil {
 		t.Fatalf("v1 execute: %v", err)
 	}
-	if !waitForSinkContains(ctx, sink, "END v1") {
-		t.Fatalf("v1 did not complete; sink:\n%s", sink.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "END v1")
 	if err := <-v2Done; err != nil {
 		t.Fatalf("backpressured v2 execute: %v", err)
 	}
-	if !waitForSinkContains(ctx, sink, "v2 2") {
-		t.Fatalf("replacement did not run the current mounted source; sink:\n%s", sink.String())
-	}
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "v2 2")
 	if !waitForContainerIDGone(ctx, m.cli, id1) {
 		t.Errorf("the retired v1 container %s should be gone after the replacement", id1)
 	}
@@ -1644,7 +1616,6 @@ export function handler(event: { event_id: string }, context: unknown): void {
 		t.Fatalf("new manager: %v", err)
 	}
 	defer func() { _ = m.Close() }()
-	out := newAppOutputSink(t)
 
 	first, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -1654,7 +1625,7 @@ export function handler(event: { event_id: string }, context: unknown): void {
 	if err := m.Execute(ctx, first, "index.handler", []byte(`{"event_id":"1"}`), nil); err != nil {
 		t.Fatalf("first execute: %v", err)
 	}
-	awaitAppOutput(t, ctx, out, "alias V1 1")
+	awaitAppLogsFor(t, ctx, m.cli, fn.Name, "alias V1 1")
 
 	// The generated module must not appear beside the source: the host mount is
 	// read-only and the bootstrap bundles into /tmp.
@@ -1690,5 +1661,5 @@ export function message(event: { event_id: string }): string {
 	if err := m.Execute(ctx, second, "index.handler", []byte(`{"event_id":"2"}`), nil); err != nil {
 		t.Fatalf("second execute: %v", err)
 	}
-	awaitAppOutput(t, ctx, out, "alias V2 2")
+	awaitAppLogsFor(t, ctx, m.cli, fn.Name, "alias V2 2")
 }

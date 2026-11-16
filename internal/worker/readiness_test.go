@@ -3,12 +3,22 @@ package worker
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"go.opentelemetry.io/otel"
 
 	"relay/internal/observability/tracing"
+	"relay/internal/runtime"
+)
+
+// The production manager satisfies BOTH readiness views: the narrow
+// dockerReadinessProbe and the optional control-network capability wired into
+// the steady-state probe.
+var (
+	_ dockerReadinessProbe    = (*runtime.Manager)(nil)
+	_ controlNetworkReadiness = (*runtime.Manager)(nil)
 )
 
 // fakeConsumerHealth is a deterministic consumerHealth whose health toggles, so
@@ -193,8 +203,22 @@ func TestReadinessSocketReflectsLifecyclePlacement(t *testing.T) {
 	}
 }
 
-// Redis/Docker/NETWORKS failures mapping to not-ready, with the healthy case
-// passing. No sleeper is needed and no real dependency is touched.
+// fakeControlReadiness is a deterministic probe fake implementing BOTH narrow
+// manager views: the base dockerReadinessProbe (healthy ping + NETWORKS) plus
+// the optional controlNetworkReadiness capability, whose result is scripted.
+type fakeControlReadiness struct {
+	fakeDockerReadiness
+	controlErr error
+}
+
+func (f *fakeControlReadiness) VerifyControlNetwork(context.Context) error {
+	return f.controlErr
+}
+
+// Redis/Docker/control-network/NETWORKS failures mapping to not-ready, with
+// the healthy case passing. No sleeper is needed and no real dependency is
+// touched. The "healthy" and base-manager cases use fakes WITHOUT the optional
+// control capability, which also pins that a manager lacking it is not gated.
 func TestProbeReadinessDependencyFailures(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -204,12 +228,21 @@ func TestProbeReadinessDependencyFailures(t *testing.T) {
 		want     string
 	}{
 		{"healthy", &fakeConsumerHealth{healthy: true}, &fakeDockerReadiness{netOK: true}, nil, ""},
+		{"healthy with control check", &fakeConsumerHealth{healthy: true}, &fakeControlReadiness{fakeDockerReadiness: fakeDockerReadiness{netOK: true}}, nil, ""},
 		{"nil consumer", nil, &fakeDockerReadiness{netOK: true}, nil, "redis consumer unavailable"},
 		{"redis unhealthy", &fakeConsumerHealth{healthy: false}, &fakeDockerReadiness{netOK: true}, nil, "redis consumer unhealthy"},
 		{"nil manager", &fakeConsumerHealth{healthy: true}, nil, nil, "docker manager unavailable"},
 		{"docker ping fails", &fakeConsumerHealth{healthy: true}, &fakeDockerReadiness{pingErr: errors.New("boom"), netOK: true}, nil, "docker unavailable"},
+		{"control network unavailable", &fakeConsumerHealth{healthy: true}, &fakeControlReadiness{fakeDockerReadiness: fakeDockerReadiness{netOK: true}, controlErr: errors.New("control network deleted")}, nil, "control network unavailable"},
 		{"network missing", &fakeConsumerHealth{healthy: true}, &fakeDockerReadiness{missing: "backend", netOK: false}, []string{"backend"}, `network "backend" missing`},
 		{"network inspect fails", &fakeConsumerHealth{healthy: true}, &fakeDockerReadiness{netErr: errors.New("daemon exploded")}, []string{"backend"}, "network verification failed"},
+		// The tightened NETWORKS policy rejects invalid user selections inside
+		// VerifyNetworks, so readiness reports not-ready with the same fixed
+		// low-cardinality reason as any other verification error — the raw
+		// policy message never leaks. An empty NETWORKS never reaches this
+		// branch (the healthy/nil cases above), keeping it valid.
+		{"reserved host mode rejected", &fakeConsumerHealth{healthy: true}, &fakeDockerReadiness{netErr: errors.New(`network "host" is not allowed (host networking)`)}, []string{"host"}, "network verification failed"},
+		{"control-labelled NETWORKS entry rejected", &fakeConsumerHealth{healthy: true}, &fakeDockerReadiness{netErr: errors.New(`network "relay-control-node" is Relay's control network and cannot be joined by workload containers`)}, []string{"relay-control-node"}, "network verification failed"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -274,6 +307,120 @@ func TestProbeReadinessVerifiesConfiguredNetworks(t *testing.T) {
 	if manager.pingCalls != 1 {
 		t.Fatalf("docker pings = %d, want exactly 1", manager.pingCalls)
 	}
+}
+
+// orderedControlReadiness records the probe's exact call sequence across both
+// manager views: ping, the optional control-network check, and NETWORKS
+// verification.
+type orderedControlReadiness struct {
+	calls      []string
+	pingErr    error
+	controlErr error
+	netOK      bool
+	missing    string
+	netErr     error
+}
+
+func (f *orderedControlReadiness) Ping(context.Context) error {
+	f.calls = append(f.calls, "ping")
+	return f.pingErr
+}
+
+func (f *orderedControlReadiness) VerifyControlNetwork(context.Context) error {
+	f.calls = append(f.calls, "control")
+	return f.controlErr
+}
+
+func (f *orderedControlReadiness) VerifyNetworks(_ context.Context, networks []string) (string, bool, error) {
+	f.calls = append(f.calls, "networks")
+	return f.missing, f.netOK, f.netErr
+}
+
+// TestProbeReadinessVerifiesControlNetwork pins the steady-state control
+// dependency: the probe pings Docker, THEN verifies the internal control
+// network, THEN verifies the optional NETWORKS set — a deleted or altered
+// control network stops readiness with the fixed low-cardinality reason (the
+// raw daemon error never leaks), and a healthy control check keeps the worker
+// ready with the NETWORKS set still optional (nil here).
+func TestProbeReadinessVerifiesControlNetwork(t *testing.T) {
+	t.Run("control failure stops readiness with a fixed reason", func(t *testing.T) {
+		manager := &orderedControlReadiness{
+			netOK:      true,
+			controlErr: errors.New("control network \"relay-control-node\": daemon detail that must not leak"),
+		}
+		ready, reason := probeReadiness(context.Background(),
+			&fakeConsumerHealth{healthy: true}, manager, nil, time.Second)
+		if ready {
+			t.Fatal("a missing control network must stop readiness")
+		}
+		if reason != "control network unavailable" {
+			t.Fatalf("reason = %q, want the fixed low-cardinality %q", reason, "control network unavailable")
+		}
+		if strings.Contains(reason, "daemon detail") {
+			t.Fatalf("reason %q leaked the raw dependency error", reason)
+		}
+		want := []string{"ping", "control"}
+		if len(manager.calls) != len(want) {
+			t.Fatalf("calls = %v, want %v (NETWORKS is optional and unset here)", manager.calls, want)
+		}
+		for i := range want {
+			if manager.calls[i] != want[i] {
+				t.Fatalf("call %d = %q, want %q (full order %v)", i, manager.calls[i], want[i], manager.calls)
+			}
+		}
+	})
+
+	t.Run("healthy control check runs before NETWORKS verification", func(t *testing.T) {
+		manager := &orderedControlReadiness{netOK: true}
+		ready, reason := probeReadiness(context.Background(),
+			&fakeConsumerHealth{healthy: true}, manager, []string{"backend"}, time.Second)
+		if !ready {
+			t.Fatalf("healthy worker must be ready (reason %q)", reason)
+		}
+		want := []string{"ping", "control", "networks"}
+		if len(manager.calls) != len(want) {
+			t.Fatalf("calls = %v, want %v", manager.calls, want)
+		}
+		for i := range want {
+			if manager.calls[i] != want[i] {
+				t.Fatalf("call %d = %q, want %q (full order %v)", i, manager.calls[i], want[i], manager.calls)
+			}
+		}
+	})
+
+	t.Run("a failed control check short-circuits NETWORKS verification", func(t *testing.T) {
+		manager := &orderedControlReadiness{
+			netOK:      true,
+			controlErr: errors.New("deleted"),
+		}
+		ready, _ := probeReadiness(context.Background(),
+			&fakeConsumerHealth{healthy: true}, manager, []string{"backend"}, time.Second)
+		if ready {
+			t.Fatal("a failed control check must stop readiness")
+		}
+		want := []string{"ping", "control"}
+		if len(manager.calls) != len(want) {
+			t.Fatalf("calls = %v, want %v (NETWORKS must not mask an unreachable control plane)", manager.calls, want)
+		}
+		for i := range want {
+			if manager.calls[i] != want[i] {
+				t.Fatalf("call %d = %q, want %q (full order %v)", i, manager.calls[i], want[i], manager.calls)
+			}
+		}
+	})
+
+	t.Run("startReady wires the control dependency into the live probe", func(t *testing.T) {
+		r := newReadiness(context.Background())
+		r.startReady(&fakeConsumerHealth{healthy: true},
+			&fakeControlReadiness{
+				fakeDockerReadiness: fakeDockerReadiness{netOK: true},
+				controlErr:          errors.New("deleted"),
+			}, nil)
+		ready, reason := r.Ready(context.Background())
+		if ready || reason != "control network unavailable" {
+			t.Fatalf("Ready = (%v, %q), want (false, %q)", ready, reason, "control network unavailable")
+		}
+	})
 }
 
 // TestProbeReadinessSkipsDockerDuringRedisOutage pins the cheap-first ordering:

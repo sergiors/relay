@@ -866,25 +866,37 @@ func (m *Manager) NetworkExists(ctx context.Context, network string) (bool, erro
 	return true, nil
 }
 
-// controlNetworkLabel marks a Docker network as Relay's control plane. A
-// workload container must never join it: that network is for Relay itself (and
-// operator control-plane services), so an app that names it in NETWORKS or
-// TRAEFIK_NETWORK would otherwise gain a path into Relay's private management
-// surface. An operator-managed control network can carry this label.
-const controlNetworkLabel = "relay.control"
+// networkRoleLabel names the role a Docker network plays in Relay's
+// infrastructure. Role is separate from ownership: a role is enough to deny a
+// network to workloads, while Relay reuses only a network whose role AND
+// ownership labels match. Relay's own per-node control network carries
+// executionControlNetworkRole together with its managed marker and
+// relay.node_id; an operator-managed network may carry the role alone and is
+// still refused to workloads.
+const networkRoleLabel = "relay.network.role"
+
+// executionControlNetworkRole marks a Docker network as Relay's execution
+// control plane. A workload container must never join it: that network is for
+// Relay itself (and operator control-plane services), so an app that names it
+// in NETWORKS, TRAEFIK_NETWORK, or a persistent service's Networks would
+// otherwise gain a path into Relay's private management surface.
+const executionControlNetworkRole = "execution-control"
 
 // validateWorkloadNetworks refuses selected networks that would break the
 // container security boundary, BEFORE Docker ContainerCreate. Every workload
 // create path calls it with the exact network set it is about to attach:
 //
-//   - a Docker network labelled relay.control is Relay's control plane and is
-//     never available to workloads;
+//   - a Docker network whose relay.network.role is execution-control is Relay's
+//     execution control plane and is never available to workloads;
 //   - the reserved host/container namespace pseudo-networks are refused
 //     explicitly instead of being left for the daemon to interpret.
 //
-// The check is by label, not by a configured name, so a renamed control network
-// stays protected. A missing network is surfaced here as an inspect error; that
-// is the same failure a create would produce, but it happens before create.
+// The check is by role label, not by a configured name, so a renamed control
+// network stays protected. A missing network is surfaced here as an inspect
+// error; that is the same failure a create would produce, but it happens
+// before create. Manager.VerifyNetworks applies the same reserved-name and
+// role-label policy to the optional NETWORKS set at startup/readiness, before
+// any create runs.
 func (m *Manager) validateWorkloadNetworks(ctx context.Context, networks []string) error {
 	for _, name := range NetworkSet(networks) {
 		if err := validateWorkloadNetworkName(name); err != nil {
@@ -894,12 +906,23 @@ func (m *Manager) validateWorkloadNetworks(ctx context.Context, networks []strin
 		if err != nil {
 			return fmt.Errorf("inspect workload network %q: %w", name, err)
 		}
-		if strings.EqualFold(insp.Network.Labels[controlNetworkLabel], "true") {
-			return fmt.Errorf(
-				"network %q is Relay's control network and cannot be joined by workload containers",
-				name,
-			)
+		if err := validateWorkloadNetworkPolicy(name, insp.Network); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+// validateWorkloadNetworkPolicy enforces the label-based part of the workload
+// network contract on an already-inspected network. It is shared by the create
+// path and the startup/readiness NETWORKS preflight so both reject the same
+// networks.
+func validateWorkloadNetworkPolicy(name string, nw network.Inspect) error {
+	if nw.Labels[networkRoleLabel] == executionControlNetworkRole {
+		return fmt.Errorf(
+			"network %q is Relay's control network and cannot be joined by workload containers",
+			name,
+		)
 	}
 	return nil
 }
@@ -918,26 +941,51 @@ func validateWorkloadNetworkName(name string) error {
 	}
 }
 
-// VerifyNetworks checks that every named Docker network exists, returning the
-// first missing network name (and false) when one does not. It is the startup
-// pre-flight the worker performs before any app is prepared or any
-// container created, for the worker-global NETWORKS set: the networks are
-// infrastructure owned OUTSIDE Relay, so a missing one is an operator condition
-// Relay reports rather than fixes — it NEVER creates a network. A non-not-found
-// inspect error is returned as a genuine error so a broken daemon never looks
-// like a missing network. The worker treats either failure as fatal startup.
+// VerifyNetworks checks the optional NETWORKS set before any app is prepared or
+// any container is created, and again from the readiness probe. It returns the
+// first missing network name (and false) when one does not exist, preserving the
+// operator-facing missing-network semantics, and otherwise validates each
+// network with the SAME workload-safe policy every create applies: reserved
+// host/container pseudo-networks and networks carrying the execution-control
+// role are rejected here rather than surfacing only when the first event is
+// consumed.
 //
-// The list is normalized defensively through NetworkSet first: config already
-// parses NETWORKS into a de-duplicated list, but a caller passing duplicates or
-// empty names still inspects each network at most once.
+// The internal control network is managed separately and is NEVER passed to
+// this validator. A user who names it in NETWORKS is therefore rejected by the
+// same label policy instead of being treated as a workload network.
+//
+// A non-not-found inspect error is returned as a genuine error so a broken
+// daemon never looks like a missing network, and a policy violation is returned
+// as an error. The list is normalized defensively through NetworkSet first, so
+// duplicates or empty names inspect each network at most once. One Manager
+// operation covers the whole check, so readiness/shutdown cancellation and
+// tracking are preserved.
 func (m *Manager) VerifyNetworks(ctx context.Context, networks []string) (string, bool, error) {
-	for _, network := range NetworkSet(networks) {
-		ok, err := m.NetworkExists(ctx, network)
-		if err != nil {
+	set := NetworkSet(networks)
+	if len(set) == 0 {
+		return "", true, nil
+	}
+	opCtx, release, err := m.beginDockerOp(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	defer release()
+	for _, network := range set {
+		if err := validateWorkloadNetworkName(network); err != nil {
 			return network, false, err
 		}
-		if !ok {
-			return network, false, nil
+		insp, err := m.cli.NetworkInspect(opCtx, network, client.NetworkInspectOptions{})
+		if err != nil {
+			if cerrdefs.IsNotFound(err) {
+				return network, false, nil
+			}
+			return network, false, fmt.Errorf(
+				"inspect workload network %q: %w",
+				network, m.classifyDockerErr(ctx, err),
+			)
+		}
+		if err := validateWorkloadNetworkPolicy(network, insp.Network); err != nil {
+			return network, false, err
 		}
 	}
 	return "", true, nil

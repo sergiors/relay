@@ -1,8 +1,18 @@
 package runtime
 
+// Unit tests for one reused executionContainer speaking the persistent framed
+// control channel (protocol.go) over a net.Pipe stand-in for the container's
+// authenticated TCP connection. The harness plays the bootstrap side: it reads
+// framed invoke requests and answers with framed result frames. Every scenario
+// from the old stdin/stdout attach harness is preserved (normal exchange,
+// reuse, blocked write/read cancellation, pre-cancel, deadline, the
+// cancellation-vs-completion race, pool non-reuse, manager shutdown join,
+// removal accounting) and extended with the control channel's correlation,
+// protocol-violation, and transport-loss semantics.
+
 import (
-	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"net"
@@ -12,24 +22,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/moby/moby/client"
-
 	"relay/internal/testutil"
 )
 
-// attachTestWatchdog bounds every wait in these tests. It is a watchdog only
-// (the tests synchronize on channels and the demuxer's pending flag, never on
-// this duration), sized generously for a loaded CI machine.
-const attachTestWatchdog = 5 * time.Second
+// execChannelWatchdog bounds every wait in these tests. It is a watchdog only
+// (the tests synchronize on channels, never on this duration), sized generously
+// for a loaded CI machine.
+const execChannelWatchdog = 5 * time.Second
 
-// observingConn wraps the client end of the attach pipe and reports the exact
-// instant the synchronous request Write ENTERS, before it can block on the pipe.
-// It closes the gap between "the pending response was registered" and "Conn.Write
-// was actually invoked": a test can cancel only once Invoke has demonstrably
-// reached the attach Write, so the cancellation provably interrupts a blocked
-// write rather than racing the call. It must be installed BEFORE
-// NewHijackedResponse so the buffered reader also reads through it; all other
-// net.Conn behavior (Read/Close/deadlines/addresses) is the embedded conn's.
+// observingConn wraps the client end of the control-channel pipe and reports
+// the exact instant the synchronous request Write ENTERS, before it can block on
+// the pipe. A test can cancel only once Invoke has demonstrably reached the
+// connection Write, so cancellation provably interrupts a blocked write rather
+// than racing the call. All other net.Conn behavior is the embedded conn's.
 type observingConn struct {
 	net.Conn
 	writeEntered chan struct{}
@@ -42,18 +47,18 @@ func (o *observingConn) Write(b []byte) (int, error) {
 }
 
 // executionContainerHarness wires a real *executionContainer to a net.Pipe
-// stand-in for the hijacked attach and a scripted Docker client for the
-// kill/remove teardown. The pipe lets a test block the synchronous request
-// Write (the peer never reads) or the demultiplexer's response Read (the peer
-// reads the request but never replies), then release it deterministically by
-// cancelling the invocation context — the exact production cancellation path.
-// writeEntered is closed the instant Invoke reaches the attach Write (before it
-// can block), so a test never has to guess whether the write is in flight.
+// stand-in for its long-lived control-channel connection and a scripted Docker
+// client for the kill/remove teardown. The pipe lets a test block the
+// synchronous request Write (the peer never reads) or the response Read (the
+// peer reads the request but never replies), then release it deterministically
+// by cancelling the invocation context — the exact production cancellation
+// path. The container's single protocol reader (readResponses) is running; the
+// exit watcher and monitor are NOT started unless a test asks for the monitor,
+// because the scripted daemon serves no wait endpoint.
 type executionContainerHarness struct {
 	c            *executionContainer
 	peer         net.Conn
-	br           *bufio.Reader
-	reader       <-chan struct{}
+	reader       <-chan struct{} // c.readerDone
 	writeEntered <-chan struct{}
 	cleanup      func()
 
@@ -67,8 +72,8 @@ func newExecutionContainerHarness(t *testing.T) *executionContainerHarness {
 	return newExecutionContainerHarnessWithRemove(t, 0)
 }
 
-// newExecutionContainerHarnessWithRemove is newExecutionContainerHarness with a
-// controllable Docker removal outcome: removeStatus 0 (or 200) scripts a
+// newExecutionContainerHarnessWithRemove is newExecutionContainerHarness with
+// a controllable Docker removal outcome: removeStatus 0 (or 200) scripts a
 // successful remove; a 5xx status scripts a genuine removal failure (the daemon
 // refused), letting a test pin how a teardown that could not clean up is
 // accounted.
@@ -77,7 +82,6 @@ func newExecutionContainerHarnessWithRemove(t *testing.T, removeStatus int) *exe
 	clientEnd, peerEnd := net.Pipe()
 	conn := &observingConn{Conn: clientEnd, writeEntered: make(chan struct{})}
 	h := &executionContainerHarness{peer: peerEnd, writeEntered: conn.writeEntered}
-	h.br = bufio.NewReader(peerEnd)
 
 	rmBody := "{}"
 	if removeStatus >= 400 {
@@ -97,32 +101,39 @@ func newExecutionContainerHarnessWithRemove(t *testing.T, removeStatus int) *exe
 	)
 
 	c := &executionContainer{
-		cli:      cli,
-		log:      testutil.DiscardLogger(),
-		fn:       "test-fn",
-		image:    "test-image",
-		id:       "test-container",
-		attach:   &client.ContainerAttachResult{HijackedResponse: client.NewHijackedResponse(conn, "application/vnd.docker.multiplexed-stream")},
-		demux:    newProtocolDemuxer("test-fn"),
-		fail:     make(chan failEvent, 4),
-		exitInfo: make(chan exitInfo, 1),
-		eof:      make(chan struct{}, 1),
-		protoErr: make(chan struct{}, 1),
-		closed:   make(chan struct{}),
+		cli:        cli,
+		log:        testutil.DiscardLogger(),
+		fn:         "test-fn",
+		image:      "test-image",
+		id:         "test-container",
+		conn:       conn,
+		fail:       make(chan failEvent, 4),
+		exitInfo:   make(chan exitInfo, 1),
+		connErr:    make(chan error, 1),
+		protoErr:   make(chan error, 1),
+		closed:     make(chan struct{}),
+		readerDone: make(chan struct{}),
 	}
-	c.demux.protoFail = func() { signal(c.protoErr) }
 	h.c = c
-	h.reader = c.startOutputReader()
+	h.reader = c.readerDone
+	go c.readResponses()
 	h.cleanup = func() {
-		c.attach.Close()
 		_ = peerEnd.Close()
+		_ = conn.Close()
 		select {
 		case <-h.reader:
-		case <-time.After(attachTestWatchdog):
+		case <-time.After(execChannelWatchdog):
 		}
 	}
 	t.Cleanup(h.cleanup)
 	return h
+}
+
+// startMonitor starts the container's death monitor, for tests that exercise
+// how death events route to a pending Invoke (correlation violations,
+// transport loss).
+func (h *executionContainerHarness) startMonitor() {
+	go h.c.monitor()
 }
 
 func (h *executionContainerHarness) killsDone() int {
@@ -147,26 +158,29 @@ func (h *executionContainerHarness) assertTornDown(t *testing.T) {
 	}
 }
 
-// requestRead is the outcome of reading one request frame line from the peer
-// side of the attach pipe.
+// requestRead is the outcome of reading one framed invoke request from the peer
+// side of the control-channel pipe.
 type requestRead struct {
 	req invokeRequest
 	err error
 }
 
-// readRequestAsync reads exactly one request frame line from br on its own
-// goroutine (net.Pipe reads are synchronous and must not run on the test
-// goroutine while an Invoke may be blocked writing).
-func readRequestAsync(br *bufio.Reader) <-chan requestRead {
+// readRequestAsync reads exactly one framed invoke request from the peer on its
+// own goroutine (net.Pipe reads are synchronous and must not run on the test
+// goroutine while an Invoke may be blocked writing), with a watchdog.
+func readRequestAsync(conn net.Conn) <-chan requestRead {
 	ch := make(chan requestRead, 1)
 	go func() {
-		line, err := br.ReadString('\n')
+		raw, err := readFrame(conn, maxRequestFrame)
 		if err != nil {
 			ch <- requestRead{err: err}
 			return
 		}
 		var req invokeRequest
-		err = json.Unmarshal([]byte(strings.TrimSuffix(line, "\n")), &req)
+		err = json.Unmarshal(raw, &req)
+		if err == nil && req.Type != frameTypeInvoke {
+			err = errors.New("frame is not an invoke request")
+		}
 		ch <- requestRead{req: req, err: err}
 	}()
 	return ch
@@ -180,7 +194,7 @@ func waitRead(t *testing.T, ch <-chan requestRead) invokeRequest {
 			t.Fatalf("read invoke request: %v", r.err)
 		}
 		return r.req
-	case <-time.After(attachTestWatchdog):
+	case <-time.After(execChannelWatchdog):
 		t.Fatal("timed out reading invoke request")
 		return invokeRequest{}
 	}
@@ -191,7 +205,7 @@ func waitInvoke(t *testing.T, ch <-chan error) error {
 	select {
 	case err := <-ch:
 		return err
-	case <-time.After(attachTestWatchdog):
+	case <-time.After(execChannelWatchdog):
 		t.Fatal("timed out waiting for Invoke to return")
 		return nil
 	}
@@ -201,21 +215,58 @@ func waitReaderExit(t *testing.T, h *executionContainerHarness) {
 	t.Helper()
 	select {
 	case <-h.reader:
-	case <-time.After(attachTestWatchdog):
-		t.Fatal("output reader goroutine did not exit after the attach closed")
+	case <-time.After(execChannelWatchdog):
+		t.Fatal("protocol reader goroutine did not exit after the connection closed")
 	}
 }
 
-// serveOne reads one request frame from the peer and answers it with an OK
-// response carrying the request's id. It is used when the invocation is driven
-// by the pool (not by the test goroutine), so the test cannot call Invoke
-// directly.
+// waitDiscardComplete waits until the teardown has closed the connection
+// (removalDone closes after the conn close and the reader join), so a
+// follow-up attempt observes a deterministically closed channel instead of
+// racing an in-flight teardown.
+func (h *executionContainerHarness) waitDiscardComplete(t *testing.T) {
+	t.Helper()
+	select {
+	case <-h.c.removalDone():
+	case <-time.After(execChannelWatchdog):
+		t.Fatalf("discard did not complete: the connection was never closed (kills=%d removes=%d)",
+			h.killsDone(), h.removesDone())
+	}
+}
+
+// assertRefusesUse proves a discarded container never runs another invocation:
+// the attempt fails closed on the closed channel without any peer interaction
+// (the pool-level non-reuse is pinned by the executeVersion pool test).
+func (h *executionContainerHarness) assertRefusesUse(t *testing.T) {
+	t.Helper()
+	err := h.c.Invoke(context.Background(), "index.run", []byte(`{}`), nil)
+	if err == nil {
+		t.Fatal("a discarded container must never run another invocation")
+	}
+	if !strings.Contains(err.Error(), "docker run: ") {
+		t.Errorf("refusal = %v, want the wrapped execution failure", err)
+	}
+}
+
+// writeResult writes one framed result payload on the peer side.
+func writeResult(t *testing.T, peer net.Conn, resp invokeResponse) {
+	t.Helper()
+	payload, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	if err := writeFrame(peer, payload, maxResponseFrame); err != nil {
+		t.Fatalf("write result frame: %v", err)
+	}
+}
+
+// serveOne reads one invoke request from the peer and answers it with an OK
+// result carrying the request's id. It is used when the invocation is driven by
+// the pool (not by the test goroutine).
 func (h *executionContainerHarness) serveOne(t *testing.T) {
 	t.Helper()
-	req := waitRead(t, readRequestAsync(h.br))
-	if _, err := h.peer.Write(frame(1, testResponse(req.ID, true, "")+"\n")); err != nil {
-		t.Fatalf("write response frame: %v", err)
-	}
+	req := waitRead(t, readRequestAsync(h.peer))
+	writeResult(t, h.peer, invokeResponse{Type: frameTypeResult, ID: req.ID, OK: true})
 }
 
 // roundTrip drives one complete Invoke exchange on the test goroutine's behalf:
@@ -228,17 +279,15 @@ func (h *executionContainerHarness) roundTrip(t *testing.T, handler string) (inv
 	go func() {
 		done <- h.c.Invoke(ctx, handler, []byte(`{"event_name":"INSERT"}`), nil)
 	}()
-	req := waitRead(t, readRequestAsync(h.br))
-	if _, err := h.peer.Write(frame(1, testResponse(req.ID, true, "")+"\n")); err != nil {
-		t.Fatalf("write response frame: %v", err)
-	}
+	req := waitRead(t, readRequestAsync(h.peer))
+	writeResult(t, h.peer, invokeResponse{Type: frameTypeResult, ID: req.ID, OK: true})
 	return req, waitInvoke(t, done)
 }
 
-// TestExecutionContainerInvokeNormalRequestResponse pins the unchanged happy
-// path: one request line carrying the handler is written, the OK response
-// frame completes the invocation, the container stays healthy, and a second
-// invocation reuses the SAME attach.
+// TestExecutionContainerInvokeNormalRequestResponse pins the happy path: one
+// framed invoke request carrying the handler, the OK result completes the
+// invocation, the container stays healthy, and a second invocation reuses the
+// SAME connection.
 func TestExecutionContainerInvokeNormalRequestResponse(t *testing.T) {
 	h := newExecutionContainerHarness(t)
 
@@ -248,6 +297,12 @@ func TestExecutionContainerInvokeNormalRequestResponse(t *testing.T) {
 	}
 	if req.Handler != "index.run" {
 		t.Errorf("request handler = %q, want index.run", req.Handler)
+	}
+	if req.Type != frameTypeInvoke {
+		t.Errorf("frame type = %q, want %q", req.Type, frameTypeInvoke)
+	}
+	if req.Context == nil {
+		t.Error("request frame must carry its execution context")
 	}
 	if h.c.dead() {
 		t.Fatal("a successful invocation must not discard the container")
@@ -261,11 +316,39 @@ func TestExecutionContainerInvokeNormalRequestResponse(t *testing.T) {
 	}
 }
 
+// TestExecutionContainerHandlerFailureKeepsContainer pins the contract split:
+// a handler exception arrives as a bounded ok:false result and the container is
+// NOT discarded — only transport/protocol failures are.
+func TestExecutionContainerHandlerFailureKeepsContainer(t *testing.T) {
+	h := newExecutionContainerHarness(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- h.c.Invoke(ctx, "index.run", []byte(`{}`), nil)
+	}()
+	req := waitRead(t, readRequestAsync(h.peer))
+	writeResult(t, h.peer, invokeResponse{
+		Type: frameTypeResult, ID: req.ID, OK: false, Error: "boom",
+	})
+	err := waitInvoke(t, done)
+	if err == nil || !strings.Contains(err.Error(), `handler "index.run" failed: boom`) {
+		t.Fatalf("error = %v, want the handler-failure message", err)
+	}
+	if h.c.dead() {
+		t.Fatal("a handler failure must keep the container healthy")
+	}
+	if _, err := h.roundTrip(t, "index.run"); err != nil {
+		t.Fatalf("invocation after a handler failure: %v", err)
+	}
+}
+
 // TestExecutionContainerInvokeBlockedWriteCancelled verifies that a request
-// Write blocked on the attach (the peer never reads) is released by context
+// Write blocked on the connection (the peer never reads) is released by context
 // cancellation: Invoke returns the wrapped context error, the container is
-// discarded with the timeout reason, kill/remove are issued, the long-lived
-// reader exits, and the peer observes the connection close.
+// discarded with the timeout reason, kill/remove are issued, the reader exits,
+// and the peer observes the connection close.
 func TestExecutionContainerInvokeBlockedWriteCancelled(t *testing.T) {
 	h := newExecutionContainerHarness(t)
 
@@ -275,14 +358,14 @@ func TestExecutionContainerInvokeBlockedWriteCancelled(t *testing.T) {
 		done <- h.c.Invoke(ctx, "index.run", []byte(`{"event_name":"INSERT"}`), nil)
 	}()
 
-	// Barrier: the observing conn closes writeEntered the instant Invoke
-	// reaches the attach Write, BEFORE it can block. With the peer never reading,
+	// Barrier: the observing conn closes writeEntered the instant Invoke reaches
+	// the connection Write, BEFORE it can block. With the peer never reading,
 	// the write cannot complete, so cancelling now provably interrupts an
 	// in-flight write rather than racing the call itself.
 	select {
 	case <-h.writeEntered:
-	case <-time.After(attachTestWatchdog):
-		t.Fatal("timed out waiting for Invoke to enter the attach write")
+	case <-time.After(execChannelWatchdog):
+		t.Fatal("timed out waiting for Invoke to enter the connection write")
 	}
 	cancel()
 
@@ -296,14 +379,14 @@ func TestExecutionContainerInvokeBlockedWriteCancelled(t *testing.T) {
 	if !h.c.dead() {
 		t.Fatal("a cancelled invocation must discard the container")
 	}
-	if got := h.c.discardReason(); got != reasonTimeout {
-		t.Fatalf("discard reason = %q, want %q", got, reasonTimeout)
+	if got := h.c.discardReason(); got != "timeout" {
+		t.Fatalf("discard reason = %q, want %q", got, "timeout")
 	}
 	h.assertTornDown(t)
 	waitReaderExit(t, h)
 
 	// The blocked write is demonstrably released: the peer's read returns
-	// promptly now that the hijacked conn was closed.
+	// promptly now that the connection was closed.
 	peerRead := make(chan error, 1)
 	go func() {
 		_, e := h.peer.Read(make([]byte, 1))
@@ -312,17 +395,17 @@ func TestExecutionContainerInvokeBlockedWriteCancelled(t *testing.T) {
 	select {
 	case e := <-peerRead:
 		if e == nil {
-			t.Fatal("peer read unexpectedly succeeded after the attach closed")
+			t.Fatal("peer read unexpectedly succeeded after the connection closed")
 		}
-	case <-time.After(attachTestWatchdog):
+	case <-time.After(execChannelWatchdog):
 		t.Fatal("the blocked request write was not released by cancellation")
 	}
 }
 
-// TestExecutionContainerInvokeBlockedReadCancelled verifies that a demultiplexer
-// Read blocked on the attach (the request was written and consumed, but the
+// TestExecutionContainerInvokeBlockedReadCancelled verifies that the response
+// Read blocked on the connection (the request was written and consumed, but the
 // container never answers) is released by context cancellation with the same
-// no-leak proof: Invoke returns, the reader goroutine exits, and the container is
+// no-leak proof: Invoke returns, the reader exits, and the container is
 // discarded as a timeout.
 func TestExecutionContainerInvokeBlockedReadCancelled(t *testing.T) {
 	h := newExecutionContainerHarness(t)
@@ -333,9 +416,9 @@ func TestExecutionContainerInvokeBlockedReadCancelled(t *testing.T) {
 		done <- h.c.Invoke(ctx, "index.run", []byte(`{"event_name":"INSERT"}`), nil)
 	}()
 
-	// Barrier: the request line was written and consumed, so the demux reader is
-	// now blocked awaiting a response that will never come.
-	waitRead(t, readRequestAsync(h.br))
+	// Barrier: the request frame was written and consumed, so the reader is now
+	// blocked awaiting a result that will never come.
+	waitRead(t, readRequestAsync(h.peer))
 	cancel()
 
 	err := waitInvoke(t, done)
@@ -345,23 +428,23 @@ func TestExecutionContainerInvokeBlockedReadCancelled(t *testing.T) {
 	if !h.c.dead() {
 		t.Fatal("a cancelled invocation must discard the container")
 	}
-	if got := h.c.discardReason(); got != reasonTimeout {
-		t.Fatalf("discard reason = %q, want %q", got, reasonTimeout)
+	if got := h.c.discardReason(); got != "timeout" {
+		t.Fatalf("discard reason = %q, want %q", got, "timeout")
 	}
 	h.assertTornDown(t)
 	waitReaderExit(t, h)
 }
 
-// TestExecutionContainerInvokePreCancelledDoesNotDiscard verifies the "at/before
-// write" case: an invocation whose context is already cancelled when it reaches
-// the container never wrote a request, so it must report cancellation WITHOUT
-// discarding the (healthy) container or issuing kill/remove.
+// TestExecutionContainerInvokePreCancelledDoesNotDiscard covers the "before
+// write" case: an invocation whose context is already cancelled never wrote a
+// request, so it must report cancellation WITHOUT discarding the healthy
+// container or issuing kill/remove.
 func TestExecutionContainerInvokePreCancelledDoesNotDiscard(t *testing.T) {
 	h := newExecutionContainerHarness(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := h.c.Invoke(ctx, "index.run", []byte(`{"event_name":"INSERT"}`), nil)
+	err := h.c.Invoke(ctx, "index.run", []byte(`{}`), nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("invoke error = %v, want context.Canceled", err)
 	}
@@ -388,10 +471,10 @@ func TestExecutionContainerInvokeDeadlineExceeded(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- h.c.Invoke(ctx, "index.run", []byte(`{"event_name":"INSERT"}`), nil)
+		done <- h.c.Invoke(ctx, "index.run", []byte(`{}`), nil)
 	}()
 
-	waitRead(t, readRequestAsync(h.br)) // request written; response never comes
+	waitRead(t, readRequestAsync(h.peer)) // request written; result never comes
 	err := waitInvoke(t, done)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("invoke error = %v, want context.DeadlineExceeded", err)
@@ -399,17 +482,17 @@ func TestExecutionContainerInvokeDeadlineExceeded(t *testing.T) {
 	if !strings.HasPrefix(err.Error(), "docker run: ") {
 		t.Fatalf("invoke error = %q, want the one-shot wrapped form", err)
 	}
-	if got := h.c.discardReason(); got != reasonTimeout {
-		t.Fatalf("discard reason = %q, want %q", got, reasonTimeout)
+	if got := h.c.discardReason(); got != "timeout" {
+		t.Fatalf("discard reason = %q, want %q", got, "timeout")
 	}
 	waitReaderExit(t, h)
 }
 
 // TestExecutionContainerInvokeCancellationRacesCompletion exercises the
-// completion/cancellation race: the response is delivered and the context
+// completion/cancellation race: the result is delivered and the context
 // cancelled concurrently. Whichever side wins, the outcome must be consistent —
 // a cancelled invocation discards the container, and a completed invocation must
-// NOT have been closed underneath (proved by reusing the same attach afterward).
+// NOT have been closed underneath (proved by reusing the same connection).
 func TestExecutionContainerInvokeCancellationRacesCompletion(t *testing.T) {
 	const iterations = 40
 	for i := 0; i < iterations; i++ {
@@ -418,16 +501,13 @@ func TestExecutionContainerInvokeCancellationRacesCompletion(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
 		go func() {
-			done <- h.c.Invoke(ctx, "index.run", []byte(`{"event_name":"INSERT"}`), nil)
+			done <- h.c.Invoke(ctx, "index.run", []byte(`{}`), nil)
 		}()
-		req := waitRead(t, readRequestAsync(h.br))
+		req := waitRead(t, readRequestAsync(h.peer))
 
-		// Deliver the response and cancel back to back: the demux reader may
-		// route the response just before or just after the cancellation callback
-		// starts.
-		if _, err := h.peer.Write(frame(1, testResponse(req.ID, true, "")+"\n")); err != nil {
-			t.Fatalf("iteration %d: write response: %v", i, err)
-		}
+		// Deliver the result and cancel back to back: the reader may deliver
+		// just before or just after the cancellation callback starts.
+		writeResult(t, h.peer, invokeResponse{Type: frameTypeResult, ID: req.ID, OK: true})
 		cancel()
 
 		err := waitInvoke(t, done)
@@ -443,8 +523,8 @@ func TestExecutionContainerInvokeCancellationRacesCompletion(t *testing.T) {
 		if h.c.dead() {
 			t.Fatalf("iteration %d: a completed invocation must not close its container", i)
 		}
-		// A nil result must imply the cancellation callback never closed the
-		// attach: a follow-up exchange on the SAME conn must still succeed.
+		// A nil result implies the cancellation callback never closed the
+		// connection: a follow-up exchange on the SAME connection must succeed.
 		if _, err := h.roundTrip(t, "index.run"); err != nil {
 			t.Fatalf("iteration %d: no-premature-close violated, reuse failed: %v", i, err)
 		}
@@ -470,14 +550,14 @@ func TestExecutionContainerCancelledInvocationNotReusedByPool(t *testing.T) {
 		return h.c, nil
 	}
 
-	// First execute: cancel while the container is blocked awaiting a response.
+	// First execute: cancel while the container is blocked awaiting a result.
 	ctx, cancel := context.WithCancel(context.Background())
 	firstDone := make(chan error, 1)
 	go func() {
 		firstDone <- cc.executeVersion(ctx, "fn", "img", cc.appConfig("fn"), 1,
 			start, "index.run", []byte(`{"event_name":"INSERT"}`), nil)
 	}()
-	waitRead(t, readRequestAsync(first.br))
+	waitRead(t, readRequestAsync(first.peer))
 	cancel()
 
 	err := waitInvoke(t, firstDone)
@@ -493,7 +573,7 @@ func TestExecutionContainerCancelledInvocationNotReusedByPool(t *testing.T) {
 	secondDone := make(chan error, 1)
 	go func() {
 		secondDone <- cc.executeVersion(context.Background(), "fn", "img", cc.appConfig("fn"), 1,
-			start, "index.run", []byte(`{"event_name":"INSERT"}`), nil)
+			start, "index.run", []byte(`{}`), nil)
 	}()
 	second.serveOne(t)
 	if err := waitInvoke(t, secondDone); err != nil {
@@ -507,16 +587,233 @@ func TestExecutionContainerCancelledInvocationNotReusedByPool(t *testing.T) {
 	}
 }
 
-// TestManagerShutdownDoesNotHangOnStuckAttach verifies pool/manager shutdown
-// cannot hang on a container whose attach reader is blocked: CloseContext
-// discards the stuck container through the bounded, context-aware teardown
-// (which closes the attach and releases the reader) and returns promptly.
-func TestManagerShutdownDoesNotHangOnStuckAttach(t *testing.T) {
+// TestExecutionContainerResultIDViolationDiscardsPromptly pins strict
+// correlation: a result whose id does not match the in-flight invocation is a
+// protocol violation delivered to that invocation, which fails (never
+// ambiguously succeeds) and discards the container as protocol_error — with no
+// process-exit grace period.
+func TestExecutionContainerResultIDViolationDiscardsPromptly(t *testing.T) {
+	h := newExecutionContainerHarness(t)
+	h.startMonitor()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- h.c.Invoke(ctx, "index.run", []byte(`{}`), nil)
+	}()
+	waitRead(t, readRequestAsync(h.peer))
+	writeResult(t, h.peer, invokeResponse{Type: frameTypeResult, ID: "wrong-id", OK: true})
+
+	start := time.Now()
+	err := waitInvoke(t, done)
+	if err == nil {
+		t.Fatal("a mismatched result id must never report success")
+	}
+	if !strings.Contains(err.Error(), "does not match") {
+		t.Errorf("error = %v, want the correlation violation surfaced", err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("violation took %v to resolve, want prompt invalidation (no exit grace)", elapsed)
+	}
+	if !h.c.dead() {
+		t.Fatal("a correlation violation must discard the container")
+	}
+	if got := h.c.discardReason(); got != "protocol_error" {
+		t.Errorf("discard reason = %q, want protocol_error", got)
+	}
+	waitReaderExit(t, h)
+}
+
+// TestExecutionContainerTransportLossFailsPendingInvocation pins loss
+// semantics: when the connection dies with an invocation unresolved, the
+// invocation fails (never succeeds), the container is discarded, and the reader
+// is joined — bounded by the monitor's short exit-attribution grace.
+func TestExecutionContainerTransportLossFailsPendingInvocation(t *testing.T) {
+	h := newExecutionContainerHarness(t)
+	h.startMonitor()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- h.c.Invoke(ctx, "index.run", []byte(`{}`), nil)
+	}()
+	waitRead(t, readRequestAsync(h.peer))
+
+	// The bootstrap side of the connection dies mid-invocation.
+	if err := h.peer.Close(); err != nil {
+		t.Fatalf("close peer: %v", err)
+	}
+
+	start := time.Now()
+	err := waitInvoke(t, done)
+	if err == nil {
+		t.Fatal("transport loss with an unresolved invocation must never report success")
+	}
+	if !strings.Contains(err.Error(), "docker run: ") {
+		t.Errorf("error = %v, want the wrapped execution failure", err)
+	}
+	if elapsed := time.Since(start); elapsed > 6*time.Second {
+		t.Errorf("transport loss resolved after %v, want within the bounded exit grace", elapsed)
+	}
+	if !h.c.dead() {
+		t.Fatal("a lost connection must discard the container")
+	}
+	waitReaderExit(t, h)
+}
+
+// expectReaderSignal writes one raw payload (already framed) from the peer and
+// returns the reader's protocol/transport signal, failing the test on timeout.
+func expectReaderSignal(t *testing.T, h *executionContainerHarness, payload []byte) error {
+	t.Helper()
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- writeFrame(h.peer, payload, maxResponseFrame) }()
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write raw frame: %v", err)
+	}
+	select {
+	case err := <-h.c.protoErr:
+		return err
+	case err := <-h.c.connErr:
+		return err
+	case <-time.After(execChannelWatchdog):
+		t.Fatal("reader signaled no protocol/transport violation")
+		return nil
+	}
+}
+
+// TestExecutionContainerReaderRejectsProtocolViolations covers the reader's
+// contract directly: every malformed, unexpected, uncorrelated, duplicate, or
+// oversized frame on an AUTHENTICATED connection is a fatal signal (never
+// silently dropped), and the reader exits after signaling.
+func TestExecutionContainerReaderRejectsProtocolViolations(t *testing.T) {
+	t.Run("malformed JSON result", func(t *testing.T) {
+		h := newExecutionContainerHarness(t)
+		err := expectReaderSignal(t, h, []byte("not a response"))
+		if !strings.Contains(err.Error(), "malformed response frame") {
+			t.Errorf("signal = %v, want the malformed-frame violation", err)
+		}
+		waitReaderExit(t, h)
+	})
+	t.Run("unexpected frame type", func(t *testing.T) {
+		h := newExecutionContainerHarness(t)
+		err := expectReaderSignal(t, h, []byte(`{"type":"invoke","id":"x"}`))
+		if !strings.Contains(err.Error(), "invalid type") {
+			t.Errorf("signal = %v, want the unexpected-type violation", err)
+		}
+		waitReaderExit(t, h)
+	})
+	t.Run("result with no pending invocation", func(t *testing.T) {
+		h := newExecutionContainerHarness(t)
+		err := expectReaderSignal(t, h, []byte(`{"type":"result","id":"idle","ok":true}`))
+		if !strings.Contains(err.Error(), "no pending invocation") {
+			t.Errorf("signal = %v, want the uncorrelated-result violation", err)
+		}
+		waitReaderExit(t, h)
+	})
+	t.Run("result id mismatch", func(t *testing.T) {
+		h := newExecutionContainerHarness(t)
+		h.c.setPending("registered", make(chan invokeResponse, 1))
+		err := expectReaderSignal(t, h, []byte(`{"type":"result","id":"other","ok":true}`))
+		if !strings.Contains(err.Error(), "does not match") {
+			t.Errorf("signal = %v, want the id-mismatch violation", err)
+		}
+		waitReaderExit(t, h)
+	})
+	t.Run("duplicate result for one pending invocation", func(t *testing.T) {
+		h := newExecutionContainerHarness(t)
+		ch := make(chan invokeResponse, 1)
+		h.c.setPending("dup", ch)
+		line := []byte(`{"type":"result","id":"dup","ok":true}`)
+		writeDone := make(chan error, 1)
+		go func() {
+			// Both frames back to back while the pending channel stays
+			// UNCONSUMED: the first fills it, the second must be flagged rather
+			// than blocking the reader on a full channel.
+			if err := writeFrame(h.peer, line, maxResponseFrame); err != nil {
+				writeDone <- err
+				return
+			}
+			writeDone <- writeFrame(h.peer, line, maxResponseFrame)
+		}()
+		select {
+		case err := <-h.c.protoErr:
+			if !strings.Contains(err.Error(), "duplicate") {
+				t.Errorf("signal = %v, want the duplicate-result violation", err)
+			}
+		case <-time.After(execChannelWatchdog):
+			t.Fatal("a duplicate result must signal a protocol violation")
+		}
+		if err := <-writeDone; err != nil {
+			t.Fatalf("write duplicate frame: %v", err)
+		}
+		select {
+		case resp := <-ch:
+			if !resp.OK || resp.ID != "dup" {
+				t.Fatalf("first result = %+v, want ok for id dup", resp)
+			}
+		case <-time.After(execChannelWatchdog):
+			t.Fatal("the first result must be delivered")
+		}
+		waitReaderExit(t, h)
+	})
+	t.Run("oversized response frame", func(t *testing.T) {
+		h := newExecutionContainerHarness(t)
+		var header [4]byte
+		binary.BigEndian.PutUint32(header[:], uint32(maxResponseFrame+1))
+		writeDone := make(chan error, 1)
+		go func() {
+			_, err := h.peer.Write(header[:])
+			writeDone <- err
+		}()
+		if err := <-writeDone; err != nil {
+			t.Fatalf("write oversize header: %v", err)
+		}
+		select {
+		case err := <-h.c.connErr:
+			if !strings.Contains(err.Error(), "exceeds") {
+				t.Errorf("signal = %v, want the size-limit rejection", err)
+			}
+		case <-time.After(execChannelWatchdog):
+			t.Fatal("an oversized frame must signal a transport-level failure")
+		}
+		waitReaderExit(t, h)
+	})
+}
+
+// TestExecutionContainerRequestFrameTooLargeIsCallerError pins the caller
+// contract half of the size limits: an event whose request frame exceeds
+// maxRequestFrame fails the invocation WITHOUT touching the healthy container.
+func TestExecutionContainerRequestFrameTooLargeIsCallerError(t *testing.T) {
+	h := newExecutionContainerHarness(t)
+
+	huge := []byte(`{"pad":"` + strings.Repeat("x", maxRequestFrame) + `"}`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err := h.c.Invoke(ctx, "index.run", huge, nil)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("error = %v, want the request-size rejection", err)
+	}
+	if h.c.dead() {
+		t.Fatal("an oversized request is a caller-contract failure; the container stays healthy")
+	}
+	if h.killsDone() != 0 || h.removesDone() != 0 {
+		t.Fatalf("oversized request issued teardown: kills=%d removes=%d",
+			h.killsDone(), h.removesDone())
+	}
+}
+
+// TestManagerShutdownDoesNotHangOnStuckChannel verifies pool/manager shutdown
+// cannot hang on a container whose protocol reader is blocked: CloseContext
+// discards the stuck container through the bounded teardown (which closes the
+// connection and releases the reader) and returns promptly.
+func TestManagerShutdownDoesNotHangOnStuckChannel(t *testing.T) {
 	m := &Manager{containers: newContainerCache()}
 	h := newExecutionContainerHarness(t)
 
-	// Seed one idle container whose attach reader is blocked (the peer never
-	// writes), then simulate shutdown.
+	// Seed one idle container whose reader is blocked (the peer never writes),
+	// then simulate shutdown.
 	lease, err := m.containers.acquire(context.Background(), "fn", "img", 1,
 		func() (reusableContainer, error) { return h.c, nil })
 	if err != nil {
@@ -534,11 +831,11 @@ func TestManagerShutdownDoesNotHangOnStuckAttach(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CloseContext: %v", err)
 		}
-	case <-time.After(attachTestWatchdog):
-		t.Fatal("CloseContext hung on a stuck attach")
+	case <-time.After(execChannelWatchdog):
+		t.Fatal("CloseContext hung on a stuck channel")
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Fatalf("CloseContext took %v; want prompt return", elapsed)
+		t.Fatalf("CloseContext took %v, want prompt return", elapsed)
 	}
 	if !h.c.dead() {
 		t.Fatal("pool shutdown did not discard the stuck container")
@@ -546,15 +843,15 @@ func TestManagerShutdownDoesNotHangOnStuckAttach(t *testing.T) {
 	waitReaderExit(t, h)
 }
 
-// TestManagerShutdownReleasesInflightBlockedAttach covers the shutdown edge the
-// idle case cannot: a container LEASED to an in-flight invocation whose request
-// Write is blocked on the attach. Manager.CloseContext must tear the busy
-// container down (closing the attach releases the blocked Write), so BOTH the
-// invocation and shutdown return, and the reader goroutine exits — no shutdown
-// hang on an in-flight attach I/O. The invocation's own context is not
-// cancelled here: the attach close is what releases it, modelling the real
-// shutdown path rather than the invocation-timeout path.
-func TestManagerShutdownReleasesInflightBlockedAttach(t *testing.T) {
+// TestManagerShutdownReleasesInflightBlockedChannel covers the shutdown edge
+// the idle case cannot: a container LEASED to an in-flight invocation whose
+// request Write is blocked on the connection. Manager.CloseContext must tear
+// the busy container down (closing the connection releases the blocked Write),
+// so BOTH the invocation and shutdown return, and the reader exits — no shutdown
+// hang on in-flight channel I/O. The invocation's own context is not cancelled
+// here: the connection close is what releases it, modelling the real shutdown
+// path rather than the invocation-timeout path.
+func TestManagerShutdownReleasesInflightBlockedChannel(t *testing.T) {
 	m := &Manager{containers: newContainerCache()}
 	h := newExecutionContainerHarness(t)
 
@@ -562,24 +859,24 @@ func TestManagerShutdownReleasesInflightBlockedAttach(t *testing.T) {
 	lease, err := m.containers.acquire(context.Background(), "fn", "img", 1,
 		func() (reusableContainer, error) { return h.c, nil })
 	if err != nil {
-		t.Fatalf("acquire: %v", err)
+		t.Fatalf("seed acquire: %v", err)
 	}
 	defer lease.release()
 
 	// Start the invocation and wait until it is demonstrably blocked in the
-	// attach Write (the peer never reads, so the write can never complete).
+	// connection Write (the peer never reads, so the write can never complete).
 	invokeDone := make(chan error, 1)
 	go func() {
-		invokeDone <- lease.invoke(context.Background(), "index.run", []byte(`{"event_name":"INSERT"}`), nil)
+		invokeDone <- lease.invoke(context.Background(), "index.run", []byte(`{}`), nil)
 	}()
 	select {
 	case <-h.writeEntered:
-	case <-time.After(attachTestWatchdog):
-		t.Fatal("timed out waiting for the in-flight invocation to enter the attach write")
+	case <-time.After(execChannelWatchdog):
+		t.Fatal("timed out waiting for the in-flight invocation to enter the connection write")
 	}
 
 	// Shutdown while that invocation is still blocked. CloseContext must not
-	// hang, and the teardown's attach close must release the blocked write.
+	// hang, and the teardown's connection close must release the blocked write.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	closeDone := make(chan error, 1)
@@ -590,16 +887,16 @@ func TestManagerShutdownReleasesInflightBlockedAttach(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CloseContext: %v", err)
 		}
-	case <-time.After(attachTestWatchdog):
-		t.Fatal("CloseContext hung while an invocation was blocked in attach I/O")
+	case <-time.After(execChannelWatchdog):
+		t.Fatal("CloseContext hung while an invocation was blocked in channel I/O")
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Fatalf("CloseContext took %v; want prompt return", elapsed)
+		t.Fatalf("CloseContext took %v, want prompt return", elapsed)
 	}
 
-	// The blocked invocation must also return (released by the attach close),
-	// and the reader must exit. Its error is a shutdown interruption, not a
-	// success; the exact text is not part of the shutdown contract.
+	// The blocked invocation must also return (released by the connection
+	// close), and the reader must exit. Its error is a shutdown interruption,
+	// not a success; the exact text is not part of the shutdown contract.
 	if err := waitInvoke(t, invokeDone); err == nil {
 		t.Fatal("the invocation interrupted by shutdown must not report success")
 	}
@@ -613,10 +910,10 @@ func TestManagerShutdownReleasesInflightBlockedAttach(t *testing.T) {
 	}
 }
 
-// TestExecutionContainerRemovalConfirmedOnSuccess pins the production removal
-// outcome: a teardown whose Docker remove succeeds (or finds the container
-// already gone) reports removalConfirmed, and removalDone closes, so the pool can
-// safely return the container's warm-budget slot.
+// TestExecutionContainerRemovalConfirmedOnSuccess pins the removal outcome: a
+// teardown whose Docker remove succeeds (or finds the container already gone)
+// reports removalConfirmed, and removalDone closes, so the pool can safely
+// return the container's warm-budget slot.
 func TestExecutionContainerRemovalConfirmedOnSuccess(t *testing.T) {
 	h := newExecutionContainerHarness(t)
 
@@ -635,18 +932,18 @@ func TestExecutionContainerRemovalConfirmedOnSuccess(t *testing.T) {
 		t.Fatal("removalDone must be closed once the teardown recorded its outcome")
 	}
 	h.assertTornDown(t)
-	// discard is idempotent: a race loser performs no teardown and does not change
-	// the recorded outcome.
+	// discard is idempotent: a race loser performs no teardown and does not
+	// change the recorded outcome.
 	if h.c.discard(reasonShutdown) {
 		t.Fatal("a second discard must be a no-op")
 	}
 }
 
-// TestExecutionContainerRemovalUnconfirmedOnFailure pins the failure half: when the
-// Docker remove genuinely fails, the container is still poisoned (never reusable)
-// and its removalDone closes, but removalConfirmed stays false so the pool keeps
-// its warm-budget slot reserved rather than admitting a fresh container on phantom
-// capacity.
+// TestExecutionContainerRemovalUnconfirmedOnFailure pins the failure half: when
+// the Docker remove genuinely fails, the container is still poisoned (never
+// reusable) and its removalDone closes, but removalConfirmed stays false so the
+// pool keeps its warm-budget slot reserved rather than admitting a fresh
+// container on phantom capacity.
 func TestExecutionContainerRemovalUnconfirmedOnFailure(t *testing.T) {
 	h := newExecutionContainerHarnessWithRemove(t, http.StatusInternalServerError)
 
@@ -669,4 +966,170 @@ func TestExecutionContainerRemovalUnconfirmedOnFailure(t *testing.T) {
 		t.Fatalf("teardown calls: kills=%d removes=%d, want kill>=1 remove==1",
 			h.killsDone(), h.removesDone())
 	}
+}
+
+// TestExecutionContainerDuplicateAfterConsumeBeforeClearIsProtocolError is the
+// independent-review correlation case: a duplicate result that arrives AFTER
+// Invoke consumed the first result but BEFORE the pending state is cleared. A
+// detector that only checks "is the buffered response channel full" misses this
+// window (the channel is empty again the instant Invoke received). The
+// duplicate must still be flagged as a protocol violation, the container must
+// be discarded, and it must never be handed out for reuse.
+func TestExecutionContainerDuplicateAfterConsumeBeforeClearIsProtocolError(t *testing.T) {
+	h := newExecutionContainerHarness(t)
+	ch := make(chan invokeResponse, 1)
+	h.c.setPending("dup", ch)
+
+	// First result delivered and consumed, exactly as Invoke would drain it.
+	writeResult(t, h.peer, invokeResponse{Type: frameTypeResult, ID: "dup", OK: true})
+	select {
+	case resp := <-ch:
+		if !resp.OK {
+			t.Fatalf("first result = %+v, want ok", resp)
+		}
+	case <-time.After(execChannelWatchdog):
+		t.Fatal("the first result must be delivered")
+	}
+	// ch is now EMPTY while pending is still set: the vulnerable window.
+	// The duplicate must signal a protocol error, not be silently accepted.
+	writeResult(t, h.peer, invokeResponse{Type: frameTypeResult, ID: "dup", OK: true})
+	var violation error
+	select {
+	case violation = <-h.c.protoErr:
+		if !strings.Contains(violation.Error(), "duplicate") {
+			t.Errorf("signal = %v, want the duplicate-result violation", violation)
+		}
+	case <-time.After(execChannelWatchdog):
+		t.Fatal("a duplicate after the response was consumed must signal a protocol violation")
+	}
+	waitReaderExit(t, h)
+
+	// The observation above drained the signal buffer; re-arm it so the
+	// later-started monitor observes the same violation production wires
+	// directly, then require the DISCARD (teardown completion, not the
+	// fatal/dead flag) even though the in-window pending state is still set: a
+	// protocol violation is never routed as a resumable invocation failure.
+	h.c.protoErr <- violation
+	h.startMonitor()
+	h.waitDiscardComplete(t)
+	// ...and a discarded container is never reused: the next exchange fails
+	// closed instead of running another handler.
+	h.assertRefusesUse(t)
+}
+
+// TestExecutionContainerLateResultAfterCompletionDiscardsContainer pins the
+// other side of the correlation window: a result arriving after the completed
+// invocation already cleared its pending state is uncorrelated — a protocol
+// violation that discards the now-untrusted container, while the FIRST
+// invocation's confirmed ok:true result stands as a success.
+func TestExecutionContainerLateResultAfterCompletionDiscardsContainer(t *testing.T) {
+	h := newExecutionContainerHarness(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- h.c.Invoke(ctx, "index.run", []byte(`{}`), nil)
+	}()
+	req := waitRead(t, readRequestAsync(h.peer))
+	writeResult(t, h.peer, invokeResponse{Type: frameTypeResult, ID: req.ID, OK: true})
+	// Invoke returns successfully; its deferred clearPending has run.
+	if err := waitInvoke(t, done); err != nil {
+		t.Fatalf("first invocation: %v", err)
+	}
+
+	// A late duplicate for the SAME id now has no pending invocation: the
+	// reader signals before any monitor can consume the observation.
+	writeResult(t, h.peer, invokeResponse{Type: frameTypeResult, ID: req.ID, OK: true})
+	var violation error
+	select {
+	case violation = <-h.c.protoErr:
+		if !strings.Contains(violation.Error(), "no pending invocation") {
+			t.Errorf("signal = %v, want the uncorrelated-result violation", violation)
+		}
+	case <-time.After(execChannelWatchdog):
+		t.Fatal("a result after completion must signal a protocol violation")
+	}
+	waitReaderExit(t, h)
+
+	// Re-arm the drained signal for the monitor: with nothing pending it must
+	// discard the container (teardown completion proves the discard, since
+	// dead() also reports the already-set fatal flag).
+	h.c.protoErr <- violation
+	h.startMonitor()
+	h.waitDiscardComplete(t)
+	h.assertRefusesUse(t)
+}
+
+// TestExecutionContainerConfirmedResponseSurvivesImmediateEOF pins the
+// reviewed race: the reader confirms a valid ok:true response and THEN sees
+// EOF, with the monitor's failure signal also becoming ready. Invoke must
+// prefer the CONFIRMED result (report success, never a retryable transport
+// failure) while the now-unhealthy container is discarded so the pool cannot
+// reuse it. Cancellation still wins when the context itself is cancelled — the
+// deterministic subtest below.
+func TestExecutionContainerConfirmedResponseSurvivesImmediateEOF(t *testing.T) {
+	h := newExecutionContainerHarness(t)
+	h.startMonitor()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- h.c.Invoke(ctx, "index.run", []byte(`{}`), nil)
+	}()
+	req := waitRead(t, readRequestAsync(h.peer))
+	// The result frame is fully consumed by the reader, THEN the connection
+	// dies: both the confirmed response and the EOF are in flight together.
+	writeResult(t, h.peer, invokeResponse{Type: frameTypeResult, ID: req.ID, OK: true})
+	if err := h.peer.Close(); err != nil {
+		t.Fatalf("close peer: %v", err)
+	}
+
+	err := waitInvoke(t, done)
+	if err != nil {
+		t.Fatalf("a confirmed ok:true response must be reported as success, not a transport failure: %v", err)
+	}
+	// The container observed the loss: it must be discarded (whether the reader's
+	// fatal flag or the monitor's exit grace got there first) so it is never
+	// reused by the pool.
+	if !pollUntil(context.Background(), 6*time.Second, h.c.dead) {
+		t.Fatal("the container must be discarded after its connection died")
+	}
+	// Never reused: a subsequent attempt on the poisoned container fails closed
+	// without running a handler (the pool-level non-reuse is pinned by
+	// TestExecutionContainerCancelledInvocationNotReusedByPool).
+	h.waitDiscardComplete(t)
+	h.assertRefusesUse(t)
+	waitReaderExit(t, h)
+
+	t.Run("cancellation wins when the context is canceled", func(t *testing.T) {
+		h2 := newExecutionContainerHarness(t)
+		h2.startMonitor()
+		ctx2, cancel2 := context.WithCancel(context.Background())
+		done2 := make(chan error, 1)
+		go func() {
+			done2 <- h2.c.Invoke(ctx2, "index.run", []byte(`{}`), nil)
+		}()
+		req2 := waitRead(t, readRequestAsync(h2.peer))
+		// Cancel first and wait until the cancellation callback has torn the
+		// container down: from that point the outcome is deterministic.
+		cancel2()
+		if !pollUntil(context.Background(), 6*time.Second, h2.c.dead) {
+			t.Fatal("cancellation must discard the container")
+		}
+		// A response arriving now races a cancellation that has already won; it
+		// must never flip the outcome to success. The write itself may fail —
+		// the connection is already closed — which is the point.
+		payload, err := json.Marshal(invokeResponse{Type: frameTypeResult, ID: req2.ID, OK: true})
+		if err != nil {
+			t.Fatalf("marshal late result: %v", err)
+		}
+		_ = writeFrame(h2.peer, payload, maxResponseFrame)
+		err2 := waitInvoke(t, done2)
+		if !errors.Is(err2, context.Canceled) {
+			t.Fatalf("invoke error = %v, want context.Canceled to win", err2)
+		}
+		waitReaderExit(t, h2)
+	})
 }

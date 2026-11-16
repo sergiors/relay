@@ -1,15 +1,15 @@
 name: Publish Python package
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "python-v*"
 
 permissions:
   contents: read
 
 jobs:
   build:
-    if: startsWith(github.event.release.tag_name, 'python-v')
     runs-on: ubuntu-latest
 
     steps:
@@ -26,7 +26,7 @@ jobs:
       - name: Validate version
         working-directory: packages/python
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           python - <<'PY'
           import os
@@ -69,3 +69,23 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+
+  release:
+    needs: publish
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            --verify-tag \
+            --title "Python ${RELEASE_TAG#python-v}" \
+            --generate-notes \
+            --latest=false

@@ -15,8 +15,7 @@ invalid startup settings cause `relay start` to fail. See
 | `NODE_ID`      | Stable node identity, unique among concurrent workers and reused across restarts. Up to 128 ASCII letters, digits, `.`, `_`, or `-`. |
 
 The Redis consumer name uses `NODE_ID`; there is no generated or hostname
-fallback. A PostgreSQL lock prevents concurrent workers from using the same
-identity. See [Operations](operations.md#node-ownership-loss).
+fallback. See [Operations](operations.md#node-identity-loss).
 
 ## Optional
 
@@ -33,7 +32,7 @@ identity. See [Operations](operations.md#node-ownership-loss).
 | `PYTHON_ZUVLOOP`              | `false`                     | Boolean; use `zuvloop` for Python event and schedule handlers.                         |
 | `METRICS_ADDR`                | unset                       | Listen address for Prometheus metrics; empty disables metrics.                         |
 | `GIT_WEBHOOK_ADDR`            | unset                       | Listen address for the optional GitHub webhook. Requires a configured webhook secret.  |
-| `NETWORKS`                    | unset                       | Comma-separated, existing Docker networks for workload containers.                     |
+| `NETWORKS`                    | unset                       | Optional comma-separated existing, operator-managed Docker networks for app connectivity. |
 | `REDIS_STREAM_RETENTION`      | `24h`                       | Age window for trimming acknowledged stream entries; see below.                        |
 | `DLQ_RETENTION`               | `168h`                      | Age window for settled PostgreSQL DLQ rows; see below.                                 |
 | `REDIS_INVOCATION_RETENTION`  | `48h`                       | Retention for terminal invocation state after ACK.                                     |
@@ -57,10 +56,18 @@ selected, missing required values or an invalid HTTPS URL fail startup; Relay
 never falls back to local files.
 
 Invalid values for required and tuning settings fail startup. Invalid retention
-values are logged and disable the corresponding retention behavior. Network
-names must already exist; Relay does not create or remove networks. Most worker
-settings require a restart to change. App-level concurrency and resources are
-documented in [Apps](apps.md).
+values are logged and disable the corresponding retention behavior. Networks
+listed in `NETWORKS` must already exist; Relay does not create or remove these
+workload networks. `NETWORKS` is optional, and an empty value is valid.
+
+Relay automatically manages the connectivity used to execute handlers; users
+do not configure an internal execution network. `NETWORKS` is optional
+additional connectivity for app containers, and every listed network must
+already exist. Networks marked `relay.network.role=execution-control` are
+reserved and rejected for `NETWORKS` and `TRAEFIK_NETWORK`. This marker does
+not prove ownership or isolate containers. `TRAEFIK_NETWORK` remains the
+additional network for routed services. Most worker settings require a restart
+to change. App-level concurrency and resources are documented in [Apps](apps.md).
 
 Boolean settings accept `1`, `t`, `true`, `0`, `f`, or `false`. Durations use Go
 syntax such as `90s` or `1h30m`; retention settings do not accept a `d` suffix.
@@ -136,8 +143,10 @@ Changing it requires a worker restart.
 
 ### Log levels
 
-`LOG_LEVEL` filters Relay's own logs. Handler stdout and stderr are forwarded
-regardless of this setting.
+`LOG_LEVEL` filters Relay's own logs. Handler stdout and stderr use native
+Docker container logs, not Relay forwarding, and are unaffected by this
+setting. Warm containers can run different handlers over time; Relay does not
+enrich their output with per-invocation context.
 
 ### Retention windows
 
@@ -160,13 +169,9 @@ state persistent. See
 
 ### Service routing
 
-`TRAEFIK_*` settings apply to services that declare routed hosts. Relay verifies
-the configured network exists but does not manage the network itself. See
-[Services](services.md) for routing configuration.
-
-Workload networks must not include Relay's control plane. Relay refuses a
-selected network labelled `relay.control=true` (and the reserved `host` /
-`container:<id>` pseudo-networks) before creating any workload container.
+`TRAEFIK_*` settings apply to services that declare routed hosts.
+`TRAEFIK_NETWORK` is required for routed services and must already exist. Relay
+does not manage the network; see [Services](services.md).
 
 ## Environment owned by other libraries
 

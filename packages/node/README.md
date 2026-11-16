@@ -16,7 +16,6 @@ pnpm add @sergiors/relay-runtime
 The initial release exports the `HandlerContext` TypeScript declaration. Relay's
 Node.js bootstrap constructs the actual context object for each invocation and
 passes it to the handler; this package does not provide that implementation.
-Future releases may add Relay application-development utilities.
 
 TypeScript:
 

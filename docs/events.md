@@ -95,16 +95,6 @@ A Debezium tombstone is acknowledged without execution when `value` is exactly
 the default null-value sentinel `default`. `format=raw` takes precedence, and
 custom null-value sentinels are not recognized.
 
-### Schedule envelopes
-
-Relay publishes schedule occurrences to the stream. Their envelopes carry
-`source: relay.schedule`, an app and schedule name, the scheduled instant, and a
-deterministic `occurrence_id`. Relay validates the envelope and dispatches it to
-the current or already-admitted handler for that schedule. Invalid claims are
-dead-lettered and never matched as ordinary events. The handler receives only
-`{"source":"relay.schedule","scheduled_at":"…"}`. See
-[Schedules](schedules.md) for identity and recovery behavior.
-
 ## Event matching
 
 Declare event rules in an app's `template.yaml`. This MongoDB CDC example matches
@@ -156,9 +146,9 @@ acknowledged without retry.
 
 ## Execution, retries, and delivery
 
-Handlers receive the decoded event as JSON on stdin. For one message, Relay runs
-matching handlers sequentially; separate messages may run concurrently, subject
-to worker and app concurrency limits.
+Relay runs matching handlers sequentially for one message; separate messages may
+run concurrently, subject to worker and app concurrency limits. Handler output
+is available through Docker container logs.
 
 Delivery is **at least once**, not exactly once. A handler may run again after a
 crash, so handlers that cause side effects should be idempotent. Relay
@@ -184,14 +174,13 @@ body after Redis has delivered it; it does not limit Redis entry overhead. See
 ## Dead-letter queue
 
 Relay stores dead letters durably in PostgreSQL before acknowledging their
-source message. A row is written per exhausted invocation; malformed messages
-use a non-replayable placeholder. Rows remain unsettled until the source ACK is
-confirmed, and only settled rows can be removed or expired.
+source message. A row is written per exhausted invocation. Malformed and
+oversized messages cannot be replayed. Rows remain unsettled until the source
+ACK is confirmed, and only settled rows can be removed or expired.
 
-Inspection preserves the original Redis `value`. Replay uses the separately
-stored `replay_payload`, which is the exact logical handler input: normalized
-Debezium event, unchanged raw event, or schedule handler payload. Invalid and
-oversized messages have no replay payload. Replay is also at least once; keep
-handlers idempotent. See [CLI](cli.md#relay-dlq) for inspection, replay, and
+Inspection preserves the original Redis `value`. Replay uses the logical handler
+input: normalized Debezium event, unchanged raw event, or schedule handler
+payload. Replay is also at least once; keep handlers idempotent. See
+[CLI](cli.md#relay-dlq) for inspection, replay, and
 removal commands, and [Operations](operations.md#dlq-controls) for recovery
 guarantees.

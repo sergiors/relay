@@ -40,6 +40,13 @@ func TestExecuteContainerCreateVsRetire(t *testing.T) {
 	dels := 0
 	imageInspects := 0
 	m := newRetireManager(t,
+		// The real create path revalidates the provisioned control network
+		// immediately before create; the fixture serves it healthy.
+		dockerRoute{
+			method: http.MethodGet,
+			path:   "/networks/" + controlNetworkName("test-host"),
+			body:   defaultControlNetFixture(controlNetworkName("test-host"), "test-host", "172.30.0.0/16").json(t),
+		},
 		dockerRoute{
 			method: http.MethodPost, path: "/containers/create",
 			onRequest: func(req *http.Request) {
@@ -67,6 +74,8 @@ func TestExecuteContainerCreateVsRetire(t *testing.T) {
 		},
 		dockerRoute{method: http.MethodDelete, path: "/images/", body: "[]", onMatch: func() { dels++ }},
 	)
+	m.nodeID = "test-host"
+	m.controlNetwork = controlNetworkName(m.nodeID)
 
 	prepared := &Prepared{Name: "a", Image: image}
 	execDone := make(chan error, 1)

@@ -1,7 +1,8 @@
 //go:build integration
 
-// Env/secret injection and app-output forwarding integration tests,
-// including multiline secrets and a panicking output sink.
+// Env/secret injection integration tests, observed through the container's
+// native Docker logs (Relay never forwards app output), including multiline
+// secrets and the operational-log leak checks.
 package runtime
 
 import (
@@ -51,7 +52,6 @@ export function env(event, context) {
 `)
 	fn := app.App{Name: "env-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -67,7 +67,7 @@ export function env(event, context) {
 	if err := m.Execute(ctx, prepared, "index.env", event, []string{"GREETING=hello"}); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	logs := awaitAppOutput(t, ctx, out, "GREETING=hello")
+	logs := awaitAppLogsFor(t, ctx, m.cli, fn.Name, "GREETING=hello")
 	// template.yaml must NOT be in the image.
 	if strings.Contains(logs, "template.yaml") {
 		t.Errorf("template.yaml must not be baked into the image, got: %s", logs)
@@ -97,7 +97,6 @@ export function secret(event, context) {
 `)
 	fn := app.App{Name: "secret-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	m, _ := newManager(t)
-	out := newAppOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -113,14 +112,14 @@ export function secret(event, context) {
 	if err := m.Execute(ctx, prepared, "index.secret", event, []string{"TOKEN=v1"}); err != nil {
 		t.Fatalf("execute v1: %v", err)
 	}
-	awaitAppOutput(t, ctx, out, "TOKEN=v1")
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "TOKEN=v1")
 
 	// Rotate the value; the second execution sees v2 with NO rebuild (the
 	// prepared image and fingerprint are unchanged).
 	if err := m.Execute(ctx, prepared, "index.secret", event, []string{"TOKEN=v2"}); err != nil {
 		t.Fatalf("execute v2: %v", err)
 	}
-	awaitAppOutput(t, ctx, out, "TOKEN=v2")
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "TOKEN=v2")
 	if prepared.Fingerprint != fp1 {
 		t.Errorf("fingerprint changed across secret rotation: %s -> %s", fp1, prepared.Fingerprint)
 	}
@@ -137,7 +136,8 @@ export function secret(event, context) {
 // execution_env_integration_test.go.) The handler logs the value between clear
 // delimiters so exact matching is robust against surrounding output. The
 // manager's operational log buffer must never contain any fragment of the
-// value (handler stdout goes to the app-output sink, not the op log).
+// value (handler stdout lives in the container's native Docker logs, never
+// in the op log).
 func TestIntegrationMultilineSecretInjection(t *testing.T) {
 	testutil.RequireDocker(t)
 
@@ -161,7 +161,6 @@ export function secret(event, context) {
 `)
 	fn := app.App{Name: "multiline-secret-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 	m, logBuf := newManager(t)
-	out := newAppOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -177,21 +176,19 @@ export function secret(event, context) {
 	if err := m.Execute(ctx, prepared, "index.secret", event, []string{"PRIVATE_KEY=" + pemValue}); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	// The handler writes one logical line, "PK<begin>" + value + "<end>", which
-	// the streamForwarder splits on internal '\n'. Reconstruct the payload by
-	// stripping whatever per-line forwarding prefix each segment carries and
-	// joining the segments with '\n'; the assertion is on the VALUE's exact
-	// bytes, not on the incidental prefix wording. Every segment of the fixture
+	// The handler writes one logical line, "PK<begin>" + value + "<end>",
+	// whose internal newlines become consecutive native log lines with no
+	// Relay-added prefix: the assertion is on the VALUE's exact bytes as
+	// observed in the container's Docker logs. Every segment of the fixture
 	// must arrive, in order, including the blank line.
-	awaitAppOutput(t, ctx, out, "<end>")
+	gotStdout, _ := awaitAppStreamsFor(t, ctx, m.cli, fn.Name, "<end>")
 	expected := "PK<begin>" + pemValue + "<end>"
-	got := stripForwardingPrefix(out.String())
-	if !strings.Contains(got, expected) {
-		t.Errorf("handler output missing the exact multiline value;\nexpected:\n%q\n\ngot:\n%q", expected, got)
+	if !strings.Contains(gotStdout, expected) {
+		t.Errorf("handler output missing the exact multiline value;\nexpected:\n%q\n\ngot:\n%q", expected, gotStdout)
 	}
 	// The secret-value contract: the value (or any distinctive fragment of it)
-	// must never appear in Relay operational logs — handler stdout goes to the
-	// app-output sink, not the op log.
+	// must never appear in Relay operational logs — handler stdout lives in the
+	// container's native logs, never in the op log.
 	ops := logBuf.String()
 	if strings.Contains(ops, "BEGIN PRIVATE KEY") || strings.Contains(ops, "MIIB") {
 		t.Errorf("operational log leaked a secret fragment:\n%s", ops)
@@ -231,7 +228,6 @@ export function secret(event, context) {
 `)
 			fn := app.App{Name: tc.name, Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
 			m, _ := newManager(t)
-			out := newAppOutputSink(t)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
 			prepared, err := m.Prepare(ctx, fn)
@@ -242,29 +238,29 @@ export function secret(event, context) {
 			if err := m.Execute(ctx, prepared, "index.secret", event, []string{"TOKEN=shared-value"}); err != nil {
 				t.Fatalf("execute: %v", err)
 			}
-			awaitAppOutput(t, ctx, out, "TOKEN=shared-value")
+			_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "TOKEN=shared-value")
 		})
 	}
 }
 
 // TestIntegrationAppOutputIgnoresLogLevel drives a Node handler that prints
 // to both stdout and stderr (multi-line) while Relay's own logger is wired to
-// DISCARD at ERROR level. Since app output is forwarded as a raw transport
-// — NOT routed through slog — the stdout lines, the stderr line, and the
-// app/handler prefix must all still appear in the app-output sink even
-// though every Relay log line is discarded at ERROR.
+// DISCARD at ERROR level. App output is the container's native Docker logs —
+// never routed through slog or any Relay-side forwarding — so the stdout
+// lines and the stderr line must still appear there even though every Relay
+// operational log line is discarded at ERROR.
 func TestIntegrationAppOutputIgnoresLogLevel(t *testing.T) {
 	testutil.RequireDocker(t)
 
-	// Relay-operational logger discards everything below ERROR, so no handler
-	// output can possibly flow through it (forwarding must be independent).
+	// Relay-operational logger discards everything below ERROR; handler output
+	// must be unaffected because it lives in the container's native Docker logs
+	// and never flows through the operational logger.
 	opLogger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	m, err := newCoordinatedRealManager(t, opLogger, nil)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
 	defer m.Close()
-	out := newAppOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -282,9 +278,9 @@ export async function emit(event, context) {
   console.log("out-first");
   console.log("out-second");
   console.error("err-line");
-  // The invocation response can arrive before Relay's separate attach reader
-  // forwards app output. Empty writes queue callbacks behind each stream's
-  // console writes, so the handler does not resolve until both are flushed.
+  // The invocation response can arrive before the daemon's log stream carries
+  // the output. Empty writes queue callbacks behind each stream's console
+  // writes, so the handler does not resolve until both are flushed.
   await Promise.all([
     new Promise((resolve, reject) => process.stdout.write("", err => err ? reject(err) : resolve())),
     new Promise((resolve, reject) => process.stderr.write("", err => err ? reject(err) : resolve())),
@@ -301,64 +297,13 @@ export async function emit(event, context) {
 		t.Fatalf("execute: %v", err)
 	}
 
-	awaitAppOutput(t, ctx, out,
-		"[loglevel-e2e/index.emit] stdout: out-first",
-		"[loglevel-e2e/index.emit] stdout: out-second",
-		"[loglevel-e2e/index.emit] stderr: err-line",
+	stdout, stderr := awaitAppStreamsFor(t, ctx, m.cli, fn.Name,
+		"out-first", "out-second", "err-line",
 	)
-}
-
-// TestIntegrationPanickingSinkDoesNotBreakInvocation drives a reused execution
-// container with an app-output sink whose Writer panics while forwarding
-// handler output. Since forwarding is a best-effort transport, the panic must
-// be swallowed: the invocation succeeds, the panic must not leak out of the
-// process, and the container stays healthy for reuse (Close removes it).
-func TestIntegrationPanickingSinkDoesNotBreakInvocation(t *testing.T) {
-	testutil.RequireDocker(t)
-	m, _ := newManager(t)
-	prev := SetAppOutput(panicWriter{})
-	defer SetAppOutput(prev)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	dir := t.TempDir()
-	writeFile(t, dir, "template.yaml", `
-runtime: nodejs24.x
-events:
-  - handler: index.paniclog
-    pattern:
-      event_name: [INSERT]
-`)
-	writeFile(t, dir, "index.js", `
-export function paniclog(event, context) {
-  console.log("output before panic");
-}
-`)
-	fn := app.App{Name: "paniclog-e2e", Dir: dir, Template: &app.Template{Runtime: "nodejs24.x"}}
-	prepared, err := m.Prepare(ctx, fn)
-	if err != nil {
-		t.Fatalf("prepare: %v", err)
+	if !strings.Contains(stdout, "out-first") || !strings.Contains(stdout, "out-second") {
+		t.Errorf("stdout stream must carry the handler prints, got: %q", stdout)
 	}
-
-	panicked := make(chan any, 1)
-	done := make(chan error, 1)
-	go func() {
-		defer func() { panicked <- recover() }()
-		done <- m.Execute(ctx, prepared, "index.paniclog", []byte(`{"event_name":"INSERT"}`), nil)
-	}()
-	select {
-	case pv := <-panicked:
-		if pv != nil {
-			t.Fatalf("sink panic leaked out of Execute: %v", pv)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("Execute did not return")
-	}
-	if err := <-done; err != nil {
-		t.Fatalf("Execute returned error despite swallowed sink panic: %v", err)
-	}
-	// The container stays healthy for reuse; Close discards it.
-	if waitForContainerByLabel(ctx, m.cli, labelApp, "paniclog-e2e") == "" {
-		t.Error("healthy container should survive a panicking sink for reuse")
+	if !strings.Contains(stderr, "err-line") {
+		t.Errorf("console.error must arrive on the native stderr stream, got: %q", stderr)
 	}
 }

@@ -9,10 +9,11 @@
 // app is loaded or fingerprinted, and before the runtime socket, services,
 // sweeps, preparation, listener starts, background loops, scheduler, and
 // reconciler. The fixed preflight order is: Redis stream/consumer-group
-// readiness, then Docker runtime-manager readiness, then verification of the
-// configured NETWORKS set, then the runtime manager's own background
-// maintenance loop is started. A failure at any step short-circuits every later
-// phase; a lifecycle cancellation during the preflight is a graceful shutdown.
+// readiness, Docker runtime-manager readiness, control-network provisioning
+// and self-attachment, verification of the configured NETWORKS set, then the
+// runtime manager's own background maintenance loop is started. A failure at
+// any step short-circuits every later phase; a lifecycle cancellation during
+// the preflight is a graceful shutdown.
 //
 // Immediately after the state database is opened (and before the preflight) the
 // worker starts an ownership monitor that re-verifies that lock on its pinned
@@ -231,9 +232,20 @@ type preflightDeps struct {
 	// OpenManager establishes Docker readiness and returns the runtime manager
 	// every later phase uses. The implementation registers the manager's
 	// deferred shutdown before returning, and opens it with deferred
-	// maintenance so no manager background loop runs before VerifyNetworks.
+	// maintenance so no manager background loop runs before the control network
+	// and configured NETWORKS are ready.
 	OpenManager func(ctx context.Context) (*runtime.Manager, error)
-	// VerifyNetworks verifies the configured NETWORKS set against the manager.
+	// EnsureControlNetwork provisions, discovers, validates, and (for a
+	// containerized Relay) attaches this node's persistent internal control
+	// network. It runs after NODE_ID ownership is held and AFTER the manager is
+	// opened, but BEFORE any background loop, app preparation, readiness, or
+	// event consumption. A conflict, an unsafe configuration, or an
+	// unverifiable self route fails startup closed.
+	EnsureControlNetwork func(ctx context.Context, manager *runtime.Manager) error
+	// VerifyNetworks verifies the configured NETWORKS set against the manager:
+	// each network must exist and satisfy the workload-safe policy every create
+	// applies. The internal control network is managed separately and is never
+	// passed here.
 	VerifyNetworks func(ctx context.Context, manager *runtime.Manager) error
 	// StartMaintenance starts the runtime manager's deferred background
 	// maintenance loop. It is the LAST preflight step, reached only after
@@ -246,21 +258,22 @@ type preflightDeps struct {
 
 // runExternalPreflight runs the worker's external-dependency preflight in the
 // fixed order Redis stream/group readiness -> Docker runtime-manager readiness
-// -> configured NETWORKS verification -> manager maintenance start. It runs
-// after the required state database is opened, and BEFORE any app is loaded or
-// fingerprinted and before the runtime socket, services, sweeps, preparation,
-// listener starts, background loops, scheduler, and reconciler are touched. A
-// failure at any step short-circuits every later step and is returned so Run
-// unwinds through its deferred shutdown;
-// a failure that only reflects the lifecycle being cancelled is classified as
-// errStartupInterrupted for a graceful nil return, and a genuine failure is
-// wrapped with its step's context.
+// -> control-network provisioning -> configured NETWORKS verification ->
+// manager maintenance start. It runs after the required state database is
+// opened, and BEFORE any app is loaded or fingerprinted and before the runtime
+// socket, services, sweeps, preparation, listener starts, background loops,
+// scheduler, and reconciler are touched. A failure at any step short-circuits
+// every later step and is returned so Run unwinds through its deferred
+// shutdown; a failure that only reflects the lifecycle being cancelled is
+// classified as errStartupInterrupted for a graceful nil return, and a genuine
+// failure is wrapped with its step's context.
 //
 // The manager is opened with deferred maintenance, and its single background
-// maintenance loop is started only as the final step — after NETWORKS
-// verification succeeds — so no manager loop runs while a prerequisite is still
-// unproven. If verification fails, no loop was ever started and Run's deferred
-// shutdown still closes the manager (and its Docker client) cleanly.
+// maintenance loop is started only as the final step — after the control
+// network and NETWORKS verification succeed — so no manager loop runs while a
+// prerequisite is still unproven. If a step fails, no loop was ever started and
+// Run's deferred shutdown still closes the manager (and its Docker client)
+// cleanly.
 //
 // The context argument is the startup trace root (a child of the worker
 // lifecycle), so each step's span is parented correctly, and a cancellation of
@@ -305,6 +318,24 @@ func runExternalPreflight(
 	}
 	managerSpan.End()
 
+	// Provision/discover this node's persistent control network and, when Relay
+	// itself is a container, attach it before any workload exists. A conflicting
+	// network, an unverifiable self route, or a failed attach is fatal startup.
+	if deps.EnsureControlNetwork != nil {
+		_, controlSpan := tracing.Start(ctx, "network.control")
+		if err := deps.EnsureControlNetwork(ctx, manager); err != nil {
+			controlSpan.RecordError(err)
+			controlSpan.SetStatus(codes.Error, err.Error())
+			controlSpan.End()
+			if startupInterrupted(ctx, err) {
+				logger.Info("Startup: control network provisioning interrupted by shutdown", "error", err)
+				return nil, errStartupInterrupted
+			}
+			return nil, err
+		}
+		controlSpan.End()
+	}
+
 	_, networkSpan := tracing.Start(ctx, "network.verify")
 	if err := deps.VerifyNetworks(ctx, manager); err != nil {
 		networkSpan.RecordError(err)
@@ -321,10 +352,11 @@ func runExternalPreflight(
 	networkSpan.End()
 
 	// Last: start the manager's deferred maintenance loop. It is deliberately
-	// after NETWORKS verification so no manager background loop ran while the
-	// preflight's prerequisites were still unproven; only now, when every
-	// external dependency is ready, does the warm-container eviction ticker
-	// begin. The step is infallible and idempotent.
+	// after control-network provisioning and NETWORKS verification so no
+	// manager background loop ran while the preflight's prerequisites were still
+	// unproven; only now, when every external dependency is ready, does the
+	// warm-container eviction ticker begin. The step is infallible and
+	// idempotent.
 	if deps.StartMaintenance != nil {
 		deps.StartMaintenance(manager)
 	}
@@ -468,9 +500,10 @@ func Run(logger *slog.Logger) (runErr error) {
 	}
 	logger.Debug("Startup: runtime image selections loaded", "count", len(runtimeSelections))
 
-	// Fixed external-dependency order: Redis/group, Docker manager, NETWORKS,
-	// then the manager's deferred maintenance loop. Any failure short-circuits
-	// every later phase; a cancellation here is a graceful shutdown.
+	// Fixed external-dependency order: Redis/group, Docker manager, this node's
+	// control network, NETWORKS, then the manager's deferred maintenance loop.
+	// Any failure short-circuits every later phase; a cancellation here is a
+	// graceful shutdown.
 	manager, err := runExternalPreflight(startupCtx, logger, preflightDeps{
 		EnsureGroup: func(ctx context.Context) error {
 			return stream.EnsureGroup(ctx, client, cfg.RedisStream, cfg.RedisGroup)
@@ -480,13 +513,21 @@ func Run(logger *slog.Logger) (runErr error) {
 		OpenManager: func(_ context.Context) (*runtime.Manager, error) {
 			return openRuntimeManager(ctx, logger, metricsInstance, cfg, st, runtimeSelections, shutdown)
 		},
+		// The control network is created/reused and (when Relay is a container)
+		// self-attached before any app is prepared or any execution container
+		// exists. Relay owns this network; it is not the operator NETWORKS set.
+		EnsureControlNetwork: func(ctx context.Context, m *runtime.Manager) error {
+			return ensureNodeControlNetwork(ctx, m)
+		},
 		VerifyNetworks: func(ctx context.Context, m *runtime.Manager) error {
-			// Relay never creates networks, so a missing one must fail startup
-			// before any container exists. Unset NETWORKS skips the check.
+			// NETWORKS is optional application connectivity, verified
+			// separately from the internal control network: existence plus the
+			// same workload-safe policy as creates. Any failure must stop
+			// startup before a container exists.
 			return verifyConfiguredNetworks(ctx, m, cfg.Networks)
 		},
-		// Last: start the deferred warm-container eviction loop only after
-		// NETWORKS succeeds. Infallible and idempotent.
+		// Last: start the deferred warm-container eviction loop only after the
+		// control network and NETWORKS succeed. Infallible and idempotent.
 		StartMaintenance: func(m *runtime.Manager) {
 			m.StartMaintenance()
 		},

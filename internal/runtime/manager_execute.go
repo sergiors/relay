@@ -20,17 +20,17 @@ import (
 // limits is the app's effective per-container resource configuration, and
 // meta is the creation-time identity RunMeta stamped as labels (per-invocation
 // fields left empty — labels are immutable while the container outlives
-// invocations). Every container joins the worker-global network set
-// (WithNetworks).
+// invocations). Every container joins the internal control network plus the
+// optional worker-global NETWORKS set (WithNetworks).
 //
-// The create+attach+start window is one admitted Manager-owned Docker operation:
-// create and its cleanup-on-failure happen inside the tracked op, and if the
-// manager begins closing while the create is in flight the fresh container is
-// torn down inside the op before it is released, so a create can never hand a
-// container to a closing manager and the client is never closed under a
-// still-live create. The returned container also carries the manager shutdown
-// context as its lifecycle, so its detached exit wait and self-initiated
-// teardown observe Manager close instead of running detached.
+// The create+start+connect window is one admitted Manager-owned Docker
+// operation: create and its cleanup-on-failure happen inside the tracked op, and
+// if the manager begins closing while the create is in flight the fresh
+// container is torn down inside the op before it is released, so a create can
+// never hand a container to a closing manager and the client is never closed
+// under a still-live create. The returned container also carries the manager
+// shutdown context as its lifecycle, so its detached exit wait and
+// self-initiated teardown observe Manager close instead of running detached.
 func (m *Manager) startContainer(
 	ctx context.Context,
 	fnName string,
@@ -105,6 +105,18 @@ func (m *Manager) createExecutionContainer(
 			workDir, sourceRoot, mounts...,
 		)
 	}
+	// The execution channel uses the internal control network, never an
+	// operator application network. An unprovisioned control network fails the
+	// create, and the network is revalidated immediately before create so a
+	// deletion or alteration while Relay is running fails closed rather than
+	// producing an unreachable container.
+	if err := m.validateControlForExecution(ctx); err != nil {
+		return nil, fmt.Errorf("docker run: %w", err)
+	}
+	networks, err := m.executionNetworks()
+	if err != nil {
+		return nil, fmt.Errorf("docker run: %w", err)
+	}
 	return startExecutionContainer(
 		ctx, ops, cli, log, fn, image, env, networks, limits, meta,
 		workDir, sourceRoot, mounts...,
@@ -120,7 +132,11 @@ func (m *Manager) createExecutionContainer(
 // behavior.
 func (m *Manager) containerOps() containerOps {
 	gate := m.opsCoord()
-	return containerOps{lifecycle: gate.context(), gate: gate}
+	return containerOps{
+		lifecycle:      gate.context(),
+		gate:           gate,
+		controlNetwork: m.controlNetwork,
+	}
 }
 
 // Execute runs the given handler invocation against a REUSED execution
@@ -129,9 +145,10 @@ func (m *Manager) containerOps() containerOps {
 // execution_container.go). The first invocation for an app starts a
 // container (stamping its creation-time identity labels from the RunMeta in
 // ctx); concurrent invocations of the same app lease distinct containers,
-// and each container serves one invocation at a time over the line-JSON
-// invocation protocol until it is discarded (timeout, process exit, protocol
-// error, image change). A handler failure (ok:false) does NOT discard it.
+// and each container serves one invocation at a time over the persistent
+// framed execution-channel protocol until it is discarded (timeout, process
+// exit, transport loss, protocol error, image change). A handler failure
+// (ok:false) does NOT discard it.
 //
 // The pool's bound is Prepared.Concurrency (the effective value, already
 // clipped to MAX_CONCURRENT_INVOCATIONS by Prepare and re-clipped here), the same value
@@ -250,10 +267,12 @@ func (m *Manager) Execute(
 	// degrades to the reference identity, never failing the invocation.
 	img := m.resolveImageIdentity(ctx, prepared.Image, prepared.Fingerprint)
 	start := func() (reusableContainer, error) {
-		// Every execution container joins the worker-global network set
-		// (WithNetworks), which the worker has already verified exists at
-		// startup. A network that disappears between verification and create
-		// surfaces as a create error here; Relay never creates networks.
+		// Every execution container joins the managed control network plus the
+		// optional worker-global NETWORKS set (WithNetworks), which the worker
+		// has already verified exists at startup. An operator network that
+		// disappears between verification and create surfaces as a create error
+		// here; Relay never creates operator networks (its own control network is
+		// provisioned during startup preflight).
 		return m.startContainer(ctx, prepared.Name, img, prepared.Env, limits, idMeta)
 	}
 	// Prepared.Concurrency is populated by Prepare as the effective bound

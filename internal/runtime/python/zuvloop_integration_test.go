@@ -3,14 +3,13 @@
 package python
 
 import (
-	"bufio"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The zuvloop bootstrap-variant tests run the REAL embedded bootstrap as a live
@@ -71,40 +70,12 @@ func writeZuvloopStub(t *testing.T, dir, source string) {
 }
 
 // startBootstrapContent runs the given bootstrap content in dir as a live
-// process with the same child environment seeding as startBootstrap.
+// process with the same child environment and reserved-loopback channel as
+// startBootstrap (see bootstrap_integration_test.go for the harness
+// conventions), completing one authenticated channel before returning.
 func startBootstrapContent(t *testing.T, dir string, content []byte) *pyProc {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(dir, "bootstrap.py"), content, 0o644); err != nil {
-		t.Fatalf("write bootstrap: %v", err)
-	}
-	cmd := exec.Command("python3", filepath.Join(dir, "bootstrap.py"))
-	cmd.Env = append(os.Environ(),
-		"PYTHONPATH="+dir,
-		"RELAY_TEST_BASELINE=process-baseline",
-		"RELAY_TEST_SYSTEM=system-value",
-	)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		t.Fatalf("stdin pipe: %v", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatalf("stdout pipe: %v", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		t.Fatalf("stderr pipe: %v", err)
-	}
-	p := &pyProc{cmd: cmd, stdin: stdin, stdout: bufio.NewReader(stdout)}
-	go func() { _, _ = io.Copy(p.stderrWriter(), stderr) }()
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start bootstrap: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = stdin.Close()
-		_ = cmd.Wait()
-	})
-	return p
+	return startEmbeddedBootstrap(t, dir, content, nil)
 }
 
 // startZuvloopBootstrap writes the engine's ENABLED bootstrap variant (what the
@@ -256,7 +227,14 @@ func TestPythonZuvloopEnabledFactoryFailureFailsStartup(t *testing.T) {
 		t.Fatalf("write bootstrap: %v", err)
 	}
 	cmd := exec.Command("python3", filepath.Join(dir, "bootstrap.py"))
-	cmd.Env = append(os.Environ(), "PYTHONPATH="+dir)
+	cmd.Env = append(os.Environ(),
+		"PYTHONPATH="+dir,
+		// Valid Relay channel configuration so startup reaches the loop
+		// factory: the factory's own failure must be what kills the process,
+		// not the config guard.
+		"RELAY_EXECUTION_PORT=7001",
+		"RELAY_EXECUTION_SECRET="+strings.Repeat("a", 64),
+	)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("an enabled image whose loop factory fails must fail startup, output:\n%s", out)
@@ -309,10 +287,10 @@ async def async_probe(event, context):
 	}
 }
 
-// TestPythonZuvloopEnabledEOFExitsZero pins the protocol lifecycle of the
-// enabled image: after Relay is done (stdin EOF) the container exits 0 cleanly,
-// exactly like the standard image.
-func TestPythonZuvloopEnabledEOFExitsZero(t *testing.T) {
+// TestPythonZuvloopEnabledChannelCloseExitsZero pins the channel lifecycle of
+// the enabled image: after Relay is done with its authenticated connection the
+// container exits 0 cleanly, exactly like the standard image.
+func TestPythonZuvloopEnabledChannelCloseExitsZero(t *testing.T) {
 	requireLoopFactoryPython(t)
 	dir := t.TempDir()
 	writeOtelStub(t, dir)
@@ -323,11 +301,10 @@ func TestPythonZuvloopEnabledEOFExitsZero(t *testing.T) {
 	if !r.OK {
 		t.Fatalf("invoke failed: %s", r.Err)
 	}
-	if err := p.stdin.Close(); err != nil {
-		t.Fatalf("close stdin: %v", err)
+	if err := p.closeChannel(); err != nil {
+		t.Fatalf("close channel: %v", err)
 	}
-	err := p.cmd.Wait()
-	if err != nil {
-		t.Fatalf("enabled bootstrap did not exit 0 on stdin EOF: %v; stderr:\n%s", err, p.stderrString())
+	if err := p.waitExit(t, 10*time.Second); err != nil {
+		t.Fatalf("enabled bootstrap did not exit 0 on channel close: %v; stderr:\n%s", err, p.stderrString())
 	}
 }

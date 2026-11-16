@@ -12,10 +12,9 @@ This guide covers the repository's production Compose deployment. See
   provisioned by `compose.prod.yaml`.
 - The production Compose file's required environment and supporting files (see
   [Configuration](#configuration)).
-- Compose creates its declared `relay` and `traefik` networks. Any additional
-  network named in `NETWORKS` must exist before
-  startup; Relay does not create networks, and a missing configured network is
-  fatal at worker startup.
+- Any network named in `NETWORKS` must exist before startup; Relay does not
+  create workload networks. See [Configuration](configuration.md) for networking
+  behavior.
 
 ## Configuration
 
@@ -37,14 +36,19 @@ development credentials or an untested Relay image.
 
 `NODE_ID` must be unique among concurrent nodes, stable across restarts,
 and at most 128 characters using only ASCII letters, digits, `.`, `_`, and `-`.
-The Compose file mounts the host Docker socket read-only into Relay, sets
-`NETWORKS=relay,traefik`, and configures Relay's Traefik network, HTTPS
-entrypoint, and certificate resolver. Compose creates its declared networks;
-Relay verifies the configured workload networks exist and fails startup if one
-is missing. The read-only mount does not restrict Docker API operations; a
-compromised Relay process can use the daemon's full authority, often equivalent
-to host root. Workload-container hardening is not protection against a
-compromised Relay process. Consult [configuration](configuration.md) before
+
+The production Compose file mounts the host Docker socket read-only into Relay,
+sets `NETWORKS=relay,traefik` for optional app connectivity, and configures
+Relay's Traefik network, HTTPS entrypoint, and certificate resolver. Routed
+services additionally use `TRAEFIK_NETWORK`. See
+[Configuration](configuration.md) and [Services](services.md).
+
+If using a Docker socket proxy, allow Relay's required Docker network
+management and container create, inspect, and removal operations. The read-only
+socket mount does not restrict Docker API operations; a compromised Relay
+process can use the daemon's full authority, often equivalent to host root.
+Workload-container hardening is not protection against a compromised Relay
+process. Consult [configuration](configuration.md) before
 changing the networks.
 
 ### Infisical provider
@@ -261,7 +265,7 @@ requirements; do not remove volumes as part of routine updates. See
 - If the Relay container does not become healthy, check its logs and verify
   `NODE_ID`, Docker Engine access, and Redis/PostgreSQL connectivity.
 - If the worker fails at startup, verify every network configured in
-  `NETWORKS` exists; a missing network is fatal.
+  `NETWORKS` exists and that Relay can access Docker Engine.
 - If apps are missing or stale, check `relay git status` and run `relay git sync`
   after confirming the configured source and path.
 - If application commands cannot read status, verify PostgreSQL availability;

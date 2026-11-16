@@ -20,27 +20,26 @@ Run `relay <command> --help` for flags. `relay apps` is an alias for
 
 ## Command requirements
 
-| Command                              | Requirements                                    |
-| ------------------------------------ | ----------------------------------------------- |
-| `start`                              | Redis, PostgreSQL, Docker, configured networks  |
-| `health`, `app invoke`, `dlq replay` | Running worker                                  |
-| `stats`, `app ls`                    | PostgreSQL (`DATABASE_URL`)                     |
-| `app inspect`                        | PostgreSQL; Docker optional for provenance      |
-| `runtime ls`, `runtime inspect`      | PostgreSQL (`DATABASE_URL`)                     |
-| `runtime check`, `runtime update`    | PostgreSQL and Docker Engine (Distribution API) |
-| `dlq ls`, `dlq inspect`, `dlq rm`    | PostgreSQL (`DATABASE_URL`)                     |
-| `secret ls`                          | Active secret provider and its configuration    |
-| `secret set`, `secret rm`            | Local provider only                             |
-| `git *`                              | Local Git configuration and `/apps`             |
+| Command                              | Requirements                                   |
+| ------------------------------------ | ---------------------------------------------- |
+| `start`                              | Redis, PostgreSQL, Docker, configured networks |
+| `health`, `app invoke`, `dlq replay` | Running worker                                 |
+| `stats`, `app ls`                    | PostgreSQL (`DATABASE_URL`)                    |
+| `app inspect`                        | PostgreSQL; Docker optional for provenance     |
+| `runtime ls`, `runtime inspect`      | PostgreSQL (`DATABASE_URL`)                    |
+| `runtime check`, `runtime update`    | PostgreSQL, Docker Engine, and registry access |
+| `dlq ls`, `dlq inspect`, `dlq rm`    | PostgreSQL (`DATABASE_URL`)                    |
+| `secret ls`                          | Active secret provider and its configuration   |
+| `secret set`, `secret rm`            | Local provider only                            |
+| `git *`                              | Local Git configuration and `/apps`            |
 
-`health` and `app invoke` communicate with the worker over its local control
-socket. `relay dlq` commands access PostgreSQL; replay also requires the worker.
+`health`, `app invoke`, and DLQ replay require a running worker. DLQ commands
+also access PostgreSQL.
 
 ## relay start
 
-Runs the worker until SIGINT or SIGTERM. It fails if another worker holds the
-process lock or if required configuration, Redis, PostgreSQL, Docker, or a
-configured network is unavailable.
+Runs the worker until SIGINT or SIGTERM. It fails if required configuration,
+Redis, PostgreSQL, Docker, or a configured network is unavailable.
 
 ## relay health
 
@@ -78,53 +77,23 @@ relay runtime update python3.14
 relay runtime update --all
 ```
 
-Managed runtimes build from their configured base tag unless the operator pins
-that tag to a registry digest. `ls` and `inspect` read only PostgreSQL; they
-never contact Docker or a registry. `check` reads PostgreSQL and resolves the
-current registry digest through the Docker Engine Distribution API without
-writing anything, pulling, building, or restarting. `update` resolves the
-runtime's exact configured base tag through the same API and persists the
-multi-platform index digest.
+`ls` and `inspect` show the local runtime image selection without contacting a
+registry. `check` compares the saved selection with the current image and makes
+no changes. `update` pins the runtime's configured base image to its current
+multi-platform registry digest; it does not pull or build an image. `check`
+without a runtime checks all supported runtimes; `update --all` updates them.
+Both continue after individual failures and report unsuccessful results.
 
-- `ls` lists every runtime this Relay binary supports, its configured base
-  image, whether the runtime is `pinned`, `unpinned`, or `invalid`, the
-  selection generation and time, and the persisted digest.
-- `inspect` shows one runtime's engine, base image, target build platform,
-  source image, digest, generation, selection time, and effective image
-  reference (`base@digest` when pinned, the base tag when unpinned). A runtime
-  with no row is reported as unpinned.
-- `check` validates the persisted binding and compares it with the current
-  registry digest. It displays the selected digest (or `unpinned`), the remote
-  digest, and a status: `matching`, `different`, `available` (no selection and
-  the remote digest is available), `unpinned` (no selection and the registry
-  could not be checked), `invalid` (a stored row a worker would reject), or
-  `failed` (a pinned runtime whose registry lookup failed). It continues across
-  every runtime in all-mode, shows per-runtime registry errors, and exits
-  non-zero if any runtime failed. It never writes PostgreSQL.
-- `update RUNTIME` resolves only that runtime's configured base tag. It requires
-  an OCI image index or Docker manifest list and rejects a missing, unknown, or
-  platform-specific manifest. When the Engine reports platforms, the index must
-  cover more than one concrete platform. The command compare-and-swaps the
-  persisted row; if the current digest is already selected, its generation and
-  timestamp do not change. A concurrent change is reported as a conflict rather
-  than overwritten.
-- `update --all` processes every runtime independently, continues after
-  failures, and exits non-zero if any runtime failed. Both update forms report
-  the previous identity (`unpinned` or digest) and the newly resolved digest.
+Changing a selection is not an app deployment. Running workers use it during a
+later reconciliation and reprepare apps that use that runtime; apps continue
+using their current image until then. See
+[Operations](operations.md#managed-runtime-images).
 
-A persisted selection is not an application rollout. Running workers refresh
-the selection once per periodic reconciliation pass; only the runtime-backed
-apps using that runtime then reprepare. Neither `check` nor `update` pulls or
-builds an image, restarts the worker, restarts apps, or deploys anything. See
-[Operations](operations.md#runtime-image-selection-state).
-
-Both `check` and `update` use the Docker Engine API, so the Engine (or an
-externally managed socket proxy) must allow the Distribution endpoint. Registry
-credentials come from the Docker client configuration (`DOCKER_CONFIG` or
-`$HOME/.docker/config.json`), including `auths`, `identitytoken`, `credHelpers`,
-and `credsStore`. Public Docker Hub works anonymously. In a container, mount the
-Docker client configuration and set `DOCKER_CONFIG`; Relay does not read
-credentials from the daemon. Credential values are never printed.
+`check` and `update` require Docker Engine access and registry credentials. For
+private registries, make the Docker client configuration available to Relay;
+when it is not in the container user's default location, set `DOCKER_CONFIG`.
+A Docker socket proxy must permit registry image checks as well as Relay's
+container operations. Public Docker Hub images can be checked anonymously.
 
 ## relay app
 
@@ -175,9 +144,9 @@ replay uses the separately stored logical handler payload. A malformed or
 oversized message has no replay payload and cannot be replayed.
 
 `replay` requires a running worker and removes an entry only after successful
-execution. Failed replays leave it available. Replay is at least once, so a
-handler may run again if execution completes after a client disconnect or lease
-expiry. Keep handlers idempotent.
+execution. Failed replays leave it available. Replay is at least once: an
+uncertain result or client disconnect may occur after the handler ran. Keep
+handlers idempotent.
 
 `rm` removes only settled entries. An entry is settled after its source message
 is acknowledged; unsettled entries are retained for recovery. Entry IDs are the
