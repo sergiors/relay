@@ -2,7 +2,11 @@
 
 Relay is an event-driven serverless runtime for apps that combine functions,
 scheduled jobs, and persistent services. It runs on infrastructure you control
-and uses Redis Streams for external events.
+and uses Redis Streams[^1] for external events.
+
+[^1]:
+    Support for additional brokers is planned
+    ([#9](https://github.com/sergiors/relay/issues/9)).
 
 Functions execute handlers triggered by event patterns or schedules, with
 automatic retries and dead-letter queues for failed executions. Persistent
