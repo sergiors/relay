@@ -103,6 +103,19 @@ func (p *nodeProc) stdoutString() string {
 	return p.stdoutSince(0)
 }
 
+// stdoutWriter routes the copy goroutine's appends through stdoutMu — the
+// same lock every stdout accessor takes — so collecting output never races
+// test reads of the builder. The lock is taken per Write, not for the whole
+// copy, keeping reads unblocked while output streams in.
+type stdoutWriter struct{ p *nodeProc }
+
+func (w stdoutWriter) Write(b []byte) (int, error) {
+	w.p.stdoutMu.Lock()
+	defer w.p.stdoutMu.Unlock()
+	_, _ = w.p.stdout.Write(b)
+	return len(b), nil
+}
+
 // awaitStdoutQuiet waits until the child's stdout has stopped growing (stable
 // across a 30ms window) so an invocation's prints are observable right after
 // its result frame, bounded by 2s. The protocol arrives on the connection
@@ -400,7 +413,7 @@ func spawnNodeProcess(t *testing.T, bsPath string, args []string) *nodeProc {
 		exitDone: make(chan struct{}),
 	}
 	go func() {
-		_, _ = io.Copy(&p.stdout, stdout)
+		_, _ = io.Copy(stdoutWriter{p}, stdout)
 	}()
 	go func() {
 		_, _ = io.Copy(p, stderr)
