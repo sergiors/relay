@@ -48,10 +48,12 @@ export function interfaceContract(file, interfaceName) {
   });
 }
 
-// bootstrapContextMembers extracts the HandlerContext contract from Relay's
-// Node bootstrap source: the fields the constructor assigns on `this` and
-// the prototype methods, without importing or executing the bootstrap.
-export function bootstrapContextMembers(file) {
+// runtimeContextMembers extracts the HandlerContext contract from Relay's
+// runtime module source (the invocation module beside the bootstrap, which is
+// where the class lives since the bootstrap was split): the fields the
+// constructor assigns on `this` and the prototype methods, without importing
+// or executing the runtime source.
+export function runtimeContextMembers(file) {
   const source = readFileSync(file, "utf8");
   const start = source.indexOf("class HandlerContext {");
 

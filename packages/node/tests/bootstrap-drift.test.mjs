@@ -4,15 +4,19 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
-  bootstrapContextMembers,
+  runtimeContextMembers,
   interfaceContract,
 } from "./helpers/contract.mjs";
 
 const declarationPath = fileURLToPath(
   new URL("../dist/index.d.ts", import.meta.url),
 );
-const bootstrapPath = fileURLToPath(
-  new URL("../../../internal/runtime/node/bootstrap.mjs", import.meta.url),
+// The runtime module that owns the HandlerContext class: since the bootstrap
+// was split, the class lives in the invocation module imported beside
+// bootstrap.mjs (both ship under /relay), so the contract is pinned against
+// that module.
+const contextModulePath = fileURLToPath(
+  new URL("../../../internal/runtime/node/invocation.mjs", import.meta.url),
 );
 
 const expectedContract = [
@@ -35,10 +39,10 @@ const expectedContract = [
 
 test("the public HandlerContext matches Relay's bootstrap contract", () => {
   assert.ok(
-    existsSync(bootstrapPath),
-    `missing Relay bootstrap: ${bootstrapPath}`,
+    existsSync(contextModulePath),
+    `missing Relay runtime module: ${contextModulePath}`,
   );
-  const runtime = bootstrapContextMembers(bootstrapPath);
+  const runtime = runtimeContextMembers(contextModulePath);
   const declaration = interfaceContract(declarationPath, "HandlerContext");
 
   assert.deepEqual(declaration, expectedContract);
