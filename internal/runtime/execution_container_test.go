@@ -73,6 +73,29 @@ func (g *gatedCloseConn) Close() error {
 	return err
 }
 
+// heldWriteConn gates the exact request Write an Invoke issues: it signals the
+// observing conn's writeEntered BEFORE delegating here, then parks the Write
+// until the test closes release — without ever touching the pipe, so a discard
+// that closes the real connection cannot fail it. Releasing returns success,
+// so the invocation proceeds to its resolve select only after the test has
+// arranged the container state. The watchdog bounds only (like gatedCloseConn's):
+// it prevents a leaked parked goroutine when a failing test never releases; the
+// test's release signal is the ordering mechanism.
+type heldWriteConn struct {
+	net.Conn
+	release  chan struct{}
+	watchdog time.Duration
+}
+
+func (w *heldWriteConn) Write(b []byte) (int, error) {
+	select {
+	case <-w.release:
+		return len(b), nil
+	case <-time.After(w.watchdog):
+		return 0, errors.New("held write was never released")
+	}
+}
+
 // executionContainerHarness wires a real *executionContainer to a net.Pipe
 // stand-in for its long-lived control-channel connection and a scripted Docker
 // client for the kill/remove teardown. The pipe lets a test block the
@@ -94,6 +117,11 @@ type executionContainerHarness struct {
 	// closed by the test to let a parked Close proceed.
 	closeEntered <-chan struct{}
 	closeRelease chan struct{}
+
+	// Held-Write barrier (set only by the held-write harness): releaseWrite is
+	// closed by the test to let the parked request Write complete, so Invoke
+	// reaches its resolve select only after the test has arranged the state.
+	releaseWrite chan struct{}
 
 	// killSignal closes on the first scripted Docker kill, so a test can wait
 	// for a teardown's kill without polling the counter.
@@ -117,7 +145,7 @@ func newExecutionContainerHarness(t *testing.T) *executionContainerHarness {
 // accounted.
 func newExecutionContainerHarnessWithRemove(t *testing.T, removeStatus int) *executionContainerHarness {
 	t.Helper()
-	return buildExecutionContainerHarness(t, removeStatus, false)
+	return buildExecutionContainerHarness(t, removeStatus, false, false)
 }
 
 // newGatedExecutionContainerHarness is newExecutionContainerHarness with the
@@ -125,10 +153,20 @@ func newExecutionContainerHarnessWithRemove(t *testing.T, removeStatus int) *exe
 // cancellation-vs-monitor discard-race regression.
 func newGatedExecutionContainerHarness(t *testing.T) *executionContainerHarness {
 	t.Helper()
-	return buildExecutionContainerHarness(t, 0, true)
+	return buildExecutionContainerHarness(t, 0, true, false)
 }
 
-func buildExecutionContainerHarness(t *testing.T, removeStatus int, gatedClose bool) *executionContainerHarness {
+// newHeldWriteExecutionContainerHarness is newExecutionContainerHarness with
+// the request Write gated behind the releaseWrite barrier: the invocation
+// registers its pending state and enters the Write, then parks there until the
+// test releases it, so a test can deterministically arrange monitor/discard
+// state BEFORE Invoke reaches its resolve select.
+func newHeldWriteExecutionContainerHarness(t *testing.T) *executionContainerHarness {
+	t.Helper()
+	return buildExecutionContainerHarness(t, 0, false, true)
+}
+
+func buildExecutionContainerHarness(t *testing.T, removeStatus int, gatedClose, holdWrites bool) *executionContainerHarness {
 	t.Helper()
 	clientEnd, peerEnd := net.Pipe()
 	conn := &observingConn{Conn: clientEnd, writeEntered: make(chan struct{})}
@@ -136,6 +174,18 @@ func buildExecutionContainerHarness(t *testing.T, removeStatus int, gatedClose b
 		peer:         peerEnd,
 		writeEntered: conn.writeEntered,
 		killSignal:   make(chan struct{}),
+	}
+	if holdWrites {
+		held := &heldWriteConn{
+			Conn:     clientEnd,
+			release:  make(chan struct{}),
+			watchdog: execChannelWatchdog,
+		}
+		// The observing conn stays outside so its writeEntered barrier fires
+		// before the held conn parks the Write. The chain is built before the
+		// reader starts, so the reader never observes a racy conn swap.
+		conn.Conn = held
+		h.releaseWrite = held.release
 	}
 
 	rmBody := "{}"
@@ -768,6 +818,79 @@ func TestExecutionContainerResultIDViolationDiscardsPromptly(t *testing.T) {
 	if got := h.c.discardReason(); got != "protocol_error" {
 		t.Errorf("discard reason = %q, want protocol_error", got)
 	}
+	waitReaderExit(t, h)
+}
+
+// TestExecutionContainerClosedOutcomeSurfacesBufferedFailure pins the resolve
+// race behind a correlation violation: onDeath queues the failure BEFORE the
+// discard closes c.closed, so when Invoke reaches its resolve select both the
+// failure branch and the closed branch can be ready at once, and Go's select
+// may commit to either. Whichever it picks, the invocation must surface the
+// buffered correlation cause — never the generic "container discarded" text —
+// while the discard reason stays protocol_error.
+//
+// Given an in-flight invocation parked in the request write (pending
+// registered, select unreachable), when a mismatched result id is delivered
+// and its full discard completes, then releasing the write resolves the
+// invocation with the correlation violation, promptly, with the container
+// dead, reason protocol_error, one kill/remove each, and the reader joined.
+//
+// The ordering is by channel barriers, never by timing: writeEntered proves
+// Invoke entered the held Write; waitDiscardComplete proves the conn close and
+// the reader join (so the earlier-queued failure is buffered and c.closed is
+// closed) before releaseWrite lets Invoke proceed. The watchdogs bound only.
+func TestExecutionContainerClosedOutcomeSurfacesBufferedFailure(t *testing.T) {
+	h := newHeldWriteExecutionContainerHarness(t)
+	h.startMonitor()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- h.c.Invoke(ctx, "index.run", []byte(`{}`), nil)
+	}()
+
+	// Barrier: the observing conn reports the instant Invoke reaches the
+	// request Write. setPending has already run, the held conn keeps the Write
+	// from completing, and Invoke cannot reach its resolve select yet.
+	select {
+	case <-h.writeEntered:
+	case <-time.After(execChannelWatchdog):
+		t.Fatal("timed out waiting for Invoke to enter the request write")
+	}
+
+	// The real protocol violation: the reader rejects the wrong-id result and
+	// signals the monitor, which queues the failure against the pending
+	// invocation and runs the full discard. The reader direction of the pipe
+	// is untouched by the held Write.
+	writeResult(t, h.peer, invokeResponse{Type: frameTypeResult, ID: "wrong-id", OK: true})
+
+	// Barrier: removalDone closes after the conn close and the reader join, so
+	// the failure queued BEFORE the discard is buffered on c.fail and
+	// c.closed is closed — both select branches ready, arranged deterministically
+	// before Invoke may select.
+	h.waitDiscardComplete(t)
+
+	close(h.releaseWrite)
+
+	start := time.Now()
+	err := waitInvoke(t, done)
+	if err == nil {
+		t.Fatal("a mismatched result id must never report success")
+	}
+	if !strings.Contains(err.Error(), "does not match") {
+		t.Errorf("error = %v, want the buffered correlation violation to survive the closed outcome", err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("resolution took %v, want prompt resolution (no exit grace)", elapsed)
+	}
+	if !h.c.dead() {
+		t.Fatal("a correlation violation must discard the container")
+	}
+	if got := h.c.discardReason(); got != "protocol_error" {
+		t.Errorf("discard reason = %q, want protocol_error", got)
+	}
+	h.assertTornDown(t)
 	waitReaderExit(t, h)
 }
 

@@ -785,6 +785,18 @@ func (c *executionContainer) Invoke(
 		default:
 		}
 	}
+	// onDeath queues its failEvent before discarding, so a failure is buffered
+	// before closed is ready. When closed wins over c.fail, recover that queued
+	// event so the invocation reports WHY the container died (e.g. the
+	// correlation violation) instead of the generic discard. A closed with no
+	// queued failure (an idle or cancellation discard) keeps the generic error.
+	if outcome == outcomeClosed {
+		select {
+		case ev = <-c.fail:
+			outcome = outcomeFail
+		default:
+		}
+	}
 	// Unregister the result channel before acting on the outcome. An
 	// already-delivered result may be reported unambiguously, but a death or
 	// channel failure that raced the select must not be left queued against a

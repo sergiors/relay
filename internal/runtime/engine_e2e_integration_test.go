@@ -346,8 +346,23 @@ export function run(event, context) {
 	if err == nil {
 		t.Fatalf("expected execute to fail for broken dependency")
 	}
-	if strings.Contains(err.Error(), "not found") {
-		t.Errorf("broken dependency must NOT be reported as module not found, got: %v", err)
+	// The loader's own fallback for a MISSING HANDLER MODULE is "module not
+	// found"; a module that exists but imports a missing dependency must not
+	// collapse into it (mirrors TestNodeRuntimeBrokenImport). Node 24 reports
+	// Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'missing-package' ...,
+	// which never contains the lowercase phrase.
+	if strings.Contains(err.Error(), "module not found") {
+		t.Errorf("broken dependency must NOT be reported as 'module not found', got: %v", err)
+	}
+	// The positive half of the contract: Execute must carry the REAL Node ESM
+	// import error — code and specifier together distinguish it from an
+	// unrelated failure (the bootstrap returns the failing import's stack
+	// verbatim, and console.error mirrors it into the logs awaited below).
+	for _, want := range []string{"ERR_MODULE_NOT_FOUND", "missing-package"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("broken dependency must surface the REAL import error (%s) through Execute, got: %v",
+				want, err)
+		}
 	}
 	logs := awaitAppLogsFor(t, ctx, m.cli, fn.Name, "missing-package")
 	t.Logf("execute error: %v", err)
