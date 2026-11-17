@@ -233,6 +233,10 @@ func enqueueStartupServices(prepared []*runner.PreparedApp, services *reconciler
 // callbacks that complete after shutdown attempt their state write with a
 // cancelled context, which is treated as normal shutdown (the write fails
 // closed and is logged at Debug) rather than a reconcile failure.
+//
+// Readiness is reported only from a successful asynchronous completion whose
+// fenced success write LANDED. This includes empty desired service sets, whose
+// pass may still need to clean up containers left by an earlier deployment.
 func enqueueStartupServicesWithState(
 	ctx context.Context,
 	prepared []*runner.PreparedApp,
@@ -262,7 +266,7 @@ func enqueueStartupServicesWithState(
 			// released when the request concludes. A no-runtime app has no
 			// lease and enqueues unleased.
 			lease := pf.SharePublication()
-			if st != nil && len(fn.Template.Services) > 0 {
+			if st != nil {
 				fencingToken := fencingTokens[fn.Name]
 				services.EnqueueWithStatusLeased(fn.Name, fn.Template, prep.Image, prep.Env, lease,
 					func() { st.RecordReconciling(ctx, fn.Name, fencingToken) },
@@ -276,7 +280,21 @@ func enqueueStartupServicesWithState(
 						// could record content the active image does not serve, and
 						// the next reconcile/audit detects any drift by comparing the
 						// on-disk digest against this built identity.
-						st.RecordReconcileSuccess(ctx, fn.Name, prep.Image, prep.Fingerprint, time.Now(), fn, fencingToken)
+						ok, werr := st.RecordReconcileSuccess(
+							ctx, fn.Name, prep.Image, prep.Fingerprint, time.Now(), fn, fencingToken,
+						)
+						if werr != nil || !ok {
+							// The write failed or a newer generation owns the row:
+							// that generation reports its own readiness.
+							return
+						}
+						logger.Info("App: ready",
+							"app", fn.Name,
+							"image", prep.Image,
+							"fingerprint", prep.Fingerprint,
+							"services", len(fn.Template.Services),
+							"outcome", "ready",
+						)
 					})
 			} else {
 				services.EnqueueLeased(fn.Name, fn.Template, prep.Image, prep.Env, lease)

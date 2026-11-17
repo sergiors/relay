@@ -746,6 +746,13 @@ func prepareStartupJob(
 // without an active image, the interruption classification that suppresses a
 // spurious state failure, and the building observation) are unchanged. The exact
 // startup fencing token for this app is used for every guarded write.
+//
+// The lifecycle lines are the operator's view of this per-app transition: the
+// start is Info with the desired (pre-build) fingerprint before the build runs,
+// a genuine failure is ONE terminal Error carrying that fingerprint and the
+// error (the runtime's own "Build: failed" line stays at Warn as the build-layer
+// detail), and a shutdown interruption stays at Debug because Run is already
+// converging on shutdown.
 func prepareStartupApp(
 	ctx context.Context,
 	manager appPreparer,
@@ -755,6 +762,11 @@ func prepareStartupApp(
 	logger *slog.Logger,
 ) *runner.PreparedApp {
 	fn := s.App
+	logger.Info("App: preparing",
+		"app", fn.Name,
+		"fingerprint", s.Fingerprint,
+		"outcome", "startup",
+	)
 	prep, err := manager.PrepareWithFingerprintAndSelection(
 		managedRuntimeBuildContext(ctx, st, fn, fencingToken), fn, s.Fingerprint, s.Selection,
 	)
@@ -764,9 +776,15 @@ func prepareStartupApp(
 		// state DB. The app is still marked unavailable, but Run is
 		// already converging on shutdown.
 		if startupInterrupted(ctx, err) {
-			logger.Debug("App: prepare interrupted by shutdown", "app", fn.Name, "error", err)
+			logger.Debug("App: prepare interrupted by shutdown",
+				"app", fn.Name, "fingerprint", s.Fingerprint, "error", err)
 		} else {
-			logger.Warn("App: prepare failed", "app", fn.Name, "error", err)
+			logger.Error("App: prepare failed",
+				"app", fn.Name,
+				"fingerprint", s.Fingerprint,
+				"outcome", "startup",
+				"error", err,
+			)
 			if st != nil {
 				st.RecordReconcileFailure(ctx, fn.Name, err, fencingToken)
 			}

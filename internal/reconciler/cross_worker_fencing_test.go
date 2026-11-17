@@ -6,9 +6,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -180,6 +182,8 @@ func assertAppStateUnchanged(
 func TestCrossWorkerStaleFencingTokenCannotOverwriteNewerState(t *testing.T) {
 	t.Run("stale success cannot overwrite newer success", func(t *testing.T) {
 		f := newCrossWorkerFixture(t, "shared")
+		var logs testutil.SyncBuffer
+		f.older.log = slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 		// The newer worker's current generation completes successfully and is
 		// persisted first.
@@ -197,6 +201,9 @@ func TestCrossWorkerStaleFencingTokenCannotOverwriteNewerState(t *testing.T) {
 		f.olderCalls[0].onComplete(nil)
 
 		assertAppStateUnchanged(t, f.olderDB, f.fn.Name, newer)
+		if strings.Contains(logs.String(), `"msg":"App: ready"`) {
+			t.Fatalf("stale fenced completion logged ready:\n%s", logs.String())
+		}
 	})
 
 	t.Run("stale failure cannot overwrite newer success", func(t *testing.T) {

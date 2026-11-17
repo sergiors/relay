@@ -218,10 +218,19 @@ func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceCon
 	return out, nil
 }
 
-func (f *fakeDocker) StopServiceContainers(_ context.Context, containers []runtime.ServiceContainer) error {
+func (f *fakeDocker) StopServiceContainers(ctx context.Context, containers []runtime.ServiceContainer) error {
+	_, err := f.StopServiceContainersWithResult(ctx, containers)
+	return err
+}
+
+func (f *fakeDocker) StopServiceContainersWithResult(
+	_ context.Context,
+	containers []runtime.ServiceContainer,
+) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var firstErr error
+	completed := 0
 	for _, sc := range containers {
 		if sc.ID == f.failStopFor {
 			if firstErr == nil {
@@ -233,9 +242,10 @@ func (f *fakeDocker) StopServiceContainers(_ context.Context, containers []runti
 			f.stops = append(f.stops, c.id)
 			f.recordEvent("stop:" + c.id)
 			delete(f.ctrs, sc.ID)
+			completed++
 		}
 	}
-	return firstErr
+	return completed, firstErr
 }
 
 func (f *fakeDocker) RemoveAppServiceContainers(_ context.Context, fnName string) (int, error) {

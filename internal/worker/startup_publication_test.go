@@ -121,8 +121,8 @@ func TestPublishStartupAppsRejectsStaleAndKeepsOnlyAcceptedGenerations(t *testin
 		t.Fatal("stale placeholder lost its desired event rules, so matching would be dropped")
 	}
 
-	if got, want := stateSink.successes, []string{"accepted"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("startup success writes = %v, want only accepted no-service app %v", got, want)
+	if len(stateSink.successes) != 0 {
+		t.Fatalf("startup success writes during publication = %v, want none before service completion", stateSink.successes)
 	}
 	if got, want := stateSink.failures, []string{"stale-service"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("startup failure writes = %v, want stale app %v", got, want)

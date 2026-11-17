@@ -1,9 +1,12 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strconv"
@@ -313,6 +316,90 @@ func TestStartServiceInspectErrorDiscardsAndFails(t *testing.T) {
 	if removed != 1 {
 		t.Fatalf("discard removals = %d, want 1", removed)
 	}
+}
+
+func TestStartServiceDiscardCancellationIsDebugOnly(t *testing.T) {
+	t.Run("caller cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cli := newScriptedDockerClient(t,
+			imageWithoutDeclaredVolumesRoute("img"),
+			dockerRoute{method: http.MethodPost, path: "/containers/create", body: `{"Id":"cid-1"}`},
+			dockerRoute{method: http.MethodPost, path: "/start",
+				onRequest: func(*http.Request) { cancel() },
+				fail:      func(req *http.Request) error { return req.Context().Err() }},
+			dockerRoute{method: http.MethodDelete, path: "/containers/cid-1",
+				fail: func(req *http.Request) error { return req.Context().Err() }},
+		)
+		var logs bytes.Buffer
+		m := &Manager{
+			cli:    cli,
+			log:    slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+			nodeID: "h",
+		}
+		_, err := m.StartService(ctx, ServiceSpec{
+			App: "fn", Name: "svc", SourceRef: "service.js", Port: 80,
+			Image: "img", Env: []string{"PORT=80"},
+		}, 0)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("StartService error = %v, want context.Canceled", err)
+		}
+		var discard map[string]any
+		for _, line := range strings.Split(logs.String(), "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			var record map[string]any
+			if err := json.Unmarshal([]byte(line), &record); err != nil {
+				t.Fatalf("invalid log line %q: %v", line, err)
+			}
+			if record["msg"] == "Service: discard failed container" {
+				discard = record
+			}
+		}
+		if discard == nil || discard["level"] != "DEBUG" || discard["outcome"] != "cancelled" {
+			t.Fatalf("discard cancellation record = %+v, want DEBUG outcome=cancelled", discard)
+		}
+	})
+
+	t.Run("genuine cleanup failure remains warning", func(t *testing.T) {
+		cli := newScriptedDockerClient(t,
+			imageWithoutDeclaredVolumesRoute("img"),
+			dockerRoute{method: http.MethodPost, path: "/containers/create", body: `{"Id":"cid-1"}`},
+			dockerRoute{method: http.MethodPost, path: "/start",
+				status: http.StatusInternalServerError, body: `{"message":"start failed"}`},
+			dockerRoute{method: http.MethodDelete, path: "/containers/cid-1",
+				status: http.StatusInternalServerError, body: `{"message":"cleanup failed"}`},
+		)
+		var logs bytes.Buffer
+		m := &Manager{
+			cli:    cli,
+			log:    slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+			nodeID: "h",
+		}
+		if _, err := m.StartService(context.Background(), ServiceSpec{
+			App: "fn", Name: "svc", SourceRef: "service.js", Port: 80,
+			Image: "img", Env: []string{"PORT=80"},
+		}, 0); err == nil {
+			t.Fatal("StartService unexpectedly succeeded")
+		}
+		var discard map[string]any
+		for _, line := range strings.Split(logs.String(), "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			var record map[string]any
+			if err := json.Unmarshal([]byte(line), &record); err != nil {
+				t.Fatalf("invalid log line %q: %v", line, err)
+			}
+			if record["msg"] == "Service: discard failed container" {
+				discard = record
+			}
+		}
+		if discard == nil || discard["level"] != "WARN" {
+			t.Fatalf("genuine discard failure record = %+v, want WARN", discard)
+		}
+	})
 }
 
 // TestStartServiceCreateSendsUniquePhysicalName pins that the name sent to

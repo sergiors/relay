@@ -1,9 +1,12 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,6 +82,65 @@ func TestStopServiceContainersCancellationRespected(t *testing.T) {
 	}
 }
 
+func TestStopServiceContainersOnlySuppressesConfirmedCancellationWarnings(t *testing.T) {
+	t.Run("cancelled request", func(t *testing.T) {
+		entered := make(chan struct{})
+		cli := newScriptedDockerClient(t,
+			dockerRoute{method: http.MethodDelete, path: "/containers/c1", body: `{}`,
+				onRequest: func(_ *http.Request) { close(entered) },
+				fail: func(req *http.Request) error {
+					<-req.Context().Done()
+					return req.Context().Err()
+				}},
+		)
+		var logs bytes.Buffer
+		m := &Manager{
+			cli: cli,
+			log: slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			done <- m.StopServiceContainers(ctx, []ServiceContainer{
+				{ID: "c1", App: "fn", Name: "svc", State: container.StateExited},
+			})
+		}()
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("container removal request was not entered")
+		}
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("StopServiceContainers error = %v, want context.Canceled", err)
+		}
+		if strings.Contains(logs.String(), "Service: remove container failed") {
+			t.Fatalf("confirmed cancellation emitted a per-container warning:\n%s", logs.String())
+		}
+	})
+
+	t.Run("operational failure remains a warning", func(t *testing.T) {
+		cli := newScriptedDockerClient(t,
+			dockerRoute{method: http.MethodDelete, path: "/containers/c1",
+				status: http.StatusInternalServerError, body: `{"message":"daemon failure"}`},
+		)
+		var logs bytes.Buffer
+		m := &Manager{
+			cli: cli,
+			log: slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		}
+		err := m.StopServiceContainers(context.Background(), []ServiceContainer{
+			{ID: "c1", App: "fn", Name: "svc", State: container.StateExited},
+		})
+		if err == nil {
+			t.Fatal("StopServiceContainers unexpectedly succeeded")
+		}
+		if !strings.Contains(logs.String(), "Service: remove container failed") {
+			t.Fatalf("operational removal failure did not emit a warning:\n%s", logs.String())
+		}
+	})
+}
+
 // TestStopServiceContainersLoopStopsOnExpiredContext pins that a loop over
 // multiple containers does not issue further Docker calls once the caller's
 // context is already done.
@@ -117,6 +179,25 @@ func TestStopServiceContainersBenignNotFound(t *testing.T) {
 	err := m.StopServiceContainers(context.Background(), []ServiceContainer{{ID: "gone", State: container.StateExited}})
 	if err != nil {
 		t.Fatalf("StopServiceContainers on a gone container = %v, want nil (not-found is benign)", err)
+	}
+}
+
+func TestStopServiceContainersWithResultReportsPartialProgress(t *testing.T) {
+	cli := newScriptedDockerClient(t,
+		dockerRoute{method: http.MethodDelete, path: "/containers/c1", body: `{}`},
+		dockerRoute{method: http.MethodDelete, path: "/containers/c2",
+			status: http.StatusInternalServerError, body: `{"message":"remove failed"}`},
+	)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger()}
+	completed, err := m.StopServiceContainersWithResult(context.Background(), []ServiceContainer{
+		{ID: "c1", State: container.StateExited},
+		{ID: "c2", State: container.StateExited},
+	})
+	if err == nil {
+		t.Fatal("partial removal failure was not returned")
+	}
+	if completed != 1 {
+		t.Fatalf("completed removals = %d, want 1", completed)
 	}
 }
 

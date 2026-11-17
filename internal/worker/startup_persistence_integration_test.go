@@ -6,9 +6,15 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/moby/moby/api/types/container"
 
 	"relay/internal/app"
+	"relay/internal/reconciler"
+	"relay/internal/routing"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/state"
@@ -292,5 +298,228 @@ func invalidIssue(t *testing.T, root, name string) app.LoadIssue {
 		Name:     name,
 		Err:      errors.New(`app "` + name + `": unknown runtime "python9.9"`),
 		Identity: app.TemplateIdentity([]byte(startupInvalidTemplate)),
+	}
+}
+
+// gatedStartupDocker parks StartService until the test releases it (or the
+// pass context ends), so a test can observe the captured log between the
+// asynchronous service enqueue and the completion callback. startErr, when
+// set, fails the start instead of parking.
+type gatedStartupDocker struct {
+	svcDeadlineDocker
+	startErr    error
+	enteredOnce sync.Once
+	entered     chan struct{}
+	release     chan struct{}
+}
+
+func newGatedStartupDocker() *gatedStartupDocker {
+	return &gatedStartupDocker{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (g *gatedStartupDocker) StartService(
+	ctx context.Context, _ runtime.ServiceSpec, _ int,
+) (string, error) {
+	if g.startErr != nil {
+		return "", g.startErr
+	}
+	g.enteredOnce.Do(func() { close(g.entered) })
+	select {
+	case <-g.release:
+		return "id-gated", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// TestStartupServiceReadyLoggedAfterAsyncCompletion pins the ready transition
+// for service-declaring startup apps: nothing reports ready while the
+// asynchronous convergence is still running; exactly one Info ready line
+// appears after the successful completion callback has recorded the accepted
+// success; a failing service pass never logs ready. Startup service
+// convergence keeps emitting its own detailed outcomes — this asserts only
+// the deployment-level line's presence, level, fields, and ordering.
+func TestStartupServiceReadyLoggedAfterAsyncCompletion(t *testing.T) {
+	t.Run("ready appears only after successful async completion", func(t *testing.T) {
+		st := testutil.NewState(t)
+		fn := startupTestApp(t, "svc-ready", true)
+		token := seedFencingToken(t, st, fn)
+		logger, logs := captureStartupLog()
+
+		docker := newGatedStartupDocker()
+		svcCtrl := reconciler.NewServiceReconciler(
+			docker, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+		coordinator, stop := startCoordinatorFixture(t, svcCtrl)
+		defer stop()
+
+		prepared := []*runner.PreparedApp{
+			runner.NewPrepared(fn, &runtime.Prepared{
+				Name: fn.Name, Image: "img-svc-ready", Fingerprint: "fp-svc-ready",
+			}, nil),
+		}
+		enqueueStartupServicesWithState(
+			context.Background(), prepared, coordinator, st,
+			map[string]state.FencingToken{fn.Name: token}, logger,
+		)
+
+		// given the service pass is parked mid-convergence: the completion
+		// callback cannot have run, so readiness must not be logged yet
+		select {
+		case <-docker.entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("service pass never reached StartService")
+		}
+		if recs := startupRecordsForMsg(parseStartupLog(t, logs.String()), "App: ready"); len(recs) != 0 {
+			t.Fatalf("App: ready logged while async completion was still pending: %+v", recs)
+		}
+
+		// when the pass completes successfully
+		close(docker.release)
+		waitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := coordinator.Wait(waitCtx); err != nil {
+			t.Fatalf("wait: %v", err)
+		}
+
+		// then readiness is logged exactly once at INFO for the app, alongside
+		// the accepted success state
+		recs := startupRecordsForMsg(parseStartupLog(t, logs.String()), "App: ready")
+		if len(recs) != 1 {
+			t.Fatalf("App: ready records = %+v, want exactly one", recs)
+		}
+		if recs[0].App != fn.Name || recs[0].Level != "INFO" {
+			t.Errorf("ready record = %+v, want app=%s at INFO", recs[0], fn.Name)
+		}
+		detail, ok := st.GetApp(fn.Name)
+		if !ok || detail.LastReconcileStatus != state.ReconcileSuccess {
+			t.Fatalf("startup state = found=%v status=%v, want the accepted success recorded",
+				ok, detail.LastReconcileStatus)
+		}
+	})
+
+	t.Run("a failed service pass never logs ready", func(t *testing.T) {
+		st := testutil.NewState(t)
+		fn := startupTestApp(t, "svc-broken", true)
+		token := seedFencingToken(t, st, fn)
+		logger, logs := captureStartupLog()
+
+		docker := newGatedStartupDocker()
+		docker.startErr = errors.New("start exploded")
+		svcCtrl := reconciler.NewServiceReconciler(
+			docker, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+		coordinator, stop := startCoordinatorFixture(t, svcCtrl)
+		defer stop()
+
+		prepared := []*runner.PreparedApp{
+			runner.NewPrepared(fn, &runtime.Prepared{
+				Name: fn.Name, Image: "img-svc-broken", Fingerprint: "fp-svc-broken",
+			}, nil),
+		}
+		enqueueStartupServicesWithState(
+			context.Background(), prepared, coordinator, st,
+			map[string]state.FencingToken{fn.Name: token}, logger,
+		)
+
+		waitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := coordinator.Wait(waitCtx); err != nil {
+			t.Fatalf("wait: %v", err)
+		}
+		if recs := startupRecordsForMsg(parseStartupLog(t, logs.String()), "App: ready"); len(recs) != 0 {
+			t.Fatalf("failed startup service convergence logged ready: %+v", recs)
+		}
+	})
+}
+
+type gatedEmptyStartupCleanupDocker struct {
+	svcDeadlineDocker
+	entered     chan struct{}
+	release     chan struct{}
+	enteredOnce sync.Once
+	stopErr     error
+}
+
+func (d *gatedEmptyStartupCleanupDocker) ServiceContainerList(
+	ctx context.Context,
+) ([]runtime.ServiceContainer, error) {
+	d.enteredOnce.Do(func() { close(d.entered) })
+	select {
+	case <-d.release:
+		return []runtime.ServiceContainer{{
+			ID: "stale-service", App: "empty-startup", Name: "old-service.js",
+			State: container.StateRunning,
+		}}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (d *gatedEmptyStartupCleanupDocker) StopServiceContainers(
+	_ context.Context,
+	_ []runtime.ServiceContainer,
+) error {
+	return d.stopErr
+}
+
+func TestStartupEmptyServiceReadinessWaitsForCleanup(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		stopErr error
+		ready   bool
+	}{
+		{name: "successful cleanup", ready: true},
+		{name: "failed cleanup", stopErr: errors.New("cleanup failed"), ready: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testutil.NewState(t)
+			fn := startupTestApp(t, "empty-startup", false)
+			token := seedFencingToken(t, st, fn)
+			logger, logs := captureStartupLog()
+			docker := &gatedEmptyStartupCleanupDocker{
+				entered: make(chan struct{}),
+				release: make(chan struct{}),
+				stopErr: tc.stopErr,
+			}
+			svcCtrl := reconciler.NewServiceReconciler(
+				docker, nil, routing.TraefikConfig{}, logger, reconcileTimeout,
+			)
+			coordinator, stop := startCoordinatorFixture(t, svcCtrl)
+			defer stop()
+			prepared := []*runner.PreparedApp{
+				runner.NewPrepared(fn, &runtime.Prepared{
+					Name: fn.Name, Image: "img-empty-startup", Fingerprint: "fp-empty-startup",
+				}, nil),
+			}
+
+			enqueueStartupServicesWithState(
+				context.Background(), prepared, coordinator, st,
+				map[string]state.FencingToken{fn.Name: token}, logger,
+			)
+			select {
+			case <-docker.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("empty-service cleanup pass did not start")
+			}
+			if recs := startupRecordsForMsg(parseStartupLog(t, logs.String()), "App: ready"); len(recs) != 0 {
+				t.Fatalf("App: ready logged before empty-service cleanup completed: %+v", recs)
+			}
+
+			close(docker.release)
+			waitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := coordinator.Wait(waitCtx); err != nil {
+				t.Fatalf("wait for empty-service cleanup: %v", err)
+			}
+			recs := startupRecordsForMsg(parseStartupLog(t, logs.String()), "App: ready")
+			if tc.ready && (len(recs) != 1 || recs[0].Level != "INFO") {
+				t.Fatalf("ready records = %+v, want exactly one INFO record after cleanup", recs)
+			}
+			if !tc.ready && len(recs) != 0 {
+				t.Fatalf("failed empty-service cleanup logged ready: %+v", recs)
+			}
+		})
 	}
 }

@@ -402,6 +402,14 @@ type Manager struct {
 	// sleeping and without racing the leader's completion. Nil in production,
 	// never called then.
 	afterDependencyJoin func(depRef string)
+	// buildProgressInitialDelay and buildProgressInterval tune the bounded
+	// progress cadence for an active managed image build. Zero (or negative)
+	// uses defaultBuildProgressInitialDelay / defaultBuildProgressInterval.
+	// They exist as Manager-scoped seams so a test can observe progress, its
+	// bound, and its cancellation without sleeping for the production cadence
+	// or mutating package-global state. Production never sets them.
+	buildProgressInitialDelay time.Duration
+	buildProgressInterval     time.Duration
 }
 
 // ManagerOption tunes NewManager. Options keep the three-argument constructor

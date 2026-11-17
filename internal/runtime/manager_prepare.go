@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel/codes"
@@ -722,6 +723,20 @@ func (m *Manager) prepare(
 			"image", image,
 			"inspect_duration", time.Since(reuseStart),
 		)
+		// Reuse during a real preparation is a deployment transition, so it is
+		// visible at Info with the image and the desired identity it serves. The
+		// periodic no-op reconciliation never reaches Prepare, so unchanged
+		// ticks stay quiet.
+		reuseAttrs := []any{
+			"app", fn.Name,
+			"image", image,
+			"fingerprint", fp,
+			"outcome", "reused",
+		}
+		if depRef != "" {
+			reuseAttrs = append(reuseAttrs, "dependency", depRef)
+		}
+		m.log.Info("App: image reused", reuseAttrs...)
 		// The prepare succeeded (the image is present and current). Plain Prepare
 		// callers activate it immediately; publication-aware callers activate only
 		// after the generation is accepted.
@@ -823,7 +838,7 @@ func (m *Manager) prepare(
 			buildCtx, m.cli, fn.Name, planResult, image, appLabels,
 			sourceSnapshot, m.metrics, !mountSource, sessionID,
 		)
-	})
+	}, fp)
 	if buildErr != nil {
 		elapsed := buildElapsed
 		m.metrics.ObserveDurationLabels(metrics.MetricAppBuild, []metrics.Label{
@@ -832,13 +847,10 @@ func (m *Manager) prepare(
 		m.metrics.IncLabels(metrics.MetricAppBuildFailures, []metrics.Label{
 			{Name: "app", Value: fn.Name},
 		})
-		// App names are validated to [a-z0-9][a-z0-9._-]* (bounded by
-		// app count), so using them as labels is low-cardinality.
-		m.log.Error("App: build failed",
-			"app", fn.Name,
-			"duration", elapsed,
-			"result", "failed",
-		)
+		// The issued build's outcome is logged by runImageBuild at the exact
+		// build boundary. This preparation does not repeat it as a second
+		// failure summary: the error is returned and the deployment owner
+		// reports the terminal failure once.
 		// The app image build failed AFTER this preparation admitted (and
 		// possibly built) its dependency layer. Release the cross-process shared
 		// protection and this Manager's local dependency lease FIRST, then run the
@@ -882,11 +894,10 @@ func (m *Manager) prepare(
 	elapsed := buildElapsed
 	m.metrics.ObserveDurationLabels(metrics.MetricAppBuild,
 		[]metrics.Label{{Name: "app", Value: fn.Name}}, elapsed)
-	m.log.Info("App: built",
-		"app", fn.Name,
-		"duration", elapsed,
-		"result", "success",
-	)
+	// The build's completion is logged by runImageBuild; this preparation
+	// continues with the dependency-protection re-proof and then returns the
+	// accepted handle. The deployment owner records the published/ready
+	// transitions.
 	// The build succeeded. Plain Prepare callers activate the exact image now;
 	// publication-aware callers do so only after acceptance, so a generation
 	// rejected by the selection fence never touches the live warm pool.
@@ -1088,6 +1099,7 @@ func (m *Manager) ensureDependencyImage(
 			"dep_image", depRef,
 			"inspect_duration", time.Since(depReuseStart),
 		)
+		m.logReusedDependency(fn.Name, depRef, depFingerprint)
 		return depRef, nil
 	}
 
@@ -1106,6 +1118,7 @@ func (m *Manager) ensureDependencyImage(
 				"dep_image", depRef,
 				"inspect_duration", time.Since(reprobeStart),
 			)
+			m.logReusedDependency(fn.Name, depRef, depFingerprint)
 			return nil
 		}
 		m.log.Debug(
@@ -1123,30 +1136,21 @@ func (m *Manager) ensureDependencyImage(
 				buildCtx, m.cli, spec, deps, snap, depRef, depFingerprint,
 				arch, m.metrics, sessionID, provenance,
 			)
-		})
+		}, depFingerprint)
 		if buildErr != nil {
 			// Dependency-image build failures count as app build failures so the
 			// existing failure metric/label surface stays the single
 			// observability contract for "this app could not be prepared".
+			// runImageBuild logs the failed build once at the build boundary;
+			// the error is returned to every waiter and reported once per app
+			// by the deployment owner.
 			m.metrics.IncLabels(metrics.MetricAppBuildFailures, []metrics.Label{
 				{Name: "app", Value: fn.Name},
 			})
-			m.log.Error("App: dependency build failed",
-				"app", fn.Name,
-				"duration", elapsed,
-				"dep_image", depRef,
-				"result", "failed",
-			)
 			return buildErr
 		}
 		m.metrics.ObserveDurationLabels(metrics.MetricAppBuild,
 			[]metrics.Label{{Name: "app", Value: fn.Name}}, elapsed)
-		m.log.Info("App: dependency layer built",
-			"app", fn.Name,
-			"duration", elapsed,
-			"dep_image", depRef,
-			"result", "success",
-		)
 		return nil
 	})
 	if err != nil {
@@ -1186,6 +1190,11 @@ func (m *Manager) buildDependencyOnce(ctx context.Context, depRef string, build 
 		}
 		if inflight, ok := m.depBuilds[depRef]; ok {
 			m.depBuildMu.Unlock()
+			// The leader owns the build-boundary and progress lines; a waiter
+			// only records that it is sharing that in-flight layer, so a
+			// deduplicated build is not mistaken for a stalled preparation.
+			m.log.Debug("Dependency build already in flight; waiting",
+				"dep_image", depRef)
 			// Test-only seam: fires exactly when this caller JOINED the
 			// in-flight build rather than claiming it, before it blocks on the
 			// leader's outcome. Nil in production, never called then.
@@ -1223,6 +1232,126 @@ func (m *Manager) buildDependencyOnce(ctx context.Context, depRef string, build 
 	}
 }
 
+// Bounded progress for an ACTIVE managed image build. The cadence is time
+// based on purpose: Docker's build output can be silent for minutes during a
+// single install step, and deriving progress from the stream would tie
+// operator-visible logging to daemon message shape. One timer and one goroutine
+// per active build report at a bounded RATE for as long as the build runs, so a
+// long install stays observable without turning the log into a second progress
+// stream.
+const (
+	defaultBuildProgressInitialDelay = 30 * time.Second
+	defaultBuildProgressInterval     = 60 * time.Second
+)
+
+// buildProgressCadence returns the effective progress timing for this Manager.
+// The Manager-scoped values exist only as test seams, so a zero value always
+// falls back to the production cadence instead of disabling progress.
+func (m *Manager) buildProgressCadence() (initialDelay, interval time.Duration) {
+	initialDelay = m.buildProgressInitialDelay
+	if initialDelay <= 0 {
+		initialDelay = defaultBuildProgressInitialDelay
+	}
+	interval = m.buildProgressInterval
+	if interval <= 0 {
+		interval = defaultBuildProgressInterval
+	}
+	return initialDelay, interval
+}
+
+// imageBuildLog identifies one issued managed image build for its lifecycle
+// lines. kind distinguishes an app image from a shared dependency layer;
+// dependency images are identified by their repository prefix, so the
+// classification needs no extra state. fingerprint is the desired content
+// identity of the artifact this build produces — the app source fingerprint for
+// an app image and the dependency layer's content address for a dependency
+// image — and is empty only for a call that has no identity to report.
+type imageBuildLog struct {
+	app         string
+	image       string
+	kind        string
+	fingerprint string
+}
+
+// attrs returns the correlation attributes shared by this build's lifecycle and
+// progress lines. It carries no fencing token or other generation authority.
+func (b imageBuildLog) attrs() []any {
+	attrs := []any{
+		"app", b.app,
+		"image", b.image,
+		"kind", b.kind,
+	}
+	if b.fingerprint != "" {
+		attrs = append(attrs, "fingerprint", b.fingerprint)
+	}
+	return attrs
+}
+
+// buildKind classifies a managed image reference as an app or dependency build.
+func buildKind(image string) string {
+	if isDepRepo(image) {
+		return "dependency"
+	}
+	return "app"
+}
+
+// logReusedDependency records that a real preparation reused an existing
+// content-addressed dependency layer instead of building it. Reuse means an
+// app is being prepared without a dependency rebuild, which is deployment-visible
+// at Info; the probe timing stays on the adjacent Debug line.
+func (m *Manager) logReusedDependency(appName, depRef, depFingerprint string) {
+	m.log.Info("Dependency image reused",
+		"app", appName,
+		"dep_image", depRef,
+		"fingerprint", depFingerprint,
+		"outcome", "reused",
+	)
+}
+
+// startBuildProgress starts the progress reporter for one active build and
+// returns an idempotent stop that joins it before returning. The reporter is
+// rooted in the build context, so build timeout or manager shutdown ends it even
+// if the caller forgets to stop. It never reads the Docker output stream. The
+// cadence comes from the Manager (production default unless a test overrides
+// it); the RATE is bounded, not the number of reports, because the build context
+// already bounds the build's lifetime.
+func (m *Manager) startBuildProgress(
+	ctx context.Context,
+	build imageBuildLog,
+	start time.Time,
+) func() {
+	if m.log == nil {
+		return func() {}
+	}
+	initialDelay, interval := m.buildProgressCadence()
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		timer := time.NewTimer(initialDelay)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			case <-timer.C:
+				m.log.Info("Build: progress",
+					append(build.attrs(), "elapsed", time.Since(start))...)
+			}
+			timer.Reset(interval)
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(stop)
+			<-done
+		})
+	}
+}
+
 // runImageBuild executes one dependency-image or app-image build under the
 // Manager's shared MAX_CONCURRENT_BUILDS limiter and the lifecycle-bounded
 // build context. The permit is acquired only for the build itself, so source
@@ -1231,6 +1360,18 @@ func (m *Manager) buildDependencyOnce(ctx context.Context, depRef string, build 
 // held and a build is actually issued; a reused image does neither. The
 // returned duration measures the issued build (including the BuildKit session
 // handshake), excluding any wait for a slot.
+//
+// An optional desired fingerprint identifies the content the build was issued
+// for; preparation always supplies it, while a direct caller that holds only a
+// reference (in-package and integration tests) omits it and the lifecycle lines
+// then carry no fingerprint. It is never a fencing token or other authority.
+//
+// The started/progress/completed lines are emitted here because this is the one
+// boundary every app and dependency build crosses after acquiring a permit. The
+// progress reporter is stopped before the outcome line, so a build never reports
+// progress after its outcome. Failures are classified by cause: a timeout is
+// distinct from an ordinary build failure, and a lifecycle cancellation is a
+// shutdown transition rather than a failure to act on.
 //
 // A BuildKit session is attached for exactly the life of the build: the
 // Engine API build path needs it to resolve base-image metadata (see
@@ -1242,10 +1383,19 @@ func (m *Manager) runImageBuild(
 	appName string,
 	image string,
 	build func(context.Context, string) error,
+	fingerprint ...string,
 ) (time.Duration, error) {
+	buildLog := imageBuildLog{
+		app:   appName,
+		image: image,
+		kind:  buildKind(image),
+	}
+	if len(fingerprint) > 0 {
+		buildLog.fingerprint = fingerprint[0]
+	}
 	limit := m.buildLimiterFor()
 	if err := limit.acquire(ctx); err != nil {
-		return 0, fmt.Errorf("app %q: %w: %w", appName, errBuildSlotWait, err)
+		return 0, fmt.Errorf("app %q: %w: %w", buildLog.app, errBuildSlotWait, err)
 	}
 	defer limit.release()
 	if m.afterBuildPermit != nil {
@@ -1259,12 +1409,50 @@ func (m *Manager) runImageBuild(
 	notifyAppBuild(ctx)
 	buildCtx, buildCancel := m.buildContext()
 	defer buildCancel()
-	_, buildSpan := startRuntimeSpan(ctx, "runtime.build", appName, image)
-	err := m.buildWithSession(buildCtx, appName, build)
+	_, buildSpan := startRuntimeSpan(ctx, "runtime.build", buildLog.app, buildLog.image)
+	m.log.Info("Build: started", buildLog.attrs()...)
+	stopProgress := m.startBuildProgress(buildCtx, buildLog, start)
+	defer stopProgress()
+	err := m.buildWithSession(buildCtx, buildLog.app, build)
+	stopProgress()
 	elapsed := time.Since(start)
 	if err != nil {
 		buildSpan.RecordError(err)
 		buildSpan.SetStatus(codes.Error, err.Error())
+		switch {
+		case errors.Is(err, context.Canceled):
+			// Relay shutdown cancels the lifecycle-rooted build context. That
+			// is an expected transition, not a build failure, so it does not
+			// raise a warning the operator would have to triage.
+			m.log.Debug("Build: cancelled",
+				append(buildLog.attrs(),
+					"duration", elapsed,
+					"outcome", "cancelled")...)
+		case errors.Is(err, context.DeadlineExceeded) ||
+			errors.Is(buildCtx.Err(), context.DeadlineExceeded):
+			// The bounded build context expired: the build did not fail on its
+			// own, it ran out of time. The distinct outcome lets an operator
+			// tell a slow install from a broken one.
+			m.log.Warn("Build: timed out",
+				append(buildLog.attrs(),
+					"duration", elapsed,
+					"timeout", buildTimeout,
+					"outcome", "timeout")...)
+		default:
+			// The error is returned to the deployment owner, which reports the
+			// terminal failure once with its full context. This line records
+			// the build outcome itself without duplicating that Error-level
+			// summary.
+			m.log.Warn("Build: failed",
+				append(buildLog.attrs(),
+					"duration", elapsed,
+					"outcome", "failed")...)
+		}
+	} else {
+		m.log.Info("Build: completed",
+			append(buildLog.attrs(),
+				"duration", elapsed,
+				"outcome", "success")...)
 	}
 	buildSpan.End()
 	return elapsed, err

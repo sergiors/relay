@@ -499,10 +499,25 @@ func (r *Reconciler) reconcileApp(name string) {
 		return
 	}
 
-	r.log.Debug(
-		"App: changed; rebuilding",
+	// A real preparation is starting: this is the application lifecycle's start
+	// transition, distinct from the periodic no-op skip above. The classification
+	// uses only state this pass already holds (the registry entry, the tracked
+	// identity, and the pre-read observation), so it adds no database read, no
+	// second fingerprint scan, and no registry lookup.
+	prepOutcome := preparationOutcome(cur, observed, known, hasFingerprint, fp)
+	prepAttrs := []any{
 		"app", name,
-	)
+		"fingerprint", fp,
+		"outcome", prepOutcome,
+	}
+	if hasFingerprint {
+		prepAttrs = append(prepAttrs, "active_fingerprint", known)
+	}
+	if cur != nil && isAvailable(cur) {
+		prepAttrs = append(prepAttrs, "active_image", cur.Prepared().Image)
+	}
+	r.log.Info("App: preparing", prepAttrs...)
+
 	r.mu.Lock()
 	r.generations[name]++
 	generation := r.generations[name]
@@ -521,13 +536,50 @@ func (r *Reconciler) reconcileApp(name string) {
 	start := time.Now()
 	built, err := r.prepareImage(r.prepareContext(name, generation, fencingToken), fn, fp, selection)
 	if err != nil {
-		r.log.Error(
-			"App: reload failed; retaining previous version",
-			"app", name,
-			"error", err,
-			"duration", time.Since(start),
-			"outcome", "failed",
-		)
+		// The runtime build boundary already reports the build itself at Warn
+		// (failed/timed out) or Debug (cancelled), so this is the ONE terminal
+		// deployment summary and it never restates the build error as a second
+		// failure line.
+		switch {
+		case errors.Is(err, context.Canceled):
+			// Relay shutdown cancels the preparation. That is an expected
+			// transition, not a deployment failure, so it does not raise an
+			// Error the operator would have to triage.
+			r.log.Debug(
+				"App: preparation cancelled",
+				"app", name,
+				"fingerprint", fp,
+				"duration", time.Since(start),
+				"outcome", "cancelled",
+			)
+		case cur != nil && isAvailable(cur):
+			// A usable generation still serves, so the deployment is degraded
+			// rather than lost; name it so the retained version is identifiable.
+			attrs := []any{
+				"app", name,
+				"fingerprint", fp,
+				"active_image", cur.Prepared().Image,
+				"duration", time.Since(start),
+				"outcome", "degraded",
+				"error", err,
+			}
+			if hasFingerprint {
+				attrs = append(attrs, "active_fingerprint", known)
+			}
+			r.log.Error("App: deployment degraded; retaining active generation", attrs...)
+		default:
+			// Nothing usable serves: a first deployment failed, or the only
+			// known generation was already unavailable. There is no active
+			// image or fingerprint to correlate, because none is serving.
+			r.log.Error(
+				"App: deployment failed",
+				"app", name,
+				"fingerprint", fp,
+				"duration", time.Since(start),
+				"outcome", "failed",
+				"error", err,
+			)
+		}
 		// Keep the old active version AND the old fingerprint so a later change
 		// (which alters the fingerprint) triggers a fresh attempt.
 		if r.st != nil {
@@ -539,12 +591,39 @@ func (r *Reconciler) reconcileApp(name string) {
 	}
 	pf := runner.NewPrepared(fn, built, r.builder)
 
+	// The skip key and the persisted active fingerprint are the identity the
+	// image was ACTUALLY built from (built.Fingerprint, derived inside Prepare
+	// from the one immutable source snapshot the build staged), not the pre-build
+	// scan `fp`. They can differ when the source mutated between the reconciler's
+	// scan and the build's capture; recording the built value means the next
+	// reconcile/periodic audit compares against what is really baked and rebuilds
+	// the drift, instead of silently treating the mutated tree as current.
+	builtFP := built.Fingerprint
+	if builtFP == "" {
+		// Defensive: a Builder that does not return an identity (hand-built
+		// fakes) keeps the scanned value.
+		builtFP = fp
+	}
+
 	// Determine the superseded image before swapping so we can retire it after
 	// the registry points at the new version. In-flight Handles keep the old
 	// snapshot's image; the runner's refcount guards removal until idle.
 	var oldImage string
 	if cur != nil && cur.Prepared() != nil {
 		oldImage = cur.Prepared().Image
+	}
+
+	// withPrevious adds the generation this pass supersedes to a lifecycle line
+	// when one was serving, so a replacement can be followed from the old
+	// identity to the new one. It never includes a fencing token.
+	withPrevious := func(attrs []any) []any {
+		if hasFingerprint {
+			attrs = append(attrs, "previous_fingerprint", known)
+		}
+		if oldImage != "" {
+			attrs = append(attrs, "previous_image", oldImage)
+		}
+		return attrs
 	}
 
 	// Publish only if the selection this generation was built from is still the
@@ -568,6 +647,9 @@ func (r *Reconciler) reconcileApp(name string) {
 				r.log.Info(
 					"App: runtime image selection changed during preparation; retaining previous version",
 					"app", name,
+					"image", built.Image,
+					"fingerprint", builtFP,
+					"outcome", "stale",
 					"error", pubErr,
 				)
 				// Refresh the complete snapshot before retrying so the next
@@ -583,6 +665,9 @@ func (r *Reconciler) reconcileApp(name string) {
 			r.log.Error(
 				"App: publication failed; retaining previous version",
 				"app", name,
+				"image", built.Image,
+				"fingerprint", builtFP,
+				"outcome", "failed",
 				"error", pubErr,
 			)
 			if r.st != nil {
@@ -593,42 +678,88 @@ func (r *Reconciler) reconcileApp(name string) {
 	} else {
 		publish()
 	}
-	// The skip key and the persisted active fingerprint are the identity the
-	// image was ACTUALLY built from (built.Fingerprint, derived inside Prepare
-	// from the one immutable source snapshot the build staged), not the pre-build
-	// scan `fp`. They can differ when the source mutated between the reconciler's
-	// scan and the build's capture; recording the built value means the next
-	// reconcile/periodic audit compares against what is really baked and rebuilds
-	// the drift, instead of silently treating the mutated tree as current.
-	builtFP := built.Fingerprint
-	if builtFP == "" {
-		// Defensive: a Builder that does not return an identity (hand-built
-		// fakes) keeps the scanned value.
-		builtFP = fp
-	}
+	// Record the built identity as this Reconciler's skip key and the source
+	// selection the published image was built from, not a later read of the
+	// Manager snapshot: a pin change after publication must compare unequal on
+	// the next pass and reprepare.
 	r.mu.Lock()
 	r.fingerprints[name] = builtFP
-	// Record the identity the published image was built from, not a later read
-	// of the Manager snapshot: a pin change after publication must compare unequal
-	// on the next pass and reprepare.
 	r.imageSelections[name] = built.ImageSelection
 	r.mu.Unlock()
 
-	ready := func() {
-		if r.st == nil || !r.currentGeneration(name, generation) {
-			return
+	// The registry now serves this generation. This is the image-PUBLICATION
+	// transition, not deployment readiness: schedules and service containers
+	// have not converged yet and state still records the preparation as
+	// building. Readiness is logged only after convergence completes.
+	publicationOutcome := "updated"
+	if cur == nil {
+		publicationOutcome = "discovered"
+	}
+	publicationAttrs := withPrevious(deploymentAttrs(name, built, builtFP))
+	publicationAttrs = append(publicationAttrs,
+		"duration", time.Since(start),
+		"outcome", publicationOutcome,
+	)
+	r.log.Info("App: image published", publicationAttrs...)
+
+	ready := func() bool {
+		if !r.currentGeneration(name, generation) {
+			return false
 		}
-		r.st.RecordReconcileSuccess(r.rctx(), name, built.Image, builtFP, time.Now(), fn, fencingToken)
+		if r.st == nil {
+			return true
+		}
+		ctx := r.rctx()
+		landed, err := r.st.RecordReconcileSuccess(
+			ctx, name, built.Image, builtFP, time.Now(), fn, fencingToken,
+		)
+		// State is a non-authoritative view: a write error must not hide a
+		// locally completed deployment. A confirmed no-row result, however,
+		// means another generation (or removal) owns the persisted lifecycle.
+		// Lifecycle cancellation is the exception: shutdown must not report a
+		// late readiness transition after the reconciler has stopped.
+		if err != nil {
+			return !(ctx.Err() != nil && errors.Is(err, ctx.Err()))
+		}
+		return landed
 	}
 	failServices := func(serviceErr error) {
 		if serviceErr != nil && r.st != nil && r.currentGeneration(name, generation) {
 			r.st.RecordServiceFailure(r.rctx(), name, serviceErr, fencingToken)
 		}
 	}
-	if len(fn.Template.Services) == 0 || r.updateServicesWithStatus == nil {
-		if r.st != nil {
-			ready()
+	hasServices := len(fn.Template.Services) > 0
+	// hasUsablePrior reports whether a generation that can still serve remains
+	// from before this pass. A service failure then means the deployment is
+	// degraded (the previous version still serves); without one — a first
+	// deployment, or one whose prior generation already failed — the deployment
+	// failed.
+	hasUsablePrior := cur != nil && isAvailable(cur)
+	readyToLog := false
+	// logReady reports the DEPLOYMENT readiness transition, which is distinct
+	// from image publication above. It is emitted once the app's desired work
+	// has completed for this generation; a service failure never logs ready.
+	logReady := func() {
+		if !r.currentGeneration(name, generation) {
+			return
 		}
+		attrs := withPrevious(deploymentAttrs(name, built, builtFP))
+		attrs = append(attrs,
+			"services", len(fn.Template.Services),
+			"duration", time.Since(start),
+			"outcome", "ready",
+		)
+		r.log.Info("App: ready", attrs...)
+	}
+	// Readiness is deferred whenever a status-capable service hook is wired: it
+	// reports a completion for EVERY desired service set, including an empty
+	// one. A template that removes its last service still enqueues cleanup of
+	// the containers it used to run, and that cleanup can fail, so the
+	// deployment must not be marked ready (or logged as ready) before it
+	// completes. The legacy status-less hook has no completion signal at all, so
+	// its immediately-available generation stays ready as before.
+	if r.updateServicesWithStatus == nil {
+		readyToLog = ready()
 	}
 
 	// After a successful swap, converge the scheduler's cron jobs to this
@@ -653,12 +784,59 @@ func (r *Reconciler) reconcileApp(name string) {
 			}, func(err error) {
 				if err != nil {
 					failServices(err)
+					if !r.currentGeneration(name, generation) {
+						// A newer generation superseded this pass: its failure
+						// is not a deployment-level outcome for this one.
+						return
+					}
+					if errors.Is(err, context.Canceled) &&
+						errors.Is(r.rctx().Err(), context.Canceled) {
+						deployAttrs := withPrevious(deploymentAttrs(name, built, builtFP))
+						deployAttrs = append(deployAttrs,
+							"services", len(fn.Template.Services),
+							"outcome", "cancelled",
+							"error", err,
+						)
+						r.log.Debug("App: deployment cancelled", deployAttrs...)
+						return
+					}
+					// The service reconciler already reported the failure
+					// detail. This line records what the failure means for the
+					// deployment, which depends on whether a usable generation
+					// remains: a retained previous generation is degraded, and a
+					// deployment with nothing usable left has failed. This holds
+					// for an empty desired service set too, where the failure is
+					// cleanup of the containers the app used to run.
+					deployAttrs := withPrevious(deploymentAttrs(name, built, builtFP))
+					deployAttrs = append(deployAttrs,
+						"services", len(fn.Template.Services),
+					)
+					if hasUsablePrior {
+						deployAttrs = append(deployAttrs, "outcome", "degraded")
+						r.log.Warn("App: deployment degraded", deployAttrs...)
+						return
+					}
+					deployAttrs = append(deployAttrs, "outcome", "failed")
+					r.log.Error("App: deployment failed", deployAttrs...)
 					return
 				}
-				ready()
+				// Completion — not publication — is readiness: every desired
+				// service set converged, including removal of the containers a
+				// zero-service template no longer wants.
+				if ready() {
+					logReady()
+				}
 			})
 	} else if r.updateServices != nil {
 		r.updateServices(name, fn.Template, built.Image)
+	}
+
+	// Only the legacy no-status path reaches here with nothing left to wait for:
+	// schedules have converged above and no service container is desired, so
+	// this generation is ready now. With the status-capable hook, readiness is
+	// reported by the completion callback above for every desired service set.
+	if r.updateServicesWithStatus == nil && !hasServices && readyToLog {
+		logReady()
 	}
 
 	// Retire the superseded version now that the registry serves the new one,
@@ -673,19 +851,72 @@ func (r *Reconciler) reconcileApp(name string) {
 	if r.retire != nil && oldImage != "" && oldImage != built.Image {
 		r.retire(name, oldImage)
 	}
+}
 
-	if cur == nil {
-		r.log.Info("App: discovered",
-			"app", name,
-			"duration", time.Since(start),
-			"outcome", "discovered",
-		)
-	} else {
-		r.log.Info("App: updated",
-			"app", name,
-			"duration", time.Since(start),
-			"outcome", "updated",
-		)
+// deploymentAttrs returns the shared correlation attributes for an app's
+// deployment lifecycle lines: the app, the image the registry serves, the
+// source identity that image was built from, and (when present) the shared
+// dependency layer it consumes. It deliberately carries no fencing token or
+// other internal generation authority.
+func deploymentAttrs(name string, built *runtime.Prepared, fingerprint string) []any {
+	attrs := []any{
+		"app", name,
+		"image", built.Image,
+		"fingerprint", fingerprint,
+	}
+	if built.Dependency != "" {
+		attrs = append(attrs, "dependency", built.Dependency)
+	}
+	return attrs
+}
+
+// preparationOutcome classifies why this pass is preparing a generation, for
+// logging only. It reads nothing: every input is state the pass already holds,
+// and the result never influences behavior, admission, or state writes.
+//
+// A generation can fail while an older one keeps serving, and a first build can
+// fail with no registry entry at all. In both cases the persisted desired
+// fingerprint and failed status record the attempt, so the comparison runs
+// BEFORE the registry-entry fallbacks: it distinguishes a RETRY of that same
+// failed desired identity from a NEW GENERATION replacing it. Without the
+// observation both look like a first discovery or a content change.
+func preparationOutcome(
+	cur *runner.PreparedApp,
+	observed *state.AppObservation,
+	trackedFingerprint string,
+	hasTrackedFingerprint bool,
+	desiredFingerprint string,
+) string {
+	failedDesiredFingerprint := ""
+	if observed != nil && observed.Found &&
+		observed.Detail.LastReconcileStatus == state.ReconcileFailed {
+		failedDesiredFingerprint = observed.Detail.DesiredFingerprint
+	}
+	switch {
+	case failedDesiredFingerprint != "" &&
+		failedDesiredFingerprint == desiredFingerprint:
+		// This exact desired generation failed before; the pass retries it
+		// instead of applying a change.
+		return "retry"
+	case failedDesiredFingerprint != "":
+		// A newer desired generation replaced one that failed, so the recorded
+		// failure no longer describes the desired content.
+		return "new_generation"
+	case cur == nil:
+		// No registry entry and no recorded failure: a first discovery.
+		return "discovered"
+	case !isAvailable(cur):
+		// Registered with no usable image: the previous attempt left nothing
+		// serving, so this pass retries it.
+		return "retry"
+	case hasTrackedFingerprint && trackedFingerprint == desiredFingerprint:
+		// Content is unchanged; the runtime base-image selection moved.
+		return "selection"
+	case hasTrackedFingerprint:
+		return "updated"
+	default:
+		// No tracked identity to compare against: report a generic change.
+		return "changed"
 	}
 }
 

@@ -2,10 +2,14 @@ package reconciler
 
 import (
 	"context"
+	"encoding/json"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	"relay/internal/app"
+	"relay/internal/observability/metrics"
 	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
@@ -227,5 +231,214 @@ func TestServiceCoordinatorSupersededPassPreservesRemovedSourceRef(t *testing.T)
 	defer joinCancel()
 	if err := coordinator.Join(joinCtx); err != nil {
 		t.Fatalf("join: %v", err)
+	}
+}
+
+// serviceLogRecord is the parsed shape of one captured JSON log line for
+// summary assertions: the message and the outcome attribute when present.
+type serviceLogRecord struct {
+	Msg     string `json:"msg"`
+	Outcome string `json:"outcome"`
+	Stopped *int   `json:"stopped"`
+}
+
+// serviceLogRecords parses captured JSON log output into records, failing the
+// test on any line that is not a structured record.
+func serviceLogRecords(t *testing.T, raw string) []serviceLogRecord {
+	t.Helper()
+	var records []serviceLogRecord
+	for _, line := range strings.Split(raw, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var rec serviceLogRecord
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("captured log line is not JSON: %q: %v", line, err)
+		}
+		records = append(records, rec)
+	}
+	return records
+}
+
+// summaryOutcomes returns the outcome attribute of every generic
+// "Service: reconciled" summary line, in order. An empty entry means the
+// summary was emitted WITHOUT an outcome attribute.
+func summaryOutcomes(records []serviceLogRecord) []string {
+	var outcomes []string
+	for _, rec := range records {
+		if rec.Msg == "Service: reconciled" {
+			outcomes = append(outcomes, rec.Outcome)
+		}
+	}
+	return outcomes
+}
+
+// hasLogRecord reports whether any record carries the exact message.
+func hasLogRecord(records []serviceLogRecord, msg string) bool {
+	for _, rec := range records {
+		if rec.Msg == msg {
+			return true
+		}
+	}
+	return false
+}
+
+// newSupersessionSummaryHarness wires a ServiceReconciler over a fake Docker
+// holding one running old generation the desired template has changed (a new
+// app image), with a JSON log capture and an inspectable metrics registry.
+func newSupersessionSummaryHarness(t *testing.T) (
+	*fakeDocker, *app.Template, *ServiceReconciler, *metrics.Registry, *testutil.SyncBuffer,
+) {
+	t.Helper()
+	f := newFakeDocker()
+	seedOldService(f, "old-1", "fn", "service.js", "img-old", 80, 0)
+	tmpl := serviceTemplate("nodejs24.x", app.Service{
+		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
+	})
+	logs := &testutil.SyncBuffer{}
+	m := metrics.New()
+	c := NewServiceReconciler(
+		f, nil, routing.TraefikConfig{},
+		slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		testReconcileTimeout, WithMetrics(m),
+	)
+	return f, tmpl, c, m, logs
+}
+
+// changedMetric reads the service-reconcile outcome counter for "fn".
+func changedMetric(m *metrics.Registry) int64 {
+	return m.CounterLabels(metrics.MetricServiceReconciles, []metrics.Label{
+		{Name: "app", Value: "fn"},
+		{Name: "outcome", Value: metrics.ServiceOutcomeChanged},
+	})
+}
+
+// TestServiceSupersededPassSummaryOmitsChangedOutcome pins the summary edge of
+// a superseded pass: the pass issues corrective work (its replacement start
+// sets changed, the existing metrics contract) but discovers the supersession
+// at its commit boundary, removes its provisional container, and preserves the
+// old generation. Such a pass must NOT be summarized as a generic
+// outcome=changed convergence — the summary either carries the explicit
+// superseded outcome or is suppressed entirely — while the explicit
+// "pass superseded" lines and the changed metric stay as they were. The
+// control subtest proves the generic summary is what an ordinary corrective
+// pass reports, so the negative assertion is not vacuous.
+func TestServiceSupersededPassSummaryOmitsChangedOutcome(t *testing.T) {
+	t.Run("an ordinary corrective pass still reports outcome changed", func(t *testing.T) {
+		// given a changed desired image over a running old generation, applied
+		// directly with no supersession authority
+		f, tmpl, c, m, logs := newSupersessionSummaryHarness(t)
+
+		// when the pass converges the replacement
+		if err := c.Apply(context.Background(), "fn", tmpl, "img-new", nil); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+
+		// then exactly one summary reports the convergence as changed, and the
+		// metric observes it
+		outcomes := summaryOutcomes(serviceLogRecords(t, logs.String()))
+		if len(outcomes) != 1 || outcomes[0] != "changed" {
+			t.Fatalf("summary outcomes = %v, want [changed]", outcomes)
+		}
+		if got := changedMetric(m); got != 1 {
+			t.Fatalf("changed metric = %d, want 1", got)
+		}
+		if got := f.runningCount("fn", "service.js"); got != 1 {
+			t.Fatalf("running = %d, want 1 after convergence", got)
+		}
+	})
+
+	t.Run("a pass superseded at its commit boundary is not summarized as changed", func(t *testing.T) {
+		// given a pass whose authority holds while it starts its provisional
+		// replacement and flips the moment the start returns — the exact
+		// window between the top-of-pass check and the commit boundary
+		f, tmpl, c, m, logs := newSupersessionSummaryHarness(t)
+		superseded := false
+		startedID := ""
+		f.mu.Lock()
+		f.startGate = func(id string, _ runtime.ServiceSpec, _ int) {
+			startedID = id
+			superseded = true
+		}
+		f.mu.Unlock()
+		ctx := withReconcileAuthority(context.Background(), func() bool {
+			return !superseded
+		})
+
+		// when the pass is applied
+		if err := c.Apply(ctx, "fn", tmpl, "img-new", nil); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		records := serviceLogRecords(t, logs.String())
+
+		// then the pass really issued corrective work and really superseded at
+		// its commit boundary (the negative assertions below are not vacuous)
+		if !hasLogRecord(records, "Service: reconciling") {
+			t.Error("missing the corrective-work start line: the pass issued no change")
+		}
+		if !hasLogRecord(records, "Service: pass superseded; preserving old generation") {
+			t.Error("missing the explicit supersession line at the commit boundary")
+		}
+
+		// then no generic summary claims the abandoned pass converged state: a
+		// summary that exists must carry the explicit superseded outcome, and a
+		// bare summary (no outcome) is equally ambiguous
+		for _, outcome := range summaryOutcomes(records) {
+			if outcome != "superseded" {
+				t.Errorf("Service: reconciled reported outcome=%q; a superseded pass must carry outcome=%q or suppress the summary",
+					outcome, "superseded")
+			}
+		}
+
+		// then the existing metrics contract is untouched: the pass still
+		// observed as changed for the counter
+		if got := changedMetric(m); got != 1 {
+			t.Errorf("changed metric = %d, want 1 (superseded pass retains changed for metrics)", got)
+		}
+
+		// then the old generation still serves and the provisional replacement
+		// was cleaned up
+		if startedID == "" {
+			t.Fatal("replacement never started: the pass did not reach the commit boundary")
+		}
+		if _, ok := f.containerByID(startedID); ok {
+			t.Error("provisional replacement survived the supersession")
+		}
+		if got := f.runningCount("fn", "service.js"); got != 1 {
+			t.Errorf("running = %d, want 1 (the old generation preserved)", got)
+		}
+	})
+}
+
+func TestServiceErrorSummaryReportsPartialStops(t *testing.T) {
+	f := newFakeDocker()
+	seedOldService(f, "old-1", "fn", "service.js", "img-old", 80, 0)
+	seedOldService(f, "old-2", "fn", "service.js", "img-old", 80, 0)
+	f.failStopFor = "old-2"
+	tmpl := serviceTemplate("nodejs24.x", app.Service{
+		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
+	})
+	logs := &testutil.SyncBuffer{}
+	c := NewServiceReconciler(
+		f, nil, routing.TraefikConfig{},
+		slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		testReconcileTimeout,
+	)
+
+	if err := c.Apply(context.Background(), "fn", tmpl, "img-new", nil); err == nil {
+		t.Fatal("Apply unexpectedly succeeded")
+	}
+	var summary *serviceLogRecord
+	for _, record := range serviceLogRecords(t, logs.String()) {
+		if record.Msg == "Service: reconciled with errors" {
+			summary = &record
+			break
+		}
+	}
+	if summary == nil {
+		t.Fatal("missing service error summary")
+	}
+	if summary.Stopped == nil || *summary.Stopped != 1 {
+		t.Fatalf("stopped count = %v, want 1 completed removal before the batch error", summary.Stopped)
 	}
 }

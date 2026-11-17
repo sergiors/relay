@@ -565,7 +565,6 @@ type startupSelectionPublisher interface {
 }
 
 type startupPublicationState interface {
-	RecordReconcileSuccess(context.Context, string, string, string, time.Time, app.App, state.FencingToken) (bool, error)
 	RecordReconcileFailure(context.Context, string, error, state.FencingToken) (bool, error)
 }
 
@@ -649,15 +648,16 @@ func publishStartupApps(
 			continue
 		}
 		published = append(published, pf)
-		if st != nil && len(fn.Template.Services) == 0 {
-			// Persist the fingerprint the image was ACTUALLY built from after the
-			// registry accepted it. Service-declaring apps record success from the
-			// service convergence callback instead (see enqueueStartupServices).
-			st.RecordReconcileSuccess(
-				lifecycle, fn.Name, built.Image, built.Fingerprint, time.Now(), fn,
-				startup.fencingTokens[fn.Name],
-			)
-		}
+		// The fence accepted this generation: it is the one this worker serves.
+		// Report the publication transition only now — never for a stale
+		// rejection or a preparation-failure placeholder — with the identity the
+		// image was actually built from.
+		logger.Info("App: image published",
+			"app", fn.Name,
+			"image", built.Image,
+			"fingerprint", built.Fingerprint,
+			"outcome", "discovered",
+		)
 	}
 	if lifecycle.Err() == nil {
 		// Refresh the complete authoritative snapshot after publication. A pin that

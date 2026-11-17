@@ -3,8 +3,11 @@
 package reconciler
 
 import (
+	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,6 +40,7 @@ func TestReconcileServiceStatusPersistedPreparingReconcilingReady(t *testing.T) 
 	reg.Set([]*runner.PreparedApp{pf})
 
 	var seen []string
+	var logs testutil.SyncBuffer
 	r := New(Config{
 		Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, State: st,
 		UpdateServicesWithStatus: func(name string, _ *app.Template, image string, onReconcileStart func(), onComplete func(error)) {
@@ -51,7 +55,7 @@ func TestReconcileServiceStatusPersistedPreparingReconcilingReady(t *testing.T) 
 				seen = append(seen, d.Status)
 			}
 		},
-	}, reg, &fakeBuilder{}, testutil.DiscardLogger())
+	}, reg, &fakeBuilder{}, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	seedCurrent(r, baseFn)
 	r.SeedFencingToken(baseFn.Name, fencingToken)
 
@@ -67,6 +71,86 @@ func TestReconcileServiceStatusPersistedPreparingReconcilingReady(t *testing.T) 
 	final, _ := st.GetApp("svc-persist")
 	if final.Status != state.StatusReady {
 		t.Fatalf("final status = %q, want ready", final.Status)
+	}
+	if !strings.Contains(logs.String(), `"msg":"App: ready"`) {
+		t.Fatalf("successful state write did not produce App: ready:\n%s", logs.String())
+	}
+}
+
+func TestReconcileReadyLogSurvivesStateWriteFailure(t *testing.T) {
+	root := t.TempDir()
+	dir := writeServicesDir(t, root, "svc-state-write-error")
+	tmpl := mustParse(servicesTemplate)
+	fn := app.App{Name: "svc-state-write-error", Dir: dir, Template: tmpl}
+	st := testutil.NewState(t)
+	token := recordSuccess(t, st, fn.Name, "img-before", "fp-before", time.Now(), fn)
+	reg := &runner.Registry{}
+	reg.Set([]*runner.PreparedApp{
+		runner.NewPrepared(fn, &runtime.Prepared{Name: fn.Name, Image: "img-before"}, &fakeBuilder{}),
+	})
+	var completion func(error)
+	var logs testutil.SyncBuffer
+	r := New(Config{
+		Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, State: st,
+		UpdateServicesWithStatus: func(_ string, _ *app.Template, _ string, _ func(), onComplete func(error)) {
+			completion = onComplete
+		},
+	}, reg, &fakeBuilder{}, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	seedCurrent(r, fn)
+	r.SeedFencingToken(fn.Name, token)
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
+		t.Fatalf("write changed source: %v", err)
+	}
+
+	r.reconcileApp(fn.Name)
+	if completion == nil {
+		t.Fatal("service completion callback was not captured")
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close state before completion: %v", err)
+	}
+	completion(nil)
+	if !strings.Contains(logs.String(), `"msg":"App: ready"`) {
+		t.Fatalf("state write failure hid locally completed readiness:\n%s", logs.String())
+	}
+}
+
+func TestReconcileReadyLogSuppressedOnLifecycleCancellation(t *testing.T) {
+	root := t.TempDir()
+	dir := writeServicesDir(t, root, "svc-lifecycle-cancel")
+	tmpl := mustParse(servicesTemplate)
+	fn := app.App{Name: "svc-lifecycle-cancel", Dir: dir, Template: tmpl}
+	st := testutil.NewState(t)
+	token := recordSuccess(t, st, fn.Name, "img-before", "fp-before", time.Now(), fn)
+	reg := &runner.Registry{}
+	reg.Set([]*runner.PreparedApp{
+		runner.NewPrepared(fn, &runtime.Prepared{Name: fn.Name, Image: "img-before"}, &fakeBuilder{}),
+	})
+	var completion func(error)
+	var logs testutil.SyncBuffer
+	r := New(Config{
+		Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, State: st,
+		UpdateServicesWithStatus: func(_ string, _ *app.Template, _ string, _ func(), onComplete func(error)) {
+			completion = onComplete
+		},
+	}, reg, &fakeBuilder{}, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.ctx = ctx
+	seedCurrent(r, fn)
+	r.SeedFencingToken(fn.Name, token)
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e, context){ console.log('v2'); }\n"), 0o644); err != nil {
+		t.Fatalf("write changed source: %v", err)
+	}
+
+	r.reconcileApp(fn.Name)
+	if completion == nil {
+		t.Fatal("service completion callback was not captured")
+	}
+	cancel()
+	completion(nil)
+	if strings.Contains(logs.String(), `"msg":"App: ready"`) {
+		t.Fatalf("lifecycle-canceled completion logged ready:\n%s", logs.String())
 	}
 }
 

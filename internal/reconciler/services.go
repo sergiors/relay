@@ -67,6 +67,7 @@ package reconciler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -114,6 +115,35 @@ type Docker interface {
 	// service reconciler uses it to refuse routed services whose routing
 	// network is missing; Relay never creates networks.
 	NetworkExists(ctx context.Context, network string) (bool, error)
+}
+
+type serviceStopResult interface {
+	StopServiceContainersWithResult(
+		context.Context,
+		[]runtime.ServiceContainer,
+	) (int, error)
+}
+
+func stopServiceContainers(
+	ctx context.Context,
+	docker Docker,
+	containers []runtime.ServiceContainer,
+) (int, bool, error) {
+	if result, ok := docker.(serviceStopResult); ok {
+		count, err := result.StopServiceContainersWithResult(ctx, containers)
+		return count, true, err
+	}
+	err := docker.StopServiceContainers(ctx, containers)
+	if err != nil {
+		return 0, false, err
+	}
+	return len(containers), true, nil
+}
+
+func requestCancelled(ctx context.Context, err error) bool {
+	return ctx != nil &&
+		errors.Is(ctx.Err(), context.Canceled) &&
+		errors.Is(err, context.Canceled)
 }
 
 // ServiceRestarter is the optional in-place restart capability of a Docker
@@ -331,6 +361,25 @@ func (t *sourceApplyTracker) forgetApp(app string) {
 	}
 }
 
+// servicePass reports what one reconciliation pass actually did. changed
+// preserves the historical "any corrective action was issued" signal used by
+// callers, the no-op log-level decision, and the reconcile metric outcome;
+// started, restarted, and stopped describe the committed container transitions
+// for the operator-facing summary. superseded marks a pass that abandoned its
+// remaining work because a newer desired state replaced its request: its
+// committed counts are still real, but the summary must not present it as a
+// plain changed pass.
+type servicePass struct {
+	changed    bool
+	superseded bool
+	started    int
+	restarted  int
+	// stopped counts containers whose stop/removal completed, as reported by
+	// the runtime manager when a batch has partial failures.
+	stopped      int
+	stoppedKnown bool
+}
+
 // Reconcile converges the set of fnName's running service containers to
 // tmpl.Services (with the freshly prepared image). It is a best-effort pass:
 // per-operation failures are logged by the caller-facing style and the first
@@ -403,10 +452,11 @@ func Reconcile(
 	traefik routing.TraefikConfig,
 	log *slog.Logger,
 ) (bool, error) {
-	return reconcileWithObserver(
+	pass, err := reconcileWithObserver(
 		ctx, reconcileTimeout, docker, fnName, tmpl, appImage, preparedEnv,
 		serviceNetworks, secrets, traefik, log, "", nil, nil,
 	)
+	return pass.changed, err
 }
 
 func reconcileWithObserver(
@@ -424,7 +474,7 @@ func reconcileWithObserver(
 	nodeID string,
 	reconcileStarted func(),
 	apply *sourceApplyTracker,
-) (bool, error) {
+) (servicePass, error) {
 	// A fresh normal-operation bound for the container listing. reconcileTimeout
 	// is always positive from the worker; a non-positive value means "no
 	// normal-operation bound", so the lifecycle context bounds it directly rather
@@ -438,7 +488,7 @@ func reconcileWithObserver(
 	if err != nil {
 		// Without a listing we cannot know the running set; surface the error
 		// rather than guessing whether to start/stop anything.
-		return false, fmt.Errorf("service: list containers: %w", err)
+		return servicePass{}, fmt.Errorf("service: list containers: %w", err)
 	}
 
 	// owned reports whether a discovered container belongs to this pass: the
@@ -481,7 +531,10 @@ func reconcileWithObserver(
 	// changed reports whether any convergence action (a stop or a start
 	// attempt) was issued during this pass. It starts false and is set by the
 	// removed-service cleanup below and by the classify/start work further down.
+	// pass counts only COMMITTED container transitions for the summary line;
+	// an issued-but-failed action leaves its count unchanged.
 	changed := false
+	pass := servicePass{stoppedKnown: true}
 
 	// reconcileStarted publishes the reconciling status, but ONLY when this
 	// pass actually has corrective container work to do: a fully-converged
@@ -493,11 +546,22 @@ func reconcileWithObserver(
 	corrective := false
 	reconcileNotified := false
 	notifyReconcile := func() {
-		if reconcileStarted == nil || reconcileNotified || !corrective {
+		if reconcileNotified || !corrective {
 			return
 		}
 		reconcileNotified = true
-		reconcileStarted()
+		// The first real corrective operation is this pass's start transition.
+		// A fully-converged verification pass has no corrective work, so it
+		// never logs a start line.
+		log.Info("Service: reconciling",
+			"app", fnName,
+			"services", len(tmpl.Services),
+			"image", appImage,
+			"outcome", "started",
+		)
+		if reconcileStarted != nil {
+			reconcileStarted()
+		}
 	}
 
 	var firstErr error
@@ -587,6 +651,7 @@ func reconcileWithObserver(
 		// here cannot leave a service with no generation.
 		if abortPass || superseded() {
 			abortPass = true
+			pass.superseded = true
 			break
 		}
 
@@ -639,7 +704,9 @@ func reconcileWithObserver(
 				err := fmt.Errorf("service %q: check routing network: %w", name, err)
 				fail(err)
 				desiredFailed = true
-				log.Warn("Service: routing validation failed", "service", name, "error", err)
+				if !requestCancelled(ctx, err) {
+					log.Warn("Service: routing validation failed", "service", name, "error", err)
+				}
 				continue
 			}
 			if !ok {
@@ -690,8 +757,10 @@ func reconcileWithObserver(
 		if err != nil {
 			fail(fmt.Errorf("service %q: %w", name, err))
 			desiredFailed = true
-			log.Warn("Service: cannot resolve source; keeping existing containers",
-				"service", name, "error", err)
+			if !requestCancelled(ctx, err) {
+				log.Warn("Service: cannot resolve source; keeping existing containers",
+					"service", name, "error", err)
+			}
 			continue
 		}
 
@@ -709,7 +778,9 @@ func reconcileWithObserver(
 			postCancel()
 			fail(fmt.Errorf("service %q: %w", name, err))
 			desiredFailed = true
-			log.Warn("Service: cannot start replicas", "service", name, "error", err)
+			if !requestCancelled(ctx, err) {
+				log.Warn("Service: cannot start replicas", "service", name, "error", err)
+			}
 			continue
 		}
 		// environmentFingerprint is the desired effective environment identity. It is
@@ -917,8 +988,10 @@ func reconcileWithObserver(
 					if err := restarter.RestartServiceContainer(postCtx, restartTarget.ID); err != nil {
 						fail(fmt.Errorf("service %q replica %d: source reload restart: %w", name, slot, err))
 						desiredFailed = true
-						log.Warn("Service: source reload restart failed; keeping generation",
-							"app", fnName, "service", name, "replica", slot, "error", err)
+						if !requestCancelled(ctx, err) {
+							log.Warn("Service: source reload restart failed; keeping generation",
+								"app", fnName, "service", name, "replica", slot, "error", err)
+						}
 						// Preserve usable olds (the restart may have left the
 						// container running); a non-usable old can never serve, so
 						// it is cleaned up. The next pass retries the reload, or the
@@ -931,6 +1004,7 @@ func reconcileWithObserver(
 						continue
 					}
 					apply.record(restartTarget.ID, fnName, desiredSourceID)
+					pass.restarted++
 					for i := range olds {
 						if olds[i].ID != restartTarget.ID {
 							stale = append(stale, olds[i])
@@ -960,18 +1034,20 @@ func reconcileWithObserver(
 			if err != nil {
 				fail(fmt.Errorf("service %q replica %d: %w", name, slot, err))
 				desiredFailed = true
-				if fallback != nil {
-					// The replacement failed: preserve the slot's usable old
-					// generation(s) so the service keeps serving, and retry on
-					// the next reconcile. Leaving them out of stale is the
-					// suppression: they are not stopped this pass.
-					log.Warn("Service: replacement failed; keeping old replica",
-						"app", fnName, "service", name, "replica", slot, "error", err)
-				} else {
-					// No old fallback for this slot: retain unavailable
-					// semantics and retry on the next reconcile.
-					log.Warn("Service: replica unavailable",
-						"app", fnName, "service", name, "replica", slot, "error", err)
+				if !requestCancelled(ctx, err) {
+					if fallback != nil {
+						// The replacement failed: preserve the slot's usable old
+						// generation(s) so the service keeps serving, and retry on
+						// the next reconcile. Leaving them out of stale is the
+						// suppression: they are not stopped this pass.
+						log.Warn("Service: replacement failed; keeping old replica",
+							"app", fnName, "service", name, "replica", slot, "error", err)
+					} else {
+						// No old fallback for this slot: retain unavailable
+						// semantics and retry on the next reconcile.
+						log.Warn("Service: replica unavailable",
+							"app", fnName, "service", name, "replica", slot, "error", err)
+					}
 				}
 				// Usable olds stay as fallbacks; a non-usable old can never
 				// serve, so it is cleaned up even when the replacement failed.
@@ -985,6 +1061,7 @@ func reconcileWithObserver(
 			// StartService confirmed the replacement is running: the old
 			// generations in this slot are now safe to stop.
 			started++
+			pass.started++
 			// A replacement that superseded a usable old generation is
 			// uncommitted until this service's stale stop runs. Record it so a
 			// supersession discovered at that commit boundary can remove this
@@ -1035,8 +1112,10 @@ func reconcileWithObserver(
 		if svc.Replicas > 0 && surviving == 0 {
 			if keep, ok := lowestUsableStale(stale); ok {
 				stale = removeStaleID(stale, keep.ID)
-				log.Warn("Service: no replacement could be confirmed; keeping a running replica",
-					"app", fnName, "service", name, "replica", keep.Replica)
+				if !requestCancelled(ctx, firstErr) {
+					log.Warn("Service: no replacement could be confirmed; keeping a running replica",
+						"app", fnName, "service", name, "replica", keep.Replica)
+				}
 			}
 		}
 
@@ -1050,7 +1129,12 @@ func reconcileWithObserver(
 		if superseded() {
 			log.Info("Service: pass superseded; preserving old generation",
 				"app", fnName, "service", name)
-			cleanupProvisional(bounded, docker, fnName, name, provisional, log)
+			pass.superseded = true
+			// The provisional replacements are neither a committed start nor a
+			// committed convergence outcome: this pass removes them and leaves
+			// the old generation serving, so they must not inflate the summary.
+			pass.started -= len(provisional)
+			cleanupProvisional(ctx, bounded, docker, fnName, name, provisional, log)
 			provisional = nil
 			abortPass = true
 			postCancel()
@@ -1063,7 +1147,10 @@ func reconcileWithObserver(
 			changed = true
 			corrective = true
 			notifyReconcile()
-			if err := docker.StopServiceContainers(postCtx, stale); err != nil {
+			stopped, known, err := stopServiceContainers(postCtx, docker, stale)
+			pass.stopped += stopped
+			pass.stoppedKnown = pass.stoppedKnown && known
+			if err != nil {
 				fail(fmt.Errorf("service %q stale: %w", name, err))
 			}
 		}
@@ -1088,11 +1175,20 @@ func reconcileWithObserver(
 	// (the coalesced newer desired state, or the next periodic pass) retries the
 	// removal once the desired set converges.
 	if abortPass || superseded() {
-		log.Info("Service: pass superseded; preserving removed services",
-			"app", fnName, "removed", len(removed))
+		// A superseded pass preserves a removed name's running containers: they
+		// may be the only usable generation for the service a rename replaces.
+		// With nothing to preserve this phase did no work, so it is neither
+		// logged nor allowed to mark an otherwise completed pass superseded.
+		if len(removed) > 0 {
+			pass.superseded = true
+			log.Info("Service: pass superseded; preserving removed services",
+				"app", fnName, "removed", len(removed))
+		}
 	} else if len(removed) > 0 && desiredFailed {
-		log.Warn("Service: desired services did not converge; preserving removed services",
-			"app", fnName, "removed", len(removed))
+		if !requestCancelled(ctx, firstErr) {
+			log.Warn("Service: desired services did not converge; preserving removed services",
+				"app", fnName, "removed", len(removed))
+		}
 	} else if len(removed) > 0 {
 		sort.Slice(removed, func(i, j int) bool { return removed[i].ID < removed[j].ID })
 		changed = true
@@ -1102,13 +1198,17 @@ func reconcileWithObserver(
 		if reconcileTimeout > 0 {
 			stopCtx, stopCancel = context.WithTimeout(ctx, reconcileTimeout)
 		}
-		if err := docker.StopServiceContainers(stopCtx, removed); err != nil {
+		stopped, known, err := stopServiceContainers(stopCtx, docker, removed)
+		pass.stopped += stopped
+		pass.stoppedKnown = pass.stoppedKnown && known
+		if err != nil {
 			fail(fmt.Errorf("service removed: %w", err))
 		}
 		stopCancel()
 	}
 
-	return changed, firstErr
+	pass.changed = changed
+	return pass, firstErr
 }
 
 // cleanupProvisional removes the replacement containers a single pass started
@@ -1118,6 +1218,7 @@ func reconcileWithObserver(
 // provisional container is a non-converged generation the next reconcile
 // replaces, exactly like any other stale candidate.
 func cleanupProvisional(
+	lifecycleCtx context.Context,
 	bounded func() (context.Context, context.CancelFunc),
 	docker Docker,
 	fnName, name string,
@@ -1130,8 +1231,10 @@ func cleanupProvisional(
 	stopCtx, stopCancel := bounded()
 	defer stopCancel()
 	if err := docker.StopServiceContainers(stopCtx, provisional); err != nil {
-		log.Warn("Service: remove provisional replacement failed",
-			"app", fnName, "service", name, "count", len(provisional), "error", err)
+		if !requestCancelled(lifecycleCtx, err) {
+			log.Warn("Service: remove provisional replacement failed",
+				"app", fnName, "service", name, "count", len(provisional), "error", err)
+		}
 	}
 }
 
@@ -1476,11 +1579,15 @@ func NewServiceReconciler(
 }
 
 // Apply converges fnName's services to tmpl+image: it runs Reconcile and logs
-// the outcome — Info when the pass changed state, Debug when it was a no-op
-// verification pass, Warn when it errored. It is intentionally non-fatal: a
-// service-convergence failure must not fail the app's reconcile. The
-// Info/Debug distinction means an unchanged app (periodic self-healing
+// the outcome — Info when the pass changed state or was superseded after
+// issuing work, Debug when it was a no-op verification pass (or a superseded
+// pass that issued nothing), Warn when it errored. It is intentionally
+// non-fatal: a service-convergence failure must not fail the app's reconcile.
+// The Info/Debug distinction means an unchanged app (periodic self-healing
 // tick) does not log at Info; only converges that actually changed or failed do.
+// A superseded pass reports outcome=superseded with its committed counts
+// instead of a plain changed outcome, because a newer desired state owns the
+// remaining convergence.
 //
 // ctx is the LIFECYCLE context, NOT a pre-bounded pass budget: Reconcile
 // derives its own fresh per-operation bounds from it and the injected
@@ -1520,25 +1627,86 @@ func (c *ServiceReconciler) apply(
 	// is the closed changed/unchanged/error set. A nil registry is a no-op. The
 	// app label is the existing bounded dimension.
 	start := time.Now()
-	changed, err := reconcileWithObserver(
+	pass, err := reconcileWithObserver(
 		ctx, c.reconcileTimeout, c.docker, fnName, tmpl, image, preparedEnv,
 		c.networks, c.secrets, c.traefik, c.log, c.nodeID, reconcileStarted,
 		c.sourceApply,
 	)
-	c.observeReconcile(fnName, changed, err, time.Since(start))
+	duration := time.Since(start)
+	c.observeReconcile(fnName, pass.changed, err, duration)
 	if err != nil {
-		c.log.Warn("Service: reconciled with errors",
+		if errors.Is(err, context.Canceled) && errors.Is(ctx.Err(), context.Canceled) {
+			attrs := []any{
+				"app", fnName,
+				"image", image,
+				"services", len(tmpl.Services),
+				"replicas", replicas,
+				"started", pass.started,
+				"restarted", pass.restarted,
+				"duration", duration,
+				"outcome", "cancelled",
+				"error", err,
+			}
+			if pass.stoppedKnown {
+				attrs = append(attrs, "stopped", pass.stopped)
+			}
+			c.log.Debug("Service: reconciliation cancelled", attrs...)
+			return err
+		}
+		// The error stays the operator-relevant outcome (and the metric), with
+		// superseded carried alongside so an abandoned pass is still visible.
+		attrs := []any{
 			"app", fnName,
-			"replicas", replicas,
-			"error", err,
-		)
-		return err
-	}
-	if changed {
-		c.log.Info("Service: reconciled",
-			"app", fnName,
+			"image", image,
 			"services", len(tmpl.Services),
 			"replicas", replicas,
+			"started", pass.started,
+			"restarted", pass.restarted,
+			"superseded", pass.superseded,
+			"duration", duration,
+			"outcome", "error",
+			"error", err,
+		}
+		if pass.stoppedKnown {
+			attrs = append(attrs, "stopped", pass.stopped)
+		}
+		c.log.Warn("Service: reconciled with errors", attrs...)
+		return err
+	}
+	if pass.superseded {
+		// The request was replaced by a newer desired state, so the pass may have
+		// committed some transitions while deliberately leaving the rest to the
+		// newer pass. Report the actual outcome instead of a plain changed pass;
+		// the level follows the same rule as changed, so a pass that issued no
+		// corrective work stays at Debug rather than adding an Info line.
+		logAt := c.log.Debug
+		if pass.changed {
+			logAt = c.log.Info
+		}
+		logAt("Service: superseded",
+			"app", fnName,
+			"image", image,
+			"services", len(tmpl.Services),
+			"replicas", replicas,
+			"started", pass.started,
+			"restarted", pass.restarted,
+			"stopped", pass.stopped,
+			"duration", duration,
+			"outcome", "superseded",
+		)
+		return nil
+	}
+	if pass.changed {
+		c.log.Info("Service: reconciled",
+			"app", fnName,
+			"image", image,
+			"services", len(tmpl.Services),
+			"replicas", replicas,
+			"started", pass.started,
+			"restarted", pass.restarted,
+			"stopped", pass.stopped,
+			"duration", duration,
+			"outcome", "changed",
 		)
 		return nil
 	}
@@ -1546,6 +1714,8 @@ func (c *ServiceReconciler) apply(
 		"app", fnName,
 		"services", len(tmpl.Services),
 		"replicas", replicas,
+		"duration", duration,
+		"outcome", "unchanged",
 	)
 	return nil
 }

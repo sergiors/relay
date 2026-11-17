@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"maps"
 	"sort"
@@ -673,14 +674,26 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 	// stale).
 	discard := func(reason string, cause error) error {
 		if rmErr := removeContainerContext(ctx, m.cli, id); rmErr != nil {
-			m.log.Warn("Service: discard failed container",
-				"app", spec.App,
-				"service", spec.Name,
-				"replica", replica,
-				"container", id,
-				"reason", reason,
-				"error", rmErr,
-			)
+			if serviceOperationCancelled(ctx, rmErr) {
+				m.log.Debug("Service: discard failed container",
+					"app", spec.App,
+					"service", spec.Name,
+					"replica", replica,
+					"container", id,
+					"reason", reason,
+					"outcome", "cancelled",
+					"error", rmErr,
+				)
+			} else {
+				m.log.Warn("Service: discard failed container",
+					"app", spec.App,
+					"service", spec.Name,
+					"replica", replica,
+					"container", id,
+					"reason", reason,
+					"error", rmErr,
+				)
+			}
 		}
 		return cause
 	}
@@ -706,7 +719,9 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		"app", spec.App,
 		"service", spec.Name,
 		"replica", replica,
+		"image", spec.Image,
 		"container", id,
+		"outcome", "started",
 	)
 	return id, nil
 }
@@ -743,7 +758,10 @@ func (m *Manager) RestartServiceContainer(ctx context.Context, containerID strin
 	if insp.Container.State == nil || !insp.Container.State.Running {
 		return fmt.Errorf("service: restarted container is not running")
 	}
-	m.log.Info("Service: restarted", "container", containerID)
+	m.log.Info("Service: restarted",
+		"container", containerID,
+		"outcome", "restarted",
+	)
 	return nil
 }
 
@@ -1006,7 +1024,18 @@ func (m *Manager) VerifyNetworks(ctx context.Context, networks []string) (string
 // round trip. The first context error is returned (via the removal/stop error)
 // like any other failure.
 func (m *Manager) StopServiceContainers(ctx context.Context, containers []ServiceContainer) error {
-	return m.stopServiceContainers(ctx, containers, m.beginDockerOp)
+	_, err := m.StopServiceContainersWithResult(ctx, containers)
+	return err
+}
+
+// StopServiceContainersWithResult is the result-bearing form used by
+// reconciliation summaries. completed counts containers whose stop/removal
+// finished successfully; per-container failures still do not abort later work.
+func (m *Manager) StopServiceContainersWithResult(
+	ctx context.Context,
+	containers []ServiceContainer,
+) (completed int, err error) {
+	return m.stopServiceContainersWithResult(ctx, containers, m.beginDockerOp)
 }
 
 // ShutdownStopServiceContainers is the shutdown-only form of
@@ -1020,22 +1049,24 @@ func (m *Manager) StopServiceContainers(ctx context.Context, containers []Servic
 // cancellation checks, so a shutdown step that exceeded its bound still unwinds
 // promptly.
 func (m *Manager) ShutdownStopServiceContainers(ctx context.Context, containers []ServiceContainer) error {
-	return m.stopServiceContainers(ctx, containers, m.beginShutdownCleanupOp)
+	_, err := m.stopServiceContainersWithResult(ctx, containers, m.beginShutdownCleanupOp)
+	return err
 }
 
-func (m *Manager) stopServiceContainers(
+func (m *Manager) stopServiceContainersWithResult(
 	ctx context.Context,
 	containers []ServiceContainer,
 	admit dockerOpAdmitter,
-) error {
+) (int, error) {
 	callerCtx := ctx
 	opCtx, release, err := admit(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer release()
 	ctx = opCtx
 	var firstErr error
+	completed := 0
 	for _, c := range containers {
 		if err := ctx.Err(); err != nil {
 			if firstErr == nil {
@@ -1049,12 +1080,14 @@ func (m *Manager) stopServiceContainers(
 				if firstErr == nil {
 					firstErr = err
 				}
-				m.log.Warn("Service: stop container failed",
-					"container", c.ID,
-					"app", c.App,
-					"service", c.Name,
-					"error", err,
-				)
+				if !serviceOperationCancelled(ctx, err) {
+					m.log.Warn("Service: stop container failed",
+						"container", c.ID,
+						"app", c.App,
+						"service", c.Name,
+						"error", err,
+					)
+				}
 				continue
 			}
 		}
@@ -1062,18 +1095,28 @@ func (m *Manager) stopServiceContainers(
 			if firstErr == nil {
 				firstErr = err
 			}
-			m.log.Warn("Service: remove container failed",
-				"container", c.ID,
-				"app", c.App,
-				"service", c.Name,
-				"error", err,
-			)
+			if !serviceOperationCancelled(ctx, err) {
+				m.log.Warn("Service: remove container failed",
+					"container", c.ID,
+					"app", c.App,
+					"service", c.Name,
+					"error", err,
+				)
+			}
+		} else {
+			completed++
 		}
 	}
 	// A failure that concludes after Manager shutdown began is classified as the
 	// terminal ErrManagerShuttingDown deferral rather than a spurious cleanup
 	// failure; a genuine caller-owned cancellation is returned unchanged.
-	return m.classifyDockerErr(callerCtx, firstErr)
+	return completed, m.classifyDockerErr(callerCtx, firstErr)
+}
+
+func serviceOperationCancelled(ctx context.Context, err error) bool {
+	return ctx != nil &&
+		errors.Is(ctx.Err(), context.Canceled) &&
+		errors.Is(err, context.Canceled)
 }
 
 // RemoveAppServiceContainers stops and removes every service container
