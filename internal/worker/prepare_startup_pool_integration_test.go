@@ -6,8 +6,11 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"relay/internal/app"
+	"relay/internal/reconciler"
+	"relay/internal/routing"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/state"
@@ -59,8 +62,9 @@ func TestPrepareAppsStartupUsesExactPerAppFencingToken(t *testing.T) {
 
 	// Supersede alpha's desired generation AFTER its token was captured, so the
 	// value in the fencing-token map is stale while beta's stays exact.
+	const newerDesiredFingerprint = "newer-alpha-desired"
 	newerAlpha, err := st.RecordDiscoveredWithFingerprint(
-		context.Background(), byName["fence-alpha"].App, byName["fence-alpha"].Fingerprint)
+		context.Background(), byName["fence-alpha"].App, newerDesiredFingerprint)
 	if err != nil {
 		t.Fatalf("supersede alpha: %v", err)
 	}
@@ -105,21 +109,49 @@ func TestPrepareAppsStartupUsesExactPerAppFencingToken(t *testing.T) {
 		}
 	}
 
+	for _, name := range []string{"fence-alpha", "fence-beta"} {
+		detail, ok := st.GetApp(name)
+		if !ok {
+			t.Fatalf("expected a %s row after publication", name)
+		}
+		if detail.Fingerprint != "" || detail.Status == state.StatusReady ||
+			detail.LastReconcileStatus == state.ReconcileSuccess {
+			t.Fatalf("%s startup publication recorded success before service completion: %+v", name, detail)
+		}
+	}
+
+	docker := newCtxRecordDocker()
+	serviceReconciler := reconciler.NewServiceReconciler(
+		docker, nil, routing.TraefikConfig{}, discardLogger(), reconcileTimeout,
+	)
+	coordinator, stop := startCoordinatorFixture(t, serviceReconciler)
+	defer stop()
+	enqueueStartupServicesWithState(
+		context.Background(), published, coordinator, st, tokens, discardLogger(),
+	)
+	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := coordinator.Wait(waitCtx); err != nil {
+		t.Fatalf("wait for startup service completion: %v", err)
+	}
+
 	alpha, ok := st.GetApp("fence-alpha")
 	if !ok {
-		t.Fatal("expected a fence-alpha row (the later desired write created it)")
+		t.Fatal("expected a fence-alpha row after service completion")
+	}
+	if alpha.DesiredFingerprint != newerDesiredFingerprint {
+		t.Fatalf("stale alpha callback changed desired fingerprint to %q, want newer identity %q",
+			alpha.DesiredFingerprint, newerDesiredFingerprint)
 	}
 	if alpha.Fingerprint != "" {
-		t.Fatalf("stale alpha success published an active fingerprint %q; it must affect no row", alpha.Fingerprint)
+		t.Fatalf("stale alpha callback published active fingerprint %q; it must affect no row", alpha.Fingerprint)
 	}
-	if alpha.Status == state.StatusReady {
-		t.Fatalf("stale alpha success published a ready row (%s); it must be rejected", alpha.Status)
+	if alpha.Status != state.StatusPreparing {
+		t.Fatalf("stale alpha callback changed status to %q, want the newer discovered row unchanged", alpha.Status)
 	}
-	if alpha.LastReconcileStatus == state.ReconcileSuccess {
-		t.Fatalf("stale alpha success rewrote the outcome to %q; it must be rejected", alpha.LastReconcileStatus)
-	}
-	if alpha.DesiredFingerprint == "" {
-		t.Fatal("the newer desired generation must still be persisted")
+	if alpha.LastReconcileStatus != "" {
+		t.Fatalf("stale alpha callback changed reconcile outcome to %q, want unchanged empty outcome",
+			alpha.LastReconcileStatus)
 	}
 
 	beta, ok := st.GetApp("fence-beta")

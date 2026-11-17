@@ -7,8 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"relay/internal/app"
+	"relay/internal/reconciler"
+	"relay/internal/routing"
 	"relay/internal/runner"
 	"relay/internal/state"
 	"relay/internal/testutil"
@@ -154,8 +157,34 @@ func TestStartupBuiltFingerprintIsReturnedIdentity(t *testing.T) {
 	if !ok {
 		t.Fatal("expected a runtime-fn row")
 	}
+	if detail.Fingerprint != "" || detail.Status == state.StatusReady {
+		t.Fatalf("startup publication recorded success before service completion: %+v", detail)
+	}
+
+	docker := newCtxRecordDocker()
+	serviceReconciler := reconciler.NewServiceReconciler(
+		docker, nil, routing.TraefikConfig{}, discardLogger(), reconcileTimeout,
+	)
+	coordinator, stop := startCoordinatorFixture(t, serviceReconciler)
+	defer stop()
+	enqueueStartupServicesWithState(
+		context.Background(), published, coordinator, st, fencingTokens, discardLogger(),
+	)
+	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := coordinator.Wait(waitCtx); err != nil {
+		t.Fatalf("wait for startup service completion: %v", err)
+	}
+
+	detail, ok = st.GetApp("runtime-fn")
+	if !ok {
+		t.Fatal("expected a runtime-fn row after service completion")
+	}
 	if detail.Fingerprint != builtIdentity {
 		t.Fatalf("persisted active fingerprint = %q, want the built identity %q (not a post-build rescan %q)",
 			detail.Fingerprint, builtIdentity, onDisk)
+	}
+	if detail.Status != state.StatusReady {
+		t.Fatalf("status = %s after service completion, want ready", detail.Status)
 	}
 }
