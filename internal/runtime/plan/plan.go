@@ -18,8 +18,13 @@ const (
 )
 
 type Spec struct {
-	Name      string
-	Engine    Engine
+	Name   string
+	Engine Engine
+	// BaseImage is the base reference the image is built FROM: the configured
+	// base image for an unpinned runtime, or the configured reference pinned to
+	// the selected multi-platform index digest ("<ref>@sha256:<hex>") when the
+	// caller captured a pin. The engine records it verbatim in the generated
+	// runtime metadata, so a caller must pass the EFFECTIVE reference.
 	BaseImage string
 	// MountableSource reports whether this runtime's dependency layout lets the
 	// app source be bind-mounted read-only instead of baked (HOT_RELOAD)

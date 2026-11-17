@@ -473,6 +473,19 @@ func (m *Manager) prepare(
 		spec.PythonZuvloop = m.pythonZuvloop
 	}
 
+	// buildSpec is the runtime spec the IMAGE builds use. A pinned runtime builds
+	// FROM configured-ref@digest — the multi-platform index digest exactly as
+	// selected, with no registry/child-digest lookup — while the dependency
+	// fingerprint below deliberately keeps the configured tag as its input and
+	// hashes the immutable selection separately. The explicit target platform is
+	// carried by buildTargetPlatform on every build. The engine plans THIS spec,
+	// so the plan's base reference and the generated runtime metadata record
+	// exactly the reference the image is built FROM.
+	buildSpec := spec
+	if runtimeSelection.pinned() {
+		buildSpec.BaseImage = runtimeSelection.baseImage()
+	}
+
 	// sourceHostPath is the path the Docker daemon must be given for the live
 	// source bind. Under the bundled Compose layout Relay runs in a container
 	// whose /apps is a host bind mount, so fn.Dir (/apps/foo) is NOT
@@ -490,7 +503,7 @@ func (m *Manager) prepare(
 	}
 
 	handlers := templateHandlers(fn)
-	planResult, err := eng.Plan(spec, fn.Dir, handlers)
+	planResult, err := eng.Plan(buildSpec, fn.Dir, handlers)
 	if err != nil {
 		return nil, fmt.Errorf("app %q: plan: %w", fn.Name, err)
 	}
@@ -556,16 +569,6 @@ func (m *Manager) prepare(
 		depRef = depImageRef(depFingerprint)
 	}
 
-	// buildSpec is the runtime spec the IMAGE builds use. A pinned runtime builds
-	// FROM configured-ref@digest — the multi-platform index digest exactly as
-	// selected, with no registry/child-digest lookup — while the dependency
-	// fingerprint above deliberately kept the configured tag as its input and
-	// hashed the immutable selection separately. The explicit target platform is
-	// carried by buildTargetPlatform on every build.
-	buildSpec := spec
-	if runtimeSelection.pinned() {
-		buildSpec.BaseImage = runtimeSelection.baseImage()
-	}
 	// planResult.BaseImage is the app image's FROM for a dependency-less build.
 	// With deps it is replaced by the dependency reference below; the rendered
 	// Dockerfile for HOT_RELOAD hashes whichever base is in effect here plus the

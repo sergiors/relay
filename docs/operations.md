@@ -116,9 +116,11 @@ tracing setup error is non-fatal; Relay continues without tracing. See
 ### Logging
 
 `LOG_LEVEL` controls Relay's logs. Handler stdout and stderr are available
-through native Docker container logs; Relay does not forward or enrich them
-with per-invocation context. Treat handler output as application data and avoid
-printing secrets.
+through native Docker container logs. Runtime bootstraps write `INIT_START`
+once per process and `START`/`END` records with the invocation request ID.
+These lifecycle records do not alter or enrich handler output. An `END` record
+may be absent when an invocation is interrupted or its process is terminated.
+Treat handler output as application data and avoid printing secrets.
 
 ## Secrets
 

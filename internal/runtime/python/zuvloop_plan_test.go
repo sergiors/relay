@@ -190,7 +190,7 @@ func TestPlanZuvloopEnabledSharedAssertions(t *testing.T) {
 	if strings.Contains(enabledContent, zuvloopDisabledMarker) {
 		t.Error("enabled bootstrap must not carry the disabled marker")
 	}
-	for _, want := range []string{zuvloopImportLine, zuvloopFactoryCall, "def main():", `asyncio.run(runtime_loop()`} {
+	for _, want := range []string{zuvloopImportLine, zuvloopFactoryCall, "def main():", `asyncio.run(runtime_loop(config)`} {
 		if !strings.Contains(enabledContent, want) {
 			t.Errorf("enabled bootstrap must contain %q", want)
 		}

@@ -7,6 +7,7 @@
 package node
 
 import (
+	"embed"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -20,8 +21,27 @@ import (
 	"relay/internal/runtime/plan"
 )
 
+const (
+	// resolveHookFile is the shared resolve hook module. It is embedded like
+	// every other module but written into the image only for a source-mounted
+	// app (see ResolveHookPath); a baked image must not carry it.
+	resolveHookFile = "resolve-hook.mjs"
+	// relayDir is the in-image directory holding the embedded runtime modules.
+	relayDir = "/relay"
+)
+
 //go:embed bootstrap.mjs
 var bootstrap []byte
+
+// runtimeModules embeds every ESM module in this package directory, so the
+// runtime ships the bootstrap together with the protocol, handler, invocation,
+// and lifecycle modules it imports. The glob keeps the Go side in step with the
+// bootstrap's own file set: a module added beside the bootstrap is embedded and
+// written into every image without a second list that could silently omit it.
+// The resolve hook is embedded too but planned per image (see runtimeFiles).
+//
+//go:embed *.mjs
+var runtimeModules embed.FS
 
 // Bootstrap exposes the embedded bootstrap so tests can verify its content.
 var Bootstrap = bootstrap
@@ -258,6 +278,34 @@ func (s handlerSource) outPath() string {
 	return path.Join(workDir, strings.TrimSuffix(s.rel, ext)+".mjs")
 }
 
+// runtimeFiles returns the embedded Node runtime modules as plan files, each at
+// its path under relayDir. The shared resolve hook is deliberately excluded: it
+// belongs to a source-mounted image only (Plan appends it explicitly), so a
+// baked image keeps the historical file set.
+func runtimeFiles() ([]plan.File, error) {
+	entries, err := fs.ReadDir(runtimeModules, ".")
+	if err != nil {
+		return nil, fmt.Errorf("node runtime modules: %w", err)
+	}
+	files := make([]plan.File, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".mjs") || name == resolveHookFile {
+			continue
+		}
+		content, err := runtimeModules.ReadFile(name)
+		if err != nil {
+			return nil, fmt.Errorf("node runtime module %s: %w", name, err)
+		}
+		files = append(files, plan.File{
+			Path:    path.Join(relayDir, name),
+			Content: content,
+			Mode:    fs.FileMode(0o644),
+		})
+	}
+	return files, nil
+}
+
 // Plan returns the generic build plan for a Node.js app. It only inspects
 // fnDir (for package.json, pnpm-lock.yaml, tsconfig.json, and the handler
 // sources) and never writes into it; any injected file is returned for the
@@ -288,11 +336,15 @@ func (s handlerSource) outPath() string {
 // container starts. The mounted plan is a deterministic function of non-source
 // inputs only, so a source-only edit reuses the same image tag.
 func (Engine) Plan(spec plan.Spec, fnDir string, handlers []string) (plan.BuildPlan, error) {
-	files := []plan.File{{
-		Path:    "/relay/bootstrap.mjs",
-		Content: bootstrap,
-		Mode:    fs.FileMode(0o644),
-	}}
+	files, err := runtimeFiles()
+	if err != nil {
+		return plan.BuildPlan{}, err
+	}
+	metadata, err := plan.RuntimeMetadataFile(spec)
+	if err != nil {
+		return plan.BuildPlan{}, err
+	}
+	files = append(files, metadata)
 
 	// The app's dependency layer is derived from its manifests. dependencyPlan
 	// enforces the pnpm-only policy: a package.json must ship a pnpm-lock.yaml,

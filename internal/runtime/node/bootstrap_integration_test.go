@@ -21,10 +21,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -222,60 +224,93 @@ func writeMountedModule(t *testing.T, root, modPath, src string) {
 	}
 }
 
-// bootstrapFor returns the embedded bootstrap with the baked source root
-// rewritten to root/app, mirroring the in-image layout.
-func bootstrapFor(root string) string {
-	bs := rewriteBootstrapRoots(string(Bootstrap), root)
-	return strings.Replace(
-		bs,
-		`const SOURCE_ROOT = MOUNTED ? MOUNT_ROOT : BAKED_ROOT;`,
-		fmt.Sprintf(`const SOURCE_ROOT = %s;`, quote(filepath.Join(root, "app"))),
-		1,
-	)
+// writeRuntimeModules materializes every embedded Node runtime module beside
+// the bootstrap (root/relay), mirroring the image's /relay directory: the
+// entrypoint bootstrap.mjs plus the sibling modules it imports. Each module's
+// in-image constants (the source roots, the mount target, the generated
+// overlay, the persisted esbuild path, and the runtime metadata path) are
+// rewritten to the test's fake layout — the same rewrite the single-file
+// bootstrap applied before the runtime was split. The metadata constant points
+// at root/relay/runtime-metadata.json, so a test stages one exactly when it
+// wants INIT_START, like the image always carries. mounted selects the
+// HOT_RELOAD layout; a baked layout keeps the mounted conditional absent.
+func writeRuntimeModules(t *testing.T, root string, mounted bool) {
+	t.Helper()
+	entries, err := fs.ReadDir(runtimeModules, ".")
+	if err != nil {
+		t.Fatalf("read embedded runtime modules: %v", err)
+	}
+	relayDir := filepath.Join(root, "relay")
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".mjs") || name == resolveHookFile {
+			continue
+		}
+		content, err := runtimeModules.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read embedded module %s: %v", name, err)
+		}
+		if err := os.MkdirAll(relayDir, 0o755); err != nil {
+			t.Fatalf("mkdir relay: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(relayDir, name),
+			[]byte(rewriteModuleLayout(string(content), root, mounted)), 0o644); err != nil {
+			t.Fatalf("write module %s: %v", name, err)
+		}
+	}
 }
 
-// rewriteBootstrapRoots rewrites the baked (dependency) root to root/app, which
-// is independent of source-mount mode: the managed API always lives in
-// BAKED_ROOT/node_modules and the ESM resolve hook re-anchors bare imports there.
-func rewriteBootstrapRoots(bs, root string) string {
-	return strings.Replace(
-		bs,
+// rewriteModuleLayout applies the fake in-image layout to one embedded module:
+// BAKED_ROOT always points at root/app (the dependency root and the fallback
+// source root); mount mode preserves the MOUNTED conditional (the process runs
+// with the --source-mount flag) and re-anchors the mount root, the generated
+// overlay, and the persisted esbuild binary under the test root, while a baked
+// process pins the SOURCE_ROOT directly at root/app. The lifecycle module's
+// static metadata path is mirrored to root/relay for every layout.
+func rewriteModuleLayout(content, root string, mounted bool) string {
+	content = strings.Replace(
+		content,
 		`const BAKED_ROOT = "/app";`,
 		fmt.Sprintf(`const BAKED_ROOT = %s;`, quote(filepath.Join(root, "app"))),
+		-1,
+	)
+	content = strings.Replace(
+		content,
+		`const RUNTIME_METADATA_PATH = "/relay/runtime-metadata.json";`,
+		fmt.Sprintf(`const RUNTIME_METADATA_PATH = %s;`, quote(filepath.Join(root, "relay", "runtime-metadata.json"))),
 		1,
 	)
-}
-
-// bootstrapForMounted returns the embedded bootstrap rewritten for a
-// source-mounted layout: the mount root becomes root/app/src (a subdirectory of
-// the fake /app, mirroring the real /app/src so /app/node_modules stays an
-// ancestor for bare-import resolution), the baked fallback stays root/app, and
-// the generated overlay root and esbuild path are redirected under root so a test
-// can exercise mount-mode resolution without touching the real filesystem.
-func bootstrapForMounted(root string) string {
-	bs := rewriteBootstrapRoots(string(Bootstrap), root)
-	bs = strings.Replace(
-		bs,
-		`const SOURCE_ROOT = MOUNTED ? MOUNT_ROOT : BAKED_ROOT;`,
-		fmt.Sprintf(`const SOURCE_ROOT = MOUNTED ? MOUNT_ROOT : %s;`, quote(filepath.Join(root, "app"))),
-		1,
-	)
-	bs = strings.Replace(
-		bs,
-		`const MOUNT_ROOT = "/app/src";`,
-		fmt.Sprintf(`const MOUNT_ROOT = %s;`, quote(filepath.Join(root, "app", "src"))),
-		1,
-	)
-	bs = strings.Replace(
-		bs,
-		`const GENERATED_ROOT = "/tmp/relay-gen";`,
-		fmt.Sprintf(`const GENERATED_ROOT = %s;`, quote(filepath.Join(root, "gen"))),
-		1,
-	)
+	if mounted {
+		content = strings.Replace(
+			content,
+			`const SOURCE_ROOT = MOUNTED ? MOUNT_ROOT : BAKED_ROOT;`,
+			fmt.Sprintf(`const SOURCE_ROOT = MOUNTED ? MOUNT_ROOT : %s;`, quote(filepath.Join(root, "app"))),
+			1,
+		)
+		content = strings.Replace(
+			content,
+			`const MOUNT_ROOT = "/app/src";`,
+			fmt.Sprintf(`const MOUNT_ROOT = %s;`, quote(filepath.Join(root, "app", "src"))),
+			1,
+		)
+		content = strings.Replace(
+			content,
+			`const GENERATED_ROOT = "/tmp/relay-gen";`,
+			fmt.Sprintf(`const GENERATED_ROOT = %s;`, quote(filepath.Join(root, "gen"))),
+			1,
+		)
+		content = strings.Replace(
+			content,
+			`const ESBUILD_BIN = "/relay/esbuild/node_modules/.bin/esbuild";`,
+			fmt.Sprintf(`const ESBUILD_BIN = %s;`, quote(filepath.Join(root, "esbuild"))),
+			1,
+		)
+		return content
+	}
 	return strings.Replace(
-		bs,
-		`const ESBUILD_BIN = "/relay/esbuild/node_modules/.bin/esbuild";`,
-		fmt.Sprintf(`const ESBUILD_BIN = %s;`, quote(filepath.Join(root, "esbuild"))),
+		content,
+		`const SOURCE_ROOT = MOUNTED ? MOUNT_ROOT : BAKED_ROOT;`,
+		fmt.Sprintf(`const SOURCE_ROOT = %s;`, quote(filepath.Join(root, "app"))),
 		1,
 	)
 }
@@ -290,7 +325,7 @@ func bootstrapForMounted(root string) string {
 //	RELAY_TEST_SYSTEM=system-value        (a key Relay never touches)
 func startNode(t *testing.T, root string) *nodeProc {
 	t.Helper()
-	return startNodeScript(t, root, bootstrapFor(root))
+	return startNodeScript(t, root, string(Bootstrap))
 }
 
 // resolveHookForMounted returns the embedded shared resolve hook rewritten for
@@ -331,19 +366,24 @@ func startNodeMounted(t *testing.T, root string) *nodeProc {
 	if err := os.WriteFile(hookPath, []byte(resolveHookForMounted(root)), 0o644); err != nil {
 		t.Fatalf("write resolve hook: %v", err)
 	}
-	return startNodeScriptArgs(t, root, bootstrapForMounted(root), "--source-mount")
+	return startNodeScriptArgs(t, root, string(Bootstrap), "--source-mount")
 }
 
 func startNodeScript(t *testing.T, root, bs string) *nodeProc {
 	return startNodeScriptArgs(t, root, bs)
 }
 
-// startNodeScriptArgs writes bs to root/relay/bootstrap.mjs and runs it as a
-// live process on its OWN reserved loopback port, completing one authenticated
-// channel before returning. The spawn retries with a fresh port when the child
-// loses the bind race with another concurrent test package.
+// startNodeScriptArgs materializes the embedded runtime module set beside the
+// bootstrap, writes bs to root/relay/bootstrap.mjs, and runs it as a live
+// process on its OWN reserved loopback port, completing one authenticated
+// channel before returning. The mount-mode module layout is selected from the
+// presence of the ENTRYPOINT's --source-mount flag. The spawn retries with a
+// fresh port when the child loses the bind race with another concurrent test
+// package.
 func startNodeScriptArgs(t *testing.T, root, bs string, args ...string) *nodeProc {
 	t.Helper()
+	mounted := slices.Contains(args, sourceMountFlag)
+	writeRuntimeModules(t, root, mounted)
 	bsPath := filepath.Join(root, "relay", "bootstrap.mjs")
 	if err := os.WriteFile(bsPath, []byte(bs), 0o644); err != nil {
 		t.Fatalf("write bootstrap: %v", err)
@@ -377,8 +417,9 @@ func startNodeScriptArgs(t *testing.T, root, bs string, args ...string) *nodePro
 // session is authenticated, admission closes every further connection).
 func startNodeUnauthenticated(t *testing.T, root string) *nodeProc {
 	t.Helper()
+	writeRuntimeModules(t, root, false)
 	bsPath := filepath.Join(root, "relay", "bootstrap.mjs")
-	if err := os.WriteFile(bsPath, []byte(bootstrapFor(root)), 0o644); err != nil {
+	if err := os.WriteFile(bsPath, []byte(Bootstrap), 0o644); err != nil {
 		t.Fatalf("write bootstrap: %v", err)
 	}
 	return spawnNodeProcess(t, bsPath, nil)
@@ -758,11 +799,13 @@ export function send(event, context) {
 			t.Fatalf("invoke %d failed: %s", i+1, r.Err)
 		}
 	}
-	if got := strings.TrimSpace(r1.Out); got != "count=1" {
-		t.Errorf("first count out = %q, want count=1", got)
+	// The invocation window carries the START/END lifecycle lines beside the
+	// app prints; match the count prints wherever they land in the window.
+	if !strings.Contains(r1.Out, "count=1") {
+		t.Errorf("first count out = %q, want count=1", r1.Out)
 	}
-	if got := strings.TrimSpace(r2.Out); got != "count=2" {
-		t.Errorf("second count out = %q, want count=2 (module state persisted, interpreter stayed alive)", got)
+	if !strings.Contains(r2.Out, "count=2") {
+		t.Errorf("second count out = %q, want count=2 (module state persisted, interpreter stayed alive)", r2.Out)
 	}
 	if !strings.Contains(r3.Out, "send hi") {
 		t.Errorf("third invoke (different handler) out = %q, want it to contain 'send hi'", r3.Out)
@@ -1132,7 +1175,7 @@ exports.handler = function (event, context) {
 		t.Fatalf("write resolve hook: %v", err)
 	}
 	absPath := filepath.Join(root, "app", "src", "local.cjs")
-	p := startNodeScriptArgs(t, root, bootstrapForMounted(root), "--source-mount", absPath)
+	p := startNodeScriptArgs(t, root, string(Bootstrap), "--source-mount", absPath)
 	r := p.invoke(t, "index.handler", `{}`, nil)
 	if !r.OK {
 		t.Fatalf("mounted invoke failed: %s", r.Err)
@@ -2151,9 +2194,16 @@ export function remain(event, context) {
 		if !r.OK {
 			t.Fatalf("invoke with deadline %q failed: %s", deadline, r.Err)
 		}
-		msText, ok := strings.CutPrefix(strings.TrimSpace(r.Out), "ms=")
-		if !ok {
-			t.Fatalf("out = %q, want ms=<int>", r.Out)
+		// The invocation window carries the START/END lifecycle lines beside
+		// the handler's print; read the LAST ms line of the window.
+		msText := ""
+		for _, line := range strings.Split(r.Out, "\n") {
+			if v, ok := strings.CutPrefix(strings.TrimSpace(line), "ms="); ok && v != "" {
+				msText = v
+			}
+		}
+		if msText == "" {
+			t.Fatalf("out = %q, want an ms=<int> line", r.Out)
 		}
 		ms, err := strconv.Atoi(msText)
 		if err != nil {

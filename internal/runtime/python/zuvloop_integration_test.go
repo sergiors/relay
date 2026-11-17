@@ -194,6 +194,7 @@ func TestPythonZuvloopEnabledMissingPackageFailsStartup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enabled bootstrap variant: %v", err)
 	}
+	writeEmbeddedRuntimeModules(t, dir)
 	if err := os.WriteFile(filepath.Join(dir, "bootstrap.py"), content, 0o644); err != nil {
 		t.Fatalf("write bootstrap: %v", err)
 	}
@@ -223,6 +224,7 @@ func TestPythonZuvloopEnabledFactoryFailureFailsStartup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enabled bootstrap variant: %v", err)
 	}
+	writeEmbeddedRuntimeModules(t, dir)
 	if err := os.WriteFile(filepath.Join(dir, "bootstrap.py"), content, 0o644); err != nil {
 		t.Fatalf("write bootstrap: %v", err)
 	}

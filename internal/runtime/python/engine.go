@@ -19,17 +19,38 @@ package python
 
 import (
 	"bytes"
+	"embed"
 	_ "embed"
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 
 	"relay/internal/runtime/plan"
 )
 
+const (
+	// bootstrapFile is the embedded bootstrap module. Every other embedded .py
+	// module is its sibling under relayDir, so relative imports resolve inside
+	// the image.
+	bootstrapFile = "bootstrap.py"
+	// relayDir is the in-image directory holding the embedded runtime modules.
+	relayDir = "/relay"
+)
+
 //go:embed bootstrap.py
 var bootstrap []byte
+
+// runtimeModules embeds every Python module in this package directory, so the
+// runtime ships the bootstrap together with the internal modules it imports. The
+// glob keeps the Go side in step with the bootstrap's own file set: a module
+// added beside the bootstrap is embedded and written into every image without a
+// second list that could silently omit it.
+//
+//go:embed *.py
+var runtimeModules embed.FS
 
 // The embedded bootstrap is the standard-asyncio variant. When PYTHON_ZUVLOOP
 // applies to an image, bootstrapFor replaces the exact build-time marker line
@@ -57,6 +78,38 @@ func bootstrapFor(zuvloop bool) ([]byte, error) {
 		return nil, fmt.Errorf("python bootstrap: expected exactly one %q marker", zuvloopBootstrapMarker)
 	}
 	return bytes.Replace(bootstrap, []byte(zuvloopBootstrapMarker), []byte(zuvloopBootstrapEnabled), 1), nil
+}
+
+// runtimeFiles returns the embedded Python runtime modules as plan files: the
+// RESOLVED bootstrap content (the embedded standard variant or its zuvloop form)
+// plus every other embedded .py module, each at its path under relayDir. The
+// returned order is the glob's sorted file order, so the bootstrap identity
+// hash is stable across builds.
+func runtimeFiles(bootstrapContent []byte) ([]plan.File, error) {
+	entries, err := fs.ReadDir(runtimeModules, ".")
+	if err != nil {
+		return nil, fmt.Errorf("python runtime modules: %w", err)
+	}
+	files := make([]plan.File, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".py") {
+			continue
+		}
+		content := bootstrapContent
+		if name != bootstrapFile {
+			content, err = runtimeModules.ReadFile(name)
+			if err != nil {
+				return nil, fmt.Errorf("python runtime module %s: %w", name, err)
+			}
+		}
+		files = append(files, plan.File{
+			Path:    path.Join(relayDir, name),
+			Content: content,
+			Mode:    fs.FileMode(0o644),
+		})
+	}
+	return files, nil
 }
 
 type Engine struct{}
@@ -195,11 +248,15 @@ func (Engine) Plan(spec plan.Spec, fnDir string, handlers []string) (plan.BuildP
 	if err != nil {
 		return plan.BuildPlan{}, err
 	}
-	files := []plan.File{{
-		Path:    "/relay/bootstrap.py",
-		Content: bootstrapContent,
-		Mode:    fs.FileMode(0o644),
-	}}
+	files, err := runtimeFiles(bootstrapContent)
+	if err != nil {
+		return plan.BuildPlan{}, err
+	}
+	metadata, err := plan.RuntimeMetadataFile(spec)
+	if err != nil {
+		return plan.BuildPlan{}, err
+	}
+	files = append(files, metadata)
 
 	deps, err := dependencyPlan(fnDir)
 	if err != nil {

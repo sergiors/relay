@@ -316,10 +316,46 @@ func startBootstrap(t *testing.T, dir string) *pyProc {
 	return startEmbeddedBootstrap(t, dir, Bootstrap, nil)
 }
 
+// writeEmbeddedRuntimeModules materializes every embedded Python runtime module
+// beside the bootstrap, mirroring the image's /relay directory: the bootstrap
+// and the _relay_* sibling modules it imports, with the test PYTHONPATH playing
+// the in-image import path. The lifecycle module's static metadata path is
+// rewritten to dir, so a test stages one exactly when it wants INIT_START,
+// like the image always carries.
+func writeEmbeddedRuntimeModules(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := runtimeModules.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read embedded runtime modules: %v", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".py") || name == "bootstrap.py" {
+			continue
+		}
+		content, err := runtimeModules.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read embedded module %s: %v", name, err)
+		}
+		source := strings.Replace(
+			string(content),
+			`RUNTIME_METADATA_PATH = "/relay/runtime-metadata.json"`,
+			fmt.Sprintf("RUNTIME_METADATA_PATH = %q", filepath.Join(dir, "runtime-metadata.json")),
+			1,
+		)
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(source), 0o644); err != nil {
+			t.Fatalf("write module %s: %v", name, err)
+		}
+	}
+}
+
 // startEmbeddedBootstrap is startBootstrap for explicit content and extra
-// child environment (used by the zuvloop variant tests).
+// child environment (used by the zuvloop variant tests). The embedded _relay_*
+// sibling modules are materialized beside bootstrap.py first, exactly as the
+// image deploys them.
 func startEmbeddedBootstrap(t *testing.T, dir string, content []byte, extraEnv []string) *pyProc {
 	t.Helper()
+	writeEmbeddedRuntimeModules(t, dir)
 	if err := os.WriteFile(filepath.Join(dir, "bootstrap.py"), content, 0o644); err != nil {
 		t.Fatalf("write bootstrap: %v", err)
 	}
@@ -487,6 +523,7 @@ func startPythonWithoutOtel(t *testing.T, dir string) *pyProc {
 func startUnauthenticatedPython(t *testing.T, dir string) *pyProc {
 	t.Helper()
 	writeOtelStub(t, dir)
+	writeEmbeddedRuntimeModules(t, dir)
 	if err := os.WriteFile(filepath.Join(dir, "bootstrap.py"), Bootstrap, 0o644); err != nil {
 		t.Fatalf("write bootstrap: %v", err)
 	}
@@ -682,11 +719,13 @@ def completed(event, context):
 			t.Fatalf("invoke %d failed: %s", i+1, r.Err)
 		}
 	}
-	if got := strings.TrimSpace(r1.Out); got != "count=1" {
-		t.Errorf("first count out = %q, want count=1", got)
+	// The invocation window carries the START/END lifecycle lines beside the
+	// app prints; match the count prints wherever they land in the window.
+	if !strings.Contains(r1.Out, "count=1") {
+		t.Errorf("first count out = %q, want count=1", r1.Out)
 	}
-	if got := strings.TrimSpace(r2.Out); got != "count=2" {
-		t.Errorf("second count out = %q, want count=2 (module state persisted, interpreter stayed alive)", got)
+	if !strings.Contains(r2.Out, "count=2") {
+		t.Errorf("second count out = %q, want count=2 (module state persisted, interpreter stayed alive)", r2.Out)
 	}
 	if !strings.Contains(r3.Out, "completed hi") {
 		t.Errorf("third invoke (different handler) out = %q, want it to contain 'completed hi'", r3.Out)
@@ -1774,9 +1813,16 @@ def remain(event, context):
 		if !r.OK {
 			t.Fatalf("invoke with deadline %q failed: %s", deadline, r.Err)
 		}
-		msText, ok := strings.CutPrefix(strings.TrimSpace(r.Out), "ms=")
-		if !ok {
-			t.Fatalf("out = %q, want ms=<int>", r.Out)
+		// The invocation window carries the START/END lifecycle lines beside
+		// the handler's print; read the LAST ms line of the window.
+		msText := ""
+		for _, line := range strings.Split(r.Out, "\n") {
+			if v, ok := strings.CutPrefix(strings.TrimSpace(line), "ms="); ok && v != "" {
+				msText = v
+			}
+		}
+		if msText == "" {
+			t.Fatalf("out = %q, want an ms=<int> line", r.Out)
 		}
 		ms, err := strconv.Atoi(msText)
 		if err != nil {
@@ -1890,9 +1936,14 @@ async def cancelled(event, context):
 	// Control: an ordinary Exception is still a NORMAL invocation failure —
 	// a result frame with ok:false carrying the handler error — and the same
 	// authenticated session keeps serving (two failures prove the process and
-	// channel stayed alive between and after them).
+	// channel stayed alive between and after them). Both failures are COMPLETED
+	// invocations: each carries its START/END pair under the LOGICAL requestId
+	// its context frame declares, never the transport correlation id (t0, t1),
+	// which the result frame echoes instead.
 	for i := 1; i <= 2; i++ {
-		r := p.invoke(t, "handler.boom", `{}`, nil)
+		transportID := fmt.Sprintf("t%d", p.seq)
+		logical := fmt.Sprintf("handled-fail-%d", i)
+		r := p.invokeFrame(t, "handler.boom", `{}`, nil, nil, logicalRequestContext("handler.boom", logical, i, 3))
 		if r.OK {
 			t.Fatalf("ordinary failure %d: an Exception must be a normal ok:false result", i)
 		}
@@ -1902,6 +1953,10 @@ async def cancelled(event, context):
 		if r.Frame == "" {
 			t.Fatalf("ordinary failure %d must arrive as a result frame", i)
 		}
+		requireTransportEcho(t, r, transportID)
+		// A handled failure completes its invocation: END follows START, both
+		// under the logical id and never under the transport id.
+		requireLogicalLifecycleLines(t, r.Out, logical, transportID, "")
 	}
 	select {
 	case <-p.exitDone:
@@ -1911,13 +1966,34 @@ async def cancelled(event, context):
 
 	// The regression: a CancelledError invocation must not be converted into a
 	// normal handler failure. If invoke() swallows the cancellation, a result
-	// frame arrives here and the assertion fails with the exact frame.
-	r := p.invoke(t, "handler.cancelled", `{}`, nil)
+	// frame arrives here and the assertion fails with the exact frame. Its
+	// transport correlation id is the harness's next t<N>; the logical id is
+	// deliberately different.
+	cancelledTransport := fmt.Sprintf("t%d", p.seq)
+	const cancelledLogical = "cancelled-logical"
+	r := p.invokeFrame(t, "handler.cancelled", `{}`, nil, nil, logicalRequestContext("handler.cancelled", cancelledLogical, 1, 3))
 	if r.Frame != "" {
 		t.Fatalf("a CancelledError invocation must not receive a result frame, got: %s", r.Frame)
 	}
 	if !strings.Contains(r.Err, "read result frame") {
 		t.Errorf("want the cancelled channel surfaced as a read-side close, got %q", r.Err)
+	}
+
+	// The interrupted lifecycle contract: the cancelled invocation STARTed
+	// under its logical requestId but its END must never be fabricated — a
+	// task cancellation is not a completed invocation — and neither line may
+	// carry the transport correlation id.
+	stdout := p.stdoutString()
+	if index := strings.Index(stdout, "START RequestId: "+cancelledLogical); index < 0 {
+		t.Errorf("the cancelled invocation must have STARTed under its logical requestId, stdout:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "END RequestId: "+cancelledLogical) {
+		t.Errorf("END must never be fabricated for a cancelled invocation; stdout:\n%s", stdout)
+	}
+	for _, field := range []string{"START RequestId: ", "END RequestId: "} {
+		if strings.Contains(stdout, field+cancelledTransport) {
+			t.Errorf("lifecycle lines must not carry the transport correlation id %q; stdout:\n%s", cancelledTransport, stdout)
+		}
 	}
 
 	// Prompt termination: the shutdown path must join and exit under a bounded
