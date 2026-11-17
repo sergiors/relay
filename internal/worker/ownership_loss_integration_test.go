@@ -228,11 +228,24 @@ export async function slow(event, context) {
 		}
 	}
 
-	// The monitor logged the structured loss line, and the stream layer logged
-	// the shutdown-cancel path (the loss cancels the lifecycle, which the message
-	// loop observes exactly as it observes SIGTERM).
-	if !strings.Contains(env.buf.String(), "Node ownership lost") {
-		t.Error("expected the structured 'Node ownership lost' log line")
+	// The monitor logged the ONE structured ownership warning from the shared
+	// loss action. A terminated backend surfaces as an UNVERIFIED failure — the
+	// query cannot run, so no confirmed sentinel is observed — and the warning
+	// must say verification failed rather than claim a confirmed loss; it
+	// carries the detecting source. The stream layer logged the shutdown-cancel
+	// path (the loss cancels the lifecycle, which the message loop observes
+	// exactly as it observes SIGTERM).
+	if !strings.Contains(env.buf.String(), "Node ownership verification failed; shutting down") {
+		t.Error("expected the structured ownership-verification warning log line")
+	}
+	if strings.Contains(env.buf.String(), "Node ownership lost; shutting down") {
+		t.Error("an unverified connection failure must not claim a confirmed ownership loss")
+	}
+	if !strings.Contains(env.buf.String(), "source="+ownershipSourceMonitor) {
+		t.Errorf("expected the ownership warning to record source=%s", ownershipSourceMonitor)
+	}
+	if got := strings.Count(env.buf.String(), "Node ownership"); got != 1 {
+		t.Errorf("ownership warning emitted %d times, want exactly 1 (once-only reporting)", got)
 	}
 	if !strings.Contains(env.buf.String(), "handler canceled during shutdown; leaving pending") {
 		t.Error("expected 'Message ...: handler canceled during shutdown; leaving pending' log line")

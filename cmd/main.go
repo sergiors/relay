@@ -22,6 +22,7 @@ import (
 
 	"relay/internal/cli"
 	"relay/internal/config"
+	"relay/internal/worker"
 )
 
 func main() {
@@ -48,35 +49,56 @@ func main() {
 	)
 	defer stop()
 
-	// runCommand owns the process-boundary error policy: print the returned
-	// error exactly once to stderr and map it to an exit code. main only acts
-	// on a nonzero code, so the success path exits 0 naturally by returning.
+	// runCommand owns the process-boundary error policy: report the returned
+	// error exactly once and map it to an exit code. main only acts on a nonzero
+	// code, so the success path exits 0 naturally by returning.
 	if code := runCommand(func() error {
 		return cli.Run(ctx, os.Args, logger)
-	}, os.Stderr); code != 0 {
+	}, os.Stderr, logger); code != 0 {
 		os.Exit(code)
 	}
 }
 
-// runCommand executes fn and maps its error to a process exit code, writing the
-// error to stderr exactly once. It is the single place that translates a
-// returned error into an exit code: nil yields 0 and writes nothing; an error
-// wrapping a urfave/cli ExitCoder (the cli.Exit(msg, 2) usage errors the command
-// tree returns) yields that explicit code; any other error yields 1. Isolating
-// this as a pure function of (func() error, io.Writer) lets tests assert the
+// runCommand executes fn and maps its error to a process exit code, reporting
+// the error exactly once. A urfave/cli ExitCoder (native usage/help errors and
+// the command tree's explicit cli.Exit values) keeps its plain stderr message
+// and explicit code. A `relay start` failure is reported as one structured
+// error log event through logger: "Worker startup failed" for startup
+// failures (including CLI lock/setup errors) and "Worker stopped" for a worker
+// failure after it became ready, classified by the typed phase on worker.Run's
+// error. The full wrapped cause is retained (for example the PostgreSQL startup
+// context). Administrative commands keep their plain stderr line because their
+// output is human-facing. Any other error yields 1. Isolating this as a pure
+// function of (func() error, io.Writer, *slog.Logger) lets tests assert the
 // boundary directly instead of spawning the process. os.Exit is deliberately
 // not called here — only main, the caller that receives code, owns the process.
-func runCommand(fn func() error, stderr io.Writer) int {
+func runCommand(fn func() error, stderr io.Writer, logger *slog.Logger) int {
 	err := fn()
 	if err == nil {
 		return 0
 	}
 
-	fmt.Fprintln(stderr, err)
-
 	var exitErr urfavecli.ExitCoder
 	if errors.As(err, &exitErr) {
+		fmt.Fprintln(stderr, err)
 		return exitErr.ExitCode()
 	}
+
+	if cli.IsStartFailure(err) {
+		if logger != nil {
+			message := "Worker startup failed"
+			if phase, ok := worker.RunPhaseOf(err); ok && phase == worker.RunPhaseRuntime {
+				message = "Worker stopped"
+			}
+			logger.Error(message, "error", err)
+			return 1
+		}
+		// No process logger wired: keep the full cause visible rather than
+		// dropping the report.
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	fmt.Fprintln(stderr, err)
 	return 1
 }

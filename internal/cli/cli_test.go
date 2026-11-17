@@ -392,6 +392,32 @@ func TestStartPropagatesWorkerError(t *testing.T) {
 	}
 }
 
+// TestStartFailureClassification pins the process-boundary marker: a start
+// lifecycle error is classified (and remains errors.Is-compatible with its
+// cause) while an administrative command's error is not. cmd/main.go uses this
+// single classification to choose structured reporting instead of inspecting
+// argv.
+func TestStartFailureClassification(t *testing.T) {
+	deps := testDeps(t)
+	workerErr := errors.New("state: open failed: connection refused")
+	deps.Start = func(*slog.Logger) error { return workerErr }
+
+	_, _, err := runCLIWithDeps(t, deps, "", "start")
+	if !IsStartFailure(err) {
+		t.Fatalf("start error %v was not classified as a start failure", err)
+	}
+	if !errors.Is(err, workerErr) {
+		t.Fatalf("start classification lost the wrapped cause: %v", err)
+	}
+	if got, want := err.Error(), workerErr.Error(); got != want {
+		t.Fatalf("start error text = %q, want the wrapped cause %q", got, want)
+	}
+
+	if _, _, err := runCLIWithDeps(t, testDeps(t), "", "bogus"); IsStartFailure(err) {
+		t.Fatalf("administrative error %v must not be classified as a start failure", err)
+	}
+}
+
 // TestStatelessAdminCommandsDoNotAcquireLockWithoutDatabase pins the non-start
 // lock contract for commands that never read state (git, secret): with the
 // start lock held elsewhere, both succeed and the lock file is neither

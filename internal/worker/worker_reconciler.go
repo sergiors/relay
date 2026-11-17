@@ -56,7 +56,6 @@ func startAppReconciler(
 		close(reconcilerDone)
 		shutdown.register(reconcilerBarrierStep(reconcilerDone))
 		if lifecycle.Err() == nil {
-			logger.Error("Reconciler: watch setup failed", "error", err)
 			span.RecordError(err)
 			onFailure(fmt.Errorf("prepare app watch: %w", err))
 		}
@@ -93,16 +92,10 @@ func startAppReconciler(
 		// A normal return is lifecycle cancellation. A non-nil error is either
 		// watcher construction failure or a terminal watcher/channel failure
 		// after the loops started; Start has already joined them, so no
-		// reconcile can still use the runtime manager or state DB. Surface it
-		// loudly rather than leaving a worker that believes it is watching apps
-		// while live reload has silently stopped.
-		runReconcilerStart(lifecycle, rec.Start, func(err error) {
-			logger.Error(
-				"Reconciler: watch loop stopped",
-				"error", err,
-			)
-			onFailure(err)
-		})
+		// reconcile can still use the runtime manager or state DB. Propagate it
+		// so the worker stops rather than believing it is watching apps while
+		// live reload has silently stopped; the process boundary reports it once.
+		runReconcilerStart(lifecycle, rec.Start, onFailure)
 	}()
 	shutdown.register(reconcilerBarrierStep(reconcilerDone))
 }

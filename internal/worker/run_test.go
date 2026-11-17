@@ -570,6 +570,12 @@ func TestRunInvalidRedisDSNReturnsError(t *testing.T) {
 	if !strings.Contains(err.Error(), "redis config invalid") {
 		t.Fatalf("error = %q, want it to name the invalid redis config", err)
 	}
+	// A failure before the ready-to-consume boundary must carry the startup
+	// phase, which the process boundary reads to report "Worker startup failed".
+	if phase, ok := RunPhaseOf(err); !ok || phase != RunPhaseStartup {
+		t.Fatalf("RunPhaseOf(startup failure) = (%q, %v), want (%q, true)",
+			phase, ok, RunPhaseStartup)
+	}
 }
 
 // preflightSpy records the exact order in which the preflight steps ran, so the

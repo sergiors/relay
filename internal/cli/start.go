@@ -15,8 +15,28 @@ import (
 
 // errStartAlreadyRunning is the concise operator-facing error returned when
 // another process already holds the start lock. It carries no stack trace; the
-// process prints it exactly once via cmd/main.go.
+// process reports it exactly once via cmd/main.go.
 var errStartAlreadyRunning = errors.New("relay start is already running")
+
+// startFailure marks a failed `relay start` lifecycle for the process boundary
+// (cmd/main.go). Administrative commands return plain errors that are printed to
+// stderr; start failures are reported through the structured process logger
+// instead, with the full wrapped cause retained. The marker implements Unwrap,
+// so errors.Is/As still classify the underlying error — notably urfave/cli
+// ExitCoders, whose exit code and plain usage message must be preserved.
+type startFailure struct{ err error }
+
+func (f *startFailure) Error() string { return f.err.Error() }
+func (f *startFailure) Unwrap() error { return f.err }
+
+// IsStartFailure reports whether err is a failure of the `relay start`
+// lifecycle. cmd/main.go uses it to choose structured reporting without
+// inspecting argv, so aliases, flags, and future commands cannot be
+// misclassified.
+func IsStartFailure(err error) bool {
+	var failure *startFailure
+	return errors.As(err, &failure)
+}
 
 // startCommand builds the `relay start` subcommand. It is the only command
 // that starts the long-running Relay runtime, delegating to internal/worker in
@@ -37,7 +57,17 @@ func startCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 		Name:        "start",
 		Usage:       "Start the runtime",
 		Description: "Run in the foreground until stopped.",
-		Action: func(ctx context.Context, cmd *cli.Command) error {
+		Action: func(ctx context.Context, cmd *cli.Command) (err error) {
+			// Every post-parse failure from this command is marked for the
+			// process boundary, which reports it as one structured error event.
+			// The marker preserves the cause, so ExitCoder usage errors keep
+			// their native code and plain message.
+			defer func() {
+				if err != nil {
+					err = &startFailure{err: err}
+				}
+			}()
+
 			if cmd.Args().Present() {
 				return cli.Exit("start: too many arguments", 2)
 			}

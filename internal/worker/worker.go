@@ -219,6 +219,42 @@ func startupResult(err error) error {
 	return err
 }
 
+// RunPhase classifies where a worker run failed, so the process boundary can
+// report a startup failure differently from a runtime stop without inspecting
+// argv or error text. It is set at the ready-to-consume boundary: every failure
+// before it is startup, and every failure after it is runtime.
+type RunPhase string
+
+const (
+	// RunPhaseStartup covers configuration, PostgreSQL, Redis, Docker, network,
+	// app-loading, and every other failure before the worker is ready to consume.
+	RunPhaseStartup RunPhase = "startup"
+	// RunPhaseRuntime covers failures after the ready-to-consume boundary.
+	RunPhaseRuntime RunPhase = "runtime"
+)
+
+// RunError adds the phase to a worker failure while preserving the wrapped
+// error's identity and message (Unwrap/Error delegate to it). Run never logs
+// this; the process boundary decides how to report it.
+type RunError struct {
+	Phase RunPhase
+	Err   error
+}
+
+func (e *RunError) Error() string { return e.Err.Error() }
+func (e *RunError) Unwrap() error { return e.Err }
+
+// RunPhaseOf reports the phase carried by a worker Run error. It returns false
+// for errors that did not originate from worker.Run (including CLI setup
+// failures and administrative commands).
+func RunPhaseOf(err error) (RunPhase, bool) {
+	var runErr *RunError
+	if errors.As(err, &runErr) {
+		return runErr.Phase, true
+	}
+	return "", false
+}
+
 // preflightDeps is the explicit ordering seam for the worker's
 // external-dependency preflight. Production Run wires the four real
 // operations; a test wires spies, so the fixed order and the
@@ -376,8 +412,21 @@ func runExternalPreflight(
 // Errors are returned through the named runErr so the ownership-loss override
 // (registered before the shutdown defer, and therefore run after it) can join
 // errOwnershipLost into whatever the deferred teardown path returned; see
-// internal/worker/ownership.go.
+// internal/worker/ownership.go. Every non-nil result carries a RunPhase so the
+// process boundary can distinguish a startup failure from a runtime stop; Run
+// itself never logs the returned error.
 func Run(logger *slog.Logger) (runErr error) {
+	// Phase is startup until the ready-to-consume boundary. The defer is
+	// registered FIRST so it runs LAST, after the shutdown and ownership-error
+	// defers have finalized runErr, and wraps the final result for the process
+	// boundary. It adds no logging and preserves the error's identity/message.
+	phase := RunPhaseStartup
+	defer func() {
+		if runErr != nil {
+			runErr = &RunError{Phase: phase, Err: runErr}
+		}
+	}()
+
 	cfg, err := config.Load(logger)
 	if err != nil {
 		// Pre-resource failures: nothing owns cleanup yet, so return for the CLI.
@@ -714,6 +763,8 @@ func Run(logger *slog.Logger) (runErr error) {
 	// does not wait on asynchronous services/housekeeping, optional tracing,
 	// PostgreSQL, or per-app success.
 	workerReady.startReady(consumer, manager, cfg.Networks)
+	// Startup is complete: any failure from here on is a runtime failure.
+	phase = RunPhaseRuntime
 	logger.Info("Worker ready to consume")
 
 	// Stats rows are keyed by node identity; the instance id fences a stale
@@ -732,7 +783,8 @@ func Run(logger *slog.Logger) (runErr error) {
 	if err := consumer.Consume(ctx, runWorker.Handle); err != nil {
 		// A Consume error means the loop stopped. A cancelled lifecycle returns
 		// nil here, so this is a genuine failure; teardown still runs in order.
-		logger.Error("Consume failed", "error", err)
+		// It is returned (and finally reported once by the process boundary),
+		// never logged here.
 		consumeErr = fmt.Errorf("consume failed: %w", err)
 	}
 

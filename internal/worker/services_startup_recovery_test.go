@@ -218,7 +218,7 @@ func TestRetryIdentitySnapshotCleanupSkipsRemovalOnFailedProof(t *testing.T) {
 	proof := ownershipProof{
 		loss:   loss,
 		verify: func(context.Context) error { return errors.New("ambiguous ownership proof") },
-		onLost: func() { loss.lose() },
+		onLost: func(err error) { loss.lose(err) },
 	}
 	var discoverCalls, removeCalls int
 	discover := func(context.Context) ([]string, error) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,13 +12,13 @@ import (
 	"relay/internal/state"
 )
 
-// errOwnershipLost marks a worker run that ended because the pinned NODE_ID
-// lock was detected no longer held (by the periodic monitor or by a fail-closed
-// shutdown verification). Run joins it into its returned error (see the override
-// defer) so the supervisor treats the exit as an abnormal termination rather
-// than a clean signal shutdown. By the time this error surfaces the worker has
-// already cancelled its lifecycle and skipped identity-scoped cleanup; it is a
-// report, not a remedy.
+// errOwnershipLost marks a worker run that ended because a failed ownership
+// verification (a confirmed lock loss or an unverified timeout/connection
+// failure) cancelled the lifecycle. Run joins it into its returned error (see
+// the override defer) so the supervisor treats the exit as an abnormal
+// termination rather than a clean signal shutdown. By the time this error
+// surfaces the worker has already cancelled its lifecycle and skipped
+// identity-scoped cleanup; it is a report, not a remedy.
 var errOwnershipLost = errors.New("node ownership lost")
 
 // ownershipLoss is the once-only latch recording a detected loss of the node-
@@ -30,17 +31,25 @@ var errOwnershipLost = errors.New("node ownership lost")
 type ownershipLoss struct {
 	lost atomic.Bool
 	once sync.Once
+	// firstCause preserves the verification error of the observation that won
+	// the latch. Later observations keep it rather than replacing it, so the
+	// one structured warning and the returned process error report the failure
+	// that actually detected the loss.
+	firstCause error
 }
 
 // lose records the loss and returns true only for the FIRST caller, so the loss
 // side effects (readiness clear, warning, lifecycle cancellation) run exactly
-// once even if several paths observe the same loss.
-func (l *ownershipLoss) lose() bool {
+// once even if several paths observe the same loss. cause is preserved for the
+// warning and the returned error; a nil cause is allowed (a test may latch a
+// loss without a verification error).
+func (l *ownershipLoss) lose(cause error) bool {
 	if l == nil {
 		return false
 	}
 	first := false
 	l.once.Do(func() {
+		l.firstCause = cause
 		l.lost.Store(true)
 		first = true
 	})
@@ -50,6 +59,97 @@ func (l *ownershipLoss) lose() bool {
 // isLost reports whether a loss has been recorded; nil receiver is false.
 func (l *ownershipLoss) isLost() bool {
 	return l != nil && l.lost.Load()
+}
+
+// cause returns the preserved verification error of the first observation, or
+// nil when no loss was recorded (or it was latched without a cause).
+func (l *ownershipLoss) cause() error {
+	if l == nil || !l.lost.Load() {
+		return nil
+	}
+	return l.firstCause
+}
+
+// Stable sources for the `source` attribute: the actual path that observed the
+// failed verification. The shared once-only latch preserves the source of the
+// observation that won, exactly as it preserves its cause.
+const (
+	ownershipSourceMonitor  = "periodic_monitor"
+	ownershipSourceShutdown = "shutdown_verification"
+	ownershipSourceIdentity = "identity_scoped_ownership_proof"
+	ownershipSourceUnknown  = "unknown"
+)
+
+// ownershipDetection carries the detecting path alongside a failed verification
+// through the shared latch. It unwraps to the verification error, so errors.Is
+// and errors.As still classify the cause; the wrapper only adds provenance.
+type ownershipDetection struct {
+	source string
+	err    error
+}
+
+func (d *ownershipDetection) Error() string { return d.err.Error() }
+func (d *ownershipDetection) Unwrap() error { return d.err }
+
+// ownershipLossSource returns the detecting path of the observation that won
+// the latch, or "unknown" when a loss was latched without an observation.
+func ownershipLossSource(cause error) string {
+	var detection *ownershipDetection
+	if errors.As(cause, &detection) && detection.source != "" {
+		return detection.source
+	}
+	return ownershipSourceUnknown
+}
+
+// Stable ownership-loss classifications carried as the `reason` attribute of the
+// one structured warning. They are low-cardinality on purpose: driver text stays
+// in the `error` attribute, never in a label-like field.
+const (
+	ownershipReasonTimeout         = "verification_timeout"
+	ownershipReasonConnection      = "connection_error"
+	ownershipReasonLockNotHeld     = "lock_not_held"
+	ownershipReasonPIDChanged      = "backend_pid_changed"
+	ownershipReasonVerificationErr = "verification_failed"
+)
+
+// ownershipLossTimedOut reports whether the verification was bounded out. It is
+// checked before every broader classification so a timed-out check is never
+// misreported as a lock loss or a connection failure.
+func ownershipLossTimedOut(cause error) bool {
+	if errors.Is(cause, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(cause, &netErr) && netErr.Timeout()
+}
+
+// ownershipLossReason classifies a failed ownership verification. Every failure
+// fails closed regardless of classification; only lock_not_held and
+// backend_pid_changed are CONFIRMED losses. A query/connection failure, a
+// timeout, and any other error remain unverified. The narrower state sentinels
+// are checked via errors.Is; the shared ErrOwnerLockLost wrapper alone is not
+// enough to confirm a loss.
+func ownershipLossReason(cause error) string {
+	switch {
+	case ownershipLossTimedOut(cause):
+		return ownershipReasonTimeout
+	case errors.Is(cause, state.ErrOwnerLockNotHeld):
+		return ownershipReasonLockNotHeld
+	case errors.Is(cause, state.ErrOwnerBackendPIDChanged):
+		return ownershipReasonPIDChanged
+	case errors.Is(cause, state.ErrOwnerLockConnection):
+		return ownershipReasonConnection
+	default:
+		return ownershipReasonVerificationErr
+	}
+}
+
+// ownershipLossConfirmed reports whether the verification positively proved the
+// identity is gone. Timeouts, connection failures, and generic verification
+// errors are fail-closed but unverified.
+func ownershipLossConfirmed(cause error) bool {
+	return errors.Is(cause, state.ErrOwnerLockNotHeld) ||
+		errors.Is(cause, state.ErrOwnerBackendPIDChanged)
 }
 
 // ownershipMonitorConfig configures the ownership monitor poll loop. Its
@@ -70,17 +170,22 @@ type ownershipMonitorConfig struct {
 	timeout  time.Duration
 }
 
-// ownershipLossAction returns the ONCE-ONLY side effect of a detected ownership
-// loss, run through the latch: on the FIRST observation it marks the latch,
+// ownershipLossAction returns the ONCE-ONLY side effect of a failed ownership
+// verification, run through the latch: on the FIRST observation it marks the
+// latch with the failing verification error (including the detecting path),
 // clears readiness (so a `relay health` query stops reporting ready the moment
-// the loss is known, before the deferred shutdown clear), logs one structured
-// warning carrying the STABLE node identity and this process's incarnation
-// token, and cancels the lifecycle so background loops, the service
-// coordinator, and rooted builds observe the loss exactly as they would a
-// signal. The periodic monitor and every fail-closed shutdown verification share
+// the failure is known, before the deferred shutdown clear), logs one structured
+// warning carrying the STABLE node identity, this process's incarnation token,
+// the detecting source, a stable failure classification, and the preserved
+// cause, and cancels the lifecycle so background loops, the service
+// coordinator, and rooted builds observe it exactly as they would a signal. The
+// warning says "ownership lost" only for a confirmed loss; timeouts,
+// connection failures, and generic verification errors are reported as a
+// failed verification because they fail closed without proving the identity
+// gone. The periodic monitor and every fail-closed shutdown verification share
 // this ONE action, so the effects run exactly once no matter which path observes
-// the loss first. Nil fields are tolerated, so a test can wire only the pieces
-// it asserts.
+// the failure first. Nil fields are tolerated, so a test can wire only the
+// pieces it asserts.
 func ownershipLossAction(
 	loss *ownershipLoss,
 	ready *readiness,
@@ -88,19 +193,29 @@ func ownershipLossAction(
 	nodeID string,
 	instance string,
 	cancel context.CancelFunc,
-) func() {
-	return func() {
-		if !loss.lose() {
+) func(error) {
+	return func(cause error) {
+		if !loss.lose(cause) {
 			return
 		}
 		if ready != nil {
 			ready.setOwnershipLost()
 		}
 		if logger != nil {
-			logger.Warn("Node ownership lost; shutting down",
+			message := "Node ownership verification failed; shutting down"
+			if ownershipLossConfirmed(cause) {
+				message = "Node ownership lost; shutting down"
+			}
+			attrs := []any{
 				"node_id", nodeID,
 				"instance_id", instance,
-			)
+				"source", ownershipLossSource(cause),
+				"reason", ownershipLossReason(cause),
+			}
+			if cause != nil {
+				attrs = append(attrs, "error", cause)
+			}
+			logger.Warn(message, attrs...)
 		}
 		if cancel != nil {
 			cancel()
@@ -110,13 +225,16 @@ func ownershipLossAction(
 
 // ownershipRunError joins errOwnershipLost into runErr when the ownership latch
 // is set, so Run's result is a distinctive abnormal-termination error rather
-// than a clean signal-shutdown result. It is the single place the conversion is
+// than a clean signal-shutdown result. The preserved verification cause (and
+// its detecting source) is joined too, so the process boundary reports why the
+// lock check failed (for example a terminated PostgreSQL backend) instead of
+// only that a failure happened. It is the single place the conversion is
 // decided, so the contract is unit-testable without exercising Run's full
-// resource wiring (mirroring startupResult). A nil runErr yields just
-// errOwnershipLost.
+// resource wiring (mirroring startupResult). A nil runErr and nil cause yield
+// just errOwnershipLost.
 func ownershipRunError(loss *ownershipLoss, runErr error) error {
 	if loss.isLost() {
-		return errors.Join(errOwnershipLost, runErr)
+		return errors.Join(errOwnershipLost, loss.cause(), runErr)
 	}
 	return runErr
 }
@@ -124,12 +242,13 @@ func ownershipRunError(loss *ownershipLoss, runErr error) error {
 // startOwnershipMonitor starts the ownership-polling goroutine and returns a
 // channel closed when it exits. The monitor re-verifies the pinned ownership
 // lock immediately and then once per interval; on a detected loss it invokes
-// onLost (the shared once-only loss action) and returns. On an ordinary
-// lifecycle cancellation it returns WITHOUT reporting a loss: VerifyOwnerLock
-// fails once the pinned connection is closing, and that is shutdown, not a
-// loss. A nil/ownerless verify is the caller's responsibility: Run only starts
-// the monitor for a worker handle that holds the lock.
-func startOwnershipMonitor(ctx context.Context, onLost func(), cfg ownershipMonitorConfig) <-chan struct{} {
+// onLost (the shared once-only loss action) with the failing verification error
+// and returns. On an ordinary lifecycle cancellation it returns WITHOUT
+// reporting a loss: VerifyOwnerLock fails once the pinned connection is closing,
+// and that is shutdown, not a loss. A nil/ownerless verify is the caller's
+// responsibility: Run only starts the monitor for a worker handle that holds the
+// lock.
+func startOwnershipMonitor(ctx context.Context, onLost func(error), cfg ownershipMonitorConfig) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -140,13 +259,14 @@ func startOwnershipMonitor(ctx context.Context, onLost func(), cfg ownershipMoni
 
 // monitorOwnership is the poll loop: it checks ownership immediately so an
 // already-lost lock is detected without waiting a full interval, then once per
-// tick. A detected loss (check failed on a LIVE lifecycle) invokes onLost and
-// returns; a check failure caused by the lifecycle being cancelled is an
-// ordinary shutdown and returns without reporting a loss.
+// tick. A detected loss (check failed on a LIVE lifecycle) invokes onLost with
+// the verification error tagged with the monitor as its source and returns; a
+// check failure caused by the lifecycle being cancelled is an ordinary shutdown
+// and returns without reporting a loss.
 func monitorOwnership(
 	ctx context.Context,
 	verify func(context.Context) error,
-	onLost func(),
+	onLost func(error),
 	interval, timeout time.Duration,
 ) {
 	if interval <= 0 {
@@ -155,9 +275,9 @@ func monitorOwnership(
 	if timeout <= 0 {
 		timeout = state.OwnerLockCheckTimeout
 	}
-	if lost, stop := ownershipCheck(ctx, verify, timeout); stop {
+	if lost, stop, cause := ownershipCheck(ctx, verify, timeout); stop {
 		if lost {
-			onLost()
+			onLost(&ownershipDetection{source: ownershipSourceMonitor, err: cause})
 		}
 		return
 	}
@@ -168,9 +288,9 @@ func monitorOwnership(
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if lost, stop := ownershipCheck(ctx, verify, timeout); stop {
+			if lost, stop, cause := ownershipCheck(ctx, verify, timeout); stop {
 				if lost {
-					onLost()
+					onLost(&ownershipDetection{source: ownershipSourceMonitor, err: cause})
 				}
 				return
 			}
@@ -179,21 +299,22 @@ func monitorOwnership(
 }
 
 // ownershipCheck runs one bounded verification. It returns lost=true when the
-// check failed on a LIVE lifecycle (a real, detected loss) and stop=true when
-// the loop must end: either a loss was detected or the check failed only because
-// the lifecycle is being cancelled (an ordinary shutdown, not a loss). A
-// successful check returns (false, false).
-func ownershipCheck(ctx context.Context, verify func(context.Context) error, timeout time.Duration) (lost, stop bool) {
+// check failed on a LIVE lifecycle (a real, detected loss) together with the
+// failing verification error, and stop=true when the loop must end: either a
+// loss was detected or the check failed only because the lifecycle is being
+// cancelled (an ordinary shutdown, not a loss). A successful check returns
+// (false, false, nil).
+func ownershipCheck(ctx context.Context, verify func(context.Context) error, timeout time.Duration) (lost, stop bool, cause error) {
 	checkCtx, cancel := context.WithTimeout(ctx, timeout)
 	err := verify(checkCtx)
 	cancel()
 	if err == nil {
-		return false, false
+		return false, false, nil
 	}
 	if ctx.Err() != nil {
-		return false, true
+		return false, true, nil
 	}
-	return true, true
+	return true, true, err
 }
 
 // ownershipProof is the fail-closed, fresh-context ownership proof shared by the
@@ -212,9 +333,13 @@ type ownershipProof struct {
 	// VerifyOwnerLock's nil/ownerless no-op contract.
 	verify func(context.Context) error
 	// onLost is the shared once-only loss action (ownershipLossAction). It is
-	// invoked on every failed proof, but only the first observation performs the
-	// side effects. Optional.
-	onLost func()
+	// invoked with the failing verification error on every failed proof, but
+	// only the first observation performs the side effects. Optional.
+	onLost func(error)
+	// source identifies the path running this proof for the once-only warning.
+	// Guards set it to the identity-scoped proof; the shutdown barrier sets it to
+	// the final shutdown verification. Empty falls back to "unknown".
+	source string
 }
 
 // prove runs ONE fresh ownership check on a context rooted in
@@ -237,7 +362,11 @@ func (p ownershipProof) prove(timeout time.Duration) error {
 	defer cancel()
 	if err := p.verify(ctx); err != nil {
 		if p.onLost != nil {
-			p.onLost()
+			source := p.source
+			if source == "" {
+				source = ownershipSourceUnknown
+			}
+			p.onLost(&ownershipDetection{source: source, err: err})
 		}
 		return err
 	}
@@ -258,6 +387,7 @@ func (p ownershipProof) prove(timeout time.Duration) error {
 func guardIdentityCleanup(
 	proof ownershipProof, logger *slog.Logger, name string, run func(context.Context) error,
 ) func(context.Context) error {
+	proof.source = ownershipSourceIdentity
 	return func(ctx context.Context) error {
 		if proof.loss.isLost() {
 			if logger != nil {
@@ -337,6 +467,7 @@ func guardIdentitySnapshotCleanup[C any](
 	discover func(context.Context) ([]C, error),
 	remove func(context.Context, []C) error,
 ) func(context.Context) error {
+	proof.source = ownershipSourceIdentity
 	return func(ctx context.Context) error {
 		if proof.loss.isLost() {
 			if logger != nil {
@@ -496,6 +627,7 @@ func retryIdentitySnapshotCleanup[C any](
 // the loss (clearing readiness and cancelling the lifecycle exactly once) so
 // every identity-scoped cleanup guard registered later skips its work.
 func ownershipBarrierStep(done <-chan struct{}, proof ownershipProof, logger *slog.Logger) shutdownStep {
+	proof.source = ownershipSourceShutdown
 	return shutdownStep{
 		name:    shutdownStepOwnership,
 		timeout: shutdownStepTimeout,

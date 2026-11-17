@@ -13,6 +13,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -72,8 +73,19 @@ func TestIntegrationVerifyOwnerLockDetectsTerminatedBackend(t *testing.T) {
 
 	// VerifyOwnerLock queries ONLY the pinned connection, so it must fail closed
 	// and must not be fooled by the pool's recovered backend.
-	if err := live.VerifyOwnerLock(ctx); !errors.Is(err, ErrOwnerLockLost) {
+	err = live.VerifyOwnerLock(ctx)
+	if !errors.Is(err, ErrOwnerLockLost) {
 		t.Fatalf("VerifyOwnerLock after backend termination = %v, want ErrOwnerLockLost", err)
+	}
+	// Typed classification: the query cannot run on the dead pinned backend, so
+	// the failure is an UNVERIFIED connection error — it must never claim a
+	// confirmed loss (lock observed gone / pid observed changed) it did not
+	// observe.
+	if !errors.Is(err, ErrOwnerLockConnection) {
+		t.Fatalf("VerifyOwnerLock after backend termination = %v, want the connection sentinel (unverified)", err)
+	}
+	if errors.Is(err, ErrOwnerLockNotHeld) || errors.Is(err, ErrOwnerBackendPIDChanged) {
+		t.Fatalf("VerifyOwnerLock after backend termination = %v, must not claim a confirmed loss", err)
 	}
 
 	// The session advisory lock died with the backend, so a replacement
@@ -214,7 +226,55 @@ func TestVerifyOwnerLockFailsClosedAfterClose(t *testing.T) {
 	if err := owner.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	if err := owner.VerifyOwnerLock(context.Background()); !errors.Is(err, ErrOwnerLockLost) {
+	err := owner.VerifyOwnerLock(context.Background())
+	if !errors.Is(err, ErrOwnerLockLost) {
 		t.Fatalf("VerifyOwnerLock after close = %v, want ErrOwnerLockLost", err)
+	}
+	// The released handle is an UNVERIFIED connection failure: no query ran, so
+	// no confirmed loss was observed.
+	if !errors.Is(err, ErrOwnerLockConnection) {
+		t.Fatalf("VerifyOwnerLock after close = %v, want the connection sentinel (unverified)", err)
+	}
+	if errors.Is(err, ErrOwnerLockNotHeld) || errors.Is(err, ErrOwnerBackendPIDChanged) {
+		t.Fatalf("VerifyOwnerLock after close = %v, must not claim a confirmed loss", err)
+	}
+}
+
+// TestIntegrationVerifyOwnerLockDetectsReleasedLock proves the CONFIRMED
+// absent-lock path against a real server: releasing the session advisory lock
+// on the pinned connection (an out-of-band release while the process keeps
+// running) makes the next verification answer held=false and report the
+// confirmed ErrOwnerLockNotHeld — while the backend and its pid stay intact,
+// so no unverified or pid-change sentinel appears.
+func TestIntegrationVerifyOwnerLockDetectsReleasedLock(t *testing.T) {
+	requireTestDB(t)
+	dsn := newTestDSN(t)
+	ctx := context.Background()
+
+	owner := uniqueNodeID(t, "worker-released")
+	live := openWithIdentity(t, dsn, owner, "inst-1")
+	if err := live.VerifyOwnerLock(ctx); err != nil {
+		t.Fatalf("VerifyOwnerLock on a held lock = %v, want nil", err)
+	}
+
+	// Only the holding session can release a session advisory lock, so the
+	// release runs ON the pinned connection, keeping the backend and pid alive.
+	live.ownerMu.Lock()
+	_, unlockErr := live.ownerConn.ExecContext(ctx,
+		`SELECT pg_advisory_unlock($1)`, nodeLockKey(live.nodeID))
+	live.ownerMu.Unlock()
+	if unlockErr != nil {
+		t.Fatalf("release node lock: %v", unlockErr)
+	}
+
+	err := live.VerifyOwnerLock(ctx)
+	if !errors.Is(err, ErrOwnerLockLost) || !errors.Is(err, ErrOwnerLockNotHeld) {
+		t.Fatalf("VerifyOwnerLock after releasing the lock = %v, want ErrOwnerLockLost + ErrOwnerLockNotHeld", err)
+	}
+	if errors.Is(err, ErrOwnerBackendPIDChanged) || errors.Is(err, ErrOwnerLockConnection) {
+		t.Fatalf("VerifyOwnerLock after releasing the lock = %v, want a confirmed loss, not an unverified failure", err)
+	}
+	if !strings.Contains(err.Error(), "is no longer held") {
+		t.Fatalf("error %q must name the absent lock", err)
 	}
 }

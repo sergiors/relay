@@ -30,8 +30,8 @@ func (fakeLockDriver) Open(string) (driver.Conn, error) {
 	return nil, errors.New("fakeLockDriver: open via the connector")
 }
 
-// fakeLockConnector is one test's fake database. It meters query concurrency and
-// controls when blocked queries proceed.
+// fakeLockConnector is one test's fake database. It meters query concurrency,
+// controls when blocked queries proceed, and can script a typed query failure.
 type fakeLockConnector struct {
 	mu          sync.Mutex
 	inFlight    int
@@ -42,6 +42,10 @@ type fakeLockConnector struct {
 
 	pid  int
 	held bool
+
+	// queryErr, when set, fails every verification query with this error so a
+	// test can script a driver/server failure without PostgreSQL.
+	queryErr error
 }
 
 func newFakeLockConnector() *fakeLockConnector {
@@ -103,6 +107,9 @@ func (c *fakeLockConn) Begin() (driver.Tx, error) {
 func (c *fakeLockConn) QueryContext(ctx context.Context, _ string, _ []driver.NamedValue) (driver.Rows, error) {
 	c.c.enter()
 	defer c.c.leave()
+	if c.c.queryErr != nil {
+		return nil, c.c.queryErr
+	}
 	select {
 	case <-c.c.release:
 	case <-ctx.Done():

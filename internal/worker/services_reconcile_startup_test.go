@@ -600,7 +600,7 @@ func TestWorkerShutdownServiceCleanupStepFailureReachesRegistry(t *testing.T) {
 // removal is gated on the ownership proof, never on id freshness.
 func TestWorkerShutdownServicesSkipsAdoptedContainerAfterOwnershipLoss(t *testing.T) {
 	latched := &ownershipLoss{}
-	latched.lose()
+	latched.lose(errors.New("ownership lost"))
 	tests := []struct {
 		name  string
 		proof ownershipProof
@@ -718,7 +718,7 @@ func TestSweepStartupServiceOrphansSnapshotsProofsThenRemoves(t *testing.T) {
 // removal, so a replacement owner's containers are never disturbed.
 func TestSweepStartupServiceOrphansSkipsRemovalOnOwnershipLoss(t *testing.T) {
 	latched := &ownershipLoss{}
-	latched.lose()
+	latched.lose(errors.New("ownership lost"))
 	tests := []struct {
 		name          string
 		proof         ownershipProof

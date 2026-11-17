@@ -80,7 +80,7 @@ func startOwnershipTracking(
 	ctx context.Context,
 	st *state.State,
 	loss *ownershipLoss,
-	onLost func(),
+	onLost func(error),
 	logger *slog.Logger,
 	shutdown *shutdownRegistry,
 ) ownershipProof {
