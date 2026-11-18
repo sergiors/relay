@@ -887,6 +887,99 @@ events:
 	}
 }
 
+// TestAppInspectFailedNewDeploymentRetainsPublishedGeneration pins the
+// operator view across a persisted failed new deployment: after rediscovery
+// advances the desired fingerprint and the reconcile fails, inspect keeps the
+// last serving image/fingerprint/prepared rows, shows the differing desired
+// fingerprint, and surfaces Last reconcile/Last error, while `ls` reports the
+// latest persisted updated_at (the failure write), not the four-hour-old
+// prepared_at of the serving generation. The renderer-level shape of this view
+// is covered by the default-suite tests in app_render_unit_test.go; this test
+// owns only the persistence transition feeding it.
+func TestAppInspectFailedNewDeploymentRetainsPublishedGeneration(t *testing.T) {
+	st, _ := openTempState(t)
+	tmpl, err := app.ParseTemplate([]byte(`runtime: nodejs24.x
+events:
+  - handler: index.hi
+    pattern:
+      event_name: [INSERT]
+`))
+	if err != nil {
+		t.Fatalf("parse template: %v", err)
+	}
+	name := "st-failed-desired"
+	fn := app.App{
+		Name: name, Dir: filepath.Join(t.TempDir(), name), Template: tmpl,
+	}
+
+	// given: a serving generation prepared four hours ago.
+	preparedAt := time.Now().Add(-4 * time.Hour).UTC()
+	recordSuccess(t, st, name, "relay-app-"+name, "published-fp", preparedAt, fn)
+
+	// when: a new desired generation is discovered and its reconcile fails.
+	newToken, err := st.RecordDiscoveredWithFingerprint(
+		context.Background(), fn, "desired-fp")
+	if err != nil {
+		t.Fatalf("RecordDiscoveredWithFingerprint: %v", err)
+	}
+	if newToken <= 0 {
+		t.Fatalf("fencing token = %d, want positive", newToken)
+	}
+	if landed, err := st.RecordReconcileFailure(
+		context.Background(), name, errors.New("build failed"), newToken,
+	); err != nil || !landed {
+		t.Fatalf("RecordReconcileFailure: landed=%v err=%v", landed, err)
+	}
+
+	// then: inspect retains the published generation and shows the failure.
+	detail, ok := st.GetApp(name)
+	if !ok {
+		t.Fatalf("expected %s", name)
+	}
+	var iw bytes.Buffer
+	renderAppDetailForTest(t, &iw, st, detail)
+	out := normWS(iw.String())
+	for _, want := range []string{
+		"Status: " + state.StatusDegraded,
+		"Image: relay-app-" + name,
+		"Fingerprint: sha256:published-fp",
+		"Desired fingerprint: sha256:desired-fp",
+		"Prepared: " + preparedAt.Format(time.RFC3339),
+		"Last reconcile: " + state.ReconcileFailed,
+		"Last error: build failed",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("inspect output missing %q\n%s", want, out)
+		}
+	}
+	if strings.Contains(iw.String(), "Active") {
+		t.Errorf("inspect must not use Active naming:\n%s", iw.String())
+	}
+
+	// ls: the UPDATED column reports the latest persisted change, not the
+	// serving generation's four-hour-old prepared_at.
+	var lw bytes.Buffer
+	renderAppListForTest(t, &lw, st)
+	row := ""
+	for _, l := range strings.Split(strings.TrimSpace(lw.String()), "\n")[1:] {
+		if fields := strings.Fields(l); len(fields) > 0 && fields[0] == name {
+			row = l
+		}
+	}
+	if row == "" {
+		t.Fatalf("ls missing row for %s:\n%s", name, lw.String())
+	}
+	if !strings.Contains(row, state.StatusDegraded) {
+		t.Errorf("ls row = %q, want status %q", row, state.StatusDegraded)
+	}
+	if strings.Contains(row, "4h ago") {
+		t.Errorf("ls UPDATED = %q, must not report the old prepared_at", row)
+	}
+	if !strings.Contains(row, "ago") {
+		t.Errorf("ls UPDATED = %q, want a rendered relative age", row)
+	}
+}
+
 // Services using entrypoint and image sources render with their source kind
 // prefix, so an operator can tell how each service is produced.
 func TestAppInspectServicesSourceKinds(t *testing.T) {

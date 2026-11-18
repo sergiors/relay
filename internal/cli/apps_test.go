@@ -4,6 +4,7 @@ package cli
 
 import (
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -11,11 +12,27 @@ import (
 	"relay/internal/app"
 )
 
+// updatedAgeToken matches the time-dependent UPDATED cell: a short relative
+// age ("15s ago", "3m ago", "2h ago", "5d ago") or the absolute-date fallback
+// beyond ~30 days. updated_at is stamped at write time, so the two command
+// invocations an alias test compares may straddle a second boundary and
+// legitimately render different ages; only this token is normalized before
+// the outputs are compared.
+var updatedAgeToken = regexp.MustCompile(`\d+[smhd] ago|\d{4}-\d{2}-\d{2}`)
+
+// normalizeUpdatedAges replaces every rendered UPDATED age with a fixed
+// placeholder, leaving every other byte of the listing to compare exactly.
+func normalizeUpdatedAges(s string) string {
+	return updatedAgeToken.ReplaceAllString(s, "<age>")
+}
+
 // seedListState creates a temp state DB holding several reconciled apps whose
-// prepared_at is a fixed instant in the past, so the UPDATED column renders a
-// stable relative age across the two command invocations the alias tests
-// compare (no second-boundary flake). Names are deliberately unsorted so a test
-// can assert both commands apply the same name ordering.
+// prepared_at is a fixed instant in the past. The UPDATED column is driven by
+// the relational updated_at, which every write stamps at write time, so the
+// populated-alias test normalizes only that rendered age token (see
+// normalizeUpdatedAges) instead of relying on a stable relative age. Names are
+// deliberately unsorted so a test can assert both commands apply the same name
+// ordering.
 func seedListState(t *testing.T) Dependencies {
 	t.Helper()
 	st, deps := openTempState(t)
@@ -64,7 +81,9 @@ func TestAppsAliasMatchesAppLsEmptyDB(t *testing.T) {
 // TestAppsAliasMatchesAppLsPopulatedDB pins that `relay apps` renders exactly
 // the same table as `relay app ls` for a populated database with several apps,
 // and that both sort rows by name. Comparing the two live outputs (rather than
-// a copied fixture) keeps the alias honest without duplicating the list format.
+// a copied fixture) keeps the alias honest without duplicating the list format;
+// only the time-dependent UPDATED ages are normalized because the two
+// invocations render at different instants.
 func TestAppsAliasMatchesAppLsPopulatedDB(t *testing.T) {
 	deps := seedListState(t)
 
@@ -76,8 +95,21 @@ func TestAppsAliasMatchesAppLsPopulatedDB(t *testing.T) {
 	if aliasErr != nil {
 		t.Fatalf("apps: err = %v, want nil", aliasErr)
 	}
-	if aliasOut != canonicalOut {
+
+	// The UPDATED cell is inherently time-dependent (updated_at is stamped at
+	// write time), so compare the listings with only the rendered age tokens
+	// normalized; every other byte, including row order, must match exactly.
+	if normalizeUpdatedAges(aliasOut) != normalizeUpdatedAges(canonicalOut) {
 		t.Fatalf("stdout differs:\n apps:\n%s\n app ls:\n%s", aliasOut, canonicalOut)
+	}
+	for _, view := range []struct {
+		name string
+		out  string
+	}{{"apps", aliasOut}, {"app ls", canonicalOut}} {
+		if got := strings.Count(normalizeUpdatedAges(view.out), "<age>"); got != 4 {
+			t.Fatalf("%s: rendered UPDATED ages = %d, want one per seeded row (4):\n%s",
+				view.name, got, view.out)
+		}
 	}
 
 	// Both must list every seeded app in name order.

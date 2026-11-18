@@ -125,6 +125,15 @@ func renderAppOverview(
 			displayFingerprint(detail.Fingerprint),
 		)
 	}
+	if desiredFingerprintDiffers(
+		detail.Fingerprint, detail.DesiredFingerprint,
+	) {
+		fmt.Fprintf(
+			tw,
+			"Desired fingerprint:\t%s\n",
+			displayFingerprint(detail.DesiredFingerprint),
+		)
+	}
 	if detail.PreparedAt != "" {
 		fmt.Fprintf(tw, "Prepared:\t%s (%s)\n",
 			detail.PreparedAt, relativeAgo(detail.PreparedAt))
@@ -154,6 +163,16 @@ func displayFingerprint(fingerprint string) string {
 		return fingerprint
 	}
 	return prefix + fingerprint
+}
+
+// desiredFingerprintDiffers reports whether a nonempty desired fingerprint
+// identifies a generation other than the published one. Initial discovery has
+// only a desired fingerprint, so that case renders instead of being hidden.
+func desiredFingerprintDiffers(published, desired string) bool {
+	if desired == "" {
+		return false
+	}
+	return displayFingerprint(desired) != displayFingerprint(published)
 }
 
 // renderAppStatsSection renders the per-app cumulative counters and execution
@@ -281,12 +300,16 @@ func lastAgo(rfc3339 string) string {
 	return relativeAgo(rfc3339)
 }
 
-// displayTime returns the UPDATED column value: prepared_at (if set) else
-// updated_at, rendered as a short relative age.
+// displayTime returns the UPDATED column value: the relational updated_at
+// timestamp, which reflects the latest persisted state change. A row without
+// that metadata falls back to prepared_at and then the "-" placeholder.
 func displayTime(r state.Row) string {
-	raw := r.PreparedAt
+	raw := r.UpdatedAt
 	if raw == "" {
-		raw = r.UpdatedAt
+		raw = r.PreparedAt
+	}
+	if raw == "" {
+		return "-"
 	}
 	return relativeAgo(raw)
 }
