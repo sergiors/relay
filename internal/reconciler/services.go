@@ -556,7 +556,6 @@ func reconcileWithObserver(
 		log.Info("Service: reconciling",
 			"app", fnName,
 			"services", len(tmpl.Services),
-			"image", appImage,
 			"outcome", "started",
 		)
 		if reconcileStarted != nil {
@@ -1638,7 +1637,6 @@ func (c *ServiceReconciler) apply(
 		if errors.Is(err, context.Canceled) && errors.Is(ctx.Err(), context.Canceled) {
 			attrs := []any{
 				"app", fnName,
-				"image", image,
 				"services", len(tmpl.Services),
 				"replicas", replicas,
 				"started", pass.started,
@@ -1657,7 +1655,6 @@ func (c *ServiceReconciler) apply(
 		// superseded carried alongside so an abandoned pass is still visible.
 		attrs := []any{
 			"app", fnName,
-			"image", image,
 			"services", len(tmpl.Services),
 			"replicas", replicas,
 			"started", pass.started,
@@ -1685,7 +1682,6 @@ func (c *ServiceReconciler) apply(
 		}
 		logAt("Service: superseded",
 			"app", fnName,
-			"image", image,
 			"services", len(tmpl.Services),
 			"replicas", replicas,
 			"started", pass.started,
@@ -1699,7 +1695,6 @@ func (c *ServiceReconciler) apply(
 	if pass.changed {
 		c.log.Info("Service: reconciled",
 			"app", fnName,
-			"image", image,
 			"services", len(tmpl.Services),
 			"replicas", replicas,
 			"started", pass.started,

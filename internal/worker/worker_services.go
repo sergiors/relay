@@ -288,13 +288,19 @@ func enqueueStartupServicesWithState(
 							// that generation reports its own readiness.
 							return
 						}
-						logger.Info("App: ready",
-							"app", fn.Name,
-							"image", prep.Image,
+						// A no-runtime app serves no app image; its services
+						// bring their own, so the attribute is omitted rather
+						// than logged empty.
+						attrs := []any{"app", fn.Name}
+						if prep.Image != "" {
+							attrs = append(attrs, "image", prep.Image)
+						}
+						attrs = append(attrs,
 							"fingerprint", prep.Fingerprint,
 							"services", len(fn.Template.Services),
 							"outcome", "ready",
 						)
+						logger.Info("App: ready", attrs...)
 					})
 			} else {
 				services.EnqueueLeased(fn.Name, fn.Template, prep.Image, prep.Env, lease)

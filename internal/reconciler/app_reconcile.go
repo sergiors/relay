@@ -514,7 +514,11 @@ func (r *Reconciler) reconcileApp(name string) {
 		prepAttrs = append(prepAttrs, "active_fingerprint", known)
 	}
 	if cur != nil && isAvailable(cur) {
-		prepAttrs = append(prepAttrs, "active_image", cur.Prepared().Image)
+		// A prepared no-runtime app serves no app image; its services bring
+		// their own, so an empty active_image is omitted rather than emitted.
+		if image := cur.Prepared().Image; image != "" {
+			prepAttrs = append(prepAttrs, "active_image", image)
+		}
 	}
 	r.log.Info("App: preparing", prepAttrs...)
 
@@ -558,11 +562,17 @@ func (r *Reconciler) reconcileApp(name string) {
 			attrs := []any{
 				"app", name,
 				"fingerprint", fp,
-				"active_image", cur.Prepared().Image,
+			}
+			// A retained no-runtime generation has no app image, so active_image
+			// is omitted rather than logged empty.
+			if image := cur.Prepared().Image; image != "" {
+				attrs = append(attrs, "active_image", image)
+			}
+			attrs = append(attrs,
 				"duration", time.Since(start),
 				"outcome", "degraded",
 				"error", err,
-			}
+			)
 			if hasFingerprint {
 				attrs = append(attrs, "active_fingerprint", known)
 			}
@@ -644,13 +654,16 @@ func (r *Reconciler) reconcileApp(name string) {
 			pf.ReleasePublication()
 			built.ReleaseLease()
 			if errors.Is(pubErr, runtime.ErrRuntimeImageSelectionStale) {
-				r.log.Info(
-					"App: runtime image selection changed during preparation; retaining previous version",
-					"app", name,
-					"image", built.Image,
+				attrs := []any{"app", name}
+				attrs = append(attrs, appImageAttr(built.Image)...)
+				attrs = append(attrs,
 					"fingerprint", builtFP,
 					"outcome", "stale",
 					"error", pubErr,
+				)
+				r.log.Info(
+					"App: runtime image selection changed during preparation; retaining previous version",
+					attrs...,
 				)
 				// Refresh the complete snapshot before retrying so the next
 				// attempt builds from the authoritative pin, then coalesce a
@@ -662,13 +675,16 @@ func (r *Reconciler) reconcileApp(name string) {
 				}
 				return
 			}
-			r.log.Error(
-				"App: publication failed; retaining previous version",
-				"app", name,
-				"image", built.Image,
+			attrs := []any{"app", name}
+			attrs = append(attrs, appImageAttr(built.Image)...)
+			attrs = append(attrs,
 				"fingerprint", builtFP,
 				"outcome", "failed",
 				"error", pubErr,
+			)
+			r.log.Error(
+				"App: publication failed; retaining previous version",
+				attrs...,
 			)
 			if r.st != nil {
 				r.st.RecordReconcileFailure(r.rctx(), name, pubErr, fencingToken)
@@ -854,20 +870,28 @@ func (r *Reconciler) reconcileApp(name string) {
 }
 
 // deploymentAttrs returns the shared correlation attributes for an app's
-// deployment lifecycle lines: the app, the image the registry serves, the
-// source identity that image was built from, and (when present) the shared
-// dependency layer it consumes. It deliberately carries no fencing token or
-// other internal generation authority.
+// deployment lifecycle lines: the app, the image the registry serves (when the
+// generation has one), the source identity that image was built from, and (when
+// present) the shared dependency layer it consumes. It deliberately carries no
+// fencing token or other internal generation authority.
 func deploymentAttrs(name string, built *runtime.Prepared, fingerprint string) []any {
-	attrs := []any{
-		"app", name,
-		"image", built.Image,
-		"fingerprint", fingerprint,
-	}
+	attrs := []any{"app", name}
+	attrs = append(attrs, appImageAttr(built.Image)...)
+	attrs = append(attrs, "fingerprint", fingerprint)
 	if built.Dependency != "" {
 		attrs = append(attrs, "dependency", built.Dependency)
 	}
 	return attrs
+}
+
+// appImageAttr returns the app-level image attribute for a generation that has
+// one. A no-runtime app builds no app image (its services bring their own), so
+// omitting the attribute avoids claiming an image identity that does not exist.
+func appImageAttr(image string) []any {
+	if image == "" {
+		return nil
+	}
+	return []any{"image", image}
 }
 
 // preparationOutcome classifies why this pass is preparing a generation, for

@@ -436,3 +436,86 @@ func TestStartupPublicationLogsAcceptedImagesAndDefersReady(t *testing.T) {
 		t.Errorf("startup success writes during publication = %v, want none before service completion", stateSink.successes)
 	}
 }
+
+// startupRawRecords parses captured JSON output into raw attribute maps for
+// every record carrying the exact message, failing on any line that is not a
+// structured record. Raw maps distinguish an ABSENT key from an empty value.
+func startupRawRecords(t *testing.T, raw, msg string) []map[string]any {
+	t.Helper()
+	var records []map[string]any
+	for _, line := range strings.Split(raw, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("captured log line is not JSON: %q: %v", line, err)
+		}
+		if record["msg"] == msg {
+			records = append(records, record)
+		}
+	}
+	return records
+}
+
+// TestStartupPublicationLogsImageOnlyWhenTheGenerationHasOne pins the image
+// rule on the startup publication line: an accepted managed generation reports
+// the image it was built from, while an accepted no-runtime generation — its
+// external-image services bring their own — omits the attribute entirely
+// rather than logging an empty identity. Both keep fingerprint and outcome.
+func TestStartupPublicationLogsImageOnlyWhenTheGenerationHasOne(t *testing.T) {
+	// given one accepted managed and one accepted no-runtime generation
+	logger, logs := captureStartupLog()
+	selection := "node:24-alpine@sha256:new"
+	managed := startupPreparedCandidate(
+		startupTestApp(t, "pub-managed", false),
+		"relay-app-pub-managed:v1", selection,
+	)
+	noRuntimeApp := app.App{Name: "pub-external", Template: &app.Template{}}
+	noRuntime := runner.NewPrepared(noRuntimeApp, &runtime.Prepared{
+		Name: noRuntimeApp.Name, Fingerprint: "fp-pub-external",
+	}, nil)
+	registry := &runner.Registry{}
+	publisher := &startupPublicationFake{
+		current: map[string]string{"nodejs24.x": selection},
+	}
+	startup := startupAppSet{fencingTokens: map[string]state.FencingToken{
+		"pub-managed": 1, "pub-external": 2,
+	}}
+
+	// when startup publication runs
+	_, _ = publishStartupApps(
+		context.Background(),
+		[]*runner.PreparedApp{managed, noRuntime},
+		registry, publisher, nil, startup, logger,
+	)
+
+	// then each accepted line carries its own image rule
+	byApp := map[string]map[string]any{}
+	for _, record := range startupRawRecords(
+		t, logs.String(), "App: image published",
+	) {
+		name, _ := record["app"].(string)
+		byApp[name] = record
+	}
+	managedRec := byApp["pub-managed"]
+	if managedRec == nil || managedRec["image"] != "relay-app-pub-managed:v1" {
+		t.Fatalf("managed publication = %+v, want the built image", managedRec)
+	}
+	externalRec := byApp["pub-external"]
+	if externalRec == nil {
+		t.Fatalf("no-runtime publication missing: %+v", byApp)
+	}
+	if value, ok := externalRec["image"]; ok {
+		t.Errorf("no-runtime publication carries image=%v; omit the attribute",
+			value)
+	}
+	for _, rec := range []map[string]any{managedRec, externalRec} {
+		if rec["fingerprint"] == "" || rec["outcome"] != "discovered" {
+			t.Errorf(
+				"publication = %+v, want fingerprint and outcome=discovered",
+				rec,
+			)
+		}
+	}
+}

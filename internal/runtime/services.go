@@ -469,6 +469,27 @@ func serviceLabels(spec ServiceSpec, nodeID string, replica int) map[string]stri
 	return labels
 }
 
+// serviceReplicaAttrs returns the correlation attributes shared by the
+// per-container service lines. Identity a container does not carry — an old
+// container with no relay.replica/relay.image label, or a direct caller's empty
+// spec image — is omitted rather than logged as an empty or sentinel value.
+func serviceReplicaAttrs(appName, service, image string, replica int) []any {
+	attrs := make([]any, 0, 8)
+	if appName != "" {
+		attrs = append(attrs, "app", appName)
+	}
+	if service != "" {
+		attrs = append(attrs, "service", service)
+	}
+	if replica >= 0 {
+		attrs = append(attrs, "replica", replica)
+	}
+	if image != "" {
+		attrs = append(attrs, "image", image)
+	}
+	return attrs
+}
+
 // StartService creates and starts ONE persistent service container. spec.Env is
 // applied verbatim (container env semantics — the caller must assemble it,
 // including PORT=<spec.Port> plus the template env values and resolved secrets;
@@ -674,25 +695,17 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 	// stale).
 	discard := func(reason string, cause error) error {
 		if rmErr := removeContainerContext(ctx, m.cli, id); rmErr != nil {
+			attrs := serviceReplicaAttrs(spec.App, spec.Name, spec.Image, replica)
+			attrs = append(attrs,
+				"container", id,
+				"reason", reason,
+				"error", rmErr,
+			)
 			if serviceOperationCancelled(ctx, rmErr) {
-				m.log.Debug("Service: discard failed container",
-					"app", spec.App,
-					"service", spec.Name,
-					"replica", replica,
-					"container", id,
-					"reason", reason,
-					"outcome", "cancelled",
-					"error", rmErr,
-				)
+				attrs = append(attrs, "outcome", "cancelled")
+				m.log.Debug("Service: discard failed container", attrs...)
 			} else {
-				m.log.Warn("Service: discard failed container",
-					"app", spec.App,
-					"service", spec.Name,
-					"replica", replica,
-					"container", id,
-					"reason", reason,
-					"error", rmErr,
-				)
+				m.log.Warn("Service: discard failed container", attrs...)
 			}
 		}
 		return cause
@@ -758,10 +771,26 @@ func (m *Manager) RestartServiceContainer(ctx context.Context, containerID strin
 	if insp.Container.State == nil || !insp.Container.State.Running {
 		return fmt.Errorf("service: restarted container is not running")
 	}
-	m.log.Info("Service: restarted",
+	// The inspect that confirms the restart also carries the ownership labels
+	// Relay stamped at create time, so the line identifies the exact service
+	// replica and image without an extra lookup. A container created before a
+	// label existed simply omits that attribute.
+	var labels map[string]string
+	if insp.Container.Config != nil {
+		labels = insp.Container.Config.Labels
+	}
+	replica, err := strconv.Atoi(labels[labelReplica])
+	if err != nil {
+		replica = -1
+	}
+	attrs := serviceReplicaAttrs(
+		labels[labelApp], labels[labelService], labels[labelImage], replica,
+	)
+	attrs = append(attrs,
 		"container", containerID,
 		"outcome", "restarted",
 	)
+	m.log.Info("Service: restarted", attrs...)
 	return nil
 }
 
@@ -1081,12 +1110,9 @@ func (m *Manager) stopServiceContainersWithResult(
 					firstErr = err
 				}
 				if !serviceOperationCancelled(ctx, err) {
-					m.log.Warn("Service: stop container failed",
-						"container", c.ID,
-						"app", c.App,
-						"service", c.Name,
-						"error", err,
-					)
+					attrs := serviceReplicaAttrs(c.App, c.Name, c.Image, c.Replica)
+					attrs = append(attrs, "container", c.ID, "error", err)
+					m.log.Warn("Service: stop container failed", attrs...)
 				}
 				continue
 			}
@@ -1096,12 +1122,9 @@ func (m *Manager) stopServiceContainersWithResult(
 				firstErr = err
 			}
 			if !serviceOperationCancelled(ctx, err) {
-				m.log.Warn("Service: remove container failed",
-					"container", c.ID,
-					"app", c.App,
-					"service", c.Name,
-					"error", err,
-				)
+				attrs := serviceReplicaAttrs(c.App, c.Name, c.Image, c.Replica)
+				attrs = append(attrs, "container", c.ID, "error", err)
+				m.log.Warn("Service: remove container failed", attrs...)
 			}
 		} else {
 			completed++

@@ -652,12 +652,17 @@ func publishStartupApps(
 		// Report the publication transition only now — never for a stale
 		// rejection or a preparation-failure placeholder — with the identity the
 		// image was actually built from.
-		logger.Info("App: image published",
-			"app", fn.Name,
-			"image", built.Image,
+		// A no-runtime app builds no app image; its services bring their own,
+		// so the attribute is omitted rather than logged empty.
+		attrs := []any{"app", fn.Name}
+		if built.Image != "" {
+			attrs = append(attrs, "image", built.Image)
+		}
+		attrs = append(attrs,
 			"fingerprint", built.Fingerprint,
 			"outcome", "discovered",
 		)
+		logger.Info("App: image published", attrs...)
 	}
 	if lifecycle.Err() == nil {
 		// Refresh the complete authoritative snapshot after publication. A pin that
