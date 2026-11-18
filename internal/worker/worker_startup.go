@@ -34,6 +34,11 @@ type startupAppSet struct {
 	// build observer, the startup service callbacks, and the reconciler seed all
 	// reuse these exact values instead of reading apps.fencing_token back.
 	fencingTokens map[string]state.FencingToken
+	// publicationFence, when non-nil, runs the startup registry add inside the
+	// deployment publication check-and-swap boundary. Cluster mode uses it to
+	// reject a prepared generation when the shared desired revision is not the
+	// generation that was materialized. Nil preserves standalone behavior.
+	publicationFence func(context.Context, func()) error
 }
 
 // startupParseGate makes the startup loader consult persisted state around each
@@ -114,6 +119,26 @@ func loadStartupApps(
 	st *state.State,
 	metricsInstance *metrics.Registry,
 ) (startupAppSet, error) {
+	return loadStartupAppsWithAuthorization(startupCtx, logger, st, metricsInstance, 0, nil, nil, false)
+}
+
+// loadStartupAppsWithAuthorization is loadStartupApps plus the coordinated
+// deployment authorization. sourceGeneration is stamped on this startup's
+// desired-state writes; authoritative filters the loaded set to the exact
+// fingerprints materialized for that generation, so a local /apps edit can
+// never be prepared or published as a desired generation on a coordinator-active
+// worker.
+// A nil map with authoritative false preserves the standalone behavior.
+func loadStartupAppsWithAuthorization(
+	startupCtx context.Context,
+	logger *slog.Logger,
+	st *state.State,
+	metricsInstance *metrics.Registry,
+	sourceGeneration int64,
+	authorized map[string]string,
+	materializedInvalid map[string]string,
+	authoritative bool,
+) (startupAppSet, error) {
 	_, loaderSpan := tracing.Start(startupCtx, "apps.load")
 	loader := app.NewLoader(app.Dir, logger)
 	observed := make(map[string]state.AppObservation)
@@ -154,6 +179,14 @@ func loadStartupApps(
 	_, fingerprintSpan := tracing.Start(startupCtx, "apps.fingerprint")
 	fingerprintStart := time.Now()
 	startup := selectAndFingerprintApps(apps, logger)
+	if authoritative {
+		startup = filterAuthorizedStartupApps(startup, authorized, logger)
+		loadIssues = filterAuthorizedStartupIssues(loadIssues, materializedInvalid)
+		apps = apps[:0]
+		for _, record := range startup {
+			apps = append(apps, record.App)
+		}
+	}
 	fingerprints := make(map[string]string, len(startup))
 	for _, s := range startup {
 		fingerprints[s.App.Name] = s.Fingerprint
@@ -173,8 +206,8 @@ func loadStartupApps(
 	// prepare it without its exact fencing token. Cancellation stops startup
 	// promptly and follows the normal teardown path.
 	_, discoverySpan := tracing.Start(startupCtx, "state.discovery")
-	fencingTokens, rerr := persistStartupDiscovery(
-		startupCtx, st, app.Dir, discovered, loadIssues, observed, logger,
+	fencingTokens, rerr := persistStartupDiscoveryWithGeneration(
+		startupCtx, st, app.Dir, discovered, loadIssues, observed, logger, sourceGeneration,
 	)
 	if rerr != nil {
 		discoverySpan.RecordError(rerr)
@@ -315,6 +348,46 @@ func discoveredFromStartup(startup []startupApp) []state.DiscoveredApp {
 // rebuild instead of treating the mutated tree as already prepared. The rule is a
 // pure helper so it is pinned by a deterministic unit test rather than inferred
 // from Run's inline wiring.
+// filterAuthorizedStartupApps drops local app candidates whose fingerprint is
+// not the one materialized for the authorized deployment generation. Local
+// additions and edits are ignored (and restored by the deployment coordinator);
+// they are never recorded as a desired generation or prepared at startup.
+// filterAuthorizedStartupIssues keeps only invalid app candidates that were
+// actually materialized for the authorized generation. A local edit that makes
+// an authorized app unparseable is drift, not a new desired definition, so its
+// issue is dropped instead of being persisted.
+func filterAuthorizedStartupIssues(
+	issues []app.LoadIssue,
+	materializedInvalid map[string]string,
+) []app.LoadIssue {
+	filtered := issues[:0]
+	for _, issue := range issues {
+		if _, ok := materializedInvalid[issue.Name]; !ok {
+			continue
+		}
+		filtered = append(filtered, issue)
+	}
+	return filtered
+}
+
+func filterAuthorizedStartupApps(
+	startup []startupApp,
+	authorized map[string]string,
+	logger *slog.Logger,
+) []startupApp {
+	filtered := startup[:0]
+	for _, record := range startup {
+		fingerprint, ok := authorized[record.App.Name]
+		if !ok || fingerprint != record.Fingerprint {
+			logger.Warn("Deployment: local app does not match the materialized revision; ignoring",
+				"app", record.App.Name)
+			continue
+		}
+		filtered = append(filtered, record)
+	}
+	return filtered
+}
+
 func startupSeedFingerprints(
 	apps []app.App,
 	fingerprints map[string]string,
@@ -416,6 +489,23 @@ func persistStartupDiscovery(
 	observed map[string]state.AppObservation,
 	logger *slog.Logger,
 ) (map[string]state.FencingToken, error) {
+	return persistStartupDiscoveryWithGeneration(
+		ctx, st, dir, discovered, issues, observed, logger, 0)
+}
+
+// persistStartupDiscoveryWithGeneration is persistStartupDiscovery with the
+// coordinated deployment generation stamped on every valid app's desired
+// snapshot. Callers without coordinated participation use the zero-generation wrapper.
+func persistStartupDiscoveryWithGeneration(
+	ctx context.Context,
+	st *state.State,
+	dir string,
+	discovered []state.DiscoveredApp,
+	issues []app.LoadIssue,
+	observed map[string]state.AppObservation,
+	logger *slog.Logger,
+	sourceGeneration int64,
+) (map[string]state.FencingToken, error) {
 	checkCtx := func() error {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("seed state: %w", err)
@@ -496,7 +586,8 @@ func persistStartupDiscovery(
 		if err := checkCtx(); err != nil {
 			return fencingTokens, err
 		}
-		fencingToken, err := st.RecordDiscoveredWithFingerprint(ctx, d.App, d.Fingerprint)
+		fencingToken, err := st.RecordDiscoveredWithSourceGeneration(
+			ctx, d.App, d.Fingerprint, sourceGeneration)
 		if err != nil {
 			if startupInterrupted(ctx, err) {
 				return fencingTokens, fmt.Errorf("record discovered: %w", err)

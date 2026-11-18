@@ -127,6 +127,12 @@ relay git sync
 relay git status
 relay git remove
 
+relay deploy
+relay deploy status
+relay deploy rollback <sha>
+relay deploy pin
+relay deploy unpin
+
 relay dlq ls
 relay dlq inspect <id>
 relay dlq replay <id>
@@ -136,6 +142,10 @@ relay dlq rm <id>
 Manual invocation takes a JSON object, or `-` to read it from stdin. Secret
 values can be entered at a hidden prompt or read from stdin; they are never
 command-line arguments. For command details, see [CLI](docs/cli.md).
+
+To deploy apps from Git, configure a source and run `relay git sync`. See
+[Git-managed apps](docs/operations.md#git-managed-apps) for setup and deployment
+guidance.
 
 ```sh
 relay app invoke my-app '{"recordType":"INSERT"}'

@@ -217,6 +217,12 @@ type SyncOptions struct {
 	CloneURL string
 	// Ref overrides the configured ref. Empty uses the configured ref.
 	Ref string
+	// Commit, when set, selects an exact immutable commit instead of resolving
+	// Ref. It must be a full 40-character hexadecimal object name. This is the
+	// materialization entry used by coordinated deployments: the shared
+	// desired revision is already a pinned SHA, so a node never resolves a
+	// mutable branch/tag of its own. Empty preserves normal branch/tag sync.
+	Commit string
 	// Path overrides the configured monorepo path in the same way as Ref.
 	Path *string
 	// Auth is the transport auth. nil is fine for local filesystem sources

@@ -81,4 +81,13 @@
 //	/var/lib/relay/git/checkout              the managed git checkout/worktree
 //
 // Relay never shells out to the git binary; all operations use go-git.
+//
+// Coordinated deployments still use this same transport, checkout, and
+// materialization code. In that mode the shared desired revision is already an
+// immutable full 40-character commit SHA, and each node calls SyncCommit (or
+// sets SyncOptions.Commit) to fetch origin and hard-checkout exactly that object
+// instead of resolving a mutable ref. Abbreviated hashes, branch/tag names, and
+// commits absent after the fetch are hard errors. The local SSH key and TOFU
+// known_hosts pins are never shared: only the repository/ref/path and the
+// selected SHA are common deployment configuration.
 package git

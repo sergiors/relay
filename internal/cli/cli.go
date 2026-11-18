@@ -44,11 +44,11 @@ type OpenDLQStore func(ctx context.Context, logger *slog.Logger) (store dlq.Stor
 type StartRun func(logger *slog.Logger) error
 
 // OpenState opens the state database for the administrative commands (`app`,
-// `stats`). It is a lazy seam: it is called only by the commands that need the
-// database, so every other command works with no DATABASE_URL configured. It
-// returns the handle and a cleanup func. Production wires openPostgresState
-// (config.LoadDatabaseURL + state.Open); tests (or an embedding host) inject an
-// isolated handle.
+// `stats`, `git sync`, and `deploy`). It is a lazy seam: it is called only by
+// commands that need the database, so other commands work with no DATABASE_URL
+// configured. It returns the handle and a cleanup func. Production wires
+// openPostgresState (config.LoadDatabaseURL + state.Open); tests (or an embedding
+// host) inject an isolated handle.
 type OpenState func(ctx context.Context) (*state.State, func(), error)
 
 // RuntimeImageResolver resolves one configured base-image reference to the
@@ -93,10 +93,10 @@ type PoolSnapshotProvider func(name string) (runtime.PoolSnapshot, bool)
 // It deliberately replaces package-level mutable variables, so a command's paths
 // and connections come from its construction rather than from global state.
 type Dependencies struct {
-	// OpenState opens the PostgreSQL state database the administrative commands
-	// (app, stats) use. It is read-mostly, not read-only: the read paths
-	// (app inspect, stats) only read, while `stats reset` writes (zeroing
-	// the cumulative counters in place). Production: openPostgresState.
+	// OpenState opens the PostgreSQL state database used by `app`, `stats`,
+	// `git sync`, and `deploy`. Read paths include `app inspect`, stats, and
+	// `deploy status`; `stats reset`, `git sync`, and deploy rollback/pin/unpin
+	// write. Production: openPostgresState.
 	OpenState OpenState
 	// OpenRuntimeImageResolver opens the Docker Engine-backed registry resolver
 	// used by `relay runtime check` (read-only) and `relay runtime update`
@@ -241,6 +241,7 @@ func New(logger *slog.Logger, writer io.Writer, deps Dependencies) *cli.Command 
 			dlqCommand(logger, deps),
 			secretCommand(deps),
 			gitCommand(deps),
+			deployCommand(deps),
 			statsCommand(deps),
 			healthCommand(deps),
 			runtimeCommand(deps),

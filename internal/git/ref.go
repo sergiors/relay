@@ -1,6 +1,7 @@
 package git
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/go-git/go-git/v5/plumbing"
@@ -80,4 +81,22 @@ func MatchPushedRef(pushedRef, configuredRef string) bool {
 		return rn.Short() == configuredRef
 	}
 	return pushedRef == configuredRef
+}
+
+// ValidateCommit reports whether commit is a full immutable Git object name
+// (40 hexadecimal characters). Coordinated deployments require an exact object
+// SHA: branch/tag names and abbreviated hashes are mutable or ambiguous and are
+// deliberately rejected. The value is case-insensitive on input; callers that
+// persist it should store the lowercase form.
+func ValidateCommit(commit string) error {
+	if len(commit) != 40 {
+		return fmt.Errorf("git: commit %q must be a full 40-character hexadecimal SHA", commit)
+	}
+	for i := 0; i < len(commit); i++ {
+		c := commit[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return fmt.Errorf("git: commit %q must be a full 40-character hexadecimal SHA", commit)
+		}
+	}
+	return nil
 }

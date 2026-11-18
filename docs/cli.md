@@ -13,28 +13,11 @@ relay runtime <ls|inspect|check|update>
 relay dlq <ls|inspect|replay|rm>
 relay secret <ls|set|rm>
 relay git <keygen|set|sync|status|remove>
+relay deploy [status|rollback <sha>|pin|unpin]
 ```
 
 Run `relay <command> --help` for flags. `relay apps` is an alias for
 `relay app ls`.
-
-## Command requirements
-
-| Command                              | Requirements                                   |
-| ------------------------------------ | ---------------------------------------------- |
-| `start`                              | Redis, PostgreSQL, Docker, configured networks |
-| `health`, `app invoke`, `dlq replay` | Running worker                                 |
-| `stats`, `app ls`                    | PostgreSQL (`DATABASE_URL`)                    |
-| `app inspect`                        | PostgreSQL; Docker optional for provenance     |
-| `runtime ls`, `runtime inspect`      | PostgreSQL (`DATABASE_URL`)                    |
-| `runtime check`, `runtime update`    | PostgreSQL, Docker Engine, and registry access |
-| `dlq ls`, `dlq inspect`, `dlq rm`    | PostgreSQL (`DATABASE_URL`)                    |
-| `secret ls`                          | Active secret provider and its configuration   |
-| `secret set`, `secret rm`            | Local provider only                            |
-| `git *`                              | Local Git configuration and `/apps`            |
-
-`health`, `app invoke`, and DLQ replay require a running worker. DLQ commands
-also access PostgreSQL.
 
 ## relay start
 
@@ -191,13 +174,32 @@ relay git remove [-y|--yes]
 - `keygen` creates an SSH deploy key under `/var/lib/relay/ssh` and prints the
   public key.
 - `set` configures an SSH repository, optional ref/path, and optional webhook
-  secret name.
-- `sync` updates `/apps` to match the configured repository and path, removing
-  apps no longer present. Review the source and path before syncing.
+  secret name. This only saves the source; run `relay git sync` to deploy it.
+- `sync` deploys the latest revision from the configured ref to this node's
+  `/apps`, removing apps no longer present in the source. Review the source and
+  path before syncing. A pinned deployment blocks sync; run
+  `relay deploy unpin` first. If another update wins during a sync, run it again.
 - `status` reports the source and last sync.
 - `remove` removes the saved Git source and checkout, but leaves `/apps` and the
   deploy key in place. It prompts for confirmation; use `-y` for automation.
 
 Git synchronization is manual unless a webhook is configured. See
-[Operations](operations.md#git-managed-apps) for synchronization behavior and
-host-key verification.
+[Operations](operations.md#git-managed-apps) for webhook setup, host-key
+verification, and multi-node behavior.
+
+## relay deploy
+
+```sh
+relay deploy
+relay deploy status
+relay deploy rollback <sha>
+relay deploy pin
+relay deploy unpin
+```
+
+`relay deploy` is an alias for `relay deploy status`. `rollback` selects a commit
+from the configured repository and pins it. `pin` blocks `git sync` and webhook
+updates; `unpin` allows future updates but does not immediately change the
+current revision. Status shows the desired generation and commit, pin state, and
+each node's current revision and app status. A node that is still updating keeps
+its previous apps active. See [Operations](operations.md#git-managed-apps).

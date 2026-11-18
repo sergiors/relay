@@ -34,6 +34,15 @@ const schemaLockKey int64 = 0x72656c6179 // "relay"
 // two-int form of pg_advisory_xact_lock.
 const appLockNamespace int32 = 1
 
+// deploymentLockNamespace is the high-order key of the single shared
+// transaction-scoped lock serializing desired-revision publication. It must not
+// alias app (1), dependency-image (2), or runtime-selection (3) locks.
+const deploymentLockNamespace int32 = 4
+
+// deploymentLockKey is the low-order half of the deployment publication lock.
+// There is exactly one desired revision, so one constant key is sufficient.
+const deploymentLockKey int32 = 1
+
 // appLockKey maps an app name to the low-order half of its advisory-lock key.
 // The mapping only needs to be stable within a run; a 32-bit hash collision
 // merely over-serializes two unrelated apps and never affects correctness.
@@ -179,6 +188,14 @@ type Detail struct {
 	Image              string `json:"image,omitempty"`
 	Fingerprint        string `json:"fingerprint,omitempty"`
 	DesiredFingerprint string `json:"desired_fingerprint,omitempty"`
+	// SourceGeneration is the coordinated deployment generation whose
+	// materialized /apps tree produced this desired/active snapshot. Zero means
+	// uncoordinated (standalone local /apps). It extends the app publication
+	// fence: a success that would publish a NEW active fingerprint is refused
+	// once a newer shared deployment generation exists, even when the app's
+	// content fingerprint is unchanged (for example a rollback to identical
+	// bytes). It is independent of the runtime image selection CAS.
+	SourceGeneration int64 `json:"source_generation,omitempty"`
 	// InvalidSource is the stable content identity (app.TemplateIdentity) of the
 	// template.yaml bytes that deterministically failed parse/validation. It is
 	// set ONLY for that failure class; read/path/fingerprint/dependency and
@@ -799,6 +816,52 @@ func (st *State) initSchema(ctx context.Context) error {
 			generation BIGINT NOT NULL CHECK (generation > 0),
 			selected_at TIMESTAMPTZ NOT NULL
 		)`,
+		// deployment_desired is the single-row coordinated deployment revision. It
+		// shares only the database between nodes: generation is the monotonic
+		// compare-and-swap key and updated_at is operator metadata, while the
+		// full revision (immutable commit SHA, repository/ref/path, publisher,
+		// pin policy, and optional source timestamp) is the JSONB object in
+		// data. A row is never edited to an older generation; a rollback is a
+		// NEW generation carrying an older commit.
+		`CREATE TABLE IF NOT EXISTS deployment_desired (
+			id SMALLINT PRIMARY KEY CHECK (id = 1),
+			generation BIGINT NOT NULL CHECK (generation > 0),
+			updated_at TIMESTAMPTZ NOT NULL,
+			data JSONB NOT NULL
+		)`,
+		// deployment_nodes holds one row per node's independent deployment
+		// progress. generation is the LATEST DESIRED generation this node
+		// observed; applied_generation is the generation currently materialized
+		// and authorized in /apps. incarnation is a PostgreSQL-allocated process
+		// fence: a stale process incarnation cannot advance the observed
+		// generation, and applied_incarnation fences the per-app activation
+		// writers. The phase, commit, and errors live in the JSONB data object.
+		`CREATE TABLE IF NOT EXISTS deployment_nodes (
+			node_id TEXT PRIMARY KEY,
+			generation BIGINT NOT NULL,
+			applied_generation BIGINT NOT NULL DEFAULT 0,
+			instance TEXT NOT NULL DEFAULT '',
+			incarnation BIGINT NOT NULL DEFAULT 0,
+			applied_incarnation BIGINT NOT NULL DEFAULT 0,
+			updated_at TIMESTAMPTZ NOT NULL,
+			data JSONB NOT NULL
+		)`,
+		`CREATE SEQUENCE IF NOT EXISTS deployment_incarnation_seq AS BIGINT CACHE 1 START WITH 1`,
+		// deployment_apps is the per-node, per-generation, per-app activation
+		// progress. It deliberately keeps historical generations until applied
+		// advancement prunes them, so a failed newer materialization cannot
+		// destroy the previous generation's authorization. The row identity is
+		// (node_id, app_name, generation); the phase, fingerprint, commit, and
+		// error live in the JSONB data object.
+		`CREATE TABLE IF NOT EXISTS deployment_apps (
+			node_id TEXT NOT NULL,
+			app_name TEXT NOT NULL,
+			generation BIGINT NOT NULL,
+			instance TEXT NOT NULL DEFAULT '',
+			updated_at TIMESTAMPTZ NOT NULL,
+			data JSONB NOT NULL,
+			PRIMARY KEY (node_id, app_name, generation)
+		)`,
 	}
 
 	for _, s := range stmts {
@@ -1116,11 +1179,27 @@ func (st *State) RecordDiscoveredWithFingerprint(
 	fn app.App,
 	fingerprint string,
 ) (FencingToken, error) {
+	return st.RecordDiscoveredWithSourceGeneration(ctx, fn, fingerprint, 0)
+}
+
+// RecordDiscoveredWithSourceGeneration is RecordDiscoveredWithFingerprint with
+// the coordinated deployment generation the materialized tree belongs to. A
+// non-zero value stamps the desired snapshot so a success that would publish a
+// DIFFERENT active fingerprint can be fenced out once a newer shared deployment
+// generation is published (see RecordReconcileSuccess). Callers without coordinated participation pass
+// zero and keep the historical behavior.
+func (st *State) RecordDiscoveredWithSourceGeneration(
+	ctx context.Context,
+	fn app.App,
+	fingerprint string,
+	sourceGeneration int64,
+) (FencingToken, error) {
 	updatedAt := st.nowTime().UTC()
 	var fencingToken FencingToken
 	err := st.appWriteTx(ctx, fn.Name, func(tx *sql.Tx) error {
 		var err error
-		fencingToken, err = recordDesiredTx(ctx, tx, fn.Name, fn.Template, fingerprint, updatedAt)
+		fencingToken, err = recordDesiredTx(
+			ctx, tx, fn.Name, fn.Template, fingerprint, sourceGeneration, updatedAt)
 		return err
 	})
 	if err != nil {
@@ -1148,6 +1227,7 @@ func recordDesiredTx(
 	name string,
 	tmpl *app.Template,
 	fingerprint string,
+	sourceGeneration int64,
 	updatedAt time.Time,
 ) (FencingToken, error) {
 	fencingToken, err := nextFencingTokenTx(ctx, tx)
@@ -1163,10 +1243,17 @@ func recordDesiredTx(
 		detail = appSnapshot(name, tmpl, StatusPreparing, "", "", fingerprint, "", "", "", "")
 	} else {
 		active := detail
+		// An uncoordinated writer sharing the state view must not weaken an
+		// existing coordinated publication fence by stamping zero. Only a newer
+		// coordinated generation (or a row that never had one) may change it.
+		if sourceGeneration == 0 && active.SourceGeneration != 0 {
+			sourceGeneration = active.SourceGeneration
+		}
 		detail = appSnapshot(name, tmpl, StatusPreparing,
 			active.Image, active.Fingerprint, fingerprint,
 			active.PreparedAt, active.LastReconcileAt, active.LastReconcileStatus, active.LastError)
 	}
+	detail.SourceGeneration = sourceGeneration
 	if err := upsertAppTx(ctx, tx, detail, fencingToken, updatedAt); err != nil {
 		return 0, err
 	}
@@ -1185,8 +1272,13 @@ func recordDesiredTx(
 // It is a fencing-token-guarded UPDATE, never an upsert: a completion carrying a
 // stale token (another worker advanced the app, or the app was removed) affects
 // no row and is not published to the status observer — it reports (false, nil).
-// A success can only ever describe the generation that already owns the row. It
-// returns whether the write landed and an error only when the write itself
+// A success can only ever describe the generation that already owns the row. In
+// coordinated deployment participation the row's SourceGeneration extends that fence: a
+// success that would publish a NEW active fingerprint is refused once the shared
+// desired deployment generation differs (including a newer revision with the
+// same bytes, as in a rollback). Re-stamping the already-active fingerprint is
+// allowed so service convergence of the serving generation is never blocked.
+// It returns whether the write landed and an error only when the write itself
 // failed. ctx bounds the transaction, including its advisory-lock wait.
 func (st *State) RecordReconcileSuccess(
 	ctx context.Context,
@@ -1205,8 +1297,35 @@ func (st *State) RecordReconcileSuccess(
 	prepared := preparedAt.UTC().Format(time.RFC3339)
 	wrote := false
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
+		current, found, err := scanApp(name, tx.QueryRowContext(ctx,
+			`SELECT `+jsonPayloadExpr+`, updated_at
+			 FROM apps WHERE name = $1 AND fencing_token = $2`, name, int64(fencingToken)))
+		if err != nil || !found {
+			return err
+		}
+		// Publication fence across independent axes: the app fencing token above
+		// orders desired generations within an app, while SourceGeneration ties
+		// the materialized deployment generation to the shared desired revision.
+		// A preparation started from an older generation must not publish a NEW
+		// active fingerprint after a newer deployment generation is durable, even
+		// when the /apps bytes (and therefore the fingerprint) are identical, as
+		// in a rollback to the same tree. Re-stamping the already-active
+		// fingerprint (a service-convergence observation of the generation that
+		// is still serving) is allowed and never blocked.
+		if current.SourceGeneration > 0 && fingerprint != current.Fingerprint {
+			var desiredGeneration int64
+			desiredErr := tx.QueryRowContext(ctx,
+				`SELECT generation FROM deployment_desired WHERE id = 1`).Scan(&desiredGeneration)
+			if errors.Is(desiredErr, sql.ErrNoRows) ||
+				(desiredErr == nil && desiredGeneration != current.SourceGeneration) {
+				return nil
+			}
+			if desiredErr != nil {
+				return desiredErr
+			}
+		}
 		detail := appSnapshot(name, fn.Template, StatusReady, image, fingerprint, fingerprint, prepared, ts, ReconcileSuccess, "")
-		var err error
+		detail.SourceGeneration = current.SourceGeneration
 		wrote, err = updateAppIfCurrentTx(ctx, tx, detail, fencingToken, now)
 		return err
 	})
@@ -1254,11 +1373,26 @@ func (st *State) RecordPreparingWithFingerprint(
 	fn app.App,
 	fingerprint string,
 ) (FencingToken, error) {
+	return st.RecordPreparingWithSourceGeneration(ctx, name, fn, fingerprint, 0)
+}
+
+// RecordPreparingWithSourceGeneration is RecordPreparingWithFingerprint with the
+// coordinated deployment generation the materialized tree belongs to. A non-zero
+// value stamps the desired snapshot for the publication fence; standalone
+// callers pass zero.
+func (st *State) RecordPreparingWithSourceGeneration(
+	ctx context.Context,
+	name string,
+	fn app.App,
+	fingerprint string,
+	sourceGeneration int64,
+) (FencingToken, error) {
 	updatedAt := st.nowTime().UTC()
 	var fencingToken FencingToken
 	err := st.appWriteTx(ctx, name, func(tx *sql.Tx) error {
 		var err error
-		fencingToken, err = recordDesiredTx(ctx, tx, name, fn.Template, fingerprint, updatedAt)
+		fencingToken, err = recordDesiredTx(
+			ctx, tx, name, fn.Template, fingerprint, sourceGeneration, updatedAt)
 		return err
 	})
 	if err != nil {

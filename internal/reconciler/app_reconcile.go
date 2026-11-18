@@ -185,6 +185,16 @@ func (r *Reconciler) reconcileApp(name string) {
 	if app.IsReservedDir(name) {
 		return
 	}
+	expectedFingerprint, deploymentAuthorized, deploymentRemovalOnly := r.deploymentAuthorization(name)
+	deploymentInvalidTemplate, deploymentInvalidMessage, deploymentInvalid := r.deploymentInvalidInfo(name)
+	deploymentCluster := r.deploymentClusterMode()
+	if deploymentCluster && !deploymentAuthorized && !deploymentRemovalOnly && !deploymentInvalid {
+		// A local-only app is not part of the materialized revision. Its bytes
+		// must never become a desired generation; the deployment coordinator
+		// removes it when it restores the authorized tree.
+		r.reportDeploymentDrift(name, "not part of the active deployment")
+		return
+	}
 	// Observe the persisted row BEFORE reading template.yaml. This snapshot is
 	// the optimistic guard an invalid observation carries: if another worker
 	// advances the app (for example with a valid correction) while this pass is
@@ -206,12 +216,24 @@ func (r *Reconciler) reconcileApp(name string) {
 			// A missing path, regular file, or direct-child symlink is not an
 			// app. These are normal removals for known names, unlike an invalid
 			// template inside a real app directory, which preserves the active
-			// generation.
+			// generation. In coordinated deployments only a name the deployment explicitly
+			// removed may be removed; an authorized app disappearing locally is
+			// drift and is restored, never treated as a desired removal.
+			if deploymentCluster && !deploymentRemovalOnly {
+				r.reportDeploymentDrift(name, "materialized app is missing locally")
+				return
+			}
 			if r.knownLocally(name) {
 				r.remove(name)
 			}
 			return
 		}
+	}
+	if deploymentRemovalOnly {
+		// The app is absent from the authorized generation but is present on
+		// disk: this is a local recreation, not an authorized removal.
+		r.reportDeploymentDrift(name, "app is not part of the active deployment")
+		return
 	}
 	// ReadTemplateSource applies the same no-follow policy as startup discovery
 	// and keeps parsing separate so an unchanged deterministic invalid input can
@@ -229,15 +251,31 @@ func (r *Reconciler) reconcileApp(name string) {
 			if inspectErr != nil {
 				err = fmt.Errorf("app %q: inspect directory: %w", name, inspectErr)
 			} else if !realDir {
+				if deploymentCluster && !deploymentRemovalOnly {
+					r.reportDeploymentDrift(name, "materialized app changed to an unsupported path")
+					return
+				}
 				if r.knownLocally(name) {
 					r.remove(name)
 				}
 				return
 			}
 		}
+		if deploymentCluster && deploymentAuthorized {
+			// An authorized app that disappeared, lost its template, or became
+			// unreadable locally is drift, not a desired removal or invalid
+			// definition. Never let a local deletion or edit change the active
+			// generation.
+			r.reportDeploymentDrift(name, "materialized app can no longer be loaded locally")
+			return
+		}
 		if errors.Is(err, fs.ErrNotExist) {
-			// Directory gone -> remove from registry. In-flight invocations keep
-			// the old snapshot; they are not killed.
+			// Directory gone -> removal only when the deployment authorized it.
+			// Otherwise this is local drift and the coordinator restores the tree.
+			if deploymentCluster && !deploymentRemovalOnly {
+				r.reportDeploymentDrift(name, "materialized app is missing locally")
+				return
+			}
 			if r.knownLocally(name) {
 				r.remove(name)
 			}
@@ -245,11 +283,13 @@ func (r *Reconciler) reconcileApp(name string) {
 		}
 		if errors.Is(err, app.ErrNotReady) {
 			// The directory has no template.yaml, so it is not an app candidate.
-			// If this Reconciler already knows the name (an active/pending
-			// registry entry, or a startup fencing token for an invalid row),
-			// losing its template is a normal removal. A never-app directory
-			// holding only unrelated files is a no-op: no warning, no invalid
-			// state write, no generation churn.
+			// On a coordinator-active worker only an authorized removal may
+			// disappear; a desired invalid/active app losing its template locally is
+			// drift, never a removal.
+			if deploymentCluster && !deploymentRemovalOnly {
+				r.reportDeploymentDrift(name, "materialized app lost its template locally")
+				return
+			}
 			if r.knownLocally(name) {
 				r.remove(name)
 			}
@@ -274,6 +314,9 @@ func (r *Reconciler) reconcileApp(name string) {
 			)
 			// No bytes were read, so there is no deterministic invalid identity:
 			// this failure stays retryable and clears any earlier identity.
+			if deploymentCluster && deploymentInvalid {
+				r.reportDeployment(name, state.DeploymentAppFailed, err.Error())
+			}
 			r.recordInvalidDesired(name, "", err, observed)
 			return
 		}
@@ -287,10 +330,37 @@ func (r *Reconciler) reconcileApp(name string) {
 			"app", name,
 			"error", err,
 		)
+		if deploymentCluster && deploymentInvalid {
+			r.reportDeployment(name, state.DeploymentAppFailed, err.Error())
+		}
 		r.recordInvalidDesired(name, "", err, observed)
 		return
 	}
-	source := templateSource
+	templateSrc := templateSource
+
+	// A template edit is drift, not a new desired generation. Checking the exact
+	// template identity here — before pending rules are published — preserves the
+	// historical pending-before-fingerprint event window for genuine deployments
+	// while refusing locally introduced template content. A DESIRED invalid app is
+	// not drift when its bytes still match the materialized invalid identity; the
+	// normal invalid-desired path below retains the diagnostic and previous active
+	// generation. Without an invalid identity, a now-successful parse cannot be
+	// distinguished from a local correction and is treated as drift.
+	expectedTemplate := ""
+	templateKnown := false
+	if deploymentCluster {
+		if deploymentAuthorized {
+			expectedTemplate, templateKnown = r.deploymentTemplateIdentity(name)
+		}
+		if deploymentInvalid {
+			expectedTemplate = deploymentInvalidTemplate
+			templateKnown = expectedTemplate != ""
+		}
+	}
+	if deploymentCluster && templateKnown && templateSrc.Identity != expectedTemplate {
+		r.reportDeploymentDrift(name, "materialized template changed locally")
+		return
+	}
 
 	// The bytes were read and hashed. If their exact deterministic-invalid
 	// identity is CURRENTLY persisted, skip the parse entirely. This is a fresh
@@ -298,18 +368,25 @@ func (r *Reconciler) reconcileApp(name string) {
 	// negative cache): the row is the authority, so an unchanged invalid input is
 	// recognized across cycles and restarts, while another worker's valid
 	// correction is never overridden by a stale local view.
-	if source.Identity != "" && observed != nil && observed.Found &&
-		observed.Detail.InvalidSource == source.Identity {
+	if templateSrc.Identity != "" && observed != nil && observed.Found &&
+		observed.Detail.InvalidSource == templateSrc.Identity {
 		if current := r.observeApp(name); current != nil &&
-			current.Found && current.Detail.InvalidSource == source.Identity {
+			current.Found && current.Detail.InvalidSource == templateSrc.Identity {
 			r.reg.ClearPending(name)
 			r.skipUnchangedInvalidDesired(name, current)
 			return
 		}
 	}
 
-	fn, err := source.Parse()
+	fn, err := templateSrc.Parse()
 	if err != nil {
+		if deploymentCluster && deploymentAuthorized {
+			// A local template edit made the materialized app unparseable. It is
+			// drift: keep serving the authorized active generation and restore the
+			// tree instead of recording a locally introduced invalid desired state.
+			r.reportDeploymentDrift(name, "materialized template changed locally")
+			return
+		}
 		// Every other load failure (invalid path, flaky read, unreadable/invalid
 		// template) means the desired definition is not a valid generation to
 		// prepare, so no desired pending rules are manufactured. Any stale
@@ -327,7 +404,17 @@ func (r *Reconciler) reconcileApp(name string) {
 			"error", err,
 		)
 		identity, _ := app.InvalidTemplateIdentity(err)
+		if deploymentCluster && deploymentInvalid {
+			r.reportDeployment(name, state.DeploymentAppFailed, err.Error())
+		}
 		r.recordInvalidDesired(name, identity, err, observed)
+		return
+	}
+	if deploymentCluster && deploymentInvalid && !templateKnown {
+		// The materialized invalid app could not be verified byte-for-byte, and it
+		// now parses successfully: treat that as local drift rather than activating
+		// locally introduced content.
+		r.reportDeploymentDrift(name, "desired invalid app changed locally")
 		return
 	}
 	dir := fn.Dir
@@ -377,6 +464,11 @@ func (r *Reconciler) reconcileApp(name string) {
 	// exactly once per reconcile.
 	selection, fp, err := r.fingerprint(dir, fn.Template)
 	if err != nil {
+		if deploymentCluster && deploymentAuthorized {
+			r.revertDeploymentPending(name, cur)
+			r.reportDeploymentDrift(name, "materialized source can no longer be fingerprinted")
+			return
+		}
 		r.log.Warn(
 			"App: fingerprint error; retaining previous version",
 			"app", name,
@@ -393,6 +485,29 @@ func (r *Reconciler) reconcileApp(name string) {
 		// fingerprint/source/dependency failure is operational and must stay
 		// retryable (and clear any earlier deterministic invalid identity).
 		r.recordInvalidDesired(name, "", err, observed)
+		return
+	}
+
+	if deploymentCluster && deploymentAuthorized && expectedFingerprint != "" &&
+		fp != expectedFingerprint {
+		r.revertDeploymentPending(name, cur)
+		r.reportDeploymentDrift(name, "materialized content changed locally")
+		return
+	}
+
+	if deploymentCluster && deploymentInvalid {
+		// The materialized revision could not fingerprint this app. A later live
+		// fingerprint success must NOT authorize a build from the current /apps
+		// bytes: a local edit made during the failure could otherwise become active.
+		// Leave the desired rules pending/unavailable and keep any previous active
+		// generation serving. checkDrift re-runs authorize; when it can fingerprint,
+		// the changed authorization re-materializes the exact shared SHA and enqueues
+		// a safe retry with an expected fingerprint.
+		message := deploymentInvalidMessage
+		if message == "" {
+			message = "desired app is invalid in the materialized revision"
+		}
+		r.reportDeployment(name, state.DeploymentAppFailed, message)
 		return
 	}
 
@@ -424,6 +539,8 @@ func (r *Reconciler) reconcileApp(name string) {
 			"App: unchanged; reconcile skipped",
 			"app", name,
 		)
+		// An authorized unchanged app is active for this deployment generation.
+		r.reportDeployment(name, state.DeploymentAppActive, "")
 		// Resource limits do not participate in the image fingerprint, so a
 		// resource-only template change lands on this skip path. Publish the
 		// current effective limits to the live warm pool so containers rotate to
@@ -520,12 +637,14 @@ func (r *Reconciler) reconcileApp(name string) {
 			prepAttrs = append(prepAttrs, "active_image", image)
 		}
 	}
+	r.reportDeployment(name, state.DeploymentAppActivating, "")
 	r.log.Info("App: preparing", prepAttrs...)
 
 	r.mu.Lock()
 	r.generations[name]++
 	generation := r.generations[name]
 	r.mu.Unlock()
+	prepSourceGeneration := r.deploymentSourceGeneration()
 	var fencingToken state.FencingToken
 	if r.st != nil {
 		// Reuse the fingerprint computed above for this desired generation: it is
@@ -533,7 +652,8 @@ func (r *Reconciler) reconcileApp(name string) {
 		// state write transaction holds no external I/O. The returned fencing
 		// token is the PostgreSQL-authoritative identity of this generation; every
 		// callback below carries it so another worker's newer generation wins.
-		fencingToken, _ = r.st.RecordPreparingWithFingerprint(r.rctx(), name, fn, fp)
+		fencingToken, _ = r.st.RecordPreparingWithSourceGeneration(
+			r.rctx(), name, fn, fp, r.deploymentSourceGeneration())
 		r.setFencingToken(name, fencingToken)
 	}
 
@@ -597,6 +717,11 @@ func (r *Reconciler) reconcileApp(name string) {
 			// the failure outcome is recorded.
 			r.st.RecordReconcileFailure(r.rctx(), name, err, fencingToken)
 		}
+		phase := state.DeploymentAppFailed
+		if cur != nil && isAvailable(cur) {
+			phase = state.DeploymentAppDegraded
+		}
+		r.reportDeployment(name, phase, err.Error())
 		return
 	}
 	pf := runner.NewPrepared(fn, built, r.builder)
@@ -643,8 +768,15 @@ func (r *Reconciler) reconcileApp(name string) {
 	// preparation/publication lease and leaves the old active app, its services,
 	// its schedules, and its warm pool untouched.
 	publish := func() error {
-		r.reg.Replace(name, pf)
-		return nil
+		// Independent publication axes: the runtime image selection CAS below
+		// fences the base-image pin, while this check-and-swap boundary fences the
+		// Git deployment generation. The registry swap runs inside the deployment
+		// publication lock, so a publisher cannot commit a newer generation
+		// between the row check and activation. A preparation started for an older
+		// desired generation therefore never becomes the active app.
+		return r.publishDeploymentCurrent(r.rctx(), prepSourceGeneration, func() {
+			r.reg.Replace(name, pf)
+		})
 	}
 	if publisher, ok := r.builder.(fencedSelectionBuilder); ok {
 		if pubErr := publisher.PublishPrepared(r.rctx(), built, publish); pubErr != nil {
@@ -653,6 +785,21 @@ func (r *Reconciler) reconcileApp(name string) {
 			// rejected generation strands no admitted image.
 			pf.ReleasePublication()
 			built.ReleaseLease()
+
+			if errors.Is(pubErr, errDeploymentSourceStale) {
+				r.reportDeployment(
+					name, state.DeploymentAppActivating,
+					"deployment generation changed during preparation",
+				)
+				r.log.Info(
+					"App: deployment generation changed during preparation; retaining previous version",
+					"app", name,
+					"fingerprint", builtFP,
+					"outcome", "stale",
+				)
+				return
+			}
+
 			if errors.Is(pubErr, runtime.ErrRuntimeImageSelectionStale) {
 				attrs := []any{"app", name}
 				attrs = append(attrs, appImageAttr(built.Image)...)
@@ -675,6 +822,7 @@ func (r *Reconciler) reconcileApp(name string) {
 				}
 				return
 			}
+
 			attrs := []any{"app", name}
 			attrs = append(attrs, appImageAttr(built.Image)...)
 			attrs = append(attrs,
@@ -691,8 +839,16 @@ func (r *Reconciler) reconcileApp(name string) {
 			}
 			return
 		}
-	} else {
-		publish()
+	} else if pubErr := publish(); pubErr != nil {
+		pf.ReleasePublication()
+		built.ReleaseLease()
+		r.log.Info(
+			"App: deployment generation changed during preparation; retaining previous version",
+			"app", name,
+			"fingerprint", builtFP,
+			"outcome", "stale",
+		)
+		return
 	}
 	// Record the built identity as this Reconciler's skip key and the source
 	// selection the published image was built from, not a later read of the
@@ -736,6 +892,9 @@ func (r *Reconciler) reconcileApp(name string) {
 		// late readiness transition after the reconciler has stopped.
 		if err != nil {
 			return !(ctx.Err() != nil && errors.Is(err, ctx.Err()))
+		}
+		if landed {
+			r.reportDeployment(name, state.DeploymentAppActive, "")
 		}
 		return landed
 	}
@@ -815,6 +974,16 @@ func (r *Reconciler) reconcileApp(name string) {
 						)
 						r.log.Debug("App: deployment cancelled", deployAttrs...)
 						return
+					}
+					// A current-generation, non-cancellation service convergence
+					// failure is terminal for this deployment progress. Report it as
+					// degraded when a usable prior generation remains, otherwise
+					// failed; never leave the cluster status stuck at activating and
+					// never mark ready.
+					if hasUsablePrior {
+						r.reportDeployment(name, state.DeploymentAppDegraded, err.Error())
+					} else {
+						r.reportDeployment(name, state.DeploymentAppFailed, err.Error())
 					}
 					// The service reconciler already reported the failure
 					// detail. This line records what the failure means for the
@@ -944,6 +1113,166 @@ func preparationOutcome(
 	}
 }
 
+// errDeploymentSourceStale reports that the coordinated deployment generation
+// changed while an app was being prepared. The prepared image is not activated.
+var errDeploymentSourceStale = errors.New("coordinated deployment generation changed during preparation")
+
+// deploymentSourceGeneration returns the coordinated generation to stamp on a
+// desired-state write. Zero means standalone local /apps.
+// deploymentClusterMode reports whether this process opted into coordinated
+// cluster reconciliation. It is independent of whether an authorized generation
+// exists yet: with no published/materialized revision, no local app is
+// authorized.
+func (r *Reconciler) deploymentClusterMode() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.deploymentEnabled
+}
+
+// deploymentSourceGeneration returns the coordinated generation stamped on a
+// desired-state write, or 0 when this process is not participating. A
+// coordinator-active worker with generation 0 still has the gate enabled; it just
+// has no authorized revision yet.
+func (r *Reconciler) deploymentSourceGeneration() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.deploymentEnabled {
+		return 0
+	}
+	return r.deploymentGeneration
+}
+
+// deploymentTemplateIdentity returns the materialized template identity for an
+// authorized app when one was recorded.
+func (r *Reconciler) deploymentTemplateIdentity(name string) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	identity, ok := r.deploymentTemplates[name]
+	return identity, ok
+}
+
+// deploymentInvalidInfo reports whether name is a desired-but-unloadable app in
+// the materialized revision, and the exact materialized template identity when
+// known. Such an app is not local drift: the reconciler records/retains its
+// invalid diagnostic while preserving any previous active generation.
+func (r *Reconciler) deploymentInvalidInfo(
+	name string,
+) (templateIdentity, message string, invalid bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.deploymentEnabled {
+		return "", "", false
+	}
+	message, invalid = r.deploymentInvalid[name]
+	if !invalid {
+		return "", "", false
+	}
+	return r.deploymentInvalidTemplates[name], message, true
+}
+
+// deploymentAuthorization returns the coordinated authorization decision for
+// name. authorized is false when the name is neither part of the materialized
+// generation nor an authorized removal (or desired-invalid app), in which case
+// local /apps content must not be reconciled. expected is the materialized
+// fingerprint.
+func (r *Reconciler) deploymentAuthorization(name string) (expected string, authorized, removalOnly bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.deploymentEnabled {
+		return "", true, false
+	}
+	expected, authorized = r.deploymentFingerprints[name]
+	removalOnly = r.deploymentRemoved[name]
+	return expected, authorized, removalOnly
+}
+
+// publishDeploymentCurrent runs publish inside a short check-and-swap boundary
+// serialized with PublishDeploymentDesired's publication advisory lock. The
+// shared desired row is re-read while that lock is held, so a publisher cannot
+// commit a newer generation between the check and the registry swap/add. The
+// callback must be tiny (an in-process registry operation): no build, fetch,
+// checkout, or materialization may run inside it. Without coordinated participation, publish
+// runs directly. A mismatched/absent generation, a read failure, or a lost lock is
+// reported as errDeploymentSourceStale and the previous active generation keeps
+// serving.
+//
+// Lock ordering: the runtime selection publication lock may already be held by
+// the caller (PublishPrepared); this method then takes the deployment publication
+// lock. The deployment publisher takes only the deployment lock and never a
+// runtime selection lock.
+func (r *Reconciler) publishDeploymentCurrent(
+	ctx context.Context,
+	generation int64,
+	publish func(),
+) error {
+	r.mu.Lock()
+	enabled := r.deploymentEnabled
+	localGeneration := r.deploymentGeneration
+	r.mu.Unlock()
+	if !enabled {
+		publish()
+		return nil
+	}
+	if generation <= 0 || localGeneration != generation {
+		return errDeploymentSourceStale
+	}
+	if r.st == nil {
+		publish()
+		return nil
+	}
+	err := r.st.WithDeploymentDesiredLock(ctx, func(desired state.DeploymentDesired, found bool) error {
+		if !found || desired.Generation != generation {
+			return errDeploymentSourceStale
+		}
+		publish()
+		return nil
+	})
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, errDeploymentSourceStale) {
+		return err
+	}
+	r.log.Warn("Deployment: verify desired generation before publication failed; retaining previous version",
+		"error", err)
+	return fmt.Errorf("%w: %v", errDeploymentSourceStale, err)
+}
+
+func (r *Reconciler) reportDeployment(name, phase, errMessage string) {
+	if r.deploymentProgress != nil {
+		r.deploymentProgress(name, phase, errMessage)
+	}
+}
+
+// reportDeploymentDrift reports local drift once per name per authorized
+// generation and asks the deployment coordinator to restore the materialized
+// revision. It never mutates the registry or state.
+func (r *Reconciler) reportDeploymentDrift(name, reason string) {
+	r.mu.Lock()
+	reported := r.deploymentDriftReported[name]
+	if !reported {
+		r.deploymentDriftReported[name] = true
+	}
+	r.mu.Unlock()
+	if reported {
+		return
+	}
+	r.log.Warn("App: local modification is not part of the active deployment; ignoring and restoring",
+		"app", name,
+		"reason", reason,
+	)
+	r.reportDeployment(name, state.DeploymentAppDrifted, reason)
+	if r.deploymentDrift != nil {
+		r.deploymentDrift(name, reason)
+	}
+}
+
+func (r *Reconciler) clearDeploymentRemoved(name string) {
+	r.mu.Lock()
+	delete(r.deploymentRemoved, name)
+	r.mu.Unlock()
+}
+
 // currentImageSelection returns the runtime Manager's current validated selection
 // identity for the template's runtime, or "" for a no-runtime app or a builder
 // that does not expose a live selection snapshot. It is read on every app pass so
@@ -985,6 +1314,17 @@ func (r *Reconciler) setFencingToken(name string, fencingToken state.FencingToke
 		return
 	}
 	delete(r.fencingTokens, name)
+}
+
+// revertDeploymentPending undoes the pending/placeholder mutation made from a
+// locally drifted tree, restoring the previously active matching state before
+// the deployment coordinator restores the authorized tree.
+func (r *Reconciler) revertDeploymentPending(name string, previous *runner.PreparedApp) {
+	if previous == nil || isAvailable(previous) {
+		r.reg.ClearPending(name)
+		return
+	}
+	r.reg.Replace(name, previous)
 }
 
 // prepareImage builds the app's image, passing the fingerprint the
@@ -1178,6 +1518,8 @@ func (r *Reconciler) remove(name string) {
 	fencingToken := r.fencingTokens[name]
 	delete(r.fencingTokens, name)
 	r.mu.Unlock()
+	r.clearDeploymentRemoved(name)
+	r.reportDeployment(name, state.DeploymentAppRemoved, "")
 	if r.st != nil {
 		r.st.RecordRemoved(r.rctx(), name, fencingToken)
 	}

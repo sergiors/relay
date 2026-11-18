@@ -175,9 +175,10 @@ func TestSyncResolvesFreshRemoteBranch(t *testing.T) {
 	// Re-sync reusing the existing checkout. The materialized content must be the
 	// NEW content and the config must record the NEW full commit hash.
 	out := mustSync(t, e, cfg)
-	// The summary's short hash is derived from HEAD; assert it matches NEW's prefix.
-	if !strings.Contains(out.String(), newHash.String()[:7]) {
-		t.Fatalf("summary %q does not pin the NEW short hash %s", out.String(), newHash.String()[:7])
+	// The summary reports the update without ref-resolution narration; the NEW
+	// pin is proven by the materialized content and LastSyncedCommit below.
+	if !strings.Contains(out.String(), "Updated 1 app(s): fn") {
+		t.Fatalf("summary %q missing the update line", out.String())
 	}
 	b, err = os.ReadFile(filepath.Join(e.apps, "fn", "template.yaml"))
 	if err != nil {

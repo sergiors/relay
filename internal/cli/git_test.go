@@ -2,16 +2,37 @@ package cli
 
 import (
 	"bytes"
-	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
 	gitpkg "relay/internal/git"
-	"relay/internal/testutil"
 )
+
+// implementationDetailPhrases are internal-mechanics words that must never
+// surface in user-facing help: the command surface explains operator behavior,
+// not Relay's storage or coordination internals.
+var implementationDetailPhrases = []string{
+	"PostgreSQL", "DATABASE_URL", "branch-tip", "publication", "materialization",
+}
+
+// assertNoImplementationDetails fails when a help output leaks any
+// implementation-detail phrase. CAS is matched as a whole word so ordinary
+// words such as "case" stay unaffected.
+func assertNoImplementationDetails(t *testing.T, label, out string) {
+	t.Helper()
+	for _, phrase := range implementationDetailPhrases {
+		if strings.Contains(strings.ToLower(out), strings.ToLower(phrase)) {
+			t.Fatalf("%s exposes implementation detail %q:\n%s", label, phrase, out)
+		}
+	}
+	if regexp.MustCompile(`(?i)\bCAS\b`).MatchString(out) {
+		t.Fatalf("%s exposes implementation detail %q:\n%s", label, "CAS", out)
+	}
+}
 
 // cliGitPaths carries the redirected dirs the CLI git tests use for assertions.
 type cliGitPaths struct {
@@ -327,7 +348,8 @@ func TestGitUnknownSubcommandFriendlyError(t *testing.T) {
 }
 
 // TestGitBareShowsHelp verifies `git` alone shows the subcommand help on stdout
-// and exits 0 (nil error), listing every subcommand.
+// and exits 0 (nil error), listing every subcommand with a helpful,
+// user-facing one-line description rather than implementation jargon.
 func TestGitBareShowsHelp(t *testing.T) {
 	deps, _ := redirectGitDirs(t)
 	out, _, err := runGitCLI(t, deps, "", "git")
@@ -337,11 +359,21 @@ func TestGitBareShowsHelp(t *testing.T) {
 	if !strings.Contains(out, "COMMANDS:") {
 		t.Fatalf("bare git help missing COMMANDS section:\n%s", out)
 	}
-	for _, want := range []string{"keygen", "set", "sync", "status", "remove"} {
+	for _, want := range []string{
+		"keygen", "set", "sync", "status", "remove",
+		"Generate an SSH deploy key",
+		"Set the git source repository",
+		"Deploy the latest revision from the configured Git source",
+		"Show the Git source and last sync",
+		"Remove the git source config and checkout",
+		"`git set` saves the Git source; `git sync` deploys its latest revision",
+		"No running worker is required",
+	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("bare git help missing %q:\n%s", want, out)
 		}
 	}
+	assertNoImplementationDetails(t, "bare git help", out)
 }
 
 // TestGitRemoveConfirmed drives `git remove` with each affirmative answer (short
@@ -497,7 +529,11 @@ func TestGitRemoveInvalidConfig(t *testing.T) {
 	}
 }
 
-// TestGitHelpRendersSubcommands verifies `git --help` lists the subcommands.
+// TestGitHelpRendersSubcommands verifies `git --help` lists the subcommands,
+// and `git sync --help` explains the operator-facing contract: it deploys the
+// latest revision from the configured source, states what a pinned deployment
+// blocks and how to proceed, and gives retry guidance when another update wins
+// during sync — with no /apps layout details and no implementation wording.
 func TestGitHelpRendersSubcommands(t *testing.T) {
 	deps, _ := redirectGitDirs(t)
 	out, _, err := runGitCLI(t, deps, "", "git", "--help")
@@ -509,6 +545,26 @@ func TestGitHelpRendersSubcommands(t *testing.T) {
 			t.Fatalf("git --help missing %q:\n%s", want, out)
 		}
 	}
+	assertNoImplementationDetails(t, "git --help", out)
+
+	syncOut, _, err := runGitCLI(t, deps, "", "git", "sync", "--help")
+	if err != nil {
+		t.Fatalf("git sync --help: %v", err)
+	}
+	for _, want := range []string{
+		"Deploy the latest revision from the configured Git source",
+		"Other Relay nodes using the same source update independently",
+		"A pinned deployment blocks sync; run 'relay deploy unpin' first",
+		"If another update wins during sync, retry",
+	} {
+		if !strings.Contains(syncOut, want) {
+			t.Fatalf("git sync --help missing %q:\n%s", want, syncOut)
+		}
+	}
+	if strings.Contains(syncOut, "/apps") {
+		t.Fatalf("git sync --help exposes the /apps layout:\n%s", syncOut)
+	}
+	assertNoImplementationDetails(t, "git sync --help", syncOut)
 }
 
 // TestGitSetTooManyArgs verifies extra positional args after the repository are
@@ -569,167 +625,5 @@ func TestGitCommandsDoNotUseLogger(t *testing.T) {
 
 	if logs.Len() != 0 {
 		t.Fatalf("git commands wrote to the process log:\n%s", logs.String())
-	}
-}
-
-// seedLocalBareRepo builds a local work repo with one app and a bare remote
-// cloned from it via the shared testutil fixture, returning the bare path. It
-// lets a CLI git sync run end to end against a filesystem source (no SSH, no
-// network) through the CLI's injected deps.GitCloneURL transport override,
-// exactly as the git package drives local sources via SyncOptions.CloneURL,
-// while the persisted repository stays a valid SSH URL.
-func seedLocalBareRepo(t *testing.T) string {
-	t.Helper()
-	return testutil.NewBareRepo(t)
-}
-
-// TestGitSyncCLIStepsAreWriterOnlyAtDebug pins that a real `relay git sync` run
-// writes its full user-facing step summary to the command writer and emits NO
-// process-log output, even with a DEBUG-level process logger. The CLI sync does
-// not set SyncOptions.Log, so the git package's structured diagnostics belong
-// exclusively to the background worker/webhook path (covered by the git package
-// tests); a short-lived CLI sync must not trail debug output.
-func TestGitSyncCLIStepsAreWriterOnlyAtDebug(t *testing.T) {
-	deps, p := redirectGitDirs(t)
-	bare := seedLocalBareRepo(t)
-
-	// Persist a valid SSH source (the only thing Config.Repository may hold now)
-	// and route the actual transport through the CLI's injected deps.GitCloneURL
-	// override, exactly as the git package drives local sources via
-	// SyncOptions.CloneURL. The override is per-dependencies command state and
-	// is never persisted.
-	if _, _, err := runGitCLI(t, deps, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
-		t.Fatalf("git set: %v", err)
-	}
-	deps.GitCloneURL = bare
-
-	var logs bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-	out, _, err := runGitCLIWithLogger(t, logger, deps, "", "git", "sync")
-	if err != nil {
-		t.Fatalf("git sync: %v", err)
-	}
-	// The user-facing progress is complete on the writer.
-	for _, step := range []string{"Syncing...", "Cloned ", "Resolved", "Materialized 1 app(s): fn", "Sync complete"} {
-		if !strings.Contains(out, step) {
-			t.Fatalf("git sync writer output missing %q:\n%s", step, out)
-		}
-	}
-	// ...and the CLI sync never logged.
-	if logs.Len() != 0 {
-		t.Fatalf("CLI git sync emitted process-log output:\n%s", logs.String())
-	}
-	// The sync actually materialized the app.
-	if _, err := os.Stat(filepath.Join(p.appsDir, "fn", "template.yaml")); err != nil {
-		t.Fatalf("function not materialized: %v", err)
-	}
-}
-
-// TestSeparateTreesUseIndependentGitCloneOverrides drives two independently
-// constructed command trees, each pointed at its OWN local filesystem repo
-// through its own deps.GitCloneURL (go-git's real file transport, no host Git,
-// no SSH, no network), and pins that the override is command-local and never
-// persisted: tree A's sync materializes repo A's app from A's template into
-// A's apps dir only, tree B's does the same for B, neither tree's materialized
-// app is visible in the other's apps dir, and both persisted configs still
-// hold their validated SSH URLs after the sync.
-func TestSeparateTreesUseIndependentGitCloneOverrides(t *testing.T) {
-	depsA, pathsA := redirectGitDirs(t)
-	depsB, pathsB := redirectGitDirs(t)
-	// Distinguishable template content per repo: the materialized app name is
-	// the fixture's fn dir in both trees, so the RENDERED template content is
-	// what proves which repo each tree cloned from.
-	bareA := testutil.New(t, testutil.Options{Template: "runtime: nodejs24.x\n"}).Bare
-	bareB := testutil.New(t, testutil.Options{Template: "runtime: python3.14\n"}).Bare
-
-	// Each tree persists its own validated SSH URL; the transport override is
-	// set on that tree's dependencies only.
-	if _, _, err := runGitCLI(t, depsA, "", "git", "set", "git@github.com:acme/repo-a.git"); err != nil {
-		t.Fatalf("tree A git set: %v", err)
-	}
-	if _, _, err := runGitCLI(t, depsB, "", "git", "set", "git@github.com:acme/repo-b.git"); err != nil {
-		t.Fatalf("tree B git set: %v", err)
-	}
-	depsA.GitCloneURL = bareA
-	depsB.GitCloneURL = bareB
-
-	var outA, outB, errA, errB bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
-	cmdA := New(logger, &outA, depsA)
-	cmdA.Reader = strings.NewReader("")
-	cmdA.ErrWriter = &errA
-	cmdB := New(logger, &outB, depsB)
-	cmdB.Reader = strings.NewReader("")
-	cmdB.ErrWriter = &errB
-
-	// Changing the source Dependencies after construction cannot retarget either
-	// command tree: each action captured its own value at New time.
-	depsA.GitCloneURL = bareB
-	depsB.GitCloneURL = bareA
-
-	// Tree A syncs from repo A: fn is materialized into A's apps dir from A's
-	// template.
-	if err := cmdA.Run(context.Background(), []string{"relay", "git", "sync"}); err != nil {
-		t.Fatalf("tree A git sync: %v", err)
-	}
-	// Tree B still has nothing: A's sync wrote only into A's apps dir.
-	if _, err := os.Stat(filepath.Join(pathsB.appsDir, "fn", "template.yaml")); !os.IsNotExist(err) {
-		t.Fatalf("tree B apps dir saw tree A's materialization: %v", err)
-	}
-	tmplA, err := os.ReadFile(filepath.Join(pathsA.appsDir, "fn", "template.yaml"))
-	if err != nil {
-		t.Fatalf("read tree A materialized template: %v", err)
-	}
-
-	// Tree B syncs from repo B: fn is materialized into B's apps dir from B's
-	// template, and A's materialized app is untouched.
-	if err := cmdB.Run(context.Background(), []string{"relay", "git", "sync"}); err != nil {
-		t.Fatalf("tree B git sync: %v", err)
-	}
-	if errA.Len() != 0 || errB.Len() != 0 {
-		t.Fatalf("CLI command errors: tree A %q; tree B %q", errA.String(), errB.String())
-	}
-	tmplB, err := os.ReadFile(filepath.Join(pathsB.appsDir, "fn", "template.yaml"))
-	if err != nil {
-		t.Fatalf("read tree B materialized template: %v", err)
-	}
-	if !strings.Contains(string(tmplA), "runtime: nodejs24.x") || strings.Contains(string(tmplA), "python3.14") {
-		t.Fatalf("tree A materialized from the wrong source: %s", tmplA)
-	}
-	if !strings.Contains(string(tmplB), "runtime: python3.14") || strings.Contains(string(tmplB), "nodejs24.x") {
-		t.Fatalf("tree B did not sync from its own local repo: %s", tmplB)
-	}
-
-	// The overrides were never persisted: every config still holds exactly the
-	// SSH URL `git set` wrote, not the local bare path it cloned from.
-	cfgA, err := gitpkg.LoadConfig(pathsA.configPath)
-	if err != nil || cfgA.Repository != "git@github.com:acme/repo-a.git" {
-		t.Fatalf("tree A config after sync = %+v (%v), want the persisted SSH URL", cfgA, err)
-	}
-	cfgB, err := gitpkg.LoadConfig(pathsB.configPath)
-	if err != nil || cfgB.Repository != "git@github.com:acme/repo-b.git" {
-		t.Fatalf("tree B config after sync = %+v (%v), want the persisted SSH URL", cfgB, err)
-	}
-	// Neither bare path (nor any local filesystem trace) appears in the
-	// persisted configs: the transport override is command state only.
-	rawA, err := os.ReadFile(pathsA.configPath)
-	if err != nil {
-		t.Fatalf("read tree A config: %v", err)
-	}
-	rawB, err := os.ReadFile(pathsB.configPath)
-	if err != nil {
-		t.Fatalf("read tree B config: %v", err)
-	}
-	for _, entry := range []struct {
-		config string
-		bare   string
-	}{
-		{config: string(rawA), bare: bareA},
-		{config: string(rawB), bare: bareB},
-	} {
-		if strings.Contains(entry.config, entry.bare) {
-			t.Fatalf("persisted config leaked the local transport override %q:\n%s", entry.bare, entry.config)
-		}
 	}
 }

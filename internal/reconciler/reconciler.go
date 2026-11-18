@@ -185,6 +185,15 @@ type Config struct {
 	// those containers must be stopped and removed before the images are
 	// retire-eligible. Nil-safe.
 	RemoveServices func(name string)
+	// DeploymentProgress, when set, records per-app cluster activation progress
+	// for the reconciler's currently authorized deployment generation. It is
+	// independent of the public apps.status state view. Nil-safe.
+	DeploymentProgress func(name, phase, errMessage string)
+	// DeploymentDrift, when set, reports that local /apps content no longer
+	// matches the authorized materialized generation. The reconciler then leaves
+	// the active registry and state untouched; the deployment coordinator
+	// re-materializes the authorized revision.
+	DeploymentDrift func(name, reason string)
 }
 
 // Watches Root, debounces per-app events, and swaps the registry when a
@@ -214,11 +223,30 @@ type Reconciler struct {
 	updateServicesWithStatus            func(name string, tmpl *app.Template, image string, onReconcileStart func(), onComplete func(error))
 	updateServicesObservationWithStatus func(name string, tmpl *app.Template, image string, onReconcileStart func(), onComplete func(error))
 	removeServices                      func(name string)
+	deploymentProgress                  func(name, phase, errMessage string)
+	deploymentDrift                     func(name, reason string)
 
-	mu              sync.Mutex
-	fingerprints    map[string]string // name -> last-reconciled fingerprint
-	imageSelections map[string]string // name -> published runtime selection identity
-	generations     map[string]uint64
+	// deploymentEnabled is the coordinated gate; once enabled, generation 0 means
+	// the configured-Git worker has no authorized desired revision yet, so no local
+	// app is authorized (the gate stays active). deploymentGeneration is the
+	// materialized generation whose tree is currently authorized in /apps.
+	// deploymentFingerprints is the authoritative app -> fingerprint set computed
+	// at materialization, deploymentInvalid the desired-but-unloadable apps (not
+	// local drift), deploymentRemoved the apps absent from this generation (their
+	// removal is authorized), and deploymentDriftReported suppresses repeated drift
+	// reports for one name in one generation.
+	deploymentEnabled          bool
+	deploymentGeneration       int64
+	deploymentFingerprints     map[string]string
+	deploymentTemplates        map[string]string
+	deploymentInvalid          map[string]string
+	deploymentInvalidTemplates map[string]string
+	deploymentRemoved          map[string]bool
+	deploymentDriftReported    map[string]bool
+	mu                         sync.Mutex
+	fingerprints               map[string]string // name -> last-reconciled fingerprint
+	imageSelections            map[string]string // name -> published runtime selection identity
+	generations                map[string]uint64
 	// fencingTokens carries the PostgreSQL-authoritative fencing token returned
 	// by the desired-generation write that started each app's current
 	// generation. It is deliberately SEPARATE from generations: generations is a
@@ -302,10 +330,18 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 		updateServicesWithStatus:            cfg.UpdateServicesWithStatus,
 		updateServicesObservationWithStatus: cfg.UpdateServicesObservationWithStatus,
 		removeServices:                      cfg.RemoveServices,
+		deploymentProgress:                  cfg.DeploymentProgress,
+		deploymentDrift:                     cfg.DeploymentDrift,
 		fingerprints:                        map[string]string{},
 		imageSelections:                     map[string]string{},
 		generations:                         map[string]uint64{},
 		fencingTokens:                       map[string]state.FencingToken{},
+		deploymentFingerprints:              map[string]string{},
+		deploymentTemplates:                 map[string]string{},
+		deploymentInvalid:                   map[string]string{},
+		deploymentInvalidTemplates:          map[string]string{},
+		deploymentRemoved:                   map[string]bool{},
+		deploymentDriftReported:             map[string]bool{},
 		timers:                              map[string]*time.Timer{},
 		incoming:                            make(chan string, DefaultQueueSize),
 		done:                                make(chan struct{}),
@@ -350,6 +386,65 @@ func (r *Reconciler) SeedImageSelection(name, identity string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.imageSelections[name] = identity
+}
+
+// SetDeploymentAuthorization installs the coordinated deployment generation whose
+// tree was materialized in /apps. It ALWAYS enables the coordinated gate; a
+// generation of 0 (configured Git source but no desired revision yet) authorizes
+// no local app, so local /apps remains inert. It does not disable the gate.
+// fingerprints is the authoritative app -> content fingerprint set; invalid
+// names are desired-but-unloadable apps (never local drift), and removed lists
+// apps that belonged to the previous generation but are absent from this one, so
+// their removal — and only their removal — is authorized. Any other local
+// addition, edit, or deletion is treated as drift and never becomes a desired
+// generation.
+func (r *Reconciler) SetDeploymentAuthorization(
+	generation int64,
+	fingerprints map[string]string,
+	templateIdentities map[string]string,
+	removed []string,
+) {
+	r.SetDeploymentAuthorizationWithInvalid(
+		generation, fingerprints, templateIdentities, nil, nil, removed)
+}
+
+// SetDeploymentAuthorizationWithInvalid installs the same coordinated
+// authorization plus the desired-but-unloadable app set and their materialized
+// template identities. Those apps are not local drift: the reconciler preserves
+// any previous active registry entry and records/retains the invalid diagnostic.
+func (r *Reconciler) SetDeploymentAuthorizationWithInvalid(
+	generation int64,
+	fingerprints map[string]string,
+	templateIdentities map[string]string,
+	invalid map[string]string,
+	invalidTemplates map[string]string,
+	removed []string,
+) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.deploymentEnabled = true
+	r.deploymentGeneration = generation
+	r.deploymentFingerprints = make(map[string]string, len(fingerprints))
+	for name, fingerprint := range fingerprints {
+		r.deploymentFingerprints[name] = fingerprint
+	}
+	r.deploymentTemplates = make(map[string]string, len(templateIdentities))
+	for name, identity := range templateIdentities {
+		r.deploymentTemplates[name] = identity
+	}
+	r.deploymentInvalid = make(map[string]string, len(invalid))
+	for name, message := range invalid {
+		r.deploymentInvalid[name] = message
+	}
+	r.deploymentInvalidTemplates = make(map[string]string, len(invalidTemplates))
+	for name, identity := range invalidTemplates {
+		r.deploymentInvalidTemplates[name] = identity
+	}
+	r.deploymentRemoved = make(map[string]bool, len(removed))
+	for _, name := range removed {
+		r.deploymentRemoved[name] = true
+	}
+	r.deploymentDriftReported = map[string]bool{}
 }
 
 // SeedFencingToken records the PostgreSQL fencing token returned by the exact

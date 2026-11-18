@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/go-git/go-git/v5/plumbing"
@@ -113,6 +114,112 @@ func SyncFromConfig(ctx context.Context, opts SyncOptions, cfg Config) error {
 	return syncWithGit(ctx, opts, cfg, newGoGitOps(), newGoGitAuthFn(opts))
 }
 
+// SyncCommit materializes one exact immutable commit instead of resolving a
+// mutable ref. It is the coordinated-deployment entry: the shared desired
+// revision is a pinned SHA, and every node independently fetches and checks out
+// that object with the same source/materialization policy as normal sync. An
+// abbreviated hash, a branch/tag name, or an object missing after the fetch is a
+// hard error, so a node never silently materializes a different revision.
+func SyncCommit(ctx context.Context, opts SyncOptions, cfg Config, commit string) error {
+	opts.Commit = commit
+	return syncWithGit(ctx, opts, cfg, newGoGitOps(), newGoGitAuthFn(opts))
+}
+
+// SyncCommitFromConfig is SyncCommit with both the transport seam and a
+// directly-provided config, mirroring SyncFromConfig.
+func SyncCommitFromConfig(ctx context.Context, opts SyncOptions, cfg Config, commit string) error {
+	opts.Commit = commit
+	return syncWithGit(ctx, opts, cfg, newGoGitOps(), newGoGitAuthFn(opts))
+}
+
+// ResolveRef fetches the configured source and resolves its configured ref (or
+// an option override) to a full immutable commit SHA WITHOUT checking out or
+// materializing /apps. It is the branch-publication half of `relay git sync`:
+// the caller can commit that SHA to the shared desired revision before this
+// node materializes it through SyncCommit. The writer lock is released before
+// returning, so publication is never performed while holding the checkout lock.
+//
+// It uses the same canonical config/override validation, transport auth, TOFU
+// host-key verification, checkout preparation, and fetch semantics as Sync. An
+// abbreviated/branch value is resolved to the exact object here; the returned
+// value is always a full lowercase SHA suitable for coordinated publication.
+func ResolveRef(ctx context.Context, opts SyncOptions, cfg Config) (string, error) {
+	return ResolveRefFromConfig(ctx, opts, cfg, newGoGitOps(), newGoGitAuthFn(opts))
+}
+
+// ResolveRefFromConfig is ResolveRef with injectable transport seams for tests
+// and local filesystem sources. It never writes the sync bookkeeping or /apps.
+func ResolveRefFromConfig(
+	ctx context.Context,
+	opts SyncOptions,
+	cfg Config,
+	ops gitOps,
+	auth builder,
+) (string, error) {
+	normalized, err := NormalizeAndValidateConfig(cfg)
+	if err != nil {
+		return "", err
+	}
+	cfg = normalized
+	if opts.RepositoryURL != "" {
+		if err := ValidateRepositoryURL(opts.RepositoryURL); err != nil {
+			return "", err
+		}
+	}
+	if opts.Ref != "" {
+		if err := validateRef(opts.Ref); err != nil {
+			return "", err
+		}
+	}
+	if opts.Path != nil {
+		if err := validatePath(*opts.Path); err != nil {
+			return "", err
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, syncTimeout)
+	defer cancel()
+
+	cloneURL := cfg.Repository
+	if opts.RepositoryURL != "" {
+		cloneURL = opts.RepositoryURL
+	}
+	if opts.CloneURL != "" {
+		cloneURL = opts.CloneURL
+	}
+	ref := cfg.Ref
+	if opts.Ref != "" {
+		ref = opts.Ref
+	}
+	am, err := auth.authFor(cloneURL)
+	if err != nil {
+		return "", err
+	}
+	if lockPath := syncLockPath(opts.CheckoutDir); lockPath != "" {
+		lock, err := processlock.AcquireBlocking(ctx, lockPath)
+		if err != nil {
+			return "", fmt.Errorf("git: acquire sync lock %s: %w", lockPath, err)
+		}
+		defer lock.Close()
+	}
+	repo, _, err := ensureCheckout(ctx, ops, opts.CheckoutDir, cloneURL, am)
+	if err != nil {
+		return "", err
+	}
+	if err := repo.fetch(ctx, cloneURL, am); err != nil {
+		return "", fmt.Errorf("git: fetch: %w", err)
+	}
+	hash, err := repo.resolveRef(ref)
+	if err != nil {
+		return "", fmt.Errorf("git: ref %q not found as branch, tag, or commit: %w", ref, err)
+	}
+	if opts.Log != nil {
+		opts.Log.Debug("Remote ref resolved",
+			"ref", ref, "commit", hash.String())
+	}
+	return hash.String(), nil
+}
+
 // newGoGitAuthFn returns the auth-builder for the transport. Production resolves
 // auth from the SSHDir key (with TOFU host-key verification over Relay's own
 // known_hosts) when the source is SSH; tests supply opts.Auth and/or point at a
@@ -186,6 +293,11 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 			return err
 		}
 	}
+	if opts.Commit != "" {
+		if err := ValidateCommit(opts.Commit); err != nil {
+			return err
+		}
+	}
 	if opts.Path != nil {
 		if err := validatePath(*opts.Path); err != nil {
 			return err
@@ -240,7 +352,7 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 		return err
 	}
 
-	writeLine("Syncing...")
+	writeLine("Updating apps on this node...")
 
 	// Serialize writers before touching the checkout or /apps. The lock file is
 	// a sibling of the checkout, never inside it: ensureCheckout may remove and
@@ -261,14 +373,9 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 	if err != nil {
 		return err
 	}
-	// User-facing progress names what happened to the checkout (a fresh clone vs
-	// a reuse) and, in both cases, the source URL. The structured Debug record
-	// carries the checkout path the presentation omits.
 	if fresh {
-		writeLine("Cloned %s", cloneURL)
 		debug("Checkout clone completed", "path", opts.CheckoutDir)
 	} else {
-		writeLine("Reusing existing checkout url=%s", cloneURL)
 		debug("Checkout reuse", "path", opts.CheckoutDir)
 	}
 
@@ -280,25 +387,41 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 	}
 	debug("Remote fetch completed", "url", cloneURL)
 
-	// Resolve the configured ref to a commit. A bare branch name resolves
-	// against the freshly fetched refs/remotes/origin/<ref> FIRST — never the
-	// possibly-stale local refs/heads/<ref>, which a clone always creates for
-	// the default branch — so a post-fetch sync reflects the remote tip.
-	hash, err := repo.resolveRef(ref)
-	if err != nil {
-		return fmt.Errorf("git: ref %q not found as branch, tag, or commit: %w", ref, err)
+	// Resolve the configured ref to a commit. A coordinated deployment supplies
+	// an exact immutable commit instead, so no mutable ref is resolved. A bare
+	// branch name resolves against the freshly fetched refs/remotes/origin/<ref>
+	// FIRST — never the possibly-stale local refs/heads/<ref>, which a clone
+	// always creates for the default branch — so a post-fetch sync reflects the
+	// remote tip.
+	var hash plumbing.Hash
+	if opts.Commit != "" {
+		hash = plumbing.NewHash(strings.ToLower(opts.Commit))
+		debug("Exact commit selected", "commit", hash.String())
+	} else {
+		hash, err = repo.resolveRef(ref)
+		if err != nil {
+			return fmt.Errorf("git: ref %q not found as branch, tag, or commit: %w", ref, err)
+		}
+		debug("Ref resolution", "ref", ref, "commit", hash.String())
 	}
-	debug("Ref resolution", "ref", ref, "commit", hash.String())
 
 	// Hard checkout (detached HEAD, Force = hard reset). The remote is truth.
+	// For an exact commit this also verifies the object is present after the
+	// fetch; a missing object is a hard error rather than a fallback to a
+	// different revision.
 	if err := repo.checkoutForce(hash); err != nil {
+		if opts.Commit != "" {
+			return fmt.Errorf("git: commit %s not available in the checkout: %w", hash.String(), err)
+		}
 		return fmt.Errorf("git: checkout %s: %w", hash.String()[:7], err)
 	}
 	headHash, err := repo.head()
 	if err != nil {
 		return fmt.Errorf("git: read HEAD: %w", err)
 	}
-	writeLine("Resolved %q to %s", ref, headHash.String()[:7])
+	if opts.Commit != "" && headHash != hash {
+		return fmt.Errorf("git: checkout produced HEAD %s, want %s", headHash.String(), hash.String())
+	}
 
 	// Source dir: checkout root or validated monorepo path.
 	srcDir, err := resolveSourceDir(opts.CheckoutDir, path)
@@ -338,11 +461,11 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 		// materializeApps already hard-errors on a missing source dir, so an
 		// empty desired set here means the source existed but held no app dirs.
 		// The deterministic-removal pass still ran and cleared stale dirs.
-		writeLine("Source contained no app directories; /apps is now empty")
+		writeLine("No apps found in the configured source; all existing apps were removed")
 	case len(result.materialized) == 0 && len(result.removed) == 0:
 		writeLine("No app changes: %d app(s) already up to date", result.desired)
 	default:
-		writeLine("Materialized %d app(s): %s", len(result.materialized), joinNames(result.materialized))
+		writeLine("Updated %d app(s): %s", len(result.materialized), joinNames(result.materialized))
 	}
 	if len(result.removed) > 0 {
 		writeLine("Removed %d app(s): %s", len(result.removed), joinNames(result.removed))
@@ -362,7 +485,7 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 		return err
 	}
 
-	writeLine("Sync complete")
+	writeLine("This node's apps are up to date")
 	return nil
 }
 

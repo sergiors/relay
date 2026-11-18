@@ -15,6 +15,12 @@ worker; admin commands communicate with it or read persistent state.
 - `cmd/main.go` is the sole final error/exit boundary. `internal/cli` builds and
   parses commands and returns errors; `internal/worker` owns lifecycle,
   readiness, control socket, and dependency wiring.
+- `deployment` owns source-driven coordinated deployments: the shared desired
+  revision, per-node materialization, and per-app activation progress. A
+  configured local Git source activates it; there is no mode flag, while an
+  invalid/corrupt source config fails startup instead of falling back. It uses
+  the existing `git` materialization and reconciler/runtime paths and has no
+  leader or executor.
 - `config` resolves configuration. `app` owns discovery, validation, model,
   and fingerprinting; source selection policy is separate in `source`. `event`
   matches patterns; `envelope` decodes the transport payload (raw JSON,
@@ -41,6 +47,11 @@ worker; admin commands communicate with it or read persistent state.
 - DLQ rows are inserted before the source ACK and marked settled only after a
   confirmed ACK (or reconciliation proves the source delivery is no longer
   pending). Admin removal and retention delete settled rows only.
+- Without a configured local Git source, `/apps` stays authoritative with no
+  coordination dependency. With one, only the materialized/published Git
+  generation authorizes app reconciliation; local `/apps` drift is ignored and
+  restored, never published. The shared desired revision is a separate
+  PostgreSQL row, never the global app lifecycle row.
 - Unavailable apps and valid pending generations remain matched and pending;
   availability alone must not cause ACK or DLQ. Keep the old active generation
   serving until its replacement is prepared.

@@ -32,8 +32,7 @@ func statsCommand(deps Dependencies) *cli.Command {
 		Name:  "stats",
 		Usage: "Show operational statistics",
 		Description: "Show the latest persisted counters and backlog gauges; the snapshot may " +
-			"lag live metrics by a few seconds. Requires PostgreSQL and works " +
-			"without a running worker.",
+			"lag live metrics by a few seconds.",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.Args().Present() {
 				return cli.Exit("stats: too many arguments", 2)

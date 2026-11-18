@@ -59,9 +59,15 @@ func TestInitialSync(t *testing.T) {
 	if !saved.Synced || saved.LastSyncedCommit == "" || saved.LastSyncedAt == "" {
 		t.Fatalf("persisted config not marked synced: %+v", saved)
 	}
-	// The summary mentions the resolved ref and materialized count.
-	if !strings.Contains(out.String(), "Resolved") {
-		t.Fatalf("summary missing 'Resolved':\n%s", out.String())
+	// The summary is the concise sync report: start line, the updated apps,
+	// and the completion line — no ref-resolution narration.
+	for _, want := range []string{
+		"Updating apps on this node...", "Updated 1 app(s): fn",
+		"This node's apps are up to date",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("summary missing %q:\n%s", want, out.String())
+		}
 	}
 }
 
@@ -294,9 +300,13 @@ func TestMonorepoSync(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(e.apps, "stray")); !os.IsNotExist(err) {
 		t.Fatal("stray dir survived a deterministic monorepo sync; /apps must reflect the source exactly")
 	}
-	// The summary reports exactly the two discovered apps.
-	if !strings.Contains(out.String(), "Materialized 2 app(s): funa, funb") {
-		t.Fatalf("summary = %q, want 'Materialized 2 app(s): funa, funb'", out.String())
+	// The summary reports exactly the two discovered apps (plus the
+	// deterministic removal of the planted stray).
+	if !strings.Contains(out.String(), "Updated 2 app(s): funa, funb") {
+		t.Fatalf("summary = %q, want 'Updated 2 app(s): funa, funb'", out.String())
+	}
+	if !strings.Contains(out.String(), "Removed 1 app(s): stray") {
+		t.Fatalf("summary = %q, want 'Removed 1 app(s): stray'", out.String())
 	}
 
 	// A second sync pointing at a path absent from the checked-out ref must fail
@@ -451,14 +461,14 @@ func TestSyncBuildsTOFUAuthWithoutSystemKnownHosts(t *testing.T) {
 
 // TestSyncPresentationIsWriterOnlyAndDiagnosticsStayLogged pins the two-channel
 // split and the DI wiring. A sync run with o.Log set to a Debug-level slog logger
-// over one buffer and o.Out set to a separate buffer writes the user-facing step
-// lines (e.g. "Syncing..." and "Sync complete") to the writer ONLY — they are
-// never mirrored into slog — while the structured Debug diagnostics (checkout,
-// fetch, resolution, materialization) still reach the logger. It also documents
-// the nil-contract: every other sync test in this file runs with o.Log unset
-// (nil) — which pins nil-logger safety (no panic, Out is still written) now that
-// the fallback-constructor helper is gone and nil-tolerance lives at this single
-// call site.
+// over one buffer and o.Out set to a separate buffer writes the user-facing
+// summary lines (start line, updated apps, completion line) to the writer ONLY —
+// they are never mirrored into slog — while the structured Debug diagnostics
+// (checkout, fetch, resolution, materialization) still reach the logger. It also
+// documents the nil-contract: every other sync test in this file runs with
+// o.Log unset (nil) — which pins nil-logger safety (no panic, Out is still
+// written) now that the fallback-constructor helper is gone and nil-tolerance
+// lives at this single call site.
 func TestSyncPresentationIsWriterOnlyAndDiagnosticsStayLogged(t *testing.T) {
 	e := fixture(t, true)
 	cfg := Config{Repository: "git@github.com:acme/r.git", Ref: "v1"}
@@ -472,13 +482,18 @@ func TestSyncPresentationIsWriterOnlyAndDiagnosticsStayLogged(t *testing.T) {
 	}
 
 	// Presentation lives on the writer exactly once.
-	for _, step := range []string{"Syncing...", "Resolved", "Materialized", "Sync complete"} {
+	for _, step := range []string{
+		"Updating apps on this node...", "Updated 1 app(s): fn",
+		"This node's apps are up to date",
+	} {
 		if !strings.Contains(outBuf.String(), step) {
 			t.Fatalf("out missing %q:\n%s", step, outBuf.String())
 		}
 	}
 	// ...and is NOT mirrored into the log.
-	for _, step := range []string{"Syncing...", "Sync complete", "app(s):", `Resolved "v1"`} {
+	for _, step := range []string{
+		"Updating apps on this node...", "This node's apps are up to date", "app(s):",
+	} {
 		if strings.Contains(logBuf.String(), step) {
 			t.Fatalf("log mirrored writer presentation %q:\n%s", step, logBuf.String())
 		}
@@ -515,12 +530,13 @@ func TestSyncBackgroundLogsDiagnosticsWithoutOut(t *testing.T) {
 	}
 }
 
-// TestSyncReuseLogsReuseLine pins the checkout-reuse reporting: a second sync
-// over an existing checkout writes the concise "Reusing existing checkout
-// url=<cloneURL>" line to the writer and does NOT mirror it (message or URL) into
-// the logger, while still emitting the structured reuse diagnostic with the
-// checkout path.
-func TestSyncReuseLogsReuseLine(t *testing.T) {
+// TestSyncReuseIsLoggedNotPresented pins checkout-reuse reporting: a second
+// sync over an existing checkout presents only the operator summary on the
+// writer — start line, the unchanged-source line, completion — with no
+// clone/reuse narration — while the structured reuse diagnostic carrying the
+// internal checkout path stays in the log and the writer presentation is never
+// mirrored into it.
+func TestSyncReuseIsLoggedNotPresented(t *testing.T) {
 	e := fixture(t, false)
 	cfg := Config{Repository: "git@github.com:acme/r.git", Ref: "main"}
 	mustSync(t, e, cfg)
@@ -532,20 +548,35 @@ func TestSyncReuseLogsReuseLine(t *testing.T) {
 	if err := SyncFromConfig(context.Background(), o, cfg); err != nil {
 		t.Fatalf("second sync: %v", err)
 	}
-	want := "Reusing existing checkout url=" + e.bare
-	if !strings.Contains(outBuf.String(), want) {
-		t.Fatalf("out missing reuse line %q:\n%s", want, outBuf.String())
+	for _, want := range []string{
+		"Updating apps on this node...",
+		"No app changes: 1 app(s) already up to date",
+		"This node's apps are up to date",
+	} {
+		if !strings.Contains(outBuf.String(), want) {
+			t.Fatalf("out missing %q:\n%s", want, outBuf.String())
+		}
 	}
-	if strings.Contains(logBuf.String(), "Reusing existing checkout") {
-		t.Fatalf("log mirrored the reuse presentation line:\n%s", logBuf.String())
+	// Reuse is an internal step: it never narrates itself to the operator.
+	for _, narration := range []string{"Cloned", "Reusing existing checkout"} {
+		if strings.Contains(outBuf.String(), narration) {
+			t.Fatalf("out narrates internals %q:\n%s", narration, outBuf.String())
+		}
 	}
-	// The reuse diagnostic retains the internal path; it must not repeat the
-	// checkout URL the writer line already presents.
+	// The reuse diagnostic retains the internal path...
 	if !strings.Contains(logBuf.String(), "Checkout reuse") {
 		t.Fatalf("log missing checkout-reuse diagnostic:\n%s", logBuf.String())
 	}
 	if !strings.Contains(logBuf.String(), "path="+e.checkout) {
 		t.Fatalf("log missing reuse checkout path:\n%s", logBuf.String())
+	}
+	// ...while the writer summary never reaches the log.
+	for _, presented := range []string{
+		"This node's apps are up to date", "No app changes",
+	} {
+		if strings.Contains(logBuf.String(), presented) {
+			t.Fatalf("log mirrored writer presentation %q:\n%s", presented, logBuf.String())
+		}
 	}
 }
 

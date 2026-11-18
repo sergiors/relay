@@ -159,25 +159,67 @@ data. Treat Docker access as access to Relay's secrets.
 
 ## Git-managed apps
 
-Git synchronization is manual by default; `relay start` does not poll or fetch.
-For example:
+Configure an SSH repository as the app source:
 
 ```sh
 relay git keygen
 relay git set git@github.com:acme/repo.git --ref main --path apps
 relay git sync
-relay git status
 ```
 
-Relay accepts SSH repository URLs. `git sync` makes `/apps` match the configured
-repository and path, including removing apps no longer present. Review the
-source and selected path before syncing. Updates are staged before live changes;
-each app is replaced atomically, but a multi-app sync is not one atomic
-repository-wide change. An optional GitHub push webhook can request a sync; see
-[CLI](cli.md#relay-git).
+Add the public key from `git keygen` to the repository as a read-only deploy key.
+`git set` saves the SSH repository and optional ref, app path, and webhook secret;
+it does not deploy apps. Run `git sync` to deploy the latest revision from the
+configured ref to `/apps`. It removes apps no longer present in the selected
+source, so review the repository and path before syncing.
+Changing or removing the Git source on a running worker requires restarting it.
 
 Relay verifies SSH host keys using its managed `known_hosts` file and does not
 silently replace a changed host key.
+
+Git updates are manual unless you configure a GitHub push webhook. Configure a
+webhook secret with `--webhook-secret NAME` and expose the webhook listener using
+`GIT_WEBHOOK_ADDR`; the production Compose file does not configure or expose that
+endpoint. A webhook requests deployment of the revision in the push.
+
+When a Git source is configured, nodes using the same repository, ref, and path
+receive the deployed revision. Give each node access to the repository with its
+own read-only deploy key. Nodes can fall behind while offline or while fetching
+or activating an update. A failed update leaves the previous working apps active;
+Relay retries, and the node catches up when it is available and the problem is
+resolved.
+
+Check the desired revision and node/app progress with:
+
+```sh
+relay git sync
+relay deploy status
+```
+
+`relay deploy status` shows the desired generation and commit, whether it is
+pinned, and each node's desired and current revision plus app status. A node
+that is behind continues serving its previous apps; check its status and error
+while it retries.
+
+To pause updates, pin the current revision:
+
+```sh
+relay deploy pin
+```
+
+While pinned, `git sync` and webhook updates are blocked. To deploy a particular
+commit from the configured repository, use `rollback`; this also pins the
+selected revision:
+
+```sh
+relay deploy rollback 0123456789abcdef0123456789abcdef01234567
+relay deploy unpin
+```
+
+`unpin` allows a future sync or webhook update; it does not immediately change
+the current revision. Without a configured Git source, apps run from local
+`/apps`. With Git configured, local `/apps` edits are not deployed and Relay
+restores the selected Git revision.
 
 ## Redis recovery and reliability
 

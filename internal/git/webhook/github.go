@@ -33,9 +33,17 @@ var signatureHexRe = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
 // at the same host+path; matching accepts any of them so the configured SSH URL
 // lines up with how GitHub reports the repository.
 type pushPayload struct {
-	Ref        string `json:"ref"`
-	After      string `json:"after"`
-	Deleted    bool   `json:"deleted"`
+	Ref    string `json:"ref"`
+	Before string `json:"before"`
+	After  string `json:"after"`
+	// Deleted removes a ref; nothing to publish.
+	Deleted bool `json:"deleted"`
+	// HeadCommit carries the pushed tip's commit metadata. Timestamp is used
+	// ONLY to reject an out-of-order automatic publication; it never selects the
+	// revision (After is the immutable SHA).
+	HeadCommit struct {
+		Timestamp string `json:"timestamp"`
+	} `json:"head_commit"`
 	Repository struct {
 		FullName string `json:"full_name"`
 		Name     string `json:"name"`
@@ -78,9 +86,29 @@ type GitHubProvider struct {
 	secretRef string           // webhook secret name in Relay's store; empty = misconfigured (fails closed)
 	secrets   secrets.Provider // resolves secretRef; may be nil only in tests
 	sync      SyncTrigger      // the coalescing sync scheduler
+	// publish, when non-nil, switches a matching push from a local branch sync
+	// to publishing the pushed immutable SHA as the shared coordinated deployment
+	// revision. It returns published=false for an intentionally ignored outcome
+	// (pinned current revision or an out-of-order/duplicate revision) while
+	// preserving the HTTP 200 "ignored" semantics.
+	publish PublishRevisionFunc
 
 	configPath string // persisted git source config, read per request
 }
+
+// PublishRevisionFunc publishes one pushed immutable revision as the shared
+// desired deployment revision. cfg is the matched Git source; before is the
+// provider's previous tip (used only to prove a direct push chain), commit is
+// the full pushed SHA, and sourceTime is the provider's commit timestamp used
+// for conservative out-of-order rejection. A false result (with nil error) is a
+// deliberate no-op that the webhook acknowledges as ignored.
+type PublishRevisionFunc func(
+	ctx context.Context,
+	cfg git.Config,
+	before,
+	commit,
+	sourceTime string,
+) (bool, error)
 
 // SyncTrigger schedules a coalescing git sync. Done returns a channel closed
 // when a scheduled sync attempt finishes (success or failure), so tests can
@@ -104,11 +132,26 @@ func NewGitHubProvider(
 	configPath string,
 	syncer SyncTrigger,
 ) *GitHubProvider {
+	return newGitHubProvider(logger, secretRef, secrets, configPath, syncer, nil)
+}
+
+// newGitHubProvider is the internal constructor that also installs the
+// coordinated-deployment publisher. The exported constructor keeps the
+// standalone sync-trigger shape; NewServer selects one mode.
+func newGitHubProvider(
+	logger *slog.Logger,
+	secretRef string,
+	secrets secrets.Provider,
+	configPath string,
+	syncer SyncTrigger,
+	publish PublishRevisionFunc,
+) *GitHubProvider {
 	return &GitHubProvider{
 		logger:     logger,
 		secretRef:  secretRef,
 		secrets:    secrets,
 		sync:       syncer,
+		publish:    publish,
 		configPath: configPath,
 	}
 }
@@ -204,9 +247,42 @@ func (provider *GitHubProvider) ServeHTTP(w http.ResponseWriter, r *http.Request
 		_, _ = io.WriteString(w, "ignored")
 		return
 	}
-	// 8. Schedule the coalescing sync. This never blocks the handler; the
-	// scheduler goroutine owns the actual git sync. A scheduler failure (only a
-	// nil receiver) is an internal error.
+	// 8. Publish the pushed IMMUTABLE revision when coordinated publication is
+	// configured; otherwise schedule the coalescing branch sync below. Publishing
+	// uses the delivery's After SHA (never a ref resolved later), so the revision
+	// is durable before the response and every node converges even if this
+	// process dies immediately afterward.
+	if provider.publish != nil {
+		if err := git.ValidateCommit(payload.After); err != nil {
+			logAt(provider.logger, r.Context(), slog.LevelWarn, "webhook: push has no usable commit SHA",
+				"repo", provider.repoName(&payload), "error", err)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		published, err := provider.publish(
+			r.Context(), cfg, payload.Before, payload.After, payload.HeadCommit.Timestamp)
+		if err != nil {
+			logAt(provider.logger, r.Context(), slog.LevelError, "webhook: publish deployment revision",
+				"repo", provider.repoName(&payload), "commit", payload.After, "error", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		if !published {
+			logAt(provider.logger, r.Context(), slog.LevelInfo, "webhook: deployment revision ignored",
+				"repo", provider.repoName(&payload), "commit", payload.After)
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "ignored")
+			return
+		}
+		logAt(provider.logger, r.Context(), slog.LevelInfo, "GitHub push published deployment revision",
+			"repo", provider.repoName(&payload), "commit", payload.After)
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = io.WriteString(w, "accepted")
+		return
+	}
+	// 8b. No coordinated publisher: schedule the coalescing sync. This never blocks the
+	// handler; the scheduler goroutine owns the actual git sync. A scheduler
+	// failure (only a nil receiver) is an internal error.
 	if provider.sync == nil {
 		logAt(provider.logger, r.Context(), slog.LevelError, "webhook: sync trigger not configured")
 		http.Error(w, "internal error", http.StatusInternalServerError)

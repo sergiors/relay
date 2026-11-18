@@ -189,8 +189,64 @@
 // converges. This package does not import the runtime package and does not
 // validate runtime/source-image binding; the runtime layer does.
 //
-// The current CLI has no selection writer. Runtimes without a row remain
-// unpinned; a stored change converges without a worker restart.
+// The current CLI has no selection writer for runtime pins. Runtimes without a
+// row remain unpinned; a stored change converges without a worker restart.
+//
+// Coordinated deployment state (source-driven participation):
+//
+// deployment_desired(id = 1, generation, updated_at, data JSONB) is the shared
+// desired revision on a coordinator-active worker. generation is a
+// monotonic compare-and-swap key and data holds the immutable 40-character
+// commit SHA plus the non-secret repository/ref/path, publisher, optional source
+// timestamp, pin policy, and note. It is deliberately separate from apps: the
+// global apps row is never repurposed as a shared desired state. Publishing is
+// serialized by a dedicated transaction-scoped advisory lock and performs only
+// PostgreSQL work, so no network, checkout, materialization, or build runs
+// inside the transaction. Repeated identical revisions are idempotent no-ops;
+// concurrent publishers serialize and exactly one advances a generation; a
+// pinned revision ignores automatic webhook publications. Automatic ordering is
+// anchored to a persisted branch tip: a push replaces the current revision only
+// when its provider before SHA equals BranchTip (the after SHA of the last
+// accepted automatic push). The first-ever automatic publication establishes the
+// anchor; commit timestamps never accept a mismatched before SHA. Missing or
+// mismatched chains are ignored (ambiguous/stale), and an automatic publication
+// may never change an existing shared repository/ref/path identity. Manual
+// publication bypasses automatic ordering, preserves the same-source metadata
+// and branch-tip anchor for pin/rollback, may deliberately roll back to an older
+// SHA as a NEW generation, and is the explicit recovery path (re-anchoring) when
+// a chain was missed. Manual publication is also the only way to change the
+// shared source identity.
+//
+// deployment_nodes(node_id PRIMARY KEY, generation, applied_generation,
+// instance, incarnation, applied_incarnation, updated_at, data JSONB) records
+// each node's INDEPENDENT progress. generation is the latest desired generation
+// observed; applied_generation is the generation materialized and authorized in
+// /apps; incarnation is allocated from deployment_incarnation_seq and fences a
+// stale process incarnation out of every progress write. The phase/commit/error
+// payload is JSONB. deployment_apps(node_id, app_name, generation, instance,
+// updated_at, data JSONB) records per-app activation progress DISTINCT from Git
+// materialization: pending/activating/active/degraded/failed/drifted/removed,
+// plus the materialized content fingerprint and template identity. Rows for
+// older generations survive until a successful applied advancement prunes them,
+// so a failed newer materialization never destroys the previous generation's
+// recovery authorization. App progress writes are accepted only while the
+// node's observed/applied generation matches and the caller presents the current
+// incarnation. No leader, executor, or global barrier participates: every node
+// reads the same desired row and converges independently after the publisher's
+// commit. A committed generation additionally emits a PostgreSQL NOTIFY hint on
+// a dedicated session channel (see ListenDeploymentDesired); it only shortens
+// convergence latency, listeners always re-read the authoritative row, and the
+// coordinator's periodic read remains the safe fallback.
+//
+// The app publication fence is extended with Detail.SourceGeneration (the
+// deployment generation whose materialized tree produced the snapshot). A
+// success that would publish a NEW active fingerprint is refused once the shared
+// desired generation differs from the app row's SourceGeneration, even if the
+// content fingerprint is unchanged (a rollback to identical bytes). Re-stamping
+// the already-active fingerprint (service convergence of the serving generation)
+// remains allowed. This axis is independent of runtime_image_selections: Git
+// generation ordering and runtime base-image pin CAS never substitute for one
+// another.
 //
 // Secret values are never stored: only the reference names appear in the
 // snapshot. Literal env values are never stored either: env entries keep the

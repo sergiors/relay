@@ -11,6 +11,7 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/cron"
+	"relay/internal/deployment"
 	"relay/internal/observability/metrics"
 	"relay/internal/reconciler"
 	"relay/internal/runner"
@@ -162,8 +163,9 @@ func appReconcilerConfig(
 	manager *runtime.Manager,
 	sched *cron.Scheduler,
 	services *reconciler.ServiceCoordinator,
+	deploymentCoordinator *deployment.Coordinator,
 ) reconciler.Config {
-	return reconciler.Config{
+	cfg := reconciler.Config{
 		Root:   root,
 		State:  st,
 		Retire: func(_ string, oldImage string) { runWorker.RetireImage(oldImage) },
@@ -285,4 +287,9 @@ func appReconcilerConfig(
 			services.RemoveAndWait(name)
 		},
 	}
+	if deploymentCoordinator != nil {
+		cfg.DeploymentProgress = deploymentCoordinator.ReportApp
+		cfg.DeploymentDrift = deploymentCoordinator.ReportDrift
+	}
+	return cfg
 }

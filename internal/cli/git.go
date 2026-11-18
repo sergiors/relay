@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,12 +12,14 @@ import (
 	"github.com/urfave/cli/v3"
 
 	git "relay/internal/git"
+	"relay/internal/state"
 )
 
-// gitCommand builds the `relay git ...` manual sync subcommand family. It never
-// runs automatically and never touches Redis, Docker, or the worker; it only
-// writes the local git config/key/checkout and materializes /apps (on
-// sync). It is a pure grouping command, so it uses the shared namespaceAction:
+// gitCommand builds the `relay git ...` manual command family. It never runs
+// automatically or touches Redis, Docker, or the worker. It manages local Git
+// config, keys, and checkout; `sync` also publishes through PostgreSQL before
+// materializing /apps. It is a pure grouping command, so it uses the shared
+// namespaceAction:
 // a bare `relay git` shows the subcommand help (there is nothing else to do with
 // just the command name), and an unknown first token is a friendly Docker-style
 // usage error naming the full path.
@@ -29,19 +32,18 @@ import (
 func gitCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "git",
-		Usage: "Manage manual Git sync",
-		Description: "Generate a deploy key, configure an SSH repository, and manually sync " +
-			"its apps into /apps. No running worker is required.",
+		Usage: "Configure Git and deploy app updates",
+		Description: "`git set` saves the Git source; `git sync` deploys its latest revision. " +
+			"No running worker is required.",
 		Action: namespaceAction(),
 		Commands: []*cli.Command{
 			{
 				Name:      "keygen",
 				Usage:     "Generate an SSH deploy key",
 				UsageText: "relay git keygen",
-				Description: "Generate an ed25519 deploy key under " + deps.GitSSHDir + " (0700 " +
-					"directory, 0600 key) and print the public key in authorized_keys form. Add " +
-					"it to your Git provider as a read-only deploy key; Relay never calls a " +
-					"provider API. Fails if a key already exists; remove it to regenerate.",
+				Description: "Generate an SSH deploy key under " + deps.GitSSHDir +
+					" and print its public key. Add it to the repository as a read-only deploy key. " +
+					"Fails if a key already exists.",
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					if cmd.Args().Present() {
 						return cli.Exit("git keygen: too many arguments", 2)
@@ -53,17 +55,14 @@ func gitCommand(deps Dependencies) *cli.Command {
 				Name:      "set",
 				Usage:     "Set the git source repository",
 				UsageText: "relay git set <repository> [--ref REF] [--path PATH] [--webhook-secret NAME]",
-				Description: "Configure the SSH repository to sync; the URL may be scp-like or " +
-					"ssh://. Running set again overwrites the source. Sync stays manual unless a " +
-					"webhook secret is configured.",
+				Description: "Save the SSH repository and optional ref, app path, and webhook " +
+					"secret. This only configures the source; run 'relay git sync' to deploy it.",
 				Flags: []cli.Flag{
-					&cli.StringFlag{Name: "ref", Usage: "branch, tag, or commit to sync (default " + git.DefaultRef + ")"},
-					&cli.StringFlag{Name: "path", Usage: "optional monorepo subdirectory within the repository"},
+					&cli.StringFlag{Name: "ref", Usage: "branch, tag, or commit (default " + git.DefaultRef + ")"},
+					&cli.StringFlag{Name: "path", Usage: "app directory within the repository"},
 					&cli.StringFlag{
-						Name: "webhook-secret",
-						Usage: "name of the stored secret used to verify GitHub webhook " +
-							"signatures; required to enable the webhook endpoint (unsigned " +
-							"deliveries are rejected)",
+						Name:  "webhook-secret",
+						Usage: "stored secret name for GitHub webhook verification; requires a configured webhook listener",
 					},
 				},
 				Arguments: []cli.Argument{
@@ -86,9 +85,11 @@ func gitCommand(deps Dependencies) *cli.Command {
 			},
 			{
 				Name:  "sync",
-				Usage: "Sync the configured source into /apps",
-				Description: "Clone or update the configured repository and sync its app " +
-					"directories into /apps, removing apps no longer present.",
+				Usage: "Deploy the latest revision from the configured Git source",
+				Description: "Deploy the latest revision from the configured Git source. Other " +
+					"Relay nodes using the same source update independently. A pinned deployment " +
+					"blocks sync; run 'relay deploy unpin' first. If another update wins during " +
+					"sync, retry.",
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					if cmd.Args().Present() {
 						return cli.Exit("git sync: too many arguments", 2)
@@ -97,10 +98,9 @@ func gitCommand(deps Dependencies) *cli.Command {
 				},
 			},
 			{
-				Name:  "status",
-				Usage: "Show git sync status",
-				Description: "Show the configured source, whether the deploy key and checkout " +
-					"exist, and the last sync time. Does not print key material.",
+				Name:        "status",
+				Usage:       "Show the Git source and last sync",
+				Description: "Show the configured source and last sync time. Does not print key material.",
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					if cmd.Args().Present() {
 						return cli.Exit("git status: too many arguments", 2)
@@ -170,23 +170,103 @@ func gitSet(ctx context.Context, w io.Writer, deps Dependencies, repository, ref
 	return nil
 }
 
-// gitSync runs the manual sync; the process context propagates Ctrl-C. The sync
-// reads the persisted config itself (via opts.ConfigPath), so the CLI passes its
-// injected filesystem locations straight through. opts.CloneURL is the injected
-// transport override (deps.GitCloneURL): empty in production, and never
-// persisted, so the configured repository remains the validated SSH URL.
+// gitSync runs the manual sync; the process context propagates Ctrl-C. It loads
+// the persisted source, publishes its resolved SHA through PostgreSQL, then
+// materializes exactly that commit. Its options carry the injected filesystem
+// locations and CloneURL transport override (empty in production and never
+// persisted, so the configured repository remains the validated SSH URL).
 // SyncOptions.Log is left nil: this short-lived command's step summary on w is
 // its complete user-facing record, and background operational diagnostics belong
 // to the worker/webhook path.
 func gitSync(ctx context.Context, w io.Writer, deps Dependencies) error {
+	o := newGitSyncOptions(deps)
+	cfg, err := git.LoadConfig(deps.GitConfigPath)
+	if err != nil {
+		return err
+	}
+	if deps.OpenState == nil {
+		return fmt.Errorf("git sync: deployment state is unavailable")
+	}
+	// A configured Git source always participates in coordinated publication.
+	// Open PostgreSQL BEFORE resolving the moving ref or touching /apps so a
+	// missing/unreachable DATABASE_URL fails clearly without side effects.
+	st, cleanup, err := deps.OpenState(ctx)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	desired, found, err := st.ReadDeploymentDesired(ctx)
+	if err != nil {
+		return err
+	}
+	if found && desired.Pinned {
+		return fmt.Errorf(
+			"git sync: deployment is pinned at %s; run 'relay deploy unpin' before syncing",
+			shortSHA(desired.Commit))
+	}
+	// Capture the generation this sync observed BEFORE resolving the moving ref.
+	// Publication is a compare-and-swap against it: two concurrent `git sync`
+	// processes that resolve B then C cannot let the slower B overwrite C as a new
+	// generation. Zero means "no deployment row yet", so the first publication is
+	// still a normal absent-row CAS.
+	expectedGeneration := desired.Generation
+	if !found {
+		expectedGeneration = 0
+	}
+
+	// Resolve the configured branch/tag tip to an immutable SHA before publishing.
+	// No materialization happens while the desired revision is merely being
+	// published; SyncCommit below checks out exactly the published object.
+	o.Out = nil
+	sha, err := git.ResolveRef(ctx, o, cfg)
+	if err != nil {
+		return err
+	}
+
+	result, err := st.PublishDeploymentDesired(ctx, state.DeploymentPublishRequest{
+		Desired: state.DeploymentDesired{
+			Commit:     sha,
+			Repository: cfg.Repository,
+			Ref:        cfg.Ref,
+			Path:       cfg.Path,
+			Publisher:  "cli:git-sync",
+		},
+		ExpectedGeneration: expectedGeneration,
+		AllowPinned:        false,
+	})
+	if err != nil {
+		if errors.Is(err, state.ErrDeploymentConflict) {
+			return fmt.Errorf(
+				"git sync: deployment changed during sync; run 'relay git sync' again")
+		}
+		return err
+	}
+	if !result.Published && result.Reason == state.DeploymentPublishReasonPinned {
+		return fmt.Errorf(
+			"git sync: deployment is pinned at %s; run 'relay deploy unpin' before syncing",
+			shortSHA(result.Desired.Commit))
+	}
+
+	o.Out = w
+	return git.SyncCommit(ctx, o, cfg, sha)
+}
+
+func newGitSyncOptions(deps Dependencies) git.SyncOptions {
 	o := git.NewSyncOptions()
 	o.ConfigPath = deps.GitConfigPath
 	o.CheckoutDir = deps.GitCheckoutDir
 	o.AppsDir = deps.GitAppsDir
 	o.SSHDir = deps.GitSSHDir
 	o.CloneURL = deps.GitCloneURL
-	o.Out = w
-	return git.Sync(ctx, o)
+	return o
+}
+
+func shortSHA(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
 }
 
 // gitStatus renders the sync state with tab-aligned labels. A missing config is

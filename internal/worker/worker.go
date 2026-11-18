@@ -59,7 +59,7 @@ import (
 	"relay/internal/app"
 	"relay/internal/bytesize"
 	"relay/internal/config"
-	gitwh "relay/internal/git/webhook"
+	"relay/internal/deployment"
 	"relay/internal/observability/metrics"
 	"relay/internal/observability/tracing"
 	"relay/internal/reconciler"
@@ -615,17 +615,77 @@ func Run(logger *slog.Logger) (runErr error) {
 	}
 	logger.Info("Startup: secrets provider ready", "provider", cfg.Secrets.Provider)
 
-	// Optional Git webhook, gated on GIT_WEBHOOK_ADDR. NewServer owns assembly
-	// and returns nil when disabled; Run only constructs, starts, and registers
-	// its teardown.
-	var gitWebhookServer *gitwh.Server
-	if cfg.GitWebhookAddr != "" {
-		gitWebhookServer = gitwh.NewServer(cfg.GitWebhookAddr, logger, gitwh.Config{Secrets: secretProvider})
+	// Source classification and coordinator construction live in
+	// newDeploymentCoordinator; nil means the local-/apps mode.
+	deploymentCoordinator, err := newDeploymentCoordinator(logger, cfg, st)
+	if err != nil {
+		return err
 	}
 
-	startupSet, err := loadStartupApps(startupCtx, logger, st, metricsInstance)
+	// Optional Git webhook, gated on GIT_WEBHOOK_ADDR; nil means disabled.
+	// Run only starts it later and registers its teardown.
+	gitWebhookServer := newGitWebhookServer(
+		logger, cfg, secretProvider, st, deploymentCoordinator,
+	)
+
+	// On a coordinator-active worker observe and materialize the shared revision
+	// BEFORE the startup app load, so the discovery/fingerprint/prepare path runs
+	// against the authorized tree. A network/auth failure is reported per node
+	// and non-fatal: the previous materialized generation keeps serving and the
+	// background coordinator retries.
+	deploymentSnapshot := deployment.Snapshot{}
+	if deploymentCoordinator != nil {
+		deploymentSnapshot, err = deploymentCoordinator.ObserveStartup(startupCtx)
+		if err != nil {
+			if startupInterrupted(startupCtx, err) {
+				return startupResult(errStartupInterrupted)
+			}
+			return fmt.Errorf("deployment: observe desired revision: %w", err)
+		}
+	}
+
+	startupSet, err := loadStartupAppsWithAuthorization(
+		startupCtx, logger, st, metricsInstance,
+		deploymentSnapshot.Generation,
+		deploymentSnapshot.Fingerprints,
+		deploymentSnapshot.Invalid,
+		// Cluster mode is authoritative even before a revision is published or
+		// materialized: with no authorized fingerprint set, no local app is
+		// prepared. This is what makes a local /apps edit inert rather than a
+		// desired generation.
+		deploymentSnapshot.Authoritative || deploymentCoordinator != nil,
+	)
 	if err != nil {
 		return startupResult(err)
+	}
+	if deploymentCoordinator != nil {
+		// Startup publication uses the same check-and-swap boundary as the live
+		// reconciler: the registry add runs while holding PublishDeploymentDesired's
+		// advisory lock, so a newer durable revision cannot slip in between the row
+		// check and activation. With no authorized generation, the coordinator
+		// publishes no startup candidate at all.
+		generation := deploymentSnapshot.Generation
+		startupSet.publicationFence = func(fctx context.Context, publish func()) error {
+			if generation <= 0 {
+				return deployment.ErrDesiredGenerationChanged
+			}
+
+			err := st.WithDeploymentDesiredLock(fctx, func(
+				desired state.DeploymentDesired, found bool,
+			) error {
+				if !found || desired.Generation != generation {
+					return deployment.ErrDesiredGenerationChanged
+				}
+				publish()
+				return nil
+			})
+
+			if err != nil && !errors.Is(err, deployment.ErrDesiredGenerationChanged) {
+				return fmt.Errorf("%w: %v", deployment.ErrDesiredGenerationChanged, err)
+			}
+
+			return err
+		}
 	}
 	apps := startupSet.loaded
 	fingerprints := startupSet.fingerprints
@@ -717,12 +777,25 @@ func Run(logger *slog.Logger) (runErr error) {
 	rec := reconciler.New(
 		appReconcilerConfig(
 			app.Dir, st, runWorker, metricsInstance,
-			statsFlusher, manager, sched, services,
+			statsFlusher, manager, sched, services, deploymentCoordinator,
 		),
 		runWorker.Registry(),
 		manager,
 		logger,
 	)
+	// Cluster reconciliation is authorized ONLY for the materialized generation.
+	// Install this before the watch starts so a local edit arriving immediately
+	// after startup can never be treated as desired.
+	if deploymentCoordinator != nil {
+		rec.SetDeploymentAuthorizationWithInvalid(
+			deploymentSnapshot.Generation,
+			deploymentSnapshot.Fingerprints,
+			deploymentSnapshot.TemplateIdentities,
+			deploymentSnapshot.Invalid,
+			deploymentSnapshot.InvalidTemplates,
+			deploymentSnapshot.Removed,
+		)
+	}
 	_, reconcilerSpan := tracing.Start(startupCtx, "reconciler.start")
 	startAppReconciler(
 		ctx, logger, reconcilerSpan, rec, apps, fingerprints,
@@ -731,6 +804,27 @@ func Run(logger *slog.Logger) (runErr error) {
 			reportReconcilerFailure(ctx, stop, reconcilerFailures, err)
 		},
 	)
+	if deploymentCoordinator != nil {
+		// The convergence loop only reads PostgreSQL and materializes into
+		// /apps; it never publishes desired state. Join it before the state DB
+		// closes (see shutdownStepDeployment).
+		deploymentDone := deploymentCoordinator.Start(
+			ctx,
+			func(snapshot deployment.Snapshot) {
+				rec.SetDeploymentAuthorizationWithInvalid(
+					snapshot.Generation, snapshot.Fingerprints,
+					snapshot.TemplateIdentities, snapshot.Invalid,
+					snapshot.InvalidTemplates, snapshot.Removed)
+			},
+			rec.Enqueue,
+		)
+		shutdown.register(deploymentBarrierStep(deploymentDone))
+		// Optional database hint path: a LISTEN supervisor wakes the loop
+		// without forcing a rematerialization. It is started only after the
+		// convergence loop exists, and it issues a normal wake on every
+		// subscription so a publication that raced startup is still observed.
+		startDeploymentListener(ctx, logger, st, deploymentCoordinator, shutdown)
+	}
 	// A startup preparation rejected by the selection fence is represented in
 	// the registry by an unavailable placeholder. Promptly re-drive exactly those
 	// apps once the watcher/pump is live, against the snapshot refreshed by the

@@ -150,28 +150,9 @@ During startup, look for `Worker ready to consume` in the Relay logs.
 
 ## Connect Applications (Git workflow)
 
-Relay loads each direct child directory of `/apps` that contains a
-`template.yaml`. The production Compose file stores `/apps` in the persistent
-`relay-apps` volume. Configure a Git repository as the source of these apps:
-
-```sh
-docker compose -f compose.prod.yaml exec -T relay relay git keygen
-docker compose -f compose.prod.yaml exec -T relay relay git set git@github.com:OWNER/REPOSITORY.git
-docker compose -f compose.prod.yaml exec -T relay relay git sync
-docker compose -f compose.prod.yaml exec -T relay relay git status
-```
-
-Add the public key printed by `git keygen` to the repository as a read-only
-deploy key. `git set` accepts an SSH repository URL; the default ref is
-`main`, and `--ref REF` and `--path PATH` can select another ref or app path.
-`git sync` updates `/apps` and removes apps no longer present in the source, so
-review the repository and selected path before running it.
-
-Relay does not poll Git automatically. Run `git sync` when you want to publish
-changes. An optional GitHub push webhook can request synchronization with
-`relay git set ... --webhook-secret NAME`, but the production Compose file does
-not configure `GIT_WEBHOOK_ADDR` or expose/route the webhook endpoint. It does
-not provide automatic external webhook access as configured.
+For Git setup and deployment steps, see
+[Git-managed apps](operations.md#git-managed-apps). The production Compose file
+does not expose a webhook endpoint.
 
 For example, the `welcome-email-node` app uses the `nodejs24.x` runtime and
 matches PostgreSQL CDC `INSERT` events for the `users` table, exposed as

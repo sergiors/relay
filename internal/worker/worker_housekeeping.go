@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"relay/internal/app"
+	"relay/internal/deployment"
 	"relay/internal/observability/tracing"
 	"relay/internal/reconciler"
 	"relay/internal/runner"
@@ -611,6 +612,11 @@ func publishStartupApps(
 			continue
 		}
 		publish := func() error {
+			if startup.publicationFence != nil {
+				return startup.publicationFence(lifecycle, func() {
+					registry.Replace(fn.Name, pf)
+				})
+			}
 			registry.Replace(fn.Name, pf)
 			return nil
 		}
@@ -634,6 +640,11 @@ func publishStartupApps(
 					"Startup: runtime image selection changed before publication; app will reprepare",
 					"app", fn.Name,
 					"error", pubErr,
+				)
+			} else if errors.Is(pubErr, deployment.ErrDesiredGenerationChanged) {
+				logger.Info(
+					"Startup: desired deployment generation changed before publication; app will reprepare",
+					"app", fn.Name,
 				)
 			} else {
 				logger.Error(

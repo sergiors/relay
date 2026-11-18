@@ -55,21 +55,23 @@ const shutdownAggregateTimeout = 2 * time.Minute
 // NOT teardown order (Redis is acquired first and released last) — so the order
 // is declared here rather than inherited from registration/LIFO.
 const (
-	shutdownStepOwnership      = "ownership"
-	shutdownStepSocket         = "socket"
-	shutdownStepScheduler      = "scheduler"
-	shutdownStepReconciler     = "reconciler"
-	shutdownStepHousekeeping   = "housekeeping"
-	shutdownStepServicesJoin   = "services-join"
-	shutdownStepServiceCleanup = "service-cleanup"
-	shutdownStepLoops          = "loops"
-	shutdownStepStatsFlush     = "stats-flush"
-	shutdownStepMetrics        = "metrics"
-	shutdownStepWebhook        = "webhook"
-	shutdownStepManager        = "manager"
-	shutdownStepState          = "state"
-	shutdownStepTracing        = "tracing"
-	shutdownStepRedis          = "redis"
+	shutdownStepOwnership        = "ownership"
+	shutdownStepSocket           = "socket"
+	shutdownStepScheduler        = "scheduler"
+	shutdownStepReconciler       = "reconciler"
+	shutdownStepDeployment       = "deployment"
+	shutdownStepDeploymentListen = "deployment-listen"
+	shutdownStepHousekeeping     = "housekeeping"
+	shutdownStepServicesJoin     = "services-join"
+	shutdownStepServiceCleanup   = "service-cleanup"
+	shutdownStepLoops            = "loops"
+	shutdownStepStatsFlush       = "stats-flush"
+	shutdownStepMetrics          = "metrics"
+	shutdownStepWebhook          = "webhook"
+	shutdownStepManager          = "manager"
+	shutdownStepState            = "state"
+	shutdownStepTracing          = "tracing"
+	shutdownStepRedis            = "redis"
 )
 
 // shutdownStepOrder is the single source of truth for graceful-shutdown
@@ -89,10 +91,13 @@ const (
 //     ownership (joins the lock monitor and runs the final fail-closed
 //     ownership verification before the state handle closes),
 //     scheduler (joins publisher callbacks before Redis closes), reconciler
-//     (writes state, drives the manager), housekeeping (startup sweeps use the
+//     (writes state, drives the manager), deployment-listen (joins the NOTIFY
+//     supervisor before its consumer), deployment (joins the convergence loop
+//     that the supervisor wakes), housekeeping (startup sweeps use the
 //     manager and state DB), services-join (coordinator workers use manager and
 //     state DB), loops (the stats and retention loops use the state DB and
-//     Redis).
+//     Redis). A producer of work joined by a later barrier must itself be
+//     joined first: the listener is stopped before the coordinator it wakes.
 //   - BEST-EFFORT CLEANUP (everything else): bounded, logged on timeout or
 //     failure, and never joined past its bound. Cleanup:
 //     socket, service-cleanup, stats-flush, metrics, webhook, manager, state,
@@ -106,6 +111,8 @@ var shutdownStepOrder = []string{
 	shutdownStepSocket,
 	shutdownStepScheduler,
 	shutdownStepReconciler,
+	shutdownStepDeploymentListen,
+	shutdownStepDeployment,
 	shutdownStepHousekeeping,
 	shutdownStepServicesJoin,
 	shutdownStepServiceCleanup,
@@ -221,6 +228,41 @@ func reconcilerBarrierStep(reconcilerDone <-chan struct{}) shutdownStep {
 		run: func(stepCtx context.Context) error {
 			return barrierJoin(stepCtx, func(joinCtx context.Context) error {
 				return waitSignal(joinCtx, reconcilerDone)
+			})
+		},
+	}
+}
+
+// deploymentBarrierStep joins the coordinated deployment convergence loop. The
+// loop writes per-node/per-app progress to the state DB and materializes /apps,
+// so it is a quiescence barrier ahead of the state close.
+func deploymentBarrierStep(done <-chan struct{}) shutdownStep {
+	return shutdownStep{
+		name:    shutdownStepDeployment,
+		timeout: 10 * time.Second,
+		barrier: true,
+		run: func(stepCtx context.Context) error {
+			return barrierJoin(stepCtx, func(joinCtx context.Context) error {
+				return waitSignal(joinCtx, done)
+			})
+		},
+	}
+}
+
+// deploymentListenerBarrierStep joins the desired-revision LISTEN supervisor.
+// The supervisor holds a dedicated state connection and produces coordinator
+// wakes, so it is joined BEFORE the deployment convergence loop itself and
+// before the state handle (and its pool) closes in a later step. Stopping the
+// producer first leaves no listener goroutine able to wake a consumer that has
+// already been joined.
+func deploymentListenerBarrierStep(done <-chan struct{}) shutdownStep {
+	return shutdownStep{
+		name:    shutdownStepDeploymentListen,
+		timeout: 10 * time.Second,
+		barrier: true,
+		run: func(stepCtx context.Context) error {
+			return barrierJoin(stepCtx, func(joinCtx context.Context) error {
+				return waitSignal(joinCtx, done)
 			})
 		},
 	}

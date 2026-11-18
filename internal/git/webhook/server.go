@@ -12,6 +12,13 @@
 // into internal/git's existing Sync entry, preserving the one-shot, no-timer
 // contract of the git package.
 //
+// With coordinated publication (an injected PublishRevision publisher) a matching
+// push instead publishes the delivery's immutable `after` SHA as the shared
+// desired deployment revision. It never resolves the pushed ref later and never
+// schedules a local branch sync. A pinned desired revision or an out-of-order
+// duplicate is acknowledged as ignored (HTTP 200), preserving the provider's
+// existing ignored-event semantics without an error.
+//
 // Architecture (why a separate HTTP server): the metrics server owns the
 // Prometheus HTTP endpoint and must remain the only thing bound to METRICS_ADDR.
 // The webhook is triggered by external provider deliveries and has different
@@ -165,6 +172,22 @@ func NewServer(addr string, logger *slog.Logger, cfg Config) *Server {
 	opts.AppsDir = defaultStr(cfg.AppsDir, app.Dir)
 	opts.SSHDir = defaultStr(cfg.SSHDir, git.SSHDir)
 	opts.Log = logger
+
+	if cfg.PublishRevision != nil {
+		// Coordinated mode: a push publishes the immutable revision directly.
+		// No local branch sync scheduler is assembled, so the handler can never
+		// fall back to resolving a mutable ref.
+		provider := newGitHubProvider(
+			logger,
+			gitCfg.WebhookSecretRef,
+			cfg.Secrets,
+			configPath,
+			nil,
+			cfg.PublishRevision,
+		)
+		return newServer(addr, logger, provider)
+	}
+
 	scheduler := NewSyncScheduler(opts, logger)
 
 	provider := NewGitHubProvider(
@@ -359,6 +382,12 @@ type Config struct {
 	// Optional directory overrides (zero value = production default):
 	// git.ConfigPath, git.CheckoutDir, app.Dir, git.SSHDir.
 	ConfigPath, CheckoutDir, AppsDir, SSHDir string
+	// PublishRevision, when non-nil, selects coordinated publication:
+	// a matching push publishes its immutable After SHA as the shared desired
+	// deployment revision instead of scheduling a local branch sync. The pushed
+	// Before SHA is supplied for conservative direct-chain ordering. The worker
+	// supplies a closure backed by PostgreSQL and its deployment coordinator.
+	PublishRevision PublishRevisionFunc
 }
 
 // defaultStr returns v when non-empty, else def. It is the tiny helper the
