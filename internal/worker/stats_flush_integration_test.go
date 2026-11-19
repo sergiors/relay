@@ -43,7 +43,10 @@ func TestStatsFlushSweepsStaleAppSeries(t *testing.T) {
 		t.Errorf("state write error: %v", err)
 	}
 
-	newStatsFlusher(st, m).flush(context.Background())
+	newStatsFlusher(st, m, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	}).flush(context.Background())
 
 	// Ghost's PostgreSQL app_stats is absent (pre-existing orphan-prune/upsert
 	// behavior).
@@ -97,7 +100,10 @@ func TestReaddedAppPersistsFreshSeries(t *testing.T) {
 	// would on removal.
 	m.IncLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}})
 	m.IncLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}})
-	newStatsFlusher(st, m).flush(context.Background())
+	newStatsFlusher(st, m, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	}).flush(context.Background())
 	m.RemoveApp("alpha")
 
 	// Re-add: a fresh series at count 1.
@@ -105,7 +111,11 @@ func TestReaddedAppPersistsFreshSeries(t *testing.T) {
 	if !strings.Contains(m.Snapshot(), "app_events_matched_total{app=alpha} count=1") {
 		t.Fatalf("re-added alpha must count 1:\n%s", m.Snapshot())
 	}
-	newStatsFlusher(st, m).flush(context.Background())
+	gens, err := st.StatsGenerations()
+	if err != nil {
+		t.Fatalf("StatsGenerations: %v", err)
+	}
+	newStatsFlusher(st, m, gens).flush(context.Background())
 	a, ok := st.AppStats("alpha")
 	if !ok || a.EventsMatchedTotal != 1 {
 		t.Fatalf("alpha persisted = %+v, ok=%v; want events 1", a, ok)
@@ -144,7 +154,10 @@ func TestSweepSkippedOnStateReadError(t *testing.T) {
 	}
 
 	// Must not panic.
-	newStatsFlusher(st, m).flush(context.Background())
+	newStatsFlusher(st, m, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	}).flush(context.Background())
 
 	// Fail-open: BOTH alpha and ghost series survive the failed flush.
 	if fs := m.AppStatsSnapshot(); !metricsStat(fs, "alpha") || !metricsStat(fs, "ghost") {
@@ -161,7 +174,10 @@ func TestSweepSkippedOnStateReadError(t *testing.T) {
 	// Reopen on the same path (Open's schema init is idempotent) and flush; the
 	// ghost/live behavior resumes: ghost (now stale) is swept, alpha survives.
 	st2 := testutil.OpenState(t, dsn)
-	newStatsFlusher(st2, m).flush(context.Background())
+	newStatsFlusher(st2, m, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	}).flush(context.Background())
 
 	if fs := m.AppStatsSnapshot(); !metricsStat(fs, "alpha") {
 		t.Fatalf("alpha must survive the resumed flush:\n%+v", fs)
@@ -205,7 +221,10 @@ func TestSweepSkippedOnCancelledFlushPreservesSeries(t *testing.T) {
 	}
 
 	// The flush must neither panic nor sweep against a nonexistent live set.
-	newStatsFlusher(st, m).flush(ctx)
+	newStatsFlusher(st, m, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	}).flush(ctx)
 
 	// Incomplete read => fail-open: alpha (live) AND ghost (stale) survive
 	// in the registry, even though record persistence under the dead context
@@ -220,7 +239,10 @@ func TestSweepSkippedOnCancelledFlushPreservesSeries(t *testing.T) {
 	// Control: on a healthy flush the sweep really does discard ghost (and
 	// keeps alpha), proving the assertion above would have caught a wrongful
 	// sweep and that the preserved state is sweepable once the read recovers.
-	newStatsFlusher(st, m).flush(context.Background())
+	newStatsFlusher(st, m, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	}).flush(context.Background())
 	if fs := m.AppStatsSnapshot(); !metricsStat(fs, "alpha") || metricsStat(fs, "ghost") {
 		t.Fatalf("recovered flush must sweep ghost and keep alpha:\n%+v", fs)
 	}
@@ -281,7 +303,10 @@ func TestSnapshotStatsAndFuncSnapshotAreInMemoryOnly(t *testing.T) {
 	}
 
 	// A single flush writes the absolute snapshot.
-	newStatsFlusher(st, m).flush(context.Background())
+	newStatsFlusher(st, m, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	}).flush(context.Background())
 	gs, ok := st.Stats()
 	if !ok {
 		t.Fatal("expected stats row after flush")
@@ -323,7 +348,10 @@ func TestStatsLoopFlushesEveryInterval(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		statsLoop(ctx, newStatsFlusher(st, m), 20*time.Millisecond)
+		statsLoop(ctx, newStatsFlusher(st, m, state.StatsGenerations{
+			Global: state.StatsGenerationUnknown,
+			Node:   state.StatsGenerationUnknown,
+		}), 20*time.Millisecond)
 	}()
 
 	// Wait (bounded) for the first flush to persist a stats row while the loop
@@ -383,7 +411,10 @@ func TestFinalStatsFlushPersistsOnShutdown(t *testing.T) {
 	m.IncLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}})
 	m.IncLabels(metrics.MetricFunctionHandlerSuccess, []metrics.Label{{Name: "app", Value: "alpha"}})
 
-	finalStatsFlush(context.Background(), newStatsFlusher(st, m))
+	finalStatsFlush(context.Background(), newStatsFlusher(st, m, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	}))
 
 	gs, ok := st.Stats()
 	if !ok {
@@ -408,8 +439,15 @@ func TestFinalStatsFlushPersistsOnShutdown(t *testing.T) {
 	}
 
 	// Nil-safety: none of these may panic.
-	finalStatsFlush(context.Background(), newStatsFlusher(st, nil))
-	finalStatsFlush(context.Background(), newStatsFlusher(nil, m))
+	gens, err := st.StatsGenerations()
+	if err != nil {
+		t.Fatalf("StatsGenerations: %v", err)
+	}
+	finalStatsFlush(context.Background(), newStatsFlusher(st, nil, gens))
+	finalStatsFlush(context.Background(), newStatsFlusher(nil, m, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	}))
 	finalStatsFlush(context.Background(), nil)
 }
 
@@ -427,13 +465,20 @@ func TestStatsFlushIdempotent(t *testing.T) {
 	m.IncLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}})
 
 	ctx := context.Background()
-	newStatsFlusher(st, m).flush(ctx)
+	newStatsFlusher(st, m, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	}).flush(ctx)
 	first, ok := st.Stats()
 	if !ok {
 		t.Fatal("expected stats row after first snapshot")
 	}
 
-	newStatsFlusher(st, m).flush(ctx)
+	gens, err := st.StatsGenerations()
+	if err != nil {
+		t.Fatalf("StatsGenerations: %v", err)
+	}
+	newStatsFlusher(st, m, gens).flush(ctx)
 	second, ok := st.Stats()
 	if !ok {
 		t.Fatal("expected stats row after second snapshot")
@@ -448,7 +493,7 @@ func TestStatsFlushIdempotent(t *testing.T) {
 	// Bump the registry; a single flush persists the new absolute value.
 	m.Inc(metrics.MetricEventsMatched)
 	m.Inc(metrics.MetricEventsMatched)
-	newStatsFlusher(st, m).flush(ctx)
+	newStatsFlusher(st, m, gens).flush(ctx)
 	gs, ok := st.Stats()
 	if !ok {
 		t.Fatal("expected stats row after bump flush")
@@ -503,6 +548,10 @@ func TestConcurrentIncrementsAndFlushRaceSafe(t *testing.T) {
 		}()
 	}
 
+	gens, err := st.StatsGenerations()
+	if err != nil {
+		t.Fatalf("StatsGenerations: %v", err)
+	}
 	// 2 flush goroutines call flush in a loop until the writers finish.
 	var flushWG sync.WaitGroup
 	flushWG.Add(2)
@@ -514,7 +563,7 @@ func TestConcurrentIncrementsAndFlushRaceSafe(t *testing.T) {
 				case <-stopFlushes:
 					return
 				default:
-					newStatsFlusher(st, m).flush(ctx)
+					newStatsFlusher(st, m, gens).flush(ctx)
 				}
 			}
 		}()
@@ -526,7 +575,7 @@ func TestConcurrentIncrementsAndFlushRaceSafe(t *testing.T) {
 	cancel()
 
 	// A final flush pins the exact totals.
-	newStatsFlusher(st, m).flush(context.Background())
+	newStatsFlusher(st, m, gens).flush(context.Background())
 
 	const total = writers * iters // 1600
 	gs, ok := st.Stats()
@@ -567,7 +616,10 @@ func TestStatsFlusherResetPersistsZero(t *testing.T) {
 	m := metrics.New()
 	m.Add(metrics.MetricEventsMatched, 100)
 	m.IncLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}})
-	f := newStatsFlusher(st, m)
+	f := newStatsFlusher(st, m, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	})
 
 	f.flush(context.Background())
 	if gs, _ := st.Stats(); gs.EventsMatchedTotal != 100 {
@@ -622,7 +674,10 @@ func TestStatsFlusherResetRaceNoResurrection(t *testing.T) {
 	m := metrics.New()
 	m.Add(metrics.MetricEventsMatched, 1000)
 	m.AddLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}}, 10)
-	f := newStatsFlusher(st, m)
+	f := newStatsFlusher(st, m, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	})
 
 	// A flush loop racing the reset.
 	stop := make(chan struct{})

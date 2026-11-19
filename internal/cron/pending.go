@@ -189,7 +189,9 @@ func (s *Scheduler) wakePending() {
 // The write uses a cancellation-independent context, so a tick cut short by
 // shutdown still records its intent (or, when the store also rejects it, is
 // retained/degraded) rather than silently vanishing.
-func (s *Scheduler) persistBeforePublish(ctx context.Context, o schedule.Occurrence, log *slog.Logger, span trace.Span) (durable, ok bool) {
+func (s *Scheduler) persistBeforePublish(
+	ctx context.Context, o schedule.Occurrence, log *slog.Logger, span trace.Span,
+) (durable, ok bool) {
 	ob := s.currentOutbox()
 	if ob == nil {
 		return false, true
@@ -207,7 +209,10 @@ func (s *Scheduler) persistBeforePublish(ctx context.Context, o schedule.Occurre
 		NextAttempt: s.now(),
 	})
 	if err != nil {
-		log.Warn("Schedule: persist occurrence intent failed; not publishing; retaining for durable flush", "reason", err)
+		log.Warn(
+			"Schedule: persist occurrence intent failed; not publishing; retaining for durable flush",
+			"reason", err,
+		)
 		s.retainUnsaved(ctx, o, log)
 		s.markDegraded(err)
 		span.RecordError(err)
@@ -620,7 +625,9 @@ func (s *Scheduler) RunPendingOnce(ctx context.Context) (int, error) {
 // pending work). It is logged for an operator and rescheduled under the same
 // bounded backoff, so the durable row is retained and repairable while it does
 // not spin.
-func (s *Scheduler) retryPending(ctx context.Context, p state.PendingOccurrence, log *slog.Logger) {
+func (s *Scheduler) retryPending(
+	ctx context.Context, p state.PendingOccurrence, log *slog.Logger,
+) {
 	// Expiry guard at the claim-to-publish boundary: do not begin an attempt
 	// once now >= expires_at_ms, and never reschedule an expired row. Removing
 	// it here covers the window between the store's claim and this call. It is
@@ -644,16 +651,22 @@ func (s *Scheduler) retryPending(ctx context.Context, p state.PendingOccurrence,
 		return
 	}
 
-	o := schedule.Occurrence{App: p.App, Schedule: p.Schedule, Handler: p.Handler, ScheduledAt: p.ScheduledAt}
+	o := schedule.Occurrence{
+		App: p.App, Schedule: p.Schedule, Handler: p.Handler, ScheduledAt: p.ScheduledAt,
+	}
 
 	published, err := s.pub.PublishOccurrence(ctx, o)
 	if err == nil {
 		if published {
 			log.Info("Schedule: pending occurrence published",
-				"app", o.App, "schedule", o.Schedule, "handler", o.Handler, "occurrence_id", o.ID(), "durable_attempts", p.Attempts+1)
+				"app", o.App, "schedule", o.Schedule, "handler", o.Handler,
+				"occurrence_id", o.ID(), "durable_attempts", p.Attempts+1,
+			)
 		} else {
 			log.Debug("Schedule: pending occurrence resolved as duplicate",
-				"app", o.App, "schedule", o.Schedule, "handler", o.Handler, "occurrence_id", o.ID(), "durable_attempts", p.Attempts+1)
+				"app", o.App, "schedule", o.Schedule, "handler", o.Handler,
+				"occurrence_id", o.ID(), "durable_attempts", p.Attempts+1,
+			)
 		}
 		// Resolve with a cancellation-independent context: the publication
 		// succeeded, so the row must be removable even if the lifecycle is

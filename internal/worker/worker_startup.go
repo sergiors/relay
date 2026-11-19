@@ -46,6 +46,29 @@ type startupAppSet struct {
 	publicationFence func(context.Context, func()) error
 }
 
+// startupState is the narrow state view the startup app phase needs: the
+// optimistic parse observation, the discovery/prune writes, and the atomic stats
+// restore snapshot. *state.State is the production implementation; a unit test
+// can supply a fake so discovery and stats restore run without PostgreSQL.
+type startupState interface {
+	ownStatsSnapshotter
+	ObserveApp(ctx context.Context, name string) (state.AppObservation, error)
+	RebuildFromApps(ctx context.Context, discovered []state.DiscoveredApp) error
+	PruneRemoved(ctx context.Context, dir string) error
+	RecordDiscoveredWithSourceGeneration(
+		ctx context.Context,
+		fn app.App,
+		fingerprint string,
+		sourceGeneration int64,
+	) (state.FencingToken, error)
+	RecordInvalidDesiredWithSource(
+		ctx context.Context,
+		name, sourceIdentity string,
+		err2 error,
+		observed *state.AppObservation,
+	) (state.InvalidDesiredResult, error)
+}
+
 // startupParseGate makes the startup loader consult persisted state around each
 // template read. Observe snapshots the row BEFORE the read so a later invalid
 // write can be rejected if another worker advances the app; SkipParse confirms
@@ -56,7 +79,7 @@ type startupAppSet struct {
 // issue rather than write without concurrency authority.
 type startupParseGate struct {
 	ctx      context.Context
-	st       *state.State
+	st       startupState
 	logger   *slog.Logger
 	observed map[string]state.AppObservation
 }
@@ -101,9 +124,11 @@ func (g *startupParseGate) SkipParse(name, identity string) (bool, error) {
 	return true, fmt.Errorf("app %q: invalid template", name)
 }
 
-// loadStartupApps loads /apps, resolves each app's fingerprint and source
-// selection exactly once, persists the startup discovery view, and restores
-// this worker's persisted stats into the fresh registry.
+// loadStartupApps loads the app root (the worker passes app.Dir), resolves each
+// app's fingerprint and source selection exactly once, persists the startup
+// discovery view, and restores this worker's persisted stats into the fresh
+// registry. The root is injected so discovery is unit-testable without the
+// production /apps path.
 //
 // The startup records carry both the fingerprint and the source selection the
 // fingerprint was computed from, so no later stage re-reads /apps or recomputes
@@ -118,26 +143,17 @@ func (g *startupParseGate) SkipParse(name, identity string) (bool, error) {
 // fingerprint or discovery work happens against a broken state database; the
 // state DB is a persisted local view, never the source of truth for matching,
 // builds, or reconciliation.
+//
+// sourceGeneration is stamped on this startup's desired-state writes;
+// authoritative filters the loaded set to the exact fingerprints materialized
+// for that generation, so a local /apps edit can never be prepared or published
+// as a desired generation on a coordinator-active worker. A nil map with
+// authoritative false preserves the standalone behavior.
 func loadStartupApps(
 	startupCtx context.Context,
 	logger *slog.Logger,
-	st *state.State,
-	metricsInstance *metrics.Registry,
-) (startupAppSet, error) {
-	return loadStartupAppsWithAuthorization(startupCtx, logger, st, metricsInstance, 0, nil, nil, false)
-}
-
-// loadStartupAppsWithAuthorization is loadStartupApps plus the coordinated
-// deployment authorization. sourceGeneration is stamped on this startup's
-// desired-state writes; authoritative filters the loaded set to the exact
-// fingerprints materialized for that generation, so a local /apps edit can
-// never be prepared or published as a desired generation on a coordinator-active
-// worker.
-// A nil map with authoritative false preserves the standalone behavior.
-func loadStartupAppsWithAuthorization(
-	startupCtx context.Context,
-	logger *slog.Logger,
-	st *state.State,
+	st startupState,
+	appsRoot string,
 	metricsInstance *metrics.Registry,
 	sourceGeneration int64,
 	authorized map[string]string,
@@ -145,7 +161,7 @@ func loadStartupAppsWithAuthorization(
 	authoritative bool,
 ) (startupAppSet, error) {
 	_, loaderSpan := tracing.Start(startupCtx, "apps.load")
-	loader := app.NewLoader(app.Dir, logger)
+	loader := app.NewLoader(appsRoot, logger)
 	observed := make(map[string]state.AppObservation)
 	var gate app.TemplateParseGate
 	if st != nil {
@@ -170,7 +186,7 @@ func loadStartupAppsWithAuthorization(
 	logger.Info("Loaded apps",
 		"count", len(apps),
 		"invalid", len(loadIssues),
-		"root", app.Dir,
+		"root", appsRoot,
 	)
 
 	// Compute every loaded app's content fingerprint — and, for a
@@ -211,8 +227,8 @@ func loadStartupAppsWithAuthorization(
 	// prepare it without its exact fencing token. Cancellation stops startup
 	// promptly and follows the normal teardown path.
 	_, discoverySpan := tracing.Start(startupCtx, "state.discovery")
-	fencingTokens, rerr := persistStartupDiscoveryWithGeneration(
-		startupCtx, st, app.Dir, discovered, loadIssues, observed, logger, sourceGeneration,
+	fencingTokens, rerr := persistStartupDiscovery(
+		startupCtx, st, appsRoot, discovered, loadIssues, observed, logger, sourceGeneration,
 	)
 	if rerr != nil {
 		discoverySpan.RecordError(rerr)
@@ -488,25 +504,12 @@ func startupSeedImageSelections(prepared []*runner.PreparedApp) map[string]strin
 // are REQUIRED for an invalid write. A missing snapshot (a failed state read) is
 // never interpreted as "the row is absent": the issue write is skipped, so a
 // failed read cannot bypass the optimistic concurrency guard.
+//
+// sourceGeneration is the coordinated deployment generation stamped on every
+// valid app's desired snapshot; callers outside coordinated deployment pass 0.
 func persistStartupDiscovery(
 	ctx context.Context,
-	st *state.State,
-	dir string,
-	discovered []state.DiscoveredApp,
-	issues []app.LoadIssue,
-	observed map[string]state.AppObservation,
-	logger *slog.Logger,
-) (map[string]state.FencingToken, error) {
-	return persistStartupDiscoveryWithGeneration(
-		ctx, st, dir, discovered, issues, observed, logger, 0)
-}
-
-// persistStartupDiscoveryWithGeneration is persistStartupDiscovery with the
-// coordinated deployment generation stamped on every valid app's desired
-// snapshot. Callers without coordinated participation use the zero-generation wrapper.
-func persistStartupDiscoveryWithGeneration(
-	ctx context.Context,
-	st *state.State,
+	st startupState,
 	dir string,
 	discovered []state.DiscoveredApp,
 	issues []app.LoadIssue,
@@ -627,7 +630,7 @@ func persistStartupDiscoveryWithGeneration(
 // rejected rather than overwriting another worker's newer state.
 func recordStartupIssue(
 	ctx context.Context,
-	st *state.State,
+	st startupState,
 	issue app.LoadIssue,
 	observed map[string]state.AppObservation,
 ) (state.InvalidDesiredResult, bool, error) {

@@ -72,7 +72,7 @@ func TestPersistStartupDiscoveryIgnoresStagingDir(t *testing.T) {
 		{Name: ".sync-abc", Err: errors.New(`function ".sync-abc": read template: no such file`)},
 	}
 
-	if _, err := persistStartupDiscovery(context.Background(), st, root, discovered, issues, observeStartupIssues(t, st, issues), discardLogger()); err != nil {
+	if _, err := persistStartupDiscovery(context.Background(), st, root, discovered, issues, observeStartupIssues(t, st, issues), discardLogger(), 0); err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
 
@@ -104,7 +104,7 @@ func TestPersistStartupDiscoveryTemplateLessDirLeavesNoState(t *testing.T) {
 		t.Fatalf("write unrelated file: %v", err)
 	}
 
-	fencingTokens, err := persistStartupDiscovery(context.Background(), st, root, nil, nil, nil, discardLogger())
+	fencingTokens, err := persistStartupDiscovery(context.Background(), st, root, nil, nil, nil, discardLogger(), 0)
 	if err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestPersistStartupDiscoveryPrunesTemplateLessKnownApp(t *testing.T) {
 		t.Fatalf("mkdir draft: %v", err)
 	}
 
-	fencingTokens, err := persistStartupDiscovery(context.Background(), st, root, nil, nil, nil, discardLogger())
+	fencingTokens, err := persistStartupDiscovery(context.Background(), st, root, nil, nil, nil, discardLogger(), 0)
 	if err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestPersistStartupDiscoveryRecordsInvalidPresent(t *testing.T) {
 		{Name: "brand-new-bad", Err: errors.New(`function "brand-new-bad": unknown runtime "python9.9"`)},
 	}
 
-	if _, err := persistStartupDiscovery(context.Background(), st, root, discovered, issues, observeStartupIssues(t, st, issues), discardLogger()); err != nil {
+	if _, err := persistStartupDiscovery(context.Background(), st, root, discovered, issues, observeStartupIssues(t, st, issues), discardLogger(), 0); err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
 
@@ -263,7 +263,7 @@ func TestPersistStartupDiscoveryInvalidAbsentFromRegistrySet(t *testing.T) {
 	st := openTempState(t)
 	startup := selectAndFingerprintApps(fns, discardLogger())
 	discovered := discoveredFromStartup(startup)
-	if _, err := persistStartupDiscovery(context.Background(), st, root, discovered, issues, observeStartupIssues(t, st, issues), discardLogger()); err != nil {
+	if _, err := persistStartupDiscovery(context.Background(), st, root, discovered, issues, observeStartupIssues(t, st, issues), discardLogger(), 0); err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
 
@@ -299,7 +299,7 @@ func TestPersistStartupDiscoveryInvalidImageRetainedInKeepSet(t *testing.T) {
 	recordSuccess(t, st, invalid, "relay-app-now-invalid:deadbeef", "fp", time.Time{}.Add(time.Hour))
 
 	issues := []app.LoadIssue{{Name: "now-invalid", Err: errors.New("function \"now-invalid\": invalid template")}}
-	if _, err := persistStartupDiscovery(context.Background(), st, root, nil, issues, observeStartupIssues(t, st, issues), discardLogger()); err != nil {
+	if _, err := persistStartupDiscovery(context.Background(), st, root, nil, issues, observeStartupIssues(t, st, issues), discardLogger(), 0); err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
 
@@ -332,7 +332,7 @@ func TestPersistStartupDiscoveryPrunesRemovedNotInvalid(t *testing.T) {
 	}
 
 	issues := []app.LoadIssue{{Name: "present", Err: errors.New("present invalid")}}
-	if _, err := persistStartupDiscovery(context.Background(), st, root, nil, issues, observeStartupIssues(t, st, issues), discardLogger()); err != nil {
+	if _, err := persistStartupDiscovery(context.Background(), st, root, nil, issues, observeStartupIssues(t, st, issues), discardLogger(), 0); err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
 
@@ -356,7 +356,7 @@ func TestPersistStartupDiscoveryPruneDropsVanishedInvalid(t *testing.T) {
 	// The loader reported "vanished" as present-invalid, but by the time the
 	// state phase runs its directory is gone (no directory is created here).
 	issues := []app.LoadIssue{{Name: "vanished", Err: errors.New("transient")}}
-	if _, err := persistStartupDiscovery(context.Background(), st, root, nil, issues, observeStartupIssues(t, st, issues), discardLogger()); err != nil {
+	if _, err := persistStartupDiscovery(context.Background(), st, root, nil, issues, observeStartupIssues(t, st, issues), discardLogger(), 0); err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
 

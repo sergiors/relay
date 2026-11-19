@@ -36,7 +36,10 @@ func TestStatsPersistWithMetricsDisabled(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		statsLoop(ctx, newStatsFlusher(st, reg), time.Hour)
+		statsLoop(ctx, newStatsFlusher(st, reg, state.StatsGenerations{
+			Global: state.StatsGenerationUnknown,
+			Node:   state.StatsGenerationUnknown,
+		}), time.Hour)
 	}()
 
 	waitForStatsRow(t, "statsLoop to persist with metrics disabled", func() bool {
@@ -100,7 +103,10 @@ func TestMetricsEnabledExposesSingleAccountingRegistry(t *testing.T) {
 	}
 
 	// The persisted snapshot reads the same registry value: one event, not two.
-	newStatsFlusher(st, reg).flush(context.Background())
+	newStatsFlusher(st, reg, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	}).flush(context.Background())
 	gs, ok := st.Stats()
 	if !ok || gs.EventsMatchedTotal != 1 {
 		t.Fatalf("persisted events = %+v, ok=%v; want exactly 1 (single accounting path)", gs, ok)
@@ -122,7 +128,10 @@ func TestStatsResetWithMetricsDisabled(t *testing.T) {
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
-	f := newStatsFlusher(st, reg)
+	f := newStatsFlusher(st, reg, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	})
 
 	reg.Add(metrics.MetricEventsMatched, 100)
 	reg.AddLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}}, 4)
@@ -174,7 +183,10 @@ func TestFinalStatsFlushWithMetricsDisabled(t *testing.T) {
 	reg.Add(metrics.MetricEventsMatched, 42)
 	reg.Add(metrics.MetricHandlerSuccess, 30)
 
-	finalStatsFlush(context.Background(), newStatsFlusher(st, reg))
+	finalStatsFlush(context.Background(), newStatsFlusher(st, reg, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	}))
 
 	gs, ok := st.Stats()
 	if !ok {
@@ -200,7 +212,7 @@ func TestStatsRestoreWithMetricsDisabled(t *testing.T) {
 	if srv != nil {
 		t.Fatal("precondition: metrics server must be nil when disabled")
 	}
-	restorePersistedStats(reg, st)
+	snapshot := restorePersistedStats(reg, st)
 
 	if got := reg.Counter(metrics.MetricEventsMatched); got != 100 {
 		t.Fatalf("restored global events = %d, want 100", got)
@@ -210,7 +222,7 @@ func TestStatsRestoreWithMetricsDisabled(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		statsLoop(ctx, newStatsFlusher(st, reg), time.Hour)
+		statsLoop(ctx, newStatsFlusher(st, reg, snapshot.Generations), time.Hour)
 	}()
 	waitForStatsRow(t, "restored totals to be written back", func() bool {
 		gs, ok := st.Stats()

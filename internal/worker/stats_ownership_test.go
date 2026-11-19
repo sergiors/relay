@@ -30,7 +30,10 @@ func TestStatsFlusherRebasesAfterRemoteReset(t *testing.T) {
 	m := metrics.New()
 	m.Add(metrics.MetricEventsMatched, 100)
 
-	f := newStatsFlusher(st, m)
+	f := newStatsFlusher(st, m, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	})
 	f.flush(ctx)
 	if s, ok := st.Stats(); !ok || s.EventsMatchedTotal != 100 {
 		t.Fatalf("after first flush = %+v ok=%v, want 100", s, ok)
@@ -77,7 +80,10 @@ func TestStatsFlusherStopsOnOwnershipLost(t *testing.T) {
 	stale := testutil.OpenState(t, dsn, state.Options{NodeID: owner, Instance: "inst-1"})
 	mStale := metrics.New()
 	mStale.Add(metrics.MetricEventsMatched, 5)
-	fStale := newStatsFlusher(stale, mStale)
+	fStale := newStatsFlusher(stale, mStale, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	})
 	fStale.flush(ctx)
 
 	// A new process incarnation of the same node ID claims the row.
@@ -118,7 +124,10 @@ func TestStatsFlusherResetAdoptsEpoch(t *testing.T) {
 	m := metrics.New()
 	m.Add(metrics.MetricEventsMatched, 100)
 
-	f := newStatsFlusher(st, m)
+	f := newStatsFlusher(st, m, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	})
 	f.flush(ctx)
 	if _, ok := st.Stats(); !ok {
 		t.Fatal("expected a stats row after the first flush")

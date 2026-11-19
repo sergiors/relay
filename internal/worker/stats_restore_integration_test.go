@@ -71,7 +71,10 @@ func TestWorkerFlushReopenRestoreRoundTrip(t *testing.T) {
 	m1.IncLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}})
 	m1.AddLabels(metrics.MetricRuntimeContainerAcquires, []metrics.Label{{Name: "app", Value: "alpha"}, {Name: "outcome", Value: metrics.RuntimeOutcomeWarm}}, 7)
 	m1.SetAppTimestamp("alpha", metrics.AppTimestampExecution, exec.Unix())
-	newStatsFlusher(c1, m1).flush(context.Background())
+	newStatsFlusher(c1, m1, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	}).flush(context.Background())
 	if err := c1.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -80,7 +83,7 @@ func TestWorkerFlushReopenRestoreRoundTrip(t *testing.T) {
 	c2 := testutil.OpenState(t, dsn)
 
 	m2 := metrics.New()
-	restorePersistedStats(m2, c2)
+	snapshot := restorePersistedStats(m2, c2)
 	if got := m2.Counter(metrics.MetricEventsMatched); got != 100 {
 		t.Fatalf("restored global events = %d, want 100", got)
 	}
@@ -93,7 +96,7 @@ func TestWorkerFlushReopenRestoreRoundTrip(t *testing.T) {
 	}
 
 	// The first post-restart flush must write the same totals back.
-	newStatsFlusher(c2, m2).flush(context.Background())
+	newStatsFlusher(c2, m2, snapshot.Generations).flush(context.Background())
 	gs, ok := c2.Stats()
 	if !ok || gs.EventsMatchedTotal != 100 {
 		t.Fatalf("global after restart flush = %+v, ok=%v; want events 100", gs, ok)
@@ -182,7 +185,7 @@ func TestRestorePersistedStatsSeedsPoolCounters(t *testing.T) {
 		DiscardedTotal:     2,
 	})
 
-	restorePersistedStats(m, st)
+	snapshot := restorePersistedStats(m, st)
 	fs := m.AppStatsSnapshot()
 	a := byApp(fs, "alpha")
 	if a.WarmAcquiresTotal != 7 || a.ColdStartsTotal != 3 || a.DiscardedTotal != 2 {
@@ -193,7 +196,7 @@ func TestRestorePersistedStatsSeedsPoolCounters(t *testing.T) {
 	m.IncLabels(metrics.MetricRuntimeContainerAcquires, []metrics.Label{{Name: "app", Value: "alpha"}, {Name: "outcome", Value: metrics.RuntimeOutcomeWarm}})
 	m.IncLabels(metrics.MetricRuntimeContainerDiscards, []metrics.Label{{Name: "app", Value: "alpha"}, {Name: "reason", Value: "idle_timeout"}})
 
-	newStatsFlusher(st, m).flush(context.Background())
+	newStatsFlusher(st, m, snapshot.Generations).flush(context.Background())
 	got, ok := st.AppStats("alpha")
 	if !ok {
 		t.Fatal("expected alpha function stats after flush")
@@ -223,7 +226,10 @@ func TestFlushPersistsCountersNotLiveGauges(t *testing.T) {
 	m.SetGaugeLabels(metrics.MetricRuntimeContainers, []metrics.Label{{Name: "app", Value: "alpha"}, {Name: "state", Value: metrics.RuntimeStateIdle}}, 4)
 	m.SetGaugeLabels(metrics.MetricRuntimePoolCapacity, []metrics.Label{{Name: "app", Value: "alpha"}}, 5)
 
-	newStatsFlusher(st, m).flush(context.Background())
+	newStatsFlusher(st, m, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	}).flush(context.Background())
 
 	got, ok := st.AppStats("alpha")
 	if !ok {
@@ -271,7 +277,7 @@ func TestStatsLoopFirstSnapshotPreservesPersistedCounters(t *testing.T) {
 
 	// Fresh registry seeded from persisted values, as the worker does at startup.
 	m := metrics.New()
-	restorePersistedStats(m, st)
+	snapshot := restorePersistedStats(m, st)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -279,7 +285,7 @@ func TestStatsLoopFirstSnapshotPreservesPersistedCounters(t *testing.T) {
 		defer close(done)
 		// time.Hour interval so no tick fires during the test; only the
 		// immediate first snapshot runs.
-		statsLoop(ctx, newStatsFlusher(st, m), time.Hour)
+		statsLoop(ctx, newStatsFlusher(st, m, snapshot.Generations), time.Hour)
 	}()
 
 	// Wait (bounded) for the goroutine to run the immediate first snapshot: the
@@ -359,7 +365,7 @@ func TestStartupSweepPrunesBeforeSeeding(t *testing.T) {
 		t.Errorf("state write error: %v", err)
 	}
 	m := metrics.New()
-	restorePersistedStats(m, st)
+	snapshot := restorePersistedStats(m, st)
 
 	// AllAppStats now returns only "kept"; "stale" is absent.
 	all := st.AllAppStats()
@@ -386,7 +392,7 @@ func TestStartupSweepPrunesBeforeSeeding(t *testing.T) {
 	// Run a flush (exactly what statsLoop does immediately) and confirm
 	// the persisted app_stats still has exactly one row and the global
 	// counters were written from the seeded registry.
-	newStatsFlusher(st, m).flush(context.Background())
+	newStatsFlusher(st, m, snapshot.Generations).flush(context.Background())
 	all = st.AllAppStats()
 	if len(all) != 1 {
 		t.Fatalf("AllAppStats after snapshot len = %d, want 1: %+v", len(all), all)
@@ -426,7 +432,7 @@ func TestRestoreSeedsAndFlushesTimestamps(t *testing.T) {
 
 	// Restore: the registry's unix-seconds timestamps must round-trip.
 	m := metrics.New()
-	restorePersistedStats(m, st)
+	snapshot := restorePersistedStats(m, st)
 	fs := m.AppStatsSnapshot()
 	if len(fs) != 1 {
 		t.Fatalf("snapshot len = %d, want 1: %+v", len(fs), fs)
@@ -440,7 +446,7 @@ func TestRestoreSeedsAndFlushesTimestamps(t *testing.T) {
 	// (seeded) timestamps are republished untouched.
 	m.IncLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}})
 	m.IncLabels(metrics.MetricFunctionHandlerSuccess, []metrics.Label{{Name: "app", Value: "alpha"}})
-	newStatsFlusher(st, m).flush(context.Background())
+	newStatsFlusher(st, m, snapshot.Generations).flush(context.Background())
 	got, ok := st.AppStats("alpha")
 	if !ok {
 		t.Fatal("expected alpha stats after flush")
@@ -455,7 +461,11 @@ func TestRestoreSeedsAndFlushesTimestamps(t *testing.T) {
 	// clobbers them).
 	fresh := metrics.New()
 	fresh.IncLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}})
-	newStatsFlusher(st, fresh).flush(context.Background())
+	gens, err := st.StatsGenerations()
+	if err != nil {
+		t.Fatalf("StatsGenerations: %v", err)
+	}
+	newStatsFlusher(st, fresh, gens).flush(context.Background())
 	got, ok = st.AppStats("alpha")
 	if !ok {
 		t.Fatal("expected alpha stats after fresh-registry flush")
@@ -521,7 +531,7 @@ func TestRestorePairsGenerationsWithRestoredTotals(t *testing.T) {
 		t.Fatalf("seeded registry events = %d, want 100", got)
 	}
 
-	f := newStatsFlusherWithGenerations(st, m, snapshot.Generations)
+	f := newStatsFlusher(st, m, snapshot.Generations)
 	f.flush(ctx)
 	if s, ok := st.Stats(); !ok || s.EventsMatchedTotal != 100 {
 		t.Fatalf("first post-restore flush = %+v ok=%v, want 100 (no spurious rebase)", s, ok)
@@ -547,7 +557,7 @@ func TestResetDuringStartupFencesFirstFlush(t *testing.T) {
 		t.Fatalf("reset during startup: %v", err)
 	}
 
-	f := newStatsFlusherWithGenerations(st, m, snapshot.Generations)
+	f := newStatsFlusher(st, m, snapshot.Generations)
 	f.flush(ctx)
 	if s, ok := st.Stats(); !ok || s.EventsMatchedTotal != 0 {
 		t.Fatalf("first flush after a startup reset = %+v ok=%v, want 0 (fenced and rebased)", s, ok)
@@ -593,7 +603,7 @@ func TestRestoreAfterResetStartsFromZero(t *testing.T) {
 		t.Fatalf("seeded registry events = %d, want 0", got)
 	}
 
-	f := newStatsFlusherWithGenerations(st, m, snapshot.Generations)
+	f := newStatsFlusher(st, m, snapshot.Generations)
 	f.flush(ctx)
 	if s, ok := st.Stats(); !ok || s.EventsMatchedTotal != 0 {
 		t.Fatalf("first flush = %+v ok=%v, want 0", s, ok)

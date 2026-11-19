@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"relay/internal/observability/metrics"
+	"relay/internal/state"
 )
 
 // TestStatsLoopNilStateExitsOnCancel ensures the snapshot loop is nil-safe on
@@ -15,7 +16,10 @@ func TestStatsLoopNilStateExitsOnCancel(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		statsLoop(ctx, newStatsFlusher(nil, metrics.New()), time.Hour)
+		statsLoop(ctx, newStatsFlusher(nil, metrics.New(), state.StatsGenerations{
+			Global: state.StatsGenerationUnknown,
+			Node:   state.StatsGenerationUnknown,
+		}), time.Hour)
 	}()
 	cancel()
 	select {

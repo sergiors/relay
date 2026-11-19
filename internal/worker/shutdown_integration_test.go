@@ -94,6 +94,9 @@ type workerEnv struct {
 	monitorDone <-chan struct{}
 	metricsDone chan error
 	statsDone   chan struct{}
+	// statsRestore is the startup restore snapshot, retained so the final
+	// flush pairs with the same generations production passes at startup.
+	statsRestore state.OwnStatsSnapshot
 }
 
 // startWorker replicates the ordering of Run() (internal/worker/worker.go) with
@@ -226,7 +229,7 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 		}
 		fencingTokens[fn.Name] = fencingToken
 	}
-	restorePersistedStats(m, st)
+	statsRestore := restorePersistedStats(m, st)
 
 	manager, err := runtime.NewManager(logger, m, cfg.consumerName)
 	if err != nil {
@@ -314,7 +317,8 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	statsDone := make(chan struct{})
 	go func() {
 		defer close(statsDone)
-		statsLoop(ctx, newStatsFlusher(st, m), statsFlushInterval)
+		statsLoop(ctx, newStatsFlusher(st, m, statsRestore.Generations),
+			statsFlushInterval)
 	}()
 
 	runWorker := runner.NewWithMetrics(prepared, logger, m)
@@ -357,7 +361,7 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 		stream: cfg.stream, group: cfg.group, consumerName: cfg.consumerName,
 		nodeID: cfg.consumerName, stateDSN: cfg.stateDSN,
 		ready: ready, loss: loss, monitorDone: monitorDone,
-		metricsDone: metricsDone, statsDone: statsDone,
+		metricsDone: metricsDone, statsDone: statsDone, statsRestore: statsRestore,
 	}
 }
 
@@ -585,7 +589,8 @@ export async function slow(event, context) {
 	// the same way and assert the flush completes within it with a stats row.
 	flushStart := time.Now()
 	flushCtx, flushCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	finalStatsFlush(flushCtx, newStatsFlusher(env.st, env.m))
+	finalStatsFlush(flushCtx,
+		newStatsFlusher(env.st, env.m, env.statsRestore.Generations))
 	flushCancel()
 	flushElapsed := time.Since(flushStart)
 	if flushElapsed > 2*time.Second {

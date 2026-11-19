@@ -73,7 +73,9 @@ func parseSchedule(expr string, loc *time.Location) (robfigcron.Schedule, error)
 // the last occurrence at or before now. The search is bounded (about 17
 // iterations for a 24h horizon) and never iterates the occurrences in the
 // window.
-func latestOccurrence(sch robfigcron.Schedule, now time.Time, horizon time.Duration) (time.Time, bool) {
+func latestOccurrence(
+	sch robfigcron.Schedule, now time.Time, horizon time.Duration,
+) (time.Time, bool) {
 	now = now.UTC()
 	loSec := now.Add(-horizon).Unix()
 	hiSec := now.Unix()
@@ -154,7 +156,9 @@ func latestOccurrence(sch robfigcron.Schedule, now time.Time, horizon time.Durat
 // Metrics: the Publisher already counts each failed attempt as a real publish
 // failure and each duplicate result as a duplicate. This loop adds the
 // bounded-policy counters (retries performed, and exhaustion of the budget).
-func (s *Scheduler) publishOccurrence(ctx context.Context, o schedule.Occurrence, catchUp bool) (published, resolved bool) {
+func (s *Scheduler) publishOccurrence(
+	ctx context.Context, o schedule.Occurrence, catchUp bool,
+) (published, resolved bool) {
 	return s.publish(ctx, o, catchUp, true)
 }
 
@@ -163,10 +167,14 @@ func (s *Scheduler) publishOccurrence(ctx context.Context, o schedule.Occurrence
 // explicit recovery catch-up passes false so it can publish schedule time that
 // passed while the scheduler was paused, BEFORE markRunning re-enables live
 // ticks. The atomic pause gate is read without the scheduler lock.
-func (s *Scheduler) publish(ctx context.Context, o schedule.Occurrence, catchUp, gated bool) (published, resolved bool) {
+func (s *Scheduler) publish(
+	ctx context.Context, o schedule.Occurrence, catchUp, gated bool,
+) (published, resolved bool) {
 	if gated && s.paused.Load() {
 		s.log.Debug("Schedule: publication skipped; scheduler not running",
-			"app", o.App, "schedule", o.Schedule, "handler", o.Handler, "catchup", catchUp)
+			"app", o.App, "schedule", o.Schedule, "handler", o.Handler,
+			"catchup", catchUp,
+		)
 		return false, false
 	}
 	ctx, span := tracing.Start(ctx, "schedule.publish",
@@ -246,7 +254,10 @@ func (s *Scheduler) publish(ctx context.Context, o schedule.Occurrence, catchUp,
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
 			span.SetAttributes(attribute.String("relay.outcome", "exhausted"))
-			log.Warn("Schedule: publish retries exhausted", "attempts", attempt+1, "catchup", catchUp, "reason", err)
+			log.Warn(
+				"Schedule: publish retries exhausted", "attempts", attempt+1,
+				"catchup", catchUp, "reason", err,
+			)
 			// The bounded in-memory budget is spent; the durable row written by
 			// the intent-first persist now carries the occurrence to the retry
 			// worker, which is woken here so it does not wait out its backoff. A

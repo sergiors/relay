@@ -113,7 +113,7 @@ func TestStartupParseGateSkipsPersistedInvalidIdentity(t *testing.T) {
 	}
 
 	tokens, err := persistStartupDiscovery(
-		context.Background(), st, root, nil, issues, gate.observed, logger)
+		context.Background(), st, root, nil, issues, gate.observed, logger, 0)
 	if err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestStartupParseGateReparsesChangedInvalidIdentity(t *testing.T) {
 	}
 
 	tokens, err := persistStartupDiscovery(
-		context.Background(), st, root, nil, issues, gate.observed, logger)
+		context.Background(), st, root, nil, issues, gate.observed, logger, 0)
 	if err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestStartupParseGateReparsesChangedInvalidIdentity(t *testing.T) {
 	}
 	discovered := []state.DiscoveredApp{{App: apps[0], Fingerprint: "fp-valid"}}
 	if _, err := persistStartupDiscovery(
-		context.Background(), st, root, discovered, nil, gate.observed, logger); err != nil {
+		context.Background(), st, root, discovered, nil, gate.observed, logger, 0); err != nil {
 		t.Fatalf("persistStartupDiscovery(valid): %v", err)
 	}
 	recovered, _ := st.GetApp("broken")
@@ -298,7 +298,7 @@ func TestStartupParseGateStaleObservationDoesNotOverwriteCorrection(t *testing.T
 	}
 
 	tokens, err := persistStartupDiscovery(
-		context.Background(), older, root, nil, issues, inner.observed, logger)
+		context.Background(), older, root, nil, issues, inner.observed, logger, 0)
 	if err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
@@ -408,7 +408,7 @@ func TestStartupParseGateRecognizesIdentityAcrossRestart(t *testing.T) {
 	}
 
 	tokens, err := persistStartupDiscovery(
-		context.Background(), restarted, root, nil, issues, gate.observed, logger)
+		context.Background(), restarted, root, nil, issues, gate.observed, logger, 0)
 	if err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}

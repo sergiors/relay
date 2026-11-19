@@ -241,7 +241,9 @@ func (c *Coordinator) ObserveStartup(ctx context.Context) (Snapshot, error) {
 	}
 	if !found {
 		if previous.Error == nil && c.cfg.Logger != nil {
-			c.cfg.Logger.Warn("Deployment: no coordinated revision published; serving the last materialized apps")
+			c.cfg.Logger.Warn(
+				"Deployment: no coordinated revision published; serving the last materialized apps",
+			)
 		}
 		return previous, nil
 	}
@@ -729,11 +731,17 @@ func (c *Coordinator) materialize(
 func deploymentSourceMismatch(desired state.DeploymentDesired, local git.Config) string {
 	switch {
 	case !strings.EqualFold(strings.TrimSpace(desired.Repository), strings.TrimSpace(local.Repository)):
-		return fmt.Sprintf("repository is %q locally, %q in the shared revision", local.Repository, desired.Repository)
+		return fmt.Sprintf(
+			"repository is %q locally, %q in the shared revision", local.Repository, desired.Repository,
+		)
 	case strings.TrimSpace(desired.Ref) != strings.TrimSpace(local.Ref):
-		return fmt.Sprintf("ref is %q locally, %q in the shared revision", local.Ref, desired.Ref)
+		return fmt.Sprintf(
+			"ref is %q locally, %q in the shared revision", local.Ref, desired.Ref,
+		)
 	case strings.TrimSpace(desired.Path) != strings.TrimSpace(local.Path):
-		return fmt.Sprintf("path is %q locally, %q in the shared revision", local.Path, desired.Path)
+		return fmt.Sprintf(
+			"path is %q locally, %q in the shared revision", local.Path, desired.Path,
+		)
 	}
 	return ""
 }

@@ -304,7 +304,9 @@ func New(pub Publisher, logger *slog.Logger) *Scheduler {
 // publication-recovery counters. It mirrors runner.NewWithMetrics: New is the
 // nil-metrics convenience, and the worker wires the registry through this
 // constructor. A nil registry is nil-safe.
-func NewWithMetrics(pub Publisher, logger *slog.Logger, metricsRegistry *metrics.Registry) *Scheduler {
+func NewWithMetrics(
+	pub Publisher, logger *slog.Logger, metricsRegistry *metrics.Registry,
+) *Scheduler {
 	g, err := gocron.NewScheduler(
 		gocron.WithLocation(time.UTC),
 		gocron.WithStopTimeout(5*time.Second),
@@ -424,18 +426,26 @@ func (s *Scheduler) ReplaceApp(name string, tmpl *app.Template) {
 		// here as it is in template validation. gocron would otherwise accept it
 		// even with withSeconds=false.
 		if trimmed := strings.TrimSpace(sch.Cron); trimmed == "@every" || strings.HasPrefix(trimmed, "@every ") {
-			s.log.Warn("Cron: register schedule failed", "app", name, "schedule", sch.Name, "handler", sch.Handler,
-				"error", "`@every` relative schedules are not supported")
+			s.log.Warn(
+				"Cron: register schedule failed", "app", name, "schedule", sch.Name,
+				"handler", sch.Handler, "error", "`@every` relative schedules are not supported",
+			)
 			continue
 		}
 		// Parse with gocron's own parser configuration (5-field/descriptor via
 		// CRON_TZ-aware ParseStandard) so occurrence derivation matches firing.
 		parsed, err := parseSchedule(sch.Cron, sch.Location)
 		if err != nil {
-			s.log.Warn("Cron: register schedule failed", "app", name, "schedule", sch.Name, "handler", sch.Handler, "error", err)
+			s.log.Warn(
+				"Cron: register schedule failed", "app", name, "schedule", sch.Name,
+				"handler", sch.Handler, "error", err,
+			)
 			continue
 		}
-		rec := registeredSchedule{fn: name, name: sch.Name, handler: sch.Handler, cron: sch.Cron, location: sch.Location.String(), parsed: parsed}
+		rec := registeredSchedule{
+			fn: name, name: sch.Name, handler: sch.Handler, cron: sch.Cron,
+			location: sch.Location.String(), parsed: parsed,
+		}
 		// Retain the live job when this name is already registered with the same
 		// handler, cron, and timezone. Only those fields reach the gocron job;
 		// timeout/retries are resolved by the runner, so a change confined to
@@ -483,7 +493,10 @@ func (s *Scheduler) ReplaceApp(name string, tmpl *app.Template) {
 			// The old job for this name was already removed and no record is
 			// appended, so the name is dropped like any other unregisterable
 			// schedule rather than left half-applied.
-			s.log.Warn("Cron: register schedule failed", "app", name, "schedule", sch.Name, "handler", sch.Handler, "error", err)
+			s.log.Warn(
+				"Cron: register schedule failed", "app", name, "schedule", sch.Name,
+				"handler", sch.Handler, "error", err,
+			)
 			continue
 		}
 		delete(existing, sch.Name)
@@ -708,7 +721,9 @@ func waitShutdown(ctx context.Context, shutdownDone, callbacksDone <-chan struct
 // Retries are bounded (see publishRetryDelays) and observe ctx, so a shutdown
 // aborts promptly. The schedule-path at-least-once contract after publication is
 // unchanged: the stream layer drives delivery, per-invocation retry, and DLQ.
-func (s *Scheduler) fire(ctx context.Context, fnName, scheduleName, handler string, parsed robfigcron.Schedule) {
+func (s *Scheduler) fire(
+	ctx context.Context, fnName, scheduleName, handler string, parsed robfigcron.Schedule,
+) {
 	// Storage gate: if live publication is paused (no usable outbox, degraded,
 	// or stopped) return BEFORE computing an occurrence, so a callback that
 	// arrives while degraded never even derives a due instant. The atomic gate

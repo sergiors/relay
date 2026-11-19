@@ -31,7 +31,10 @@ func TestStatsFlusherFailedResetKeepsBaseline(t *testing.T) {
 	st, dsn := openTempWorkerNodeState(t)
 	m := metrics.New()
 	m.Add(metrics.MetricEventsMatched, 42)
-	f := newStatsFlusher(st, m)
+	f := newStatsFlusher(st, m, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	})
 	f.flush(ctx)
 	if s, ok := st.Stats(); !ok || s.EventsMatchedTotal != 42 {
 		t.Fatalf("pre-reset persisted events = %+v ok=%v, want 42", s, ok)
@@ -105,7 +108,10 @@ func TestStatsFlusherResetStatsResetsOnlyOwnNode(t *testing.T) {
 	m := metrics.New()
 	m.Add(metrics.MetricEventsMatched, 100)
 	m.SetPendingBacklogObserved(3, 4, time.Now())
-	f := newStatsFlusher(a, m)
+	f := newStatsFlusher(a, m, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	})
 	f.flush(ctx)
 	if own, ok, err := a.ReadNodeStats(ctx, a.NodeID()); err != nil || !ok ||
 		own.EventsMatchedTotal != 100 {
@@ -204,7 +210,10 @@ func TestStatsFlusherResetAllStatsResetsEveryNode(t *testing.T) {
 
 	m := metrics.New()
 	m.Add(metrics.MetricEventsMatched, 100)
-	f := newStatsFlusher(a, m)
+	f := newStatsFlusher(a, m, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	})
 	f.flush(ctx)
 
 	metaBefore, err := admin.StatsGeneration()
@@ -280,7 +289,11 @@ func TestStatsFlusherResetAllRaceNoResurrection(t *testing.T) {
 	st, _ := openTempWorkerNodeState(t)
 	m := metrics.New()
 	m.Add(metrics.MetricEventsMatched, 1000)
-	f := newStatsFlusher(st, m)
+	gens, err := st.StatsGenerations()
+	if err != nil {
+		t.Fatalf("StatsGenerations: %v", err)
+	}
+	f := newStatsFlusher(st, m, gens)
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup

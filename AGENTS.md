@@ -1,8 +1,8 @@
 # AGENTS.md
 
 Compact repository guide for coding agents. Prefer code, `README.md`, and package
-docs when details here disagree. Update this file only when an architectural
-boundary or invariant changes.
+docs when details here disagree. Update this file when architectural boundaries,
+invariants, or shared engineering practices change.
 
 Relay is an event-driven app runner (Go 1.27, module `relay`; main package
 `./cmd`).
@@ -86,6 +86,79 @@ worker; admin commands communicate with it or read persistent state.
 - Prefer existing abstractions and seams over parallel frameworks. Internal APIs
   and persisted internal state have no compatibility promise unless documented.
 - `relay apps` aliases `relay app ls`.
+
+## Engineering and testability
+
+Design code for maintainability, reliability, and testability from the start.
+Code should be naturally testable without introducing unnecessary abstractions.
+
+- Separate business logic from infrastructure access and lifecycle
+  orchestration.
+- Core behavior should be unit-testable without PostgreSQL, Redis, Docker,
+  networking, or other external services.
+- Prefer explicit dependency injection over hidden dependencies and global
+  state.
+- Introduce small, consumer-owned interfaces only when they represent a
+  meaningful boundary or enable useful substitution.
+- Depend on behavior rather than concrete infrastructure implementations where
+  substitution is genuinely necessary.
+- Keep data structures and simple values concrete. Do not introduce interfaces
+  for types that do not need behavioral substitution.
+- Prefer straightforward constructors with explicit dependencies. Avoid
+  redundant constructors, test-only wrappers, and unnecessary initialization.
+- Keep orchestration functions focused on wiring, startup, and shutdown.
+  Extract business decisions into cohesive, independently testable functions.
+- Prefer deterministic tests using lightweight fakes, controlled inputs,
+  and explicit clocks where necessary.
+- Test observable behavior, including failures, retries, cancellation,
+  and concurrency. Avoid tests coupled to implementation details.
+- Reserve integration tests for behavior that genuinely requires external
+  systems, such as database transactions, ownership fencing, Redis delivery,
+  and Docker lifecycle operations.
+- Do not introduce abstractions solely to make mocking possible. Choose the
+  simplest design that provides meaningful testability.
+- Prefer production code that is naturally testable over production code
+  modified exclusively for tests.
+
+## Code organization
+
+- Keep functions focused on one responsibility.
+- Organize files by cohesive responsibilities, not arbitrary size limits.
+- Use consistent naming across packages, files, types, and functions.
+- Prefer existing patterns over introducing parallel implementations.
+- Remove obsolete wrappers, redundant helpers, and unused abstractions when
+  they are no longer needed.
+- Avoid mixing infrastructure concerns with business decisions.
+- Preserve clear package boundaries and minimize unnecessary dependencies.
+- Refactor only what is necessary for the task. Avoid unrelated changes.
+
+## Code comments
+
+- Write comments only when they explain something the code cannot make clear
+  on its own.
+- Prefer self-explanatory names and simple code over explanatory comments.
+- Explain non-obvious decisions, invariants, constraints, and important
+  trade-offs when necessary.
+- Do not narrate what functions, variables, or individual statements do.
+- Avoid redundant comments that merely repeat function or type names.
+- Keep comments concise, accurate, and relevant to the current implementation.
+- Remove or update comments when the code changes.
+- Preserve Go documentation comments where required for exported APIs.
+
+## Change discipline
+
+- Inspect existing implementations, call sites, and tests before editing.
+- Understand the relevant invariants and failure scenarios before changing
+  concurrency, persistence, or lifecycle behavior.
+- Prefer the smallest coherent change that solves the underlying problem.
+- Consider testability during implementation, not as a later refactoring task.
+- Add or update focused unit tests for behavior changes.
+- Do not weaken assertions or remove tests merely to make them pass.
+- Preserve existing behavior unless the task explicitly changes its contract.
+- Report validation failures accurately, distinguishing existing failures
+  from regressions introduced by the change.
+- Preserve unrelated working-tree changes.
+- Do not create commits unless explicitly requested.
 
 ## Documentation guidelines
 

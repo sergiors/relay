@@ -18,6 +18,13 @@ import (
 // (a hard crash loses at most one interval of telemetry).
 const statsFlushInterval = 5 * time.Second
 
+// ownStatsSnapshotter is the narrow state view the startup stats restore needs.
+// *state.State is the production implementation; a unit test can supply a
+// lightweight fake returning a fixed atomic snapshot.
+type ownStatsSnapshotter interface {
+	OwnStatsSnapshot(ctx context.Context) (state.OwnStatsSnapshot, error)
+}
+
 // restorePersistedStats seeds the fresh process-lifetime metrics registry with
 // THIS worker's cumulative counters persisted in the state database, so the
 // first snapshot never resets them. The registry only knows this process's
@@ -35,7 +42,7 @@ const statsFlushInterval = 5 * time.Second
 // is preserved: a failed snapshot logs in state, seeds nothing, and returns
 // unknown epochs so the first flush adopts whatever the database holds.
 func restorePersistedStats(
-	metricsInstance *metrics.Registry, st *state.State,
+	metricsInstance *metrics.Registry, st ownStatsSnapshotter,
 ) state.OwnStatsSnapshot {
 	unknown := state.OwnStatsSnapshot{Generations: state.StatsGenerations{
 		Global: state.StatsGenerationUnknown,
@@ -290,6 +297,25 @@ func snapshotAppStats(metricsInstance *metrics.Registry, base *relayBaseline) []
 	return out
 }
 
+// statsStore is the narrow state view the flusher needs: the live app set for
+// the metrics sweep, the fenced snapshot and reset writes, stale-row pruning,
+// and the stable node identity used in the ownership-loss log. *state.State is
+// the production implementation; a unit test can supply a lightweight fake with
+// supplied reset generations so flush and reset logic run without PostgreSQL.
+type statsStore interface {
+	AppNames(ctx context.Context) ([]string, bool)
+	RecordStatsSnapshotWithGenerations(
+		ctx context.Context,
+		generations state.StatsGenerations,
+		stats state.Stats,
+		fns []state.AppStats,
+	) (state.StatsGenerations, error)
+	PruneStaleStats(ctx context.Context, retention time.Duration) (int, error)
+	ResetNodeStats(ctx context.Context, nodeID string) (int64, error)
+	ResetAllStats(ctx context.Context) (int64, error)
+	NodeID() string
+}
+
 // statsFlusher owns every write of the registry's Relay-visible totals into
 // PostgreSQL and the matching in-memory reset. It is the serialization point that
 // makes a socket-triggered `reset stats` deterministic against the periodic
@@ -299,7 +325,7 @@ func snapshotAppStats(metricsInstance *metrics.Registry, base *relayBaseline) []
 // It is safe for concurrent use.
 type statsFlusher struct {
 	mu sync.Mutex
-	st *state.State
+	st statsStore
 	// metrics is the accounting registry the worker always constructs; it is
 	// nil only when a caller deliberately passes nil (tests), in which case the
 	// snapshot mappers yield zero values. Production always supplies the
@@ -336,26 +362,19 @@ type statsFlusher struct {
 	log *slog.Logger
 }
 
-// newStatsFlusher builds a flusher whose reset epochs are unknown; the first
-// flush adopts whatever the database holds. Startup uses
-// newStatsFlusherWithGenerations with the epochs captured by the atomic stats
-// restore, so a reset racing startup is detectable instead of pairing stale
-// seeded totals with a newer generation. retention and the process logger are
-// installed by the worker after construction; tests that only exercise the
-// flush path leave the defaults (no compaction, default logger).
-func newStatsFlusher(st *state.State, metricsInstance *metrics.Registry) *statsFlusher {
-	return newStatsFlusherWithGenerations(st, metricsInstance, state.StatsGenerations{
-		Global: state.StatsGenerationUnknown,
-		Node:   state.StatsGenerationUnknown,
-	})
-}
-
-// newStatsFlusherWithGenerations builds a flusher initialized from the same
+// newStatsFlusher builds a flusher initialized with the epochs from the same
 // atomic restore snapshot that seeded the registry. Those epochs are the
-// linearization point for the seeded totals: any later reset advances one of
-// them and fences the first flush.
-func newStatsFlusherWithGenerations(
-	st *state.State,
+// linearization point for the seeded totals: a reset racing startup advances
+// one of them and fences the first flush instead of pairing stale seeded totals
+// with a newer generation. Callers with no observed epoch pass
+// state.StatsGenerationUnknown: an unknown global epoch adopts the stored epoch,
+// while an unknown node epoch adopts only a stored zero/absent epoch, so a
+// non-zero stored node epoch fences the first flush with ErrStatsResetAdvanced.
+// retention and the process logger are installed by the worker after
+// construction; tests that only exercise the flush path leave the defaults (no
+// compaction, default logger).
+func newStatsFlusher(
+	st statsStore,
 	metricsInstance *metrics.Registry,
 	generations state.StatsGenerations,
 ) *statsFlusher {

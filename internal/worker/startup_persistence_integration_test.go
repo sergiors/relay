@@ -49,7 +49,7 @@ func TestPersistStartupDiscoveryCriticalDiscoveryFailure(t *testing.T) {
 
 	failAppWrites(t, dsn, "failing")
 	tokens, err := persistStartupDiscovery(
-		context.Background(), st, root, discovered, nil, nil, discardLogger())
+		context.Background(), st, root, discovered, nil, nil, discardLogger(), 0)
 	if err == nil {
 		t.Fatal("a valid app's discovery failure must be fatal, not silently skipped")
 	}
@@ -76,7 +76,7 @@ func TestPersistStartupDiscoveryInvalidWriteIsIsolated(t *testing.T) {
 
 	failAppWrites(t, dsn, "bad-write")
 	tokens, err := persistStartupDiscovery(
-		context.Background(), st, root, nil, issues, observed, discardLogger())
+		context.Background(), st, root, nil, issues, observed, discardLogger(), 0)
 	if err != nil {
 		t.Fatalf("invalid-app write failure must not be fatal: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestPersistStartupDiscoveryMissingObservationFailsClosed(t *testing.T) {
 
 	tokens, err := persistStartupDiscovery(
 		context.Background(), st, root, nil, issues,
-		map[string]state.AppObservation{}, discardLogger())
+		map[string]state.AppObservation{}, discardLogger(), 0)
 	if err != nil {
 		t.Fatalf("persistStartupDiscovery: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestPersistStartupDiscoveryStaleObservationIsIsolated(t *testing.T) {
 	}
 
 	tokens, err := persistStartupDiscovery(context.Background(), older, root, nil,
-		[]app.LoadIssue{staleIssue, freshIssue}, observed, discardLogger())
+		[]app.LoadIssue{staleIssue, freshIssue}, observed, discardLogger(), 0)
 	if err != nil {
 		t.Fatalf("stale rejection must be recoverable: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestPersistStartupDiscoveryRebuildFailureKeepsObservationsConsistent(t *tes
 
 	failAppWrites(t, dsn, "seed-fail")
 	tokens, err := persistStartupDiscovery(context.Background(), st, root,
-		discovered, []app.LoadIssue{broken}, observed, discardLogger())
+		discovered, []app.LoadIssue{broken}, observed, discardLogger(), 0)
 	if err == nil {
 		t.Fatal("the discovery failure after a failed rebuild must be critical")
 	}

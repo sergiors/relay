@@ -81,7 +81,10 @@ func TestStatsResetDoesNotTouchAppStatus(t *testing.T) {
 	}
 
 	reg.Add(metrics.MetricEventsMatched, 100)
-	f := newStatsFlusher(st, reg)
+	f := newStatsFlusher(st, reg, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	})
 	if err := f.ResetStats(); err != nil {
 		t.Fatalf("ResetStats: %v", err)
 	}

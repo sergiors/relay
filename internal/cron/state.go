@@ -212,7 +212,9 @@ func (s *Scheduler) markRunningIfDrained(recovered bool) bool {
 
 // markRunningLocked performs the running transition; the caller must hold s.mu.
 // It reports ok=false only when the scheduler is stopped (a no-op).
-func (s *Scheduler) markRunningLocked(recovered bool) (was schedulerState, recovery, startNow bool, count int, ok bool) {
+func (s *Scheduler) markRunningLocked(recovered bool) (
+	was schedulerState, recovery, startNow bool, count int, ok bool,
+) {
 	if s.stopped {
 		return 0, false, false, 0, false
 	}

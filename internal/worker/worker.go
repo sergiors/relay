@@ -644,8 +644,8 @@ func Run(logger *slog.Logger) (runErr error) {
 		}
 	}
 
-	startupSet, err := loadStartupAppsWithAuthorization(
-		startupCtx, logger, st, metricsInstance,
+	startupSet, err := loadStartupApps(
+		startupCtx, logger, st, app.Dir, metricsInstance,
 		deploymentSnapshot.Generation,
 		deploymentSnapshot.Fingerprints,
 		deploymentSnapshot.Invalid,
@@ -694,7 +694,7 @@ func Run(logger *slog.Logger) (runErr error) {
 	// snapshot capture and write, so a socket reset can never be overwritten by
 	// a flush holding pre-reset values; shared by the loop, final flush, and
 	// socket reset command.
-	statsFlusher := newStatsFlusherWithGenerations(
+	statsFlusher := newStatsFlusher(
 		st, metricsInstance, startupSet.statsRestore.Generations,
 	)
 	statsFlusher.retention = cfg.StatsRetention
