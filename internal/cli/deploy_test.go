@@ -3,20 +3,44 @@ package cli
 import (
 	"errors"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
 
 const deployTestSHA = "0123456789abcdef0123456789abcdef01234567"
 
-// TestDeployHelpListsOnlyPublicCommands pins the simplified command surface and
-// its operator-facing help: bare `relay deploy` documents itself as the status
-// alias, the only public subcommands are status, rollback, pin, and unpin (no
-// publish entry remains in the command list), each subcommand explains itself
-// in user terms — and no deploy help text leaks implementation details
-// (PostgreSQL/DATABASE_URL, internal CAS, branch-tip, publication, or
+// deployHelpSubcommands extracts the subcommand names listed in the COMMANDS
+// block of deploy help output, so tests can pin the exact public set rather
+// than spot-checking a few names. The block ends at the next unindented
+// heading (OPTIONS).
+func deployHelpSubcommands(t *testing.T, help string) []string {
+	t.Helper()
+	idx := strings.Index(help, "COMMANDS:")
+	if idx < 0 {
+		t.Fatalf("deploy help missing a COMMANDS section:\n%s", help)
+	}
+	var names []string
+	for _, line := range strings.Split(help[idx+len("COMMANDS:"):], "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, " ") {
+			break
+		}
+		names = append(names, strings.Fields(line)[0])
+	}
+	return names
+}
+
+// TestDeployHelpListsOnlyPublicSubcommands pins the simplified command surface
+// and its operator-facing help: the COMMANDS block lists exactly status,
+// rollback, pin, and unpin — no publish entry and no alias wording (bare
+// `relay deploy` is a namespace, not a status alias) — each subcommand
+// explains itself in user terms — and no deploy help text leaks implementation
+// details (PostgreSQL/DATABASE_URL, internal CAS, branch-tip, publication, or
 // materialization wording).
-func TestDeployHelpListsOnlyPublicCommands(t *testing.T) {
+func TestDeployHelpListsOnlyPublicSubcommands(t *testing.T) {
 	help := make(map[string]string)
 	for _, args := range [][]string{
 		{"deploy", "--help"},
@@ -34,10 +58,22 @@ func TestDeployHelpListsOnlyPublicCommands(t *testing.T) {
 		assertNoImplementationDetails(t, label, out)
 	}
 
-	// The bare command presents itself as the status alias and describes each
-	// public subcommand with a concise, user-facing one-liner.
+	// The COMMANDS block is exactly the four public subcommands: no publish,
+	// nothing extra, nothing missing.
+	wantCmds := []string{"rollback", "pin", "unpin", "status"}
+	gotCmds := deployHelpSubcommands(t, help["deploy --help"])
+	if len(gotCmds) != len(wantCmds) {
+		t.Fatalf("deploy help subcommands = %v, want exactly %v", gotCmds, wantCmds)
+	}
+	for _, name := range wantCmds {
+		if !slices.Contains(gotCmds, name) {
+			t.Fatalf("deploy help missing subcommand %q (got %v)", name, gotCmds)
+		}
+	}
+
+	// Each public subcommand is described with a concise, user-facing
+	// one-liner in the command list.
 	for _, want := range []string{
-		"Alias for 'relay deploy status'",
 		"Select a commit from the configured repository and pin it",
 		"Block Git updates to the current revision",
 		"Allow future Git updates",
@@ -73,50 +109,67 @@ func TestDeployHelpListsOnlyPublicCommands(t *testing.T) {
 		}
 	}
 
-	// No indented COMMANDS entry lists "publish" as a subcommand.
-	if regexp.MustCompile(`(?m)^\s+publish\s`).MatchString(help["deploy --help"]) {
-		t.Fatalf("deploy help still lists a publish subcommand:\n%s", help["deploy --help"])
+	// No indented COMMANDS entry lists "publish" as a subcommand, and no help
+	// presents `relay deploy` itself as an alias of another command: it is a
+	// namespace, not a shorthand.
+	for label, out := range help {
+		if regexp.MustCompile(`(?m)^\s+publish\s`).MatchString(out) {
+			t.Fatalf("%s still lists a publish subcommand:\n%s", label, out)
+		}
+		if regexp.MustCompile(`(?i)alias`).MatchString(out) {
+			t.Fatalf("%s still documents an alias:\n%s", label, out)
+		}
 	}
 }
 
-// TestDeployBareIsStatusAlias pins that bare `relay deploy` reaches exactly the
-// status path: with the database-free fixture both forms fail on the same
-// state-access sentinel, proving the alias performs no other work.
-func TestDeployBareIsStatusAlias(t *testing.T) {
-	_, _, bareErr := runCLI(t, "", "deploy")
-	_, _, statusErr := runCLI(t, "", "deploy", "status")
-	if !errors.Is(bareErr, errUnexpectedStateAccess) {
-		t.Fatalf("bare deploy err = %v, want the status state-access path", bareErr)
+// TestDeployBareShowsNamespaceHelp pins that bare `relay deploy` is a plain
+// namespace invocation: it succeeds with the same help surface as
+// `relay deploy --help` and never reaches OpenState — the database-free
+// fixture fails loudly on any state access — while the explicit
+// `relay deploy status` still hits the injected state-access sentinel.
+func TestDeployBareShowsNamespaceHelp(t *testing.T) {
+	bareOut, _, bareErr := runCLI(t, "", "deploy")
+	if bareErr != nil {
+		t.Fatalf("bare deploy err = %v, want nil (subcommand help)", bareErr)
 	}
+	helpOut, _, helpErr := runCLI(t, "", "deploy", "--help")
+	if helpErr != nil {
+		t.Fatalf("deploy --help err = %v, want nil", helpErr)
+	}
+	if bareOut != helpOut {
+		t.Fatalf("bare deploy output differs from deploy --help:\nbare:\n%s\nhelp:\n%s",
+			bareOut, helpOut)
+	}
+	if !strings.Contains(bareOut, "COMMANDS:") {
+		t.Fatalf("bare deploy output missing the COMMANDS section:\n%s", bareOut)
+	}
+
+	_, _, statusErr := runCLI(t, "", "deploy", "status")
 	if !errors.Is(statusErr, errUnexpectedStateAccess) {
 		t.Fatalf("deploy status err = %v, want the state-access path", statusErr)
 	}
 }
 
-// TestDeployObsoleteShorthandAndPublishRejected pins that the removed surface
-// is gone: the `<sha>` shorthand is a usage error, and `publish` (subcommand
-// or bare) is an unknown command — never a publication.
-func TestDeployObsoleteShorthandAndPublishRejected(t *testing.T) {
+// TestDeployRemovedOperandsAreUnknownCommands pins that the removed surface is
+// gone: the `<sha>` shorthand and `publish` (bare or with a SHA) are rejected
+// by the shared namespace action as Docker-style unknown-command usage errors
+// with exit code 2 — never a publication and never the old arity message — and
+// none of them reaches OpenState.
+func TestDeployRemovedOperandsAreUnknownCommands(t *testing.T) {
 	cases := []struct {
 		name string
 		args []string
-		want string
 	}{
-		{"shorthand", []string{"deploy", deployTestSHA},
-			"deploy: too many arguments (use 'relay deploy status')"},
-		// With no publish subcommand, the operands fall through to the bare
-		// deploy action, which refuses any argument.
-		{"publish subcommand", []string{"deploy", "publish", deployTestSHA},
-			"deploy: too many arguments (use 'relay deploy status')"},
-		{"publish bare", []string{"deploy", "publish"},
-			"deploy: too many arguments (use 'relay deploy status')"},
+		{"shorthand", []string{"deploy", deployTestSHA}},
+		{"publish bare", []string{"deploy", "publish"}},
+		{"publish with sha", []string{"deploy", "publish", deployTestSHA}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, _, err := runCLI(t, "", tc.args...)
-			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("%v: err = %v, want %q", tc.args, err, tc.want)
-			}
+			want := "relay: unknown command: relay deploy " + strings.Join(tc.args[1:], " ") +
+				"\n\nUsage: relay deploy\n\nRun 'relay deploy --help' for more information"
+			requireExitCode2(t, err, want)
 			if errors.Is(err, errUnexpectedStateAccess) {
 				t.Fatalf("%v reached the state database: %v", tc.args, err)
 			}
