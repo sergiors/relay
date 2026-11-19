@@ -249,9 +249,10 @@ func TestDeployPinUnpinPreserveRevisionWithoutMaterializing(t *testing.T) {
 
 // TestDeployStatusShowsNodeProgressWhileBehind pins the status rendering for a
 // node that has observed a newer generation than it has applied (and whose
-// latest attempt failed): the node table shows observed/applied/phase, and the
-// per-app activation progress for the applied generation renders beneath the
-// desired revision block.
+// latest attempt failed): the desired summary shows generation, abbreviated
+// commit, source, and pin state; the node table shows observed/applied/phase;
+// and the per-app activation progress for the applied generation renders
+// beneath the desired revision block.
 func TestDeployStatusShowsNodeProgressWhileBehind(t *testing.T) {
 	deps, st, first, second := rollbackDeps(t)
 	ctx := context.Background()
@@ -296,15 +297,30 @@ func TestDeployStatusShowsNodeProgressWhileBehind(t *testing.T) {
 		t.Fatalf("deploy status: %v (out=%s)", err, out)
 	}
 	for _, want := range []string{
-		"Desired generation 2",
-		"Commit     " + second,
-		"Source     git@github.com:acme/r.git ref=main path=services",
-		"Pin state  pinned",
 		"Apps on node-1 (active generation 1)",
 		"fetch failed",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("status output missing %q:\n%s", want, out)
+		}
+	}
+	// The desired summary reports generation 2, the first 12 chars of the
+	// desired commit, the configured repository/ref/path, and the pin left by
+	// the rollbacks. Cell spacing is the tabwriter's, so match it loosely; the
+	// commit must stop after 12 chars rather than render the full SHA.
+	summary := []*regexp.Regexp{
+		regexp.MustCompile(`Desired generation:\s+2(?:\s|$)`),
+		regexp.MustCompile(`Commit:\s+` + regexp.QuoteMeta(second[:12]) +
+			`(?:\s|$)`),
+		regexp.MustCompile(`Source:\s+` + regexp.QuoteMeta(
+			"git@github.com:acme/r.git ref=main path=services") +
+			`(?:\s|$)`),
+		regexp.MustCompile(`Pinned:\s+yes(?:\s|$)`),
+	}
+	for _, want := range summary {
+		if !want.MatchString(out) {
+			t.Fatalf("status output missing the summary line matching %q:\n%s",
+				want, out)
 		}
 	}
 	// The node table and per-app progress render their documented columns in
@@ -319,17 +335,18 @@ func TestDeployStatusShowsNodeProgressWhileBehind(t *testing.T) {
 		t.Fatalf("status output missing the app column header:\n%s", out)
 	}
 	// The node row pairs observed=2, applied=1 with the failed phase and the
-	// applied commit while the node is behind.
+	// applied commit (abbreviated to 12 chars) while the node is behind.
 	nodeRow := regexp.MustCompile(`node-1\s+2\s+1\s+` +
 		regexp.QuoteMeta(state.DeploymentNodeFailed) + `\s+` +
-		regexp.QuoteMeta(first) + `\s`)
+		regexp.QuoteMeta(first[:12]) + `(?:\s|$)`)
 	if !nodeRow.MatchString(out) {
 		t.Fatalf("status output missing the observed/applied node row:\n%s", out)
 	}
-	// The app activation progress row for the applied generation.
+	// The app activation progress row for the applied generation, also with
+	// the abbreviated commit.
 	appRow := regexp.MustCompile(`gated\s+` +
 		regexp.QuoteMeta(state.DeploymentAppActive) + `\s+` +
-		regexp.QuoteMeta(first) + `\s`)
+		regexp.QuoteMeta(first[:12]) + `(?:\s|$)`)
 	if !appRow.MatchString(out) {
 		t.Fatalf("status output missing the app activation row:\n%s", out)
 	}
