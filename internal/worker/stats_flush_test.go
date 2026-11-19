@@ -5,12 +5,14 @@ import (
 	"testing"
 
 	"relay/internal/observability/metrics"
+	"relay/internal/state"
 )
 
 // TestStatsFlusherResetWithoutStateErrors verifies a worker whose state handle
-// is unavailable reports an error (so the socket answers stats_unavailable and
-// the CLI falls back to the state DB), while still resetting the in-memory
-// baseline.
+// is unavailable reports an error (so the socket answers stats_reset_failed and
+// the CLI surfaces it instead of masking it) AND leaves the effective baseline
+// untouched: no reset happened, so the persisted snapshot must keep reporting
+// the original counters rather than a reset point that was never committed.
 func TestStatsFlusherResetWithoutStateErrors(t *testing.T) {
 	m := metrics.New()
 	m.Add(metrics.MetricEventsMatched, 42)
@@ -19,14 +21,18 @@ func TestStatsFlusherResetWithoutStateErrors(t *testing.T) {
 	if err := f.ResetStats(); err == nil {
 		t.Fatal("ResetStats without a state handle: err = nil, want error")
 	}
-	// The worker-owned baseline was still captured: the raw counter is
-	// unchanged (Prometheus stays monotonic), but the baselined snapshot is
-	// zero.
+	// Prometheus stays monotonic and the baseline was NOT captured: the
+	// baselined snapshot still reports the full raw counter.
 	if got := m.Counter(metrics.MetricEventsMatched); got != 42 {
-		t.Fatalf("Prometheus events after reset = %d, want 42 (monotonic)", got)
+		t.Fatalf("Prometheus events after failed reset = %d, want 42 (monotonic)", got)
 	}
-	if got := f.baseline.counter(metrics.MetricEventsMatched, m.Counter(metrics.MetricEventsMatched)); got != 0 {
-		t.Fatalf("baselined events after reset = %d, want 0", got)
+	if got := f.baseline.counter(metrics.MetricEventsMatched, m.Counter(metrics.MetricEventsMatched)); got != 42 {
+		t.Fatalf("baselined events after failed reset = %d, want 42 (baseline untouched)", got)
+	}
+	// The failed reset must not adopt any epoch either.
+	if f.generation != state.StatsGenerationUnknown || f.nodeGeneration != state.StatsGenerationUnknown {
+		t.Fatalf("epochs after failed reset = (%d, %d), want both unknown",
+			f.generation, f.nodeGeneration)
 	}
 }
 
@@ -67,7 +73,10 @@ func TestStatsFlusherDropAppBaseline(t *testing.T) {
 	m := metrics.New()
 	m.AddLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}}, 10)
 	f := newStatsFlusher(nil, m)
-	_ = f.ResetStats() // capture baseline; nil state is fine for this test
+	// Install the reset baseline directly: this unit test has no state DB, and
+	// the baseline only ever lands after a SUCCESSFUL state reset (see
+	// ResetStats), which the nil handle can never provide.
+	f.baseline = captureRelayBaseline(m)
 
 	// A fresh series (simulating the registry's removal + re-add) at 1 must be
 	// offset by the stale baseline (10) until the hook drops it.

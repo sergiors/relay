@@ -62,6 +62,7 @@ func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 		DLQTotal:                3,
 		PendingEntries:          17,
 		OldestPendingAgeSeconds: 134,
+		PendingObservedAtUnixMs: 1767225600000,
 	})
 	exec := base.Add(-time.Hour).Format(time.RFC3339)
 	c.RecordAppStats(AppStats{
@@ -86,8 +87,9 @@ func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 		t.Fatalf("ResetStats: %v", err)
 	}
 
-	// Global counters are zero; the live backlog gauges are preserved; the row
-	// still exists and its updated_at was refreshed to now().
+	// Global counters are zero; the live backlog gauges AND their observation
+	// instant are preserved (they describe a backlog the reset does not touch);
+	// the row still exists and its updated_at was refreshed to now().
 	s, ok := c.Stats()
 	if !ok {
 		t.Fatal("stats row must still exist after reset")
@@ -97,8 +99,9 @@ func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 		s.HandlerFailureTotal != 0 || s.RetryTotal != 0 || s.DLQTotal != 0 {
 		t.Fatalf("cumulative counters must be zeroed: %+v", s)
 	}
-	if s.PendingEntries != 17 || s.OldestPendingAgeSeconds != 134 {
-		t.Fatalf("backlog gauges must be preserved: %+v", s)
+	if s.PendingEntries != 17 || s.OldestPendingAgeSeconds != 134 ||
+		s.PendingObservedAtUnixMs != 1767225600000 {
+		t.Fatalf("backlog gauges and their observation must be preserved: %+v", s)
 	}
 	if want := base.Add(time.Minute).Format(time.RFC3339); s.UpdatedAt != want {
 		t.Fatalf("updated_at = %q, want refreshed %q", s.UpdatedAt, want)
@@ -257,7 +260,7 @@ func TestResetStatsThenAccumulate(t *testing.T) {
 		t.Fatalf("ResetStats: %v", err)
 	}
 
-	c.RecordStats(Stats{EventsMatchedTotal: 3, PendingEntries: 9})
+	c.RecordStats(Stats{EventsMatchedTotal: 3, PendingEntries: 9, PendingObservedAtUnixMs: 2000})
 	exec := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
 	c.RecordAppStatsContext(context.Background(), AppStats{
 		App:                 "alpha",
@@ -289,7 +292,7 @@ func TestResetStatsThenAccumulate(t *testing.T) {
 // succeeds and keeps the fresh state.
 func TestResetStatsIdempotent(t *testing.T) {
 	c := openTestState(t)
-	c.RecordStats(Stats{EventsMatchedTotal: 1, PendingEntries: 4})
+	c.RecordStats(Stats{EventsMatchedTotal: 1, PendingEntries: 4, PendingObservedAtUnixMs: 3000})
 	c.RecordAppStats(AppStats{App: "alpha", EventsMatchedTotal: 1})
 
 	for i := 1; i <= 2; i++ {

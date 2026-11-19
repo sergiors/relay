@@ -45,6 +45,7 @@ func TestRecordStatsSnapshotSingleTransaction(t *testing.T) {
 		DLQTotal:                1,
 		PendingEntries:          7,
 		OldestPendingAgeSeconds: 42,
+		PendingObservedAtUnixMs: 1767225600000,
 	}
 	fns := []AppStats{
 		{App: "alpha", EventsMatchedTotal: 30, HandlerSuccessTotal: 25, HandlerFailureTotal: 5, RetryTotal: 1, DLQTotal: 0},

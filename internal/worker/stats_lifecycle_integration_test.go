@@ -116,7 +116,9 @@ func TestStatsResetWithMetricsDisabled(t *testing.T) {
 	if srv != nil {
 		t.Fatal("precondition: metrics server must be nil when disabled")
 	}
-	st := openTempState(t)
+	// A worker handle carries its node identity: the socket reset is the
+	// node-scoped reset of NODE_ID's row.
+	st, _ := openTempWorkerNodeState(t)
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
 		t.Errorf("state write error: %v", err)
 	}

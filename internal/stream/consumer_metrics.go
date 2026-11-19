@@ -70,10 +70,12 @@ var _ streamMetricsReader = (*redis.Client)(nil)
 // age) and the configured consumer group's XINFO GROUPS lag. It is decoupled
 // from health/backoff/processing: a failing Redis command only skips its own
 // gauge for that tick (recorded on the read-error counter) and is logged
-// quietly, never zeroed and never propagated. The overall registry snapshot is
-// exposed by the worker's MetricsLogger. DLQ depth is no longer a Redis stream
-// observation: the durable DLQ lives in PostgreSQL and is sampled by the
-// worker's own gauge source.
+// quietly, never zeroed and never propagated. The pending depth and age are
+// published as one pair with a successful-observation instant, so a persisted
+// snapshot can order them against another node's pair. The overall registry
+// snapshot is exposed by the worker's MetricsLogger. DLQ depth is no longer a
+// Redis stream observation: the durable DLQ lives in PostgreSQL and is sampled
+// by the worker's own gauge source.
 type PendingGaugeSource struct {
 	client  streamMetricsReader
 	stream  string
@@ -103,19 +105,28 @@ func (source *PendingGaugeSource) Refresh(ctx context.Context) {
 		source.log.Debug("Metrics: xpending failed", "stream", source.stream, "group", source.group, "error", err)
 		return
 	}
-	source.metrics.SetGauge(metrics.MetricPendingEntries, float64(pending.Count))
-	// An empty PEL has no oldest pending ID to parse (Lower is ""), so the age
-	// must be cleared explicitly; otherwise it would keep the last non-empty
-	// value and report a pending age for a group with nothing pending. A
-	// non-empty PEL keeps the existing behavior: the age is updated only when
-	// the oldest ID parses.
+	// The depth and age are one observation of the same PEL: publish them
+	// together, with one successful-observation instant, so a persisted snapshot
+	// can order this pair against another node's pair without relying on the
+	// stats row's updated_at (which advances even when XPENDING fails).
+	observedAt := time.Now()
 	if pending.Count == 0 {
-		source.metrics.SetGauge(metrics.MetricPendingOldestAge, 0)
+		// An empty PEL has no oldest pending ID to parse (Lower is ""), so both
+		// gauges are explicitly zero; otherwise the age would keep the last
+		// non-empty value and report a backlog that no longer exists.
+		source.metrics.SetPendingBacklogObserved(0, 0, observedAt)
 		return
 	}
-	if age, ok := pendingAge(pending.Lower); ok {
-		source.metrics.SetGauge(metrics.MetricPendingOldestAge, age.Seconds())
+	age, ok := pendingAge(pending.Lower)
+	if !ok {
+		// A non-empty PEL whose oldest ID cannot be parsed is not a complete
+		// observation: leave BOTH gauges and their observation instant at their
+		// prior values rather than publishing a half-updated pair.
+		return
 	}
+	source.metrics.SetPendingBacklogObserved(
+		float64(pending.Count), age.Seconds(), observedAt,
+	)
 }
 
 // refreshGroupLag reads XINFO GROUPS for the configured stream and records the

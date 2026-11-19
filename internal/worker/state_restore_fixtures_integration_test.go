@@ -62,3 +62,20 @@ func openTempState(t *testing.T) *state.State {
 	t.Helper()
 	return testutil.NewState(t)
 }
+
+// openTempWorkerNodeState opens a state handle scoped to a fresh unique node
+// identity — the shape every production worker handle has (NodeID + Instance) —
+// and returns it with its DSN. Node-scoped resets (ResetNodeStats through the
+// flusher's ResetStats) and the instance fence only exist for such handles, so
+// flush/reset tests exercise them here instead of on the identity-free
+// openTempState. The identity is unique per test because PostgreSQL session
+// advisory locks are database-wide: per-test schemas do not namespace them.
+func openTempWorkerNodeState(t *testing.T) (*state.State, string) {
+	t.Helper()
+	dsn := testutil.NewStateDSN(t)
+	st := testutil.OpenState(t, dsn, state.Options{
+		NodeID:   testutil.UniqueName(t, "stats-node"),
+		Instance: "inst-1",
+	})
+	return st, dsn
+}

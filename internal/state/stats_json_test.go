@@ -10,8 +10,10 @@ import (
 	"time"
 )
 
-// statsJSONKeys is the exact set of payload keys expected in stats.data. It
-// deliberately excludes the relational updated_at (and the id).
+// statsJSONKeys is the exact set of always-present payload keys expected in
+// stats.data. It deliberately excludes the relational updated_at (and the id),
+// and the conditional backlog observation instant (pending_observed_at_unix_ms),
+// which appears only when the payload carries a successful backlog observation.
 var statsJSONKeys = []string{
 	"events_received_total",
 	"events_matched_total",
@@ -22,6 +24,21 @@ var statsJSONKeys = []string{
 	"dlq_total",
 	"pending_entries",
 	"oldest_pending_age_seconds",
+}
+
+// statsJSONKeysObserved is statsJSONKeys plus the backlog observation instant,
+// the exact key set for a payload whose gauges carry a successful observation.
+var statsJSONKeysObserved = []string{
+	"events_received_total",
+	"events_matched_total",
+	"events_unmatched_total",
+	"handler_success_total",
+	"handler_failure_total",
+	"retry_total",
+	"dlq_total",
+	"pending_entries",
+	"oldest_pending_age_seconds",
+	"pending_observed_at_unix_ms",
 }
 
 // appStatsJSONRequiredKeys is the exact set of ALWAYS-present payload keys
@@ -151,6 +168,7 @@ func TestStatsPayloadIsCentralizedJSON(t *testing.T) {
 		DLQTotal:                1,
 		PendingEntries:          5,
 		OldestPendingAgeSeconds: 42,
+		PendingObservedAtUnixMs: 1767225600000,
 	}
 	c.RecordStats(in)
 
@@ -158,7 +176,7 @@ func TestStatsPayloadIsCentralizedJSON(t *testing.T) {
 		t.Fatalf("stats.data JSONB type = %q, want object", jsonbType)
 	}
 	data, updatedAt := rawStatsData(t, c)
-	assertJSONKeysExactly(t, data, statsJSONKeys)
+	assertJSONKeysExactly(t, data, statsJSONKeysObserved)
 	// updated_at is relational, not in the payload.
 	assertJSONKeysAbsent(t, data, "updated_at")
 	if updatedAt.IsZero() {
@@ -410,7 +428,12 @@ func TestStatsJSONReopenRoundTrip(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	exec := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
-	global := Stats{EventsMatchedTotal: 100, PendingEntries: 9, OldestPendingAgeSeconds: 42}
+	global := Stats{
+		EventsMatchedTotal:      100,
+		PendingEntries:          9,
+		OldestPendingAgeSeconds: 42,
+		PendingObservedAtUnixMs: 1767225600000,
+	}
 	fn := AppStats{
 		App:                "alpha",
 		EventsMatchedTotal: 10,

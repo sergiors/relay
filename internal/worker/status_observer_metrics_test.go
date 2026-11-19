@@ -69,7 +69,9 @@ func TestWireStatusObserverNilSafe(t *testing.T) {
 // status is a current-state gauge, not a cumulative total, so it must never be
 // reset or baselined. The Prometheus counters stay monotonic too.
 func TestStatsResetDoesNotTouchAppStatus(t *testing.T) {
-	st := openTempState(t)
+	// A worker handle carries its node identity: the socket reset is the
+	// node-scoped reset of NODE_ID's row.
+	st, _ := openTempWorkerNodeState(t)
 	reg := metrics.New()
 	wireStatusObserver(st, reg)
 	fn := stateApp("alpha", t.TempDir())

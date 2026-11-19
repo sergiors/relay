@@ -108,9 +108,9 @@ func TestStatsFlusherStopsOnOwnershipLost(t *testing.T) {
 }
 
 // TestStatsFlusherResetAdoptsEpoch verifies that the in-process socket reset
-// adopts the epoch it just bumped, so the very next flush persists the reset
-// point instead of treating its own reset as a concurrent one and rebasing a
-// second time.
+// adopts the NODE epoch it just bumped, so the very next flush persists the
+// reset point instead of treating its own reset as a concurrent one and
+// rebasing a second time. A local reset must not move the shared epoch.
 func TestStatsFlusherResetAdoptsEpoch(t *testing.T) {
 	ctx := context.Background()
 	owner := testutil.UniqueName(t, "stats-reset")
@@ -127,12 +127,19 @@ func TestStatsFlusherResetAdoptsEpoch(t *testing.T) {
 	if err := f.ResetStats(); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
-	gen, err := st.StatsGeneration()
+	gens, err := st.StatsGenerations()
 	if err != nil {
-		t.Fatalf("StatsGeneration: %v", err)
+		t.Fatalf("StatsGenerations: %v", err)
 	}
-	if f.generation != gen {
-		t.Fatalf("flusher generation = %d, want the reset epoch %d", f.generation, gen)
+	if gens.Node == 0 {
+		t.Fatal("a local reset must advance the node epoch")
+	}
+	if f.nodeGeneration != gens.Node {
+		t.Fatalf("flusher node epoch = %d, want the local reset epoch %d", f.nodeGeneration, gens.Node)
+	}
+	if f.generation != gens.Global {
+		t.Fatalf("flusher global epoch = %d, want %d (a local reset must not move the shared epoch)",
+			f.generation, gens.Global)
 	}
 
 	// The next flush persists from the reset baseline (zero here).

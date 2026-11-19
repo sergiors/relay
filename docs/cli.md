@@ -6,7 +6,8 @@ administer a running Relay deployment; they do not start the worker.
 ```text
 relay start
 relay health
-relay stats [reset]
+relay stats [--node <id>|--all]
+relay stats reset [--all]
 relay app <ls|inspect|invoke>
 relay apps
 relay runtime <ls|inspect|check|update>
@@ -38,13 +39,21 @@ There is no HTTP health endpoint. See [Operations](operations.md#health-and-stat
 
 ```sh
 relay stats
+relay stats --node relay-2
+relay stats --all
 relay stats reset
+relay stats reset --all
 ```
 
-`stats` displays the latest persisted counters and backlog gauges; it works
-without a running worker. The snapshot can lag live metrics by about five
-seconds. `stats reset` clears cumulative counters, not backlog gauges or
-Prometheus counters.
+Bare `stats` displays the current node's latest persisted counters and backlog
+gauges. `--node <id>` reads one explicitly named node and `--all` aggregates
+every node. Stats reads work without a running worker. The snapshot can lag
+live metrics by about five seconds.
+
+`stats reset` clears the current node's cumulative counters. `stats reset --all`
+clears every node's counters. Neither reset form changes backlog gauges or
+Prometheus counters. A running worker applies the reset to its in-memory totals
+as well. `--node` and `--all` cannot be combined.
 
 “Message reclaims” counts stream redeliveries, not handler retry attempts. “DLQ
 entries” counts rows written to PostgreSQL, not just invocations that exhausted

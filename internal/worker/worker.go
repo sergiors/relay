@@ -694,7 +694,9 @@ func Run(logger *slog.Logger) (runErr error) {
 	// snapshot capture and write, so a socket reset can never be overwritten by
 	// a flush holding pre-reset values; shared by the loop, final flush, and
 	// socket reset command.
-	statsFlusher := newStatsFlusher(st, metricsInstance)
+	statsFlusher := newStatsFlusherWithGenerations(
+		st, metricsInstance, startupSet.statsRestore.Generations,
+	)
 	statsFlusher.retention = cfg.StatsRetention
 	statsFlusher.log = logger
 	shutdown.register(shutdownStep{

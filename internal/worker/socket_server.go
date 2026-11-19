@@ -23,9 +23,9 @@ import (
 // This file implements the worker-owned LIVE runtime-pool query socket at
 // /run/relay/relay.sock, alongside the process lock this worker runs under.
 //
-// It carries five semantic operations: the live warm-container pool gauges
-// (capacity and container counts by lease state), the operator-facing
-// "reset stats" command, the synchronous manual app invocation
+// It carries six semantic operations: the live warm-container pool gauges
+// (capacity and container counts by lease state), the operator-facing local and
+// global "reset stats" commands, the synchronous manual app invocation
 // (`relay app invoke`), the synchronous DLQ replay
 // (`relay dlq replay`), which re-executes one dead-lettered entry's exact
 // recorded app/handler once against the live registry, and the worker
@@ -102,6 +102,28 @@ type PoolSnapshotter interface {
 // rather than falling back.
 type StatsResetter interface {
 	ResetStats() error
+}
+
+// NodeStatsResetter is the optional identity extension of StatsResetter. The
+// socket requires it for a node-scoped reset so it can compare the CLI-selected
+// NODE_ID with the resetter's actual node BEFORE resetting anything: a CLI
+// environment inherited by the wrong node (or a stale local command) must fail
+// instead of silently clearing another node's counters. A resetter without this
+// extension answers stats_unavailable for a local reset; the global reset does
+// not need it.
+type NodeStatsResetter interface {
+	StatsResetter
+	NodeID() string
+}
+
+// GlobalStatsResetter is the optional extension of StatsResetter that serves
+// the operator-facing `stats reset --all` command. It resets every node's
+// persisted counters through the shared epoch; other workers observe that epoch
+// on their next flush and rebase. A resetter that does not implement it answers
+// stats_unavailable for a global reset rather than performing a node-local one,
+// so the CLI never mistakes a local reset for a global one.
+type GlobalStatsResetter interface {
+	ResetAllStats() error
 }
 
 // AppInvoker is the minimal live-runner view the manual-invocation command
@@ -191,10 +213,11 @@ type SocketServer struct {
 //
 // resetter handles the semantic "reset stats" command. Run always supplies the
 // stats flusher (constructed with the state handle and the always-present
-// accounting registry), so production always has a resetter; a nil resetter
-// answers stats_unavailable, which the CLI surfaces (a live worker with no stats
-// source is authoritative — it deliberately does NOT fall back to a direct
-// state-DB write that would mask it).
+// accounting registry), so production always has a resetter and a NodeID for a
+// local reset's expected-target check; a nil resetter answers stats_unavailable,
+// which the CLI surfaces (a live worker with no stats source is authoritative —
+// it deliberately does NOT fall back to a direct state-DB write that would mask
+// it).
 //
 // The stale removal is safe because the caller (`relay start` via worker.Run)
 // holds the process lock: see the file comment.
@@ -405,7 +428,9 @@ func (s *SocketServer) handle(conn net.Conn) {
 	}
 	switch req.Command {
 	case cmdResetStats:
-		s.handleResetStats(conn)
+		s.handleResetStats(conn, req.NodeID, false)
+	case cmdResetAllStats:
+		s.handleResetStats(conn, "", true)
 	case cmdRuntimeState:
 		s.handleRuntimeState(conn, req.App)
 	case cmdInvokeApp:
@@ -420,14 +445,59 @@ func (s *SocketServer) handle(conn net.Conn) {
 }
 
 // handleResetStats resets the worker's accumulated Relay statistics through the
-// StatsResetter. A nil resetter answers stats_unavailable; the CLI surfaces that
-// (the worker is authoritative and cannot reset), it does not fall back to a
-// direct state-DB write. A reset error answers stats_reset_failed so the CLI
-// surfaces it instead of masking a failed worker reset. On success the frame
-// carries reset_stats.
-func (s *SocketServer) handleResetStats(conn net.Conn) {
+// StatsResetter. A local reset requires a non-empty expectedNodeID and verifies
+// it against the resetter's actual node BEFORE resetting, so a CLI whose
+// NODE_ID drifted cannot clear a different node's counters. A mismatch is a
+// worker-reported failure (stats_reset_failed), never a fallback. all=true
+// performs the shared reset and requires GlobalStatsResetter; the expected node
+// is ignored because the operation is deliberately cluster-wide. A nil or
+// incapable resetter answers stats_unavailable; the CLI surfaces that (the
+// worker is authoritative and cannot reset), it does not fall back to a direct
+// state-DB write. A reset error answers stats_reset_failed so the CLI surfaces
+// it instead of masking a failed worker reset. On success the frame carries
+// reset_stats.
+func (s *SocketServer) handleResetStats(conn net.Conn, expectedNodeID string, all bool) {
 	if s.resetter == nil {
 		s.respond(conn, socketResponse{Error: errCodeStatsUnavailable})
+		return
+	}
+	if all {
+		global, ok := s.resetter.(GlobalStatsResetter)
+		if !ok {
+			s.respond(conn, socketResponse{Error: errCodeStatsUnavailable})
+			return
+		}
+		if err := global.ResetAllStats(); err != nil {
+			s.respond(conn, socketResponse{Error: errCodeStatsFailed})
+			return
+		}
+		s.respond(conn, socketResponse{ResetStats: true})
+		return
+	}
+	identified, ok := s.resetter.(NodeStatsResetter)
+	if !ok {
+		s.respond(conn, socketResponse{Error: errCodeStatsUnavailable})
+		return
+	}
+	actualNodeID := identified.NodeID()
+	if actualNodeID == "" {
+		s.respond(conn, socketResponse{Error: errCodeStatsUnavailable})
+		return
+	}
+	if expectedNodeID == "" {
+		s.respond(conn, socketResponse{
+			Error:   errCodeStatsFailed,
+			Message: "node id required for a local stats reset",
+		})
+		return
+	}
+	if expectedNodeID != actualNodeID {
+		s.respond(conn, socketResponse{
+			Error: errCodeStatsFailed,
+			Message: fmt.Sprintf(
+				"node id mismatch for a local stats reset: requested %s, worker is %s",
+				expectedNodeID, actualNodeID,
+			)})
 		return
 	}
 	if err := s.resetter.ResetStats(); err != nil {

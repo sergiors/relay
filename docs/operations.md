@@ -76,10 +76,15 @@ degradation, tracing, app-level status, and service convergence do not by
 themselves make the worker unready. There is no HTTP health endpoint.
 
 `relay stats` reads persisted counters from PostgreSQL and works without a
-running worker. Its snapshot may lag live metrics by about five seconds. Backlog
-gauges show the Redis consumer group's pending entries and oldest pending age.
-`relay stats reset` resets cumulative totals, not backlog gauges or Prometheus
-counters.
+running worker. Bare `relay stats` shows the current node's snapshot;
+`--node <id>` selects one explicit node and `--all` aggregates every node.
+See the [CLI guide](cli.md#relay-stats) for selector details.
+The snapshot may lag live metrics by about five seconds. Backlog gauges show
+the Redis consumer group's pending entries and oldest pending age.
+
+`relay stats reset` resets the current node's cumulative totals;
+`stats reset --all` resets every node's. Neither form resets backlog gauges
+or Prometheus counters.
 
 ## Observability
 

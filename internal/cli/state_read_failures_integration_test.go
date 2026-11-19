@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"relay/internal/state"
+	"relay/internal/testutil"
 )
 
 // This file pins the CLI's read-failure contract against a real state
@@ -51,8 +52,10 @@ func brokenStateDeps(t *testing.T) Dependencies {
 // TestStatsCommandReadFailureSurfaces pins the strict read contract for
 // `relay stats`: an unreadable state view fails the command, and nothing is
 // rendered on stdout — a read failure must not pass as the legitimate
-// all-zero snapshot a missing row produces.
+// all-zero snapshot a missing row produces. NODE_ID is set so the default
+// selector passes and the failure really is the read.
 func TestStatsCommandReadFailureSurfaces(t *testing.T) {
+	t.Setenv("NODE_ID", testutil.UniqueName(t, "stats-broken"))
 	deps := brokenStateDeps(t)
 
 	out, _, err := runCLIWithDeps(t, deps, "", "stats")
@@ -71,9 +74,10 @@ func TestStatsCommandReadFailureSurfaces(t *testing.T) {
 }
 
 // TestStatsCommandZeroRowRendersZeros pins the other half of the contract at
-// the command boundary: a FRESH database has no stats row, which is legitimate
-// data — `relay stats` exits 0 with the zero snapshot, not an error.
+// the command boundary: a FRESH database has no stats row for NODE_ID, which is
+// legitimate data — `relay stats` exits 0 with the zero snapshot, not an error.
 func TestStatsCommandZeroRowRendersZeros(t *testing.T) {
+	t.Setenv("NODE_ID", testutil.UniqueName(t, "stats-empty"))
 	deps := stateTestDeps(t)
 
 	out, _, err := runCLIWithDeps(t, deps, "", "stats")

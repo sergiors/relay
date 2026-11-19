@@ -433,6 +433,24 @@ const (
 // has no measured latency SLO to justify a bespoke curve.
 var buckets = prometheus.DefBuckets
 
+// gaugeObservation is one successful gauge sample together with the instant it
+// was observed. The pair travels together so a caller can order two samples by
+// when they were actually observed rather than by an unrelated row write time.
+type gaugeObservation struct {
+	value float64
+	at    time.Time
+}
+
+// backlogObservation is one complete successful Redis consumer-group backlog
+// sample: the pending depth and oldest-pending age observed together, with the
+// instant that pair became valid. Storing it as one value makes a snapshot read
+// the pair atomically.
+type backlogObservation struct {
+	entries          float64
+	oldestAgeSeconds float64
+	at               time.Time
+}
+
 // Registry is a thin, nil-safe facade over a dedicated Prometheus registry. It
 // deliberately does NOT use the global default registry: each Registry owns its
 // own prometheus.NewRegistry() so instances never leak collectors to one another
@@ -447,6 +465,16 @@ type Registry struct {
 	counterVecs   map[string]*labeledCounterVec
 	histogramVecs map[string]*labeledHistogramVec
 	gaugeVecs     map[string]*labeledGaugeVec
+
+	// gaugeObservedMu guards gaugeObserved and pendingBacklog, the
+	// successful-observation metadata for gauges whose freshness cannot be
+	// inferred from the Prometheus value alone. The pending backlog pair is
+	// stored as one value so a snapshot can never mix a new depth with an old
+	// age. It is separate from the collectors because it is Relay-side state,
+	// not a scrape-time metric.
+	gaugeObservedMu sync.RWMutex
+	gaugeObserved   map[string]gaugeObservation
+	pendingBacklog  backlogObservation
 
 	// restoredMu guards restoredDiscards, the Relay-side per-app discard
 	// aggregate restored from persisted state at startup (see SeedAppStat).
@@ -612,6 +640,7 @@ func New() *Registry {
 		counterVecs:   make(map[string]*labeledCounterVec, 7),
 		histogramVecs: make(map[string]*labeledHistogramVec, 2),
 		gaugeVecs:     make(map[string]*labeledGaugeVec, 1),
+		gaugeObserved: make(map[string]gaugeObservation, 2),
 	}
 
 	// Unlabeled counters fed by the runner, stream, and manager (worker reads
@@ -1114,6 +1143,104 @@ func (r *Registry) SetGaugeLabels(name string, labels []Label, v float64) {
 	if g, ok := r.gauges[name]; ok {
 		g.Set(v)
 	}
+}
+
+// SetGaugeObserved sets an unlabeled gauge and records the instant its value was
+// successfully observed. The timestamp is Relay-side metadata for consumers
+// that must order samples of a shared external quantity; it is deliberately not
+// a Prometheus metric. A nil receiver or unknown gauge is a no-op, and a zero
+// instant records no observation.
+func (r *Registry) SetGaugeObserved(name string, v float64, at time.Time) {
+	if r == nil {
+		return
+	}
+	if _, ok := r.gauges[name]; !ok {
+		return
+	}
+	r.SetGauge(name, v)
+	if at.IsZero() {
+		return
+	}
+	r.gaugeObservedMu.Lock()
+	if r.gaugeObserved == nil {
+		r.gaugeObserved = make(map[string]gaugeObservation, 2)
+	}
+	r.gaugeObserved[name] = gaugeObservation{value: v, at: at}
+	r.gaugeObservedMu.Unlock()
+}
+
+// GaugeObservation returns the last value recorded by SetGaugeObserved and its
+// observation instant. ok is false when the gauge was never recorded that way
+// (for example it was set with SetGauge, or this is a fresh registry); value is
+// still the live gauge reading so callers can fall back to it. A nil receiver
+// returns (0, zero, false).
+func (r *Registry) GaugeObservation(name string) (value float64, at time.Time, ok bool) {
+	if r == nil {
+		return 0, time.Time{}, false
+	}
+	r.gaugeObservedMu.RLock()
+	observation, found := r.gaugeObserved[name]
+	r.gaugeObservedMu.RUnlock()
+	if found {
+		return observation.value, observation.at, true
+	}
+	return r.Gauge(name), time.Time{}, false
+}
+
+// SetPendingBacklogObserved publishes the Redis consumer-group backlog pair and
+// its successful-observation instant atomically. The pending depth and oldest
+// pending age are one observation of the same PEL, so storing and exposing them
+// together prevents a concurrent snapshot from persisting a new depth with an
+// old age (or the reverse) marked fresh. A nil receiver, an unknown gauge, or a
+// zero instant is a no-op, preserving the previously observed pair.
+func (r *Registry) SetPendingBacklogObserved(
+	entries, oldestAgeSeconds float64, at time.Time,
+) {
+	if r == nil || at.IsZero() {
+		return
+	}
+	if _, ok := r.gauges[MetricPendingEntries]; !ok {
+		return
+	}
+	if _, ok := r.gauges[MetricPendingOldestAge]; !ok {
+		return
+	}
+	r.gaugeObservedMu.Lock()
+	r.SetGauge(MetricPendingEntries, entries)
+	r.SetGauge(MetricPendingOldestAge, oldestAgeSeconds)
+	if r.gaugeObserved == nil {
+		r.gaugeObserved = make(map[string]gaugeObservation, 2)
+	}
+	r.gaugeObserved[MetricPendingEntries] = gaugeObservation{value: entries, at: at}
+	r.gaugeObserved[MetricPendingOldestAge] = gaugeObservation{value: oldestAgeSeconds, at: at}
+	r.pendingBacklog = backlogObservation{
+		entries:          entries,
+		oldestAgeSeconds: oldestAgeSeconds,
+		at:               at,
+	}
+	r.gaugeObservedMu.Unlock()
+}
+
+// PendingBacklogObservation returns the complete backlog pair recorded by
+// SetPendingBacklogObserved and the instant it was observed. ok is false until a
+// successful observation exists (for example after only a failed XPENDING
+// sample), in which case the prior pair must be preserved; the returned values
+// are then the current live gauges, still read under the same lock as the pair
+// update so a caller never observes a mixed depth/age pair. It never reads the
+// two gauges separately for an observed pair.
+func (r *Registry) PendingBacklogObservation() (
+	entries, oldestAgeSeconds float64, at time.Time, ok bool,
+) {
+	if r == nil {
+		return 0, 0, time.Time{}, false
+	}
+	r.gaugeObservedMu.RLock()
+	defer r.gaugeObservedMu.RUnlock()
+	observation := r.pendingBacklog
+	if observation.at.IsZero() {
+		return r.Gauge(MetricPendingEntries), r.Gauge(MetricPendingOldestAge), time.Time{}, false
+	}
+	return observation.entries, observation.oldestAgeSeconds, observation.at, true
 }
 
 // SetAppStatus writes the one-hot lifecycle status series for an app:

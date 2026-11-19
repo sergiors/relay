@@ -310,7 +310,7 @@ func TestDeployStatusShowsNodeProgressWhileBehind(t *testing.T) {
 	// The node table and per-app progress render their documented columns in
 	// order (spacing is the tabwriter's, so match it loosely).
 	nodeHeader := regexp.MustCompile(`NODE\s+DESIRED\s+ACTIVE\s+STATUS\s+` +
-		`ACTIVE COMMIT\s+UPDATED\s+ERROR`)
+		`COMMIT\s+UPDATED\s+ERROR`)
 	if !nodeHeader.MatchString(out) {
 		t.Fatalf("status output missing the node column header:\n%s", out)
 	}

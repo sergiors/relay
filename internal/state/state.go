@@ -693,23 +693,25 @@ func (st *State) initSchema(ctx context.Context) error {
 		// value): only the process whose instance matches the stored one may
 		// update the row, so a stale incarnation cannot overwrite a newer one.
 		// Only stable relational metadata is a column — the node key, the
-		// incarnation, and the write timestamp updated_at — while the evolving
-		// counter/gauge payload is the JSONB object in data (see Stats and
-		// stats_json.go). JSONB, not a column per field: the payload grows as
-		// instrumentation is added without changing the schema, and absent fields
-		// decode to zero.
+		// incarnation, the node-local reset generation, and the write timestamp
+		// updated_at — while the evolving counter/gauge payload is the JSONB
+		// object in data (see Stats and stats_json.go). JSONB, not a column per
+		// field: the payload grows as instrumentation is added without changing
+		// the schema, and absent fields decode to zero.
 		`CREATE TABLE IF NOT EXISTS stats (
 			node_id TEXT PRIMARY KEY,
 			instance TEXT NOT NULL DEFAULT '',
+			generation BIGINT NOT NULL DEFAULT 0,
 			data JSONB NOT NULL,
 			updated_at TIMESTAMPTZ NOT NULL
 		)`,
 		// stats_meta is the single-row GLOBAL stats epoch (id is pinned to
-		// 'global'). generation is bumped by every `stats reset`; a flush reads
+		// 'global'). generation is bumped by `stats reset --all`; a flush reads
 		// it under a shared lock and rebases when it observes a bump, so a
 		// delayed pre-reset snapshot from ANY worker is fenced out — not only the
-		// socket-owning worker's. It carries no statistics; it is coordination
-		// state.
+		// socket-owning worker's. A node-scoped reset uses the per-node
+		// generation column on stats instead, leaving this global epoch alone.
+		// It carries no statistics; it is coordination state.
 		`CREATE TABLE IF NOT EXISTS stats_meta (
 			id TEXT PRIMARY KEY CHECK (id = 'global'),
 			generation BIGINT NOT NULL DEFAULT 0,

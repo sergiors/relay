@@ -58,10 +58,12 @@ func QueryRuntimeState(path, name string) (RuntimeState, error) {
 	return *resp.RuntimeState, nil
 }
 
-// ResetRuntimeStats asks the live worker at path to reset its accumulated Relay
-// statistics through the socket's semantic "reset stats" command, so the
-// worker's in-memory snapshot source and persisted stats both continue from
-// zero without losing the flush race. It is the CLI's running-worker path.
+// ResetRuntimeStatsForNode asks the live worker at path to reset the selected
+// node's accumulated Relay statistics through the socket's semantic "reset
+// stats" command, so the worker's in-memory snapshot source and persisted stats
+// both continue from zero without losing the flush race. expectedNodeID is the
+// CLI-selected NODE_ID; the worker verifies it before resetting, so config drift
+// cannot clear a different node's counters.
 //
 // Only a POSITIVELY absent worker permits the CLI's direct state-DB fallback:
 // a refused dial (no socket / nothing listening) reports ErrRuntimeStatsNoWorker.
@@ -69,10 +71,25 @@ func QueryRuntimeState(path, name string) (RuntimeState, error) {
 // malformed response — reports ErrRuntimeStatsUnavailable, because a live
 // worker may have reset or may do so after the CLI gives up, and the live
 // worker must stay the authority; the CLI does not fall back on this error. A
-// worker that answered but failed the reset reports ErrRuntimeStatsFailed so the
-// CLI surfaces it. The worker's Prometheus counters are deliberately left
-// monotonic (the worker resets its Relay-side baseline only).
-func ResetRuntimeStats(path string) error {
+// worker that answered but failed or rejected the reset (including a node
+// mismatch) reports ErrRuntimeStatsFailed so the CLI surfaces it. The worker's
+// Prometheus counters are deliberately left monotonic.
+func ResetRuntimeStatsForNode(path, expectedNodeID string) error {
+	return resetRuntimeStats(path, cmdResetStats, expectedNodeID)
+}
+
+// ResetAllRuntimeStats asks the live worker at path to reset EVERY node's
+// accumulated Relay statistics through the socket's global reset command. Other
+// workers detect the advanced shared epoch and rebase their in-memory baselines
+// on their next flush. It has the same error classification as
+// ResetRuntimeStatsForNode: only a positively absent worker permits the CLI's
+// direct state-DB fallback, and every ambiguous or worker-reported failure is
+// surfaced. The global command needs no expected node identity.
+func ResetAllRuntimeStats(path string) error {
+	return resetRuntimeStats(path, cmdResetAllStats, "")
+}
+
+func resetRuntimeStats(path, command, expectedNodeID string) error {
 	dialer := net.Dialer{Timeout: runtimeStateDialTimeout}
 	conn, err := dialer.Dial("unix", path)
 	if err != nil {
@@ -84,7 +101,10 @@ func ResetRuntimeStats(path string) error {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(runtimeStateRequestTimeout))
 
-	if err := json.NewEncoder(conn).Encode(socketRequest{Command: cmdResetStats}); err != nil {
+	if err := json.NewEncoder(conn).Encode(socketRequest{
+		Command: command,
+		NodeID:  expectedNodeID,
+	}); err != nil {
 		return fmt.Errorf("%w: %v", ErrRuntimeStatsUnavailable, err)
 	}
 	var resp socketResponse
@@ -95,7 +115,7 @@ func ResetRuntimeStats(path string) error {
 		if resp.Error == errCodeStatsUnavailable {
 			return fmt.Errorf("%w: %s", ErrRuntimeStatsUnavailable, resp.Error)
 		}
-		return fmt.Errorf("%w: %s", ErrRuntimeStatsFailed, resp.Error)
+		return fmt.Errorf("%w: %s", ErrRuntimeStatsFailed, messageOr(resp.Message, resp.Error))
 	}
 	if !resp.ResetStats {
 		return fmt.Errorf("%w: empty response", ErrRuntimeStatsFailed)

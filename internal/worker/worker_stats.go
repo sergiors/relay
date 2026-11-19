@@ -22,25 +22,44 @@ const statsFlushInterval = 5 * time.Second
 // THIS worker's cumulative counters persisted in the state database, so the
 // first snapshot never resets them. The registry only knows this process's
 // lifetime, while the PostgreSQL stats rows are cumulative history; seeding
-// bridges them. Only the node's OWN rows (keyed by its NodeID)
-// are read — never another node's, so two nodes sharing one database never
-// double-count. It is nil-safe on both the registry and the state handle. Gauges
-// are deliberately NOT restored: they are point-in-time backlog snapshots
-// refreshed each snapshot.
-func restorePersistedStats(metricsInstance *metrics.Registry, st *state.State) {
-	if metricsInstance == nil || st == nil {
-		return
+// bridges them. Only the node's OWN rows (keyed by its NodeID) are read — never
+// another node's, so two nodes sharing one database never double-count. It is
+// nil-safe on both the registry and the state handle. Gauges are deliberately
+// NOT restored: they are point-in-time backlog snapshots refreshed each
+// snapshot.
+//
+// The restore is one atomic state snapshot (data plus reset epochs), and the
+// returned generations initialize the stats flusher. A reset that lands after
+// this snapshot advances an epoch the first flush detects; a reset before it is
+// already reflected in the zeroed data and adopted epochs. Best-effort behavior
+// is preserved: a failed snapshot logs in state, seeds nothing, and returns
+// unknown epochs so the first flush adopts whatever the database holds.
+func restorePersistedStats(
+	metricsInstance *metrics.Registry, st *state.State,
+) state.OwnStatsSnapshot {
+	unknown := state.OwnStatsSnapshot{Generations: state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	}}
+	if st == nil {
+		return unknown
 	}
-	if gs, ok := st.OwnerStats(); ok {
-		metricsInstance.SeedCounter(metrics.MetricEventsReceived, gs.EventsReceivedTotal)
-		metricsInstance.SeedCounter(metrics.MetricEventsMatched, gs.EventsMatchedTotal)
-		metricsInstance.SeedCounter(metrics.MetricEventsUnmatched, gs.EventsUnmatchedTotal)
-		metricsInstance.SeedCounter(metrics.MetricHandlerSuccess, gs.HandlerSuccessTotal)
-		metricsInstance.SeedCounter(metrics.MetricHandlerFailure, gs.HandlerFailureTotal)
-		metricsInstance.SeedCounter(metrics.MetricRetries, gs.RetryTotal)
-		metricsInstance.SeedCounter(metrics.MetricDLQEntries, gs.DLQTotal)
+	snapshot, err := st.OwnStatsSnapshot(context.Background())
+	if err != nil {
+		return unknown
 	}
-	for _, fs := range st.OwnerAppStats() {
+	if metricsInstance == nil {
+		return snapshot
+	}
+	gs := snapshot.Stats
+	metricsInstance.SeedCounter(metrics.MetricEventsReceived, gs.EventsReceivedTotal)
+	metricsInstance.SeedCounter(metrics.MetricEventsMatched, gs.EventsMatchedTotal)
+	metricsInstance.SeedCounter(metrics.MetricEventsUnmatched, gs.EventsUnmatchedTotal)
+	metricsInstance.SeedCounter(metrics.MetricHandlerSuccess, gs.HandlerSuccessTotal)
+	metricsInstance.SeedCounter(metrics.MetricHandlerFailure, gs.HandlerFailureTotal)
+	metricsInstance.SeedCounter(metrics.MetricRetries, gs.RetryTotal)
+	metricsInstance.SeedCounter(metrics.MetricDLQEntries, gs.DLQTotal)
+	for _, fs := range snapshot.AppStats {
 		metricsInstance.SeedAppStat(metrics.AppStat{
 			App:                 fs.App,
 			EventsMatchedTotal:  fs.EventsMatchedTotal,
@@ -63,6 +82,7 @@ func restorePersistedStats(metricsInstance *metrics.Registry, st *state.State) {
 			LastDLQ:       rfc3339ToUnix(fs.LastDLQAt),
 		})
 	}
+	return snapshot
 }
 
 // rfc3339ToUnix parses an RFC3339 timestamp string into its unix-seconds value,
@@ -198,15 +218,19 @@ func captureRelayBaseline(metricsInstance *metrics.Registry) relayBaseline {
 // (base), so an operator reset starts the persisted totals from zero while
 // Prometheus stays monotonic; before any reset the baseline is zero and this
 // equals the raw counter. The backlog gauges are point-in-time values and are
-// never baselined. The three event-classification counters are copied verbatim,
-// preserving the received == matched + unmatched partition.
-// It is nil-safe: a nil registry yields a zero Stats so the snapshot path can
-// never panic or block processing.
+// never baselined; they are read as ONE observation pair together with their
+// observation instant, so a concurrent sampler update cannot persist a mixed
+// depth/age pair marked fresh. Until the first complete observation exists, the
+// live gauge values are snapshotted without a freshness timestamp. The three
+// event-classification counters are copied verbatim, preserving the received ==
+// matched + unmatched partition. It is nil-safe: a nil registry yields a zero
+// Stats so the snapshot path can never panic or block processing.
 func snapshotStats(metricsInstance *metrics.Registry, base *relayBaseline) state.Stats {
 	if metricsInstance == nil {
 		return state.Stats{}
 	}
-	return state.Stats{
+	pending, oldestAge, pendingAt, _ := metricsInstance.PendingBacklogObservation()
+	stats := state.Stats{
 		EventsReceivedTotal: base.counter(
 			metrics.MetricEventsReceived, metricsInstance.Counter(metrics.MetricEventsReceived)),
 		EventsMatchedTotal: base.counter(
@@ -221,9 +245,13 @@ func snapshotStats(metricsInstance *metrics.Registry, base *relayBaseline) state
 			metrics.MetricRetries, metricsInstance.Counter(metrics.MetricRetries)),
 		DLQTotal: base.counter(
 			metrics.MetricDLQEntries, metricsInstance.Counter(metrics.MetricDLQEntries)),
-		PendingEntries:          int64(metricsInstance.Gauge(metrics.MetricPendingEntries)),
-		OldestPendingAgeSeconds: int64(metricsInstance.Gauge(metrics.MetricPendingOldestAge)),
+		PendingEntries:          int64(pending),
+		OldestPendingAgeSeconds: int64(oldestAge),
 	}
+	if !pendingAt.IsZero() {
+		stats.PendingObservedAtUnixMs = pendingAt.UnixMilli()
+	}
+	return stats
 }
 
 // snapshotAppStats maps the registry's per-app counters AND latest
@@ -282,11 +310,13 @@ type statsFlusher struct {
 	// baseline. Zero value = "no reset yet".
 	baseline relayBaseline
 
-	// generation is this worker's last-known global reset epoch (see
-	// state.StatsGeneration). It starts at statsGenerationUnknown so the first
-	// flush adopts whatever epoch the database holds instead of a spurious
-	// rebase, and tracks the epoch every flush returns thereafter.
-	generation int64
+	// generation and nodeGeneration are this worker's last-known shared and
+	// node-local reset epochs (see state.StatsGenerations). They start at
+	// state.StatsGenerationUnknown and are refreshed from the database when the
+	// flusher is built, so the first flush adopts the stored epochs instead of a
+	// spurious rebase; every flush then tracks the epochs it returns.
+	generation     int64
+	nodeGeneration int64
 
 	// ownershipLost records that another process incarnation of the same
 	// node identity has claimed this worker's stats row, so this (stale) process must
@@ -306,17 +336,36 @@ type statsFlusher struct {
 	log *slog.Logger
 }
 
-// statsGenerationUnknown is the sentinel for "this process has not yet observed
-// the global reset epoch". A negative generation tells RecordStatsSnapshot to
-// adopt the stored epoch rather than treat the first flush as a reset race.
-const statsGenerationUnknown = -1
-
-// newStatsFlusher builds a flusher over the state handle and registry. retention
-// and the process logger are installed by the worker after construction; tests
-// that only exercise the flush path leave the defaults (no compaction, default
-// logger).
+// newStatsFlusher builds a flusher whose reset epochs are unknown; the first
+// flush adopts whatever the database holds. Startup uses
+// newStatsFlusherWithGenerations with the epochs captured by the atomic stats
+// restore, so a reset racing startup is detectable instead of pairing stale
+// seeded totals with a newer generation. retention and the process logger are
+// installed by the worker after construction; tests that only exercise the
+// flush path leave the defaults (no compaction, default logger).
 func newStatsFlusher(st *state.State, metricsInstance *metrics.Registry) *statsFlusher {
-	return &statsFlusher{st: st, metrics: metricsInstance, generation: statsGenerationUnknown, log: slog.Default()}
+	return newStatsFlusherWithGenerations(st, metricsInstance, state.StatsGenerations{
+		Global: state.StatsGenerationUnknown,
+		Node:   state.StatsGenerationUnknown,
+	})
+}
+
+// newStatsFlusherWithGenerations builds a flusher initialized from the same
+// atomic restore snapshot that seeded the registry. Those epochs are the
+// linearization point for the seeded totals: any later reset advances one of
+// them and fences the first flush.
+func newStatsFlusherWithGenerations(
+	st *state.State,
+	metricsInstance *metrics.Registry,
+	generations state.StatsGenerations,
+) *statsFlusher {
+	return &statsFlusher{
+		st:             st,
+		metrics:        metricsInstance,
+		generation:     generations.Global,
+		nodeGeneration: generations.Node,
+		log:            slog.Default(),
+	}
 }
 
 // flush captures the current Relay-visible snapshot and writes it in one short
@@ -363,28 +412,33 @@ func (flusher *statsFlusher) flushLocked(ctx context.Context) {
 		return
 	}
 
-	// At most two attempts: the first under the known epoch; if a reset (possibly
-	// from another worker) advanced the epoch in the meantime, rebase the
-	// in-memory baseline to the registry's current values and retry once under
-	// the new epoch. A second advance is left for the next tick rather than
-	// looped on.
+	// At most two attempts: the first under the known epochs; if a reset
+	// (global, or local to this node) advanced an epoch in the meantime, rebase
+	// the in-memory baseline to the registry's current values and retry once
+	// under the new epochs. A second advance is left for the next tick rather
+	// than looped on.
 	for range 2 {
-		gen, err := flusher.st.RecordStatsSnapshot(
+		generations, err := flusher.st.RecordStatsSnapshotWithGenerations(
 			ctx,
-			flusher.generation,
+			state.StatsGenerations{
+				Global: flusher.generation,
+				Node:   flusher.nodeGeneration,
+			},
 			snapshotStats(flusher.metrics, &flusher.baseline),
 			snapshotAppStats(flusher.metrics, &flusher.baseline),
 		)
 		switch {
 		case err == nil:
-			flusher.generation = gen
+			flusher.generation = generations.Global
+			flusher.nodeGeneration = generations.Node
 			flusher.prune(ctx)
 			return
 		case errors.Is(err, state.ErrStatsResetAdvanced):
 			// The persisted rows were just zeroed by a reset. Rebase so the
 			// snapshot restarts from the reset point instead of re-adding the
-			// pre-reset totals, and adopt the epoch it happened under.
-			flusher.generation = gen
+			// pre-reset totals, and adopt the epochs it happened under.
+			flusher.generation = generations.Global
+			flusher.nodeGeneration = generations.Node
 			flusher.baseline = captureRelayBaseline(flusher.metrics)
 		case errors.Is(err, state.ErrStatsOwnershipLost):
 			if !flusher.ownershipLost {
@@ -441,33 +495,78 @@ func (flusher *statsFlusher) dropAppBaseline(name string) {
 	flusher.mu.Unlock()
 }
 
-// ResetStats resets the worker's accumulated Relay statistics. It captures the
-// registry's current raw values as the worker-owned subtraction baseline and
-// rewrites the persisted rows to zero, all while holding the SAME mutex flush
-// uses, so no captured pre-reset snapshot can be written after the reset. It
-// implements StatsResetter for the socket's `reset stats` command and never
-// mutates Prometheus: the registry keeps accumulating monotonically, and the
-// flush subtracts the baseline when it snapshots. The state reset bumps the
-// global generation, which the flusher adopts so its next flush does not mistake
-// its OWN reset for a concurrent one and rebase a second time. A missing state
-// handle (state open failed at startup) reports an error so the socket answers
-// stats_reset_failed and the CLI surfaces it rather than masking a failed worker
-// reset; the baseline is still captured so the in-memory totals continue from
-// zero.
+// NodeID returns the stable node identity this resetter owns, or the empty
+// string when no state handle is available. It implements NodeStatsResetter so
+// the control socket can verify a local reset's expected NODE_ID before
+// touching any counters.
+func (flusher *statsFlusher) NodeID() string {
+	if flusher == nil || flusher.st == nil {
+		return ""
+	}
+	return flusher.st.NodeID()
+}
+
+// ResetStats resets THIS node's accumulated Relay statistics. It captures a
+// candidate subtraction baseline BEFORE the state reset and installs it only
+// after the reset succeeds, all while holding the SAME mutex flush uses, so no
+// captured pre-reset snapshot can be written after the reset. It implements
+// StatsResetter for the socket's local `reset stats` command and never mutates
+// Prometheus: the registry keeps accumulating monotonically, and the flush
+// subtracts the baseline when it snapshots.
+//
+// Capturing before the reset linearizes the baseline safely: an increment after
+// the capture but before the reset commit is zeroed by the reset and excluded
+// from the new baseline, so it is not double-counted; an increment after the
+// commit is after the linearization point and is therefore counted post-reset.
+// Capturing after the commit would drop such increments. A failed reset leaves
+// the effective baseline and epochs untouched, while an ambiguous commit outcome
+// cannot silently lose or double-count: the persisted node epoch was bumped, so
+// the next flush is fenced, rebases to the current registry values, and writes
+// them under the new epoch. A missing state handle reports an error so the
+// socket answers stats_reset_failed and the CLI surfaces it rather than masking
+// a failed worker reset.
 func (flusher *statsFlusher) ResetStats() error {
 	if flusher == nil {
 		return errors.New("stats flusher unavailable")
 	}
 	flusher.mu.Lock()
 	defer flusher.mu.Unlock()
-	flusher.baseline = captureRelayBaseline(flusher.metrics)
 	if flusher.st == nil {
 		return errors.New("state database unavailable")
 	}
-	gen, err := flusher.st.ResetStats()
+	candidate := captureRelayBaseline(flusher.metrics)
+	gen, err := flusher.st.ResetNodeStats(context.Background(), flusher.st.NodeID())
 	if err != nil {
 		return err
 	}
+	flusher.baseline = candidate
+	flusher.nodeGeneration = gen
+	return nil
+}
+
+// ResetAllStats resets EVERY node's accumulated Relay statistics through the
+// global state reset, installing the candidate baseline and new shared epoch
+// only after the reset succeeds, under the same mutex as flush. The candidate is
+// captured before the reset so increments committed after the reset's
+// linearization point are counted post-reset instead of being lost. It
+// implements the socket's `reset stats --all` command; other workers observe the
+// advanced shared epoch on their next flush and rebase without losing monotonic
+// Prometheus counters.
+func (flusher *statsFlusher) ResetAllStats() error {
+	if flusher == nil {
+		return errors.New("stats flusher unavailable")
+	}
+	flusher.mu.Lock()
+	defer flusher.mu.Unlock()
+	if flusher.st == nil {
+		return errors.New("state database unavailable")
+	}
+	candidate := captureRelayBaseline(flusher.metrics)
+	gen, err := flusher.st.ResetAllStats(context.Background())
+	if err != nil {
+		return err
+	}
+	flusher.baseline = candidate
 	flusher.generation = gen
 	return nil
 }

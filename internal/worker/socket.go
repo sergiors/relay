@@ -74,17 +74,19 @@ const (
 
 // Wire commands. Every request frame MUST name its command explicitly:
 // cmdRuntimeState requests app's live pool gauges, cmdResetStats asks the
-// worker to reset its Relay statistics (the command name is the operator-facing
-// semantic, not a DB operation — the socket never exposes storage details), and
-// cmdInvokeApp asks the worker to run app's matching event handlers
-// synchronously against the live runner. An absent or unknown command is
-// malformed.
+// worker to reset its own node's Relay statistics, cmdResetAllStats asks it to
+// reset every node's through the shared epoch (the command names are
+// operator-facing semantics, not DB operations — the socket never exposes
+// storage details), and cmdInvokeApp asks the worker to run app's matching event
+// handlers synchronously against the live runner. An absent or unknown command
+// is malformed.
 const (
-	cmdRuntimeState = "runtime_state"
-	cmdResetStats   = "reset_stats"
-	cmdInvokeApp    = "invoke_app"
-	cmdReplayDLQ    = "replay_dlq"
-	cmdReady        = "ready"
+	cmdRuntimeState  = "runtime_state"
+	cmdResetStats    = "reset_stats"
+	cmdResetAllStats = "reset_all_stats"
+	cmdInvokeApp     = "invoke_app"
+	cmdReplayDLQ     = "replay_dlq"
+	cmdReady         = "ready"
 )
 
 // ErrRuntimeStateUnavailable reports that the live worker query socket could not
@@ -194,8 +196,10 @@ type ReadyResult struct {
 
 // socketRequest is the newline-JSON request frame. Command selects the
 // operation: cmdRuntimeState requests app's live pool gauges (App is
-// required); cmdResetStats asks the worker to reset its Relay statistics;
-// cmdInvokeApp asks the worker to run app's matching event handlers
+// required); cmdResetStats asks the worker to reset its Relay statistics and
+// carries the CLI-selected NodeID as the expected identity, so config drift
+// cannot reset a different node; cmdInvokeApp asks the worker to run app's
+// matching event handlers
 // synchronously (App is required and Event carries the operator-supplied
 // JSON event object); cmdReplayDLQ re-executes one DLQ entry's exact
 // app/handler (App and Handler are required, Event carries the
@@ -214,6 +218,7 @@ type socketRequest struct {
 	Event           json.RawMessage `json:"event,omitempty"`
 	Trace           string          `json:"trace,omitempty"`
 	SourceMessageID string          `json:"source_message_id,omitempty"`
+	NodeID          string          `json:"node_id,omitempty"`
 }
 
 // socketResponse is the newline-JSON response frame. Exactly one of the

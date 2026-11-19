@@ -556,9 +556,11 @@ func TestConcurrentIncrementsAndFlushRaceSafe(t *testing.T) {
 // TestStatsFlusherResetPersistsZero verifies the flusher's ResetStats resets
 // both the in-memory source and the persisted rows, and that a subsequent flush
 // writes the post-reset totals (never resurrecting the pre-reset values), while
-// the Prometheus counters stay monotonic.
+// the Prometheus counters stay monotonic. The handle carries a node identity,
+// the shape production workers use — the node-scoped reset is defined for a
+// worker's own NODE_ID row.
 func TestStatsFlusherResetPersistsZero(t *testing.T) {
-	st := openTempState(t)
+	st, _ := openTempWorkerNodeState(t)
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
 		t.Errorf("state write error: %v", err)
 	}
@@ -572,7 +574,9 @@ func TestStatsFlusherResetPersistsZero(t *testing.T) {
 		t.Fatalf("pre-reset persisted events = %d, want 100", gs.EventsMatchedTotal)
 	}
 
-	f.ResetStats()
+	if err := f.ResetStats(); err != nil {
+		t.Fatalf("ResetStats: %v", err)
+	}
 
 	// Persisted rows are zero immediately.
 	if gs, _ := st.Stats(); gs.EventsMatchedTotal != 0 {
@@ -611,7 +615,7 @@ func TestStatsFlusherResetPersistsZero(t *testing.T) {
 // running concurrently with ResetStats can never persist a pre-reset total after
 // the reset completes, because flush and ResetStats share the flusher mutex.
 func TestStatsFlusherResetRaceNoResurrection(t *testing.T) {
-	st := openTempState(t)
+	st, _ := openTempWorkerNodeState(t)
 	if _, err := st.RecordDiscovered(context.Background(), stateApp("alpha", t.TempDir())); err != nil {
 		t.Errorf("state write error: %v", err)
 	}

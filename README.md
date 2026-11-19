@@ -104,8 +104,8 @@ relay start
 
 relay health
 
-relay stats
-relay stats reset
+relay stats [--node <id>|--all]
+relay stats reset [--all]
 
 relay app ls
 relay app inspect <name>
@@ -127,7 +127,6 @@ relay git sync
 relay git status
 relay git remove
 
-relay deploy
 relay deploy status
 relay deploy rollback <sha>
 relay deploy pin

@@ -491,3 +491,111 @@ func TestRestoreSkipsInvalidAndEmptyTimestamps(t *testing.T) {
 		t.Fatalf("invalid/empty timestamps must restore as 0: %+v", fs)
 	}
 }
+
+// TestRestorePairsGenerationsWithRestoredTotals pins the atomic startup
+// contract: the restore snapshot carries the node's data AND the global/node
+// reset epochs read in the SAME transaction, and a flusher built from that
+// exact pair writes the restored totals back untouched — no spurious rebase on
+// the first flush.
+func TestRestorePairsGenerationsWithRestoredTotals(t *testing.T) {
+	ctx := context.Background()
+	st, _ := openTempWorkerNodeState(t)
+	st.RecordStats(state.Stats{EventsMatchedTotal: 100})
+	st.RecordAppStats(state.AppStats{App: "alpha", EventsMatchedTotal: 9})
+
+	m := metrics.New()
+	snapshot := restorePersistedStats(m, st)
+
+	gens, err := st.StatsGenerations()
+	if err != nil {
+		t.Fatalf("StatsGenerations: %v", err)
+	}
+	if snapshot.Generations != gens {
+		t.Fatalf("restored generations = %+v, want %+v (data and epochs from one snapshot)",
+			snapshot.Generations, gens)
+	}
+	if snapshot.Stats.EventsMatchedTotal != 100 {
+		t.Fatalf("restored snapshot events = %d, want 100", snapshot.Stats.EventsMatchedTotal)
+	}
+	if got := m.Counter(metrics.MetricEventsMatched); got != 100 {
+		t.Fatalf("seeded registry events = %d, want 100", got)
+	}
+
+	f := newStatsFlusherWithGenerations(st, m, snapshot.Generations)
+	f.flush(ctx)
+	if s, ok := st.Stats(); !ok || s.EventsMatchedTotal != 100 {
+		t.Fatalf("first post-restore flush = %+v ok=%v, want 100 (no spurious rebase)", s, ok)
+	}
+}
+
+// TestResetDuringStartupFencesFirstFlush is the reset-across-restart race: a
+// global reset lands AFTER the startup restore snapshot but BEFORE the first
+// flush. The restored epochs must fence that flush, which rebases to the
+// registry's current values and restarts the persisted totals from zero — the
+// pre-reset 100 is never resurrected — while Prometheus stays monotonic.
+func TestResetDuringStartupFencesFirstFlush(t *testing.T) {
+	ctx := context.Background()
+	st, dsn := openTempWorkerNodeState(t)
+	admin := testutil.OpenState(t, dsn)
+	st.RecordStats(state.Stats{EventsMatchedTotal: 100})
+
+	m := metrics.New()
+	snapshot := restorePersistedStats(m, st)
+
+	// An operator resets while the worker is still starting.
+	if _, err := admin.ResetStats(); err != nil {
+		t.Fatalf("reset during startup: %v", err)
+	}
+
+	f := newStatsFlusherWithGenerations(st, m, snapshot.Generations)
+	f.flush(ctx)
+	if s, ok := st.Stats(); !ok || s.EventsMatchedTotal != 0 {
+		t.Fatalf("first flush after a startup reset = %+v ok=%v, want 0 (fenced and rebased)", s, ok)
+	}
+	if got := m.Counter(metrics.MetricEventsMatched); got != 100 {
+		t.Fatalf("Prometheus events = %d, want 100 (monotonic across the reset)", got)
+	}
+	// The flusher adopted the epochs it fenced on, so the next flush is normal.
+	gens, err := st.StatsGenerations()
+	if err != nil {
+		t.Fatalf("StatsGenerations: %v", err)
+	}
+	if f.generation != gens.Global {
+		t.Fatalf("flusher global epoch = %d, want %d (adopted after the rebase)", f.generation, gens.Global)
+	}
+	m.Add(metrics.MetricEventsMatched, 5)
+	f.flush(ctx)
+	if s, _ := st.Stats(); s.EventsMatchedTotal != 5 {
+		t.Fatalf("post-rebase events = %d, want 5", s.EventsMatchedTotal)
+	}
+}
+
+// TestRestoreAfterResetStartsFromZero is the other restart ordering: the reset
+// lands BEFORE the worker restores. The snapshot then pairs the already-zeroed
+// data with the post-reset epochs, so the registry seeds at zero and the first
+// flush writes zero with no fence at all.
+func TestRestoreAfterResetStartsFromZero(t *testing.T) {
+	ctx := context.Background()
+	st, dsn := openTempWorkerNodeState(t)
+	admin := testutil.OpenState(t, dsn)
+	st.RecordStats(state.Stats{EventsMatchedTotal: 100})
+
+	if _, err := admin.ResetStats(); err != nil {
+		t.Fatalf("reset before restart: %v", err)
+	}
+
+	m := metrics.New()
+	snapshot := restorePersistedStats(m, st)
+	if snapshot.Stats.EventsMatchedTotal != 0 {
+		t.Fatalf("restored events = %d, want 0 (the reset landed before the restore)", snapshot.Stats.EventsMatchedTotal)
+	}
+	if got := m.Counter(metrics.MetricEventsMatched); got != 0 {
+		t.Fatalf("seeded registry events = %d, want 0", got)
+	}
+
+	f := newStatsFlusherWithGenerations(st, m, snapshot.Generations)
+	f.flush(ctx)
+	if s, ok := st.Stats(); !ok || s.EventsMatchedTotal != 0 {
+		t.Fatalf("first flush = %+v ok=%v, want 0", s, ok)
+	}
+}

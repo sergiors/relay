@@ -19,6 +19,16 @@ import (
 // than skips, when the database is unreachable. Only tests that genuinely read
 // or write state should use it; the default testDeps stays database-free.
 func stateTestDeps(t *testing.T) Dependencies {
+	deps, _ := stateTestDepsWithDSN(t)
+	return deps
+}
+
+// stateTestDepsWithDSN is stateTestDeps plus the DSN its OpenState uses, for
+// fixtures that must open their OWN node-scoped handle on the same schema:
+// stats rows are keyed by node identity, so seeding NODE_ID's row (or another
+// node's) needs a handle carrying that identity, not the fixture's identity-
+// free admin handles.
+func stateTestDepsWithDSN(t *testing.T) (Dependencies, string) {
 	t.Helper()
 	deps := testDeps(t)
 	dsn := testutil.NewStateDSN(t)
@@ -29,7 +39,7 @@ func stateTestDeps(t *testing.T) Dependencies {
 		}
 		return st, func() { _ = st.Close() }, nil
 	}
-	return deps
+	return deps, dsn
 }
 
 // TestNonStartCommandsDoNotAcquireLock pins that administrative commands never

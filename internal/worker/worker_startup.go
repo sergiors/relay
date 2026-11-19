@@ -29,6 +29,11 @@ type startupAppSet struct {
 	issues       []app.LoadIssue
 	records      []startupApp
 	fingerprints map[string]string
+	// statsRestore is the atomic own-node stats snapshot used both to seed the
+	// fresh metrics registry and to initialize the stats flusher's reset epochs.
+	// Keeping the pair together prevents a reset between the two reads from
+	// pairing stale registry totals with the post-reset generation.
+	statsRestore state.OwnStatsSnapshot
 	// fencingTokens carries the PostgreSQL fencing token persisted for each app's
 	// startup desired generation, keyed by app name. Startup preparation, its
 	// build observer, the startup service callbacks, and the reconciler seed all
@@ -228,9 +233,11 @@ func loadStartupAppsWithAuthorization(
 	// the first snapshot writes them back instead of zeroing PostgreSQL. Each
 	// worker restores only its own rows (stats are keyed by node identity), so
 	// two nodes sharing the database never double-count. Gauges are NOT
-	// restored (they are point-in-time snapshots refreshed each interval).
+	// restored (they are point-in-time snapshots refreshed each interval). The
+	// same atomic snapshot carries the reset epochs the stats flusher adopts, so
+	// a reset racing startup cannot pair these seeded totals with a newer epoch.
 	_, statsRestoreSpan := tracing.Start(startupCtx, "state.restore_stats")
-	restorePersistedStats(metricsInstance, st)
+	statsRestore := restorePersistedStats(metricsInstance, st)
 	statsRestoreSpan.End()
 
 	return startupAppSet{
@@ -239,6 +246,7 @@ func loadStartupAppsWithAuthorization(
 		records:       startup,
 		fingerprints:  fingerprints,
 		fencingTokens: fencingTokens,
+		statsRestore:  statsRestore,
 	}, nil
 }
 

@@ -45,6 +45,7 @@ func TestRestartPreservesGlobalStats(t *testing.T) {
 		DLQTotal:                2,
 		PendingEntries:          9,
 		OldestPendingAgeSeconds: 42,
+		PendingObservedAtUnixMs: 1767225600000,
 	}
 	c1.RecordStats(want)
 	_ = c1.Close()

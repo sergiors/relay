@@ -52,6 +52,35 @@ func TestSnapshotStatsNilRegistry(t *testing.T) {
 	}
 }
 
+// TestSnapshotStatsCarriesBacklogObservation pins the backlog half of the
+// snapshot: a COMPLETE observed pair is persisted WITH its observation instant
+// (the JSONB timestamp the cross-node aggregate orders gauges by), while live
+// gauges that were never observed are persisted without claiming freshness.
+func TestSnapshotStatsCarriesBacklogObservation(t *testing.T) {
+	m := metrics.New()
+	m.SetGauge(metrics.MetricPendingEntries, 9)
+	m.SetGauge(metrics.MetricPendingOldestAge, 4)
+
+	got := snapshotStats(m, nil)
+	if got.PendingEntries != 9 || got.OldestPendingAgeSeconds != 4 {
+		t.Fatalf("unobserved gauges = (%d, %d), want the live values (9, 4)",
+			got.PendingEntries, got.OldestPendingAgeSeconds)
+	}
+	if got.PendingObservedAtUnixMs != 0 {
+		t.Fatalf("unobserved snapshot claimed observation instant %d, want 0 (no freshness)",
+			got.PendingObservedAtUnixMs)
+	}
+
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	m.SetPendingBacklogObserved(4, 12, at)
+	got = snapshotStats(m, nil)
+	if got.PendingEntries != 4 || got.OldestPendingAgeSeconds != 12 ||
+		got.PendingObservedAtUnixMs != at.UnixMilli() {
+		t.Fatalf("observed snapshot = %+v, want the pair (4, 12) with instant %d",
+			got, at.UnixMilli())
+	}
+}
+
 // TestFuncSnapshotStatsMapping pins the per-app registry-to-state row
 // mapping, indexed by app name.
 func TestFuncSnapshotStatsMapping(t *testing.T) {

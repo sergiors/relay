@@ -469,18 +469,31 @@ func TestRuntimeSocketActiveOwnershipGuard(t *testing.T) {
 	}
 }
 
-// fakeStatsResetter counts ResetStats calls for socket tests.
+// fakeStatsResetter counts ResetStats calls for socket tests and reports the
+// node identity a local reset must name (NodeID), so the socket's
+// expected-target check — the worker verifies the CLI-selected NODE_ID BEFORE
+// resetting — can be exercised. The compile-time assertion pins that the fake
+// really satisfies the identity extension a local reset requires.
 type fakeStatsResetter struct {
-	mu    sync.Mutex
-	calls int
-	err   error
+	mu     sync.Mutex
+	nodeID string
+	calls  int
+	err    error
 }
+
+var _ NodeStatsResetter = (*fakeStatsResetter)(nil)
 
 func (f *fakeStatsResetter) ResetStats() error {
 	f.mu.Lock()
 	f.calls++
 	f.mu.Unlock()
 	return f.err
+}
+
+func (f *fakeStatsResetter) NodeID() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nodeID
 }
 
 func (f *fakeStatsResetter) count() int {
@@ -490,15 +503,16 @@ func (f *fakeStatsResetter) count() int {
 }
 
 // TestRuntimeSocketResetStatsCommand verifies the semantic "reset stats" command
-// invokes the worker's StatsResetter exactly once and answers with the reset
-// frame, and that an unknown command is rejected without invoking the resetter.
+// invokes the worker's StatsResetter exactly once — for the matching expected
+// node the CLI names — and answers with the reset frame, and that an unknown
+// command is rejected without invoking the resetter.
 func TestRuntimeSocketResetStatsCommand(t *testing.T) {
 	path := testSocketPath(t)
-	resetter := &fakeStatsResetter{}
+	resetter := &fakeStatsResetter{nodeID: "worker-a"}
 	startTestSocketWithResetter(t, path, map[string]runtime.PoolSnapshot{"fn": {App: "fn"}}, resetter)
 
-	if err := ResetRuntimeStats(path); err != nil {
-		t.Fatalf("ResetRuntimeStats: %v", err)
+	if err := ResetRuntimeStatsForNode(path, resetter.nodeID); err != nil {
+		t.Fatalf("ResetRuntimeStatsForNode: %v", err)
 	}
 	if got := resetter.count(); got != 1 {
 		t.Fatalf("resetter calls = %d, want 1", got)
@@ -520,13 +534,14 @@ func TestRuntimeSocketResetStatsCommand(t *testing.T) {
 }
 
 // TestRuntimeSocketResetStatsUnavailable verifies a worker with no stats
-// resetter answers stats_unavailable (so the CLI falls back to the state DB)
-// rather than looking like a successful reset.
+// resetter answers stats_unavailable (so the CLI surfaces it) rather than
+// looking like a successful reset — and this holds for a correctly targeted
+// local reset, so the empty-target rejection below is not what fires here.
 func TestRuntimeSocketResetStatsUnavailable(t *testing.T) {
 	path := testSocketPath(t)
 	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {App: "fn"}})
 
-	err := ResetRuntimeStats(path)
+	err := ResetRuntimeStatsForNode(path, "worker-a")
 	if !errors.Is(err, ErrRuntimeStatsUnavailable) {
 		t.Fatalf("error = %v, want ErrRuntimeStatsUnavailable", err)
 	}
@@ -537,10 +552,10 @@ func TestRuntimeSocketResetStatsUnavailable(t *testing.T) {
 // ErrRuntimeStatsUnavailable, so the CLI surfaces it instead of masking it.
 func TestRuntimeSocketResetStatsResetterError(t *testing.T) {
 	path := testSocketPath(t)
-	resetter := &fakeStatsResetter{err: errors.New("state unavailable")}
+	resetter := &fakeStatsResetter{nodeID: "worker-a", err: errors.New("state unavailable")}
 	startTestSocketWithResetter(t, path, nil, resetter)
 
-	err := ResetRuntimeStats(path)
+	err := ResetRuntimeStatsForNode(path, resetter.nodeID)
 	if !errors.Is(err, ErrRuntimeStatsFailed) {
 		t.Fatalf("error = %v, want ErrRuntimeStatsFailed", err)
 	}
@@ -552,12 +567,235 @@ func TestRuntimeSocketResetStatsResetterError(t *testing.T) {
 	}
 }
 
+// TestRuntimeSocketResetStatsNodeMismatchFails pins the target check: a local
+// reset naming a DIFFERENT node than the worker actually is fails as a
+// worker-reported failure (ErrRuntimeStatsFailed, never
+// ErrRuntimeStatsUnavailable, so the CLI never falls back to a direct state
+// write) and must not invoke the resetter at all — config drift cannot clear
+// another node's counters.
+func TestRuntimeSocketResetStatsNodeMismatchFails(t *testing.T) {
+	path := testSocketPath(t)
+	resetter := &fakeStatsResetter{nodeID: "worker-a"}
+	startTestSocketWithResetter(t, path, nil, resetter)
+
+	err := ResetRuntimeStatsForNode(path, "worker-b")
+	if !errors.Is(err, ErrRuntimeStatsFailed) {
+		t.Fatalf("error = %v, want ErrRuntimeStatsFailed", err)
+	}
+	if errors.Is(err, ErrRuntimeStatsUnavailable) {
+		t.Fatalf("a mismatched target must not look like an unreachable worker: %v", err)
+	}
+	if !strings.Contains(err.Error(), "mismatch") {
+		t.Fatalf("error must carry the worker's mismatch report: %v", err)
+	}
+	if got := resetter.count(); got != 0 {
+		t.Fatalf("resetter calls = %d, want 0 (rejected before resetting)", got)
+	}
+}
+
+// TestRuntimeSocketResetStatsEmptyTargetFails pins the empty-target half: a
+// local reset that names NO expected node is rejected by the worker before
+// resetting — as a worker-reported failure (ErrRuntimeStatsFailed, never
+// ErrRuntimeStatsUnavailable), so the CLI cannot mistake it for an absent
+// worker and fall back to the state DB.
+func TestRuntimeSocketResetStatsEmptyTargetFails(t *testing.T) {
+	path := testSocketPath(t)
+	resetter := &fakeStatsResetter{nodeID: "worker-a"}
+	startTestSocketWithResetter(t, path, nil, resetter)
+
+	err := ResetRuntimeStatsForNode(path, "")
+	if !errors.Is(err, ErrRuntimeStatsFailed) {
+		t.Fatalf("error = %v, want ErrRuntimeStatsFailed", err)
+	}
+	if errors.Is(err, ErrRuntimeStatsUnavailable) {
+		t.Fatalf("an empty target must not look like an unreachable worker: %v", err)
+	}
+	if !strings.Contains(err.Error(), "node id required") {
+		t.Fatalf("error must carry the worker's empty-target report: %v", err)
+	}
+	if got := resetter.count(); got != 0 {
+		t.Fatalf("resetter calls = %d, want 0 (rejected before resetting)", got)
+	}
+}
+
+// plainStatsResetter implements ONLY StatsResetter — deliberately WITHOUT the
+// NodeStatsResetter identity extension — so the socket's "resetter cannot
+// vouch for a node identity" branch is reachable. The test pins the fixture's
+// shape at runtime, since Go has no negative compile-time assertion.
+type plainStatsResetter struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (p *plainStatsResetter) ResetStats() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	return nil
+}
+
+func (p *plainStatsResetter) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
+// TestRuntimeSocketResetStatsWithoutNodeExtension pins the first defensive
+// branch: a local reset against a resetter that implements ONLY StatsResetter
+// (no NodeStatsResetter) is answered stats_unavailable — the worker cannot
+// verify the requested node identity, so it must not reset — and the
+// resetter's ResetStats is never invoked. The CLI surfaces this as
+// ErrRuntimeStatsUnavailable, never ErrRuntimeStatsNoWorker, so no direct
+// state-DB fallback happens either.
+func TestRuntimeSocketResetStatsWithoutNodeExtension(t *testing.T) {
+	path := testSocketPath(t)
+	resetter := &plainStatsResetter{}
+	if _, ok := any(resetter).(NodeStatsResetter); ok {
+		t.Fatal("fixture must implement only StatsResetter, not NodeStatsResetter")
+	}
+	startTestSocketWithResetter(t, path, nil, resetter)
+
+	err := ResetRuntimeStatsForNode(path, "worker-a")
+	if !errors.Is(err, ErrRuntimeStatsUnavailable) {
+		t.Fatalf("error = %v, want ErrRuntimeStatsUnavailable", err)
+	}
+	if errors.Is(err, ErrRuntimeStatsNoWorker) {
+		t.Fatalf("an identity-less worker must not look like an absent worker: %v", err)
+	}
+	if got := resetter.count(); got != 0 {
+		t.Fatalf("resetter calls = %d, want 0 (identity check happens before any reset)", got)
+	}
+}
+
+// TestRuntimeSocketResetStatsEmptyWorkerNodeID pins the second defensive
+// branch: a resetter that HAS the NodeStatsResetter extension but reports an
+// empty identity still cannot vouch for which node it is, so a local reset is
+// answered stats_unavailable and ResetStats is never invoked — same no-fallback
+// classification as a missing extension.
+func TestRuntimeSocketResetStatsEmptyWorkerNodeID(t *testing.T) {
+	path := testSocketPath(t)
+	resetter := &fakeStatsResetter{nodeID: ""}
+	startTestSocketWithResetter(t, path, nil, resetter)
+
+	err := ResetRuntimeStatsForNode(path, "worker-a")
+	if !errors.Is(err, ErrRuntimeStatsUnavailable) {
+		t.Fatalf("error = %v, want ErrRuntimeStatsUnavailable", err)
+	}
+	if errors.Is(err, ErrRuntimeStatsNoWorker) {
+		t.Fatalf("an identity-less worker must not look like an absent worker: %v", err)
+	}
+	if got := resetter.count(); got != 0 {
+		t.Fatalf("resetter calls = %d, want 0 (identity check happens before any reset)", got)
+	}
+}
+
+// fakeGlobalStatsResetter extends the socket-test fake with the global reset
+// command and a node identity, counting the two commands separately so a test
+// can prove WHICH command the client asked for.
+type fakeGlobalStatsResetter struct {
+	mu         sync.Mutex
+	nodeID     string
+	localCalls int
+	allCalls   int
+	err        error
+}
+
+var _ NodeStatsResetter = (*fakeGlobalStatsResetter)(nil)
+var _ GlobalStatsResetter = (*fakeGlobalStatsResetter)(nil)
+
+func (f *fakeGlobalStatsResetter) ResetStats() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.localCalls++
+	return f.err
+}
+
+func (f *fakeGlobalStatsResetter) ResetAllStats() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.allCalls++
+	return f.err
+}
+
+func (f *fakeGlobalStatsResetter) NodeID() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nodeID
+}
+
+func (f *fakeGlobalStatsResetter) counts() (local, all int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.localCalls, f.allCalls
+}
+
+// TestRuntimeSocketResetAllStatsCommand verifies the global `reset stats --all`
+// wire command reaches the resetter's global operation exactly once and never
+// the node-scoped one, while the node-scoped command still routes to the local
+// operation on the same socket when it names the worker's own node.
+func TestRuntimeSocketResetAllStatsCommand(t *testing.T) {
+	path := testSocketPath(t)
+	resetter := &fakeGlobalStatsResetter{nodeID: "worker-a"}
+	startTestSocketWithResetter(t, path, nil, resetter)
+
+	if err := ResetAllRuntimeStats(path); err != nil {
+		t.Fatalf("ResetAllRuntimeStats: %v", err)
+	}
+	if local, all := resetter.counts(); local != 0 || all != 1 {
+		t.Fatalf("reset calls = local %d, all %d; want 0/1 (the --all command must not reset locally)", local, all)
+	}
+
+	// The node-scoped command still routes to the local reset on the same
+	// socket, and the two commands stay distinct.
+	if err := ResetRuntimeStatsForNode(path, resetter.nodeID); err != nil {
+		t.Fatalf("ResetRuntimeStatsForNode: %v", err)
+	}
+	if local, all := resetter.counts(); local != 1 || all != 1 {
+		t.Fatalf("reset calls = local %d, all %d; want 1/1", local, all)
+	}
+}
+
+// TestRuntimeSocketResetAllStatsNeedsGlobalResetter pins that a resetter
+// without the global extension answers stats_unavailable for `--all` instead of
+// silently performing a node-local one: the CLI must never mistake a local
+// reset for a global one, and there is no fallback for that answer.
+func TestRuntimeSocketResetAllStatsNeedsGlobalResetter(t *testing.T) {
+	path := testSocketPath(t)
+	resetter := &fakeStatsResetter{}
+	startTestSocketWithResetter(t, path, nil, resetter)
+
+	err := ResetAllRuntimeStats(path)
+	if !errors.Is(err, ErrRuntimeStatsUnavailable) {
+		t.Fatalf("error = %v, want ErrRuntimeStatsUnavailable", err)
+	}
+	if got := resetter.count(); got != 0 {
+		t.Fatalf("local resetter calls = %d, want 0 (--all must never degrade to a local reset)", got)
+	}
+}
+
+// TestRuntimeSocketResetAllStatsResetterError verifies a worker-reported
+// failure of the GLOBAL reset surfaces as ErrRuntimeStatsFailed, so the CLI
+// reports it rather than falling back to a direct state write.
+func TestRuntimeSocketResetAllStatsResetterError(t *testing.T) {
+	path := testSocketPath(t)
+	resetter := &fakeGlobalStatsResetter{err: errors.New("corrupt payload")}
+	startTestSocketWithResetter(t, path, nil, resetter)
+
+	err := ResetAllRuntimeStats(path)
+	if !errors.Is(err, ErrRuntimeStatsFailed) {
+		t.Fatalf("error = %v, want ErrRuntimeStatsFailed", err)
+	}
+	if local, all := resetter.counts(); local != 0 || all != 1 {
+		t.Fatalf("reset calls = local %d, all %d; want 0/1", local, all)
+	}
+}
+
 // TestResetRuntimeStatsNoSocket verifies the standalone no-worker case reports
 // ErrRuntimeStatsNoWorker (positively absent: the socket file does not exist),
 // which is the ONLY outcome that lets the CLI reset the state database directly.
 func TestResetRuntimeStatsNoSocket(t *testing.T) {
 	path := filepath.Join(shortTempDir(t), "missing.sock")
-	err := ResetRuntimeStats(path)
+	err := ResetRuntimeStatsForNode(path, "worker-a")
 	if !errors.Is(err, ErrRuntimeStatsNoWorker) {
 		t.Fatalf("error = %v, want ErrRuntimeStatsNoWorker", err)
 	}
@@ -586,7 +824,7 @@ func TestResetRuntimeStatsRefusedSocketIsNoWorker(t *testing.T) {
 		t.Fatalf("close listener: %v", err)
 	}
 
-	if err := ResetRuntimeStats(path); !errors.Is(err, ErrRuntimeStatsNoWorker) {
+	if err := ResetRuntimeStatsForNode(path, "worker-a"); !errors.Is(err, ErrRuntimeStatsNoWorker) {
 		t.Fatalf("error = %v, want ErrRuntimeStatsNoWorker (refused)", err)
 	}
 }
@@ -622,7 +860,7 @@ func TestResetRuntimeStatsTimeoutIsAmbiguous(t *testing.T) {
 		wg.Wait()
 	})
 
-	err = ResetRuntimeStats(path)
+	err = ResetRuntimeStatsForNode(path, "worker-a")
 	if !errors.Is(err, ErrRuntimeStatsUnavailable) {
 		t.Fatalf("error = %v, want ErrRuntimeStatsUnavailable (ambiguous timeout)", err)
 	}

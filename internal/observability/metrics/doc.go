@@ -65,7 +65,8 @@
 //     relay_service_reconcile_duration_seconds{app}
 //     (prometheus.DefBuckets; all observed in seconds).
 //   - Gauges: relay_pending_entries and relay_pending_oldest_age_seconds
-//     (Redis backlog depth and age sampled by the stream consumer),
+//     (Redis backlog depth and age sampled by the stream consumer; the two are
+//     recorded as one atomic observation with a shared freshness instant),
 //     relay_stream_group_lag_entries (the configured consumer group's lag, from
 //     XINFO GROUPS) sampled by the stream-metrics source, and relay_dlq_depth
 //     (an APPROXIMATE durable PostgreSQL DLQ row count from pg_class.reltuples,

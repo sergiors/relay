@@ -176,6 +176,22 @@ func TestPendingGaugeSourceRefreshRecordsDepthAndAge(t *testing.T) {
 	if got < want-2 || got > want+2 {
 		t.Fatalf("pending_oldest_age_seconds = %v, want ~%v", got, want)
 	}
+	// The depth and age are published as ONE observation pair with a single
+	// successful-observation instant, so a persisted snapshot can order this
+	// pair against another node's.
+	entries, age, at, ok := m.PendingBacklogObservation()
+	if !ok {
+		t.Fatal("a successful XPENDING sample must record a backlog observation")
+	}
+	if entries != 1 {
+		t.Fatalf("observed entries = %v, want 1", entries)
+	}
+	if age < want-2 || age > want+2 {
+		t.Fatalf("observed age = %v, want ~%v", age, want)
+	}
+	if at.IsZero() {
+		t.Fatal("observed backlog pair must carry a non-zero observation instant")
+	}
 }
 
 // TestPendingGaugeSourceRefreshEmptyPELZeroesDepthAndAge is the regression for
@@ -209,6 +225,12 @@ func TestPendingGaugeSourceRefreshEmptyPELZeroesDepthAndAge(t *testing.T) {
 	if got := m.Gauge(metrics.MetricPendingOldestAge); got != 0 {
 		t.Fatalf("pending_oldest_age_seconds after empty PEL = %v, want 0 (stale age must be cleared)", got)
 	}
+	// The emptied backlog is itself a complete observation, so the published
+	// pair is the zeroed one — marked fresh, not left stale.
+	if entries, age, at, ok := m.PendingBacklogObservation(); !ok || entries != 0 || age != 0 || at.IsZero() {
+		t.Fatalf("backlog observation after empty PEL = (%v, %v, %v, %v), want a fresh zero pair",
+			entries, age, at, ok)
+	}
 
 	// The zeroed gauges must be visible on the wire, not only in the Registry's
 	// typed getters: scrape the same exposition handler the worker serves and
@@ -228,8 +250,10 @@ func TestPendingGaugeSourceRefreshEmptyPELZeroesDepthAndAge(t *testing.T) {
 }
 
 // TestPendingGaugeSourceRefreshErrorDoesNotZeroGauges pins that a XPENDING
-// failure preserves the previously sampled gauges (fail open, no false zero):
-// the read error is counted and the depth/age are left untouched.
+// failure preserves the previously sampled gauges AND their observation
+// freshness (fail open, no false zero and no re-dated pair): the read error is
+// counted, the depth/age stay untouched, and the last successful observation
+// instant is what a persisted snapshot still orders by.
 func TestPendingGaugeSourceRefreshErrorDoesNotZeroGauges(t *testing.T) {
 	m := metrics.New()
 	f := &fakePendingSummarizer{val: &redis.XPending{Count: 3, Lower: "1234567-0"}}
@@ -240,6 +264,10 @@ func TestPendingGaugeSourceRefreshErrorDoesNotZeroGauges(t *testing.T) {
 	age := m.Gauge(metrics.MetricPendingOldestAge)
 	if depth != 3 || age <= 0 {
 		t.Fatalf("setup: depth = %v, age = %v, want (3, >0)", depth, age)
+	}
+	pairEntries, pairAge, pairAt, pairOK := m.PendingBacklogObservation()
+	if !pairOK {
+		t.Fatal("setup: a successful sample must record a backlog observation")
 	}
 
 	f.err = errors.New("connection refused")
@@ -252,17 +280,23 @@ func TestPendingGaugeSourceRefreshErrorDoesNotZeroGauges(t *testing.T) {
 	if got := m.Gauge(metrics.MetricPendingOldestAge); got != age {
 		t.Fatalf("pending_oldest_age_seconds after read error = %v, want %v (preserved)", got, age)
 	}
+	entries, oldest, at, ok := m.PendingBacklogObservation()
+	if !ok || entries != pairEntries || oldest != pairAge || !at.Equal(pairAt) {
+		t.Fatalf("backlog observation after read error = (%v, %v, %v, %v), want the prior pair (%v, %v, %v)",
+			entries, oldest, at, ok, pairEntries, pairAge, pairAt)
+	}
 	labels := []metrics.Label{{Name: "operation", Value: metrics.RedisOpPendingGauge}}
 	if got := m.CounterLabels(metrics.MetricRedisReadErrors, labels); got != 1 {
 		t.Fatalf("pending_gauge read errors = %d, want 1", got)
 	}
 }
 
-// TestPendingGaugeSourceRefreshUnparsableOldestIDKeepsPriorAge pins the
-// non-empty-PEL semantics exactly as they were: the depth is always recorded,
-// but an unparsable oldest ID leaves the prior age rather than zeroing it (only
-// an empty PEL zeroes the age).
-func TestPendingGaugeSourceRefreshUnparsableOldestIDKeepsPriorAge(t *testing.T) {
+// TestPendingGaugeSourceRefreshUnparsableOldestIDKeepsPriorPair pins the
+// non-empty-PEL semantics: a PEL whose oldest ID cannot be parsed is not a
+// COMPLETE observation, so NEITHER gauge nor the observation instant may move —
+// a half-updated pair (new depth, stale age, or an unobserved pair marked
+// fresh) must never be published. Only an empty PEL zeroes both gauges.
+func TestPendingGaugeSourceRefreshUnparsableOldestIDKeepsPriorPair(t *testing.T) {
 	m := metrics.New()
 	f := &fakePendingSummarizer{val: &redis.XPending{Count: 1, Lower: "1234567-0"}}
 	src := newPendingGaugeTestSource(f, m)
@@ -272,15 +306,25 @@ func TestPendingGaugeSourceRefreshUnparsableOldestIDKeepsPriorAge(t *testing.T) 
 	if age <= 0 {
 		t.Fatalf("setup: pending_oldest_age_seconds = %v, want > 0", age)
 	}
+	entries, oldest, at, ok := m.PendingBacklogObservation()
+	if !ok || entries != 1 {
+		t.Fatalf("setup: backlog observation = (%v, %v, %v, %v), want the successful pair",
+			entries, oldest, at, ok)
+	}
 
 	f.val = &redis.XPending{Count: 2, Lower: "not-a-stream-id"}
 	src.Refresh(context.Background())
 
-	if got := m.Gauge(metrics.MetricPendingEntries); got != 2 {
-		t.Fatalf("pending_entries = %v, want 2", got)
+	if got := m.Gauge(metrics.MetricPendingEntries); got != 1 {
+		t.Fatalf("pending_entries = %v, want 1 (depth must not move without a complete pair)", got)
 	}
 	if got := m.Gauge(metrics.MetricPendingOldestAge); got != age {
 		t.Fatalf("pending_oldest_age_seconds = %v, want %v (unchanged on unparsable ID)", got, age)
+	}
+	gotEntries, gotOldest, gotAt, gotOK := m.PendingBacklogObservation()
+	if !gotOK || gotEntries != entries || gotOldest != oldest || !gotAt.Equal(at) {
+		t.Fatalf("backlog observation after unparsable ID = (%v, %v, %v, %v), want the prior pair (%v, %v, %v)",
+			gotEntries, gotOldest, gotAt, gotOK, entries, oldest, at)
 	}
 }
 
@@ -494,8 +538,9 @@ func TestConsumerGaugeSourcesComposition(t *testing.T) {
 	}
 
 	// Point the stream sampler at the fake Redis seam so the WHOLE composed slice
-	// can be driven without a Redis server.
-	f := &fakePendingSummarizer{val: &redis.XPending{Count: 4}}
+	// can be driven without a Redis server. A non-empty PEL needs a parsable
+	// oldest ID, otherwise the sampler deliberately skips the incomplete pair.
+	f := &fakePendingSummarizer{val: &redis.XPending{Count: 4, Lower: "1234567-0"}}
 	stream.client = f
 
 	// Drive each composed source once, in order, exactly as the Refresher does.

@@ -14,21 +14,15 @@ import (
 	"relay/internal/state"
 )
 
-// deployCommand builds the `relay deploy` command family. The bare command is an
-// alias for status. Rollback selects a commit from the configured Git source;
-// pin and unpin control whether future Git updates can change the revision.
+// deployCommand builds the `relay deploy` command family. Rollback selects a
+// commit from the configured Git source; pin and unpin control whether future
+// Git updates can change the revision.
 func deployCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
-		Name:  "deploy",
-		Usage: "Show deployment status",
-		Description: "Alias for 'relay deploy status'. Shows the desired revision " +
-			"and each node's current revision and app status.",
-		Action: func(ctx context.Context, cmd *cli.Command) error {
-			if cmd.Args().Present() {
-				return cli.Exit("deploy: too many arguments (use 'relay deploy status')", 2)
-			}
-			return deployStatus(ctx, cmd.Writer, deps)
-		},
+		Name:        "deploy",
+		Usage:       "Manage coordinated deployments",
+		Description: "Manage Git deployments across nodes.",
+		Action:      namespaceAction(),
 		Commands: []*cli.Command{
 			{
 				Name:      "rollback",
@@ -158,6 +152,7 @@ func deploySetPinned(ctx context.Context, w io.Writer, deps Dependencies, pinned
 		return err
 	}
 	defer cleanup()
+
 	desired, found, err := st.SetDeploymentPinned(ctx, pinned)
 	if err != nil {
 		return err
@@ -181,6 +176,7 @@ func deployStatus(ctx context.Context, w io.Writer, deps Dependencies) error {
 		return err
 	}
 	defer cleanup()
+
 	desired, found, err := st.ReadDeploymentDesired(ctx)
 	if err != nil {
 		return err
@@ -189,18 +185,25 @@ func deployStatus(ctx context.Context, w io.Writer, deps Dependencies) error {
 		fmt.Fprintln(w, "No deployment is available yet.")
 		return nil
 	}
-	fmt.Fprintf(w, "Desired generation %d\n", desired.Generation)
-	fmt.Fprintf(w, "Commit     %s\n", desired.Commit)
-	fmt.Fprintf(w, "Source     %s ref=%s", desired.Repository, desired.Ref)
+
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+
+	fmt.Fprintf(tw, "Desired generation:\t%d\n", desired.Generation)
+	fmt.Fprintf(tw, "Commit:\t%s\n", shortCommit(desired.Commit))
+	fmt.Fprintf(tw, "Source:\t%s ref=%s", desired.Repository, desired.Ref)
 	if desired.Path != "" {
-		fmt.Fprintf(w, " path=%s", desired.Path)
+		fmt.Fprintf(tw, " path=%s", desired.Path)
 	}
-	fmt.Fprintln(w)
-	policy := "not pinned"
+	fmt.Fprintln(tw)
+
 	if desired.Pinned {
-		policy = "pinned"
+		fmt.Fprintln(tw, "Pinned:\tyes")
 	}
-	fmt.Fprintf(w, "Pin state  %s\n", policy)
+
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+
 	nodes, err := st.ReadDeploymentNodes(ctx)
 	if err != nil {
 		return err
@@ -209,19 +212,33 @@ func deployStatus(ctx context.Context, w io.Writer, deps Dependencies) error {
 		fmt.Fprintln(w, "\nNo node status available yet.")
 		return nil
 	}
+
 	fmt.Fprintln(w)
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "NODE\tDESIRED\tACTIVE\tSTATUS\tACTIVE COMMIT\tUPDATED\tERROR")
+
+	tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "NODE\tDESIRED\tACTIVE\tSTATUS\tCOMMIT\tUPDATED\tERROR")
+
 	for _, node := range nodes {
 		fmt.Fprintf(tw, "%s\t%d\t%d\t%s\t%s\t%s\t%s\n",
-			node.NodeID, node.Generation, node.AppliedGeneration, nodeStatus(node.Phase),
-			node.AppliedCommit, node.UpdatedAt, oneLine(node.Error))
+			node.NodeID,
+			node.Generation,
+			node.AppliedGeneration,
+			nodeStatus(node.Phase),
+			shortCommit(node.AppliedCommit),
+			node.UpdatedAt,
+			oneLine(node.Error),
+		)
 	}
-	_ = tw.Flush()
+
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+
 	for _, node := range nodes {
 		if node.AppliedGeneration <= 0 {
 			continue
 		}
+
 		apps, err := st.ReadDeploymentAppProgress(ctx, node.NodeID, node.AppliedGeneration)
 		if err != nil {
 			return err
@@ -229,16 +246,36 @@ func deployStatus(ctx context.Context, w io.Writer, deps Dependencies) error {
 		if len(apps) == 0 {
 			continue
 		}
-		fmt.Fprintf(w, "\nApps on %s (active generation %d)\n", node.NodeID, node.AppliedGeneration)
+
+		fmt.Fprintf(w, "\nApps on %s (active generation %d)\n",
+			node.NodeID, node.AppliedGeneration)
+
 		atw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(atw, "APP\tSTATUS\tCOMMIT\tUPDATED\tERROR")
+
 		for _, app := range apps {
 			fmt.Fprintf(atw, "%s\t%s\t%s\t%s\t%s\n",
-				app.App, app.Phase, app.Commit, app.UpdatedAt, oneLine(app.Error))
+				app.App,
+				app.Phase,
+				shortCommit(app.Commit),
+				app.UpdatedAt,
+				oneLine(app.Error),
+			)
 		}
-		_ = atw.Flush()
+
+		if err := atw.Flush(); err != nil {
+			return err
+		}
 	}
+
 	return nil
+}
+
+func shortCommit(commit string) string {
+	if len(commit) > 12 {
+		return commit[:12]
+	}
+	return commit
 }
 
 func nodeStatus(phase string) string {

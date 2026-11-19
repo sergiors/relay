@@ -15,12 +15,27 @@ import (
 // writing under this incarnation rather than retry.
 var ErrStatsOwnershipLost = errors.New("stats ownership lost")
 
-// ErrStatsResetAdvanced reports that the global stats epoch advanced since the
-// caller's last observation — a `stats reset` happened, possibly in another
-// process. The snapshot was NOT written. The caller must rebase its cumulative
-// baseline to its current registry values, adopt the generation returned
-// alongside this error, and retry once.
+// ErrStatsResetAdvanced reports that a stats reset epoch advanced since the
+// caller's last observation — either the global epoch (a `stats reset --all`)
+// or this node's local epoch (a `stats reset` for the same node), possibly in
+// another process. The snapshot was NOT written. The caller must rebase its
+// cumulative baseline to its current registry values, adopt the generations
+// returned alongside this error, and retry once.
 var ErrStatsResetAdvanced = errors.New("stats reset advanced")
+
+// StatsGenerationUnknown is the sentinel for "this process has not observed a
+// reset epoch yet". A negative generation lets the first snapshot adopt the
+// stored epoch instead of treating it as a reset race.
+const StatsGenerationUnknown int64 = -1
+
+// StatsGenerations is the pair of reset epochs a stats snapshot is written
+// under: Global is the shared epoch bumped by `stats reset --all`, Node is the
+// per-node epoch bumped by `stats reset` for one node. A flush is fenced by
+// both; a negative value means unknown and adopts the stored epoch.
+type StatsGenerations struct {
+	Global int64
+	Node   int64
+}
 
 // Stats is the current operational snapshot of Relay's runtime, persisted as the
 // JSONB payload of a per-node row in the stats table (keyed by node identity).
@@ -38,8 +53,15 @@ var ErrStatsResetAdvanced = errors.New("stats reset advanced")
 // Ownership: each node writes only its OWN row (State.nodeID), so N nodes
 // sharing one PostgreSQL database keep N independent counter sets instead of
 // last-writer-wins overwriting a single global row. A node's startup restore
-// reads only its own row (OwnerStats); CLI and observability reads aggregate
-// across every node (Stats) via mergeStats.
+// reads only its own row (OwnerStats); an operator read selects one node
+// (ReadNodeStats) or aggregates every node (ReadStats) via mergeStats.
+//
+// The backlog gauges carry their own successful-observation instant
+// (PendingObservedAtUnixMs). updated_at is only the row's last write time, and a
+// failed XPENDING sample still advances it because the counters are flushed; it
+// therefore cannot order two rows' gauges. A zero observation instant means a
+// legacy payload (or a caller that never observed the backlog) and is never
+// treated as fresher than an observed pair.
 //
 // The struct is the source of truth for the payload: JSON (un)marshalling is
 // centralized in stats_json.go and the stable relational metadata — the node
@@ -54,6 +76,7 @@ type Stats struct {
 	DLQTotal                int64  `json:"dlq_total"`
 	PendingEntries          int64  `json:"pending_entries"`
 	OldestPendingAgeSeconds int64  `json:"oldest_pending_age_seconds"`
+	PendingObservedAtUnixMs int64  `json:"pending_observed_at_unix_ms,omitempty"`
 	UpdatedAt               string `json:"-"`
 }
 
@@ -107,26 +130,34 @@ func (st *State) RecordStatsContext(ctx context.Context, stats Stats) {
 // the whole snapshot atomic and idempotent (absolute values, no deltas).
 //
 // FENCING. The snapshot is written only by the CURRENT ownership incarnation and
-// only under the caller's known reset epoch:
+// only under the caller's known reset epochs (see
+// RecordStatsSnapshotWithGenerations):
 //
-//   - generation is the caller's last-known global reset generation (see
-//     StatsGeneration). A NEGATIVE generation means "unknown, adopt current",
-//     which lets a process's very first flush avoid a spurious rebase. If
-//     generation is non-negative and differs from the stored one, the epoch
-//     advanced (a `stats reset` from ANY worker), and the call returns
-//     (currentGeneration, ErrStatsResetAdvanced) WITHOUT writing so the caller
+//   - The global generation is the caller's last-known shared epoch (see
+//     StatsGeneration). A NEGATIVE value means "unknown, adopt current", which
+//     lets a process's very first flush avoid a spurious rebase. If it is
+//     non-negative and differs from the stored one, a `stats reset --all`
+//     advanced the shared epoch, and the call returns
+//     (currentGenerations, ErrStatsResetAdvanced) WITHOUT writing so the caller
 //     can rebase and retry.
+//   - The node generation is the caller's last-known epoch for THIS node (see
+//     StatsGenerations). A local `stats reset` bumps only this row's epoch, so a
+//     mismatch fences a stale snapshot for that node without affecting any other
+//     node. A NEGATIVE value adopts an existing zero/absent epoch; an existing
+//     non-zero epoch reports ErrStatsResetAdvanced so a first flush can never
+//     overwrite a local reset it did not observe.
 //   - The global row upsert is conditioned on stats.instance = this handle's
-//     instance, so a stale process incarnation whose row a newer one has claimed
-//     affects no rows; RowsAffected()==0 then returns ErrStatsOwnershipLost.
+//     instance AND on the node generation read earlier, so a stale process
+//     incarnation or a concurrently inserted reset row affects no rows.
 //     Per-app rows are written only AFTER the global ownership check passes, so
 //     an incarnation that lost ownership writes nothing at all.
 //
-// Both checks are decided at the START of the transaction: it takes the
-// stats_meta row FOR SHARE, which serializes every flush against a reset's
-// exclusive bump and fixes a single lock order (meta first) so no deadlock is
+// Both checks are decided at the START of the transaction: it first takes the
+// stats_meta row FOR SHARE, then locks this node's stats row. A reset (global or
+// node-local) takes the same rows in the same order, with the global reset
+// holding stats_meta exclusively for its whole transaction, so no deadlock is
 // possible against a concurrent reset or prune. Every path returns the stored
-// generation so the caller knows the epoch to adopt. Unexpected errors are
+// generations so the caller knows the epochs to adopt. Unexpected errors are
 // logged here (matching the package's non-fatal style); the two sentinel
 // outcomes are control flow and are left to the caller.
 //
@@ -138,25 +169,76 @@ func (st *State) RecordStatsContext(ctx context.Context, stats Stats) {
 // once inside the transaction and merged before writing (see
 // mergeAppStatsTimestamps); counters are never merged — they are absolute
 // snapshots and always overwrite.
+// RecordStatsSnapshot is the global-epoch form of
+// RecordStatsSnapshotWithGenerations, retained for callers that only track the
+// shared reset epoch. The unknown node epoch adopts only a stored zero/absent
+// epoch; a stored non-zero node epoch fences the snapshot with
+// ErrStatsResetAdvanced. The production worker uses the explicit form so a local
+// reset also fences its snapshots.
 func (st *State) RecordStatsSnapshot(ctx context.Context, generation int64, stats Stats, fns []AppStats) (int64, error) {
+	next, err := st.RecordStatsSnapshotWithGenerations(ctx, StatsGenerations{
+		Global: generation,
+		Node:   StatsGenerationUnknown,
+	}, stats, fns)
+	return next.Global, err
+}
+
+// RecordStatsSnapshotWithGenerations persists one snapshot under both the
+// shared and the per-node reset epochs. It is the worker's flush path; see the
+// RecordStatsSnapshot doc comment above for the snapshot and fencing contract.
+func (st *State) RecordStatsSnapshotWithGenerations(
+	ctx context.Context,
+	generations StatsGenerations,
+	stats Stats,
+	fns []AppStats,
+) (StatsGenerations, error) {
 	globalPayload, err := marshalStats(stats)
 	if err != nil {
 		st.log.Warn("State: flush stats snapshot failed", "error", err)
-		return generation, err
+		return generations, err
 	}
-	// newGen carries the stored generation out of the transaction on every path;
-	// it defaults to the caller's value so a failure before the read leaves the
-	// caller's epoch unchanged.
-	newGen := generation
+	// current carries the stored generations out of the transaction on every
+	// path; it defaults to the caller's values so a failure before a read leaves
+	// the caller's epochs unchanged.
+	current := generations
 	err = st.rebuildTx(ctx, func(tx *sql.Tx) error {
-		gen, err := readGenerationForWrite(ctx, tx)
+		globalGen, err := readGenerationForWrite(ctx, tx)
 		if err != nil {
 			return err
 		}
-		newGen = gen
-		if generation >= 0 && generation != gen {
+		current.Global = globalGen
+		if generations.Global >= 0 && generations.Global != globalGen {
 			return ErrStatsResetAdvanced
 		}
+
+		storedGen, storedInstance, found, err :=
+			readNodeGenerationForWrite(ctx, tx, st.nodeID)
+		if err != nil {
+			return err
+		}
+		if found {
+			current.Node = storedGen
+		} else {
+			current.Node = 0
+		}
+		if generations.Node >= 0 && generations.Node != current.Node {
+			return ErrStatsResetAdvanced
+		}
+		// An unknown epoch may adopt an existing zero/absent epoch, but never a
+		// non-zero one: that would let a first flush resurrect pre-reset history.
+		if generations.Node < 0 && current.Node != 0 {
+			return ErrStatsResetAdvanced
+		}
+		// An empty stored instance is an unowned row (a fresh local-reset row, or
+		// an ownerless admin write); the current worker may claim it. A non-empty
+		// different instance is a stale incarnation and is fenced.
+		if found && storedInstance != "" && storedInstance != st.instance {
+			return ErrStatsOwnershipLost
+		}
+		if !found && generations.Node > 0 {
+			return ErrStatsResetAdvanced
+		}
+
 		// Prune orphaned app_stats rows first so a removed app's row
 		// is gone before the upserts below could re-create it. The apps table is
 		// shared and authoritative across workers, so an orphan is an orphan for
@@ -174,13 +256,17 @@ func (st *State) RecordStatsSnapshot(ctx context.Context, generation int64, stat
 		// One timestamp for the whole snapshot, so this worker's global row and
 		// every per-app row share the same updated_at.
 		ts := st.nowTime().UTC()
+		expectedNode := current.Node
 		res, err := tx.ExecContext(ctx,
-			`INSERT INTO stats (node_id, instance, data, updated_at) VALUES ($1, $2, $3, $4)
+			`INSERT INTO stats (node_id, instance, generation, data, updated_at)
+			 VALUES ($1, $2, $3, $4, $5)
 			 ON CONFLICT(node_id) DO UPDATE SET
+			   instance   = excluded.instance,
 			   data       = excluded.data,
 			   updated_at = excluded.updated_at
-			 WHERE stats.instance = excluded.instance`,
-			st.nodeID, st.instance, globalPayload, ts)
+			 WHERE (stats.instance = excluded.instance OR stats.instance = '')
+			   AND stats.generation = excluded.generation`,
+			st.nodeID, st.instance, expectedNode, globalPayload, ts)
 		if err != nil {
 			return err
 		}
@@ -189,9 +275,25 @@ func (st *State) RecordStatsSnapshot(ctx context.Context, generation int64, stat
 			return err
 		}
 		if n == 0 {
-			// The row exists and is owned by a different incarnation; skip the
-			// per-app writes too so no partial snapshot lands.
-			return ErrStatsOwnershipLost
+			// The row was claimed by another incarnation or a reset inserted a
+			// newer node epoch between our read and this upsert. Re-read to
+			// classify the failure for the caller's rebase/latch decision; skip
+			// the per-app writes too so no partial snapshot lands.
+			storedGen, storedInstance, found, err := readNodeGeneration(ctx, tx, st.nodeID)
+			if err != nil {
+				return err
+			}
+			if found {
+				current.Node = storedGen
+			}
+			switch {
+			case found && storedInstance != "" && storedInstance != st.instance:
+				return ErrStatsOwnershipLost
+			case !found || storedGen != expectedNode:
+				return ErrStatsResetAdvanced
+			default:
+				return fmt.Errorf("stats snapshot not written")
+			}
 		}
 		for _, fs := range fns {
 			// Counters are absolute and always replaced; an empty incoming
@@ -221,7 +323,7 @@ func (st *State) RecordStatsSnapshot(ctx context.Context, generation int64, stat
 	if err != nil && !errors.Is(err, ErrStatsResetAdvanced) && !errors.Is(err, ErrStatsOwnershipLost) {
 		st.log.Warn("State: flush stats snapshot failed", "error", err)
 	}
-	return newGen, err
+	return current, err
 }
 
 // readGenerationForWrite reads the global reset generation inside tx under a
@@ -238,9 +340,175 @@ func readGenerationForWrite(ctx context.Context, tx *sql.Tx) (int64, error) {
 	return gen, nil
 }
 
-// StatsGeneration returns the current global reset generation, or an error if it
-// cannot be read. It is a direct read of the epoch for diagnostics/tests; the
-// flush path learns the epoch from RecordStatsSnapshot's return value instead.
+// readNodeGenerationForWrite reads this node's local reset generation and
+// owning incarnation inside tx, locking an existing row FOR UPDATE. Absence is
+// reported as found=false with no error so the first flush can create the row.
+// The row lock serializes the flush with a concurrent local reset (which takes
+// the same row) while the caller already holds the shared stats_meta lock, so
+// the lock order is always meta then stats.
+func readNodeGenerationForWrite(
+	ctx context.Context, tx *sql.Tx, nodeID string,
+) (int64, string, bool, error) {
+	return readNodeGenerationRow(ctx, tx, nodeID, true)
+}
+
+// readNodeGeneration is the unlocked re-read used to classify a failed
+// conditional upsert, where a concurrent reset may have inserted a newer row.
+func readNodeGeneration(
+	ctx context.Context, tx *sql.Tx, nodeID string,
+) (int64, string, bool, error) {
+	return readNodeGenerationRow(ctx, tx, nodeID, false)
+}
+
+func readNodeGenerationRow(
+	ctx context.Context, tx *sql.Tx, nodeID string, lock bool,
+) (int64, string, bool, error) {
+	query := `SELECT generation, instance FROM stats WHERE node_id = $1`
+	if lock {
+		query += ` FOR UPDATE`
+	}
+	var (
+		gen      int64
+		instance string
+	)
+	err := tx.QueryRowContext(ctx, query, nodeID).Scan(&gen, &instance)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", false, nil
+	}
+	if err != nil {
+		return 0, "", false, fmt.Errorf("read node stats generation: %w", err)
+	}
+	return gen, instance, true, nil
+}
+
+// StatsGenerations returns the current shared and node-local reset epochs. It is
+// a direct read for diagnostics; startup uses OwnStatsSnapshot so the epochs are
+// captured atomically with the restored data, and the flush path learns them
+// from RecordStatsSnapshotWithGenerations instead.
+func (st *State) StatsGenerations() (StatsGenerations, error) {
+	ctx := context.Background()
+	var generations StatsGenerations
+	row := st.db.QueryRowContext(ctx,
+		`SELECT generation FROM stats_meta WHERE id = 'global'`)
+	if err := row.Scan(&generations.Global); err != nil {
+		return StatsGenerations{}, fmt.Errorf("read stats generation: %w", err)
+	}
+	if st.nodeID == "" {
+		generations.Node = StatsGenerationUnknown
+		return generations, nil
+	}
+	var gen int64
+	err := st.db.QueryRowContext(ctx,
+		`SELECT generation FROM stats WHERE node_id = $1`, st.nodeID).Scan(&gen)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		generations.Node = 0
+	case err != nil:
+		return StatsGenerations{}, fmt.Errorf("read node stats generation: %w", err)
+	default:
+		generations.Node = gen
+	}
+	return generations, nil
+}
+
+// OwnStatsSnapshot is one node's persisted stats state captured atomically with
+// the reset epochs it was written under. Restoring a fresh worker from this
+// single snapshot is what makes startup safe against a reset racing the restore:
+// seeding stale totals with a newer generation would let the first flush
+// resurrect pre-reset history.
+type OwnStatsSnapshot struct {
+	Stats       Stats
+	AppStats    []AppStats
+	Generations StatsGenerations
+}
+
+// OwnStatsSnapshot reads THIS handle's own stats row, its app_stats rows, and the
+// current global and node-local reset epochs in one transaction. It takes the
+// stats_meta row FOR SHARE and then the node's stats row FOR SHARE, matching the
+// flush/reset lock order, so a global reset cannot interleave with the snapshot
+// and a node-local reset of this node cannot advance past it. A reset after the
+// snapshot therefore advances an epoch the caller can detect; a reset before it
+// is already reflected in the zeroed data and returned epochs.
+//
+// It is the startup restore path. Gauges are read back like any other payload
+// field but are not seeded by the worker. A corrupt global payload is logged and
+// treated as zero (matching OwnerStats); a corrupt app payload is logged and
+// skipped (matching OwnerAppStats). Query/scan failures are returned.
+func (st *State) OwnStatsSnapshot(ctx context.Context) (OwnStatsSnapshot, error) {
+	var snapshot OwnStatsSnapshot
+	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+		globalGen, err := readGenerationForWrite(ctx, tx)
+		if err != nil {
+			return err
+		}
+		snapshot.Generations.Global = globalGen
+
+		var (
+			nodeGen   int64
+			data      sql.NullString
+			updatedAt time.Time
+		)
+		err = tx.QueryRowContext(ctx,
+			`SELECT generation, `+jsonPayloadExpr+`, updated_at
+			 FROM stats WHERE node_id = $1 FOR SHARE`, st.nodeID,
+		).Scan(&nodeGen, &data, &updatedAt)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			snapshot.Generations.Node = 0
+		case err != nil:
+			return fmt.Errorf("read own stats: %w", err)
+		default:
+			snapshot.Generations.Node = nodeGen
+			parsed, decodeErr := unmarshalStats(data)
+			if decodeErr != nil {
+				st.log.Warn("State: read own stats failed", "error", decodeErr)
+			} else {
+				parsed.UpdatedAt = timestampString(updatedAt)
+				snapshot.Stats = parsed
+			}
+		}
+
+		rows, err := tx.QueryContext(ctx,
+			`SELECT app_name, `+jsonPayloadExpr+`, updated_at
+			 FROM app_stats WHERE node_id = $1 ORDER BY app_name`, st.nodeID)
+		if err != nil {
+			return fmt.Errorf("read own app stats: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var (
+				name         string
+				appData      sql.NullString
+				appUpdatedAt time.Time
+			)
+			if err := rows.Scan(&name, &appData, &appUpdatedAt); err != nil {
+				return fmt.Errorf("scan own app stats: %w", err)
+			}
+			appStats, decodeErr := unmarshalAppStats(appData)
+			if decodeErr != nil {
+				st.log.Warn("State: read own app stats failed", "app", name, "error", decodeErr)
+				continue
+			}
+			appStats.App = name
+			appStats.UpdatedAt = timestampString(appUpdatedAt)
+			snapshot.AppStats = append(snapshot.AppStats, appStats)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("read own app stats: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		st.log.Warn("State: read own stats snapshot failed", "error", err)
+		return OwnStatsSnapshot{}, err
+	}
+	return snapshot, nil
+}
+
+// StatsGeneration returns the current SHARED reset generation, or an error if it
+// cannot be read. It is a direct read of the global epoch for diagnostics/tests;
+// a caller that also needs the node-local epoch uses StatsGenerations, and the
+// flush path learns both from RecordStatsSnapshotWithGenerations instead.
 func (st *State) StatsGeneration() (int64, error) {
 	ctx := context.Background()
 	var gen int64
@@ -319,9 +587,10 @@ func (st *State) storedAppStatsTx(ctx context.Context, tx *sql.Tx, name string) 
 // simply writes new absolute values over them instead of re-creating them.
 //
 // The reset affects EVERY owner: the persisted history is a shared operator
-// view, so `relay stats reset` clears all workers' rows (a running worker resets
-// its own in-memory source over the socket; the CLI fallback resets the whole
-// database).
+// view, so `relay stats reset --all` clears all workers' rows (a running worker
+// resets its in-memory source over the socket; the CLI fallback resets the whole
+// database). The node-scoped counterpart is ResetNodeStats, which clears and
+// fences only one node.
 //
 // The global backlog gauges (pending_entries / oldest_pending_age_seconds) are
 // POINT-IN-TIME snapshots of the live Redis backlog, deliberately NOT reset:
@@ -364,7 +633,14 @@ func (st *State) storedAppStatsTx(ctx context.Context, tx *sql.Tx, name string) 
 // leaves the stored epoch unchanged. The package's Warn log also records the
 // failure, matching RecordStats.
 func (st *State) ResetStats() (int64, error) {
-	ctx := context.Background()
+	return st.ResetAllStats(context.Background())
+}
+
+// ResetAllStats is the context-aware form of the global reset. It bumps the
+// shared reset epoch and zeroes every node's global and per-app counters in one
+// transaction, so every worker is fenced and rebases its cumulative baseline on
+// its next flush. See ResetStats for the full semantics.
+func (st *State) ResetAllStats(ctx context.Context) (int64, error) {
 	var gen int64
 	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
 		// Bump the epoch FIRST, taking the stats_meta row exclusively. Every
@@ -382,10 +658,80 @@ func (st *State) ResetStats() (int64, error) {
 		if err := st.resetGlobalStatsTx(ctx, tx, ts); err != nil {
 			return err
 		}
-		return st.resetAppStatsTx(ctx, tx, ts)
+		return st.resetAppStatsTx(ctx, tx, ts, "")
 	})
 	if err != nil {
 		st.log.Warn("State: reset stats failed", "error", err)
+		return 0, err
+	}
+	return gen, nil
+}
+
+// ResetNodeStats zeroes ONE node's global and per-app cumulative counters and
+// bumps only that node's local reset epoch, in one transaction. It returns the
+// node's NEW epoch. Other nodes' rows and epochs, the shared stats_meta epoch,
+// and every backlog gauge are untouched, so a local reset fences only stale
+// snapshots from this node while `stats reset --all` remains the global fence.
+//
+// An absent stats row is CREATED with the new epoch and a zero payload, so a
+// later first flush from that node sees the reset instead of writing an epoch it
+// never observed. An existing row keeps its instance fencing value and its
+// backlog gauges. The transaction takes stats_meta FOR SHARE first and then the
+// node row, matching the flush and global-reset lock order; a concurrent first
+// flush either lands before the reset (and is zeroed) or observes the new epoch
+// and refuses to write. Corrupt payloads are fatal and roll the whole reset
+// back.
+func (st *State) ResetNodeStats(ctx context.Context, nodeID string) (int64, error) {
+	if nodeID == "" {
+		return 0, fmt.Errorf("reset node stats: node ID is required")
+	}
+	var gen int64
+	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+		// Take the meta row FOR SHARE first, matching the flush and prune lock
+		// order (meta before stats/app_stats), so this reset cannot deadlock
+		// with a global reset's exclusive bump.
+		var one int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT 1 FROM stats_meta WHERE id = 'global' FOR SHARE`).Scan(&one); err != nil {
+			return err
+		}
+		zeroPayload, err := marshalStats(Stats{})
+		if err != nil {
+			return err
+		}
+		ts := st.nowTime().UTC()
+		// Bump the epoch atomically whether the row exists or not. On conflict
+		// only the epoch and updated_at change here; the payload is zeroed
+		// below from the returned value so gauges and unknown fields survive.
+		var data sql.NullString
+		if err := tx.QueryRowContext(ctx,
+			`INSERT INTO stats (node_id, instance, generation, data, updated_at)
+			 VALUES ($1, '', 1, $2, $3)
+			 ON CONFLICT(node_id) DO UPDATE SET
+			   generation = stats.generation + 1,
+			   updated_at = excluded.updated_at
+			 RETURNING generation, data::text`,
+			nodeID, zeroPayload, ts).Scan(&gen, &data); err != nil {
+			return fmt.Errorf("bump node stats generation: %w", err)
+		}
+		stats, err := unmarshalStats(data)
+		if err != nil {
+			return err
+		}
+		stats = zeroStatsCounters(stats)
+		payload, err := marshalStats(stats)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE stats SET data = $1, updated_at = $2 WHERE node_id = $3`,
+			payload, ts, nodeID); err != nil {
+			return err
+		}
+		return st.resetAppStatsTx(ctx, tx, ts, nodeID)
+	})
+	if err != nil {
+		st.log.Warn("State: reset node stats failed", "node_id", nodeID, "error", err)
 		return 0, err
 	}
 	return gen, nil
@@ -414,10 +760,12 @@ func bumpGeneration(ctx context.Context, tx *sql.Tx, ts time.Time) (int64, error
 //
 // A worker keeps its OWN row unconditionally (it is the live owner), even if its
 // updated_at looks stale — a temporarily quiet worker must not lose the
-// cumulative totals it will resume writing. Rows are matched by their native
-// UTC updated_at values: a row is stale when updated_at < now-retention. The
-// zero-time row a fresh ownership claim creates is therefore immediately stale
-// for any OTHER worker, which is intended — an abandoned claim must not linger.
+// cumulative totals it will resume writing. Deleting a stats row also removes
+// its node-local reset generation; stats_meta stays intact. Rows are matched by
+// their native UTC updated_at values: a row is stale when
+// updated_at < now-retention. The zero-time row a fresh ownership claim creates
+// is therefore immediately stale for any OTHER worker, which is intended — an
+// abandoned claim must not linger.
 //
 // Retention <= 0 is a no-op (compaction disabled) and deletes nothing. The whole
 // prune runs in one transaction that takes the stats_meta row FOR SHARE first,
@@ -459,6 +807,21 @@ func (st *State) PruneStaleStats(ctx context.Context, retention time.Duration) (
 	return int(deleted), nil
 }
 
+// zeroStatsCounters returns stats with its cumulative counters zeroed and every
+// gauge, observation instant, and unknown decoded field preserved. Both the
+// global and the node-local reset use it, so a reset never reports a backlog
+// that still exists as zero.
+func zeroStatsCounters(stats Stats) Stats {
+	stats.EventsReceivedTotal = 0
+	stats.EventsMatchedTotal = 0
+	stats.EventsUnmatchedTotal = 0
+	stats.HandlerSuccessTotal = 0
+	stats.HandlerFailureTotal = 0
+	stats.RetryTotal = 0
+	stats.DLQTotal = 0
+	return stats
+}
+
 // resetGlobalStatsTx zeroes every worker's stats row cumulative counters in
 // tx while preserving the live backlog gauges and any other decoded field. An
 // absent table (no rows) has nothing cumulative to zero and is left untouched
@@ -496,15 +859,10 @@ func (st *State) resetGlobalStatsTx(ctx context.Context, tx *sql.Tx, ts time.Tim
 		if err != nil {
 			return err
 		}
-		// Zero ONLY the cumulative counters; the two gauges are live backlog
-		// snapshots and are preserved (the next flush refreshes them).
-		stats.EventsReceivedTotal = 0
-		stats.EventsMatchedTotal = 0
-		stats.EventsUnmatchedTotal = 0
-		stats.HandlerSuccessTotal = 0
-		stats.HandlerFailureTotal = 0
-		stats.RetryTotal = 0
-		stats.DLQTotal = 0
+		// Zero ONLY the cumulative counters; the two gauges and their
+		// successful-observation instant are live backlog snapshots and are
+		// preserved (the next flush refreshes them).
+		stats = zeroStatsCounters(stats)
 		payload, err := marshalStats(stats)
 		if err != nil {
 			return err
@@ -518,20 +876,28 @@ func (st *State) resetGlobalStatsTx(ctx context.Context, tx *sql.Tx, ts time.Tim
 	return nil
 }
 
-// resetAppStatsTx zeroes every app_stats row's cumulative fields in
-// tx with an UPDATE per row (never a DELETE): the event-matched/handler
-// counters, the three warm-container pool counters, and the four Last*At
-// timestamps. A corrupt payload returns the decode error, rolling the whole
-// reset back. Timestamps are cleared (not merged) because a reset is an explicit
-// erasure of execution history. It covers every worker's row.
-func (st *State) resetAppStatsTx(ctx context.Context, tx *sql.Tx, ts time.Time) error {
+// resetAppStatsTx zeroes app_stats rows' cumulative fields in tx with an UPDATE
+// per row (never a DELETE): the event-matched/handler counters, the three
+// warm-container pool counters, and the four Last*At timestamps. An empty
+// nodeID covers every worker's rows (the global reset); a non-empty nodeID
+// covers only that node's rows (a local reset). A corrupt payload returns the
+// decode error, rolling the whole reset back. Timestamps are cleared (not
+// merged) because a reset is an explicit erasure of execution history.
+func (st *State) resetAppStatsTx(
+	ctx context.Context, tx *sql.Tx, ts time.Time, nodeID string,
+) error {
 	type row struct {
 		name   string
 		nodeID string
 		data   sql.NullString
 	}
-	rows, err := tx.QueryContext(ctx,
-		`SELECT app_name, node_id, `+jsonPayloadExpr+` FROM app_stats`)
+	query := `SELECT app_name, node_id, ` + jsonPayloadExpr + ` FROM app_stats`
+	var args []any
+	if nodeID != "" {
+		query += ` WHERE node_id = $1`
+		args = append(args, nodeID)
+	}
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -555,18 +921,7 @@ func (st *State) resetAppStatsTx(ctx context.Context, tx *sql.Tx, ts time.Time) 
 		if err != nil {
 			return err
 		}
-		fs.EventsMatchedTotal = 0
-		fs.HandlerSuccessTotal = 0
-		fs.HandlerFailureTotal = 0
-		fs.RetryTotal = 0
-		fs.DLQTotal = 0
-		fs.WarmAcquiresTotal = 0
-		fs.ColdStartsTotal = 0
-		fs.DiscardedTotal = 0
-		fs.LastExecutionAt = ""
-		fs.LastSuccessAt = ""
-		fs.LastFailureAt = ""
-		fs.LastDLQAt = ""
+		fs = zeroAppStatsCounters(fs)
 		payload, err := marshalAppStats(fs)
 		if err != nil {
 			return err
@@ -580,16 +935,52 @@ func (st *State) resetAppStatsTx(ctx context.Context, tx *sql.Tx, ts time.Time) 
 	return nil
 }
 
+// zeroAppStatsCounters returns fs with every cumulative per-app counter zeroed
+// and its execution-history timestamps cleared. It is the shared reset shape for
+// both the global and the node-local reset.
+func zeroAppStatsCounters(fs AppStats) AppStats {
+	fs.EventsMatchedTotal = 0
+	fs.HandlerSuccessTotal = 0
+	fs.HandlerFailureTotal = 0
+	fs.RetryTotal = 0
+	fs.DLQTotal = 0
+	fs.WarmAcquiresTotal = 0
+	fs.ColdStartsTotal = 0
+	fs.DiscardedTotal = 0
+	fs.LastExecutionAt = ""
+	fs.LastSuccessAt = ""
+	fs.LastFailureAt = ""
+	fs.LastDLQAt = ""
+	return fs
+}
+
 // ReadStats returns the operational snapshot AGGREGATED across every node's
 // persisted row. ok is false only when no row has been recorded yet; a query,
 // scan, or decode failure is returned as an error so a caller can distinguish
 // an empty stats table from an unreadable one instead of rendering zeros.
-// Cumulative counters are summed across nodes; the two backlog gauges (a shared
-// Redis backlog each worker reports) come from the FRESHEST node snapshot (the
-// newest updated_at), so a dead node's stale gauge cannot mask the live value;
-// UpdatedAt is the newest.
+// Cumulative counters are summed across nodes. The two backlog gauges (a shared
+// Redis backlog each worker reports) come from the row with the newest
+// successful backlog observation, chosen as a pair and never summed; a legacy
+// row without an observation instant never wins on updated_at alone. UpdatedAt
+// is the newest row write time.
 func (st *State) ReadStats(ctx context.Context) (Stats, bool, error) {
 	return st.readStats(ctx, "")
+}
+
+// ReadNodeStats returns ONE node's operational snapshot, including its own
+// backlog gauge pair, without aggregating another node's counters. Its gauges
+// are returned verbatim even for a legacy payload with no observation instant;
+// freshness selection applies only to the cross-node aggregate. ok is false when
+// that node has no row yet; query, scan, and decode failures are returned as
+// errors. This is the explicit node-filtered read behind `relay stats` and
+// `relay stats --node`.
+func (st *State) ReadNodeStats(
+	ctx context.Context, nodeID string,
+) (Stats, bool, error) {
+	if nodeID == "" {
+		return Stats{}, false, fmt.Errorf("read node stats: node ID is required")
+	}
+	return st.readStats(ctx, nodeID)
 }
 
 // Stats is the best-effort form of ReadStats: it returns (zero, false) for an
@@ -651,7 +1042,14 @@ func (st *State) readStats(ctx context.Context, nodeID string) (Stats, bool, err
 			return Stats{}, false, fmt.Errorf("read stats for node %q: %w", rowNodeID, err)
 		}
 		s.UpdatedAt = timestampString(updatedAt)
-		mergeStats(&out, s)
+		if nodeID != "" {
+			// A node-specific read shows that row's own gauges verbatim,
+			// including a legacy payload with no observation instant. Only the
+			// cross-node aggregate applies freshness selection.
+			out = s
+		} else {
+			mergeStats(&out, s)
+		}
 		seen = true
 	}
 	if err := rows.Err(); err != nil {
@@ -665,14 +1063,17 @@ func (st *State) readStats(ctx context.Context, nodeID string) (Stats, bool, err
 
 // mergeStats folds src into dst: cumulative counters are summed (each row is an
 // independent worker's absolute total), while the two backlog gauges are NOT
-// summed and NOT maxed. Every worker snapshots the SAME shared Redis backlog, so
-// the aggregate must present exactly ONE worker's observation — the FRESHEST one
-// (the row with the newest updated_at), which is the worker currently flushing.
-// Taking the maximum instead would let a dead worker's stale high gauge mask the
-// live value indefinitely. UpdatedAt takes the newest, and the freshest row's
-// gauges win; when updated_at values tie in RFC3339 presentation (which omits
-// fractional seconds) the larger gauge wins, so the aggregate is deterministic
-// regardless of row order and never under-reports an equally-fresh backlog.
+// summed and never merged component-wise. Every worker snapshots the SAME shared
+// Redis backlog, so the aggregate presents exactly ONE worker's complete
+// observation pair — the one with the newest successful-observation instant
+// (PendingObservedAtUnixMs). Row updated_at is deliberately NOT used: a failed
+// XPENDING sample still flushes counters and advances updated_at, so it cannot
+// order the gauges. A legacy/unobserved row (instant 0) supplies no aggregate
+// gauges at all; if no row has a valid observation the aggregate retains zero
+// gauges. Equally fresh observations are ordered by their complete pair
+// (depth, then age), so the result is deterministic regardless of row order
+// without synthesizing a pair from two observations. UpdatedAt itself still
+// takes the newest row write time for display.
 func mergeStats(dst *Stats, src Stats) {
 	dst.EventsReceivedTotal += src.EventsReceivedTotal
 	dst.EventsMatchedTotal += src.EventsMatchedTotal
@@ -681,21 +1082,37 @@ func mergeStats(dst *Stats, src Stats) {
 	dst.HandlerFailureTotal += src.HandlerFailureTotal
 	dst.RetryTotal += src.RetryTotal
 	dst.DLQTotal += src.DLQTotal
-	switch {
-	case src.UpdatedAt > dst.UpdatedAt:
-		// A strictly fresher snapshot owns the gauges outright.
-		dst.PendingEntries = src.PendingEntries
-		dst.OldestPendingAgeSeconds = src.OldestPendingAgeSeconds
-	case src.UpdatedAt == dst.UpdatedAt:
-		// Equally fresh: take the larger gauge so the result is order-independent.
-		if src.PendingEntries > dst.PendingEntries {
+	if dst.PendingObservedAtUnixMs == 0 {
+		// An aggregate only carries gauges from a valid observation. Clear any
+		// legacy/unobserved values already in dst so they can never survive as
+		// a synthesized pair when no source has freshness metadata.
+		dst.PendingEntries = 0
+		dst.OldestPendingAgeSeconds = 0
+	}
+	if src.PendingObservedAtUnixMs > 0 {
+		switch {
+		case dst.PendingObservedAtUnixMs == 0 ||
+			src.PendingObservedAtUnixMs > dst.PendingObservedAtUnixMs:
 			dst.PendingEntries = src.PendingEntries
-		}
-		if src.OldestPendingAgeSeconds > dst.OldestPendingAgeSeconds {
+			dst.OldestPendingAgeSeconds = src.OldestPendingAgeSeconds
+			dst.PendingObservedAtUnixMs = src.PendingObservedAtUnixMs
+		case src.PendingObservedAtUnixMs == dst.PendingObservedAtUnixMs &&
+			gaugePairAfter(src, *dst):
+			dst.PendingEntries = src.PendingEntries
 			dst.OldestPendingAgeSeconds = src.OldestPendingAgeSeconds
 		}
 	}
 	dst.UpdatedAt = maxRFC3339(dst.UpdatedAt, src.UpdatedAt)
+}
+
+// gaugePairAfter reports whether a's complete backlog pair sorts after b's:
+// depth first, then oldest age. It is the deterministic tie-break for two
+// observations carrying the same instant, never a component-wise merge.
+func gaugePairAfter(a, b Stats) bool {
+	if a.PendingEntries != b.PendingEntries {
+		return a.PendingEntries > b.PendingEntries
+	}
+	return a.OldestPendingAgeSeconds > b.OldestPendingAgeSeconds
 }
 
 // maxRFC3339 returns the later of two RFC3339 UTC strings. RFC3339 UTC strings

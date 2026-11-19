@@ -9,7 +9,8 @@ import (
 )
 
 // RecordStats then Stats round-trips exact values, including a non-empty
-// updated_at set by the write.
+// updated_at set by the write. The backlog gauges carry their observation
+// instant, which is what lets the cross-node aggregate read them back.
 func TestStatsRoundTrip(t *testing.T) {
 	c := openTestState(t)
 	in := Stats{
@@ -22,6 +23,7 @@ func TestStatsRoundTrip(t *testing.T) {
 		DLQTotal:                1,
 		PendingEntries:          5,
 		OldestPendingAgeSeconds: 42,
+		PendingObservedAtUnixMs: 1767225600000,
 	}
 	c.RecordStats(in)
 
@@ -43,13 +45,14 @@ func TestStatsRoundTrip(t *testing.T) {
 }
 
 // A second RecordStats REPLACES every column (gauge semantics): pending_entries
-// goes 3 -> 7 -> 0 across writes rather than accumulating.
+// goes 3 -> 7 -> 0 across writes rather than accumulating. Each write carries a
+// fresh observation instant, since the aggregate only surfaces observed pairs.
 func TestRecordStatsReplaces(t *testing.T) {
 	c := openTestState(t)
 
-	c.RecordStats(Stats{PendingEntries: 3})
+	c.RecordStats(Stats{PendingEntries: 3, PendingObservedAtUnixMs: 1000})
 	// Counters are replaced too, not accumulated.
-	c.RecordStats(Stats{PendingEntries: 7, EventsMatchedTotal: 100})
+	c.RecordStats(Stats{PendingEntries: 7, EventsMatchedTotal: 100, PendingObservedAtUnixMs: 2000})
 
 	s, ok := c.Stats()
 	if !ok {
@@ -62,7 +65,7 @@ func TestRecordStatsReplaces(t *testing.T) {
 		t.Fatalf("events = %d, want 100", s.EventsMatchedTotal)
 	}
 
-	c.RecordStats(Stats{PendingEntries: 0, EventsMatchedTotal: 100})
+	c.RecordStats(Stats{PendingEntries: 0, EventsMatchedTotal: 100, PendingObservedAtUnixMs: 3000})
 	s, ok = c.Stats()
 	if !ok {
 		t.Fatal("expected stats row")
@@ -87,10 +90,12 @@ func TestStatsOnEmptyDB(t *testing.T) {
 	}
 }
 
-// TestStatsGaugesOwnedByFreshestSnapshot pins the backlog-gauge aggregation. The
-// two backlog gauges describe the SAME shared Redis backlog, so the aggregate
-// must report the FRESHEST worker's snapshot; taking the maximum across rows
-// would let a dead worker's stale high gauge mask the live value forever.
+// TestStatsGaugesOwnedByFreshestSnapshot pins the backlog-gauge aggregation.
+// The two backlog gauges describe the SAME shared Redis backlog, so the
+// aggregate reports the pair from the NEWEST SUCCESSFUL OBSERVATION instant —
+// row updated_at cannot order them (it advances even when a backlog sample
+// failed), and taking the maximum across rows would let a dead worker's stale
+// high gauge mask the live value forever.
 func TestStatsGaugesOwnedByFreshestSnapshot(t *testing.T) {
 	dsn := newTestDSN(t)
 	a := testOpenOrFail(t, dsn)
@@ -102,11 +107,22 @@ func TestStatsGaugesOwnedByFreshestSnapshot(t *testing.T) {
 	a.nowFn = func() time.Time { return t0 }
 	b.nowFn = func() time.Time { return t0 }
 
-	// The stale node's row carries a high gauge (its last observation before it
-	// stopped flushing); the fresh owner observed the current lower backlog later.
-	a.RecordStats(Stats{EventsMatchedTotal: 10, PendingEntries: 500, OldestPendingAgeSeconds: 9999})
+	// The stale node's row carries a high gauge from an OLD observation (its
+	// last sample before it stopped flushing); the fresh owner sampled the
+	// backlog later and reports the current lower values.
+	a.RecordStats(Stats{
+		EventsMatchedTotal:      10,
+		PendingEntries:          500,
+		OldestPendingAgeSeconds: 9999,
+		PendingObservedAtUnixMs: t0.UnixMilli(),
+	})
 	b.nowFn = func() time.Time { return t0.Add(5 * time.Second) }
-	b.RecordStats(Stats{EventsMatchedTotal: 25, PendingEntries: 2, OldestPendingAgeSeconds: 3})
+	b.RecordStats(Stats{
+		EventsMatchedTotal:      25,
+		PendingEntries:          2,
+		OldestPendingAgeSeconds: 3,
+		PendingObservedAtUnixMs: t0.Add(5 * time.Second).UnixMilli(),
+	})
 
 	s, ok := a.Stats()
 	if !ok {
@@ -116,20 +132,25 @@ func TestStatsGaugesOwnedByFreshestSnapshot(t *testing.T) {
 		t.Fatalf("events = %d, want 35 (counters summed across owners)", s.EventsMatchedTotal)
 	}
 	if s.PendingEntries != 2 || s.OldestPendingAgeSeconds != 3 {
-		t.Fatalf("gauges = (%d, %d), want the freshest owner's (2, 3)", s.PendingEntries, s.OldestPendingAgeSeconds)
+		t.Fatalf("gauges = (%d, %d), want the freshest observation's (2, 3)", s.PendingEntries, s.OldestPendingAgeSeconds)
 	}
 
-	// Ownership tracks the freshest flush: when the other owner later flushes, the
-	// aggregate switches to ITS gauges (correct because the gauge really did drop),
-	// still never a maximum of stale rows.
+	// Ownership follows the freshest OBSERVATION: when the other owner samples
+	// the backlog later, the aggregate switches to ITS pair (correct because the
+	// gauge really did drop), still never a maximum of stale rows.
 	a.nowFn = func() time.Time { return t0.Add(10 * time.Second) }
-	a.RecordStats(Stats{EventsMatchedTotal: 11, PendingEntries: 1, OldestPendingAgeSeconds: 1})
+	a.RecordStats(Stats{
+		EventsMatchedTotal:      11,
+		PendingEntries:          1,
+		OldestPendingAgeSeconds: 1,
+		PendingObservedAtUnixMs: t0.Add(10 * time.Second).UnixMilli(),
+	})
 	s, ok = a.Stats()
 	if !ok {
 		t.Fatal("expected an aggregate stats snapshot")
 	}
 	if s.PendingEntries != 1 || s.OldestPendingAgeSeconds != 1 {
-		t.Fatalf("gauges after the freshest owner changed = (%d, %d), want (1, 1)", s.PendingEntries, s.OldestPendingAgeSeconds)
+		t.Fatalf("gauges after the freshest observation moved = (%d, %d), want (1, 1)", s.PendingEntries, s.OldestPendingAgeSeconds)
 	}
 	if s.EventsMatchedTotal != 36 {
 		t.Fatalf("events = %d, want 36", s.EventsMatchedTotal)
@@ -143,7 +164,11 @@ func TestRebuildFromFSKeepsStats(t *testing.T) {
 	writeAppsDir(t, root)
 
 	c := openTestState(t)
-	c.RecordStats(Stats{EventsMatchedTotal: 55, PendingEntries: 3})
+	c.RecordStats(Stats{
+		EventsMatchedTotal:      55,
+		PendingEntries:          3,
+		PendingObservedAtUnixMs: 1767225600000,
+	})
 
 	if err := c.RebuildFromFS(context.Background(), root); err != nil {
 		t.Fatalf("rebuild: %v", err)
