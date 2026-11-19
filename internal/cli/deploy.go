@@ -24,60 +24,76 @@ func deployCommand(deps Dependencies) *cli.Command {
 		Description: "Manage Git deployments across nodes.",
 		Action:      namespaceAction(),
 		Commands: []*cli.Command{
-			{
-				Name:      "rollback",
-				Usage:     "Select a commit from the configured repository and pin it",
-				UsageText: "relay deploy rollback <sha>",
-				Description: "Select a full commit SHA from the configured repository and pin it. " +
-					"Run 'relay deploy unpin' to allow future Git updates.",
-				Arguments: []cli.Argument{
-					&cli.StringArgs{Name: "commit", Min: 1, Max: 1},
-				},
-				Action: func(ctx context.Context, cmd *cli.Command) error {
-					if cmd.Args().Present() {
-						return cli.Exit("deploy rollback: too many arguments", 2)
-					}
-					return deployRollback(ctx, cmd.Writer, deps, cmd.StringArgs("commit")[0])
-				},
-			},
-			{
-				Name:      "pin",
-				Usage:     "Block Git updates to the current revision",
-				UsageText: "relay deploy pin",
-				Description: "Block 'relay git sync' and webhook updates from changing the " +
-					"current revision.",
-				Action: func(ctx context.Context, cmd *cli.Command) error {
-					if cmd.Args().Present() {
-						return cli.Exit("deploy pin: too many arguments", 2)
-					}
-					return deploySetPinned(ctx, cmd.Writer, deps, true)
-				},
-			},
-			{
-				Name:      "unpin",
-				Usage:     "Allow future Git updates",
-				UsageText: "relay deploy unpin",
-				Description: "Allow a future 'relay git sync' or webhook update to change the " +
-					"revision. This does not immediately change the current revision.",
-				Action: func(ctx context.Context, cmd *cli.Command) error {
-					if cmd.Args().Present() {
-						return cli.Exit("deploy unpin: too many arguments", 2)
-					}
-					return deploySetPinned(ctx, cmd.Writer, deps, false)
-				},
-			},
-			{
-				Name:  "status",
-				Usage: "Show the desired revision and node/app status",
-				Description: "Show the desired generation and commit, pin state, and each node's " +
-					"current revision and app status.",
-				Action: func(ctx context.Context, cmd *cli.Command) error {
-					if cmd.Args().Present() {
-						return cli.Exit("deploy status: too many arguments", 2)
-					}
-					return deployStatus(ctx, cmd.Writer, deps)
-				},
-			},
+			deployRollbackCommand(deps),
+			deployPinCommand(deps),
+			deployUnpinCommand(deps),
+			deployStatusCommand(deps),
+		},
+	}
+}
+
+func deployRollbackCommand(deps Dependencies) *cli.Command {
+	return &cli.Command{
+		Name:      "rollback",
+		Usage:     "Select a commit from the configured repository and pin it",
+		UsageText: "relay deploy rollback <sha>",
+		Description: "Select a full commit SHA from the configured repository and pin it. " +
+			"Run 'relay deploy unpin' to allow future Git updates.",
+		Arguments: []cli.Argument{
+			&cli.StringArgs{Name: "commit", Min: 1, Max: 1},
+		},
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Args().Present() {
+				return cli.Exit("deploy rollback: too many arguments", 2)
+			}
+			return deployRollback(ctx, cmd.Writer, deps, cmd.StringArgs("commit")[0])
+		},
+	}
+}
+
+func deployPinCommand(deps Dependencies) *cli.Command {
+	return &cli.Command{
+		Name:      "pin",
+		Usage:     "Block Git updates to the current revision",
+		UsageText: "relay deploy pin",
+		Description: "Block 'relay git sync' and webhook updates from changing the " +
+			"current revision.",
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Args().Present() {
+				return cli.Exit("deploy pin: too many arguments", 2)
+			}
+			return deploySetPinned(ctx, cmd.Writer, deps, true)
+		},
+	}
+}
+
+func deployUnpinCommand(deps Dependencies) *cli.Command {
+	return &cli.Command{
+		Name:      "unpin",
+		Usage:     "Allow future Git updates",
+		UsageText: "relay deploy unpin",
+		Description: "Allow a future 'relay git sync' or webhook update to change the " +
+			"revision. This does not immediately change the current revision.",
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Args().Present() {
+				return cli.Exit("deploy unpin: too many arguments", 2)
+			}
+			return deploySetPinned(ctx, cmd.Writer, deps, false)
+		},
+	}
+}
+
+func deployStatusCommand(deps Dependencies) *cli.Command {
+	return &cli.Command{
+		Name:  "status",
+		Usage: "Show the desired revision and node/app status",
+		Description: "Show the desired generation and commit, pin state, and each node's " +
+			"current revision and app status.",
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Args().Present() {
+				return cli.Exit("deploy status: too many arguments", 2)
+			}
+			return deployStatus(ctx, cmd.Writer, deps)
 		},
 	}
 }

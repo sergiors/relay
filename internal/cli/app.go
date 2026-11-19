@@ -26,31 +26,40 @@ func appCommand(deps Dependencies) *cli.Command {
 			"running worker. Invoking requires a running worker.",
 		Action: namespaceAction(),
 		Commands: []*cli.Command{
-			{
-				Name:        "ls",
-				Usage:       "List apps",
-				Description: "List discovered apps sorted by name.",
-				Action:      appListAction(deps),
-			},
-			{
-				Name:      "inspect",
-				Usage:     "Show one app's details",
-				UsageText: "relay app inspect NAME",
-				Description: "Show one app's status, handlers, events, schedules, services, " +
-					"environment variable names (values redacted), secret references, and pool " +
-					"counters. Image provenance is shown when " +
-					"available, and live pool gauges require a running worker.",
-				Arguments: []cli.Argument{
-					&cli.StringArgs{Name: "name", Min: 1, Max: 1},
-				},
-				Action: func(ctx context.Context, cmd *cli.Command) error {
-					if cmd.Args().Present() {
-						return cli.Exit("app inspect: too many arguments", 2)
-					}
-					return appInspect(ctx, cmd.Writer, cmd.StringArgs("name")[0], deps)
-				},
-			},
+			appListCommand(deps),
+			appInspectCommand(deps),
 			appInvokeCommand(deps),
+		},
+	}
+}
+
+func appListCommand(deps Dependencies) *cli.Command {
+	return &cli.Command{
+		Name:        "ls",
+		Usage:       "List apps",
+		Description: "List discovered apps sorted by name.",
+		Action:      appListAction(deps),
+	}
+}
+
+// appInspectCommand builds `relay app inspect NAME`.
+func appInspectCommand(deps Dependencies) *cli.Command {
+	return &cli.Command{
+		Name:      "inspect",
+		Usage:     "Show one app's details",
+		UsageText: "relay app inspect NAME",
+		Description: "Show one app's status, handlers, events, schedules, services, " +
+			"environment variable names (values redacted), secret references, and pool " +
+			"counters. Image provenance is shown when " +
+			"available, and live pool gauges require a running worker.",
+		Arguments: []cli.Argument{
+			&cli.StringArgs{Name: "name", Min: 1, Max: 1},
+		},
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Args().Present() {
+				return cli.Exit("app inspect: too many arguments", 2)
+			}
+			return appInspect(ctx, cmd.Writer, cmd.StringArgs("name")[0], deps)
 		},
 	}
 }

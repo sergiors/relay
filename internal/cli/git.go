@@ -37,93 +37,113 @@ func gitCommand(deps Dependencies) *cli.Command {
 			"No running worker is required.",
 		Action: namespaceAction(),
 		Commands: []*cli.Command{
-			{
-				Name:      "keygen",
-				Usage:     "Generate an SSH deploy key",
-				UsageText: "relay git keygen",
-				Description: "Generate an SSH deploy key under " + deps.GitSSHDir +
-					" and print its public key. Add it to the repository as a read-only deploy key. " +
-					"Fails if a key already exists.",
-				Action: func(ctx context.Context, cmd *cli.Command) error {
-					if cmd.Args().Present() {
-						return cli.Exit("git keygen: too many arguments", 2)
-					}
-					return gitKeygen(cmd.Writer, deps)
-				},
+			gitKeygenCommand(deps),
+			gitSetCommand(deps),
+			gitSyncCommand(deps),
+			gitStatusCommand(deps),
+			gitRemoveCommand(deps),
+		},
+	}
+}
+
+func gitKeygenCommand(deps Dependencies) *cli.Command {
+	return &cli.Command{
+		Name:      "keygen",
+		Usage:     "Generate an SSH deploy key",
+		UsageText: "relay git keygen",
+		Description: "Generate an SSH deploy key under " + deps.GitSSHDir +
+			" and print its public key. Add it to the repository as a read-only deploy key. " +
+			"Fails if a key already exists.",
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Args().Present() {
+				return cli.Exit("git keygen: too many arguments", 2)
+			}
+			return gitKeygen(cmd.Writer, deps)
+		},
+	}
+}
+
+func gitSetCommand(deps Dependencies) *cli.Command {
+	return &cli.Command{
+		Name:      "set",
+		Usage:     "Set the git source repository",
+		UsageText: "relay git set <repository> [--ref REF] [--path PATH] [--webhook-secret NAME]",
+		Description: "Save the SSH repository and optional ref, app path, and webhook " +
+			"secret. This only configures the source; run 'relay git sync' to deploy it.",
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "ref", Usage: "branch, tag, or commit (default " + git.DefaultRef + ")"},
+			&cli.StringFlag{Name: "path", Usage: "app directory within the repository"},
+			&cli.StringFlag{
+				Name:  "webhook-secret",
+				Usage: "stored secret name for GitHub webhook verification; requires a configured webhook listener",
 			},
-			{
-				Name:      "set",
-				Usage:     "Set the git source repository",
-				UsageText: "relay git set <repository> [--ref REF] [--path PATH] [--webhook-secret NAME]",
-				Description: "Save the SSH repository and optional ref, app path, and webhook " +
-					"secret. This only configures the source; run 'relay git sync' to deploy it.",
-				Flags: []cli.Flag{
-					&cli.StringFlag{Name: "ref", Usage: "branch, tag, or commit (default " + git.DefaultRef + ")"},
-					&cli.StringFlag{Name: "path", Usage: "app directory within the repository"},
-					&cli.StringFlag{
-						Name:  "webhook-secret",
-						Usage: "stored secret name for GitHub webhook verification; requires a configured webhook listener",
-					},
-				},
-				Arguments: []cli.Argument{
-					&cli.StringArgs{Name: "repository", Min: 1, Max: 1},
-				},
-				Action: func(ctx context.Context, cmd *cli.Command) error {
-					if cmd.Args().Present() {
-						return cli.Exit("git set: too many arguments", 2)
-					}
-					return gitSet(
-						ctx,
-						cmd.Writer,
-						deps,
-						cmd.StringArgs("repository")[0],
-						cmd.String("ref"),
-						cmd.String("path"),
-						cmd.String("webhook-secret"),
-					)
-				},
-			},
-			{
-				Name:  "sync",
-				Usage: "Deploy the latest revision from the configured Git source",
-				Description: "Deploy the latest revision from the configured Git source. Other " +
-					"Relay nodes using the same source update independently. A pinned deployment " +
-					"blocks sync; run 'relay deploy unpin' first. If another update wins during " +
-					"sync, retry.",
-				Action: func(ctx context.Context, cmd *cli.Command) error {
-					if cmd.Args().Present() {
-						return cli.Exit("git sync: too many arguments", 2)
-					}
-					return gitSync(ctx, cmd.Writer, deps)
-				},
-			},
-			{
-				Name:        "status",
-				Usage:       "Show the Git source and last sync",
-				Description: "Show the configured source and last sync time. Does not print key material.",
-				Action: func(ctx context.Context, cmd *cli.Command) error {
-					if cmd.Args().Present() {
-						return cli.Exit("git status: too many arguments", 2)
-					}
-					return gitStatus(cmd.Writer, deps)
-				},
-			},
-			{
-				Name:      "remove",
-				Usage:     "Remove the git source config and checkout",
-				UsageText: "relay git remove [-y]",
-				Description: "Remove the saved Git source and checkout. Leaves /apps and the " +
-					"deploy key untouched. Prompts for confirmation (default No); use -y to skip.",
-				Flags: []cli.Flag{
-					&cli.BoolFlag{Name: "yes", Aliases: []string{"y"}, Usage: "skip confirmation (for automation)"},
-				},
-				Action: func(ctx context.Context, cmd *cli.Command) error {
-					if cmd.Args().Present() {
-						return cli.Exit("git remove: too many arguments", 2)
-					}
-					return gitRemoveAction(ctx, cmd, deps)
-				},
-			},
+		},
+		Arguments: []cli.Argument{
+			&cli.StringArgs{Name: "repository", Min: 1, Max: 1},
+		},
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Args().Present() {
+				return cli.Exit("git set: too many arguments", 2)
+			}
+			return gitSet(
+				ctx,
+				cmd.Writer,
+				deps,
+				cmd.StringArgs("repository")[0],
+				cmd.String("ref"),
+				cmd.String("path"),
+				cmd.String("webhook-secret"),
+			)
+		},
+	}
+}
+
+func gitSyncCommand(deps Dependencies) *cli.Command {
+	return &cli.Command{
+		Name:  "sync",
+		Usage: "Deploy the latest revision from the configured Git source",
+		Description: "Deploy the latest revision from the configured Git source. Other " +
+			"Relay nodes using the same source update independently. A pinned deployment " +
+			"blocks sync; run 'relay deploy unpin' first. If another update wins during " +
+			"sync, retry.",
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Args().Present() {
+				return cli.Exit("git sync: too many arguments", 2)
+			}
+			return gitSync(ctx, cmd.Writer, deps)
+		},
+	}
+}
+
+func gitStatusCommand(deps Dependencies) *cli.Command {
+	return &cli.Command{
+		Name:        "status",
+		Usage:       "Show the Git source and last sync",
+		Description: "Show the configured source and last sync time. Does not print key material.",
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Args().Present() {
+				return cli.Exit("git status: too many arguments", 2)
+			}
+			return gitStatus(cmd.Writer, deps)
+		},
+	}
+}
+
+func gitRemoveCommand(deps Dependencies) *cli.Command {
+	return &cli.Command{
+		Name:      "remove",
+		Usage:     "Remove the git source config and checkout",
+		UsageText: "relay git remove [-y]",
+		Description: "Remove the saved Git source and checkout. Leaves /apps and the " +
+			"deploy key untouched. Prompts for confirmation (default No); use -y to skip.",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "yes", Aliases: []string{"y"}, Usage: "skip confirmation (for automation)"},
+		},
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Args().Present() {
+				return cli.Exit("git remove: too many arguments", 2)
+			}
+			return gitRemoveAction(ctx, cmd, deps)
 		},
 	}
 }
@@ -149,7 +169,10 @@ func gitKeygen(w io.Writer, deps Dependencies) error {
 // confirmation line on w IS the complete record of this single-step command. The
 // confirmation line may mention the webhook-secret REFERENCE name (never its
 // value).
-func gitSet(ctx context.Context, w io.Writer, deps Dependencies, repository, ref, path, webhookSecretRef string) error {
+func gitSet(
+	ctx context.Context, w io.Writer, deps Dependencies, repository, ref, path,
+	webhookSecretRef string,
+) error {
 	// Default the ref to DefaultRef when the flag was omitted, so the
 	// confirmation line shows the effective ref. SetSource applies the same
 	// default and the full canonical validation.

@@ -38,66 +38,78 @@ func secretCommand(deps Dependencies) *cli.Command {
 			"local provider. Values are never accepted as arguments or printed.",
 		Action: namespaceAction(),
 		Commands: []*cli.Command{
-			{
-				Name:  "ls",
-				Usage: "List secrets from the active provider",
-				Description: "List secret names from the configured provider. " +
-					"Values are never read or printed.",
-				Action: func(ctx context.Context, cmd *cli.Command) error {
-					if cmd.Args().Present() {
-						return cli.Exit("secret ls: too many arguments", 2)
-					}
-					return secretList(ctx, cmd.Writer, deps)
-				},
-			},
-			{
-				Name:      "set",
-				Usage:     "Create or update a local secret (local provider only)",
-				UsageText: "relay secret set NAME [-]",
-				Description: "Enter the value interactively with echo disabled, or use - to " +
-					"read all of stdin. Values are never accepted as positional arguments and " +
-					"are never printed.",
-				Arguments: []cli.Argument{
-					&cli.StringArgs{Name: "name", Min: 1, Max: 1, UsageText: "NAME"},
-					&cli.StringArgs{Name: "source", Min: 0, Max: 1, UsageText: "[-]"},
-				},
-				// Stop flag parsing after NAME so a trailing "-" and any extra
-				// argument are preserved as positionals: urfave otherwise swallows
-				// everything after a lone "-", which would silently accept extra
-				// arguments instead of rejecting them.
-				StopOnNthArg: stopOnFirstPositional(),
-				Action: func(ctx context.Context, cmd *cli.Command) error {
-					if cmd.Args().Present() {
-						return cli.Exit("secret set: too many arguments", 2)
-					}
-					source := cmd.StringArgs("source")
-					if len(source) > 0 && source[0] != secretStdinArg {
-						// A value must never be passed as a positional argument.
-						// Do not echo the rejected literal: it is secret material.
-						return cli.Exit(
-							"secret set: secret values must not be passed as arguments (use - to read the value from stdin)",
-							2,
-						)
-					}
-					return secretSet(ctx, cmd.Reader, cmd.Writer, deps, cmd.StringArgs("name")[0], len(source) > 0)
-				},
-			},
-			{
-				Name:      "rm",
-				Usage:     "Remove a local secret",
-				UsageText: "relay secret rm NAME",
-				Description: "Requires the local provider; other providers " +
-					"are rejected. Removing a missing secret is an error.",
-				Arguments: []cli.Argument{
-					&cli.StringArgs{Name: "name", Min: 1, Max: 1},
-				},
-				Action: func(ctx context.Context, cmd *cli.Command) error {
-					if cmd.Args().Present() {
-						return cli.Exit("secret rm: too many arguments", 2)
-					}
-					return secretRm(ctx, cmd.Writer, deps, cmd.StringArgs("name")[0])
-				},
-			},
+			secretListCommand(deps),
+			secretSetCommand(deps),
+			secretRmCommand(deps),
+		},
+	}
+}
+
+func secretListCommand(deps Dependencies) *cli.Command {
+	return &cli.Command{
+		Name:  "ls",
+		Usage: "List secrets from the active provider",
+		Description: "List secret names from the configured provider. " +
+			"Values are never read or printed.",
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Args().Present() {
+				return cli.Exit("secret ls: too many arguments", 2)
+			}
+			return secretList(ctx, cmd.Writer, deps)
+		},
+	}
+}
+
+func secretSetCommand(deps Dependencies) *cli.Command {
+	return &cli.Command{
+		Name:      "set",
+		Usage:     "Create or update a local secret (local provider only)",
+		UsageText: "relay secret set NAME [-]",
+		Description: "Enter the value interactively with echo disabled, or use - to " +
+			"read all of stdin. Values are never accepted as positional arguments and " +
+			"are never printed.",
+		Arguments: []cli.Argument{
+			&cli.StringArgs{Name: "name", Min: 1, Max: 1, UsageText: "NAME"},
+			&cli.StringArgs{Name: "source", Min: 0, Max: 1, UsageText: "[-]"},
+		},
+		// Stop flag parsing after NAME so a trailing "-" and any extra
+		// argument are preserved as positionals: urfave otherwise swallows
+		// everything after a lone "-", which would silently accept extra
+		// arguments instead of rejecting them.
+		StopOnNthArg: stopOnFirstPositional(),
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Args().Present() {
+				return cli.Exit("secret set: too many arguments", 2)
+			}
+			source := cmd.StringArgs("source")
+			if len(source) > 0 && source[0] != secretStdinArg {
+				// A value must never be passed as a positional argument.
+				// Do not echo the rejected literal: it is secret material.
+				return cli.Exit(
+					"secret set: secret values must not be passed as arguments (use - to read the value from stdin)",
+					2,
+				)
+			}
+			return secretSet(ctx, cmd.Reader, cmd.Writer, deps, cmd.StringArgs("name")[0], len(source) > 0)
+		},
+	}
+}
+
+func secretRmCommand(deps Dependencies) *cli.Command {
+	return &cli.Command{
+		Name:      "rm",
+		Usage:     "Remove a local secret",
+		UsageText: "relay secret rm NAME",
+		Description: "Requires the local provider; other providers " +
+			"are rejected. Removing a missing secret is an error.",
+		Arguments: []cli.Argument{
+			&cli.StringArgs{Name: "name", Min: 1, Max: 1},
+		},
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Args().Present() {
+				return cli.Exit("secret rm: too many arguments", 2)
+			}
+			return secretRm(ctx, cmd.Writer, deps, cmd.StringArgs("name")[0])
 		},
 	}
 }
