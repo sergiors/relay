@@ -1,0 +1,59 @@
+name: relay-ci-local
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: relay
+      POSTGRES_DB: relay
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:8-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ci:
+    build:
+      context: .ci/local
+      dockerfile: Dockerfile
+
+    privileged: true
+    hostname: relay-ci-local
+
+    environment:
+      DOCKER_HOST: unix:///var/run/docker.sock
+      DOCKER_TLS_CERTDIR: ""
+      DOCKER_BUILDKIT: "1"
+      TEST_DATABASE_URL: postgres://relay:relay@postgres:5432/relay?sslmode=disable
+      REDIS_TEST_ADDR: redis:6379
+      NODE_ID: relay-ci-local
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    working_dir: /src
+
+    volumes:
+      - .:/src
+      - go-mod:/go/pkg/mod
+      - go-build:/home/ci/.cache/go-build
+      - uv-cache:/home/ci/.cache/uv
+      - pnpm-cache:/home/ci/.local/share/pnpm/store
+
+volumes:
+  go-mod:
+  go-build:
+  uv-cache:
+  pnpm-cache:
