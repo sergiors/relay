@@ -166,10 +166,11 @@ func (p *pyProc) stdoutString() string {
 	return p.stdoutSince(0)
 }
 
-// stdoutWriter routes the copy goroutine's appends through stdoutMu — the
-// same lock every stdout accessor takes — so collecting output never races
-// test reads of the builder. The lock is taken per Write, not for the whole
-// copy, keeping reads unblocked while output streams in.
+// stdoutWriter is assigned as cmd.Stdout so os/exec's own copy goroutine —
+// joined by cmd.Wait — appends through stdoutMu, the same lock every stdout
+// accessor takes, so collecting output never races test reads of the builder.
+// The lock is taken per Write, not for the whole copy, keeping reads unblocked
+// while output streams in.
 type stdoutWriter struct{ p *pyProc }
 
 func (w stdoutWriter) Write(b []byte) (int, error) {
@@ -384,8 +385,9 @@ func startEmbeddedBootstrap(t *testing.T, dir string, content []byte, extraEnv [
 // spawnProcessEnv starts the already-written bootstrap.py in dir on a fresh
 // reserved port with the Relay-owned channel environment, the test's controlled
 // baseline/system env, and any caller extras (e.g. the zuvloop variant's
-// environment). The process exit is tracked exactly once. No connection is
-// made yet.
+// environment). The process exit is tracked exactly once; cmd.Wait joins
+// os/exec's output-copy goroutines, so a closed exitDone implies both the
+// stdout and stderr collectors have drained. No connection is made yet.
 func spawnProcessEnv(t *testing.T, dir string, extraEnv []string) *pyProc {
 	t.Helper()
 	port := reserveLoopbackPort(t)
@@ -398,26 +400,19 @@ func spawnProcessEnv(t *testing.T, dir string, extraEnv []string) *pyProc {
 		"RELAY_TEST_BASELINE=process-baseline",
 		"RELAY_TEST_SYSTEM=system-value",
 	), extraEnv...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatalf("stdout pipe: %v", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		t.Fatalf("stderr pipe: %v", err)
-	}
 	p := &pyProc{
 		cmd:      cmd,
 		port:     port,
 		secret:   secret,
 		exitDone: make(chan struct{}),
 	}
-	go func() {
-		_, _ = io.Copy(stdoutWriter{p}, stdout)
-	}()
-	go func() {
-		_, _ = io.Copy(p, stderr)
-	}()
+	// The collectors are assigned as cmd.Stdout/cmd.Stderr rather than served
+	// through StdoutPipe/StderrPipe plus detached copies: os/exec then owns the
+	// copy goroutines and Wait joins them before returning. With raw pipes,
+	// Wait could close the read end while a detached copy still drained it,
+	// racing (and truncating) any stdout snapshot taken after exit.
+	cmd.Stdout = stdoutWriter{p}
+	cmd.Stderr = p
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start bootstrap: %v", err)
 	}
@@ -1979,6 +1974,15 @@ async def cancelled(event, context):
 		t.Errorf("want the cancelled channel surfaced as a read-side close, got %q", r.Err)
 	}
 
+	// Prompt termination first: the shutdown path must join and exit under a
+	// bounded wait — a hang fails here rather than stalling the suite. Because
+	// cmd.Wait joins os/exec's output-copy goroutines, a completed exit also
+	// means both pipes have drained, so the final stdout snapshot below is
+	// taken against a complete, deterministic capture.
+	if err := p.waitExit(t, 10*time.Second); err != nil {
+		t.Logf("bootstrap exit status after cancellation: %v (termination is the contract; code not pinned)", err)
+	}
+
 	// The interrupted lifecycle contract: the cancelled invocation STARTed
 	// under its logical requestId but its END must never be fabricated — a
 	// task cancellation is not a completed invocation — and neither line may
@@ -1994,11 +1998,5 @@ async def cancelled(event, context):
 		if strings.Contains(stdout, field+cancelledTransport) {
 			t.Errorf("lifecycle lines must not carry the transport correlation id %q; stdout:\n%s", cancelledTransport, stdout)
 		}
-	}
-
-	// Prompt termination: the shutdown path must join and exit under a bounded
-	// wait — a hang fails here rather than stalling the suite.
-	if err := p.waitExit(t, 10*time.Second); err != nil {
-		t.Logf("bootstrap exit status after cancellation: %v (termination is the contract; code not pinned)", err)
 	}
 }
