@@ -807,6 +807,12 @@ func Run(logger *slog.Logger) (runErr error) {
 		},
 	)
 	if deploymentCoordinator != nil {
+		// Give the coordinator's independent drift backstop the reconciler's
+		// verification ledger before the loop starts: it then hashes only apps the
+		// serial reconcile pump has not verified recently, so a long build cannot
+		// delay drift detection and the steady state never hashes twice per
+		// cadence.
+		deploymentCoordinator.SetVerificationLedger(rec.VerifiedSince)
 		// The convergence loop only reads PostgreSQL and materializes into
 		// /apps; it never publishes desired state. Join it before the state DB
 		// closes (see shutdownStepDeployment).

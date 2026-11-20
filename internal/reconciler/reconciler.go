@@ -114,7 +114,11 @@ type Config struct {
 	// single reconcile fires. Defaults to DefaultDebounce.
 	Debounce time.Duration
 	// Interval is the periodic reconciliation period, a backstop for watches that
-	// miss events. Defaults to DefaultInterval.
+	// miss events. Defaults to DefaultInterval. In a coordinated deployment this
+	// pass is also the primary drift verifier: it compares every app against the
+	// materialized authorization and reports drift (see DeploymentDrift). It
+	// records each successful content verification so the deployment coordinator's
+	// independent backstop can avoid hashing the same bytes again.
 	Interval time.Duration
 	// Fingerprint, when non-nil, replaces the package-level
 	// app.SelectAndFingerprintApp that reconcileApp uses to derive
@@ -189,10 +193,13 @@ type Config struct {
 	// for the reconciler's currently authorized deployment generation. It is
 	// independent of the public apps.status state view. Nil-safe.
 	DeploymentProgress func(name, phase, errMessage string)
-	// DeploymentDrift, when set, reports that local /apps content no longer
-	// matches the authorized materialized generation. The reconciler then leaves
-	// the active registry and state untouched; the deployment coordinator
-	// re-materializes the authorized revision.
+	// DeploymentDrift, when set, reports that local /apps content cannot be
+	// reconciled as the authorized materialized generation: local drift, or an app
+	// the materialization could not authorize but the live tree can now
+	// fingerprint. The reconciler then leaves the active registry and state
+	// untouched; the deployment coordinator re-materializes the authorized
+	// revision. The coordinator also checks independently, so a long build in this
+	// process's serial pump cannot delay detection.
 	DeploymentDrift func(name, reason string)
 }
 
@@ -233,8 +240,10 @@ type Reconciler struct {
 	// deploymentFingerprints is the authoritative app -> fingerprint set computed
 	// at materialization, deploymentInvalid the desired-but-unloadable apps (not
 	// local drift), deploymentRemoved the apps absent from this generation (their
-	// removal is authorized), and deploymentDriftReported suppresses repeated drift
-	// reports for one name in one generation.
+	// removal is authorized), and deploymentDriftReported suppresses repeated
+	// local-drift reports for one name in one generation. It is deliberately not
+	// touched by the desired-invalid re-verification path (see reverifyCooldown):
+	// an invalid re-verification must never delay a later genuine local drift.
 	deploymentEnabled          bool
 	deploymentGeneration       int64
 	deploymentFingerprints     map[string]string
@@ -243,10 +252,33 @@ type Reconciler struct {
 	deploymentInvalidTemplates map[string]string
 	deploymentRemoved          map[string]bool
 	deploymentDriftReported    map[string]bool
-	mu                         sync.Mutex
-	fingerprints               map[string]string // name -> last-reconciled fingerprint
-	imageSelections            map[string]string // name -> published runtime selection identity
-	generations                map[string]uint64
+	// deploymentEpoch identifies the currently installed authorization. It
+	// advances on every SetDeploymentAuthorizationWithInvalid, so a content
+	// verification recorded under one authorization can never be trusted after a
+	// materialization or authorization update.
+	deploymentEpoch uint64
+	mu              sync.Mutex
+	fingerprints    map[string]string // name -> last-reconciled fingerprint
+	imageSelections map[string]string // name -> published runtime selection identity
+	generations     map[string]uint64
+	// verified records the last time a reconcile pass successfully read and
+	// fingerprinted each app's current content, under the authorization epoch it
+	// was verified against. The deployment coordinator's independent drift
+	// backstop reads it through VerifiedSince, so it hashes only apps this
+	// periodic pass has not verified in the current authorization since the
+	// previous check: a long build in the serial pump then cannot delay drift
+	// detection, while the steady state never hashes the same tree twice per
+	// check window. It is a progress marker only; no reconcile decision reads it.
+	verified map[string]verifiedContent
+	// reverifyCooldown rate-limits the desired-invalid re-verification path to one
+	// request per reconciler interval for the same effective authorization. A
+	// successful same-generation materialization reinstalls the authorization and
+	// re-enqueues the still-invalid app; this state, which authorization installs
+	// never clear, keeps that from forcing a Git sync on every reconcile. A new
+	// generation or a changed effective authorization retries immediately. It is
+	// separate from deploymentDriftReported so invalid re-verification can never
+	// suppress ordinary local drift, which never consults this state.
+	reverifyCooldown map[string]reverifyCooldownEntry
 	// fencingTokens carries the PostgreSQL-authoritative fencing token returned
 	// by the desired-generation write that started each app's current
 	// generation. It is deliberately SEPARATE from generations: generations is a
@@ -294,6 +326,20 @@ type Reconciler struct {
 	loops sync.WaitGroup
 }
 
+// verifiedContent is one app's last successful content verification: when it
+// happened and the authorization epoch it was verified against.
+type verifiedContent struct {
+	at    time.Time
+	epoch uint64
+}
+
+// reverifyCooldownEntry is the last desired-invalid re-verification request for
+// one app and the effective authorization it was made under.
+type reverifyCooldownEntry struct {
+	authorization string
+	at            time.Time
+}
+
 // New builds a Reconciler. The registry must already be populated with the
 // startup-loaded apps (available or not) so reconciliation can compare
 // against and swap them.
@@ -335,6 +381,8 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 		fingerprints:                        map[string]string{},
 		imageSelections:                     map[string]string{},
 		generations:                         map[string]uint64{},
+		verified:                            map[string]verifiedContent{},
+		reverifyCooldown:                    map[string]reverifyCooldownEntry{},
 		fencingTokens:                       map[string]state.FencingToken{},
 		deploymentFingerprints:              map[string]string{},
 		deploymentTemplates:                 map[string]string{},
@@ -388,6 +436,32 @@ func (r *Reconciler) SeedImageSelection(name, identity string) {
 	r.imageSelections[name] = identity
 }
 
+// VerifiedSince reports the app names whose content this Reconciler successfully
+// read and fingerprinted strictly after since, under the authorization epoch that
+// is currently installed. A verification from an earlier authorization is never
+// reported: a materialization or authorization update advances the epoch, so the
+// deployment coordinator's independent drift backstop hashes the whole authorized
+// set once after such an update instead of trusting pre-update timestamps. The
+// strict comparison keeps a verification exactly on a window boundary from being
+// trusted by two checks; the next check hashes it conservatively instead.
+//
+// Within one authorization the coordinator uses it to hash only authorized apps
+// this Reconciler has not verified since the coordinator's previous check, so a
+// build backlog in the single reconcile pump cannot delay drift detection while
+// the steady state never hashes the same tree twice per interval. It is a
+// progress marker, never an input to a reconcile decision.
+func (r *Reconciler) VerifiedSince(since time.Time) map[string]struct{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]struct{}, len(r.verified))
+	for name, entry := range r.verified {
+		if entry.epoch == r.deploymentEpoch && entry.at.After(since) {
+			out[name] = struct{}{}
+		}
+	}
+	return out
+}
+
 // SetDeploymentAuthorization installs the coordinated deployment generation whose
 // tree was materialized in /apps. It ALWAYS enables the coordinated gate; a
 // generation of 0 (configured Git source but no desired revision yet) authorizes
@@ -423,6 +497,10 @@ func (r *Reconciler) SetDeploymentAuthorizationWithInvalid(
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.deploymentEnabled = true
+	// Advance the authorization epoch: every content verification recorded before
+	// this update was made against a different authorization, so the coordinator's
+	// independent backstop must not trust it.
+	r.deploymentEpoch++
 	r.deploymentGeneration = generation
 	r.deploymentFingerprints = make(map[string]string, len(fingerprints))
 	for name, fingerprint := range fingerprints {
@@ -611,6 +689,15 @@ func (r *Reconciler) pump() {
 // correctness, so it is deliberately retained. An unchanged audit finds the
 // same fingerprint and skips (no build), so the cost is the single read the
 // backstop exists to perform.
+//
+// In a coordinated deployment this pass is the primary drift verifier: it
+// compares each app against the materialized authorization and reports every
+// mismatch as drift (see DeploymentDrift), including authorized names that are
+// not candidates on disk (see missingNames). Each successful content
+// fingerprint is recorded (VerifiedSince) so the deployment coordinator's
+// independent drift backstop can hash only the apps this pass has not verified
+// within one interval. That keeps the independent path prompt when a long build
+// holds this serial pump, without re-hashing the whole tree every cadence.
 //
 // Each pass first fires the Config.Audit hook (when set): it is the re-drive
 // point for deferred image cleanup, so an image whose bounded removal retries

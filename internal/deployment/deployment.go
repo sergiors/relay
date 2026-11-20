@@ -17,6 +17,15 @@
 // active generation; local SSH keys, known_hosts, and other private credentials
 // are never shared.
 //
+// Local drift of /apps is detected by the app reconciler's periodic pass, which
+// compares each app against the materialized authorization and reports every
+// mismatch back through Coordinator.ReportDrift. A coordinator-side check runs
+// independently of the reconciler's serial preparation pump, so a long build
+// cannot delay drift detection; it hashes only the apps the reconciler has not
+// verified in the current scan window (since the previous check), so the same
+// tree is not hashed twice per cadence and no verification is trusted by two
+// checks.
+//
 // Rollback is a NEW generation carrying an older commit. A manual publication may
 // pin that revision; while pinned, automatic webhook pushes are ignored so a
 // later or out-of-order branch delivery cannot silently undo the rollback.
@@ -55,6 +64,9 @@ const DefaultRetryInterval = 5 * time.Second
 // DefaultDriftInterval is the periodic local-drift check. Immediate drift
 // detection comes from the reconciler's filesystem watch; this is the bounded
 // backstop that re-materializes the authorized revision if an edit was missed.
+// It runs on the coordinator loop, independent of the reconciler's serial
+// preparation pump, and hashes only the apps the reconciler has not verified
+// since the previous check, under the current authorization.
 const DefaultDriftInterval = 30 * time.Second
 
 // materializeTimeout bounds one fetch/checkout/materialization attempt. The
@@ -82,8 +94,9 @@ type Config struct {
 
 	Logger *slog.Logger
 	// LoadApps overrides the materialized-tree app discovery/load used by
-	// authorize. It is a narrow seam for exercising a root/global loader failure
-	// without a filesystem race. Nil uses app.NewLoader(AppsDir, Logger).
+	// authorize and the drift check. It is a narrow seam for exercising a
+	// root/global loader failure without a filesystem race. Nil uses
+	// app.NewLoader(AppsDir, Logger).
 	LoadApps func(dir string) ([]app.App, []app.LoadIssue, error)
 	// PollInterval, RetryInterval, and DriftInterval override the package
 	// defaults when positive.
@@ -134,6 +147,16 @@ type Coordinator struct {
 
 	mu      sync.Mutex
 	applied Snapshot
+	// driftSince is the boundary of the current independent drift window: it is
+	// the start time of the previous check. A reconciler verification is trusted
+	// by exactly one check (the one whose window contains it), so a check that
+	// runs shortly after another cannot re-trust the same verification and defer
+	// detection.
+	driftSince time.Time
+	// verifiedSince is the reconciler's authorization-scoped verification ledger.
+	// It is runtime wiring installed by SetVerificationLedger, not a tunable
+	// option; nil performs the full check.
+	verifiedSince func(since time.Time) map[string]struct{}
 	// incarnation and appliedIncarnation are the PostgreSQL fences for this
 	// node's observed generation and applied generation respectively. App
 	// progress uses appliedIncarnation.
@@ -178,12 +201,30 @@ func New(cfg Config) *Coordinator {
 		}
 	}
 	return &Coordinator{
-		cfg:   cfg,
-		poll:  cfg.PollInterval,
-		retry: cfg.RetryInterval,
-		drift: cfg.DriftInterval,
-		kick:  make(chan struct{}, 1),
+		cfg:        cfg,
+		poll:       cfg.PollInterval,
+		retry:      cfg.RetryInterval,
+		drift:      cfg.DriftInterval,
+		driftSince: time.Now(),
+		kick:       make(chan struct{}, 1),
 	}
+}
+
+// SetVerificationLedger installs the reconciler's verification ledger, which
+// reports the app names whose content the reconciler has verified since a given
+// time under its current authorization. The independent drift check then hashes
+// only the authorized apps the reconciler has not verified in the current scan
+// window, so a long preparation holding the reconciler's single pump cannot
+// delay drift detection while the steady state performs no duplicate full-tree
+// hash. It is runtime wiring, not a Config option; it must be called before
+// Start, and a nil ledger keeps the full check.
+func (c *Coordinator) SetVerificationLedger(verified func(since time.Time) map[string]struct{}) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.verifiedSince = verified
+	c.mu.Unlock()
 }
 
 // ObserveStartup reads the shared desired revision and, when one exists, fetches
@@ -271,6 +312,12 @@ func (c *Coordinator) ObserveStartup(ctx context.Context) (Snapshot, error) {
 // called with app names that need a normal reconciler pass after a successful
 // materialization. Both callbacks are nil-safe. The first pass is immediate so a
 // revision published while startup was in progress converges promptly.
+//
+// Besides the 60s desired poll and the conditional 5s retry, the loop runs the
+// independent drift check on the drift interval. That check does not share the
+// reconciler's serial preparation pump, so a long build cannot delay it, and it
+// hashes only apps the reconciler has not verified since the previous check
+// (see SetVerificationLedger), so no verification is trusted twice.
 func (c *Coordinator) Start(
 	ctx context.Context,
 	onMaterialized func(Snapshot),
@@ -380,7 +427,9 @@ func (c *Coordinator) requestSync(force bool) {
 
 // ReportApp records per-app activation progress for the node's currently applied
 // generation. It is the reconciler's progress callback. A stale coordinator (no
-// applied generation or no incarnation yet) is a no-op.
+// applied generation or no incarnation yet) is a no-op. An empty-fingerprint
+// Drifted update is also ignored while the applied snapshot marks the app
+// desired-invalid, preserving its Failed row for restart recovery.
 func (c *Coordinator) ReportApp(name, phase, errText string) {
 	if c == nil || c.cfg.State == nil || name == "" {
 		return
@@ -390,6 +439,7 @@ func (c *Coordinator) ReportApp(name, phase, errText string) {
 	incarnation := c.appliedIncarnation
 	commit := c.applied.Commit
 	fingerprint := c.applied.Fingerprints[name]
+	_, desiredInvalid := c.applied.Invalid[name]
 	templateIdentity := c.applied.TemplateIdentities[name]
 	if templateIdentity == "" {
 		// Desired-invalid apps keep their materialized identity in InvalidTemplates
@@ -403,6 +453,10 @@ func (c *Coordinator) ReportApp(name, phase, errText string) {
 	if generation <= 0 || incarnation <= 0 {
 		return
 	}
+
+	if phase == state.DeploymentAppDrifted && desiredInvalid && fingerprint == "" {
+		return
+	}
 	if fingerprint == "" {
 		switch phase {
 		case state.DeploymentAppActive,
@@ -410,8 +464,8 @@ func (c *Coordinator) ReportApp(name, phase, errText string) {
 			state.DeploymentAppDegraded:
 			// These phases describe authorized content. Without a materialized
 			// fingerprint the write would erase a persisted fingerprint or record
-			// an empty expected identity that startup must not authorize. Explicit
-			// drift and failure diagnostics are still recorded.
+			// an empty expected identity that startup must not authorize. Failed
+			// diagnostics and permitted drift reports are still recorded.
 			return
 		}
 	}
@@ -444,12 +498,26 @@ func (c *Coordinator) ReportApp(name, phase, errText string) {
 
 // ReportDrift records that local /apps content no longer matches the authorized
 // generation and requests an immediate re-materialization. The previous active
-// generation keeps serving until the restore succeeds.
+// generation keeps serving until the restore succeeds. It is the reconciler's
+// per-app drift seam; the coordinator's own periodic check (checkDrift) is the
+// independent backstop for a reconcile that a build backlog has not reached yet.
+//
+// A name the applied snapshot already classifies as desired-invalid only requests
+// the restore. Such an app has no authorized fingerprint, so a Drifted progress
+// row would carry an empty fingerprint, which loadApplied discards on restart; the
+// existing Failed row is the persisted authority for its desired-invalid state and
+// must not be replaced by a transient diagnostic. Valid and local-only drift keeps
+// recording Drifted progress.
 func (c *Coordinator) ReportDrift(name, reason string) {
 	if c == nil {
 		return
 	}
-	c.ReportApp(name, state.DeploymentAppDrifted, reason)
+	c.mu.Lock()
+	_, invalid := c.applied.Invalid[name]
+	c.mu.Unlock()
+	if !invalid {
+		c.ReportApp(name, state.DeploymentAppDrifted, reason)
+	}
 	c.Kick()
 }
 
@@ -900,17 +968,52 @@ func (c *Coordinator) loadApplied(ctx context.Context) (Snapshot, error) {
 	return snapshot, nil
 }
 
-// checkDrift periodically compares local app fingerprints with the authorized
-// generation. The reconciler's watch normally catches edits first; this bounded
-// backstop restores a missed change without ever publishing it as desired.
+// checkDrift independently verifies local /apps against the authorized
+// generation. It runs on the coordinator loop, so it is serialized with
+// materialization and never observes a tree mid-sync.
+//
+// The reconciler's periodic pass is the primary verifier: it re-reads every app
+// and records each successful content verification under the authorization epoch
+// it was made against (VerifiedSince). This backstop audits the whole authorized
+// set on every drift tick — valid apps, desired-invalid apps, their materialized
+// template identities, and every local entry that is not authorized — and hashes
+// a valid authorized app only when the reconciler has not verified it in the
+// current authorization since this backstop's previous check. The scan boundary
+// is therefore explicit: each check covers the window since the previous check,
+// so one verification can never be trusted by two checks and a long build in the
+// reconciler's pump cannot defer detection indefinitely. Every authorization
+// update advances the reconciler's epoch and invalidates earlier verifications,
+// so a rematerialization is never masked by pre-update timestamps.
+//
+// Every app is still verified at least once per window: by the reconciler if it
+// covers the app, otherwise by this check. A nil ledger performs the full check
+// (tests and embedders).
+//
+// This path must stay independent of the reconciler's pump: do not move it onto
+// the reconcile queue, where a build backlog can starve it. The coordinator loop
+// itself is only serialized with its own materialization, which is the repair.
 func (c *Coordinator) checkDrift(ctx context.Context) {
 	c.mu.Lock()
 	applied := c.applied
+	since := c.driftSince
+	verifiedSince := c.verifiedSince
+	c.mu.Unlock()
+	// Snapshot the ledger BEFORE advancing the window boundary. A verification
+	// that lands while the snapshot is being taken is then either included here
+	// (and hashed again by nobody, because the new boundary is at or after it) or
+	// missed here and hashed conservatively now; it can never be trusted by two
+	// checks.
+	var verified map[string]struct{}
+	if verifiedSince != nil {
+		verified = verifiedSince(since)
+	}
+	c.mu.Lock()
+	c.driftSince = time.Now()
 	c.mu.Unlock()
 	if !applied.Authoritative {
 		return
 	}
-	fingerprints, _, _, _, err := c.authorize(ctx)
+	apps, issues, err := c.cfg.LoadApps(c.cfg.AppsDir)
 	if err != nil {
 		// A transiently unreadable /apps is not evidence of drift; do not churn a
 		// rematerialization attempt from the drift backstop. The convergence loop
@@ -920,21 +1023,101 @@ func (c *Coordinator) checkDrift(ctx context.Context) {
 		}
 		return
 	}
-	if !sameFingerprints(applied.Fingerprints, fingerprints) {
-		c.Kick()
-	}
-}
-
-func sameFingerprints(a, b map[string]string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for name, fingerprint := range a {
-		if b[name] != fingerprint {
-			return false
+	present := make(map[string]bool, len(apps)+len(issues))
+	for _, issue := range issues {
+		present[issue.Name] = true
+		if _, authorized := applied.Fingerprints[issue.Name]; authorized {
+			// An authorized app that no longer loads at all is drift.
+			c.Kick()
+			return
+		}
+		if _, invalid := applied.Invalid[issue.Name]; !invalid {
+			// A local entry that is neither authorized nor desired-invalid is
+			// unauthorized content, whether or not the loader could read it. This
+			// is the invalid counterpart of a local-only app.
+			c.Kick()
+			return
+		}
+		// Desired-invalid: a deterministic local identity is unverifiable drift
+		// when the materialized revision never recorded one for this app — there is
+		// nothing to compare against, and the reconciler's parse-error path cannot
+		// distinguish a locally changed invalid template from the materialized one
+		// without an expected identity. Request re-authorization of the exact shared
+		// SHA instead of trusting the bytes. When both identities are known, only
+		// changed bytes are drift. An empty local identity is an operational
+		// failure (permissions, I/O) that says nothing about the bytes, so it stays
+		// with the reconciler's retry.
+		expected := applied.InvalidTemplates[issue.Name]
+		if issue.Identity != "" && (expected == "" || issue.Identity != expected) {
+			c.Kick()
+			return
 		}
 	}
-	return true
+	for _, fn := range apps {
+		if ctx.Err() != nil {
+			return
+		}
+		present[fn.Name] = true
+		if expected, authorized := applied.Fingerprints[fn.Name]; authorized {
+			if _, done := verified[fn.Name]; done {
+				// The reconciler verified this app's content under the current
+				// authorization since the previous check; it either matched or
+				// reported drift. Hashing it again would duplicate that work.
+				continue
+			}
+			_, fingerprint, err := app.SelectAndFingerprintApp(fn.Dir, fn.Template)
+			if err != nil || fingerprint != expected {
+				// An authorized app whose content can no longer be read or differs
+				// from the authorization is drift.
+				c.Kick()
+				return
+			}
+			continue
+		}
+		if _, invalid := applied.Invalid[fn.Name]; invalid {
+			if _, done := verified[fn.Name]; done {
+				// The reconciler read this app under the current authorization since
+				// the previous check and handled it: a changed template identity is
+				// reported as drift, and a non-activatable app requests
+				// re-authorization. Re-checking would duplicate that work.
+				continue
+			}
+			// The local template identity is the only decision input. A matching
+			// identity is the materialized content (a restore would be a no-op), so
+			// the remaining fingerprint retry belongs to the reconciler. A changed
+			// identity is drift, and an identity that cannot be compared because the
+			// materialization recorded none is unverifiable drift: either way the
+			// exact shared revision must be restored and re-authorized. The source
+			// content hash would not change that decision.
+			source, err := app.ReadTemplateSource(c.cfg.AppsDir, fn.Name)
+			if err != nil || source.Identity == "" {
+				// An operational failure says nothing about the bytes; it stays with
+				// the reconciler's retry.
+				continue
+			}
+			if expected := applied.InvalidTemplates[fn.Name]; expected == "" || source.Identity != expected {
+				c.Kick()
+				return
+			}
+			continue
+		}
+		// A name present outside the authorized generation is drift regardless of
+		// whether its source can be hashed: the authorized tree must be restored.
+		c.Kick()
+		return
+	}
+	for name := range applied.Fingerprints {
+		if !present[name] {
+			c.Kick()
+			return
+		}
+	}
+	for name := range applied.Invalid {
+		if !present[name] {
+			c.Kick()
+			return
+		}
+	}
 }
 
 func (c *Coordinator) setApplied(snapshot Snapshot) {

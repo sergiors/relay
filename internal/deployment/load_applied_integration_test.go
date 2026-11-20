@@ -505,11 +505,13 @@ func TestReportAppPreservesTemplateIdentity(t *testing.T) {
 
 // TestReportAppPreservesInvalidTemplateIdentity pins the final Low residual:
 // an invalid app's materialized identity lives in Snapshot.InvalidTemplates
-// (not TemplateIdentities), so ReportApp's failed/drift diagnostics — which
-// write with an empty fingerprint — must fall back to it instead of upserting
-// "". Restart recovery then still reconstructs InvalidTemplates from the row
-// and can never misclassify an unchanged invalid app as local drift during a
-// fetch outage.
+// (not TemplateIdentities), so ReportApp's failed diagnostics — which write
+// with an empty fingerprint — must fall back to it instead of upserting "".
+// A stale Drifted report for the same desired-invalid app is skipped entirely
+// by the coordinator's narrow guard (see
+// TestReportAppSkipsStaleDriftedOverwriteForDesiredInvalid). Restart recovery
+// then still reconstructs InvalidTemplates from the row and can never
+// misclassify an unchanged invalid app as local drift during a fetch outage.
 func TestReportAppPreservesInvalidTemplateIdentity(t *testing.T) {
 	env := newCoordinatorEnv(t)
 	if err := git.SetSource(env.cfg.GitConfigPath, deployRepo, "main", "", ""); err != nil {
@@ -572,7 +574,10 @@ func TestReportAppPreservesInvalidTemplateIdentity(t *testing.T) {
 			"as local drift during a fetch outage", recovered.InvalidTemplates)
 	}
 
-	// A drift diagnostic from the recovered coordinator preserves it too.
+	// A STALE Drifted diagnostic for this desired-invalid app is skipped by
+	// the coordinator's narrow guard: the Failed row and its identity must
+	// survive rather than being replaced by an empty-fingerprint Drifted row
+	// that loadApplied would drop after the next restart.
 	restarted.ReportApp("broken", state.DeploymentAppDrifted, "content changed")
 	rows, err = env.st.ReadDeploymentAppProgress(
 		context.Background(), env.cfg.NodeID, 1)
@@ -585,8 +590,9 @@ func TestReportAppPreservesInvalidTemplateIdentity(t *testing.T) {
 			row = &rows[i]
 		}
 	}
-	if row == nil || row.Phase != state.DeploymentAppDrifted ||
-		row.TemplateIdentity != "tid-x" {
-		t.Fatalf("row = %+v, want the drift diagnostic preserving tid-x", row)
+	if row == nil || row.Phase != state.DeploymentAppFailed ||
+		row.Error != "template invalid" || row.TemplateIdentity != "tid-x" {
+		t.Fatalf("row = %+v, want the Failed phase, diagnostic, and tid-x preserved "+
+			"across a stale Drifted report", row)
 	}
 }

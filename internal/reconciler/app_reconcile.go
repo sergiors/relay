@@ -24,6 +24,13 @@ import (
 // template-less directory is not an app and is handled by the missing-name sweep
 // when it was previously known. Each candidate is dispatched through the same
 // single pump so reconciles stay serialized per app.
+//
+// In a coordinated deployment this pass also verifies each app's template
+// identity and content fingerprint against the materialized authorization in
+// reconcileApp, and it sweeps every deployment-authorized name that is not a
+// candidate on disk (an app that was filtered out at startup, deleted, or
+// replaced by an unsupported path), which no registry/pending/fencing-token
+// sweep would find.
 func (r *Reconciler) reconcileAll() {
 	// Refresh the complete runtime base-image selection snapshot ONCE per pass,
 	// before dispatching any app. Each reconcile then compares its app's recorded
@@ -90,14 +97,18 @@ func (r *Reconciler) reconcileAll() {
 		seen[name] = true
 		r.dispatch(name)
 	}
-	// Apps still registered, pending, or carrying a fencing token but no
-	// longer candidates on disk were removed. A brand-new app whose first
-	// preparation has not yet completed exists ONLY as a pending desired entry
-	// (nothing is published as active until the build succeeds), so PendingNames
-	// must be swept too: otherwise a directory that vanishes during preparation
-	// would leave a stale pending entry gating events forever. Fencing tokens
-	// cover a name that only ever had a startup invalid-desired row and therefore
-	// never entered the registry.
+	// Apps still registered, pending, carrying a fencing token, or authorized by
+	// the materialized deployment generation but no longer candidates on disk must
+	// still be dispatched. A brand-new app whose first preparation has not yet
+	// completed exists ONLY as a pending desired entry (nothing is published as
+	// active until the build succeeds), so PendingNames must be swept too:
+	// otherwise a directory that vanishes during preparation would leave a stale
+	// pending entry gating events forever. Fencing tokens cover a name that only
+	// ever had a startup invalid-desired row and therefore never entered the
+	// registry, and deployment authorization covers an authorized app that startup
+	// filtered out because its local bytes already drifted; both are invisible to
+	// the local indexes, so without the sweep their local deletion or unsupported
+	// replacement would never be observed (and never restored).
 	for _, name := range r.missingNames(seen) {
 		r.dispatch(name)
 	}
@@ -137,13 +148,19 @@ func (r *Reconciler) refreshRuntimeSelections() bool {
 	return true
 }
 
-// missingNames returns the locally-known names (active, pending-only, or
-// carrying a startup fencing token) that are NOT app candidates on disk, so
-// reconcileAll dispatches them for removal. Fencing tokens are included so a
-// name that only ever had a startup invalid-desired row — and therefore never
-// entered the registry — is still removed once its definition disappears. An app
-// that is BOTH active and pending (an available generation being rebuilt) is
-// returned once.
+// missingNames returns the names that are NOT app candidates on disk but still
+// need a reconcile pass, so reconcileAll dispatches them. It covers the
+// locally-known names (active, pending-only, or carrying a startup fencing
+// token) and, in a coordinated deployment, every name the materialized
+// generation authorizes (valid or desired-invalid). Fencing tokens are included
+// so a name that only ever had a startup invalid-desired row — and therefore
+// never entered the registry — is still removed once its definition disappears.
+// Deployment authorization is included because a coordinated app can be absent
+// from every local index: startup filters out a locally drifted authorized app,
+// so it is never registered and never receives a fencing token, yet the
+// periodic pass must still observe that it is missing (or became an unsupported
+// path) and report drift. An app that is BOTH active and pending (an available
+// generation being rebuilt) is returned once.
 func (r *Reconciler) missingNames(seen map[string]bool) []string {
 	var out []string
 	added := map[string]bool{}
@@ -165,8 +182,23 @@ func (r *Reconciler) missingNames(seen map[string]bool) []string {
 	for name := range r.fencingTokens {
 		fencingTokenNames = append(fencingTokenNames, name)
 	}
+	// deploymentRemoved is deliberately excluded: those apps are absent from the
+	// authorized generation, so absence is the expected state and a present
+	// directory is already dispatched as a normal candidate.
+	deploymentNames := make([]string, 0, len(r.deploymentFingerprints)+len(r.deploymentInvalid))
+	if r.deploymentEnabled {
+		for name := range r.deploymentFingerprints {
+			deploymentNames = append(deploymentNames, name)
+		}
+		for name := range r.deploymentInvalid {
+			deploymentNames = append(deploymentNames, name)
+		}
+	}
 	r.mu.Unlock()
 	for _, name := range fencingTokenNames {
+		add(name)
+	}
+	for _, name := range deploymentNames {
 		add(name)
 	}
 	return out
@@ -185,9 +217,18 @@ func (r *Reconciler) reconcileApp(name string) {
 	if app.IsReservedDir(name) {
 		return
 	}
-	expectedFingerprint, deploymentAuthorized, deploymentRemovalOnly := r.deploymentAuthorization(name)
-	deploymentInvalidTemplate, deploymentInvalidMessage, deploymentInvalid := r.deploymentInvalidInfo(name)
-	deploymentCluster := r.deploymentClusterMode()
+	// Read the whole authorization and its epoch under one lock. The epoch stamped
+	// on this pass's content verification must be the authorization the pass
+	// actually compared against, so a concurrent authorization update cannot
+	// relabel content verified against the previous one as current.
+	authorization := r.deploymentAuthorization(name)
+	expectedFingerprint := authorization.fingerprint
+	deploymentAuthorized := authorization.authorized
+	deploymentRemovalOnly := authorization.removalOnly
+	deploymentInvalidTemplate := authorization.invalidTemplate
+	deploymentInvalidMessage := authorization.invalidMessage
+	deploymentInvalid := authorization.invalid
+	deploymentCluster := authorization.cluster
 	if deploymentCluster && !deploymentAuthorized && !deploymentRemovalOnly && !deploymentInvalid {
 		// A local-only app is not part of the materialized revision. Its bytes
 		// must never become a desired generation; the deployment coordinator
@@ -350,7 +391,8 @@ func (r *Reconciler) reconcileApp(name string) {
 	templateKnown := false
 	if deploymentCluster {
 		if deploymentAuthorized {
-			expectedTemplate, templateKnown = r.deploymentTemplateIdentity(name)
+			expectedTemplate = authorization.templateIdentity
+			templateKnown = authorization.templateIdentityKnown
 		}
 		if deploymentInvalid {
 			expectedTemplate = deploymentInvalidTemplate
@@ -487,6 +529,19 @@ func (r *Reconciler) reconcileApp(name string) {
 		r.recordInvalidDesired(name, "", err, observed)
 		return
 	}
+	// Record the successful content verification for the deployment coordinator's
+	// independent drift backstop, tagged with the authorization epoch this pass
+	// actually compared against (captured atomically with the authorization). A
+	// concurrent authorization update makes the mark conservative: either it is
+	// filtered out by VerifiedSince (stale epoch), or the next pass records under
+	// the new epoch. This happens before the authorization comparison: a mismatch
+	// reports drift now, and the coordinator must not re-hash the same bytes to
+	// reach the same conclusion.
+	r.mu.Lock()
+	if r.deploymentEpoch == authorization.epoch {
+		r.verified[name] = verifiedContent{at: time.Now(), epoch: authorization.epoch}
+	}
+	r.mu.Unlock()
 
 	if deploymentCluster && deploymentAuthorized && expectedFingerprint != "" &&
 		fp != expectedFingerprint {
@@ -500,9 +555,21 @@ func (r *Reconciler) reconcileApp(name string) {
 		// fingerprint success must NOT authorize a build from the current /apps
 		// bytes: a local edit made during the failure could otherwise become active.
 		// Leave the desired rules pending/unavailable and keep any previous active
-		// generation serving. checkDrift re-runs authorize; when it can fingerprint,
-		// the changed authorization re-materializes the exact shared SHA and enqueues
-		// a safe retry with an expected fingerprint.
+		// generation serving. Request a forced re-materialization so authorize
+		// re-runs against the exact shared SHA with this app's expected
+		// fingerprint; a transient materialization failure (for example the attempt
+		// context expiring after this app was skipped) then recovers instead of
+		// staying invalid until a newer generation is published. The reason is
+		// deliberately not a claim about local bytes.
+		reason := "materialized revision could not authorize this app; re-verifying the materialized tree"
+		if deploymentInvalidMessage != "" {
+			reason += ": " + deploymentInvalidMessage
+		}
+		// Request first: the coordinator's request records a transient drifted row,
+		// and the Failed diagnostic below must remain the row a restart
+		// reconstructs for this desired-invalid app. Unlike the request, that
+		// diagnostic is written on every pass, exactly as before.
+		r.requestDeploymentReverification(name, reason)
 		message := deploymentInvalidMessage
 		if message == "" {
 			message = "desired app is invalid in the materialized revision"
@@ -1117,18 +1184,6 @@ func preparationOutcome(
 // changed while an app was being prepared. The prepared image is not activated.
 var errDeploymentSourceStale = errors.New("coordinated deployment generation changed during preparation")
 
-// deploymentSourceGeneration returns the coordinated generation to stamp on a
-// desired-state write. Zero means standalone local /apps.
-// deploymentClusterMode reports whether this process opted into coordinated
-// cluster reconciliation. It is independent of whether an authorized generation
-// exists yet: with no published/materialized revision, no local app is
-// authorized.
-func (r *Reconciler) deploymentClusterMode() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.deploymentEnabled
-}
-
 // deploymentSourceGeneration returns the coordinated generation stamped on a
 // desired-state write, or 0 when this process is not participating. A
 // coordinator-active worker with generation 0 still has the gate enabled; it just
@@ -1142,48 +1197,49 @@ func (r *Reconciler) deploymentSourceGeneration() int64 {
 	return r.deploymentGeneration
 }
 
-// deploymentTemplateIdentity returns the materialized template identity for an
-// authorized app when one was recorded.
-func (r *Reconciler) deploymentTemplateIdentity(name string) (string, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	identity, ok := r.deploymentTemplates[name]
-	return identity, ok
+// deploymentAuthorization is one app's coordinated authorization, read atomically
+// with the authorization epoch. A pass must compare content against one
+// authorization and stamp its verification with that same epoch: a concurrent
+// SetDeploymentAuthorizationWithInvalid cannot then relabel content verified
+// against the previous authorization as current.
+type deploymentAuthorization struct {
+	cluster               bool
+	epoch                 uint64
+	fingerprint           string
+	authorized            bool
+	removalOnly           bool
+	templateIdentity      string
+	templateIdentityKnown bool
+	invalidTemplate       string
+	invalidMessage        string
+	invalid               bool
 }
 
-// deploymentInvalidInfo reports whether name is a desired-but-unloadable app in
-// the materialized revision, and the exact materialized template identity when
-// known. Such an app is not local drift: the reconciler records/retains its
-// invalid diagnostic while preserving any previous active generation.
-func (r *Reconciler) deploymentInvalidInfo(
-	name string,
-) (templateIdentity, message string, invalid bool) {
+// deploymentAuthorization returns the authorization decision, template identity,
+// desired-invalid diagnostic, and epoch for name from one consistent read. In
+// standalone mode every app is authorized and no deployment state applies.
+func (r *Reconciler) deploymentAuthorization(name string) deploymentAuthorization {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	authorization := deploymentAuthorization{
+		cluster: r.deploymentEnabled,
+		epoch:   r.deploymentEpoch,
+	}
 	if !r.deploymentEnabled {
-		return "", "", false
+		authorization.authorized = true
+		return authorization
 	}
-	message, invalid = r.deploymentInvalid[name]
-	if !invalid {
-		return "", "", false
+	authorization.fingerprint, authorization.authorized = r.deploymentFingerprints[name]
+	authorization.removalOnly = r.deploymentRemoved[name]
+	authorization.templateIdentity, authorization.templateIdentityKnown =
+		r.deploymentTemplates[name]
+	message, invalid := r.deploymentInvalid[name]
+	if invalid {
+		authorization.invalid = true
+		authorization.invalidMessage = message
+		authorization.invalidTemplate = r.deploymentInvalidTemplates[name]
 	}
-	return r.deploymentInvalidTemplates[name], message, true
-}
-
-// deploymentAuthorization returns the coordinated authorization decision for
-// name. authorized is false when the name is neither part of the materialized
-// generation nor an authorized removal (or desired-invalid app), in which case
-// local /apps content must not be reconciled. expected is the materialized
-// fingerprint.
-func (r *Reconciler) deploymentAuthorization(name string) (expected string, authorized, removalOnly bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !r.deploymentEnabled {
-		return "", true, false
-	}
-	expected, authorized = r.deploymentFingerprints[name]
-	removalOnly = r.deploymentRemoved[name]
-	return expected, authorized, removalOnly
+	return authorization
 }
 
 // publishDeploymentCurrent runs publish inside a short check-and-swap boundary
@@ -1246,22 +1302,105 @@ func (r *Reconciler) reportDeployment(name, phase, errMessage string) {
 
 // reportDeploymentDrift reports local drift once per name per authorized
 // generation and asks the deployment coordinator to restore the materialized
-// revision. It never mutates the registry or state.
+// revision. It never mutates the registry.
+//
+// A name the authorization classifies as desired-invalid keeps its Failed
+// progress row: it has no authorized fingerprint, so a Drifted row would carry an
+// empty fingerprint and loadApplied would discard it on restart, losing the app's
+// desired-invalid authorization (including when its directory later disappears).
+// The mismatch is still logged and still requests restoration; the previous
+// Failed row remains the restart authority. Valid and local-only drift keeps
+// recording Drifted progress.
 func (r *Reconciler) reportDeploymentDrift(name, reason string) {
-	r.mu.Lock()
-	reported := r.deploymentDriftReported[name]
-	if !reported {
-		r.deploymentDriftReported[name] = true
-	}
-	r.mu.Unlock()
-	if reported {
+	if !r.admitDeploymentReverification(name) {
 		return
 	}
-	r.log.Warn("App: local modification is not part of the active deployment; ignoring and restoring",
+	if !r.deploymentNameInvalid(name) {
+		r.reportDeployment(name, state.DeploymentAppDrifted, reason)
+	}
+	r.announceDeploymentReverification(name, reason)
+}
+
+// deploymentNameInvalid reports whether the installed authorization classifies
+// name as desired-invalid (not local drift).
+func (r *Reconciler) deploymentNameInvalid(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, invalid := r.deploymentInvalid[name]
+	return invalid
+}
+
+// requestDeploymentReverification asks the deployment coordinator for a forced
+// re-materialization of the applied generation, without changing the reported
+// phase. The desired-invalid recovery path uses it before writing its own
+// unconditional Failed diagnostic: a materialization that could not authorize the
+// app may have failed transiently, and a later successful live fingerprint must
+// re-authorize the exact shared revision rather than trust local bytes.
+//
+// It is rate-limited to one request per reconciler interval for the same
+// effective authorization, so a successful same-generation materialization that
+// reinstalls the authorization and re-enqueues the still-invalid app cannot
+// force another Git sync on every pass. A new generation or a changed effective
+// authorization is admitted immediately. This state is entirely separate from
+// ordinary local drift: a re-verification request here never delays a later
+// genuine local drift report for the same name.
+func (r *Reconciler) requestDeploymentReverification(name, reason string) {
+	if r.admitInvalidReverification(name) {
+		r.announceDeploymentReverification(name, reason)
+	}
+}
+
+// admitInvalidReverification applies the desired-invalid retry cooldown. It
+// never reads or writes deploymentDriftReported, which belongs to local drift
+// once-per-generation suppression.
+func (r *Reconciler) admitInvalidReverification(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	authorization := r.invalidReverificationSignature(name)
+	now := time.Now()
+	if entry, ok := r.reverifyCooldown[name]; ok &&
+		entry.authorization == authorization && now.Sub(entry.at) < r.interval {
+		return false
+	}
+	r.reverifyCooldown[name] = reverifyCooldownEntry{authorization: authorization, at: now}
+	return true
+}
+
+// invalidReverificationSignature identifies a desired-invalid app's effective
+// authorization. A new generation, the app entering or leaving the invalid set,
+// or a different materialized template identity admits an immediate retry; an
+// identical reinstall does not. Callers must hold r.mu.
+func (r *Reconciler) invalidReverificationSignature(name string) string {
+	_, invalid := r.deploymentInvalid[name]
+	return fmt.Sprintf(
+		"%d/%t/%s/%s",
+		r.deploymentGeneration,
+		invalid,
+		r.deploymentFingerprints[name],
+		r.deploymentInvalidTemplates[name],
+	)
+}
+
+// admitDeploymentReverification records a re-materialization request for name in
+// the current authorized generation and reports whether this is the first. It
+// writes no progress and logs nothing, so a retried drift observation performs
+// no duplicate progress write.
+func (r *Reconciler) admitDeploymentReverification(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.deploymentDriftReported[name] {
+		return false
+	}
+	r.deploymentDriftReported[name] = true
+	return true
+}
+
+func (r *Reconciler) announceDeploymentReverification(name, reason string) {
+	r.log.Warn(
+		"App: local content is not authorized by the materialized deployment; ignoring and restoring",
 		"app", name,
 		"reason", reason,
 	)
-	r.reportDeployment(name, state.DeploymentAppDrifted, reason)
 	if r.deploymentDrift != nil {
 		r.deploymentDrift(name, reason)
 	}
@@ -1514,6 +1653,9 @@ func (r *Reconciler) remove(name string) {
 	r.mu.Lock()
 	delete(r.fingerprints, name)
 	delete(r.imageSelections, name)
+	delete(r.verified, name)
+	delete(r.reverifyCooldown, name)
+	delete(r.deploymentDriftReported, name)
 	r.generations[name]++
 	fencingToken := r.fencingTokens[name]
 	delete(r.fencingTokens, name)

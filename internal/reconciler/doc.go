@@ -21,8 +21,13 @@
 //   - In coordinated deployments, only the materialized/published Git
 //     generation authorizes reconciliation. A local addition, edit, or deletion
 //     is drift: it never writes a desired generation or swaps the registry, and
-//     the deployment coordinator restores the authorized revision. A newly
-//     authorized generation advances the same gate for the live reconciler.
+//     the deployment coordinator restores the authorized revision. This periodic
+//     pass is the primary drift verifier and records each successful content
+//     verification, so the coordinator's independent backstop hashes only apps
+//     this pass has not verified recently; the pass also sweeps authorized names
+//     that are not candidates on disk (including an app startup filtered out
+//     because it had already drifted). A newly authorized generation advances
+//     the same gate for the live reconciler.
 //   - A healthy app is never replaced until its replacement is ready
 //   - A previously-failed (unavailable) build is retried when its fingerprint
 //     is stable, so a broken app recovers without further edits

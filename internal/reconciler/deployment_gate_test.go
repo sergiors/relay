@@ -470,10 +470,15 @@ func TestClusterModeLocalEditOfDesiredInvalidAppIsDrift(t *testing.T) {
 	}) {
 		t.Fatalf("drift reports = %+v, want the template-edit reason", *drifts)
 	}
-	if !containsEvent(*progress, deploymentEvent{
+	// The drift request still reaches the coordinator (Kick), but a
+	// desired-invalid app must never be overwritten with an empty-fingerprint
+	// Drifted row: loadApplied drops that row on restart and the authorized
+	// name would be lost while its directory is absent.
+	if containsEvent(*progress, deploymentEvent{
 		name: "gated", phase: "drifted",
 	}) {
-		t.Fatalf("progress = %+v, want a drifted phase", *progress)
+		t.Fatalf("progress = %+v, want no Drifted overwrite for a desired-invalid app",
+			*progress)
 	}
 	if got := reg.GetByName("gated"); got != fn {
 		t.Fatalf("registry = %+v, want the previous active entry untouched", got)
@@ -519,10 +524,14 @@ func TestClusterModeDeletionOfDesiredInvalidAppIsDrift(t *testing.T) {
 	}) {
 		t.Fatalf("drift reports = %+v, want the missing-directory reason", *drifts)
 	}
-	if !containsEvent(*progress, deploymentEvent{
+	// Missing-directory drift for a desired-invalid app also requests the
+	// restore (above) but must not overwrite the persisted Failed
+	// authorization with an empty-fingerprint Drifted row.
+	if containsEvent(*progress, deploymentEvent{
 		name: "gated", phase: "drifted",
 	}) {
-		t.Fatalf("progress = %+v, want a drifted phase", *progress)
+		t.Fatalf("progress = %+v, want no Drifted overwrite for a desired-invalid app",
+			*progress)
 	}
 	if got := reg.GetByName("gated"); got != fn {
 		t.Fatalf("registry = %+v, want the previous active entry still serving", got)
@@ -578,10 +587,15 @@ func TestClusterModeRecreationOfDesiredInvalidAppIsDrift(t *testing.T) {
 	}) {
 		t.Fatalf("drift reports = %+v, want the template-edit reason", *drifts)
 	}
-	if !containsEvent(*progress, deploymentEvent{
+	// The drift request still reaches the coordinator (Kick), but a
+	// desired-invalid app must never be overwritten with an empty-fingerprint
+	// Drifted row: loadApplied drops that row on restart and the authorized
+	// name would be lost while its directory is absent.
+	if containsEvent(*progress, deploymentEvent{
 		name: "gated", phase: "drifted",
 	}) {
-		t.Fatalf("progress = %+v, want a drifted phase", *progress)
+		t.Fatalf("progress = %+v, want no Drifted overwrite for a desired-invalid app",
+			*progress)
 	}
 	if got := reg.GetByName("gated"); got != fn {
 		t.Fatalf("registry = %+v, want the previous active entry untouched", got)
@@ -677,10 +691,12 @@ func TestClusterModeReprepareFailureKeepsUnavailablePlaceholder(t *testing.T) {
 // app (its materialization-time fingerprint walk failed while the recorded
 // template identity matches) must NOT be prepared from potentially locally
 // edited /apps bytes — there is no authorized expected fingerprint to compare.
-// The pass reports failed and retains the matched-but-unavailable placeholder
-// so matching deliveries stay pending; only after coordinator re-materialization
-// renews the authorization (fingerprint installed, invalid set cleared) does
-// the normal retry build.
+// Each pass requests exactly ONE forced re-materialization per authorized
+// generation (suppressed on repeats, reset when the authorization generation
+// advances), reports failed with the materialization diagnostic, and retains
+// the matched-but-unavailable placeholder so matching deliveries stay pending;
+// only after coordinator re-materialization renews the authorization
+// (fingerprint installed, invalid set cleared) does the normal retry build.
 func TestDesiredInvalidFingerprintErrorAppWaitsForRenewedAuthorization(t *testing.T) {
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "gated")
@@ -697,39 +713,85 @@ func TestDesiredInvalidFingerprintErrorAppWaitsForRenewedAuthorization(t *testin
 			progress, drifts = deploymentRecorder(cfg)
 		})
 	_, tidNow := authorizationFor(t, root, "gated")
+	invalidSet := map[string]string{"gated": "fingerprint failed at materialization"}
 	r.SetDeploymentAuthorizationWithInvalid(1,
 		map[string]string{}, map[string]string{},
-		map[string]string{"gated": "fingerprint failed at materialization"},
-		map[string]string{"gated": tidNow}, nil)
+		invalidSet, map[string]string{"gated": tidNow}, nil)
+
+	const reverifyReason = "materialized revision could not authorize this app; " +
+		"re-verifying the materialized tree: fingerprint failed at materialization"
+
+	// assertFailedNotActivated pins the per-pass invariants: no build, no
+	// local activation, the failed diagnostic is the last reported phase, and
+	// the unavailable placeholder still serves matching deliveries.
+	assertFailedNotActivated := func(pass string) {
+		t.Helper()
+		if b.prepares() != 0 {
+			t.Fatalf("%s: prepare calls = %d, want 0 (an app without an authorized "+
+				"expected fingerprint must not build from local bytes)", pass, b.prepares())
+		}
+		for _, phase := range []string{"active", "activating", "drifted"} {
+			if containsEvent(*progress, deploymentEvent{name: "gated", phase: phase}) {
+				t.Fatalf("%s: progress = %+v, want no %q phase (the app must never "+
+					"activate locally while unauthorized)", pass, *progress, phase)
+			}
+		}
+		last, ok := lastProgressFor(*progress, "gated")
+		if !ok || last.phase != "failed" ||
+			last.detail != "fingerprint failed at materialization" {
+			t.Fatalf("%s: last progress = (%+v, %v), want failed with the "+
+				"materialization diagnostic", pass, last, ok)
+		}
+		if got := reg.GetByName("gated"); got == nil || got.Prepared() != nil {
+			t.Fatalf("%s: registry = %+v, want the matched-but-unavailable "+
+				"placeholder retained so matching deliveries stay pending", pass, got)
+		}
+	}
 
 	// Phase 1: the local bytes fingerprint FINE (the danger case), parse, and
-	// match the recorded template identity — yet no build may run.
+	// match the recorded template identity — yet no build may run. The pass
+	// asks the coordinator for exactly one re-verification of the materialized
+	// tree; it is deliberately not a claim about local bytes.
 	r.reconcileApp("gated")
 
-	if b.prepares() != 0 {
-		t.Fatalf("prepare calls = %d, want 0 (an app without an authorized "+
-			"expected fingerprint must not build from local bytes)", b.prepares())
+	if len(*drifts) != 1 || (*drifts)[0].name != "gated" ||
+		(*drifts)[0].detail != reverifyReason {
+		t.Fatalf("re-verification requests = %+v, want exactly one gated request "+
+			"with reason %q", *drifts, reverifyReason)
 	}
-	if len(*drifts) != 0 {
-		t.Fatalf("drift reports = %+v, want none (the identity matches; this is "+
-			"a retryable failure, not local drift)", *drifts)
+	assertFailedNotActivated("first pass")
+
+	// A repeated pass under the SAME authorization suppresses the request, but
+	// the failed diagnostic is unconditional and stays the reported phase.
+	r.reconcileApp("gated")
+
+	if len(*drifts) != 1 {
+		t.Fatalf("re-verification requests after a repeat pass = %+v, want the "+
+			"request suppressed for the same generation", *drifts)
 	}
-	last, ok := lastProgressFor(*progress, "gated")
-	if !ok || last.phase != "failed" ||
-		last.detail != "fingerprint failed at materialization" {
-		t.Fatalf("last progress = (%+v, %v), want failed with the materialization "+
-			"diagnostic", last, ok)
+	assertFailedNotActivated("repeat pass")
+
+	// A renewed AUTHORIZATION GENERATION resets the suppression: the same
+	// materialization gap now asks for re-verification again, still without
+	// activating anything locally.
+	r.SetDeploymentAuthorizationWithInvalid(2,
+		map[string]string{}, map[string]string{},
+		invalidSet, map[string]string{"gated": tidNow}, nil)
+
+	r.reconcileApp("gated")
+
+	if len(*drifts) != 2 || (*drifts)[1].name != "gated" ||
+		(*drifts)[1].detail != reverifyReason {
+		t.Fatalf("re-verification requests after the generation advanced = %+v, "+
+			"want one more gated request with reason %q", *drifts, reverifyReason)
 	}
-	if got := reg.GetByName("gated"); got == nil || got.Prepared() != nil {
-		t.Fatalf("registry = %+v, want the matched-but-unavailable placeholder "+
-			"retained so matching deliveries stay pending", got)
-	}
+	assertFailedNotActivated("advanced-generation pass")
 
 	// Phase 2: coordinator re-materialization renewed the authorization — the
 	// expected fingerprint is installed and the invalid set is cleared. The
 	// normal retry is now safe and publishes the build.
 	fpNow, tidNow := authorizationFor(t, root, "gated")
-	r.SetDeploymentAuthorizationWithInvalid(1,
+	r.SetDeploymentAuthorizationWithInvalid(2,
 		map[string]string{"gated": fpNow},
 		map[string]string{"gated": tidNow},
 		nil, nil, nil)
