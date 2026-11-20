@@ -860,6 +860,17 @@ func (st *State) RecordDeploymentNodeProgress(
 // the node's current incarnation. A stale process incarnation therefore cannot
 // overwrite progress; a newer generation cannot be clobbered by a delayed older
 // generation.
+//
+// The fence read locks the node row FOR SHARE so a concurrent acquire or node
+// progress write is ordered against this statement: it either commits before the
+// fence is evaluated or waits for this write, and a locking read re-checks the
+// predicate against the newest row. A plain snapshot read could accept an
+// incarnation that a concurrent acquire had already superseded.
+//
+// It reports whether the call inserted a row or changed the stored instance or
+// payload. An identical fenced write leaves updated_at untouched and reports
+// false, as does a stale incarnation or a generation the node has neither
+// observed nor applied.
 func (st *State) RecordDeploymentAppProgress(
 	ctx context.Context,
 	nodeID,
@@ -869,7 +880,9 @@ func (st *State) RecordDeploymentAppProgress(
 	progress DeploymentAppProgress,
 ) (bool, error) {
 	if nodeID == "" || appName == "" || generation <= 0 || incarnation <= 0 {
-		return false, fmt.Errorf("deployment app progress: node ID, app, generation, and incarnation are required")
+		return false, fmt.Errorf(
+			"deployment app progress: node ID, app, generation, and incarnation are required",
+		)
 	}
 	now := st.nowTime().UTC()
 	payload, err := json.Marshal(deploymentAppPayload{
@@ -891,11 +904,14 @@ func (st *State) RecordDeploymentAppProgress(
 			WHERE node_id = $1
 			  AND incarnation = $7
 			  AND (generation = $3 OR applied_generation = $3)
+			FOR SHARE
 		 )
 		 ON CONFLICT (node_id, app_name, generation) DO UPDATE SET
 			instance = excluded.instance,
 			updated_at = excluded.updated_at,
-			data = excluded.data`,
+			data = excluded.data
+		 WHERE deployment_apps.instance IS DISTINCT FROM excluded.instance
+		    OR deployment_apps.data IS DISTINCT FROM excluded.data`,
 		nodeID, appName, generation, progress.Instance, now, string(payload), incarnation)
 	if err != nil {
 		return false, fmt.Errorf("record deployment app %q/%q: %w", nodeID, appName, err)
@@ -931,11 +947,13 @@ func (st *State) ReadDeploymentNode(
 		return DeploymentNodeProgress{}, false, nil
 	}
 	if err != nil {
-		return DeploymentNodeProgress{}, false, fmt.Errorf("read deployment node %q: %w", nodeID, err)
+		return DeploymentNodeProgress{}, false, fmt.Errorf(
+			"read deployment node %q: %w", nodeID, err)
 	}
 	var payload deploymentNodePayload
 	if err := json.Unmarshal([]byte(data), &payload); err != nil {
-		return DeploymentNodeProgress{}, false, fmt.Errorf("decode deployment node %q: %w", nodeID, err)
+		return DeploymentNodeProgress{}, false, fmt.Errorf(
+			"decode deployment node %q: %w", nodeID, err)
 	}
 	return DeploymentNodeProgress{
 		NodeID:             nodeID,
