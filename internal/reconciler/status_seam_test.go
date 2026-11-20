@@ -27,10 +27,10 @@ func TestReconcileWithStatusCallbackOrdering(t *testing.T) {
 
 		var order []string
 		c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
-		if err := c.ApplyWithStatus(context.Background(), "fn", entryTmpl, "img", nil,
-			func() { order = append(order, "reconciling") },
-		); err != nil {
-			t.Fatalf("apply: %v", err)
+		if result := c.ApplyResult(context.Background(), "fn", entryTmpl, "img", nil, func() {
+			order = append(order, "reconciling")
+		}); result.Err != nil {
+			t.Fatalf("apply: %v", result.Err)
 		}
 		if len(order) != 1 || order[0] != "reconciling" {
 			t.Fatalf("callback order = %v, want [reconciling]", order)
@@ -43,10 +43,10 @@ func TestReconcileWithStatusCallbackOrdering(t *testing.T) {
 
 		var order []string
 		c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
-		if err := c.ApplyWithStatus(context.Background(), "fn", imgTmpl, "img", nil,
-			func() { order = append(order, "reconciling") },
-		); err != nil {
-			t.Fatalf("apply: %v", err)
+		if result := c.ApplyResult(context.Background(), "fn", imgTmpl, "img", nil, func() {
+			order = append(order, "reconciling")
+		}); result.Err != nil {
+			t.Fatalf("apply: %v", result.Err)
 		}
 		if len(order) != 1 || order[0] != "reconciling" {
 			t.Fatalf("callback order = %v, want [reconciling]", order)
@@ -70,10 +70,10 @@ func TestReconcileWithStatusNoOpVerificationDoesNotNotifyReconciling(t *testing.
 
 	var reconciling int
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
-	if err := c.ApplyWithStatus(context.Background(), "fn", tmpl, "img-1", nil,
+	if result := c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil,
 		func() { reconciling++ },
-	); err != nil {
-		t.Fatalf("apply: %v", err)
+	); result.Err != nil {
+		t.Fatalf("apply: %v", result.Err)
 	}
 	if reconciling != 0 {
 		t.Fatalf("reconciling fired %d times on a no-op verification, want 0", reconciling)
@@ -89,10 +89,10 @@ func TestReconcileWithStatusCorrectiveStartNotifiesReconciling(t *testing.T) {
 
 	var reconciling int
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
-	if err := c.ApplyWithStatus(context.Background(), "fn", tmpl, "img-1", nil,
+	if result := c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil,
 		func() { reconciling++ },
-	); err != nil {
-		t.Fatalf("apply: %v", err)
+	); result.Err != nil {
+		t.Fatalf("apply: %v", result.Err)
 	}
 	if reconciling != 1 {
 		t.Fatalf("reconciling fired %d times on a corrective pass, want 1", reconciling)
@@ -115,10 +115,10 @@ func TestReconcileWithStatusRemovedServiceNotifiesReconciling(t *testing.T) {
 
 	var reconciling int
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
-	if err := c.ApplyWithStatus(context.Background(), "fn", tmpl, "img-1", nil,
+	if result := c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil,
 		func() { reconciling++ },
-	); err != nil {
-		t.Fatalf("apply: %v", err)
+	); result.Err != nil {
+		t.Fatalf("apply: %v", result.Err)
 	}
 	if reconciling != 1 {
 		t.Fatalf("reconciling fired %d times when stopping a removed service, want 1", reconciling)

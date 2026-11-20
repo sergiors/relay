@@ -131,12 +131,46 @@
 // each normal Docker operation itself. Lifecycle cancellation still cancels
 // normal operations promptly.
 //
+// A service pass can be PENDING when the Docker backend accepts a replacement
+// but cannot confirm terminal convergence (for example, an external readiness
+// signal). Pending is not failure: the pass preserves every usable old
+// generation, releases its worker and one-pass image lease, and retains the
+// logical request (callbacks and desired state) in the ServiceCoordinator.
+// Pending never reports app ready/deployment active and never retires the old
+// app image. The coordinator resumes the CURRENT stored desired state on an
+// explicit Notify or an observation wake when no retry is scheduled, or on a due
+// per-app deadline; a wake carries no desired authorization and never invokes
+// this package's app reconcile, fingerprint, or build path. A scheduled deadline
+// is never bypassed by a periodic observation. Wait and the exclusive
+// housekeeping barrier observe only active backend work, so externally pending
+// requests do not starve housekeeping.
+//
+// Startup recovery of service convergence relies on the worker's unconditional
+// startup service enqueue plus the Docker daemon's surviving containers. A
+// future backend that needs external observer registrations must reconstruct
+// those registrations at startup by enumerating the authoritative current
+// service resources; it must not depend on an in-memory registration from the
+// previous process. The periodic app reconcile remains the fallback that
+// re-observes services.
+//
+// Pending requests and scheduled deadlines are process-local hints, not durable
+// state. Startup re-evaluates backend resources, but this foundation does not
+// preserve retry attempts or deadlines across restarts. A readiness backend that
+// needs restart-stable backoff must derive or persist its retry count and next
+// deadline with authoritative candidate state, scoped to the current desired
+// generation; it must not reset backoff on every reconcile pass. Future retry
+// policy should use exponential backoff with a capped interval and no permanent
+// attempt cutoff. Schedule only wakes the coordinator and never authorizes work.
+//
 // Ordering on a rebuild: the new version is prepared and swapped in, schedules
 // converge, persistent services converge to the new image, and only THEN is the
 // superseded image retired (via the Config.Retire hook). Retiring after service
 // converge ensures a service container still running on the old image is
 // replaced first, so the old image becomes removable; the runner's reference
-// guard is a second line of defense for partial failures.
+// guard is a second line of defense for partial failures. With the lifecycle
+// service hook, retirement is deferred until the logical service request
+// settles (success, failure, supersession, or cancellation) so a pending pass
+// cannot retire a candidate generation prematurely.
 //
 // The package does NOT build images; it delegates image preparation and
 // invocation to a Builder.

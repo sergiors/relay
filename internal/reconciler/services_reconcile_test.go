@@ -40,9 +40,14 @@ type fakeContainer struct {
 	resources              string   // relay.resources as stamped at create (spec.Resources' fingerprint); "" = legacy/unlabeled
 	tmpfs                  string   // relay.tmpfs as stamped at create (canonical additional destinations)
 	sourceID               string   // relay.source as stamped at create (spec.SourceMount.Identity); "" = no mount
-	labels                 map[string]string
-	networks               []string // spec.Networks passed to StartService (global + routing networks)
-	nodeID                 string   // the node identity (relay.node_id) that owns the container
+	// ready is the backend's readiness observation reported through
+	// ServiceContainerList; nil reports no signal (Docker's historical
+	// running-is-converged behaviour), false keeps a config-matching running
+	// candidate pending.
+	ready    *bool
+	labels   map[string]string
+	networks []string // spec.Networks passed to StartService (global + routing networks)
+	nodeID   string   // the node identity (relay.node_id) that owns the container
 }
 
 // effectiveSourceRef returns the container's configured source descriptor,
@@ -211,6 +216,7 @@ func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceCon
 			Tmpfs:                  c.tmpfs,
 			Networks:               runtime.NetworksLabel(c.networks...),
 			SourceID:               c.sourceID,
+			Ready:                  c.ready,
 			Labels:                 c.labels,
 		})
 	}
@@ -1308,8 +1314,8 @@ func TestServiceReconcilerAdoptsConvergedContainerSameID(t *testing.T) {
 
 	// Incarnation A converges one replica onto an empty daemon: id-1.
 	a := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
-	if err := a.Apply(context.Background(), "fn", tmpl, "img-1", nil); err != nil {
-		t.Fatalf("incarnation A apply: %v", err)
+	if result := a.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil, nil); result.Err != nil {
+		t.Fatalf("incarnation A apply: %v", result.Err)
 	}
 	if _, ok := f.containerByID("id-1"); !ok {
 		t.Fatal("incarnation A must have created id-1")
@@ -1318,8 +1324,8 @@ func TestServiceReconcilerAdoptsConvergedContainerSameID(t *testing.T) {
 	// Incarnation B reuses the same NODE_ID with a FRESH reconciler (empty
 	// source-apply tracker). It must retain the converged, running id-1 in place.
 	b := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
-	if err := b.Apply(context.Background(), "fn", tmpl, "img-1", nil); err != nil {
-		t.Fatalf("incarnation B apply: %v", err)
+	if result := b.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil, nil); result.Err != nil {
+		t.Fatalf("incarnation B apply: %v", result.Err)
 	}
 	if _, ok := f.containerByID("id-1"); !ok {
 		t.Fatal("incarnation B must retain id-1 (adopted in place, not recreated)")
@@ -1431,8 +1437,8 @@ func (d *startFailDocker) RemoveAppServiceContainers(context.Context, string) (i
 func (d *startFailDocker) NetworkExists(context.Context, string) (bool, error) { return true, nil }
 
 // captureLogger is a minimal in-memory slog writer used to assert the level and
-// text of ServiceReconciler.Apply's summary lines. Apply (and Reconcile) run
-// synchronously in this test, so a plain strings.Builder is safe.
+// text of ServiceReconciler.ApplyResult's summary lines. ApplyResult (and
+// Reconcile) run synchronously in this test, so a plain strings.Builder is safe.
 type captureLogger struct{ buf strings.Builder }
 
 func (c *captureLogger) Write(p []byte) (int, error) { return c.buf.Write(p) }
@@ -1454,8 +1460,8 @@ func TestApplyNoOpLogsDebugNotInfo(t *testing.T) {
 	logger, capture := newCaptureLogger(slog.LevelDebug)
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
 
-	c.Apply(context.Background(), "fn", tmpl, "img-1", nil)
-	c.Apply(context.Background(), "fn", tmpl, "img-1", nil) // idempotent second pass
+	c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil, nil)
+	c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil, nil) // idempotent second pass
 
 	out := capture.String()
 	if !strings.Contains(out, "Service: unchanged") {
@@ -1477,7 +1483,7 @@ func TestApplyChangedLogsInfo(t *testing.T) {
 
 	logger, capture := newCaptureLogger(slog.LevelInfo)
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
-	c.Apply(context.Background(), "fn", tmpl, "img-1", nil)
+	c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil, nil)
 
 	out := capture.String()
 	if !strings.Contains(out, "Service: reconciled") {
@@ -1501,7 +1507,7 @@ func TestApplyChangedStaleReplacement(t *testing.T) {
 
 	logger, capture := newCaptureLogger(slog.LevelInfo)
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
-	c.Apply(context.Background(), "fn", tmpl, "img-new", nil)
+	c.ApplyResult(context.Background(), "fn", tmpl, "img-new", nil, nil)
 
 	out := capture.String()
 	if !strings.Contains(out, "Service: reconciled") {
@@ -1541,7 +1547,7 @@ func TestApplyErrorLogsWarn(t *testing.T) {
 
 	logger, capture := newCaptureLogger(slog.LevelWarn)
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
-	c.Apply(context.Background(), "fn", tmpl, "img-1", nil)
+	c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil, nil)
 
 	out := capture.String()
 	if !strings.Contains(out, "Service: reconciled with errors") {
@@ -1670,5 +1676,37 @@ func TestReconcileRemovedImageServiceStopped(t *testing.T) {
 	}
 	if f.runningCount("fn", "ghcr.io/acme/old:1") != 0 {
 		t.Fatal("removed image service container should be stopped")
+	}
+}
+
+// TestLowestUsableStalePrefersActuallyReady pins the safety-net preference: an
+// explicitly unready running container must never be chosen over an actually
+// ready stale container as the last-resort survivor. Unknown readiness (nil)
+// keeps Docker's historical behavior.
+func TestLowestUsableStalePrefersActuallyReady(t *testing.T) {
+	ready := true
+	unready := false
+	stale := []runtime.ServiceContainer{
+		{ID: "a-unready", State: container.StateRunning, Ready: &unready},
+		{ID: "b-ready", State: container.StateRunning, Ready: &ready},
+	}
+	got, ok := lowestUsableStale(stale)
+	if !ok || got.ID != "b-ready" {
+		t.Fatalf("lowestUsableStale = %q, want the actually-ready b-ready", got.ID)
+	}
+
+	// With no ready candidate, a running-but-unready container remains the
+	// last-resort survivor rather than leaving the service with nothing.
+	got, ok = lowestUsableStale(stale[:1])
+	if !ok || got.ID != "a-unready" {
+		t.Fatalf("lowestUsableStale = %q, want the unready last-resort fallback", got.ID)
+	}
+
+	// Unknown readiness is Docker's historical behavior: a running container
+	// is ready.
+	unknown := []runtime.ServiceContainer{{ID: "c-unknown", State: container.StateRunning}}
+	got, ok = lowestUsableStale(unknown)
+	if !ok || got.ID != "c-unknown" {
+		t.Fatalf("lowestUsableStale = %q, want the unknown-readiness container", got.ID)
 	}
 }

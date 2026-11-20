@@ -330,8 +330,8 @@ func TestServiceSupersededPassSummaryOmitsChangedOutcome(t *testing.T) {
 		f, tmpl, c, m, logs := newSupersessionSummaryHarness(t)
 
 		// when the pass converges the replacement
-		if err := c.Apply(context.Background(), "fn", tmpl, "img-new", nil); err != nil {
-			t.Fatalf("apply: %v", err)
+		if result := c.ApplyResult(context.Background(), "fn", tmpl, "img-new", nil, nil); result.Err != nil {
+			t.Fatalf("apply: %v", result.Err)
 		}
 
 		// then exactly one summary reports the convergence as changed, and the
@@ -366,8 +366,8 @@ func TestServiceSupersededPassSummaryOmitsChangedOutcome(t *testing.T) {
 		})
 
 		// when the pass is applied
-		if err := c.Apply(ctx, "fn", tmpl, "img-new", nil); err != nil {
-			t.Fatalf("apply: %v", err)
+		if result := c.ApplyResult(ctx, "fn", tmpl, "img-new", nil, nil); result.Err != nil {
+			t.Fatalf("apply: %v", result.Err)
 		}
 		records := serviceLogRecords(t, logs.String())
 
@@ -425,8 +425,8 @@ func TestServiceErrorSummaryReportsPartialStops(t *testing.T) {
 		testReconcileTimeout,
 	)
 
-	if err := c.Apply(context.Background(), "fn", tmpl, "img-new", nil); err == nil {
-		t.Fatal("Apply unexpectedly succeeded")
+	if result := c.ApplyResult(context.Background(), "fn", tmpl, "img-new", nil, nil); result.Err == nil {
+		t.Fatal("ApplyResult unexpectedly succeeded")
 	}
 	var summary *serviceLogRecord
 	for _, record := range serviceLogRecords(t, logs.String()) {

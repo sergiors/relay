@@ -147,7 +147,7 @@ func TestStartupReadyLogCarriesImageOnlyWhenTheGenerationHasOne(t *testing.T) {
 			Name: external.Name, Fingerprint: "fp-startup-external",
 		}, nil),
 	}
-	enqueueStartupServicesWithState(
+	enqueueStartupServices(
 		context.Background(), prepared, coordinator, st, tokens, logger,
 	)
 

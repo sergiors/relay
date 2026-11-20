@@ -167,7 +167,7 @@ func TestStartupBuiltFingerprintIsReturnedIdentity(t *testing.T) {
 	)
 	coordinator, stop := startCoordinatorFixture(t, serviceReconciler)
 	defer stop()
-	enqueueStartupServicesWithState(
+	enqueueStartupServices(
 		context.Background(), published, coordinator, st, fencingTokens, discardLogger(),
 	)
 	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

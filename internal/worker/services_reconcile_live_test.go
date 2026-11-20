@@ -342,7 +342,7 @@ func TestEnqueueStartupServicesApplyUsesLifecycleNotPassBudget(t *testing.T) {
 		runner.NewPrepared(app.App{Name: "alpha", Template: tmpl}, &runtime.Prepared{Image: "img-alpha"}, nil),
 	}
 
-	enqueueStartupServices(prepared, coordinator, logger)
+	enqueueStartupServices(context.Background(), prepared, coordinator, nil, nil, logger)
 	fake.waitEntered(t, "list")
 
 	start := time.Now()
@@ -373,7 +373,7 @@ func TestEnqueueStartupServicesStandaloneRemoveBounded(t *testing.T) {
 	fn := app.App{Name: "broken", Template: tmpl}
 	prepared := []*runner.PreparedApp{runner.NewUnavailable(fn)}
 
-	enqueueStartupServices(prepared, coordinator, logger)
+	enqueueStartupServices(context.Background(), prepared, coordinator, nil, nil, logger)
 
 	// Wait for the published removal to run and settle.
 	if err := coordinator.Wait(context.Background()); err != nil {
@@ -412,7 +412,7 @@ func TestEnqueueStartupServicesStandaloneRemoveNonBlocking(t *testing.T) {
 	returned := make(chan struct{})
 	go func() {
 		defer close(returned)
-		enqueueStartupServices(prepared, coordinator, logger)
+		enqueueStartupServices(context.Background(), prepared, coordinator, nil, nil, logger)
 	}()
 	select {
 	case <-returned:
@@ -437,7 +437,7 @@ func TestEnqueueStartupServicesUnavailableWithServicesSkips(t *testing.T) {
 	fn := app.App{Name: "broken", Template: tmpl}
 	prepared := []*runner.PreparedApp{runner.NewUnavailable(fn)}
 
-	enqueueStartupServices(prepared, coordinator, logger)
+	enqueueStartupServices(context.Background(), prepared, coordinator, nil, nil, logger)
 	if err := coordinator.Wait(context.Background()); err != nil {
 		t.Fatalf("wait: %v", err)
 	}

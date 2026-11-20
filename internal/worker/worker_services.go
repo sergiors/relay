@@ -107,12 +107,11 @@ func startServiceConvergence(
 // (unavailable) entry falls back to no plan env, mirroring the runner's
 // nil-safe behavior.
 //
-// The managed app image lease is acquired BEFORE the enqueue and handed to
-// the coordinator, which holds it across pending/coalesced/running service
-// reconciliation through StartService completion, so a concurrent retirement
-// cannot remove the image a service pass is still converging. When the image is
-// already retiring (a superseded desired state), the enqueue is skipped: a newer
-// desired state will follow.
+// The managed app image lease is acquired BEFORE the enqueue and covers one
+// worker pass. The coordinator releases it when that pass returns, including
+// when convergence is pending; the registry publication lease and backend
+// resource references protect images between passes. When the image is already
+// retiring, the enqueue is unleased and a newer desired state will follow.
 func enqueueLiveServices(
 	services *reconciler.ServiceCoordinator,
 	manager *runtime.Manager,
@@ -181,6 +180,48 @@ func enqueueLiveServiceObservationWithStatus(
 	)
 }
 
+// enqueueLiveServicesWithLifecycle is the lifecycle-aware meaningful enqueue.
+// The settlement hook lets the app reconciler defer old-image retirement until
+// the logical service request concludes, including when a newer desired state
+// supersedes it or shutdown cancels it.
+func enqueueLiveServicesWithLifecycle(
+	services *reconciler.ServiceCoordinator,
+	manager *runtime.Manager,
+	reg *runner.Registry,
+	name string,
+	tmpl *app.Template,
+	image string,
+	hooks reconciler.ServiceRequestHooks,
+) {
+	preparedEnv := livePreparedEnv(reg, name)
+	lease := acquireServiceLease(manager, name, image)
+	services.EnqueueWithHooksLeased(name, tmpl, image, preparedEnv, lease, hooks)
+}
+
+// enqueueLiveServiceObservationWithLifecycle is the lifecycle-aware periodic
+// observation enqueue. The coordinator treats it as a hint about current
+// service state and retains the current desired request and its callbacks.
+func enqueueLiveServiceObservationWithLifecycle(
+	services *reconciler.ServiceCoordinator,
+	manager *runtime.Manager,
+	reg *runner.Registry,
+	name string,
+	tmpl *app.Template,
+	image string,
+	hooks reconciler.ServiceRequestHooks,
+) {
+	preparedEnv := livePreparedEnv(reg, name)
+	lease := acquireServiceLease(manager, name, image)
+	services.EnqueueObservationWithHooksLeased(name, tmpl, image, preparedEnv, lease, hooks)
+}
+
+func livePreparedEnv(reg *runner.Registry, name string) []string {
+	if cur := reg.GetByName(name); cur != nil && cur.Prepared() != nil {
+		return cur.Prepared().Env
+	}
+	return nil
+}
+
 // acquireServiceLease admits a managed image lease for a service pass, or nil
 // when the image is not Relay-owned (an external image service) or a manager is
 // absent (tests). A retirement in progress yields nil: the enqueue proceeds
@@ -206,8 +247,9 @@ func acquireServiceLease(manager *runtime.Manager, name, image string) *runtime.
 // image pull). The
 // unavailable/no-services removals are published the same nonblocking way (see
 // the special case below), so startup never blocks on Docker work at all; the
-// background housekeeping pass' barrier waits for every published operation to
-// settle before touching containers or images.
+// background housekeeping pass' barrier waits for active worker passes before
+// touching containers or images. Externally pending requests hold no worker;
+// backend resource references protect their candidates between passes.
 //
 // Prepared (available) apps are enqueued UNCONDITIONALLY — including
 // templates that now declare no services: Reconcile with an empty desired set
@@ -222,14 +264,10 @@ func acquireServiceLease(manager *runtime.Manager, name, image string) *runtime.
 // definition and are removed via the nonblocking EnqueueRemove. The coordinator
 // derives the removal's own fresh reconcileTimeout bound; the housekeeping
 // barrier serializes the image sweep behind it exactly as it does for Applys.
-func enqueueStartupServices(prepared []*runner.PreparedApp, services *reconciler.ServiceCoordinator, logger *slog.Logger) {
-	enqueueStartupServicesWithState(context.Background(), prepared, services, nil, nil, logger)
-}
-
-// enqueueStartupServicesWithState is enqueueStartupServices with the state sink
-// and the exact startup discovery fencing tokens. The service status
-// callbacks are conditioned on those tokens, so a convergence superseded by a
-// newer generation cannot rewrite state. ctx is the worker lifecycle context:
+//
+// The service status callbacks are conditioned on the exact startup discovery
+// fencing tokens in fencingTokens, so a convergence superseded by a newer
+// generation cannot rewrite state. ctx is the worker lifecycle context:
 // callbacks that complete after shutdown attempt their state write with a
 // cancelled context, which is treated as normal shutdown (the write fails
 // closed and is logged at Debug) rather than a reconcile failure.
@@ -237,7 +275,7 @@ func enqueueStartupServices(prepared []*runner.PreparedApp, services *reconciler
 // Readiness is reported only from a successful asynchronous completion whose
 // fenced success write LANDED. This includes empty desired service sets, whose
 // pass may still need to clean up containers left by an earlier deployment.
-func enqueueStartupServicesWithState(
+func enqueueStartupServices(
 	ctx context.Context,
 	prepared []*runner.PreparedApp,
 	services *reconciler.ServiceCoordinator,
@@ -260,11 +298,11 @@ func enqueueStartupServicesWithState(
 		}
 		if prep := pf.Prepared(); prep != nil {
 			// Share the app's publication lease into the startup service
-			// request, so a concurrent retirement cannot remove the image while
-			// the initial service convergence still needs it. The share is
-			// admitted from the SAME lease the registry will publish, and is
-			// released when the request concludes. A no-runtime app has no
-			// lease and enqueues unleased.
+			// request so the initial worker pass is admitted even if retirement
+			// starts concurrently. The share comes from the SAME lease the
+			// registry publishes and is released after each pass. Backend
+			// resource references protect pending candidates between passes. A
+			// no-runtime app has no lease and enqueues unleased.
 			lease := pf.SharePublication()
 			if st != nil {
 				fencingToken := fencingTokens[fn.Name]

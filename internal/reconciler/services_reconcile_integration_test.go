@@ -98,7 +98,7 @@ func TestServicesReconcileIntegration(t *testing.T) {
 			Interval: time.Hour,
 			UpdateServices: func(fnName string, tmpl *app.Template, image string) {
 				ctx := context.Background()
-				svcCtrl.Apply(ctx, fnName, tmpl, image, nil)
+				svcCtrl.ApplyResult(ctx, fnName, tmpl, image, nil, nil)
 			},
 			RemoveServices: func(fnName string) {
 				svcCtrl.Remove(context.Background(), fnName)
@@ -190,7 +190,7 @@ func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
 			Root: root, Debounce: 20 * time.Millisecond, Interval: time.Hour,
 			UpdateServices: func(fnName string, tmpl *app.Template, image string) {
 				ctx := context.Background()
-				svcCtrl.Apply(ctx, fnName, tmpl, image, nil)
+				svcCtrl.ApplyResult(ctx, fnName, tmpl, image, nil, nil)
 			},
 			RemoveServices: func(fnName string) {
 				svcCtrl.Remove(context.Background(), fnName)

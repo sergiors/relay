@@ -152,7 +152,7 @@ func TestEnqueueStartupServicesRootedInLifecycle(t *testing.T) {
 		runner.NewPrepared(app.App{Name: "alpha", Template: tmpl}, &runtime.Prepared{Image: "img-alpha"}, nil),
 	}
 
-	enqueueStartupServices(prepared, coordinator, logger)
+	enqueueStartupServices(context.Background(), prepared, coordinator, nil, nil, logger)
 
 	select {
 	case <-fake.entered:
@@ -196,7 +196,7 @@ func TestEnqueueStartupServicesBoundedPerApp(t *testing.T) {
 		runner.NewPrepared(app.App{Name: "beta", Template: tmpl}, &runtime.Prepared{Image: "img-beta", Env: nil}, nil),
 	}
 
-	enqueueStartupServices(prepared, coordinator, logger)
+	enqueueStartupServices(context.Background(), prepared, coordinator, nil, nil, logger)
 	if err := coordinator.Wait(context.Background()); err != nil {
 		t.Fatalf("wait: %v", err)
 	}

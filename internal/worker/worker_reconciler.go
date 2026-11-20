@@ -274,6 +274,40 @@ func appReconcilerConfig(
 				},
 			)
 		},
+		UpdateServicesWithLifecycle: func(
+			name string,
+			tmpl *app.Template,
+			image string,
+			hooks reconciler.ServiceRequestHooks,
+		) {
+			hooks.OnComplete = withDeferredImageRetry(runWorker, hooks.OnComplete)
+			enqueueLiveServicesWithLifecycle(
+				services,
+				manager,
+				runWorker.Registry(),
+				name,
+				tmpl,
+				image,
+				hooks,
+			)
+		},
+		UpdateServicesObservationWithLifecycle: func(
+			name string,
+			tmpl *app.Template,
+			image string,
+			hooks reconciler.ServiceRequestHooks,
+		) {
+			hooks.OnComplete = withDeferredImageRetry(runWorker, hooks.OnComplete)
+			enqueueLiveServiceObservationWithLifecycle(
+				services,
+				manager,
+				runWorker.Registry(),
+				name,
+				tmpl,
+				image,
+				hooks,
+			)
+		},
 		// On removal, stop the app's service containers BEFORE the images
 		// are retired (reconciler calls RemoveServices before RemoveApp):
 		// running service containers reference those images. RemoveAndWait
@@ -292,4 +326,16 @@ func appReconcilerConfig(
 		cfg.DeploymentDrift = deploymentCoordinator.ReportDrift
 	}
 	return cfg
+}
+
+// withDeferredImageRetry wraps a service completion so a terminal service pass
+// re-drives deferred image cleanup after the caller's own bookkeeping. It only
+// admits asynchronous cleanup, so it never blocks or changes the outcome.
+func withDeferredImageRetry(runWorker *runner.Runner, onComplete func(error)) func(error) {
+	return func(err error) {
+		if onComplete != nil {
+			onComplete(err)
+		}
+		runWorker.RetryDeferredImageRemovals()
+	}
 }

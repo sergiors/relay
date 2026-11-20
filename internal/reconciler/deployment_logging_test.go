@@ -301,8 +301,8 @@ func TestServiceLoggingDistinguishesCorrectiveWorkNoOpAndErrors(t *testing.T) {
 		serviceLog := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 		services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, serviceLog, testReconcileTimeout)
 		tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
-		if err := services.Apply(context.Background(), "fn", tmpl, "img-current", nil); err != nil {
-			t.Fatalf("apply: %v", err)
+		if result := services.ApplyResult(context.Background(), "fn", tmpl, "img-current", nil, nil); result.Err != nil {
+			t.Fatalf("apply: %v", result.Err)
 		}
 		records := deploymentLogRecords(t, &logs)
 		start := deploymentRecord(records, "Service: reconciling")
@@ -338,12 +338,12 @@ func TestServiceLoggingDistinguishesCorrectiveWorkNoOpAndErrors(t *testing.T) {
 		serviceLog := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 		services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, serviceLog, testReconcileTimeout)
 		tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
-		if err := services.Apply(context.Background(), "fn", tmpl, "img-current", nil); err != nil {
-			t.Fatalf("initial apply: %v", err)
+		if result := services.ApplyResult(context.Background(), "fn", tmpl, "img-current", nil, nil); result.Err != nil {
+			t.Fatalf("initial apply: %v", result.Err)
 		}
 		before := len(deploymentLogRecords(t, &logs))
-		if err := services.Apply(context.Background(), "fn", tmpl, "img-current", nil); err != nil {
-			t.Fatalf("no-op apply: %v", err)
+		if result := services.ApplyResult(context.Background(), "fn", tmpl, "img-current", nil, nil); result.Err != nil {
+			t.Fatalf("no-op apply: %v", result.Err)
 		}
 		records := deploymentLogRecords(t, &logs)[before:]
 		if len(records) != 1 || records[0].Msg != "Service: unchanged" || records[0].Level != "DEBUG" {
@@ -363,8 +363,8 @@ func TestServiceLoggingDistinguishesCorrectiveWorkNoOpAndErrors(t *testing.T) {
 		tmpl := serviceTemplate("nodejs24.x", app.Service{
 			Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
 		})
-		if err := services.Apply(ctx, "fn", tmpl, "img-current", nil); !errors.Is(err, context.Canceled) {
-			t.Fatalf("Apply error = %v, want context.Canceled", err)
+		if result := services.ApplyResult(ctx, "fn", tmpl, "img-current", nil, nil); !errors.Is(result.Err, context.Canceled) {
+			t.Fatalf("ApplyResult error = %v, want context.Canceled", result.Err)
 		}
 		records := deploymentLogRecords(t, &logs)
 		cancelled := deploymentRecord(records, "Service: reconciliation cancelled")
@@ -397,8 +397,8 @@ func TestServiceLoggingDistinguishesCorrectiveWorkNoOpAndErrors(t *testing.T) {
 		tmpl := serviceTemplate("nodejs24.x", app.Service{
 			Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
 		})
-		if err := services.Apply(ctx, "fn", tmpl, "img-new", nil); !errors.Is(err, context.Canceled) {
-			t.Fatalf("Apply error = %v, want context.Canceled", err)
+		if result := services.ApplyResult(ctx, "fn", tmpl, "img-new", nil, nil); !errors.Is(result.Err, context.Canceled) {
+			t.Fatalf("ApplyResult error = %v, want context.Canceled", result.Err)
 		}
 		records := deploymentLogRecords(t, &logs)
 		cancelled := deploymentRecord(records, "Service: reconciliation cancelled")
@@ -415,8 +415,8 @@ func TestServiceLoggingDistinguishesCorrectiveWorkNoOpAndErrors(t *testing.T) {
 		serviceLog := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 		services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, serviceLog, testReconcileTimeout)
 		tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
-		if err := services.Apply(context.Background(), "fn", tmpl, "img-current", nil); err == nil {
-			t.Fatal("Apply unexpectedly succeeded")
+		if result := services.ApplyResult(context.Background(), "fn", tmpl, "img-current", nil, nil); result.Err == nil {
+			t.Fatal("ApplyResult unexpectedly succeeded")
 		}
 		records := deploymentLogRecords(t, &logs)
 		summary := deploymentRecord(records, "Service: reconciled with errors")
@@ -448,8 +448,8 @@ func TestServiceSupersededSummaryOmitsAppImage(t *testing.T) {
 		return !superseded
 	})
 
-	if err := c.Apply(ctx, "fn", tmpl, "img-new", nil); err != nil {
-		t.Fatalf("apply: %v", err)
+	if result := c.ApplyResult(ctx, "fn", tmpl, "img-new", nil, nil); result.Err != nil {
+		t.Fatalf("apply: %v", result.Err)
 	}
 
 	records := deploymentLogRecords(t, logs)
@@ -562,7 +562,7 @@ func TestNoRuntimeAppLifecycleLogsOmitEmptyImageAttributes(t *testing.T) {
 			name string, tmpl *app.Template, image string,
 			_ func(), onComplete func(error),
 		) {
-			onComplete(services.Apply(context.Background(), name, tmpl, image, nil))
+			onComplete(services.ApplyResult(context.Background(), name, tmpl, image, nil, nil).Err)
 		}
 	})
 

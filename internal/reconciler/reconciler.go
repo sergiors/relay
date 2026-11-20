@@ -183,6 +183,16 @@ type Config struct {
 	UpdateServices                      func(name string, tmpl *app.Template, image string)
 	UpdateServicesWithStatus            func(name string, tmpl *app.Template, image string, onReconcileStart func(), onComplete func(error))
 	UpdateServicesObservationWithStatus func(name string, tmpl *app.Template, image string, onReconcileStart func(), onComplete func(error))
+	// UpdateServicesWithLifecycle and UpdateServicesObservationWithLifecycle
+	// are the lifecycle-aware service hooks. They carry the same status
+	// callbacks plus a settlement hook that runs exactly once when the logical
+	// request concludes (terminal convergence, supersession, or cancellation).
+	// The reconciler uses them to defer old-image retirement while service
+	// convergence is pending, without leaking the retirement when a newer
+	// generation supersedes the request. When set they take precedence over the
+	// status hooks above.
+	UpdateServicesWithLifecycle            func(name string, tmpl *app.Template, image string, hooks ServiceRequestHooks)
+	UpdateServicesObservationWithLifecycle func(name string, tmpl *app.Template, image string, hooks ServiceRequestHooks)
 	// RemoveServices, when set, is called in remove() immediately BEFORE
 	// RemoveApp and the app's images are retired. The ordering
 	// invariant: running service containers reference the app's images, so
@@ -229,6 +239,8 @@ type Reconciler struct {
 	updateServices                      func(name string, tmpl *app.Template, image string)
 	updateServicesWithStatus            func(name string, tmpl *app.Template, image string, onReconcileStart func(), onComplete func(error))
 	updateServicesObservationWithStatus func(name string, tmpl *app.Template, image string, onReconcileStart func(), onComplete func(error))
+	updateServicesLifecycle             func(name string, tmpl *app.Template, image string, hooks ServiceRequestHooks)
+	updateServicesObservationLifecycle  func(name string, tmpl *app.Template, image string, hooks ServiceRequestHooks)
 	removeServices                      func(name string)
 	deploymentProgress                  func(name, phase, errMessage string)
 	deploymentDrift                     func(name, reason string)
@@ -375,6 +387,8 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 		updateServices:                      cfg.UpdateServices,
 		updateServicesWithStatus:            cfg.UpdateServicesWithStatus,
 		updateServicesObservationWithStatus: cfg.UpdateServicesObservationWithStatus,
+		updateServicesLifecycle:             cfg.UpdateServicesWithLifecycle,
+		updateServicesObservationLifecycle:  cfg.UpdateServicesObservationWithLifecycle,
 		removeServices:                      cfg.RemoveServices,
 		deploymentProgress:                  cfg.DeploymentProgress,
 		deploymentDrift:                     cfg.DeploymentDrift,

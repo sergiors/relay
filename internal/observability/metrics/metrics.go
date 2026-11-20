@@ -232,10 +232,10 @@ const (
 	MetricRedisReadErrors = metricNamespacePrefix + "redis_read_errors_total"
 
 	// Service reconcile observability. MetricServiceReconciles counts every
-	// ServiceReconciler.Apply outcome (changed/unchanged/error), including the
-	// periodic no-op verification passes; MetricServiceReconcileDuration
+	// ServiceReconciler pass outcome (changed/unchanged/pending/error), including
+	// the periodic no-op verification passes; MetricServiceReconcileDuration
 	// observes each pass's wall-clock duration. Both are labeled by the bounded
-	// app dimension, and the outcome label is a closed three-value set.
+	// app dimension, and the outcome label is a closed four-value set.
 	MetricServiceReconciles        = metricNamespacePrefix + "service_reconciles_total"
 	MetricServiceReconcileDuration = metricNamespacePrefix + "service_reconcile_duration_seconds"
 
@@ -404,11 +404,13 @@ const (
 )
 
 // Service reconcile outcome label values. A pass that changed container state
-// is "changed", a fully-converged verification pass is "unchanged", and a pass
-// that issued no change but recorded at least one error is "error".
+// is "changed", a fully-converged verification pass is "unchanged", a pass that
+// ended with backend work still pending is "pending", and a pass that issued no
+// terminal change but recorded at least one error is "error".
 const (
 	ServiceOutcomeChanged   = "changed"
 	ServiceOutcomeUnchanged = "unchanged"
+	ServiceOutcomePending   = "pending"
 	ServiceOutcomeError     = "error"
 )
 

@@ -258,7 +258,7 @@ func TestStartupServicePublicationFailsClosedWithoutToken(t *testing.T) {
 
 	// A nil coordinator makes any accidental publication fail the test. The
 	// missing token must be detected before the coordinator is touched.
-	enqueueStartupServicesWithState(
+	enqueueStartupServices(
 		context.Background(), prepared, nil, st, nil, discardLogger())
 }
 
@@ -360,7 +360,7 @@ func TestStartupServiceReadyLoggedAfterAsyncCompletion(t *testing.T) {
 				Name: fn.Name, Image: "img-svc-ready", Fingerprint: "fp-svc-ready",
 			}, nil),
 		}
-		enqueueStartupServicesWithState(
+		enqueueStartupServices(
 			context.Background(), prepared, coordinator, st,
 			map[string]state.FencingToken{fn.Name: token}, logger,
 		)
@@ -418,7 +418,7 @@ func TestStartupServiceReadyLoggedAfterAsyncCompletion(t *testing.T) {
 				Name: fn.Name, Image: "img-svc-broken", Fingerprint: "fp-svc-broken",
 			}, nil),
 		}
-		enqueueStartupServicesWithState(
+		enqueueStartupServices(
 			context.Background(), prepared, coordinator, st,
 			map[string]state.FencingToken{fn.Name: token}, logger,
 		)
@@ -494,7 +494,7 @@ func TestStartupEmptyServiceReadinessWaitsForCleanup(t *testing.T) {
 				}, nil),
 			}
 
-			enqueueStartupServicesWithState(
+			enqueueStartupServices(
 				context.Background(), prepared, coordinator, st,
 				map[string]state.FencingToken{fn.Name: token}, logger,
 			)

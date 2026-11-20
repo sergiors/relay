@@ -10,6 +10,7 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/routing"
+	"relay/internal/runtime"
 	"relay/internal/testutil"
 )
 
@@ -49,6 +50,135 @@ func (f *restartFakeDocker) restartCount() int {
 	return len(f.restarts)
 }
 
+// readinessFakeDocker overlays an explicit backend readiness observation on a
+// restartFakeDocker. Test-only; the production Docker backend leaves the
+// observation unknown (nil).
+type readinessFakeDocker struct {
+	*restartFakeDocker
+	unready map[string]bool
+}
+
+func newReadinessFakeDocker() *readinessFakeDocker {
+	return &readinessFakeDocker{restartFakeDocker: newRestartFakeDocker()}
+}
+
+func (f *readinessFakeDocker) ServiceContainerList(
+	ctx context.Context,
+) ([]runtime.ServiceContainer, error) {
+	containers, err := f.restartFakeDocker.ServiceContainerList(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range containers {
+		ready := !f.unready[containers[i].ID]
+		containers[i].Ready = &ready
+	}
+	return containers, nil
+}
+
+// TestServiceReconcileUnreadySourceCandidateIsNotRestarted pins the readiness
+// edge of HOT_RELOAD: an explicitly unready source-stale candidate must not be
+// in-place restarted and then have the slot's actually-ready generation stopped.
+// The ready generation is restarted instead; the unready one is replaced.
+func TestServiceReconcileUnreadySourceCandidateIsNotRestarted(t *testing.T) {
+	f := newReadinessFakeDocker()
+	f.setMountIdentity("service.py", "newfp")
+	f.mu.Lock()
+	f.ctrs["a-unready"] = &fakeContainer{
+		id: "a-unready", appName: "fn", entrypoint: "service.py",
+		sourceRef: "service.py", image: "img-1", port: 80, replica: 0,
+		state: container.StateRunning, sourceID: "oldfp",
+		environmentFingerprint: serviceEnvironmentFingerprint(80),
+		resources:              serviceResources(),
+	}
+	f.ctrs["b-ready"] = &fakeContainer{
+		id: "b-ready", appName: "fn", entrypoint: "service.py",
+		sourceRef: "service.py", image: "img-1", port: 80, replica: 0,
+		state: container.StateRunning, sourceID: "oldfp",
+		environmentFingerprint: serviceEnvironmentFingerprint(80),
+		resources:              serviceResources(),
+	}
+	f.mu.Unlock()
+	f.unready = map[string]bool{"a-unready": true}
+
+	tmpl := serviceTemplate("nodejs24.x", app.Service{
+		Name: "service.py", Entrypoint: "service.py", Port: 80, Replicas: 1,
+	})
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	result := c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil, nil)
+	if result.Err != nil {
+		t.Fatalf("apply: %v", result.Err)
+	}
+	if result.Pending() {
+		t.Fatal("pass ended pending, want the ready generation restarted")
+	}
+
+	f.mu.Lock()
+	restarts := append([]string(nil), f.restarts...)
+	stops := append([]string(nil), f.stops...)
+	f.mu.Unlock()
+	if len(restarts) != 1 || restarts[0] != "b-ready" {
+		t.Fatalf("restarts = %v, want only the actually-ready container b-ready", restarts)
+	}
+	if containsString(stops, "b-ready") {
+		t.Fatalf("stops = %v, must not stop the actually-ready generation", stops)
+	}
+	if !containsString(stops, "a-unready") {
+		t.Fatalf("stops = %v, want the unready candidate replaced after the ready restart", stops)
+	}
+}
+
+// TestServiceReconcileRestartedUnreadyCandidateRemainsPending pins the other
+// half: once a restarted candidate is explicitly observed as unready, the next
+// pass must remain pending instead of treating it as converged or starting a
+// duplicate replacement.
+func TestServiceReconcileRestartedUnreadyCandidateRemainsPending(t *testing.T) {
+	f := newReadinessFakeDocker()
+	f.setMountIdentity("service.py", "newfp")
+	f.mu.Lock()
+	f.ctrs["svc"] = &fakeContainer{
+		id: "svc", appName: "fn", entrypoint: "service.py",
+		sourceRef: "service.py", image: "img-1", port: 80, replica: 0,
+		state: container.StateRunning, sourceID: "oldfp",
+		environmentFingerprint: serviceEnvironmentFingerprint(80),
+		resources:              serviceResources(),
+	}
+	f.mu.Unlock()
+
+	tmpl := serviceTemplate("nodejs24.x", app.Service{
+		Name: "service.py", Entrypoint: "service.py", Port: 80, Replicas: 1,
+	})
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	first := c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil, nil)
+	if first.Err != nil || first.Pending() {
+		t.Fatalf("first pass = %+v, want a terminal in-place restart", first)
+	}
+	if got := f.restartCount(); got != 1 {
+		t.Fatalf("restarts after first pass = %d, want 1", got)
+	}
+
+	f.unready = map[string]bool{"svc": true}
+	second := c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil, nil)
+	if !second.Pending() {
+		t.Fatalf("second pass outcome = %v, want pending for the explicitly unready candidate", second.Outcome)
+	}
+
+	f.mu.Lock()
+	restarts := len(f.restarts)
+	stops := append([]string(nil), f.stops...)
+	containers := len(f.ctrs)
+	f.mu.Unlock()
+	if restarts != 1 {
+		t.Fatalf("restarts after second pass = %d, want no second restart", restarts)
+	}
+	if len(stops) != 0 {
+		t.Fatalf("stops after second pass = %v, want none", stops)
+	}
+	if containers != 1 {
+		t.Fatalf("containers after second pass = %d, want no duplicate replacement", containers)
+	}
+}
+
 // onlyContainerID returns the single container ID for fn/service, failing when
 // there is not exactly one (any state).
 func onlyContainerID(t *testing.T, f *fakeDocker, fn, service string) string {
@@ -73,7 +203,7 @@ func onlyContainerID(t *testing.T, f *fakeDocker, fn, service string) string {
 // package-level Reconcile, so in-place reload is active.
 func applyServices(t *testing.T, c *ServiceReconciler, fn string, tmpl *app.Template, image string) error {
 	t.Helper()
-	return c.Apply(context.Background(), fn, tmpl, image, nil)
+	return c.ApplyResult(context.Background(), fn, tmpl, image, nil, nil).Err
 }
 
 // TestServiceReconcileSourceOnlyChangeRestartsInPlace pins the HOT_RELOAD

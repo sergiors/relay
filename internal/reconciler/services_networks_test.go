@@ -212,15 +212,15 @@ func TestReconcileServiceNetworksConvergedNoOp(t *testing.T) {
 	}
 }
 
-// ServiceReconciler.WithNetworks wires the global set through Apply (the
+// ServiceReconciler.WithNetworks wires the global set through ApplyResult (the
 // production shape), so the reconciler — not the caller — owns the network set.
 func TestServiceReconcilerWithNetworksAppliesGlobals(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout,
 		WithNetworks([]string{"backend", "frontend"}))
-	if err := c.Apply(context.Background(), "fn", tmpl, "img-1", nil); err != nil {
-		t.Fatalf("apply: %v", err)
+	if result := c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil, nil); result.Err != nil {
+		t.Fatalf("apply: %v", result.Err)
 	}
 	started := f.lastStartedFor("fn", "service.js")
 	if started == nil || serviceNetworks(started.networks...) != "backend,frontend" {

@@ -148,7 +148,7 @@ func TestPublishStartupAppsRejectsStaleAndKeepsOnlyAcceptedGenerations(t *testin
 	serviceReconciler := reconciler.NewServiceReconciler(docker, nil, routing.TraefikConfig{}, discardLogger(), reconcileTimeout)
 	coordinator, stop := startCoordinatorFixture(t, serviceReconciler)
 	defer stop()
-	enqueueStartupServices(published, coordinator, discardLogger())
+	enqueueStartupServices(context.Background(), published, coordinator, nil, nil, discardLogger())
 	if err := coordinator.Wait(context.Background()); err != nil {
 		t.Fatalf("wait for accepted startup service: %v", err)
 	}

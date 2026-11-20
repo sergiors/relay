@@ -19,8 +19,8 @@ func TestServiceReconcilerMetricsChanged(t *testing.T) {
 	m := metrics.New()
 
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout, WithMetrics(m))
-	if err := c.Apply(context.Background(), "fn", tmpl, "img", nil); err != nil {
-		t.Fatalf("apply: %v", err)
+	if result := c.ApplyResult(context.Background(), "fn", tmpl, "img", nil, nil); result.Err != nil {
+		t.Fatalf("apply: %v", result.Err)
 	}
 
 	if got := m.CounterLabels(metrics.MetricServiceReconciles, []metrics.Label{{Name: "app", Value: "fn"}, {Name: "outcome", Value: metrics.ServiceOutcomeChanged}}); got != 1 {
@@ -43,11 +43,11 @@ func TestServiceReconcilerMetricsUnchanged(t *testing.T) {
 	m := metrics.New()
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout, WithMetrics(m))
 
-	if err := c.Apply(context.Background(), "fn", tmpl, "img", nil); err != nil {
-		t.Fatalf("apply 1: %v", err)
+	if result := c.ApplyResult(context.Background(), "fn", tmpl, "img", nil, nil); result.Err != nil {
+		t.Fatalf("apply 1: %v", result.Err)
 	}
-	if err := c.Apply(context.Background(), "fn", tmpl, "img", nil); err != nil {
-		t.Fatalf("apply 2: %v", err)
+	if result := c.ApplyResult(context.Background(), "fn", tmpl, "img", nil, nil); result.Err != nil {
+		t.Fatalf("apply 2: %v", result.Err)
 	}
 
 	if got := m.CounterLabels(metrics.MetricServiceReconciles, []metrics.Label{{Name: "app", Value: "fn"}, {Name: "outcome", Value: metrics.ServiceOutcomeChanged}}); got != 1 {
@@ -71,7 +71,7 @@ func TestServiceReconcilerMetricsError(t *testing.T) {
 	m := metrics.New()
 
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout, WithMetrics(m))
-	if err := c.Apply(context.Background(), "fn", tmpl, "img", nil); err == nil {
+	if result := c.ApplyResult(context.Background(), "fn", tmpl, "img", nil, nil); result.Err == nil {
 		t.Fatal("apply: err = nil, want the resolve failure surfaced")
 	}
 
@@ -92,10 +92,10 @@ func TestServiceReconcilerMetricsNilRegistryNoPanic(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
-	if err := c.Apply(context.Background(), "fn", tmpl, "img", nil); err != nil {
-		t.Fatalf("apply: %v", err)
+	if result := c.ApplyResult(context.Background(), "fn", tmpl, "img", nil, nil); result.Err != nil {
+		t.Fatalf("apply: %v", result.Err)
 	}
-	if err := c.Apply(context.Background(), "fn", tmpl, "img", nil); err != nil {
-		t.Fatalf("apply 2: %v", err)
+	if result := c.ApplyResult(context.Background(), "fn", tmpl, "img", nil, nil); result.Err != nil {
+		t.Fatalf("apply 2: %v", result.Err)
 	}
 }

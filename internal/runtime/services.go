@@ -28,6 +28,13 @@ import (
 // one-shot invocation containers (event/schedule), so sweeps/reconcilers can
 // never confuse the two populations.
 
+// ErrServicePending reports that a service operation was accepted but is not
+// yet terminally converged. StartService implementations return it (possibly
+// wrapped) when a replacement is running but a backend-specific readiness or
+// observation step has not concluded; the service reconciler treats that as a
+// pending pass rather than a failure. The reconciler re-exports this sentinel.
+var ErrServicePending = errors.New("service convergence pending")
+
 // ServiceSpec describes one desired service replica's container. The service
 // IDENTITY is its stable template name (app.Service.Name): relay.service is
 // stamped with it and it is what Reconcile uses to group an app's containers
@@ -173,6 +180,17 @@ type ServiceContainer struct {
 	// container has none). The service reconciler compares routing metadata
 	// through it without Relay parsing or interpreting foreign label names.
 	Labels map[string]string
+	// Ready is the backend's CURRENT readiness observation for a running
+	// service container. nil means the backend reports no readiness signal,
+	// preserving Docker's historical behavior where a running container is
+	// converged. A non-nil false reports that the backend accepted the
+	// replacement but has not terminally converged it yet; the service
+	// reconciler then keeps the pass pending instead of starting a duplicate
+	// replacement or stopping the previous generation. An explicitly unready
+	// container is also never an in-place restart target, never counts as an
+	// actually-ready survivor for the stopping safety net, and is not treated
+	// as converged after a restart.
+	Ready *bool
 }
 
 // serviceContainerNameLenCap caps the deterministic (logical) container name of

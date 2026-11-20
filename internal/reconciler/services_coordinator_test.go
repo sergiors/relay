@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -731,4 +732,964 @@ func TestServiceCoordinatorRunExclusiveCancelledBarrierSkipsCallback(t *testing.
 	if invoked {
 		t.Fatal("RunExclusive invoked the callback despite a cancelled barrier")
 	}
+}
+
+// pendingServiceDocker is a test-local Docker fake for the coordinator's
+// pending/resume contract: StartService reports ErrServicePending on its FIRST
+// call and succeeds on every later call, so the first pass of a one-replica
+// service ends pending and a later pass ends terminally. removeEntered is
+// closed once an app removal enters, which then parks until removeRelease, so
+// a test can observe a removal in progress. resolveErr (set only while no pass
+// is active) makes a later source resolution fail terminally.
+type pendingServiceDocker struct {
+	startCalls    atomic.Int32
+	resolveCalls  atomic.Int32
+	pendingSignal chan struct{}
+	removeEntered chan struct{}
+	removeRelease chan struct{}
+	removeOnce    sync.Once
+	resolveErr    error
+}
+
+func newPendingServiceDocker() *pendingServiceDocker {
+	return &pendingServiceDocker{
+		pendingSignal: make(chan struct{}, 1),
+		removeEntered: make(chan struct{}),
+		removeRelease: make(chan struct{}),
+	}
+}
+
+func (d *pendingServiceDocker) ResolveServiceImage(
+	_ context.Context, _ string, _ *app.Template, _ app.Service, image string,
+) (runtime.ServiceImage, error) {
+	d.resolveCalls.Add(1)
+	if err := d.resolveErr; err != nil {
+		return runtime.ServiceImage{}, err
+	}
+	return runtime.ServiceImage{Ref: image, ID: image}, nil
+}
+
+func (d *pendingServiceDocker) StartService(context.Context, runtime.ServiceSpec, int) (string, error) {
+	if d.startCalls.Add(1) == 1 {
+		select {
+		case d.pendingSignal <- struct{}{}:
+		default:
+		}
+		return "", ErrServicePending
+	}
+	return "id-terminal", nil
+}
+
+func (d *pendingServiceDocker) ServiceContainerList(context.Context) ([]runtime.ServiceContainer, error) {
+	return nil, nil
+}
+func (d *pendingServiceDocker) StopServiceContainers(context.Context, []runtime.ServiceContainer) error {
+	return nil
+}
+func (d *pendingServiceDocker) RemoveAppServiceContainers(ctx context.Context, _ string) (int, error) {
+	d.removeOnce.Do(func() { close(d.removeEntered) })
+	select {
+	case <-d.removeRelease:
+		return 1, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+func (d *pendingServiceDocker) NetworkExists(context.Context, string) (bool, error) { return true, nil }
+
+// enqueueMeaningfulWithHooks publishes one meaningful leased request through
+// the coordinator's single enqueue funnel and returns its done channel, so a
+// test can observe exactly when the logical request concludes.
+func enqueueMeaningfulWithHooks(
+	c *ServiceCoordinator, name string, tmpl *app.Template, image string,
+	lease *runtime.ImageLease, onComplete func(error), onSettled func(),
+) chan struct{} {
+	return c.enqueue(&serviceRequest{
+		name: name, tmpl: cloneServiceTemplate(tmpl), image: image,
+		lease: lease, onComplete: onComplete, onSettled: onSettled,
+	})
+}
+
+// TestServiceCoordinatorPendingReleasesWorkerAndNotifyCompletesOnce pins the
+// external-pending lifecycle: a first pass whose StartService reports
+// ErrServicePending ends WITHOUT concluding the logical request (no completion,
+// no settlement, done stays open) while releasing the worker (Wait returns) and
+// the per-pass image lease; an explicit Notify then resumes the SAME request,
+// which concludes terminally with its callback and settlement hook running
+// exactly once.
+func TestServiceCoordinatorPendingReleasesWorkerAndNotifyCompletesOnce(t *testing.T) {
+	docker := newPendingServiceDocker()
+	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	coordinator := NewServiceCoordinator(services)
+	lifecycle, cancel := context.WithCancel(context.Background())
+	coordinator.Start(lifecycle)
+	defer func() {
+		cancel()
+		joinCtx, joinCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer joinCancel()
+		if err := coordinator.Join(joinCtx); err != nil {
+			t.Fatalf("join: %v", err)
+		}
+	}()
+
+	tmpl := serviceTemplate("", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	mgr := &runtime.Manager{}
+	lease, err := mgr.AcquireImageLease("relay-app-pending:v1")
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+
+	var completeCount, settleCount atomic.Int32
+	completed := make(chan error, 1)
+	done := enqueueMeaningfulWithHooks(coordinator, "alpha", tmpl, "relay-app-pending:v1", lease,
+		func(err error) {
+			completeCount.Add(1)
+			select {
+			case completed <- err:
+			default:
+			}
+		},
+		func() { settleCount.Add(1) },
+	)
+
+	// The first pass ends pending and must release its worker.
+	select {
+	case <-docker.pendingSignal:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the first pass never reached StartService")
+	}
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer waitCancel()
+	if err := coordinator.Wait(waitCtx); err != nil {
+		t.Fatalf("Wait did not return while the request was pending: %v", err)
+	}
+
+	// Pending concludes nothing: the logical request, its callbacks, and its
+	// waiter are retained; only the per-pass image lease is released.
+	if got := docker.startCalls.Load(); got != 1 {
+		t.Fatalf("StartService calls = %d, want 1 (no resume without an explicit wake)", got)
+	}
+	if got := completeCount.Load(); got != 0 {
+		t.Fatalf("completion calls while pending = %d, want 0", got)
+	}
+	if got := settleCount.Load(); got != 0 {
+		t.Fatalf("settlement calls while pending = %d, want 0 (settlement is delayed to conclusion)", got)
+	}
+	select {
+	case <-done:
+		t.Fatal("pending request's done channel was closed (it must stay open for resume)")
+	default:
+	}
+	if got := mgr.LeaseCount("relay-app-pending:v1"); got != 0 {
+		t.Fatalf("lease count after the pending pass = %d, want 0 (released per pass)", got)
+	}
+
+	// Notify resumes the retained request; only its terminal pass concludes it.
+	coordinator.Notify("alpha")
+	select {
+	case got := <-completed:
+		if got != nil {
+			t.Fatalf("terminal completion err = %v, want nil", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("terminal completion did not fire after Notify resumed the pending request")
+	}
+	if got := docker.startCalls.Load(); got != 2 {
+		t.Fatalf("StartService calls = %d, want 2 (Notify ran exactly one second pass)", got)
+	}
+	if got := completeCount.Load(); got != 1 {
+		t.Fatalf("completion calls = %d, want exactly 1", got)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("done channel still open after the terminal completion")
+	}
+	select {
+	case <-completed:
+		t.Fatal("completion callback fired more than once")
+	default:
+	}
+
+	cancel()
+	joinCtx, joinCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer joinCancel()
+	if err := coordinator.Join(joinCtx); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	if got := settleCount.Load(); got != 1 {
+		t.Fatalf("settlement calls = %d, want exactly 1 after conclusion", got)
+	}
+	if got := completeCount.Load(); got != 1 {
+		t.Fatalf("completion calls after join = %d, want exactly 1", got)
+	}
+	if got := docker.startCalls.Load(); got != 2 {
+		t.Fatalf("StartService calls after join = %d, want 2 (no stray extra pass)", got)
+	}
+}
+
+// TestServiceCoordinatorMidPassDoubleEnqueueSupersedesIntermediateRequest
+// pins the mid-pass double-enqueue race: while one request executes, two newer
+// enqueues arrive. The intermediate queued request can never run, so it must be
+// concluded exactly once at the second enqueue — done closed, admitted lease
+// released, settlement hook run once — and its completion callback must never
+// fire; the executing request's stale completion is likewise suppressed, and
+// only the newest request's callback runs.
+func TestServiceCoordinatorMidPassDoubleEnqueueSupersedesIntermediateRequest(t *testing.T) {
+	docker := &coordinatorDocker{entered: make(chan struct{}, 8), release: make(chan struct{})}
+	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	coordinator := NewServiceCoordinator(services)
+	lifecycle, cancel := context.WithCancel(context.Background())
+	coordinator.Start(lifecycle)
+	var release sync.Once
+	defer func() {
+		release.Do(func() { close(docker.release) })
+		cancel()
+		joinCtx, joinCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer joinCancel()
+		if err := coordinator.Join(joinCtx); err != nil {
+			t.Fatalf("join: %v", err)
+		}
+	}()
+
+	tmpl := serviceTemplate("", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	mgr := &runtime.Manager{}
+	lease1, err := mgr.AcquireImageLease("relay-app-mid:v1")
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	lease2, err := mgr.AcquireImageLease("relay-app-mid:v2")
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+
+	var complete1, complete2, settle1, settle2 atomic.Int32
+	completed3 := make(chan error, 1)
+
+	// req1 executes, parked inside its resolve.
+	done1 := enqueueMeaningfulWithHooks(coordinator, "alpha", tmpl, "relay-app-mid:v1", lease1,
+		func(error) { complete1.Add(1) }, func() { settle1.Add(1) })
+	select {
+	case <-docker.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the first pass never entered")
+	}
+
+	// req2 queues behind the executing pass; req3 then supersedes req2 before
+	// req2 can ever run.
+	done2 := enqueueMeaningfulWithHooks(coordinator, "alpha", tmpl, "relay-app-mid:v2", lease2,
+		func(error) { complete2.Add(1) }, func() { settle2.Add(1) })
+	coordinator.EnqueueWithStatus("alpha", tmpl, "img-3", nil, nil, func(err error) {
+		select {
+		case completed3 <- err:
+		default:
+		}
+	})
+
+	// The intermediate request is concluded synchronously by the supersession:
+	// done closed, lease released, settlement exactly once, completion never.
+	select {
+	case <-done2:
+	default:
+		t.Fatal("intermediate request's done channel was not closed on supersession")
+	}
+	if got := mgr.LeaseCount("relay-app-mid:v2"); got != 0 {
+		t.Fatalf("intermediate request lease count = %d, want 0 (released on supersession)", got)
+	}
+	if got := settle2.Load(); got != 1 {
+		t.Fatalf("intermediate settlement calls = %d, want exactly 1", got)
+	}
+	if got := complete2.Load(); got != 0 {
+		t.Fatalf("intermediate completion calls = %d, want 0 (suppressed)", got)
+	}
+
+	// Release the executing pass: it must not fire its stale completion, and
+	// the newest request runs to a terminal result.
+	release.Do(func() { close(docker.release) })
+	if err := coordinator.Wait(context.Background()); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	select {
+	case got := <-completed3:
+		if got != nil {
+			t.Fatalf("newest completion err = %v, want nil", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("newest request's completion did not fire")
+	}
+
+	cancel()
+	joinCtx, joinCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer joinCancel()
+	if err := coordinator.Join(joinCtx); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	if got := complete1.Load(); got != 0 {
+		t.Fatalf("executing request completion calls = %d, want 0 (superseded)", got)
+	}
+	if got := settle1.Load(); got != 1 {
+		t.Fatalf("executing request settlement calls = %d, want exactly 1", got)
+	}
+	if got := complete2.Load(); got != 0 {
+		t.Fatalf("intermediate request completion calls after join = %d, want 0", got)
+	}
+	if got := settle2.Load(); got != 1 {
+		t.Fatalf("intermediate request settlement calls after join = %d, want exactly 1", got)
+	}
+	select {
+	case <-done1:
+	default:
+		t.Fatal("superseded executing request's done channel was not closed")
+	}
+}
+
+// TestServiceCoordinatorObservationDoesNotReplacePendingRequestOrAdvanceDeadline
+// pins callback/deadline ownership while a meaningful request is pending: a
+// periodic observation enqueued under a future wake deadline is dropped without
+// replacing the pending request's callbacks, without starting a pass, and
+// without advancing (or clearing) the scheduled deadline. The explicit wake
+// then concludes the ORIGINAL meaningful request — through a terminal FAILURE —
+// with its own callback, never the observation's, and the concluded request's
+// deadline is cleared.
+func TestServiceCoordinatorObservationDoesNotReplacePendingRequestOrAdvanceDeadline(t *testing.T) {
+	docker := newPendingServiceDocker()
+	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	coordinator := NewServiceCoordinator(services)
+	lifecycle, cancel := context.WithCancel(context.Background())
+	coordinator.Start(lifecycle)
+	defer func() {
+		cancel()
+		joinCtx, joinCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer joinCancel()
+		if err := coordinator.Join(joinCtx); err != nil {
+			t.Fatalf("join: %v", err)
+		}
+	}()
+
+	tmpl := serviceTemplate("", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+
+	var meaningfulComplete, meaningfulSettle atomic.Int32
+	completed := make(chan error, 1)
+	done := enqueueMeaningfulWithHooks(coordinator, "alpha", tmpl, "img-meaningful", nil,
+		func(err error) {
+			meaningfulComplete.Add(1)
+			select {
+			case completed <- err:
+			default:
+			}
+		},
+		func() { meaningfulSettle.Add(1) },
+	)
+
+	// The first pass ends pending.
+	select {
+	case <-docker.pendingSignal:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the first pass never reached StartService")
+	}
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer waitCancel()
+	if err := coordinator.Wait(waitCtx); err != nil {
+		t.Fatalf("Wait did not return while the request was pending: %v", err)
+	}
+
+	// A future wake deadline is installed for the pending request.
+	deadline := time.Now().Add(time.Hour)
+	coordinator.Schedule("alpha", deadline)
+	deadlineOf := func() time.Time {
+		coordinator.mu.Lock()
+		defer coordinator.mu.Unlock()
+		state := coordinator.states["alpha"]
+		if state == nil {
+			return time.Time{}
+		}
+		return state.deadline
+	}
+	if got := deadlineOf(); !got.Equal(deadline) {
+		t.Fatalf("scheduled deadline = %v, want %v", got, deadline)
+	}
+
+	// A periodic observation arrives while the meaningful request is pending.
+	var obsComplete, obsSettle atomic.Int32
+	coordinator.EnqueueObservationWithHooksLeased("alpha", tmpl, "img-observation", nil, nil,
+		ServiceRequestHooks{
+			OnComplete: func(error) { obsComplete.Add(1) },
+			OnSettled:  func() { obsSettle.Add(1) },
+		})
+
+	// The observation is dropped as logical work: it settles once, does not
+	// complete while the request is pending, does not start a pass, and leaves
+	// the pending request's deadline untouched. Its terminal callback is
+	// composed onto the retained request instead of running now.
+	if got := obsSettle.Load(); got != 1 {
+		t.Fatalf("observation settlement calls = %d, want exactly 1 (dropped request concluded)", got)
+	}
+	if got := obsComplete.Load(); got != 0 {
+		t.Fatalf("observation completion calls = %d, want 0 (never ran)", got)
+	}
+	if got := deadlineOf(); !got.Equal(deadline) {
+		t.Fatalf("deadline after observation = %v, want the unchanged %v", got, deadline)
+	}
+	obsWaitCtx, obsWaitCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if err := coordinator.Wait(obsWaitCtx); err != nil {
+		obsWaitCancel()
+		t.Fatalf("wait after observation: %v", err)
+	}
+	obsWaitCancel()
+	if got := docker.startCalls.Load(); got != 1 {
+		t.Fatalf("StartService calls after observation = %d, want 1 (observation must not resume/replace)", got)
+	}
+	if got := meaningfulComplete.Load(); got != 0 {
+		t.Fatalf("meaningful completion calls while pending = %d, want 0", got)
+	}
+
+	// The explicit wake concludes the ORIGINAL meaningful request through a
+	// terminal failure. The composed observation completion runs once with that
+	// same terminal result; the observation never owned a separate status
+	// transition.
+	resolveErr := errors.New("registry unavailable")
+	docker.resolveErr = resolveErr
+	coordinator.Notify("alpha")
+	select {
+	case got := <-completed:
+		if !errors.Is(got, resolveErr) {
+			t.Fatalf("terminal completion err = %v, want the meaningful request's resolve failure", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("terminal completion did not fire after Notify resumed the pending request")
+	}
+	// The waiter is released only after the callbacks and settlement finished.
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("meaningful request's done channel still open after terminal completion")
+	}
+	// The resumed pass ran exactly once: it resolved the source (and failed
+	// there), so StartService was never reached a second time and no stray
+	// extra pass followed.
+	if got := docker.resolveCalls.Load(); got != 2 {
+		t.Fatalf("resolve attempts = %d, want 2 (pending pass + exactly one resumed pass)", got)
+	}
+	if got := docker.startCalls.Load(); got != 1 {
+		t.Fatalf("StartService calls = %d, want 1 (the resumed pass failed before starting)", got)
+	}
+	if got := meaningfulComplete.Load(); got != 1 {
+		t.Fatalf("meaningful completion calls = %d, want exactly 1", got)
+	}
+	if got := obsComplete.Load(); got != 1 {
+		t.Fatalf("observation completion calls after terminal = %d, want exactly 1 (composed observer)", got)
+	}
+	// The concluded request's deadline belongs to it and is cleared with it.
+	if got := deadlineOf(); !got.IsZero() {
+		t.Fatalf("deadline after conclusion = %v, want cleared", got)
+	}
+
+	cancel()
+	joinCtx, joinCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer joinCancel()
+	if err := coordinator.Join(joinCtx); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	if got := meaningfulSettle.Load(); got != 1 {
+		t.Fatalf("meaningful settlement calls = %d, want exactly 1", got)
+	}
+	if got := meaningfulComplete.Load(); got != 1 {
+		t.Fatalf("meaningful completion calls after join = %d, want exactly 1", got)
+	}
+}
+
+// TestServiceCoordinatorRemoveAndWaitSupersedesPendingRequest pins the app
+// removal edge: a removal request is non-meaningful for status authority but
+// must NOT be mistaken for a redundant observation — it supersedes a pending
+// meaningful request (concluding it once, without its stale completion), runs
+// the Docker removal, and RemoveAndWait waits deterministically until that
+// removal actually returns.
+func TestServiceCoordinatorRemoveAndWaitSupersedesPendingRequest(t *testing.T) {
+	docker := newPendingServiceDocker()
+	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), time.Minute)
+	coordinator := NewServiceCoordinator(services)
+	lifecycle, cancel := context.WithCancel(context.Background())
+	coordinator.Start(lifecycle)
+	defer func() {
+		cancel()
+		joinCtx, joinCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer joinCancel()
+		if err := coordinator.Join(joinCtx); err != nil {
+			t.Fatalf("join: %v", err)
+		}
+	}()
+
+	tmpl := serviceTemplate("", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	mgr := &runtime.Manager{}
+	lease, err := mgr.AcquireImageLease("relay-app-removal:v1")
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+
+	var completeCount, settleCount atomic.Int32
+	done := enqueueMeaningfulWithHooks(coordinator, "alpha", tmpl, "relay-app-removal:v1", lease,
+		func(error) { completeCount.Add(1) }, func() { settleCount.Add(1) })
+
+	// The first pass ends pending: worker and lease released, request retained.
+	select {
+	case <-docker.pendingSignal:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the first pass never reached StartService")
+	}
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer waitCancel()
+	if err := coordinator.Wait(waitCtx); err != nil {
+		t.Fatalf("Wait did not return while the request was pending: %v", err)
+	}
+	if got := mgr.LeaseCount("relay-app-removal:v1"); got != 0 {
+		t.Fatalf("lease count after the pending pass = %d, want 0", got)
+	}
+	select {
+	case <-done:
+		t.Fatal("pending request's done channel was closed before the removal")
+	default:
+	}
+
+	// The removal supersedes the pending meaningful request and parks in Docker.
+	removeReturned := make(chan struct{})
+	go func() {
+		defer close(removeReturned)
+		coordinator.RemoveAndWait("alpha")
+	}()
+	select {
+	case <-docker.removeEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the removal never entered: it was mistaken for a redundant observation")
+	}
+	select {
+	case <-done:
+	default:
+		t.Fatal("pending request's done channel not closed by removal supersession")
+	}
+	if got := settleCount.Load(); got != 1 {
+		t.Fatalf("pending request settlement calls = %d, want exactly 1 (superseded by removal)", got)
+	}
+	if got := completeCount.Load(); got != 0 {
+		t.Fatalf("pending request completion calls = %d, want 0 (suppressed by removal)", got)
+	}
+
+	// RemoveAndWait must still be waiting on the parked removal.
+	select {
+	case <-removeReturned:
+		t.Fatal("RemoveAndWait returned while the removal was still parked in Docker")
+	default:
+	}
+	close(docker.removeRelease)
+	select {
+	case <-removeReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RemoveAndWait did not return after the removal completed")
+	}
+
+	cancel()
+	joinCtx, joinCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer joinCancel()
+	if err := coordinator.Join(joinCtx); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	if got := settleCount.Load(); got != 1 {
+		t.Fatalf("pending request settlement calls after join = %d, want exactly 1", got)
+	}
+	if got := completeCount.Load(); got != 0 {
+		t.Fatalf("pending request completion calls after join = %d, want 0", got)
+	}
+}
+
+// TestServiceCoordinatorStatusLessDesiredSupersedesExecutingMeaningful pins the
+// authority split: a status-less desired update advances the desired-operation
+// fence without advancing meaningful status authority. An executing meaningful
+// pass superseded by it must not commit its old-generation stop, and its
+// completion callback must be suppressed. The new status-less desired state then
+// runs and converges.
+func TestServiceCoordinatorStatusLessDesiredSupersedesExecutingMeaningful(t *testing.T) {
+	f := newFakeDocker()
+	seedOldService(f, "old-1", "alpha", "service.js", "img-old", 80, 0)
+	services := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), time.Minute)
+	coordinator := NewServiceCoordinator(services)
+	lifecycle, cancel := context.WithCancel(context.Background())
+	coordinator.Start(lifecycle)
+	defer func() {
+		cancel()
+		joinCtx, joinCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer joinCancel()
+		if err := coordinator.Join(joinCtx); err != nil {
+			t.Fatalf("join: %v", err)
+		}
+	}()
+
+	tmpl := serviceTemplate("nodejs24.x", app.Service{
+		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
+	})
+	oldCompleted := make(chan error, 1)
+	coordinator.EnqueueWithStatus("alpha", tmpl, "img-meaningful", nil, nil,
+		func(err error) { oldCompleted <- err })
+	coordinator.mu.Lock()
+	operationID := coordinator.operationIDs["alpha"]
+	coordinator.mu.Unlock()
+
+	// Park the first pass at the post-start/pre-commit boundary, then publish a
+	// status-less desired update. It must advance the desired-operation fence
+	// and supersede the older request.
+	firstIDs := make(chan string, 1)
+	f.mu.Lock()
+	f.startGate = func(id string, _ runtime.ServiceSpec, _ int) {
+		select {
+		case firstIDs <- id:
+			coordinator.Enqueue("alpha", tmpl, "img-statusless", nil)
+		default:
+		}
+	}
+	f.mu.Unlock()
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer waitCancel()
+	if err := coordinator.Wait(waitCtx); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+
+	select {
+	case err := <-oldCompleted:
+		t.Fatalf("superseded meaningful completion ran with err=%v, want suppression", err)
+	default:
+	}
+
+	coordinator.mu.Lock()
+	gotOperation := coordinator.operationIDs["alpha"]
+	coordinator.mu.Unlock()
+	if gotOperation == operationID {
+		t.Fatalf("operation fence = %d, want the status-less desired update to advance it past %d",
+			gotOperation, operationID)
+	}
+
+	var firstID string
+	select {
+	case firstID = <-firstIDs:
+	default:
+		t.Fatal("the first meaningful pass never reached StartService")
+	}
+
+	f.mu.Lock()
+	stops := append([]string(nil), f.stops...)
+	f.mu.Unlock()
+	if !containsString(stops, firstID) {
+		t.Fatalf("stops = %v, want the superseded pass's provisional %q cleaned up", stops, firstID)
+	}
+	if !containsString(stops, "old-1") {
+		t.Fatalf("stops = %v, want the new status-less pass to replace old-1", stops)
+	}
+	started := f.lastStartedFor("alpha", "service.js")
+	if started == nil || started.image != "img-statusless" {
+		t.Fatalf("running service = %+v, want the status-less desired image", started)
+	}
+}
+
+// TestServiceCoordinatorStatusLessEnqueueAfterTerminalDecisionKeepsCallback
+// pins callback linearization: once the terminal decision is made under the
+// mutex, a newer status-less desired update arriving before callback dispatch
+// must not suppress the already-authorized completion.
+func TestServiceCoordinatorStatusLessEnqueueAfterTerminalDecisionKeepsCallback(t *testing.T) {
+	docker := &coordinatorDocker{entered: make(chan struct{}, 8), release: make(chan struct{})}
+	close(docker.release)
+	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	coordinator := NewServiceCoordinator(services)
+	lifecycle, cancel := context.WithCancel(context.Background())
+	coordinator.Start(lifecycle)
+	defer func() {
+		cancel()
+		joinCtx, joinCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer joinCancel()
+		if err := coordinator.Join(joinCtx); err != nil {
+			t.Fatalf("join: %v", err)
+		}
+	}()
+
+	decided := make(chan struct{})
+	releaseDecision := make(chan struct{})
+	var decisionOnce sync.Once
+	coordinator.terminalDecided = func() {
+		decisionOnce.Do(func() {
+			close(decided)
+			<-releaseDecision
+		})
+	}
+
+	tmpl := serviceTemplate("", app.Service{
+		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
+	})
+	completed := make(chan error, 1)
+	done := enqueueMeaningfulWithHooks(coordinator, "alpha", tmpl, "img-1", nil,
+		func(err error) { completed <- err }, nil)
+
+	select {
+	case <-decided:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the terminal decision seam never fired")
+	}
+	// The terminal decision is fixed. A status-less desired update now advances
+	// operationIDs before the callback is dispatched.
+	coordinator.Enqueue("alpha", tmpl, "img-2", nil)
+	close(releaseDecision)
+
+	select {
+	case err := <-completed:
+		if err != nil {
+			t.Fatalf("terminal completion err = %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the linearized terminal completion was lost")
+	}
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer waitCancel()
+	if err := coordinator.Wait(waitCtx); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("concluded request's done channel stayed open")
+	}
+	docker.mu.Lock()
+	resolves := append([]string(nil), docker.resolves...)
+	docker.mu.Unlock()
+	if !containsString(resolves, "alpha=img-2") {
+		t.Fatalf("resolves = %v, want the status-less follow-up pass to run", resolves)
+	}
+}
+
+// TestServiceCoordinatorShutdownAfterTerminalDecisionSuppressesCallback pins
+// the shutdown side: cancellation between the terminal decision and callback
+// dispatch suppresses the status callback, while the settlement cleanup still
+// runs and releases the waiter.
+func TestServiceCoordinatorShutdownAfterTerminalDecisionSuppressesCallback(t *testing.T) {
+	docker := &coordinatorDocker{entered: make(chan struct{}, 8), release: make(chan struct{})}
+	close(docker.release)
+	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	coordinator := NewServiceCoordinator(services)
+	lifecycle, cancel := context.WithCancel(context.Background())
+	coordinator.Start(lifecycle)
+	defer func() {
+		cancel()
+		joinCtx, joinCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer joinCancel()
+		if err := coordinator.Join(joinCtx); err != nil {
+			t.Fatalf("join: %v", err)
+		}
+	}()
+
+	decided := make(chan struct{})
+	releaseDecision := make(chan struct{})
+	var decisionOnce sync.Once
+	coordinator.terminalDecided = func() {
+		decisionOnce.Do(func() {
+			close(decided)
+			<-releaseDecision
+		})
+	}
+
+	tmpl := serviceTemplate("", app.Service{
+		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
+	})
+	var completeCount, settleCount atomic.Int32
+	done := enqueueMeaningfulWithHooks(coordinator, "alpha", tmpl, "img-1", nil,
+		func(error) { completeCount.Add(1) },
+		func() { settleCount.Add(1) },
+	)
+
+	select {
+	case <-decided:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the terminal decision seam never fired")
+	}
+	cancel()
+	close(releaseDecision)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("done did not close after shutdown settlement")
+	}
+	if got := completeCount.Load(); got != 0 {
+		t.Fatalf("completion calls after shutdown = %d, want 0", got)
+	}
+	if got := settleCount.Load(); got != 1 {
+		t.Fatalf("settlement calls after shutdown = %d, want 1", got)
+	}
+}
+
+// TestServiceCoordinatorShutdownDuringCompletionSuppressesComposedObserver pins
+// the per-callback liveness check: a shutdown that begins while the completion
+// callback is still blocked must suppress the composed observation callback
+// that runs after it, while settlement and waiter closure still complete.
+func TestServiceCoordinatorShutdownDuringCompletionSuppressesComposedObserver(t *testing.T) {
+	docker := &coordinatorDocker{entered: make(chan struct{}, 8), release: make(chan struct{})}
+	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	coordinator := NewServiceCoordinator(services)
+	lifecycle, cancel := context.WithCancel(context.Background())
+	coordinator.Start(lifecycle)
+
+	completeEntered := make(chan struct{})
+	releaseComplete := make(chan struct{})
+	var dockerOnce, completeOnce sync.Once
+	releaseDocker := func() { dockerOnce.Do(func() { close(docker.release) }) }
+	releaseCompletion := func() { completeOnce.Do(func() { close(releaseComplete) }) }
+	defer func() {
+		cancel()
+		releaseDocker()
+		releaseCompletion()
+		joinCtx, joinCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer joinCancel()
+		if err := coordinator.Join(joinCtx); err != nil {
+			t.Fatalf("join: %v", err)
+		}
+	}()
+
+	tmpl := serviceTemplate("", app.Service{
+		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
+	})
+	var completeCount, observerCount, settleCount atomic.Int32
+	done := enqueueMeaningfulWithHooks(coordinator, "alpha", tmpl, "img-1", nil,
+		func(error) {
+			completeCount.Add(1)
+			close(completeEntered)
+			<-releaseComplete
+		},
+		func() { settleCount.Add(1) },
+	)
+	select {
+	case <-docker.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the pass never entered the backend")
+	}
+
+	// A future retry deadline keeps the coalesced observation from setting the
+	// dirty-rerun bit, so this same pass is the terminal one that dispatches
+	// both the completion and the composed observer callback.
+	coordinator.Schedule("alpha", time.Now().Add(time.Hour))
+	coordinator.EnqueueObservationWithHooksLeased("alpha", tmpl, "img-1", nil, nil,
+		ServiceRequestHooks{OnComplete: func(error) { observerCount.Add(1) }})
+
+	releaseDocker()
+	select {
+	case <-completeEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the completion callback never ran")
+	}
+
+	// Shutdown begins while the completion callback is still blocked.
+	cancel()
+	releaseCompletion()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("done did not close after settlement")
+	}
+	if got := completeCount.Load(); got != 1 {
+		t.Fatalf("completion calls = %d, want 1", got)
+	}
+	if got := observerCount.Load(); got != 0 {
+		t.Fatalf("composed observer calls after shutdown = %d, want 0", got)
+	}
+	if got := settleCount.Load(); got != 1 {
+		t.Fatalf("settlement calls after shutdown = %d, want 1", got)
+	}
+}
+
+// TestServiceCoordinatorCancelPendingKeepsIdleBarrierThroughSettlement pins
+// the shutdown race: cancelPending runs a queued request's settlement hook
+// outside the mutex while another worker still executes. If that worker
+// finishes and broadcasts idle during a blocking hook, Wait/RunExclusive must
+// remain busy until the cancellation settlement and waiter closure finish.
+func TestServiceCoordinatorCancelPendingKeepsIdleBarrierThroughSettlement(t *testing.T) {
+	docker := &coordinatorDocker{entered: make(chan struct{}, 8), release: make(chan struct{})}
+	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	coordinator := NewServiceCoordinator(services)
+	lifecycle, cancel := context.WithCancel(context.Background())
+	coordinator.Start(lifecycle)
+
+	settleEntered := make(chan struct{})
+	releaseSettle := make(chan struct{})
+	var releaseDockerOnce, releaseSettleOnce sync.Once
+	releaseDocker := func() { releaseDockerOnce.Do(func() { close(docker.release) }) }
+	releaseSettlement := func() { releaseSettleOnce.Do(func() { close(releaseSettle) }) }
+	defer func() {
+		cancel()
+		releaseSettlement()
+		releaseDocker()
+		joinCtx, joinCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer joinCancel()
+		if err := coordinator.Join(joinCtx); err != nil {
+			t.Fatalf("join: %v", err)
+		}
+	}()
+
+	tmpl := serviceTemplate("", app.Service{
+		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
+	})
+	// The first request executes and parks inside ResolveServiceImage.
+	enqueueMeaningfulWithHooks(coordinator, "alpha", tmpl, "img-1", nil, nil, nil)
+	select {
+	case <-docker.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the executing request never entered the backend")
+	}
+
+	// A queued replacement is cancelled by shutdown and its settlement hook
+	// blocks, representing a real resource-release step.
+	cancelledDone := enqueueMeaningfulWithHooks(coordinator, "alpha", tmpl, "img-2", nil, nil,
+		func() {
+			close(settleEntered)
+			<-releaseSettle
+		})
+
+	cancel()
+	select {
+	case <-settleEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelPending did not run the queued request's settlement")
+	}
+
+	// Park a waiter while the cancellation settlement is blocked.
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer waitCancel()
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- coordinator.Wait(waitCtx) }()
+
+	// Let the executing worker finish and broadcast idle. The waiter must stay
+	// parked because cancellation settlement is still in flight.
+	releaseDocker()
+	select {
+	case err := <-waitDone:
+		t.Fatalf("Wait returned before cancellation settlement completed: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	releaseSettlement()
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("wait: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not return after cancellation settlement completed")
+	}
+	select {
+	case <-cancelledDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled request's waiter was not released after settlement")
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

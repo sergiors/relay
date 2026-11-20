@@ -64,8 +64,8 @@ func TestReconcileNoRuntimeExternalImageResourceHotChange(t *testing.T) {
 	svc := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
 	r, reg := newTestReconciler(t, root, b, nil, func(cfg *Config) {
 		cfg.UpdateServices = func(name string, tmpl *app.Template, image string) {
-			if err := svc.Apply(context.Background(), name, tmpl, image, nil); err != nil {
-				svcErrs = append(svcErrs, err)
+			if result := svc.ApplyResult(context.Background(), name, tmpl, image, nil, nil); result.Err != nil {
+				svcErrs = append(svcErrs, result.Err)
 			}
 		}
 	})

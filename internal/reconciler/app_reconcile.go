@@ -606,8 +606,17 @@ func (r *Reconciler) reconcileApp(name string) {
 			"App: unchanged; reconcile skipped",
 			"app", name,
 		)
-		// An authorized unchanged app is active for this deployment generation.
-		r.reportDeployment(name, state.DeploymentAppActive, "")
+		// An authorized unchanged app becomes active for this deployment
+		// generation only after any status-capable service observation reaches
+		// a terminal success. A pending observation must not publish active.
+		statusCapable := r.updateServicesWithStatus != nil ||
+			r.updateServicesObservationWithStatus != nil ||
+			r.updateServicesLifecycle != nil ||
+			r.updateServicesObservationLifecycle != nil
+		deferActive := statusCapable && len(fn.Template.Services) > 0
+		if !deferActive {
+			r.reportDeployment(name, state.DeploymentAppActive, "")
+		}
 		// Resource limits do not participate in the image fingerprint, so a
 		// resource-only template change lands on this skip path. Publish the
 		// current effective limits to the live warm pool so containers rotate to
@@ -628,8 +637,8 @@ func (r *Reconciler) reconcileApp(name string) {
 		// cur.Prepared() != nil via isAvailable). When that converge pass is a
 		// no-op (nothing to stop or start), the caller logs it at Debug rather
 		// than Info — the summary line only surfaces real state changes.
-		if (r.updateServices != nil || r.updateServicesWithStatus != nil || r.updateServicesObservationWithStatus != nil) && len(fn.Template.Services) > 0 {
-			if r.updateServicesWithStatus == nil && r.updateServicesObservationWithStatus == nil {
+		if (r.updateServices != nil || statusCapable) && len(fn.Template.Services) > 0 {
+			if !statusCapable {
 				r.updateServices(name, fn.Template, cur.Prepared().Image)
 			} else {
 				// This is an observation of the current source generation, not a
@@ -652,32 +661,64 @@ func (r *Reconciler) reconcileApp(name string) {
 				// did real corrective convergence ends ready. The callback is
 				// per-generation and generation-guarded.
 				worked := false
-				updateStatus := r.updateServicesObservationWithStatus
-				if updateStatus == nil {
-					updateStatus = r.updateServicesWithStatus
+				onStart := func() {
+					worked = true
+					if r.st != nil && r.currentGeneration(name, generation) {
+						r.st.RecordReconciling(r.rctx(), name, fencingToken)
+					}
 				}
-				updateStatus(name, fn.Template, cur.Prepared().Image,
-					func() {
-						worked = true
-						if r.st != nil && r.currentGeneration(name, generation) {
-							r.st.RecordReconciling(r.rctx(), name, fencingToken)
-						}
-					}, func(err error) {
-						if r.st == nil || !r.currentGeneration(name, generation) {
-							return
-						}
-						if err != nil {
+				onComplete := func(err error) {
+					if !r.currentGeneration(name, generation) {
+						return
+					}
+					if err != nil {
+						if r.st != nil {
 							r.st.RecordServiceFailure(r.rctx(), name, err, fencingToken)
+						}
+						if errors.Is(err, context.Canceled) &&
+							errors.Is(r.rctx().Err(), context.Canceled) {
+							// Shutdown cancelled the observation: that is not a
+							// deployment failure.
 							return
 						}
-						if !worked {
-							// Nothing was converged: a no-op verification must not
-							// rewrite last_reconcile_status/last_reconcile_at or
-							// touch updated_at.
-							return
+						// An unchanged app whose service observation fails
+						// terminally must not leave deployment progress pending
+						// or stale at a previous phase. A usable generation still
+						// serves (the skip path requires an available one), so it
+						// is degraded; a later successful observation restores
+						// active.
+						phase := state.DeploymentAppFailed
+						if cur != nil && isAvailable(cur) {
+							phase = state.DeploymentAppDegraded
 						}
+						r.reportDeployment(name, phase, err.Error())
+						return
+					}
+					if r.st != nil && worked {
+						// Nothing was converged: a no-op verification must not
+						// rewrite last_reconcile_status/last_reconcile_at or
+						// touch updated_at.
 						r.st.RecordReconcileSuccess(r.rctx(), name, cur.Prepared().Image, known, time.Now(), fn, fencingToken)
-					})
+					}
+					// Deferred activation: the observation is terminal and
+					// successful. A pending observation never reaches here.
+					if deferActive {
+						r.reportDeployment(name, state.DeploymentAppActive, "")
+					}
+				}
+				if r.updateServicesObservationLifecycle != nil {
+					r.updateServicesObservationLifecycle(name, fn.Template, cur.Prepared().Image,
+						ServiceRequestHooks{OnReconcileStart: onStart, OnComplete: onComplete})
+				} else if r.updateServicesLifecycle != nil {
+					r.updateServicesLifecycle(name, fn.Template, cur.Prepared().Image,
+						ServiceRequestHooks{OnReconcileStart: onStart, OnComplete: onComplete})
+				} else {
+					updateStatus := r.updateServicesObservationWithStatus
+					if updateStatus == nil {
+						updateStatus = r.updateServicesWithStatus
+					}
+					updateStatus(name, fn.Template, cur.Prepared().Image, onStart, onComplete)
+				}
 			}
 		}
 		return
@@ -1000,7 +1041,8 @@ func (r *Reconciler) reconcileApp(name string) {
 	// deployment must not be marked ready (or logged as ready) before it
 	// completes. The legacy status-less hook has no completion signal at all, so
 	// its immediately-available generation stays ready as before.
-	if r.updateServicesWithStatus == nil {
+	meaningfulStatusHook := r.updateServicesWithStatus != nil || r.updateServicesLifecycle != nil
+	if !meaningfulStatusHook {
 		readyToLog = ready()
 	}
 
@@ -1012,74 +1054,100 @@ func (r *Reconciler) reconcileApp(name string) {
 		r.updateSchedules(name, fn.Template)
 	}
 
+	// Retiring the superseded image is deferred until the logical service
+	// request settles when the lifecycle hook is wired. A pending service pass
+	// still owns a candidate generation; retiring early would rely only on the
+	// backend reference guard instead of the service convergence boundary. The
+	// settlement hook runs exactly once, including on supersession or
+	// cancellation, so deferral cannot leak the retirement.
+	retireOld := func() {
+		if r.retire != nil && oldImage != "" && oldImage != built.Image {
+			r.retire(name, oldImage)
+		}
+	}
+	retireDeferred := false
+
 	// After the scheduler converges, converge the app's persistent service
 	// containers to the freshly prepared template and image. This runs on both
 	// discovery and update paths (the registry now serves the new version), and
 	// not on the skip path above nor on a build failure (where the previous
 	// version — and its service containers — are retained).
-	if r.updateServicesWithStatus != nil {
+	onServiceStart := func() {
+		if r.st != nil && r.currentGeneration(name, generation) {
+			r.st.RecordReconciling(r.rctx(), name, fencingToken)
+		}
+	}
+	onServiceComplete := func(err error) {
+		if err != nil {
+			failServices(err)
+			if !r.currentGeneration(name, generation) {
+				// A newer generation superseded this pass: its failure
+				// is not a deployment-level outcome for this one.
+				return
+			}
+			if errors.Is(err, context.Canceled) &&
+				errors.Is(r.rctx().Err(), context.Canceled) {
+				deployAttrs := withPrevious(deploymentAttrs(name, built, builtFP))
+				deployAttrs = append(deployAttrs,
+					"services", len(fn.Template.Services),
+					"outcome", "cancelled",
+					"error", err,
+				)
+				r.log.Debug("App: deployment cancelled", deployAttrs...)
+				return
+			}
+			// A current-generation, non-cancellation service convergence
+			// failure is terminal for this deployment progress. Report it as
+			// degraded when a usable prior generation remains, otherwise
+			// failed; never leave the cluster status stuck at activating and
+			// never mark ready.
+			if hasUsablePrior {
+				r.reportDeployment(name, state.DeploymentAppDegraded, err.Error())
+			} else {
+				r.reportDeployment(name, state.DeploymentAppFailed, err.Error())
+			}
+			// The service reconciler already reported the failure
+			// detail. This line records what the failure means for the
+			// deployment, which depends on whether a usable generation
+			// remains: a retained previous generation is degraded, and a
+			// deployment with nothing usable left has failed. This holds
+			// for an empty desired service set too, where the failure is
+			// cleanup of the containers the app used to run.
+			deployAttrs := withPrevious(deploymentAttrs(name, built, builtFP))
+			deployAttrs = append(deployAttrs,
+				"services", len(fn.Template.Services),
+			)
+			if hasUsablePrior {
+				deployAttrs = append(deployAttrs, "outcome", "degraded")
+				r.log.Warn("App: deployment degraded", deployAttrs...)
+				return
+			}
+			deployAttrs = append(deployAttrs, "outcome", "failed")
+			r.log.Error("App: deployment failed", deployAttrs...)
+			return
+		}
+		// Completion — not publication — is readiness: every desired
+		// service set converged, including removal of the containers a
+		// zero-service template no longer wants.
+		if ready() {
+			logReady()
+		}
+	}
+	switch {
+	case r.updateServicesLifecycle != nil:
+		hooks := ServiceRequestHooks{
+			OnReconcileStart: onServiceStart,
+			OnComplete:       onServiceComplete,
+		}
+		if r.retire != nil && oldImage != "" && oldImage != built.Image {
+			retireDeferred = true
+			hooks.OnSettled = retireOld
+		}
+		r.updateServicesLifecycle(name, fn.Template, built.Image, hooks)
+	case r.updateServicesWithStatus != nil:
 		r.updateServicesWithStatus(name, fn.Template, built.Image,
-			func() {
-				if r.st != nil && r.currentGeneration(name, generation) {
-					r.st.RecordReconciling(r.rctx(), name, fencingToken)
-				}
-			}, func(err error) {
-				if err != nil {
-					failServices(err)
-					if !r.currentGeneration(name, generation) {
-						// A newer generation superseded this pass: its failure
-						// is not a deployment-level outcome for this one.
-						return
-					}
-					if errors.Is(err, context.Canceled) &&
-						errors.Is(r.rctx().Err(), context.Canceled) {
-						deployAttrs := withPrevious(deploymentAttrs(name, built, builtFP))
-						deployAttrs = append(deployAttrs,
-							"services", len(fn.Template.Services),
-							"outcome", "cancelled",
-							"error", err,
-						)
-						r.log.Debug("App: deployment cancelled", deployAttrs...)
-						return
-					}
-					// A current-generation, non-cancellation service convergence
-					// failure is terminal for this deployment progress. Report it as
-					// degraded when a usable prior generation remains, otherwise
-					// failed; never leave the cluster status stuck at activating and
-					// never mark ready.
-					if hasUsablePrior {
-						r.reportDeployment(name, state.DeploymentAppDegraded, err.Error())
-					} else {
-						r.reportDeployment(name, state.DeploymentAppFailed, err.Error())
-					}
-					// The service reconciler already reported the failure
-					// detail. This line records what the failure means for the
-					// deployment, which depends on whether a usable generation
-					// remains: a retained previous generation is degraded, and a
-					// deployment with nothing usable left has failed. This holds
-					// for an empty desired service set too, where the failure is
-					// cleanup of the containers the app used to run.
-					deployAttrs := withPrevious(deploymentAttrs(name, built, builtFP))
-					deployAttrs = append(deployAttrs,
-						"services", len(fn.Template.Services),
-					)
-					if hasUsablePrior {
-						deployAttrs = append(deployAttrs, "outcome", "degraded")
-						r.log.Warn("App: deployment degraded", deployAttrs...)
-						return
-					}
-					deployAttrs = append(deployAttrs, "outcome", "failed")
-					r.log.Error("App: deployment failed", deployAttrs...)
-					return
-				}
-				// Completion — not publication — is readiness: every desired
-				// service set converged, including removal of the containers a
-				// zero-service template no longer wants.
-				if ready() {
-					logReady()
-				}
-			})
-	} else if r.updateServices != nil {
+			onServiceStart, onServiceComplete)
+	case r.updateServices != nil:
 		r.updateServices(name, fn.Template, built.Image)
 	}
 
@@ -1087,7 +1155,7 @@ func (r *Reconciler) reconcileApp(name string) {
 	// schedules have converged above and no service container is desired, so
 	// this generation is ready now. With the status-capable hook, readiness is
 	// reported by the completion callback above for every desired service set.
-	if r.updateServicesWithStatus == nil && !hasServices && readyToLog {
+	if !meaningfulStatusHook && !hasServices && readyToLog {
 		logReady()
 	}
 
@@ -1099,9 +1167,10 @@ func (r *Reconciler) reconcileApp(name string) {
 	// container references) is the second line of defense for partial service
 	// reconcile failures, so a service container left on the old image keeps that
 	// image from being removed. Skip a nil hook and an equal image (an
-	// unavailable->unavailable retry, or a same-image re-prepare).
-	if r.retire != nil && oldImage != "" && oldImage != built.Image {
-		r.retire(name, oldImage)
+	// unavailable->unavailable retry, or a same-image re-prepare). When the
+	// lifecycle hook owns settlement, retirement runs there instead.
+	if !retireDeferred {
+		retireOld()
 	}
 }
 

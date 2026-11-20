@@ -81,13 +81,14 @@ func sweepStartupExecutionOrphans(
 // startupHousekeeper groups the background startup cleanup passes so their
 // ordering and lifecycle behavior are deterministic to test without Docker.
 // exclusive is the coordinator's housekeeping seam (see
-// ServiceCoordinator.RunExclusive): it atomically waits for current service work
-// to settle, PAUSES scheduling of new requests for the duration of the callback,
-// and resumes/schedules the latest coalesced desired states afterward. The three
-// passes run inside that exclusive window in the safe order — orphan container
-// sweep, then image sweep (whose keep-set must observe the settled service
+// ServiceCoordinator.RunExclusive): it atomically waits for active service
+// passes, PAUSES scheduling of new requests for the callback, and resumes dirty
+// desired states afterward. Externally pending requests do not hold the barrier;
+// backend resource references keep their candidates safe during cleanup. The
+// three passes run inside the exclusive window in the safe order — orphan
+// container sweep, then image sweep (whose keep-set observes current service
 // containers), then dependency GC (which prunes dependency images the image
-// sweep orphaned) — so no live UpdateServices can race them.
+// sweep orphaned) — so no live UpdateServices pass can race them.
 type startupHousekeeper struct {
 	exclusive func(context.Context, func(context.Context)) error
 	sweep     func(context.Context)
@@ -98,14 +99,14 @@ type startupHousekeeper struct {
 // startStartupHousekeeping launches the lifecycle-aware startup housekeeping in a
 // background goroutine and returns a channel closed when it completes. Startup
 // must NOT block on it: Run publishes the initial desired states and returns
-// immediately, and only this pass waits at the coordinator barrier for the
-// initial service attempts to settle before touching containers or images. Its
-// lifecycle is the worker lifecycle, so shutdown cancels an in-flight wait/sweep
-// promptly. A barrier failure (lifecycle cancellation or a bounded wait that did
-// not clear) skips the sweeps: image/orphan cleanup must never run against an
-// unconverged or shutting-down world. An update arriving while the exclusive
-// callback runs is coalesced as a pending desired state and scheduled only once
-// the callback returns, so it can never run concurrently with a sweep.
+// immediately, and this pass waits at the coordinator barrier for active initial
+// service passes before touching containers or images. Externally pending
+// requests do not delay housekeeping; backend references protect their
+// candidates. The lifecycle is the worker lifecycle, so shutdown cancels an
+// in-flight wait/sweep promptly. A barrier failure (lifecycle cancellation or a
+// wait that did not clear) skips the sweeps. An update arriving while the
+// exclusive callback runs is coalesced as a pending desired state and scheduled
+// only once the callback returns, so it cannot run concurrently with a sweep.
 func startStartupHousekeeping(
 	lifecycle context.Context,
 	logger *slog.Logger,
@@ -447,10 +448,10 @@ func cleanupStartupDependencies(lifecycle context.Context, manager *runtime.Mana
 // prepareAndStartApps builds every app's image, publishes each ACCEPTED
 // generation into the live registry through the authoritative runtime-selection
 // fence, publishes the initial desired service state, and starts the background
-// startup housekeeping that runs once the coordinator's initial service attempts
-// settle. It returns the published set the reconciler seed and startup sweeps
-// consume, plus the names whose preparation was rejected and need a prompt
-// reconcile.
+// startup housekeeping that runs after active service passes finish. Externally
+// pending requests do not block the housekeeping barrier. It returns the
+// published set the reconciler seed and startup sweeps consume, plus the names
+// whose preparation was rejected and need a prompt reconcile.
 //
 // Ordering is part of the contract: preparation completes before publication;
 // registry publication precedes warm activation, service enqueue, and startup
@@ -499,14 +500,16 @@ func prepareAndStartApps(
 	// represented by its unavailable placeholder, so no stale service request is
 	// enqueued.
 	_, enqueueSpan := tracing.Start(startupCtx, "services.enqueue")
-	enqueueStartupServicesWithState(lifecycle, published, services, st, startup.fencingTokens, logger)
+	enqueueStartupServices(lifecycle, published, services, st, startup.fencingTokens, logger)
 	enqueueSpan.End()
 
 	// Lifecycle-aware background housekeeping. It waits behind the coordinator's
-	// barrier for the initial service attempts to settle, then runs the startup
-	// cleanup passes in their safe order: orphan container sweep, image sweep
-	// (whose keep-set must observe the settled service containers), then
-	// dependency GC (which prunes dependency images the image sweep orphaned).
+	// barrier for active initial service passes, then runs the startup cleanup
+	// passes in their safe order: orphan container sweep, image sweep (whose
+	// keep-set observes current service containers), then dependency GC (which
+	// prunes dependency images the image sweep orphaned). Externally pending
+	// requests do not hold the barrier; backend resource references protect
+	// their candidates.
 	// Startup does NOT call image GC synchronously; the returned done channel is
 	// joined in the shutdown tail so no sweep overlaps shutdown cleanup or the
 	// closing state DB and Docker client.
