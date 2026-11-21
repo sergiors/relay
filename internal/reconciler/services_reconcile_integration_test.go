@@ -100,7 +100,7 @@ func TestServicesReconcileIntegration(t *testing.T) {
 				ctx := context.Background()
 				svcCtrl.ApplyResult(ctx, fnName, tmpl, image, nil, nil)
 			},
-			RemoveServices: func(fnName string) {
+			RemoveServices: func(fnName string, _ func()) {
 				svcCtrl.Remove(context.Background(), fnName)
 			},
 		},
@@ -192,7 +192,7 @@ func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
 				ctx := context.Background()
 				svcCtrl.ApplyResult(ctx, fnName, tmpl, image, nil, nil)
 			},
-			RemoveServices: func(fnName string) {
+			RemoveServices: func(fnName string, _ func()) {
 				svcCtrl.Remove(context.Background(), fnName)
 			},
 		},

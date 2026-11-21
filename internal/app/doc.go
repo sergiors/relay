@@ -34,9 +34,9 @@
 //     source, so FingerprintApp narrows its fingerprint to template.yaml
 //     ALONE — an irrelevant source edit can never look like a desired-state
 //     change, and the tree is not scanned. Runtime-only configuration (the
-//     top-level `resources` mapping and service `tmpfs` lists) is excluded from
-//     BOTH fingerprint paths (stripTemplateResources), so editing it never
-//     changes the digest and never triggers a rebuild.
+//     top-level `resources` mapping and service `tmpfs`/`healthcheck` settings)
+//     is excluded from BOTH fingerprint paths (stripTemplateResources), so
+//     editing it never changes the digest and never triggers a rebuild.
 //
 // Resource limits:
 //   - `resources` (optional) declares per-container memory/CPU/PID limits for
@@ -96,6 +96,26 @@
 //     identified deterministically across workers (breaking cluster-wide dedup);
 //     the `@every <duration>` descriptor is rejected because it is anchored to
 //     each worker's own job start rather than a shared calendar instant.
+//
+// Service health checks:
+//   - An `entrypoint` service may declare `healthcheck` with optional `path`
+//     (default "/"), `interval` (default 10s), `timeout` (default 3s), `retries`
+//     (default 3), and `start_period` (default 10s). Durations are Go duration
+//     strings; the resolved values are positive, timeout does not exceed
+//     interval, and retries stays within [1, 10]. The check is an HTTP GET on
+//     127.0.0.1:<port><path> where 2xx/3xx is healthy. The path is validated as a
+//     safe absolute URL path and used exactly as configured; a trailing slash is
+//     significant and is not canonicalized away.
+//   - A healthcheck on an external `image` service is rejected at parse time:
+//     Relay does not assume a shell or probe tool inside an image it does not
+//     build. It never reports readiness it cannot prove.
+//   - The `healthcheck` mapping is decoded strictly: a key that is not one of
+//     path/interval/timeout/retries/start_period is a template error naming the
+//     unknown key and the accepted ones, so a typo cannot silently fall back to
+//     Relay's defaults. (Other template mappings keep yaml.v3's
+//     ignore-unknown-fields behavior.)
+//   - Healthcheck settings (like the top-level `resources` mapping and service
+//     `tmpfs`) are runtime-only and excluded from the image fingerprint.
 //
 // The package reads the /apps tree and has no filesystem side effects beyond
 // that read except CaptureSourceSnapshot (and CaptureSourceSnapshotIn), which

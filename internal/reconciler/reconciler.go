@@ -142,10 +142,6 @@ type Config struct {
 	// or equal image is skipped by the caller. Ignoring the name is fine — the
 	// image reference already embeds it.
 	Retire func(name, oldImage string)
-	// RemoveApp, when set, is called after an app directory vanishes
-	// (and its registry entry and state are dropped) so the runner can retire
-	// every version of that app's images. Nil-safe.
-	RemoveApp func(name string)
 	// Audit, when set, is called once per periodic audit pass (the ticker's
 	// missed-event backstop; see ticker), before that pass reconciles the apps.
 	// It is the lifecycle re-drive hook for DEFERRED image cleanup: the runner
@@ -193,12 +189,29 @@ type Config struct {
 	// status hooks above.
 	UpdateServicesWithLifecycle            func(name string, tmpl *app.Template, image string, hooks ServiceRequestHooks)
 	UpdateServicesObservationWithLifecycle func(name string, tmpl *app.Template, image string, hooks ServiceRequestHooks)
-	// RemoveServices, when set, is called in remove() immediately BEFORE
-	// RemoveApp and the app's images are retired. The ordering
-	// invariant: running service containers reference the app's images, so
-	// those containers must be stopped and removed before the images are
-	// retire-eligible. Nil-safe.
-	RemoveServices func(name string)
+	// RemoveServices is the single app-removal contract. It starts the app's
+	// service-container removal WITHOUT blocking the serial pump and takes
+	// ownership of app retirement: the reconciler invokes it with a retired
+	// callback that performs the deferred, freshness-gated image retirement. The
+	// callback runs exactly once when service removal settles (removed,
+	// superseded, or cancelled) and is a no-op when the app has a live published
+	// generation again, so a valid re-add cannot lose its images. Nil-safe.
+	RemoveServices func(name string, retired func())
+	// RemoveAppResources is called SYNCHRONOUSLY when the app directory vanishes:
+	// it drops the removed generation's non-image resources (schedules, metrics
+	// series, reset baselines, warm execution containers, per-app semaphore). It
+	// runs in the serial app pump, so it cannot race a newer generation's
+	// registration; a later valid re-add republishes and re-registers whatever it
+	// needs. A directory that is re-added with an INVALID template never
+	// publishes, so this eager drop is what keeps its stale schedules and state
+	// from surviving. It must NOT retire images, which stay governed by the
+	// deferred settlement. Nil-safe.
+	RemoveAppResources func(name string)
+	// RetireAppImages performs the deferred image retirement from the removal
+	// settlement. The reconciler skips it when the app has a live published
+	// generation again (a valid re-add), so only truly dead generations' images
+	// are retired. Nil-safe.
+	RetireAppImages func(name string)
 	// DeploymentProgress, when set, records per-app cluster activation progress
 	// for the reconciler's currently authorized deployment generation. It is
 	// independent of the public apps.status state view. Nil-safe.
@@ -229,11 +242,13 @@ type Reconciler struct {
 	// Config.Fingerprint for tests that need to observe (or count) the ONE
 	// resolution per reconcile.
 	fingerprint func(dir string, tmpl *app.Template) (*source.Selection, string, error)
-	// retire/removeApp/updateSchedules/updateServices/removeServices are
-	// optional image-lifecycle, schedule-convergence, and service-convergence
-	// hooks (see Config).
+	// retire/updateSchedules/updateServices are optional image-lifecycle,
+	// schedule-convergence, and service-convergence hooks (see Config).
+	// removeServices starts the asynchronous removal and owns the settlement
+	// callback; removeAppResources drops the removed generation's non-image
+	// resources eagerly and retireAppImages performs the freshness-gated image
+	// retirement.
 	retire                              func(name, oldImage string)
-	removeApp                           func(name string)
 	audit                               func()
 	updateSchedules                     func(name string, tmpl *app.Template)
 	updateServices                      func(name string, tmpl *app.Template, image string)
@@ -241,7 +256,9 @@ type Reconciler struct {
 	updateServicesObservationWithStatus func(name string, tmpl *app.Template, image string, onReconcileStart func(), onComplete func(error))
 	updateServicesLifecycle             func(name string, tmpl *app.Template, image string, hooks ServiceRequestHooks)
 	updateServicesObservationLifecycle  func(name string, tmpl *app.Template, image string, hooks ServiceRequestHooks)
-	removeServices                      func(name string)
+	removeServices                      func(name string, retired func())
+	removeAppResources                  func(name string)
+	retireAppImages                     func(name string)
 	deploymentProgress                  func(name, phase, errMessage string)
 	deploymentDrift                     func(name, reason string)
 
@@ -381,7 +398,6 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 		st:                                  cfg.State,
 		fingerprint:                         fingerprint,
 		retire:                              cfg.Retire,
-		removeApp:                           cfg.RemoveApp,
 		audit:                               cfg.Audit,
 		updateSchedules:                     cfg.UpdateSchedules,
 		updateServices:                      cfg.UpdateServices,
@@ -390,6 +406,8 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 		updateServicesLifecycle:             cfg.UpdateServicesWithLifecycle,
 		updateServicesObservationLifecycle:  cfg.UpdateServicesObservationWithLifecycle,
 		removeServices:                      cfg.RemoveServices,
+		removeAppResources:                  cfg.RemoveAppResources,
+		retireAppImages:                     cfg.RetireAppImages,
 		deploymentProgress:                  cfg.DeploymentProgress,
 		deploymentDrift:                     cfg.DeploymentDrift,
 		fingerprints:                        map[string]string{},

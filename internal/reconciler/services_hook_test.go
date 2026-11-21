@@ -12,13 +12,15 @@ import (
 	"relay/internal/runtime"
 )
 
-// servicesRecorder records UpdateServices/RemoveServices invocations in order
-// so the reconciler's service-convergence hooks can be asserted (when they fire,
-// with what template service count / image, and — for removal — ordering vs
-// RemoveApp).
+// servicesRecorder records UpdateServices/RemoveServices/RemoveAppResources
+// invocations in order so the reconciler's service-convergence hooks can be
+// asserted (when they fire, with what template service count / image, and — for
+// removal — ordering between the eager resource drop and the asynchronous
+// service removal).
 type servicesRecorder struct {
-	mu     sync.Mutex
-	events []string
+	mu      sync.Mutex
+	events  []string
+	retired map[string]func()
 }
 
 // update records an UpdateServices call: "update <name>=<serviceCount>@<image>".
@@ -28,18 +30,37 @@ func (s *servicesRecorder) update(name string, tmpl *app.Template, image string)
 	s.events = append(s.events, "update "+name+"="+strconv.Itoa(len(tmpl.Services))+"@"+image)
 }
 
-// remove records a RemoveServices call.
-func (s *servicesRecorder) remove(name string) {
+// remove records a RemoveServices call; the settlement callback is captured so
+// a test can drive the deferred retirement explicitly.
+func (s *servicesRecorder) remove(name string, retired func()) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.events = append(s.events, "remove "+name)
+	if retired != nil {
+		if s.retired == nil {
+			s.retired = map[string]func(){}
+		}
+		s.retired[name] = retired
+	}
+	s.mu.Unlock()
 }
 
-// removeFn records a RemoveApp call.
-func (s *servicesRecorder) removeFn(name string) {
+// removeResources records an eager RemoveAppResources call.
+func (s *servicesRecorder) removeResources(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.events = append(s.events, "removeApp "+name)
+	s.events = append(s.events, "remove-resources "+name)
+}
+
+// settle drives the captured settlement callback for one app, if any.
+func (s *servicesRecorder) settle(name string) bool {
+	s.mu.Lock()
+	retired := s.retired[name]
+	s.mu.Unlock()
+	if retired == nil {
+		return false
+	}
+	retired()
+	return true
 }
 
 func (s *servicesRecorder) all() []string {
@@ -48,13 +69,13 @@ func (s *servicesRecorder) all() []string {
 	return append([]string(nil), s.events...)
 }
 
-// withServiceHooks wires UpdateServices, RemoveServices, and RemoveApp to
-// the given recorder.
+// withServiceHooks wires UpdateServices, RemoveAppResources, and RemoveServices
+// to the given recorder.
 func withServiceHooks(rec *servicesRecorder) func(*Config) {
 	return func(cfg *Config) {
 		cfg.UpdateServices = rec.update
+		cfg.RemoveAppResources = rec.removeResources
 		cfg.RemoveServices = rec.remove
-		cfg.RemoveApp = rec.removeFn
 	}
 }
 
@@ -148,9 +169,11 @@ func TestReconcileUpdateServicesFiresOnSkipPathWhenServicesDefined(t *testing.T)
 	}
 }
 
-// On removal, RemoveServices fires BEFORE RemoveApp — so service containers
-// (which reference the images) are stopped before the images are retired.
-func TestReconcileRemoveServicesFiresBeforeRemoveApp(t *testing.T) {
+// On removal, the eager non-image resource drop fires BEFORE RemoveServices
+// starts (and RemoveServices receives the settlement callback that defers image
+// retirement), so stale schedules/metrics cannot outlive the pump pass while
+// images stay governed by the removal settlement.
+func TestReconcileRemoveAppResourcesFireBeforeRemoveServices(t *testing.T) {
 	root := t.TempDir()
 	dir := writeServicesDir(t, root, "svc-gone")
 
@@ -164,7 +187,11 @@ func TestReconcileRemoveServicesFiresBeforeRemoveApp(t *testing.T) {
 	r.reconcileApp("svc-gone")
 
 	got := rec.all()
-	if len(got) != 2 || got[0] != "remove svc-gone" || got[1] != "removeApp svc-gone" {
-		t.Fatalf("removal order = %v, want [remove svc-gone, removeApp svc-gone]", got)
+	if len(got) != 2 || got[0] != "remove-resources svc-gone" || got[1] != "remove svc-gone" {
+		t.Fatalf("removal order = %v, want [remove-resources svc-gone, remove svc-gone]",
+			got)
+	}
+	if !rec.settle("svc-gone") {
+		t.Fatal("RemoveServices did not receive a settlement callback")
 	}
 }

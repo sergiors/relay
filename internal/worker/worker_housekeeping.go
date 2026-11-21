@@ -312,6 +312,7 @@ func sweepStartupServiceOrphans(
 		logStartupCleanupFailure(hctx, logger, "Startup: service orphan sweep failed", err)
 		return
 	}
+	svcCtrl.PruneServiceConvergenceStates(sweepCtx, liveNames)
 	if result.removed > 0 {
 		logger.Info("Startup: service orphan sweep complete",
 			"discovered", result.discovered,

@@ -22,6 +22,7 @@ type coordinatorDocker struct {
 	resolveErr error
 	entered    chan struct{}
 	release    chan struct{}
+	removals   atomic.Int32
 }
 
 func (d *coordinatorDocker) ResolveServiceImage(_ context.Context, fnName string, _ *app.Template, _ app.Service, image string) (runtime.ServiceImage, error) {
@@ -54,6 +55,7 @@ func (d *coordinatorDocker) StopServiceContainers(context.Context, []runtime.Ser
 	return nil
 }
 func (d *coordinatorDocker) RemoveAppServiceContainers(context.Context, string) (int, error) {
+	d.removals.Add(1)
 	return 0, nil
 }
 func (d *coordinatorDocker) NetworkExists(context.Context, string) (bool, error) { return true, nil }

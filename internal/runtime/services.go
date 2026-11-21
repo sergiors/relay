@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
@@ -31,8 +32,9 @@ import (
 // ErrServicePending reports that a service operation was accepted but is not
 // yet terminally converged. StartService implementations return it (possibly
 // wrapped) when a replacement is running but a backend-specific readiness or
-// observation step has not concluded; the service reconciler treats that as a
-// pending pass rather than a failure. The reconciler re-exports this sentinel.
+// observation step has not concluded (for example, a Docker healthcheck is still
+// starting); the service reconciler treats that as a pending pass rather than a
+// failure. The reconciler re-exports this sentinel.
 var ErrServicePending = errors.New("service convergence pending")
 
 // ServiceSpec describes one desired service replica's container. The service
@@ -105,6 +107,21 @@ type ServiceSpec struct {
 	// and restart the container in place (or, where in-place restart is
 	// unavailable, replace it).
 	SourceMount *SourceMount
+	// Runtime is the configured template runtime used to derive the healthcheck
+	// probe command for an `entrypoint` source. It is empty for a direct
+	// ServiceSpec caller with no healthcheck and for an external `image` source,
+	// which can never carry a Relay healthcheck.
+	Runtime string
+	// Healthcheck, when non-nil, is the service's Docker-native HTTP health probe.
+	// StartService builds the exec-form test from Runtime and Port; the template
+	// parser rejects a healthcheck on an external image source. A HOT_RELOAD
+	// source mount bypasses Relay healthcheck behavior entirely.
+	Healthcheck *app.ServiceHealthcheck
+	// HealthcheckAttempt is the one-based retry generation stamped as
+	// relay.healthcheck_attempt when a healthcheck is configured. It is Docker
+	// metadata used to reconstruct a bounded retry backoff after a worker restart;
+	// 0 (or any value below 1) is normalized to the first attempt.
+	HealthcheckAttempt int
 }
 
 // ServiceContainer is one discovered service container, as stamped on its
@@ -168,6 +185,34 @@ type ServiceContainer struct {
 	// before the label existed). The service reconciler compares it to the
 	// desired set to detect a network change.
 	Networks string
+	// Healthcheck is the canonical identity of the healthcheck configuration the
+	// container was created with, parsed from relay.healthcheck. It is "" for a
+	// service with no healthcheck (and for a container created before the label
+	// existed), including every HOT_RELOAD container.
+	Healthcheck string
+	// HealthcheckAttempt is the one-based retry generation parsed from
+	// relay.healthcheck_attempt. It is Docker-owned retry metadata used to
+	// reconstruct bounded backoff after a restart; 0 means unlabeled.
+	HealthcheckAttempt int
+	// CreatedAt is the container's Docker create time (the daemon's durable
+	// metadata). It is create metadata only: a container can be created well
+	// before it is started, so readiness deadlines are derived from StartedAt
+	// instead.
+	CreatedAt time.Time
+	// StartedAt is the instant Docker actually started the container. It is the
+	// durable reference for a healthcheck candidate's startup grace: create time
+	// cannot represent a delayed create→start, and Docker reports the start
+	// instant with nanosecond precision. It is zero when the daemon reports no
+	// usable start time (never started, or the inspect needed to read it failed);
+	// callers must then fall back conservatively instead of substituting
+	// CreatedAt.
+	StartedAt time.Time
+	// Health is Docker's current health status for a container that carries
+	// Relay's own healthcheck label: "starting", "healthy", or "unhealthy". It
+	// is "" when the service has no Relay healthcheck, including an external
+	// image's own image-declared HEALTHCHECK, in which case the historical
+	// running-is-converged behavior applies. Ready is derived from it.
+	Health container.HealthStatus
 	// SourceID is the source fingerprint a HOT_RELOAD container's live
 	// read-only bind mount corresponds to, parsed from relay.source. It is "" for
 	// a container with no source mount (including every container created before
@@ -189,7 +234,9 @@ type ServiceContainer struct {
 	// replacement or stopping the previous generation. An explicitly unready
 	// container is also never an in-place restart target, never counts as an
 	// actually-ready survivor for the stopping safety net, and is not treated
-	// as converged after a restart.
+	// as converged after a restart. For a service with a healthcheck it is
+	// derived from Docker's health summary (healthy => true, starting/unhealthy
+	// => false); for a service without one it remains nil.
 	Ready *bool
 }
 
@@ -409,7 +456,9 @@ func ServiceTmpfsLabel(destinations []string) string {
 // container whose image reference is unchanged (see labelEnvironment).
 // relay.resources and relay.tmpfs pin the effective per-container resources and
 // the configured additional tmpfs destinations, so a change to either replaces
-// a running service.
+// a running service. relay.healthcheck pins the configured healthcheck identity
+// (path and timings) so a probe-only change replaces the running container
+// without a rebuild; it is omitted for a service with no healthcheck.
 //
 // Extra caller-supplied labels (spec.Labels, e.g. routing labels) are merged
 // on top, then the relay ownership keys are RE-applied last so Relay's
@@ -419,6 +468,22 @@ func serviceLabels(spec ServiceSpec, nodeID string, replica int) map[string]stri
 	environmentFingerprint := EnvironmentFingerprint(spec.Env)
 	resourceHash := spec.Resources.OrDefault().Fingerprint()
 	tmpfsLabel := ServiceTmpfsLabel(spec.Tmpfs)
+	// A HOT_RELOAD source mount bypasses Relay healthcheck behavior entirely:
+	// no Docker healthcheck configuration and no healthcheck metadata are
+	// stamped, so a healthcheck-only template edit cannot make the container
+	// stale or replace it under HOT_RELOAD.
+	effectiveHealthcheck := spec.Healthcheck
+	if spec.SourceMount != nil {
+		effectiveHealthcheck = nil
+	}
+	healthcheckLabel := ServiceHealthcheckLabel(effectiveHealthcheck)
+	healthcheckAttempt := 0
+	if effectiveHealthcheck != nil {
+		healthcheckAttempt = spec.HealthcheckAttempt
+		if healthcheckAttempt < 1 {
+			healthcheckAttempt = 1
+		}
+	}
 	sourceID := ""
 	if spec.SourceMount != nil {
 		sourceID = spec.SourceMount.Identity
@@ -434,6 +499,12 @@ func serviceLabels(spec ServiceSpec, nodeID string, replica int) map[string]stri
 		labelReplica:     strconv.Itoa(replica),
 		labelEnvironment: environmentFingerprint,
 		labelResources:   resourceHash,
+	}
+	if healthcheckLabel != "" {
+		labels[labelHealthcheck] = healthcheckLabel
+	}
+	if healthcheckAttempt > 0 {
+		labels[labelHealthcheckAttempt] = strconv.Itoa(healthcheckAttempt)
 	}
 	if spec.ImageID != "" {
 		labels[labelImageID] = spec.ImageID
@@ -461,6 +532,21 @@ func serviceLabels(spec ServiceSpec, nodeID string, replica int) map[string]stri
 		labels[labelTmpfs] = tmpfsLabel
 	} else {
 		delete(labels, labelTmpfs)
+	}
+	// The healthcheck configuration is identity metadata too; re-apply it last
+	// and clear a spoofed value when the service declares no healthcheck. The
+	// attempt is retry metadata, never desired configuration: it is re-applied
+	// for integrity but does not participate in the reconciler's config match.
+	if healthcheckLabel != "" {
+		labels[labelHealthcheck] = healthcheckLabel
+		if healthcheckAttempt > 0 {
+			labels[labelHealthcheckAttempt] = strconv.Itoa(healthcheckAttempt)
+		} else {
+			delete(labels, labelHealthcheckAttempt)
+		}
+	} else {
+		delete(labels, labelHealthcheck)
+		delete(labels, labelHealthcheckAttempt)
 	}
 	// The image content ID is an ownership key too; a caller can never spoof it,
 	// and an empty ID (a content-addressed Relay tag) clears any spoofed value.
@@ -523,7 +609,10 @@ func serviceReplicaAttrs(appName, service, image string, replica int) []any {
 // the gate for stopping the generation it replaces, so a container that created
 // and exited immediately (a crash-on-boot, a bad command) must NEVER be treated
 // as a viable replacement. No sleep or polling is involved — a single inspect
-// is the daemon's authoritative answer at that instant.
+// is the daemon's authoritative answer at that instant. When the spec carries a
+// healthcheck, a running container that Docker does not yet report as healthy is
+// returned with ErrServicePending (the candidate is retained, not discarded), so
+// the reconciler keeps the old generation serving until a later observation.
 //
 // On any error after create (create→start failure, or a start that reports
 // success but inspects as non-running/absent), the created container is removed
@@ -598,6 +687,23 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		// ExposedPorts is metadata only (informational). Relay does NOT publish a
 		// host port this iteration: no HostConfig.PortBindings.
 		ExposedPorts: network.PortSet{network.MustParsePort(fmt.Sprintf("%d/tcp", spec.Port)): {}},
+	}
+	if spec.Healthcheck != nil && spec.SourceMount == nil {
+		// Docker's native HEALTHCHECK, implemented with the runtime's own
+		// node/python executable. It runs inside the hardened container with no
+		// shell involved. A healthcheck is valid only for a runtime-managed
+		// entrypoint source: an external image has no Entry override and cannot be
+		// assumed to provide probe tooling, so a direct ServiceSpec caller fails
+		// closed just like the template parser. HOT_RELOAD bypasses Relay
+		// healthchecks entirely (no Docker probe and no readiness gate).
+		if len(spec.Entry) == 0 {
+			return "", fmt.Errorf("service: healthcheck requires an entrypoint source")
+		}
+		healthConfig, err := serviceHealthConfig(spec.Runtime, spec.Port, spec.Healthcheck)
+		if err != nil {
+			return "", fmt.Errorf("service: %w", err)
+		}
+		cfg.Healthcheck = healthConfig
 	}
 	if len(spec.Entry) > 0 {
 		// An entrypoint-source service overrides the app image's
@@ -743,7 +849,52 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		return "", discard("inspect_error", fmt.Errorf("service: inspect started container: %w", m.classifyDockerErr(callerCtx, err)))
 	}
 	if insp.Container.State == nil || !insp.Container.State.Running {
+		status := ""
+		if insp.Container.State != nil {
+			status = string(insp.Container.State.Status)
+		}
+		if cfg.Healthcheck != nil {
+			// The candidate exists and carries its durable attempt/identity labels. Do
+			// NOT discard it: the reconciler must observe the exited candidate, persist
+			// its failure instant, and enter bounded retry while preserving the old
+			// replica. No-healthcheck starts keep the historical discard-and-fail path.
+			m.log.Info("Service: started; exited before readiness",
+				"app", spec.App,
+				"service", spec.Name,
+				"replica", replica,
+				"image", spec.Image,
+				"container", id,
+				"state", status,
+				"outcome", "pending",
+			)
+			return id, fmt.Errorf(
+				"%w: container %s exited before readiness", ErrServicePending, id)
+		}
 		return "", discard("not_running", fmt.Errorf("service: started container is not running"))
+	}
+
+	// A healthcheck-configured replacement is not a viable swap target until
+	// Docker reports it healthy. Reporting pending keeps the old generation
+	// running and lets the coordinator observe the candidate again; the candidate
+	// itself is never stopped or duplicated by the reconciler while it is starting.
+	if cfg.Healthcheck != nil {
+		status := container.Starting
+		if insp.Container.State.Health != nil {
+			status = insp.Container.State.Health.Status
+		}
+		if status != container.Healthy {
+			attrs := []any{
+				"app", spec.App,
+				"service", spec.Name,
+				"replica", replica,
+				"image", spec.Image,
+				"container", id,
+				"health", string(status),
+				"outcome", "pending",
+			}
+			m.log.Info("Service: started; awaiting health", attrs...)
+			return id, fmt.Errorf("%w: container %s health status %s", ErrServicePending, id, status)
+		}
 	}
 
 	m.log.Info("Service: started",
@@ -828,7 +979,11 @@ type dockerOpAdmitter func(ctx context.Context) (context.Context, func(), error)
 // across worker restarts; the worker-wired reconciler applies its own
 // stable-NODE_ID scope, see ServiceContainer), but it IS included in the
 // result. Replica is parsed from labelReplica, defaulting to -1 when
-// missing/invalid.
+// missing/invalid. For a container carrying Relay's own relay.healthcheck label,
+// the Docker health summary is converted into Ready and Health so the reconciler
+// can observe a pending candidate without an extra inspect; otherwise Ready stays
+// nil and an image's own healthcheck does not affect convergence. CreatedAt is
+// parsed from Docker's durable create time for the healthcheck startup deadline.
 func (m *Manager) ServiceContainerList(ctx context.Context) ([]ServiceContainer, error) {
 	return m.serviceContainerList(ctx, m.beginDockerOp)
 }
@@ -872,6 +1027,10 @@ func (m *Manager) serviceContainerList(ctx context.Context, admit dockerOpAdmitt
 		if p, err := strconv.Atoi(c.Labels[labelPort]); err == nil {
 			port = p
 		}
+		healthcheckAttempt := 0
+		if a, err := strconv.Atoi(c.Labels[labelHealthcheckAttempt]); err == nil {
+			healthcheckAttempt = a
+		}
 		// The full label set is copied as-is (nil when the container has none)
 		// so the reconciler can compare routing metadata without Relay owning
 		// or interpreting foreign label names.
@@ -879,6 +1038,26 @@ func (m *Manager) serviceContainerList(ctx context.Context, admit dockerOpAdmitt
 		if len(c.Labels) > 0 {
 			labelsCopy = make(map[string]string, len(c.Labels))
 			maps.Copy(labelsCopy, c.Labels)
+		}
+		// Docker's health summary is authoritative and cheap here: it is part of
+		// the list response. It is used ONLY when the container carries Relay's
+		// relay.healthcheck label; an external image's own image-declared
+		// HEALTHCHECK is not Relay's contract and must not change convergence for a
+		// service that declares no healthcheck. In that case Ready stays nil and
+		// the historical running-is-converged behavior is unchanged.
+		var health container.HealthStatus
+		var ready *bool
+		if c.Labels[labelHealthcheck] != "" &&
+			c.Health != nil &&
+			c.Health.Status != "" &&
+			c.Health.Status != container.NoHealthcheck {
+			health = c.Health.Status
+			isReady := health == container.Healthy
+			ready = &isReady
+		}
+		var createdAt time.Time
+		if c.Created > 0 {
+			createdAt = time.Unix(c.Created, 0)
 		}
 		out = append(out, ServiceContainer{
 			ID:                     c.ID,
@@ -895,11 +1074,61 @@ func (m *Manager) serviceContainerList(ctx context.Context, admit dockerOpAdmitt
 			Resources:              c.Labels[labelResources],
 			Tmpfs:                  c.Labels[labelTmpfs],
 			Networks:               c.Labels[labelNetworks],
+			Healthcheck:            c.Labels[labelHealthcheck],
+			HealthcheckAttempt:     healthcheckAttempt,
+			CreatedAt:              createdAt,
+			Health:                 health,
 			SourceID:               c.Labels[labelSource],
+			Ready:                  ready,
 			Labels:                 labelsCopy,
 		})
 	}
+	fillServiceStartedAt(ctx, m.cli, out)
 	return out, nil
+}
+
+// fillServiceStartedAt reads Docker's actual start instant for the containers
+// whose startup grace a caller can still be measuring: Relay healthcheck
+// candidates that are not healthy yet. The list summary does not expose
+// StartedAt, so those specific containers need one inspect; converged healthy
+// containers, failed unhealthy ones (already terminal), and every service
+// without Relay's probe add no Docker call.
+//
+// A failed inspect leaves StartedAt zero rather than failing discovery: the
+// list is authoritative for convergence, and a missing start instant is handled
+// conservatively by the caller (the startup window is not treated as elapsed).
+func fillServiceStartedAt(
+	ctx context.Context, cli client.APIClient, containers []ServiceContainer,
+) {
+	for i := range containers {
+		ctr := &containers[i]
+		if ctr.Healthcheck == "" ||
+			ctr.State != container.StateRunning ||
+			ctr.Health == container.Healthy ||
+			ctr.Health == container.Unhealthy {
+			continue
+		}
+		insp, err := cli.ContainerInspect(ctx, ctr.ID, client.ContainerInspectOptions{})
+		if err != nil || insp.Container.State == nil {
+			continue
+		}
+		ctr.StartedAt = parseDockerStartInstant(insp.Container.State.StartedAt)
+	}
+}
+
+// parseDockerStartInstant parses Docker's State.StartedAt into the durable start
+// instant. An empty, unparseable, or zero (year 1) value is not a usable start
+// instant and yields the zero time, which callers treat conservatively rather
+// than substituting create time.
+func parseDockerStartInstant(value string) time.Time {
+	if value == "" {
+		return time.Time{}
+	}
+	startedAt, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil || startedAt.Year() <= 1 {
+		return time.Time{}
+	}
+	return startedAt
 }
 
 // NetworkExists reports whether a Docker network exists on the daemon. It is

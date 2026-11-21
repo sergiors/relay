@@ -243,7 +243,8 @@ func writeRuntimeModules(t *testing.T, root string, mounted bool) {
 	relayDir := filepath.Join(root, "relay")
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".mjs") || name == resolveHookFile {
+		if entry.IsDir() || !strings.HasSuffix(name, ".mjs") ||
+			name == resolveHookFile || name == healthcheckFile {
 			continue
 		}
 		content, err := runtimeModules.ReadFile(name)

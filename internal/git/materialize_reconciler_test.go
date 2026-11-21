@@ -117,10 +117,12 @@ func startMaterializeReconcilerWithDebounce(
 		builder,
 	)})
 	r := reconciler.New(reconciler.Config{
-		Root:      apps,
-		Debounce:  debounce,
-		Interval:  time.Hour,
-		RemoveApp: removeApp,
+		Root:     apps,
+		Debounce: debounce,
+		Interval: time.Hour,
+		RemoveServices: func(name string, _ func()) {
+			removeApp(name)
+		},
 	}, registry, builder, testLog())
 	r.Seed(active, fingerprint)
 

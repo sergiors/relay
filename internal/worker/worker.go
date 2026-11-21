@@ -72,8 +72,9 @@ import (
 
 // reconcileTimeout bounds every bounded service-reconcile daemon operation:
 // the startup orphan container sweep, the startup image keep-set list, the
-// coordinator's per-removal operation context (RemoveAndWait/EnqueueRemove), and
-// — injected into the ServiceReconciler — each normal pre-resolution and
+// coordinator's per-removal operation context (EnqueueRemove and
+// RemoveAndWait), the Docker-owned convergence-marker list/write/delete calls,
+// and — injected into the ServiceReconciler — each normal pre-resolution and
 // post-resolution Docker operation inside a per-app Apply. Each such
 // operation gets its own fresh bound so one slow Docker call cannot consume the
 // budget of the calls

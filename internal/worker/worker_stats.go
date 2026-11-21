@@ -500,8 +500,8 @@ func (flusher *statsFlusher) prune(ctx context.Context) {
 }
 
 // dropAppBaseline drops an app's entry from the worker-owned reset
-// baseline. It is called from the reconciler's RemoveApp hook alongside the
-// registry's series deletion, so an app removed and later re-added starts
+// baseline. It is called from the reconciler's RemoveAppResources hook alongside
+// the registry's series deletion, so an app removed and later re-added starts
 // from its fresh zero-valued series instead of subtracting a stale pre-removal
 // total (which would persist a negative value). It is idempotent, nil-safe, and
 // safe to call before any reset (a zero baseline has no entry to drop).

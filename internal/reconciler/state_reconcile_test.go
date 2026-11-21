@@ -11,8 +11,8 @@ import (
 )
 
 // TestReconcileRemovalDeletesMetricsSeries wires a metrics.Registry through the
-// RemoveApp hook the worker builds (RemoveApp: m.RemoveApp(...) +
-// image retirement), so a removed app's Prometheus series are dropped at
+// RemoveAppResources hook the worker builds (the eager non-image drop inside
+// remove()), so a removed app's Prometheus series are dropped at
 // reconciliation time while an unrelated app's series and the globals stay
 // untouched. This is the reconciler-package view of the production hook wiring;
 // internal/worker owns the actual closure.
@@ -39,13 +39,14 @@ func TestReconcileRemovalDeletesMetricsSeries(t *testing.T) {
 		t.Fatalf("expected bystander series before removal:\n%s", before)
 	}
 
-	// Build the reconciler with the production-style RemoveApp hook: delete
-	// the app's metrics series, then retire its images (a no-op with the
-	// fake builder). The runner registry and state wiring mirror production.
+	// Build the reconciler with the production-style eager resource hook:
+	// delete the app's metrics series when the directory vanishes. The runner
+	// registry and state wiring mirror production.
 	r, _ := newTestReconciler(t, root, b, []*runner.PreparedApp{victim, bystander}, func(cfg *Config) {
-		cfg.RemoveApp = func(name string) {
+		cfg.RemoveAppResources = func(name string) {
 			m.RemoveApp(name)
 		}
+		cfg.RemoveServices = func(name string, _ func()) {}
 	})
 
 	if err := os.RemoveAll(victimDir); err != nil {

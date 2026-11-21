@@ -11,7 +11,8 @@ import (
 // the bootstrap plus every sibling module it imports, exactly as the engine
 // embeds and ships them into the /relay image directory. The resolve hook is
 // excluded because it is planned separately into source-mounted images only,
-// never carried by the shared module set.
+// never carried by the shared module set, and the service health probe is
+// excluded because it belongs to Relay, not the image.
 func embeddedModuleSources(t *testing.T) map[string]string {
 	t.Helper()
 	entries, err := fs.ReadDir(runtimeModules, ".")
@@ -21,7 +22,8 @@ func embeddedModuleSources(t *testing.T) map[string]string {
 	sources := make(map[string]string)
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".mjs") || name == resolveHookFile {
+		if entry.IsDir() || !strings.HasSuffix(name, ".mjs") ||
+			name == resolveHookFile || name == healthcheckFile {
 			continue
 		}
 		content, err := runtimeModules.ReadFile(name)

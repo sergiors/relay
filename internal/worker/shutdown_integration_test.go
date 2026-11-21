@@ -327,10 +327,15 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 
 	rec := reconciler.New(
 		reconciler.Config{
-			Root:      cfg.fnRoot,
-			State:     st,
-			Retire:    func(_ string, oldImage string) { runWorker.RetireImage(oldImage) },
-			RemoveApp: runWorker.RemoveAppImages,
+			Root:   cfg.fnRoot,
+			State:  st,
+			Retire: func(_ string, oldImage string) { runWorker.RetireImage(oldImage) },
+			RemoveServices: func(_ string, retired func()) {
+				// This harness wires no service coordinator, so the removal
+				// settles immediately and the deferred retirement runs.
+				retired()
+			},
+			RetireAppImages: runWorker.RemoveAppImages,
 		},
 		runWorker.Registry(),
 		manager,

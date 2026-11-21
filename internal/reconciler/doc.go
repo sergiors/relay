@@ -97,7 +97,8 @@
 // When Config.UpdateSchedules is set, it is called after an app's new
 // version is swapped into the registry (discovery and update paths only, never
 // the skip path or a failed build) so the scheduler can converge its cron jobs
-// to the template's schedules. Removal converges via RemoveApp instead.
+// to the template's schedules. Removal drops the old generation's schedules via
+// RemoveAppResources instead.
 //
 // When Config.Audit is set, it is called once per periodic audit pass before
 // that pass reconciles the apps. It is the re-drive point for DEFERRED image
@@ -111,7 +112,11 @@
 // The service reconciler (services.go) is part of this package. Service
 // convergence is driven by the Config hooks UpdateServices/RemoveServices (both
 // nil-safe), which the worker wires to a *ServiceReconciler constructed from the
-// runtime Manager's Docker seam. The worker also wires its stable NODE_ID
+// runtime Manager's Docker seam. Removal has ONE contract: the hook enqueues the
+// removal without blocking the serial pump, RemoveAppResources drops the removed
+// generation's non-image resources eagerly, and image retirement runs from the
+// settlement callback and is skipped when a live published generation exists
+// again. The worker also wires its stable NODE_ID
 // (WithNodeID), so that reconciler only converges, adopts, removes, and sweeps
 // containers stamped with its own relay.node_id: a restart of the SAME identity
 // still adopts its running services, while another worker's containers on a
@@ -132,35 +137,56 @@
 // normal operations promptly.
 //
 // A service pass can be PENDING when the Docker backend accepts a replacement
-// but cannot confirm terminal convergence (for example, an external readiness
-// signal). Pending is not failure: the pass preserves every usable old
-// generation, releases its worker and one-pass image lease, and retains the
-// logical request (callbacks and desired state) in the ServiceCoordinator.
-// Pending never reports app ready/deployment active and never retires the old
-// app image. The coordinator resumes the CURRENT stored desired state on an
-// explicit Notify or an observation wake when no retry is scheduled, or on a due
-// per-app deadline; a wake carries no desired authorization and never invokes
-// this package's app reconcile, fingerprint, or build path. A scheduled deadline
-// is never bypassed by a periodic observation. Wait and the exclusive
-// housekeeping barrier observe only active backend work, so externally pending
-// requests do not starve housekeeping.
+// but cannot confirm terminal convergence (for example, a running replacement
+// whose Docker healthcheck is still starting). Pending is not failure: the pass
+// preserves every usable old generation, releases its worker and one-pass image
+// lease, and retains the logical request (callbacks and desired state) in the
+// ServiceCoordinator. Pending never reports app ready/deployment active and
+// never retires the old app image. The coordinator resumes the CURRENT stored
+// desired state on an explicit Notify or an observation wake when no retry is
+// scheduled, or on a due per-app deadline; a wake carries no desired
+// authorization and never invokes this package's app reconcile, fingerprint, or
+// build path. A scheduled deadline is never bypassed by a periodic observation.
+// Wait and the exclusive housekeeping barrier observe only active backend work,
+// so externally pending requests do not starve housekeeping.
+//
+// A healthcheck-driven pending pass supplies separate soft and hard deadlines.
+// A starting candidate supplies its exact durable startup deadline (soft: an
+// observer hint may wake early, but reconcile never duplicates the candidate),
+// measured from the instant Docker actually started it. A failed candidate
+// supplies a hard RetryNotBefore recorded in Docker-owned state when the failure
+// is observed, together with its immutable attempt label; Notify cannot bypass it
+// and no attempt cutoff exists. A pass that converges most slots but records an
+// independent error (for example a marker write that could not be persisted)
+// still returns PENDING with that error, so the retained candidates/deadlines are
+// never dropped and the deployment is never marked concluded. The Docker health
+// observer polls only registered pending candidates at a bounded cadence and
+// calls Notify on a state/health transition; it never starts, stops, or
+// authorizes work, and it retires a startup-recovered registration once the
+// coordinator has accepted service work for that app. Pending in one replica
+// slot does not stop other slots or services from being attempted:
+// stale/excess/removed stops are deferred until every desired slot has
+// converged, remained pending, or failed. A committed active replica that later
+// becomes unhealthy is not
+// replaced for health alone; a Docker-owned committed-generation marker makes
+// that distinction durable across restarts. This metadata lives in Docker, not
+// PostgreSQL, and never drives matching or builds. A service with no healthcheck
+// keeps the historical running-is-converged and notify-only pending behavior.
 //
 // Startup recovery of service convergence relies on the worker's unconditional
-// startup service enqueue plus the Docker daemon's surviving containers. A
-// future backend that needs external observer registrations must reconstruct
-// those registrations at startup by enumerating the authoritative current
-// service resources; it must not depend on an in-memory registration from the
-// previous process. The periodic app reconcile remains the fallback that
-// re-observes services.
+// startup service enqueue plus the Docker daemon's surviving containers. The
+// Docker health observer reconstructs its candidate registrations at startup by
+// enumerating uncommitted healthcheck candidates; it never depends on an
+// in-memory registration from the previous process. The periodic app reconcile
+// remains the fallback that re-observes services.
 //
-// Pending requests and scheduled deadlines are process-local hints, not durable
-// state. Startup re-evaluates backend resources, but this foundation does not
-// preserve retry attempts or deadlines across restarts. A readiness backend that
-// needs restart-stable backoff must derive or persist its retry count and next
-// deadline with authoritative candidate state, scoped to the current desired
-// generation; it must not reset backoff on every reconcile pass. Future retry
-// policy should use exponential backoff with a capped interval and no permanent
-// attempt cutoff. Schedule only wakes the coordinator and never authorizes work.
+// Healthcheck candidate attempts, failure instants, and committed active
+// generations are durable Docker-owned metadata: immutable container labels plus
+// a tiny label-only Docker volume record the retry eligibility and the committed
+// generation that distinguishes an active replica from an uncommitted candidate. Neither is a PostgreSQL table and neither drives app
+// matching or builds. Process-local deadlines are only wake hints; the reconciler
+// re-derives and enforces the same eligibility from Docker metadata after a
+// restart. Notify never authorizes work and cannot bypass a hard retry deadline.
 //
 // Ordering on a rebuild: the new version is prepared and swapped in, schedules
 // converge, persistent services converge to the new image, and only THEN is the

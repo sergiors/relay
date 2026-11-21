@@ -22,7 +22,7 @@ func TestReloadSymlinkedAppDirRemovesKnown(t *testing.T) {
 	var removeApps []string
 	b := &fakeBuilder{}
 	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{fn}, func(cfg *Config) {
-		cfg.RemoveApp = func(name string) { removeApps = append(removeApps, name) }
+		cfg.RemoveServices = func(name string, _ func()) { removeApps = append(removeApps, name) }
 	})
 
 	// Replace the real directory with a symlink to an OUTSIDE directory whose
@@ -156,7 +156,7 @@ func TestReloadUnsupportedRootEntryRemovesKnown(t *testing.T) {
 		var removeApps []string
 		b := &fakeBuilder{}
 		r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{fn}, func(cfg *Config) {
-			cfg.RemoveApp = func(name string) { removeApps = append(removeApps, name) }
+			cfg.RemoveServices = func(name string, _ func()) { removeApps = append(removeApps, name) }
 		})
 
 		if err := os.RemoveAll(dir); err != nil {

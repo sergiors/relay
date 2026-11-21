@@ -14,8 +14,9 @@ import (
 // plan writes EVERY embedded .mjs runtime module (each at /relay/<name> with
 // the exact embedded bytes), so the split bootstrap's relative imports resolve
 // inside the image. The resolve hook is not among them: it is planned
-// separately, only into a source-mounted image. The plan must also carry the
-// runtime metadata document beside the modules.
+// separately, only into a source-mounted image. The service health probe is not
+// among them either: it belongs to Relay's own healthcheck, never the image. The
+// plan must also carry the runtime metadata document beside the modules.
 func TestPlanShipsEmbeddedRuntimeModules(t *testing.T) {
 	p, err := Engine{}.Plan(testSpecs[0], t.TempDir(), nil)
 	if err != nil {
@@ -35,7 +36,8 @@ func TestPlanShipsEmbeddedRuntimeModules(t *testing.T) {
 
 	for _, entry := range embedded {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".mjs") || name == resolveHookFile {
+		if entry.IsDir() || !strings.HasSuffix(name, ".mjs") ||
+			name == resolveHookFile || name == healthcheckFile {
 			continue
 		}
 		want, err := runtimeModules.ReadFile(name)
@@ -62,6 +64,13 @@ func TestPlanShipsEmbeddedRuntimeModules(t *testing.T) {
 	// only the shared set, so check its absence explicitly.
 	if _, ok := written[resolveHookFile]; ok {
 		t.Error("baked plan must not write the resolve hook (it belongs to source-mounted images only)")
+	}
+	// The embed glob picks up the health probe too; it belongs to Relay's own
+	// healthcheck and never the image module set.
+	if _, ok := written[healthcheckFile]; ok {
+		t.Errorf("baked plan must not write the service health probe"+
+			" (it belongs to Relay's healthcheck, never the image),"+
+			" wrote %v", moduleList(written))
 	}
 	// The bootstrap is part of the embedded set; it must be present under its
 	// planned entrypoint name.

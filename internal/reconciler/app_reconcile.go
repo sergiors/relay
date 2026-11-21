@@ -638,6 +638,7 @@ func (r *Reconciler) reconcileApp(name string) {
 		// no-op (nothing to stop or start), the caller logs it at Debug rather
 		// than Info — the summary line only surfaces real state changes.
 		if (r.updateServices != nil || statusCapable) && len(fn.Template.Services) > 0 {
+			servicesChanged := serviceDesiredConfigurationChanged(cur.App().Template, fn.Template)
 			if !statusCapable {
 				r.updateServices(name, fn.Template, cur.Prepared().Image)
 			} else {
@@ -706,7 +707,33 @@ func (r *Reconciler) reconcileApp(name string) {
 						r.reportDeployment(name, state.DeploymentAppActive, "")
 					}
 				}
-				if r.updateServicesObservationLifecycle != nil {
+				if servicesChanged {
+					// A service-runtime configuration change (including a
+					// healthcheck-only edit, which is stripped from the image
+					// fingerprint) is DESIRED state, not an observation of the old
+					// configuration. Publishing it supersedes any pending logical
+					// request so the old healthcheck configuration cannot complete and
+					// report active while a newer one is waiting.
+					switch {
+					case r.updateServicesLifecycle != nil:
+						r.updateServicesLifecycle(name, fn.Template, cur.Prepared().Image,
+							ServiceRequestHooks{OnReconcileStart: onStart, OnComplete: onComplete})
+					case r.updateServicesWithStatus != nil:
+						r.updateServicesWithStatus(name, fn.Template, cur.Prepared().Image,
+							onStart, onComplete)
+					case r.updateServices != nil:
+						r.updateServices(name, fn.Template, cur.Prepared().Image)
+					case r.updateServicesObservationLifecycle != nil:
+						r.updateServicesObservationLifecycle(name, fn.Template, cur.Prepared().Image,
+							ServiceRequestHooks{OnReconcileStart: onStart, OnComplete: onComplete})
+					default:
+						updateStatus := r.updateServicesObservationWithStatus
+						if updateStatus == nil {
+							updateStatus = r.updateServicesWithStatus
+						}
+						updateStatus(name, fn.Template, cur.Prepared().Image, onStart, onComplete)
+					}
+				} else if r.updateServicesObservationLifecycle != nil {
 					r.updateServicesObservationLifecycle(name, fn.Template, cur.Prepared().Image,
 						ServiceRequestHooks{OnReconcileStart: onStart, OnComplete: onComplete})
 				} else if r.updateServicesLifecycle != nil {
@@ -1172,6 +1199,61 @@ func (r *Reconciler) reconcileApp(name string) {
 	if !retireDeferred {
 		retireOld()
 	}
+}
+
+// serviceDesiredConfigurationChanged reports whether the parsed template's
+// service-runtime configuration differs from the currently published generation.
+// Such changes are NOT part of the image fingerprint (top-level resources and
+// per-service tmpfs/healthcheck are deliberately stripped), so they reach the
+// unchanged-app skip path. They are desired coordinator state and must supersede
+// a pending request instead of being coalesced as an observation.
+func serviceDesiredConfigurationChanged(previous, next *app.Template) bool {
+	if previous == nil || next == nil {
+		return false
+	}
+	if previous.ResourceLimits() != next.ResourceLimits() {
+		return true
+	}
+	if len(previous.Services) != len(next.Services) {
+		return true
+	}
+	before := make(map[string]app.Service, len(previous.Services))
+	for _, svc := range previous.Services {
+		before[svc.Name] = svc
+	}
+	for _, svc := range next.Services {
+		old, ok := before[svc.Name]
+		if !ok || !serviceConfigurationEqual(old, svc) {
+			return true
+		}
+	}
+	return false
+}
+
+func serviceConfigurationEqual(a, b app.Service) bool {
+	if a.Name != b.Name || a.Entrypoint != b.Entrypoint || a.Image != b.Image ||
+		a.Host != b.Host || a.Path != b.Path || a.Port != b.Port ||
+		a.Replicas != b.Replicas {
+		return false
+	}
+	if len(a.Tmpfs) != len(b.Tmpfs) {
+		return false
+	}
+	for i := range a.Tmpfs {
+		if a.Tmpfs[i] != b.Tmpfs[i] {
+			return false
+		}
+	}
+	return serviceHealthcheckEqual(a.Healthcheck, b.Healthcheck)
+}
+
+func serviceHealthcheckEqual(a, b *app.ServiceHealthcheck) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Path == b.Path && a.Interval == b.Interval &&
+		a.Timeout == b.Timeout && a.Retries == b.Retries &&
+		a.StartPeriod == b.StartPeriod
 }
 
 // deploymentAttrs returns the shared correlation attributes for an app's
@@ -1735,20 +1817,38 @@ func (r *Reconciler) remove(name string) {
 		r.st.RecordRemoved(r.rctx(), name, fencingToken)
 	}
 	// The directory is gone, so every version of this app's images is now
-	// garbage. Let the runner retire all of them (once idle) when wired. The
-	// wired RemoveApp hook also deletes the app's Prometheus series at
-	// this same retirement point (the reconciler itself stays metrics-free; the
-	// worker wires the metrics deletion by wrapping the hook).
+	// garbage. Removal has exactly ONE contract: RemoveServices starts the
+	// service-container removal asynchronously and owns the settlement. The split
+	// is deliberate:
 	//
-	// RemoveServices runs FIRST, before RemoveApp retires the images: a
-	// running service container still references the app's images, so those
-	// containers must be stopped and removed before the images become
-	// retire-eligible. Nil-safe.
-	if r.removeServices != nil {
-		r.removeServices(name)
+	//   - Non-image resources of the removed generation (schedules, metrics
+	//     series, reset baselines, warm containers, per-app semaphore) are
+	//     dropped EAGERLY, in this pump pass, because they do not depend on the
+	//     service containers and must not linger when the directory is re-added
+	//     with an invalid template (which never publishes a generation and never
+	//     re-registers anything). Running in the serial pump means no newer
+	//     generation of the same app can have registered its own resources yet; a
+	//     later valid re-add republishes and re-registers its own.
+	//
+	//   - Image retirement is DEFERRED to the removal settlement, because running
+	//     service containers still reference the images. It is freshness-gated:
+	//     when a live published generation exists again by settlement time (a
+	//     valid re-add), the app's images are NOT retired. Without a live
+	//     generation (a true removal, or an invalid re-add whose images are dead)
+	//     they are retired. The runner-side reference guard is the second line of
+	//     defense for a partial supersession.
+	if r.removeAppResources != nil {
+		r.removeAppResources(name)
 	}
-	if r.removeApp != nil {
-		r.removeApp(name)
+	if r.removeServices != nil {
+		r.removeServices(name, func() {
+			if r.appLiveAgain(name) {
+				return
+			}
+			if r.retireAppImages != nil {
+				r.retireAppImages(name)
+			}
+		})
 	}
 	r.log.Info(
 		"App: removed",
@@ -1773,6 +1873,24 @@ func (r *Reconciler) knownLocally(name string) bool {
 	_, ok := r.fencingTokens[name]
 	r.mu.Unlock()
 	return ok
+}
+
+// appLiveAgain reports whether a name whose deferred removal is settling has a
+// LIVE app image again: a published, usable generation is serving it. Such an
+// app's images must not be retired.
+//
+// A directory that reappeared with an invalid template, or a valid re-add whose
+// preparation has not published yet, has no live image: removal cleared the
+// recorded fingerprint, so the next valid generation always prepares a new image
+// instead of reusing the removed one. Pending rule state (a re-add's in-flight
+// preparation) references no image, so it is deliberately not treated as
+// liveness and cannot pin dead images forever after a failed build.
+func (r *Reconciler) appLiveAgain(name string) bool {
+	if r.reg == nil {
+		return false
+	}
+	cur := r.reg.GetByName(name)
+	return cur != nil && cur.Prepared() != nil
 }
 
 // isSinglePathElement reports whether name can safely be joined to the root to

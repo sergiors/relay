@@ -153,6 +153,19 @@ func (m *Manager) sourceMountFor(name string) (SourceMount, bool) {
 	return sm, ok
 }
 
+// ServiceSourceMounted reports whether the app's current prepared generation
+// runs from a live source mount (HOT_RELOAD). It is the cheap, build-free
+// predicate ResolveServiceImage itself uses, exposed so a caller can decide
+// BEFORE resolving whether Relay's own Docker probe will be effective: a
+// HOT_RELOAD entrypoint service bypasses Relay healthchecks entirely, so probe
+// metadata must not drive its retry policy or desired identity. It reads only
+// the in-memory record published by a successful Prepare and never inspects,
+// pulls, or fingerprints anything.
+func (m *Manager) ServiceSourceMounted(name string) bool {
+	_, ok := m.sourceMountFor(name)
+	return ok
+}
+
 // executionSourceMount returns the HOT_RELOAD container configuration for an
 // app's execution containers: the working directory (empty preserves the image
 // workdir), the trusted host source root (empty when there is no mount), and

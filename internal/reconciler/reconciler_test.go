@@ -292,7 +292,7 @@ func TestReconcileAllDiscoversAndRemoves(t *testing.T) {
 	// defect produced more removals than expected.
 	removals := make(chan string, 4)
 	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{live, gone}, func(cfg *Config) {
-		cfg.RemoveApp = func(name string) { removals <- name }
+		cfg.RemoveServices = func(name string, _ func()) { removals <- name }
 	})
 
 	// Remove "gone" only from disk; the registry still knows it.

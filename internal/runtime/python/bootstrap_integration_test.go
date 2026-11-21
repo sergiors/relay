@@ -331,7 +331,8 @@ func writeEmbeddedRuntimeModules(t *testing.T, dir string) {
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".py") || name == "bootstrap.py" {
+		if entry.IsDir() || !strings.HasSuffix(name, ".py") ||
+			name == "bootstrap.py" || name == healthcheckFile {
 			continue
 		}
 		content, err := runtimeModules.ReadFile(name)

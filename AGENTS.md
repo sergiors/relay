@@ -29,9 +29,10 @@ worker; admin commands communicate with it or read persistent state.
   consumption, recovery, invocation state, ACK, and DLQ.
 - `schedule` owns occurrence identity/publication; `cron` owns timing,
   catch-up, and durable publication retry. `reconciler` owns reload and service
-  convergence. `runtime` owns Docker integration; language engines live in
-  `runtime/python` and `runtime/node`. `state` owns PostgreSQL, including the
-  durable dead-letter rows; `observability` owns telemetry.
+  convergence, including the Docker health observer that only hints pending
+  healthcheck candidates. `runtime` owns Docker integration; language engines
+  live in `runtime/python` and `runtime/node`. `state` owns PostgreSQL, including
+  the durable dead-letter rows; `observability` owns telemetry.
 
 ## Invariants to preserve
 
@@ -54,7 +55,11 @@ worker; admin commands communicate with it or read persistent state.
   PostgreSQL row, never the global app lifecycle row.
 - Unavailable apps and valid pending generations remain matched and pending;
   availability alone must not cause ACK or DLQ. Keep the old active generation
-  serving until its replacement is prepared.
+  serving until its replacement is prepared. A committed active service replica
+  that later becomes unhealthy is not replaced for health alone. Committed
+  generation and healthcheck retry eligibility are Docker-owned metadata (strictly
+  labeled volumes and immutable container labels), never PostgreSQL app state;
+  PostgreSQL must not drive matching, builds, or reconciliation.
 - Schedule identity is app + stable schedule name + absolute scheduled instant.
   Persist the exact intent to the PostgreSQL outbox before Redis publication;
   the execution descriptor is pinned at the first successful claim

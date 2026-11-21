@@ -18,9 +18,10 @@ import (
 // Fingerprint returns a deterministic SHA-256 over the complete contents of the
 // app's SELECTED source: every included file's slash-separated relative path
 // plus its bytes, sorted by path. template.yaml is hashed with its runtime-only
-// configuration (top-level `resources` and service `tmpfs`) removed, so an edit
-// to either is deliberately invisible to the digest: both are applied to
-// containers, not baked into the image (see stripTemplateResources).
+// configuration (top-level `resources` and service `tmpfs`/`healthcheck`)
+// removed, so an edit to any of them is deliberately invisible to the digest:
+// they are applied to containers, not baked into the image (see
+// stripTemplateResources).
 //
 // Selection is the shared source policy (internal/source): the app's own
 // .gitignore rules decide which files under dir are source. A file the rules

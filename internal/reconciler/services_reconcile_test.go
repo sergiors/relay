@@ -48,6 +48,17 @@ type fakeContainer struct {
 	labels   map[string]string
 	networks []string // spec.Networks passed to StartService (global + routing networks)
 	nodeID   string   // the node identity (relay.node_id) that owns the container
+	// Docker-owned healthcheck metadata, as stamped at create: the
+	// relay.healthcheck identity, the relay.healthcheck_attempt label, the
+	// current health summary, and the durable create time. ""/zero matches an
+	// unlabeled (probe-less) container.
+	healthcheck        string
+	healthcheckAttempt int
+	health             container.HealthStatus
+	createdAt          time.Time
+	// startedAt is the durable start instant (Docker State.StartedAt); zero
+	// models a daemon that reports no usable start time.
+	startedAt time.Time
 }
 
 // effectiveSourceRef returns the container's configured source descriptor,
@@ -80,6 +91,7 @@ type fakeDocker struct {
 	nextID          int
 	ctrs            map[string]*fakeContainer
 	stops           []string        // container ids stopped (in order), for ordering assertions
+	stopRequests    []string        // raw stop-request ids, duplicates included, for exactly-once assertions
 	failStopFor     string          // when non-empty, StopServiceContainers errors for this id
 	failStart       map[int]error   // slot -> error injected into StartService, for replacement-failure tests
 	events          []string        // ordered "start:<replica>" / "stop:<id>" / "remove:<fn>" transitions
@@ -92,6 +104,11 @@ type fakeDocker struct {
 	// ResolveServiceImage return an entrypoint source with a live source Mount
 	// carrying that identity, so tests can exercise HOT_RELOAD convergence.
 	mountIdentity map[string]string
+	// sourceMounted is what the optional ServiceSourceMounted seam reports for
+	// the fake: true models an app whose prepared generation runs from a live
+	// HOT_RELOAD source mount (the production Manager's in-memory Prepare
+	// record). The zero value keeps the historical "no mount" behavior.
+	sourceMounted bool
 	// startGate, when non-nil, is called AFTER a container is created and BEFORE
 	// StartService returns, with the lock released. It lets a test park a
 	// replacement at the exact post-start/pre-commit boundary (e.g. to enqueue a
@@ -179,6 +196,16 @@ func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, r
 		labels:                 spec.Labels,
 		networks:               append([]string(nil), spec.Networks...),
 		nodeID:                 defaultFakeNodeID,
+		// Mirror production: a StartService that returns nil has confirmed the
+		// container RUNNING and, with a probe, HEALTHY; the healthcheck identity
+		// and durable attempt label are stamped from the spec.
+		healthcheck:        runtime.ServiceHealthcheckLabel(spec.Healthcheck),
+		healthcheckAttempt: spec.HealthcheckAttempt,
+		createdAt:          time.Now(),
+		startedAt:          time.Now(),
+	}
+	if spec.Healthcheck != nil {
+		f.ctrs[id].health = container.Healthy
 	}
 	gate := f.startGate
 	f.mu.Unlock()
@@ -218,6 +245,11 @@ func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceCon
 			SourceID:               c.sourceID,
 			Ready:                  c.ready,
 			Labels:                 c.labels,
+			Healthcheck:            c.healthcheck,
+			HealthcheckAttempt:     c.healthcheckAttempt,
+			Health:                 c.health,
+			CreatedAt:              c.createdAt,
+			StartedAt:              c.startedAt,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -238,6 +270,9 @@ func (f *fakeDocker) StopServiceContainersWithResult(
 	var firstErr error
 	completed := 0
 	for _, sc := range containers {
+		// Recorded before the map lookup: a duplicate request for the same id
+		// would otherwise be masked by the delete below, hiding a double-stop.
+		f.stopRequests = append(f.stopRequests, sc.ID)
 		if sc.ID == f.failStopFor {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("stop failed for %s", sc.ID)
@@ -295,12 +330,68 @@ func (f *fakeDocker) setMountIdentity(sourceRef, identity string) {
 	f.mountIdentity[sourceRef] = identity
 }
 
+// setSourceMounted flips the ServiceSourceMounted seam, modeling an app whose
+// prepared generation runs from a live HOT_RELOAD source mount (or not).
+func (f *fakeDocker) setSourceMounted(mounted bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sourceMounted = mounted
+}
+
+// ServiceSourceMounted implements the optional HOT_RELOAD reporter seam that
+// the preparation retry policy and preparation identity consult for the
+// EFFECTIVE probe (see serviceSourceMounted).
+func (f *fakeDocker) ServiceSourceMounted(string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sourceMounted
+}
+
+// setResolveError forces ResolveServiceImage to fail for one source reference
+// (nil clears the failure), modeling an unresolvable source/image.
+func (f *fakeDocker) setResolveError(sourceRef string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.resolveErr == nil {
+		f.resolveErr = map[string]error{}
+	}
+	if err == nil {
+		delete(f.resolveErr, sourceRef)
+		return
+	}
+	f.resolveErr[sourceRef] = err
+}
+
+// networkLookupCount returns how many routing-network lookups ran.
+func (f *fakeDocker) networkLookupCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.networkLookups)
+}
+
 // order returns the recorded transition sequence (start/stop/remove), so tests
 // can assert the create/start-before-stop ordering of replacement.
 func (f *fakeDocker) order() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.events...)
+}
+
+// stopRequestLog returns every id passed to StopServiceContainers, duplicates
+// included — the raw view an exactly-once stop assertion needs.
+func (f *fakeDocker) stopRequestLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.stopRequests...)
+}
+
+// startedCount returns how many containers StartService created (the fake
+// bumps nextID only there), a start-free assertion's second witness alongside
+// the ordered events.
+func (f *fakeDocker) startedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nextID
 }
 
 // indexOfEvent returns the index of the first exact event, or -1.

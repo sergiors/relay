@@ -53,6 +53,121 @@ const DefaultServicePort = 80
 // `replicas` key: Relay maintains a single long-running instance by default.
 const DefaultServiceReplicas = 1
 
+// DefaultServiceHealthcheckPath is the HTTP path probed when a service declares
+// a `healthcheck` without a `path`. It is the conventional root endpoint.
+const DefaultServiceHealthcheckPath = "/"
+
+// DefaultServiceHealthcheckInterval is the delay between health probes when a
+// healthcheck omits `interval`.
+const DefaultServiceHealthcheckInterval = 10 * time.Second
+
+// DefaultServiceHealthcheckTimeout is the maximum duration of one health probe
+// when a healthcheck omits `timeout`.
+const DefaultServiceHealthcheckTimeout = 3 * time.Second
+
+// DefaultServiceHealthcheckRetries is the number of consecutive probe failures
+// Docker tolerates before reporting a container unhealthy when a healthcheck
+// omits `retries`.
+const DefaultServiceHealthcheckRetries = 3
+
+// DefaultServiceHealthcheckStartPeriod is the grace period after a container
+// starts during which failed probes do not count when a healthcheck omits
+// `start_period`.
+const DefaultServiceHealthcheckStartPeriod = 10 * time.Second
+
+// Service healthcheck bounds. They keep a typo from turning into a probe storm or
+// an effectively unbounded startup grace period.
+const (
+	MinServiceHealthcheckInterval    = time.Second
+	MaxServiceHealthcheckInterval    = time.Hour
+	MinServiceHealthcheckTimeout     = time.Second
+	MaxServiceHealthcheckTimeout     = time.Hour
+	MaxServiceHealthcheckRetries     = 10
+	MaxServiceHealthcheckStartPeriod = 10 * time.Minute
+)
+
+// ServiceHealthcheck is a service's optional Docker-native HTTP health probe.
+// After ParseTemplate every field carries its effective value: Path defaults to
+// "/", Interval/Timeout/StartPeriod are positive (StartPeriod may be zero), and
+// Retries is within [1, MaxServiceHealthcheckRetries].
+//
+// The probe is implemented with the runtime's own node/python executable, so it
+// is available only for a runtime-managed `entrypoint` service. An external
+// `image` service cannot assume a shell or an HTTP client inside the image, and
+// is rejected at parse time instead of reporting a health state Relay cannot
+// prove.
+type ServiceHealthcheck struct {
+	// Path is the exact HTTP path probed on 127.0.0.1:<service port>. It is used
+	// verbatim; a trailing slash is significant.
+	Path     string
+	Interval time.Duration
+	Timeout  time.Duration
+	// Retries is the number of consecutive failures Docker tolerates before the
+	// container is reported unhealthy.
+	Retries     int
+	StartPeriod time.Duration
+}
+
+// rawServiceHealthcheck is the decoded `healthcheck` mapping. Durations stay
+// strings so an omitted duration is distinguishable from an explicit zero (and
+// so "0" is not silently accepted as a nanosecond value).
+type rawServiceHealthcheck struct {
+	Path        string `yaml:"path"`
+	Interval    string `yaml:"interval"`
+	Timeout     string `yaml:"timeout"`
+	Retries     any    `yaml:"retries"`
+	StartPeriod string `yaml:"start_period"`
+}
+
+// rawServiceHealthcheckFields is rawServiceHealthcheck without its strict
+// UnmarshalYAML method, so the strict decoder can reuse the field tags.
+type rawServiceHealthcheckFields rawServiceHealthcheck
+
+// serviceHealthcheckKeys are the only keys accepted inside a service
+// `healthcheck` mapping. Unknown keys are rejected instead of silently ignored:
+// a misspelled `start_period` or `interval` would otherwise leave the probe
+// running with Relay's defaults, which is the opposite of what the template
+// asked for.
+var serviceHealthcheckKeys = []string{
+	"path", "interval", "timeout", "retries", "start_period",
+}
+
+// UnmarshalYAML decodes one `healthcheck` mapping strictly. yaml.v3 ignores
+// unknown fields by default; for this nested mapping that would silently drop a
+// mistyped probe option, so the accepted key set is validated first and the
+// error names every unknown key together with the accepted ones.
+func (r *rawServiceHealthcheck) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.MappingNode {
+		accepted := make(map[string]bool, len(serviceHealthcheckKeys))
+		for _, key := range serviceHealthcheckKeys {
+			accepted[key] = true
+		}
+		var unknown []string
+		for i := 0; i+1 < len(value.Content); i += 2 {
+			key := value.Content[i].Value
+			if !accepted[key] {
+				unknown = append(unknown, key)
+			}
+		}
+		if len(unknown) > 0 {
+			sort.Strings(unknown)
+			return fmt.Errorf(
+				"healthcheck: unknown key(s) %s; accepted keys are %s",
+				quotedList(unknown), strings.Join(serviceHealthcheckKeys, ", "))
+		}
+	}
+	return value.Decode((*rawServiceHealthcheckFields)(r))
+}
+
+// quotedList renders names for an actionable error message.
+func quotedList(names []string) string {
+	quoted := make([]string, len(names))
+	for i, name := range names {
+		quoted[i] = fmt.Sprintf("%q", name)
+	}
+	return strings.Join(quoted, ", ")
+}
+
 // MaxTimeout is the upper bound on any rule's handler timeout. It is the same
 // value as stream.MaxRuleTimeout (kept in sync; app is a leaf package and
 // stream may import it, not the reverse). The stream layer derives its
@@ -251,6 +366,11 @@ type Service struct {
 	// size and safe nosuid,nodev,noexec options; callers cannot supply mount
 	// options.
 	Tmpfs []string
+	// Healthcheck is the optional Docker-native HTTP health probe. It is nil
+	// when the service declares no `healthcheck`; a declared probe is resolved
+	// with the defaults documented on ServiceHealthcheck. It is supported only
+	// for an `entrypoint` source (see ServiceHealthcheck).
+	Healthcheck *ServiceHealthcheck
 }
 
 // NeedsRuntime reports whether Relay must know how to launch this template:
@@ -591,6 +711,10 @@ func ParseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 			// YAML decode; path policy and memory bounds are validated below
 			// (see resolveServiceTmpfs).
 			Tmpfs []string `yaml:"tmpfs"`
+			// Healthcheck is the optional Docker-native HTTP health probe. The
+			// pointer distinguishes an omitted key from a declared (possibly
+			// empty, defaults-only) probe.
+			Healthcheck *rawServiceHealthcheck `yaml:"healthcheck"`
 		} `yaml:"services"`
 	}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
@@ -823,6 +947,15 @@ func ParseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 			if err := validateServiceImage(image); err != nil {
 				return nil, fmt.Errorf("service %q: %w", s.Name, err)
 			}
+			if s.Healthcheck != nil {
+				return nil, fmt.Errorf(
+					"service %q: healthcheck is not supported for an image source: Relay cannot assume a probe tool or shell inside an external image",
+					s.Name)
+			}
+		}
+		healthcheck, err := resolveServiceHealthcheck(s.Healthcheck)
+		if err != nil {
+			return nil, fmt.Errorf("service %q: %w", s.Name, err)
 		}
 		port, err := resolveServicePort(s.Port)
 		if err != nil {
@@ -856,14 +989,15 @@ func ParseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 			return nil, fmt.Errorf("service %q: %w", s.Name, err)
 		}
 		t.Services = append(t.Services, Service{
-			Name:       s.Name,
-			Entrypoint: entrypoint,
-			Image:      image,
-			Host:       s.Host,
-			Path:       path,
-			Port:       port,
-			Replicas:   replicas,
-			Tmpfs:      tmpfs,
+			Name:        s.Name,
+			Entrypoint:  entrypoint,
+			Image:       image,
+			Host:        s.Host,
+			Path:        path,
+			Port:        port,
+			Replicas:    replicas,
+			Tmpfs:       tmpfs,
+			Healthcheck: healthcheck,
 		})
 	}
 	return t, nil
@@ -1127,6 +1261,117 @@ func resolveServiceReplicas(raw any) (int, error) {
 		return 0, fmt.Errorf("replicas %d must be a positive integer", n)
 	}
 	return n, nil
+}
+
+// resolveServiceHealthcheck parses and validates an optional service
+// `healthcheck`. A nil raw value (omitted key) yields nil, preserving the
+// historical no-probe behavior exactly. Every present field is independently
+// optional and resolves to its default. Durations accept Go duration strings
+// (for example "10s", "1m", "500ms").
+func resolveServiceHealthcheck(raw *rawServiceHealthcheck) (*ServiceHealthcheck, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	path := raw.Path
+	if path == "" {
+		path = DefaultServiceHealthcheckPath
+	}
+	path, err := validateHealthcheckPath(path)
+	if err != nil {
+		return nil, fmt.Errorf("healthcheck: %w", err)
+	}
+	interval, err := resolveHealthcheckDuration(
+		"interval", raw.Interval, DefaultServiceHealthcheckInterval,
+		MinServiceHealthcheckInterval, MaxServiceHealthcheckInterval)
+	if err != nil {
+		return nil, err
+	}
+	// The default probe timeout is clamped to a shorter configured interval so a
+	// sub-default interval remains usable without also spelling out a timeout.
+	// An explicit timeout is still required not to exceed the interval.
+	timeout, err := resolveHealthcheckDuration(
+		"timeout", raw.Timeout, DefaultServiceHealthcheckTimeout,
+		MinServiceHealthcheckTimeout, MaxServiceHealthcheckTimeout)
+	if err != nil {
+		return nil, err
+	}
+	if raw.Timeout == "" && timeout > interval {
+		timeout = interval
+	}
+	if timeout > interval {
+		return nil, fmt.Errorf(
+			"healthcheck: timeout %s must not exceed interval %s", timeout, interval)
+	}
+	startPeriod, err := resolveHealthcheckDuration(
+		"start_period", raw.StartPeriod, DefaultServiceHealthcheckStartPeriod,
+		0, MaxServiceHealthcheckStartPeriod)
+	if err != nil {
+		return nil, err
+	}
+	retries := DefaultServiceHealthcheckRetries
+	if raw.Retries != nil {
+		n, ok := raw.Retries.(int)
+		if !ok {
+			return nil, fmt.Errorf("healthcheck: retries must be an integer, got %v", raw.Retries)
+		}
+		if n < 1 || n > MaxServiceHealthcheckRetries {
+			return nil, fmt.Errorf(
+				"healthcheck: retries %d must be between 1 and %d", n, MaxServiceHealthcheckRetries)
+		}
+		retries = n
+	}
+	return &ServiceHealthcheck{
+		Path:        path,
+		Interval:    interval,
+		Timeout:     timeout,
+		Retries:     retries,
+		StartPeriod: startPeriod,
+	}, nil
+}
+
+// validateHealthcheckPath validates an HTTP health-probe path WITHOUT rewriting
+// it. A trailing slash is significant for HTTP endpoints (/health and /health/
+// can differ), so the exact accepted path is used in the Docker command and the
+// desired label identity.
+func validateHealthcheckPath(path string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("path is empty")
+	}
+	if !strings.HasPrefix(path, "/") {
+		return "", fmt.Errorf("path %q must start with %q", path, "/")
+	}
+	if strings.ContainsAny(path, " \t\r\n") {
+		return "", fmt.Errorf("path %q contains whitespace", path)
+	}
+	if strings.ContainsAny(path, "?#\\") {
+		return "", fmt.Errorf("path %q must not contain a query, fragment, or backslash", path)
+	}
+	if path != "/" && strings.Contains(path, "//") {
+		return "", fmt.Errorf("path %q contains an empty path segment", path)
+	}
+	return path, nil
+}
+
+// resolveHealthcheckDuration parses one optional healthcheck duration field.
+// Empty means the field was omitted, so def applies. An explicit "0s" is
+// accepted only when min is zero.
+func resolveHealthcheckDuration(
+	field, raw string, def, min, max time.Duration,
+) (time.Duration, error) {
+	if raw == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("healthcheck: invalid %s %q: %w", field, raw, err)
+	}
+	if d < min {
+		return 0, fmt.Errorf("healthcheck: %s %s must be at least %s", field, d, min)
+	}
+	if d > max {
+		return 0, fmt.Errorf("healthcheck: %s %s must not exceed %s", field, d, max)
+	}
+	return d, nil
 }
 
 // serviceImagePattern is a permissive image-reference syntax check: a

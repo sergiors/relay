@@ -72,11 +72,30 @@ func startServiceConvergence(
 	)
 	services := reconciler.NewServiceCoordinator(svcCtrl)
 	services.Start(ctx)
+	healthObserver := reconciler.NewServiceHealthObserver(
+		manager,
+		services.PendingServiceCandidates,
+		svcCtrl.RecoverServiceHealthCandidates,
+		services.Notify,
+		logger,
+		// Once the coordinator has accepted service work for an app its
+		// candidate list is authoritative, so a startup-recovered registration
+		// it no longer reports is retired instead of being polled forever.
+		reconciler.WithTrackedServiceApps(services.TrackedServiceApps),
+	)
+	healthObserver.Start(ctx)
 	// Joining the coordinator releases its workers and waiters and drains
-	// in-flight Applys; the join is a strict barrier whose per-step bound is only
-	// the wait-before-diagnostic threshold, while the node-scoped container
-	// cleanup that runs right after is a separate bounded best-effort step.
-	shutdown.register(servicesJoinBarrierStep(services.Join))
+	// in-flight Applys; the observer is joined first because it only hints the
+	// coordinator and must not outlive it. The join is a strict barrier whose
+	// per-step bound is only the wait-before-diagnostic threshold, while the
+	// node-scoped container cleanup that runs right after is a separate bounded
+	// best-effort step.
+	shutdown.register(servicesJoinBarrierStep(func(joinCtx context.Context) error {
+		if err := healthObserver.Join(joinCtx); err != nil {
+			return err
+		}
+		return services.Join(joinCtx)
+	}))
 	shutdown.register(shutdownStep{
 		name:    shutdownStepServiceCleanup,
 		timeout: shutdownServiceTimeout,

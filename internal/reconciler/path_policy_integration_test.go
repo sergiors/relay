@@ -27,7 +27,7 @@ func TestReconcileUnsupportedEntryRemovesStateRow(t *testing.T) {
 	b := &fakeBuilder{}
 	var removeApps []string
 	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, func(cfg *Config, _ *state.State) {
-		cfg.RemoveApp = func(name string) { removeApps = append(removeApps, name) }
+		cfg.RemoveServices = func(name string, _ func()) { removeApps = append(removeApps, name) }
 	})
 	fencingToken := recordSuccess(t, st, "filed-over", "img-old", "fp-old", time.Now(), fn.App())
 	r.SeedFencingToken("filed-over", fencingToken)

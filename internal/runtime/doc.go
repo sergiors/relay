@@ -118,6 +118,22 @@
 // the host itself. The relay.environment label stores an environment fingerprint
 // for reconciliation; it is not a confidentiality boundary.
 //
+// A managed entrypoint service may declare an HTTP healthcheck. Relay maps it
+// onto Docker's native HEALTHCHECK using the runtime's own node/python executable
+// (exec form, standard-library HTTP only; no shell, curl, or wget is assumed).
+// A 2xx/3xx response is healthy; errors, timeouts, and other statuses are
+// unhealthy. StartService reports ErrServicePending when the replacement is
+// running but not yet healthy, so the reconciler preserves the old generation.
+// ServiceContainerList derives Ready from Docker's health summary and exposes the
+// durable start instant and retry-attempt label so a candidate's bounded retry is
+// reconstructible after a restart. A HOT_RELOAD source mount bypasses Relay
+// healthchecks entirely: no probe or health metadata is applied. A committed
+// generation is recorded in label-only Docker volume state, which lets the
+// reconciler distinguish an already-active unhealthy replica from an uncommitted
+// candidate. An external `image` service cannot carry a Relay healthcheck; the
+// template parser rejects it rather than fabricating readiness from tooling that
+// may not exist in the image.
+//
 // The build context stages exactly the app's selected source via the shared
 // internal/source policy (the app's .gitignore rules), the same selection
 // the fingerprint uses: an ignored file is neither hashed nor baked into a layer.

@@ -56,7 +56,7 @@ func newWorkerScheduler(
 	// The cron scheduler maps each app template's schedules into jobs that
 	// publish schedule occurrences through the publisher, seeded from the loaded
 	// app set before Start, then converges live via the reconciler's
-	// UpdateSchedules/RemoveApp hooks.
+	// UpdateSchedules hook and the RemoveAppResources removal hook.
 	sched := cron.NewWithMetrics(publisher, logger, metricsInstance)
 	shutdown.register(schedulerBarrierStep(sched.Stop))
 

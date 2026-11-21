@@ -249,8 +249,7 @@ func TestClusterModeAuthorizedDeletionIsDrift(t *testing.T) {
 	removals := 0
 	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{fn}, func(cfg *Config) {
 		progress, drifts = deploymentRecorder(cfg)
-		cfg.RemoveApp = func(string) { removals++ }
-		cfg.RemoveServices = func(string) { removals++ }
+		cfg.RemoveServices = func(string, func()) { removals++ }
 	})
 	fp, tid := authorizationFor(t, root, "authorized")
 	r.SetDeploymentAuthorization(1,
@@ -296,7 +295,7 @@ func TestClusterModeAuthorizedRemovalApplied(t *testing.T) {
 	removals := []string{}
 	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{fn}, func(cfg *Config) {
 		progress, drifts = deploymentRecorder(cfg)
-		cfg.RemoveApp = func(name string) { removals = append(removals, name) }
+		cfg.RemoveServices = func(name string, _ func()) { removals = append(removals, name) }
 	})
 	r.SetDeploymentAuthorization(2,
 		map[string]string{}, map[string]string{}, []string{"gone"})
@@ -337,7 +336,7 @@ func TestClusterModeRecreationOfRemovedAppIsDrift(t *testing.T) {
 	removals := 0
 	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{fn}, func(cfg *Config) {
 		progress, drifts = deploymentRecorder(cfg)
-		cfg.RemoveApp = func(string) { removals++ }
+		cfg.RemoveServices = func(string, func()) { removals++ }
 	})
 	r.SetDeploymentAuthorization(2,
 		map[string]string{}, map[string]string{}, []string{"recreated"})
@@ -502,7 +501,7 @@ func TestClusterModeDeletionOfDesiredInvalidAppIsDrift(t *testing.T) {
 	removals := 0
 	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{fn}, func(cfg *Config) {
 		progress, drifts = deploymentRecorder(cfg)
-		cfg.RemoveApp = func(string) { removals++ }
+		cfg.RemoveServices = func(string, func()) { removals++ }
 	})
 	invalidPath := filepath.Join(dir, "template.yaml")
 	if err := os.WriteFile(invalidPath, []byte("runtime: python9.9\n"), 0o644); err != nil {

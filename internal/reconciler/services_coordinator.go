@@ -122,6 +122,29 @@ type serviceAppState struct {
 	dirty     bool
 	deadline  time.Time
 	runSeq    uint64
+	// retryNotBefore is the hard eligibility time for a failed healthcheck
+	// candidate. While it is in the future, Notify cannot schedule a pass and the
+	// reconciler will not start a replacement. It is derived from Docker-owned
+	// candidate metadata (the immutable attempt label and the recorded failure
+	// instant), so a restart reconstructs the same eligibility. Startup-
+	// observation deadlines are soft: they may be woken early by an observer
+	// hint, but the reconciler still refuses to duplicate a starting candidate.
+	retryNotBefore time.Time
+	// observationDeadline is the earliest soft startup deadline for a starting
+	// candidate in any slot. It is separate from retryNotBefore so a readiness
+	// transition in one slot can prompt a pass even while a different slot's failed
+	// retry is still ineligible; the reconciler rechecks every slot's eligibility
+	// and starts nothing early.
+	observationDeadline time.Time
+	// pendingCandidates are the Docker containers the last pending pass asked a
+	// health observer to watch. They are hints only.
+	pendingCandidates []runtime.ServiceHealthCandidate
+	// logical records that a desired or removal request was accepted for this
+	// app since Start. A coalesced observation alone does not qualify: it carries
+	// no desired authorization and may arrive before any reconcile pass. The
+	// health observer uses this to know when the coordinator's candidate list is
+	// authoritative for the app.
+	logical bool
 }
 
 // ServiceCoordinator asynchronously converges persistent services. It permits
@@ -145,6 +168,15 @@ type serviceAppState struct {
 // housekeeping. Resume re-evaluates the stored current desired request through
 // Notify or the one shared deadline scheduler; notifications carry no desired
 // authorization and never invoke the app reconciler, fingerprint, or build.
+//
+// A healthcheck-driven pending pass supplies two distinct deadlines. A starting
+// candidate supplies its exact durable startup deadline (a SOFT observation
+// deadline: an observer hint may wake the request early, but reconcile still
+// refuses to duplicate the candidate). A failed candidate supplies a HARD
+// RetryNotBefore derived from Docker-owned attempt/failure metadata: Notify
+// cannot bypass it, no attempt cutoff exists, and a restart reconstructs the
+// same eligibility from the candidate itself. A generic backend readiness signal
+// with no healthcheck keeps the historical notify/observation-only resumption.
 type ServiceCoordinator struct {
 	services *ServiceReconciler
 	ctx      context.Context
@@ -349,21 +381,59 @@ func (c *ServiceCoordinator) EnqueueRemove(name string) {
 	c.enqueue(&serviceRequest{kind: serviceRequestRemoval, name: name})
 }
 
-// RemoveAndWait serializes removal behind any active pass for name and waits
-// DETERMINISTICALLY until the request concludes. It is the reconciler's removal
-// hook, called before the app's images are retired: returning while the
-// container stop was still running (e.g. because a caller timeout expired) would
-// let image retirement race the very removal it depends on, so there is no
-// early-return timeout path. The wait ends when the worker closes the request's
-// done after the removal returns; at shutdown the lifecycle cancels the bounded
-// removal context, so the wait is still bounded. A removal superseded by a newer
-// enqueue before it starts concludes without running — not reachable from the
-// removal hook, which runs after the app is gone and no further desired
-// state is published for it.
+// EnqueueRemoveWithSettlement publishes a removal that invokes settled exactly
+// once when the logical request concludes — after the containers are removed,
+// when a newer desired state supersedes the removal, or when lifecycle
+// cancellation drops it. It is the app-removal hook's asynchronous form: the
+// caller (the serial app pump) must not block on Docker work, but anything that
+// depends on the containers really being gone (retiring the app's images) is
+// deferred to settled instead of racing the removal.
 //
-// The removal operation is bounded by a fresh coordinator-derived context
-// (reconcileTimeout rooted in the lifecycle), not by the caller, so a queued
-// removal still gets its own full bound when it is picked up.
+// settled runs outside the coordinator mutex and never reports a status. A
+// superseded or cancelled removal can conclude before its containers were
+// removed; the caller's hook decides whether the deferred work still applies
+// (for example, an app re-added while the removal was queued must not have its
+// images retired).
+func (c *ServiceCoordinator) EnqueueRemoveWithSettlement(name string, settled func()) {
+	c.enqueue(&serviceRequest{
+		kind: serviceRequestRemoval, name: name, onSettled: settled,
+	})
+}
+
+// TrackedServiceApps returns the apps for which the coordinator has accepted a
+// logical service request (desired state or removal) since Start. It is the scope
+// the health observer needs to retire a startup-recovered candidate
+// registration: once an app is tracked, the coordinator's candidate list is
+// authoritative for it, so a recovered ID it no longer reports has been
+// committed, replaced, or removed. An app that is not tracked has not been
+// reconciled by a logical request this process, so its startup-recovered
+// registrations are retained (a missed readiness notification is still caught).
+// The result is copied so a caller cannot mutate coordinator state.
+func (c *ServiceCoordinator) TrackedServiceApps() map[string]bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]bool, len(c.states))
+	for name, state := range c.states {
+		if state.logical {
+			out[name] = true
+		}
+	}
+	return out
+}
+
+// RemoveAndWait serializes removal behind any active pass for name and waits
+// DETERMINISTICALLY until the request concludes. It is the synchronous removal
+// form for callers that may block on Docker work; the worker's app-removal hook
+// uses EnqueueRemoveWithSettlement instead so the serial app pump never blocks,
+// and defers image retirement to the settlement it receives. Because a caller
+// that returns early could let image retirement race the very removal it
+// depends on, there is no early-return timeout path. The wait ends when the
+// worker closes the request's done after the removal returns; at shutdown the
+// lifecycle cancels the bounded removal context, so the wait is still bounded. A
+// removal superseded by a newer enqueue before it starts concludes without
+// running. The removal operation is bounded by a fresh coordinator-derived
+// context (reconcileTimeout rooted in the lifecycle), not by the caller, so a
+// queued removal still gets its own full bound when it is picked up.
 func (c *ServiceCoordinator) RemoveAndWait(name string) {
 	<-c.enqueue(&serviceRequest{kind: serviceRequestRemoval, name: name})
 }
@@ -388,6 +458,13 @@ func (c *ServiceCoordinator) Notify(name string) {
 	}
 	state := c.states[name]
 	if state == nil || state.desired == nil {
+		c.mu.Unlock()
+		return
+	}
+	if state.retryNotBefore.After(time.Now()) && state.observationDeadline.IsZero() {
+		// A failed candidate's retry eligibility is authoritative and there is no
+		// independent starting-candidate observation to prompt. An observer hint
+		// cannot start a pass before the hard deadline.
 		c.mu.Unlock()
 		return
 	}
@@ -422,6 +499,9 @@ func (c *ServiceCoordinator) Schedule(name string, deadline time.Time) {
 		c.mu.Unlock()
 		return
 	}
+	if state.observationDeadline.IsZero() && state.retryNotBefore.After(deadline) {
+		deadline = state.retryNotBefore
+	}
 	state.deadline = deadline
 	var job serviceJob
 	scheduled := false
@@ -436,6 +516,33 @@ func (c *ServiceCoordinator) Schedule(name string, deadline time.Time) {
 	if scheduled {
 		go c.signal(job)
 	}
+}
+
+func earlierDeadline(a, b time.Time) time.Time {
+	if a.IsZero() {
+		return b
+	}
+	if b.IsZero() || a.Before(b) {
+		return a
+	}
+	return b
+}
+
+// PendingServiceCandidates returns the healthcheck candidate containers the
+// current pending logical requests have asked an observer to watch. It is a hint
+// source only: entries carry app and container ID, never desired authorization.
+// The result is copied so a caller cannot mutate coordinator state.
+func (c *ServiceCoordinator) PendingServiceCandidates() []runtime.ServiceHealthCandidate {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []runtime.ServiceHealthCandidate
+	for _, state := range c.states {
+		if state.desired == nil {
+			continue
+		}
+		out = append(out, state.pendingCandidates...)
+	}
+	return out
 }
 
 // CancelSchedule removes name's future wake deadline, if any.
@@ -592,6 +699,7 @@ func (c *ServiceCoordinator) enqueue(req *serviceRequest) chan struct{} {
 	c.nextID++
 	req.opID = c.nextID
 	c.operationIDs[req.name] = req.opID
+	state.logical = true
 	// A newer desired state replaces the current logical request whenever the
 	// current one is not executing: it will never run (or resume), so conclude
 	// it now. An executing request is left to its worker, which observes
@@ -606,6 +714,9 @@ func (c *ServiceCoordinator) enqueue(req *serviceRequest) chan struct{} {
 	// A newer desired state supersedes any future wake for the old logical
 	// request. A deadline belongs to the request, never to the app forever.
 	state.deadline = time.Time{}
+	state.retryNotBefore = time.Time{}
+	state.observationDeadline = time.Time{}
+	state.pendingCandidates = nil
 	c.wakeSchedulerLocked()
 	job, scheduled := c.scheduleLocked(req.name, state)
 	c.mu.Unlock()
@@ -737,6 +848,26 @@ func (c *ServiceCoordinator) run(job serviceJob) {
 			// longer look executing: lifecycle cancellation has to be able to
 			// drop it.
 			state.executing = nil
+			// A pending result may carry an independent failure (result.Err).
+			// Convergence is still explicitly incomplete, so the retained
+			// candidates and deadlines below are preserved exactly as for a
+			// clean pending pass; the error is already reported by the pass's
+			// log/metric and must NOT authorize the terminal completion
+			// callback, which would mark the deployment concluded.
+			//
+			// A healthcheck-driven pending pass supplies its durable deadlines.
+			// A failed candidate installs a HARD retryNotBefore that Notify cannot
+			// bypass; a starting candidate installs a SOFT startup deadline that an
+			// observer hint may wake early. When neither is set, the historical
+			// notify/observation-only resumption is unchanged.
+			state.pendingCandidates = append(
+				state.pendingCandidates[:0], result.Candidates...)
+			state.retryNotBefore = result.RetryNotBefore
+			state.observationDeadline = result.StartupDeadline
+			state.deadline = earlierDeadline(result.RetryNotBefore, result.StartupDeadline)
+			if !state.deadline.IsZero() {
+				c.wakeSchedulerLocked()
+			}
 		}
 	case state.dirty && state.desired == req:
 		// A wake arrived while this pass ran. Keep the same logical request and
@@ -758,6 +889,11 @@ func (c *ServiceCoordinator) run(job serviceJob) {
 			state.desired = nil
 			state.deadline = time.Time{}
 		}
+	}
+	if conclude {
+		state.retryNotBefore = time.Time{}
+		state.observationDeadline = time.Time{}
+		state.pendingCandidates = nil
 	}
 	c.mu.Unlock()
 
@@ -826,6 +962,9 @@ func (c *ServiceCoordinator) runRemoval(req *serviceRequest) {
 	if state.desired == req {
 		state.desired = nil
 		state.deadline = time.Time{}
+		state.retryNotBefore = time.Time{}
+		state.observationDeadline = time.Time{}
+		state.pendingCandidates = nil
 	}
 	c.mu.Unlock()
 
@@ -888,6 +1027,14 @@ func (c *ServiceCoordinator) scheduleLocked(name string, state *serviceAppState)
 	if c.paused || c.stopped || state.running || state.desired == nil || !state.dirty {
 		return serviceJob{}, false
 	}
+	if state.retryNotBefore.After(time.Now()) && state.observationDeadline.IsZero() {
+		// A failed candidate is not eligible for another replacement yet and no
+		// independent startup observation is pending. The scheduler holds the wake;
+		// an explicit Notify cannot bypass it. When a starting candidate exists in
+		// another slot, a pass may run, but the reconciler still refuses to start the
+		// failed slot before its own eligibility.
+		return serviceJob{}, false
+	}
 	if c.ctx != nil && c.ctx.Err() != nil {
 		return serviceJob{}, false
 	}
@@ -918,6 +1065,9 @@ func (c *ServiceCoordinator) schedulerLoop() {
 			}
 			if !state.deadline.After(now) {
 				state.deadline = time.Time{}
+				if !state.retryNotBefore.After(now) {
+					state.retryNotBefore = time.Time{}
+				}
 				state.dirty = true
 				if job, ok := c.scheduleLocked(name, state); ok {
 					due = append(due, job)
@@ -1020,6 +1170,9 @@ func (c *ServiceCoordinator) cancelPendingOnce() {
 	c.stopped = true
 	for _, state := range c.states {
 		state.deadline = time.Time{}
+		state.retryNotBefore = time.Time{}
+		state.observationDeadline = time.Time{}
+		state.pendingCandidates = nil
 		state.dirty = false
 		if state.executing != nil {
 			// The worker owns this logical request and concludes it after its
@@ -1065,9 +1218,10 @@ func (c *ServiceCoordinator) cancelPendingOnce() {
 }
 
 // cloneServiceTemplate snapshots the template fields the service reconcile path
-// reads — Runtime, Env, Secrets, and Services — so a live reconciler
-// replacing an app's *Template while a request is queued or in flight cannot
-// mutate the copy a worker is converging. A nil template clones to nil.
+// reads — Runtime, Env, Secrets, Services, and each service's Healthcheck — so a
+// live reconciler replacing an app's *Template while a request is queued or in
+// flight cannot mutate the copy a worker is converging. A nil template clones to
+// nil.
 func cloneServiceTemplate(tmpl *app.Template) *app.Template {
 	if tmpl == nil {
 		return nil
@@ -1075,7 +1229,14 @@ func cloneServiceTemplate(tmpl *app.Template) *app.Template {
 	clone := *tmpl
 	clone.Env = cloneStringMap(tmpl.Env)
 	clone.Secrets = cloneSecretMap(tmpl.Secrets)
-	clone.Services = append([]app.Service(nil), tmpl.Services...)
+	clone.Services = make([]app.Service, len(tmpl.Services))
+	for i, svc := range tmpl.Services {
+		clone.Services[i] = svc
+		if svc.Healthcheck != nil {
+			hc := *svc.Healthcheck
+			clone.Services[i].Healthcheck = &hc
+		}
+	}
 	return &clone
 }
 

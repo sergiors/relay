@@ -36,6 +36,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"strings"
 	"sync"
@@ -1059,6 +1060,41 @@ func (c *Coordinator) checkDrift(ctx context.Context) {
 		}
 		present[fn.Name] = true
 		if expected, authorized := applied.Fingerprints[fn.Name]; authorized {
+			// The content fingerprint deliberately excludes runtime-only service
+			// configuration (resources, tmpfs, healthcheck) so those edits do not
+			// rebuild an image. The raw template identity is the authorization
+			// identity for ALL template bytes, including healthcheck, so compare it
+			// before the cached-verification shortcut; otherwise a healthcheck-only
+			// local edit could be invisible to this drift backstop until the next
+			// reconciler pass.
+			if expectedTemplate := applied.TemplateIdentities[fn.Name]; expectedTemplate != "" {
+				source, sourceErr := app.ReadTemplateSource(c.cfg.AppsDir, fn.Name)
+				if sourceErr != nil {
+					// Only a deterministic read outcome (the authorized app or
+					// its template is gone, or its path is no longer a valid app
+					// directory) is evidence of drift. A transient read failure —
+					// permissions, I/O, a read racing a replacement — says nothing
+					// about the bytes, exactly like the LoadApps failure above, so
+					// it is left to the reconciler's retry instead of churning a
+					// rematerialization. The raw template identity is still
+					// compared whenever the bytes WERE read, which is what keeps a
+					// healthcheck-only local edit visible here.
+					if !templateSourceDrift(sourceErr) {
+						if c.cfg.Logger != nil {
+							c.cfg.Logger.WarnContext(ctx,
+								"Deployment: drift check could not read an app template",
+								"app", fn.Name, "error", sourceErr)
+						}
+						continue
+					}
+					c.Kick()
+					return
+				}
+				if source.Identity != expectedTemplate {
+					c.Kick()
+					return
+				}
+			}
 			if _, done := verified[fn.Name]; done {
 				// The reconciler verified this app's content under the current
 				// authorization since the previous check; it either matched or
@@ -1118,6 +1154,20 @@ func (c *Coordinator) checkDrift(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// templateSourceDrift reports whether a ReadTemplateSource error is deterministic
+// evidence that an authorized app no longer matches its materialized generation:
+// the app directory or its template is gone, or the path is no longer a valid
+// app directory. Any other failure (permissions, I/O, a read that raced a
+// replacement) is transient and says nothing about the bytes, so the drift
+// backstop leaves it to the reconciler's retry instead of requesting a
+// rematerialization — the same classification already applied to a failed
+// LoadApps read.
+func templateSourceDrift(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) ||
+		errors.Is(err, app.ErrNotReady) ||
+		errors.Is(err, app.ErrInvalidPath)
 }
 
 func (c *Coordinator) setApplied(snapshot Snapshot) {

@@ -241,9 +241,10 @@ func numericToFloat(raw any) (float64, bool) {
 
 // stripTemplateResources removes the RUNTIME-ONLY configuration that must not
 // participate in an app's image fingerprint: the top-level `resources` key and
-// each service's `tmpfs` list. Both are applied to containers at create time,
-// never baked into a built image, so a resource-only or tmpfs-only edit must not
-// look like a source change (and therefore must not trigger a rebuild).
+// each service's `tmpfs` and `healthcheck` settings. They are applied to
+// containers at create time, never baked into a built image, so editing only
+// this configuration must not look like a source change (and therefore must not
+// trigger a rebuild).
 //
 // The rest of the document is preserved verbatim by operating on the YAML node
 // tree rather than re-marshalling a decoded Go value, so comments, key order,
@@ -271,7 +272,7 @@ func stripTemplateResources(raw []byte) []byte {
 		case "resources":
 			continue
 		case "services":
-			stripServiceTmpfsKeys(root.Content[i+1])
+			stripServiceRuntimeKeys(root.Content[i+1])
 		}
 		kept = append(kept, key, root.Content[i+1])
 	}
@@ -283,11 +284,14 @@ func stripTemplateResources(raw []byte) []byte {
 	return out
 }
 
-// stripServiceTmpfsKeys removes the `tmpfs` key from every mapping in a
-// top-level `services` sequence. It is deliberately narrow: a `tmpfs` key
-// elsewhere in the document is not runtime-only service configuration and still
-// participates in the fingerprint.
-func stripServiceTmpfsKeys(services *yaml.Node) {
+// stripServiceRuntimeKeys removes the runtime-only per-service keys `tmpfs` and
+// `healthcheck` from every mapping in a top-level `services` sequence. Neither
+// is baked into the image: a change to either replaces/updates containers at the
+// reconciler layer, so it must not look like a source change and trigger a
+// rebuild. The strip is deliberately narrow: the same key elsewhere in the
+// document is not runtime-only service configuration and still participates in
+// the fingerprint.
+func stripServiceRuntimeKeys(services *yaml.Node) {
 	if services == nil || services.Kind != yaml.SequenceNode {
 		return
 	}
@@ -297,7 +301,8 @@ func stripServiceTmpfsKeys(services *yaml.Node) {
 		}
 		kept := make([]*yaml.Node, 0, len(service.Content))
 		for i := 0; i+1 < len(service.Content); i += 2 {
-			if service.Content[i].Value == "tmpfs" {
+			switch service.Content[i].Value {
+			case "tmpfs", "healthcheck":
 				continue
 			}
 			kept = append(kept, service.Content[i], service.Content[i+1])

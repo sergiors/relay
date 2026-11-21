@@ -148,9 +148,10 @@ func reconcilerRunResult(runErr error, failures <-chan error) error {
 
 // appReconcilerConfig builds the reconciler's callback wiring: the live
 // registry swap and image retirement hooks, the per-app
-// metrics/baseline/warm-pool/schedule convergence on removal, the schedule and
-// service convergence hooks used on discovery and update, and the
-// remove-services-before-image-retirement ordering. It only builds the Config;
+// metrics/baseline/warm-pool/schedule convergence on removal (eager, non-image)
+// and deferred image retirement, the schedule and service convergence hooks used
+// on discovery and update, and the remove-services-before-image-retirement
+// ordering. It only builds the Config;
 // startAppReconciler owns PrepareWatch, the conditional startup seeding, and
 // the Start goroutine/barrier so the watch/seeding ordering stays visible in
 // one place.
@@ -165,6 +166,21 @@ func appReconcilerConfig(
 	services *reconciler.ServiceCoordinator,
 	deploymentCoordinator *deployment.Coordinator,
 ) reconciler.Config {
+	// removeAppResources drops every non-image resource belonging to the removed
+	// generation. It never touches images: those are retired separately, after
+	// service-container removal settles.
+	removeAppResources := func(name string) {
+		metricsInstance.RemoveApp(name)
+		// Drop the app's reset baseline too, so a re-added app is not offset by
+		// a stale pre-removal total.
+		statsFlusher.dropAppBaseline(name)
+		// Drop the app's warm container state: no new acquire may warm a removed
+		// app, idle containers are discarded now, and busy ones are discarded on
+		// release.
+		manager.RemoveApp(name)
+		runWorker.RemoveAppSemaphore(name)
+		sched.RemoveApp(name) // a removed app never keeps firing
+	}
 	cfg := reconciler.Config{
 		Root:   root,
 		State:  st,
@@ -176,21 +192,23 @@ func appReconcilerConfig(
 		// behind when the initial retry window elapsed. Coalesced and
 		// idempotent, and a no-op when nothing is deferred.
 		Audit: func() { runWorker.RetryDeferredImageRemovals() },
-		RemoveApp: func(name string) {
-			metricsInstance.RemoveApp(name)
-			// Drop the app's reset baseline too, so a re-added app
-			// is not offset by a stale pre-removal total.
-			statsFlusher.dropAppBaseline(name)
-			// Drop the app's warm container state first: no new acquire
-			// may warm a removed app, idle containers are discarded now,
-			// and busy ones are discarded on release. Then retire every image
-			// version once idle (the runner's reference guard keeps an image
-			// an in-flight execution still needs).
-			manager.RemoveApp(name)
-			runWorker.RemoveAppSemaphore(name)
-			runWorker.RemoveAppImages(name)
-			sched.RemoveApp(name) // a removed app never keeps firing
-		},
+		// App retirement is split so the serial app pump never blocks on Docker
+		// work while still dropping everything that is not tied to
+		// service-container removal:
+		//
+		//   - removeAppResources drops the removed generation's non-image
+		//     resources (metrics series, reset baseline, warm containers, per-app
+		//     semaphore, and schedules). It runs eagerly in the pump, so an app
+		//     re-added with an invalid template — which never publishes a
+		//     generation — cannot leave stale schedules firing or stale state
+		//     behind, and it cannot race a newer generation's registration.
+		//
+		//   - RetireAppImages retires every image version once idle (the runner's
+		//     reference guard keeps an image an in-flight execution or a not-yet-
+		//     removed service container still needs). It runs from the removal
+		//     settlement, and only when no live generation exists again.
+		RemoveAppResources: removeAppResources,
+		RetireAppImages:    func(name string) { runWorker.RemoveAppImages(name) },
 		UpdateSchedules: func(name string, tmpl *app.Template) {
 			sched.ReplaceApp(name, tmpl)
 		},
@@ -308,17 +326,16 @@ func appReconcilerConfig(
 				hooks,
 			)
 		},
-		// On removal, stop the app's service containers BEFORE the images
-		// are retired (reconciler calls RemoveServices before RemoveApp):
-		// running service containers reference those images. RemoveAndWait
-		// waits DETERMINISTICALLY for the queued removal to complete; the
-		// coordinator derives the operation's own fresh 30s bound rooted in
-		// the lifecycle context, and shutdown releases the wait via the
-		// lifecycle, so the hook can never let image retirement race the
-		// removal. The hook runs in the single pump goroutine, so it never
-		// blocks a reconcile of another app.
-		RemoveServices: func(name string) {
-			services.RemoveAndWait(name)
+		// On removal, stop the app's service containers BEFORE the images are
+		// retired (the settlement callback runs only after removal concludes):
+		// running service containers reference those images. The hook only
+		// ENQUEUES the removal, so the serial app pump never blocks on Docker
+		// work. The reconciler drops the removed generation's non-image resources
+		// eagerly (RemoveAppResources) and runs the freshness-gated image
+		// retirement from the settlement callback, so a valid re-add keeps its
+		// images and an invalid re-add still loses its stale schedules and state.
+		RemoveServices: func(name string, retired func()) {
+			services.EnqueueRemoveWithSettlement(name, retired)
 		},
 	}
 	if deploymentCoordinator != nil {

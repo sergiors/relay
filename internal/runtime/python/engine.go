@@ -36,6 +36,11 @@ const (
 	// module is its sibling under relayDir, so relative imports resolve inside
 	// the image.
 	bootstrapFile = "bootstrap.py"
+	// healthcheckFile is the service health probe. It is embedded so Relay's
+	// healthcheck can execute it, but it is never written into an image: the
+	// Docker healthcheck passes its source to `python -c` (see
+	// runtime.serviceHealthConfig).
+	healthcheckFile = "healthcheck.py"
 	// relayDir is the in-image directory holding the embedded runtime modules.
 	relayDir = "/relay"
 )
@@ -47,7 +52,8 @@ var bootstrap []byte
 // runtime ships the bootstrap together with the internal modules it imports. The
 // glob keeps the Go side in step with the bootstrap's own file set: a module
 // added beside the bootstrap is embedded and written into every image without a
-// second list that could silently omit it.
+// second list that could silently omit it. The service health probe is embedded
+// too but is never part of the shipped module set (see runtimeFiles).
 //
 //go:embed *.py
 var runtimeModules embed.FS
@@ -82,9 +88,9 @@ func bootstrapFor(zuvloop bool) ([]byte, error) {
 
 // runtimeFiles returns the embedded Python runtime modules as plan files: the
 // RESOLVED bootstrap content (the embedded standard variant or its zuvloop form)
-// plus every other embedded .py module, each at its path under relayDir. The
-// returned order is the glob's sorted file order, so the bootstrap identity
-// hash is stable across builds.
+// plus every other embedded .py module except the service health probe, each at
+// its path under relayDir. The returned order is the glob's sorted file order,
+// so the bootstrap identity hash is stable across builds.
 func runtimeFiles(bootstrapContent []byte) ([]plan.File, error) {
 	entries, err := fs.ReadDir(runtimeModules, ".")
 	if err != nil {
@@ -93,7 +99,7 @@ func runtimeFiles(bootstrapContent []byte) ([]plan.File, error) {
 	files := make([]plan.File, 0, len(entries))
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".py") {
+		if entry.IsDir() || !strings.HasSuffix(name, ".py") || name == healthcheckFile {
 			continue
 		}
 		content := bootstrapContent

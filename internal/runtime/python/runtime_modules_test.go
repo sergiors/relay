@@ -14,7 +14,9 @@ import (
 // plan writes the RESOLVED bootstrap (the embedded standard variant or its
 // zuvloop form) plus EVERY embedded .py sibling module, each at /relay/<name>
 // with the exact embedded bytes, so the bootstrap's relative _relay_* imports
-// resolve inside the image. It must also carry the runtime metadata document.
+// resolve inside the image. The service health probe is not among them: it
+// belongs to Relay's own healthcheck, never the image. It must also carry the
+// runtime metadata document.
 func TestPlanShipsEmbeddedRuntimeModules(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -77,6 +79,14 @@ func TestPlanShipsEmbeddedRuntimeModules(t *testing.T) {
 					t.Errorf("plan must write the sibling module %s, wrote %v", embeddedName, moduleList(written))
 				}
 			}
+			// The embed glob picks up the health probe too; it belongs to
+			// Relay's own healthcheck, never the image module set.
+			if _, ok := written[healthcheckFile]; ok {
+				t.Errorf("plan must not write the service"+
+					" health probe (it belongs to Relay's"+
+					" healthcheck, never the image),"+
+					" wrote %v", moduleList(written))
+			}
 		})
 	}
 }
@@ -95,6 +105,22 @@ func moduleList(written map[string]plan.File) []string {
 	return names
 }
 
+// assertPlanOmitsHealthcheck pins that the embedded service health probe never
+// enters a planned image: the embed glob picks it up for Relay's own use, but
+// the Docker healthcheck runs its source directly (see
+// runtime.serviceHealthConfig), so no plan may write it under /relay.
+func assertPlanOmitsHealthcheck(t *testing.T, p plan.BuildPlan) {
+	t.Helper()
+	probe := path.Join(relayDir, healthcheckFile)
+	for _, f := range p.Files {
+		if f.Path == probe {
+			t.Errorf("plan must not write the service health probe"+
+				" %s (it belongs to Relay's healthcheck,"+
+				" never the image)", probe)
+		}
+	}
+}
+
 // TestPlanShipsSameModulesForBothZuvloopVariants pins that only the bootstrap
 // module differs between the loop modes: every _relay_* sibling is
 // byte-identical, so a mode flip is a bootstrap-label change (rebuild) and the
@@ -108,6 +134,8 @@ func TestPlanShipsSameModulesForBothZuvloopVariants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enabled plan: %v", err)
 	}
+	assertPlanOmitsHealthcheck(t, disabled)
+	assertPlanOmitsHealthcheck(t, enabled)
 	index := func(files []plan.File) map[string]string {
 		out := make(map[string]string, len(files))
 		for _, f := range files {
@@ -155,6 +183,7 @@ func TestPlanMetadataRecordsEffectiveBaseImage(t *testing.T) {
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}
+			assertPlanOmitsHealthcheck(t, p)
 			var metadata *plan.File
 			for i := range p.Files {
 				if p.Files[i].Path == plan.RuntimeMetadataPath {

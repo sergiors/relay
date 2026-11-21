@@ -26,6 +26,11 @@ const (
 	// every other module but written into the image only for a source-mounted
 	// app (see ResolveHookPath); a baked image must not carry it.
 	resolveHookFile = "resolve-hook.mjs"
+	// healthcheckFile is the service health probe. It is embedded so Relay's
+	// healthcheck can execute it, but it is never written into an image: the
+	// Docker healthcheck passes its source to `node -e` (see
+	// runtime.serviceHealthConfig).
+	healthcheckFile = "healthcheck.mjs"
 	// relayDir is the in-image directory holding the embedded runtime modules.
 	relayDir = "/relay"
 )
@@ -38,7 +43,9 @@ var bootstrap []byte
 // and lifecycle modules it imports. The glob keeps the Go side in step with the
 // bootstrap's own file set: a module added beside the bootstrap is embedded and
 // written into every image without a second list that could silently omit it.
-// The resolve hook is embedded too but planned per image (see runtimeFiles).
+// The resolve hook is embedded too but planned per image, and the service health
+// probe is embedded for Relay itself; neither is part of the shipped module set
+// (see runtimeFiles).
 //
 //go:embed *.mjs
 var runtimeModules embed.FS
@@ -290,7 +297,8 @@ func runtimeFiles() ([]plan.File, error) {
 	files := make([]plan.File, 0, len(entries))
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".mjs") || name == resolveHookFile {
+		if entry.IsDir() || !strings.HasSuffix(name, ".mjs") ||
+			name == resolveHookFile || name == healthcheckFile {
 			continue
 		}
 		content, err := runtimeModules.ReadFile(name)

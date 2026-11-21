@@ -515,7 +515,7 @@ func TestReconcileInvalidSourceTemplateDeletionRemovesRow(t *testing.T) {
 	var removed []string
 	b := &fakeBuilder{}
 	r, reg, st := newTestStateReconciler(t, root, b, nil, func(cfg *Config, _ *state.State) {
-		cfg.RemoveApp = func(name string) {
+		cfg.RemoveServices = func(name string, _ func()) {
 			removed = append(removed, name)
 		}
 	})

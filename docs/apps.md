@@ -66,6 +66,9 @@ services: # persistent long-running containers
     entrypoint: service.js
     port: 3000
     replicas: 2
+    healthcheck: # optional, entrypoint services only
+      path: /health
+      interval: 10s
   - name: cache
     image: nginxinc/nginx-unprivileged:1.27-alpine
     tmpfs: [/run, /var/cache/nginx] # optional additional writable tmpfs

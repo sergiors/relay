@@ -228,7 +228,7 @@ func TestPeriodicPassSweepsAuthorizedNamesMissingFromDisk(t *testing.T) {
 		removals := []string{}
 		r, reg := newTestReconciler(t, root, b, nil, func(cfg *Config) {
 			progress, drifts = deploymentRecorder(cfg)
-			cfg.RemoveApp = func(name string) { removals = append(removals, name) }
+			cfg.RemoveServices = func(name string, _ func()) { removals = append(removals, name) }
 		})
 		// Startup filtered this locally drifted authorized app out, so it never
 		// entered any local index; only the authorization can name it. Its
@@ -249,7 +249,7 @@ func TestPeriodicPassSweepsAuthorizedNamesMissingFromDisk(t *testing.T) {
 		removals := []string{}
 		r, reg := newTestReconciler(t, root, b, nil, func(cfg *Config) {
 			progress, drifts = deploymentRecorder(cfg)
-			cfg.RemoveApp = func(name string) { removals = append(removals, name) }
+			cfg.RemoveServices = func(name string, _ func()) { removals = append(removals, name) }
 		})
 		authorizeDesiredInvalid(r, "invalid-missing", "tid-invalid-missing")
 
@@ -273,7 +273,7 @@ func TestPeriodicPassHandlesAuthorizedRemovalSet(t *testing.T) {
 	removals := []string{}
 	r, reg := newTestReconciler(t, root, b, nil, func(cfg *Config) {
 		progress, drifts = deploymentRecorder(cfg)
-		cfg.RemoveApp = func(name string) { removals = append(removals, name) }
+		cfg.RemoveServices = func(name string, _ func()) { removals = append(removals, name) }
 	})
 	r.SetDeploymentAuthorization(2,
 		map[string]string{}, map[string]string{},
@@ -344,7 +344,7 @@ func TestPeriodicPassIgnoresStandaloneUnknownNonCandidates(t *testing.T) {
 	removals := []string{}
 	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{gone}, func(cfg *Config) {
 		progress, drifts = deploymentRecorder(cfg)
-		cfg.RemoveApp = func(name string) { removals = append(removals, name) }
+		cfg.RemoveServices = func(name string, _ func()) { removals = append(removals, name) }
 	})
 
 	r.reconcileAll()

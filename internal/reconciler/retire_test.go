@@ -193,8 +193,12 @@ func TestReconcileNoRetireOnSkipPath(t *testing.T) {
 	}
 }
 
-// App removal fires the RemoveApp hook.
-func TestReconcileRemovalInvokesRemoveAppHook(t *testing.T) {
+// App removal has ONE contract: the eager RemoveAppResources drop runs in the
+// serial pump pass, then RemoveServices starts the container removal WITHOUT
+// blocking and receives the settlement callback. Nothing is retired before the
+// settlement runs; when it runs with no live generation again, RetireAppImages
+// performs the deferred image retirement.
+func TestReconcileRemovalDropsResourcesEagerlyAndSettlesRetirement(t *testing.T) {
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "gone")
 
@@ -203,19 +207,123 @@ func TestReconcileRemovalInvokesRemoveAppHook(t *testing.T) {
 		&runtime.Prepared{Name: "gone", Image: "img-gone-v1"},
 		&fakeBuilder{},
 	)
-	var calls int
+	var order []string
+	var mu sync.Mutex
+	var retired func()
 	r, reg := newTestReconciler(t, root, &fakeBuilder{}, []*runner.PreparedApp{fn}, func(cfg *Config) {
-		cfg.RemoveApp = func(string) { calls++ }
+		cfg.RemoveAppResources = func(name string) {
+			mu.Lock()
+			order = append(order, "resources "+name)
+			mu.Unlock()
+		}
+		cfg.RemoveServices = func(name string, settle func()) {
+			mu.Lock()
+			order = append(order, "services "+name)
+			retired = settle
+			mu.Unlock()
+		}
+		cfg.RetireAppImages = func(name string) {
+			mu.Lock()
+			order = append(order, "retire "+name)
+			mu.Unlock()
+		}
 	})
 	if err := os.RemoveAll(dir); err != nil {
 		t.Fatalf("remove dir: %v", err)
 	}
 	r.reconcileApp("gone")
+
 	if reg.GetByName("gone") != nil {
 		t.Fatal("gone should be dropped from the registry")
 	}
-	if calls != 1 {
-		t.Fatalf("RemoveApp hook calls = %d, want 1", calls)
+	mu.Lock()
+	got := append([]string(nil), order...)
+	settle := retired
+	mu.Unlock()
+	if len(got) != 2 || got[0] != "resources gone" || got[1] != "services gone" {
+		t.Fatalf("removal order = %v, want eager resources then the non-blocking "+
+			"service removal, with retirement still deferred", got)
+	}
+	if settle == nil {
+		t.Fatal("RemoveServices received no settlement callback")
+	}
+
+	// The settlement concludes the removal: with no live generation again, the
+	// deferred retirement finally runs — exactly once.
+	settle()
+	mu.Lock()
+	got = append([]string(nil), order...)
+	mu.Unlock()
+	if len(got) != 3 || got[2] != "retire gone" {
+		t.Fatalf("order after settlement = %v, want [resources gone services gone retire gone]",
+			got)
+	}
+}
+
+// A valid re-add between removal and settlement must not lose its images: the
+// freshness gate sees the live published generation again and the settlement
+// performs no retirement, while the eager resource drop still happened in the
+// removal pass (a later re-add re-registers its own resources).
+func TestReconcileRemovalSettlementSkipsRetirementForReaddedApp(t *testing.T) {
+	root := t.TempDir()
+	dir := writeFnDir(t, root, "readded")
+
+	fn := runner.NewPrepared(
+		app.App{Name: "readded", Dir: dir, Template: mustParse(template)},
+		&runtime.Prepared{Name: "readded", Image: "img-readded-v1"},
+		&fakeBuilder{},
+	)
+	var resources, retires int
+	var mu sync.Mutex
+	var retired func()
+	r, reg := newTestReconciler(t, root, &fakeBuilder{}, []*runner.PreparedApp{fn}, func(cfg *Config) {
+		cfg.RemoveAppResources = func(string) {
+			mu.Lock()
+			resources++
+			mu.Unlock()
+		}
+		cfg.RemoveServices = func(_ string, settle func()) {
+			mu.Lock()
+			retired = settle
+			mu.Unlock()
+		}
+		cfg.RetireAppImages = func(string) {
+			mu.Lock()
+			retires++
+			mu.Unlock()
+		}
+	})
+
+	// The app disappears; removal is enqueued with its settlement retained.
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatalf("remove dir: %v", err)
+	}
+	r.reconcileApp("readded")
+	mu.Lock()
+	settle := retired
+	mu.Unlock()
+	if settle == nil {
+		t.Fatal("precondition: the removal settlement was not captured")
+	}
+
+	// A valid re-add publishes a live generation BEFORE the settlement runs.
+	writeFnDir(t, root, "readded")
+	r.reconcileApp("readded")
+	if pf := reg.GetByName("readded"); pf == nil || pf.Prepared() == nil {
+		t.Fatal("precondition: the re-added app must publish a live generation")
+	}
+
+	settle()
+	mu.Lock()
+	gotResources, gotRetires := resources, retires
+	mu.Unlock()
+	if gotResources != 1 {
+		t.Fatalf("RemoveAppResources calls = %d, want 1 (the eager drop still ran)",
+			gotResources)
+	}
+	if gotRetires != 0 {
+		t.Fatalf("RetireAppImages calls = %d, want 0 (a live re-add keeps its images)",
+			gotRetires)
 	}
 }
 

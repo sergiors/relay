@@ -151,11 +151,11 @@ func TestReconcileTemplateRemovalRemovesKnownApp(t *testing.T) {
 	var events []string
 	b := &fakeBuilder{}
 	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, func(cfg *Config, _ *state.State) {
-		cfg.RemoveServices = func(name string) {
-			events = append(events, "remove-services "+name)
+		cfg.RemoveAppResources = func(name string) {
+			events = append(events, "remove-resources "+name)
 		}
-		cfg.RemoveApp = func(name string) {
-			events = append(events, "remove-app "+name)
+		cfg.RemoveServices = func(name string, _ func()) {
+			events = append(events, "remove-services "+name)
 		}
 		cfg.UpdateSchedules = func(name string, _ *app.Template) {
 			events = append(events, "update-schedules "+name)
@@ -184,7 +184,7 @@ func TestReconcileTemplateRemovalRemovesKnownApp(t *testing.T) {
 	if _, ok := st.AppStats("known"); ok {
 		t.Fatal("a removed app's app_stats must be deleted")
 	}
-	want := []string{"remove-services known", "remove-app known"}
+	want := []string{"remove-resources known", "remove-services known"}
 	if len(events) != len(want) {
 		t.Fatalf("removal hooks = %v, want %v", events, want)
 	}

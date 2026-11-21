@@ -125,6 +125,49 @@ const (
 	// reconcile; the label instead pins exactly what StartService applied.
 	labelTmpfs = "relay.tmpfs"
 
+	// labelHealthcheck pins the canonical identity of a service's healthcheck
+	// configuration (path and probe timings). It lets the service reconciler
+	// replace a running container whose probe configuration changed even though
+	// its image and environment did not. It is omitted for a service with no
+	// healthcheck, so such a container's label set is unchanged.
+	labelHealthcheck = "relay.healthcheck"
+
+	// labelHealthcheckAttempt records the one-based retry generation of a
+	// healthcheck candidate. It is Docker-owned, immutable metadata: a candidate's
+	// attempt and Docker create time are enough to reconstruct a bounded retry
+	// backoff after a Relay restart without a process-local counter or a database
+	// table. It is omitted when no Relay healthcheck applies.
+	labelHealthcheckAttempt = "relay.healthcheck_attempt"
+
+	// Service convergence state marker labels. Relay records the committed
+	// generation in a tiny Docker volume (labels only, never mounted) so an
+	// active replica can be distinguished from an uncommitted healthcheck
+	// candidate across restarts. The marker is Docker-owned state, never the
+	// PostgreSQL app view, and is scoped by relay.type=service-state and
+	// relay.node_id.
+	labelServiceStateType = "service-state"
+	labelCommitted        = "relay.committed"
+	labelGeneration       = "relay.generation"
+	labelUpdatedAt        = "relay.updated_at"
+	// Candidate/retry marker labels. They persist the current uncommitted
+	// healthcheck candidate's identity, attempt, and failure eligibility in the
+	// same Docker-owned state volume, so a restart reconstructs the exact retry
+	// window instead of recomputing it from create time. candidate_started_at is
+	// the instant the attempt began (the container start when known, otherwise the
+	// pre-start/preparation admission write); it records the attempt, and when the
+	// failure instant was never persisted a restart conservatively measures the
+	// bounded window from recovery rather than from this instant. state_kind names
+	// the independent marker family (empty = committed/candidate state;
+	// ServiceStateKindPreparation = the service-level preparation retry record), so
+	// a preparation record can never overwrite a replica's candidate
+	// attempt/window.
+	labelCandidateGeneration = "relay.candidate_generation"
+	labelCandidateAttempt    = "relay.candidate_attempt"
+	labelCandidateContainer  = "relay.candidate_container"
+	labelCandidateStartedAt  = "relay.candidate_started_at"
+	labelRetryNotBefore      = "relay.retry_not_before"
+	labelStateKind           = "relay.state_kind"
+
 	// Managed-image labels. These pin the identity and wiring of a managed
 	// image (app or dependency) so the dependency GC can classify images
 	// and resolve app→dependency ownership without inferring anything

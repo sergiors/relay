@@ -6,11 +6,12 @@
 //
 // Replacement is ZERO-DOWNTIME-BY-CONSTRUCTION: for every desired replica slot
 // the reconciler starts the replacement and requires StartService to confirm it
-// RUNNING before stopping the superseded generation for that same logical slot.
-// A failed create/start/inspect leaves the old generation running and the slot
-// keeps serving; the next reconcile retries. Old generations, excess replicas,
-// and removed services are stopped only after the desired slots have converged,
-// so a service is never taken to zero replicas by a failed replacement.
+// RUNNING (and, for a service with a healthcheck, HEALTHY) before stopping the
+// superseded generation for that same logical slot. A failed create/start/inspect
+// or an unhealthy candidate leaves the old generation running and the slot keeps
+// serving; the next reconcile retries. Old generations, excess replicas, and
+// removed services are stopped only after the desired slots have converged, so a
+// service is never taken to zero replicas by a failed replacement.
 //
 // The component is deliberately small and the owning layer (worker wiring) is
 // what decides when to invoke it. Containers owned by OTHER apps are never
@@ -44,9 +45,14 @@
 //     and mutates nothing, so calling it on every periodic reconcile tick (as a
 //     cheap no-op) is safe and gives crash replacement within the default 30s
 //     cadence without a separate services-only loop.
-//   - RemoveAll (via the reconciler's RemoveServices hook) must run BEFORE the
-//     app's images are retired, because running service containers still
-//     reference those images.
+//   - Service-container removal must settle BEFORE the app's images are
+//     retired, because running service containers still reference those images.
+//     The worker wires the deferred removal form (EnqueueRemoveWithSettlement),
+//     so the serial app pump starts the removal without blocking and the app
+//     retirement runs from the settlement callback; a removal superseded by a
+//     re-add settles without retiring a live app's images. The runner-side
+//     reference guard remains the second line of defense for a partial
+//     supersession.
 //   - Routing (Traefik) for routed services (a service declaring a host) is
 //     validated before any container action for that service: the routing
 //     config must be present, the per-service effective host (including any
@@ -65,8 +71,9 @@
 //     whole pass in one short deadline.
 //
 // A backend may report ErrServicePending from StartService when a replacement is
-// accepted but not terminally converged. The pass then stops before any stale
-// stop, preserves every usable old generation, and reports
+// accepted but not terminally converged (for example, it is running but its
+// Docker healthcheck has not reported healthy yet). The pass then stops before
+// any stale stop, preserves every usable old generation, and reports
 // ServicePassPending. Pending is not a failure and never authorizes readiness or
 // image retirement; the coordinator retains the logical request and resumes it
 // on a notification, an eligible periodic observation, or a due deadline.
@@ -74,6 +81,8 @@ package reconciler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -385,19 +394,41 @@ const (
 	ServicePassSucceeded ServicePassOutcome = iota
 	// ServicePassPending means at least one desired service has not terminally
 	// converged and a later wake should re-evaluate the current desired state.
+	// A pending result may also carry an independent error (Err); pending is
+	// still the governing outcome because convergence is explicitly incomplete.
 	ServicePassPending
-	// ServicePassFailed means the pass returned an error.
+	// ServicePassFailed means the pass returned an error without a retained
+	// pending request (for example a convergence-state load failure, or a
+	// lifecycle cancellation).
 	ServicePassFailed
 )
 
-// ServicePassResult is a worker-pass result. Err is non-nil exactly for a
-// failed outcome. Changed reports whether the pass performed corrective work;
-// Superseded reports that a newer desired state replaced its request.
+// ServicePassResult is a worker-pass result. Outcome classifies the pass; Err is
+// non-nil for a failed pass AND may be non-nil alongside a pending outcome
+// (an independent failure that must not replace the retained pending
+// candidates/deadlines). Changed reports whether the pass performed corrective
+// work; Superseded reports that a newer desired state replaced its request.
 type ServicePassResult struct {
 	Err        error
 	Outcome    ServicePassOutcome
 	Changed    bool
 	Superseded bool
+	// StartupDeadline, when set with a pending outcome, is the candidate's exact
+	// durable startup deadline. The coordinator schedules one soft wake for it; an
+	// observer hint may wake earlier, and reconcile still refuses to duplicate a
+	// starting candidate.
+	StartupDeadline time.Time
+	// RetryNotBefore, when set with a pending outcome, is the hard earliest time a
+	// failed candidate/preparation may be retried. The coordinator installs it as
+	// the wake deadline and refuses Notify before it, so an observer hint (for
+	// example from a starting candidate in another slot) cannot bypass the
+	// bounded retry backoff. It is normally backed by Docker-owned marker state;
+	// when that write failed it is a PROCESS-LOCAL window only, and the
+	// reconciler holds the same floor itself until a durable write succeeds.
+	RetryNotBefore time.Time
+	// Candidates are the pending healthcheck candidate containers to observe. They
+	// are hints only and never authorize work.
+	Candidates []runtime.ServiceHealthCandidate
 }
 
 // Pending reports whether the pass ended without terminal convergence.
@@ -413,15 +444,21 @@ func (r ServicePassResult) Failed() bool { return r.Outcome == ServicePassFailed
 // for the operator-facing summary. superseded marks a pass that abandoned its
 // remaining work because a newer desired state replaced its request: its
 // committed counts are still real, but the summary must not present it as a
-// plain changed pass. pending marks a pass that stopped at a service whose
-// convergence is not terminal; it is not a failure and must not remove old
-// generations.
+// plain changed pass. pending marks a pass in which at least one desired replica
+// slot is not terminally converged; independent slots/services are still
+// attempted, but no pending slot's fallback is stopped.
 type servicePass struct {
 	changed    bool
 	superseded bool
 	pending    bool
 	started    int
 	restarted  int
+	// startupDeadline and retryNotBefore are the durable healthcheck wake
+	// deadlines derived from Docker-owned candidate metadata. candidates are the
+	// containers an observer should watch.
+	startupDeadline time.Time
+	retryNotBefore  time.Time
+	candidates      []runtime.ServiceHealthCandidate
 	// stopped counts containers whose stop/removal completed, as reported by
 	// the runtime manager when a batch has partial failures.
 	stopped      int
@@ -502,10 +539,13 @@ func Reconcile(
 ) (bool, error) {
 	pass, err := reconcileWithObserver(
 		ctx, reconcileTimeout, docker, fnName, tmpl, appImage, preparedEnv,
-		serviceNetworks, secrets, traefik, log, "", nil, nil,
+		serviceNetworks, secrets, traefik, log, "", nil, nil, nil,
 	)
-	if err == nil && pass.pending {
-		err = ErrServicePending
+	if pass.pending && !requestCancelled(ctx, err) {
+		// Pending is reported as ErrServicePending for the direct API. An
+		// independent failure is preserved alongside it, so a caller never
+		// mistakes a pending-with-error pass for a clean pending pass.
+		err = errors.Join(ErrServicePending, err)
 	}
 	return pass.changed, err
 }
@@ -525,6 +565,7 @@ func reconcileWithObserver(
 	nodeID string,
 	reconcileStarted func(),
 	apply *sourceApplyTracker,
+	stateTracker *ServiceReconciler,
 ) (servicePass, error) {
 	// A fresh normal-operation bound for the container listing. reconcileTimeout
 	// is always positive from the worker; a non-positive value means "no
@@ -621,6 +662,66 @@ func reconcileWithObserver(
 		}
 	}
 
+	// Retry policy, in one place:
+	//
+	//   - A HEALTHCHECK CANDIDATE failure (Docker accepted a replacement but did
+	//     not report it ready, or an existing candidate is observed unhealthy,
+	//     exited, or past its startup grace) uses the durable Docker-owned
+	//     exponential retry scheme: the attempt is an immutable container label
+	//     plus a marker field, only the delay is capped, and the reconciler
+	//     refuses to start a replacement before the persisted window elapses (see
+	//     handlePendingStart and the failed-slot branch).
+	//
+	//   - A PREPARATION failure for a service with an EFFECTIVE Relay probe — an
+	//     unavailable routing network, a source/image that cannot be resolved, an
+	//     environment/secret that cannot be resolved, or a create/start error —
+	//     uses the SAME bounded, durable exponential scheme, keyed by the
+	//     preparation generation and persisted in the same Docker-owned marker
+	//     (recordPreparationAttempt / recordPreparationFailure / retryStartFailure).
+	//     The admitted attempt is written BEFORE any network/source/environment
+	//     work; if that write fails, no preparation work is attempted. If the
+	//     failure write is unavailable, the admitted attempt is still durable and a
+	//     restart converts it into the SAME attempt's bounded failure before
+	//     retrying — never an immediate retry or a reset attempt. It therefore does
+	//     not depend on the app's periodic reconcile cadence, survives a restart,
+	//     has no attempt cutoff, keeps the existing replicas serving, and resets
+	//     when preparation succeeds or the desired generation changes. The gate is
+	//     the EFFECTIVE probe, not merely a declared one: the app's prepared
+	//     HOT_RELOAD source-mount record is consulted before resolution (it is a
+	//     cheap in-memory predicate, the same one ResolveServiceImage uses), so a
+	//     source-mounted service ignores Relay healthchecks entirely — it keeps
+	//     the no-probe historical behavior below, and a healthcheck-only template
+	//     edit cannot reset its preparation window.
+	//
+	//   - A service WITHOUT a declared healthcheck keeps the historical
+	//     behavior: its preparation failures are per-pass operational failures
+	//     retried by the ordinary app reconciliation cadence. There is no
+	//     candidate readiness contract or Docker-owned attempt state to persist
+	//     for it, so the bounded scheme is deliberately not applied.
+	//
+	//   - Routing CONFIG validation (missing/invalid worker Traefik config, an
+	//     overlong effective host) is deterministic for the running process: the
+	//     same inputs always fail until the template or worker config changes, so
+	//     it stays a terminal per-pass failure rather than entering a retry loop
+	//     that cannot succeed.
+	//
+	// A marker-persistence failure is never treated as DURABLE authority: it is
+	// reported as an independent error while the pass keeps its pending
+	// candidate contract, and the SAME hard eligibility/attempt is retained in a
+	// process-local floor (and handed to the coordinator) so another slot's
+	// notification cannot bypass the backoff or drive a retry loop. No start is
+	// admitted on an unpersisted attempt. If an ATTEMPT ADMISSION (preparation or
+	// pre-start candidate) survives without a recorded outcome — the process
+	// stopped mid-operation, or the failure write was unavailable — a restart
+	// converts it into the SAME attempt's durable window anchored at RECOVERY
+	// time. The failure instant was never persisted and the operation may have run
+	// longer than the backoff, so an admission-time anchor could already be
+	// elapsed; recovery anchoring can only delay, never retry sooner than a full
+	// backoff after the unrecorded outcome, and it never resets the attempt. A
+	// preparation admission whose exact attempt is matched by a durable completion
+	// record is NOT such an unknown outcome: its preparation already succeeded, so
+	// it is dropped without installing a failure window.
+
 	// bounded derives a fresh normal-operation bound rooted in the lifecycle
 	// context, matching the per-phase bounds Reconcile already uses. Supersession
 	// cleanup (removing this pass's provisional replacements) uses it so it never
@@ -688,17 +789,23 @@ func reconcileWithObserver(
 		byService[ctr.Name] = append(byService[ctr.Name], ctr)
 	}
 
+	// Stale/excess stops are deferred until every desired service and replica
+	// slot has been attempted. A pending candidate cannot block independent
+	// convergence, and a slot that is still pending never contributes its old
+	// generation to this list.
+	var deferredStale []runtime.ServiceContainer
+	type commitIntent struct {
+		name       string
+		replica    int
+		generation string
+		id         string
+		attempt    int
+	}
+	var commitIntents []commitIntent
 	for _, svc := range tmpl.Services {
 		name := svc.Name
 		sourceRef := svc.SourceRef()
 		existing := byService[name]
-
-		// A pending service ended this pass: do not converge any remaining
-		// desired service, and do not stop old generations. The coordinator
-		// retains the logical request and resumes it later.
-		if pass.pending {
-			break
-		}
 
 		// Supersession check at the top of each service: if a newer desired
 		// state replaced this request while a previous service was converging,
@@ -710,6 +817,192 @@ func reconcileWithObserver(
 			abortPass = true
 			pass.superseded = true
 			break
+		}
+
+		// Preparation retry (services with an EFFECTIVE Relay probe only): a
+		// failure that happens BEFORE any candidate exists — an unavailable routing
+		// network, a source/image that cannot be resolved, an environment/secret
+		// that cannot be resolved, or a start that fails — is retried with the same
+		// bounded, durable exponential window as a failed candidate. It is
+		// persisted in the Docker-owned marker keyed by the PREPARATION generation
+		// (the desired inputs available before resolution), so a restart
+		// reconstructs the same eligibility, a new desired generation resets it,
+		// and recovery does not depend on the app's periodic reconcile cadence.
+		//
+		// The gate is the EFFECTIVE probe. Relay's own probe is effective only when
+		// the app is not source-mounted (HOT_RELOAD); sourceMounted is an in-memory
+		// Prepare record — no inspect, pull, or fingerprint — and mirrors what
+		// ResolveServiceImage reports below. Under HOT_RELOAD a declared
+		// healthcheck is bypassed entirely: it must not drive the preparation retry
+		// policy or the preparation identity, so a healthcheck-only template edit
+		// cannot reset a retry window. A service whose probe is not applied (none
+		// declared, or HOT_RELOAD) keeps the historical terminal per-pass behavior:
+		// it has no candidate readiness contract or Docker-owned attempt state to
+		// persist.
+		sourceMounted := serviceSourceMounted(docker, fnName)
+		preparationGeneration := servicePreparationIdentity(
+			fnName, tmpl, svc, appImage, serviceNetworks, traefik, sourceMounted)
+		preparationAttempt := 0
+		preparationRetry := svc.Healthcheck != nil && !sourceMounted && stateTracker != nil
+		// preparationAdmittedAt is the start instant of the admission this pass
+		// writes. It identifies that admission's successful completion, so it is
+		// zero when no admission was written (no effective probe, or a failed
+		// admission write).
+		preparationAdmittedAt := time.Time{}
+		preparationFloorKey := preparationRetryFloorKey(fnName, name, preparationGeneration)
+		if preparationRetry {
+			// Resolve the attempt/window that must gate this process and any
+			// restart, in order of authority:
+			//   1. the process-local floor (covers a failed marker write that has
+			//      not been superseded yet);
+			//   2. a recorded failure window;
+			//   3. an ADMITTED attempt whose outcome was never recorded (the
+			//      process died during preparation, or the failure write failed).
+			//      It is converted into the SAME attempt's durable bounded failure
+			//      BEFORE any new preparation work, anchored at recovery time (the
+			//      failure instant is unknown), so a restart can never retry
+			//      immediately, retry early, or reset the attempt. An admission
+			//      whose exact attempt has a durable completion record already
+			//      succeeded and is dropped instead of converted.
+			floor := stateTracker.retryFloorFor(preparationFloorKey)
+			if time.Now().Before(floor.until) {
+				pass.pending = true
+				pass.retryNotBefore = earlierDeadline(pass.retryNotBefore, floor.until)
+				continue
+			}
+			preparationAttempt = floor.attempt
+			if recorded, ok := stateTracker.preparationState(
+				fnName, name, 0, preparationGeneration,
+			); ok {
+				if time.Now().Before(recorded.RetryNotBefore) {
+					pass.pending = true
+					pass.retryNotBefore = earlierDeadline(
+						pass.retryNotBefore, recorded.RetryNotBefore)
+					continue
+				}
+				if recorded.CandidateAttempt > preparationAttempt {
+					preparationAttempt = recorded.CandidateAttempt
+				}
+			} else if unfinished, ok := stateTracker.preparationAdmission(
+				fnName, name, 0, preparationGeneration,
+			); ok {
+				if stateTracker.preparationCompleted(
+					fnName, name, 0, preparationGeneration,
+					unfinished.CandidateAttempt, unfinished.CandidateStartedAt,
+				) {
+					// This admission's preparation COMPLETED successfully; the
+					// marker is a leftover from a process that stopped before the
+					// retry-family cleanup, or from a cleanup write that failed. It
+					// records no failure, so converting it would delay an
+					// already-prepared (and possibly already-serving) generation by
+					// a full backoff. Drop it (best effort) and admit a fresh
+					// attempt below.
+					if err := stateTracker.clearPreparationState(
+						ctx, fnName, name, 0, preparationGeneration,
+					); err != nil {
+						log.Debug("Service: clear completed preparation state failed",
+							"app", fnName, "service", name, "error", err)
+					}
+					preparationAttempt = 0
+				} else {
+					attempt := unfinished.CandidateAttempt
+					if preparationAttempt > attempt {
+						attempt = preparationAttempt
+					}
+					if attempt < 1 {
+						attempt = 1
+					}
+					// The FAILURE instant was never persisted — that is exactly why
+					// this record is unfinished (the process died during preparation,
+					// or the failure write was unavailable). The preparation operation
+					// may also have run longer than the backoff (a slow pull), so
+					// anchoring at CandidateStartedAt could already be in the past and
+					// retry immediately after the unrecorded outcome. Convert it into
+					// the SAME attempt's window anchored at RECOVERY time instead: this
+					// can only delay, never retry sooner than a full backoff after the
+					// outcome, and it preserves the attempt number.
+					eligibleAt := time.Now().Add(servicePreparationBackoff(
+						svc.Healthcheck.Interval, attempt))
+					stateTracker.noteRetryFloor(preparationFloorKey, eligibleAt, attempt)
+					if err := stateTracker.recordPreparationFailure(
+						ctx, fnName, name, 0, preparationGeneration, attempt, eligibleAt,
+					); err != nil {
+						fail(fmt.Errorf("service %q: %w", name, err))
+						desiredFailed = true
+						pass.pending = true
+						pass.retryNotBefore = earlierDeadline(pass.retryNotBefore, eligibleAt)
+						continue
+					}
+					if time.Now().Before(eligibleAt) {
+						pass.pending = true
+						pass.retryNotBefore = earlierDeadline(pass.retryNotBefore, eligibleAt)
+						continue
+					}
+					preparationAttempt = attempt
+				}
+			}
+		}
+		// admitPreparation persists the admitted preparation attempt DURABLY
+		// before any network/source/environment work. If that write fails, no
+		// preparation work is attempted: a restart then finds the admitted
+		// attempt and converts it into the same bounded failure instead of
+		// retrying immediately with a reset attempt. It is called only after the
+		// deterministic routing-config validation, so a terminal config failure
+		// never leaves an admission to be converted.
+		admitPreparation := func() bool {
+			if !preparationRetry {
+				return true
+			}
+			admitted := preparationAttempt + 1
+			admittedAt := time.Now()
+			if err := stateTracker.recordPreparationAttempt(
+				ctx, fnName, name, 0, preparationGeneration, admitted, admittedAt,
+			); err != nil {
+				fail(fmt.Errorf("service %q: %w", name, err))
+				desiredFailed = true
+				pass.pending = true
+				floorAt := time.Now().Add(servicePreparationBackoff(
+					svc.Healthcheck.Interval, admitted))
+				stateTracker.noteRetryFloor(preparationFloorKey, floorAt, admitted)
+				pass.retryNotBefore = earlierDeadline(pass.retryNotBefore, floorAt)
+				return false
+			}
+			preparationAttempt = admitted
+			preparationAdmittedAt = admittedAt
+			return true
+		}
+		// retryPreparation installs the durable window for the ADMITTED attempt's
+		// failure. The window is also recorded in the process-local floor BEFORE
+		// the marker write, so a failed write still holds the same hard
+		// eligibility and attempt in this process; the admitted marker (written
+		// above) keeps the attempt durable for a restart, which converts it into
+		// the same bounded failure. A successful preparation prunes the family.
+		retryPreparation := func() bool {
+			if !preparationRetry {
+				return false
+			}
+			attempt := preparationAttempt
+			if attempt < 1 {
+				attempt = 1
+			}
+			eligibleAt := time.Now().Add(servicePreparationBackoff(
+				svc.Healthcheck.Interval, attempt))
+			stateTracker.noteRetryFloor(preparationFloorKey, eligibleAt, attempt)
+			if err := stateTracker.recordPreparationFailure(
+				ctx, fnName, name, 0, preparationGeneration, attempt, eligibleAt,
+			); err != nil {
+				fail(fmt.Errorf("service %q: %w", name, err))
+				desiredFailed = true
+				pass.pending = true
+				// The failure window is not durable, but the ADMITTED attempt is;
+				// a restart converts it into the same bounded window. Keep the hard
+				// eligibility in this process so notifications cannot retry early.
+				pass.retryNotBefore = earlierDeadline(pass.retryNotBefore, eligibleAt)
+				return true
+			}
+			pass.pending = true
+			pass.retryNotBefore = earlierDeadline(pass.retryNotBefore, eligibleAt)
+			return true
 		}
 
 		// The pre-resolution phase runs on its own fresh normal-operation bound
@@ -726,7 +1019,9 @@ func reconcileWithObserver(
 		// a routed service (one declaring a host) whose routing config is
 		// unusable must be reported and skipped entirely — no stops, no
 		// starts — replacing it half-way would break the existing container
-		// for nothing.
+		// for nothing. The deterministic config checks run before the preparation
+		// admission so a terminal config failure cannot leave an admitted attempt
+		// behind.
 		var routeLabels map[string]string
 		routeNetwork := ""
 		if svc.Host != "" {
@@ -752,6 +1047,12 @@ func reconcileWithObserver(
 				log.Warn("Service: routing validation failed", "service", name, "error", err)
 				continue
 			}
+		}
+		if !admitPreparation() {
+			preCancel()
+			continue
+		}
+		if svc.Host != "" {
 			// The routing network (e.g. the Traefik network) is infrastructure
 			// owned outside Relay; Relay verifies it exists and refuses to
 			// start routed containers otherwise — it never creates it.
@@ -760,18 +1061,24 @@ func reconcileWithObserver(
 				preCancel()
 				err := fmt.Errorf("service %q: check routing network: %w", name, err)
 				fail(err)
-				desiredFailed = true
 				if !requestCancelled(ctx, err) {
 					log.Warn("Service: routing validation failed", "service", name, "error", err)
 				}
+				if retryPreparation() {
+					continue
+				}
+				desiredFailed = true
 				continue
 			}
 			if !ok {
 				preCancel()
 				err := fmt.Errorf("service %q: %w", name, routing.MissingNetwork(traefik.Network))
 				fail(err)
-				desiredFailed = true
 				log.Warn("Service: routing validation failed", "service", name, "error", err)
+				if retryPreparation() {
+					continue
+				}
+				desiredFailed = true
 				continue
 			}
 			routeLabels = routing.TraefikLabels(fnName, name, svc.Host, svc.Path, svc.Port, traefik)
@@ -813,11 +1120,14 @@ func reconcileWithObserver(
 		preCancel()
 		if err != nil {
 			fail(fmt.Errorf("service %q: %w", name, err))
-			desiredFailed = true
 			if !requestCancelled(ctx, err) {
 				log.Warn("Service: cannot resolve source; keeping existing containers",
 					"service", name, "error", err)
 			}
+			if retryPreparation() {
+				continue
+			}
+			desiredFailed = true
 			continue
 		}
 
@@ -834,12 +1144,55 @@ func reconcileWithObserver(
 		if err != nil {
 			postCancel()
 			fail(fmt.Errorf("service %q: %w", name, err))
-			desiredFailed = true
 			if !requestCancelled(ctx, err) {
 				log.Warn("Service: cannot start replicas", "service", name, "error", err)
 			}
+			if retryPreparation() {
+				continue
+			}
+			desiredFailed = true
 			continue
 		}
+		// Preparation succeeded, so the admitted attempt's OUTCOME is now known.
+		// Record that durably BEFORE pruning the retry family: a restart (or a
+		// failed cleanup write) can then never mistake this admission for an
+		// interrupted, unknown preparation and install a failure backoff for a
+		// generation that already prepared successfully. The completion record is
+		// keyed by the admission's generation, attempt, and start instant, so a
+		// LATER admission of the same generation never inherits this outcome.
+		// Then prune the retry family (best-effort) so a later failure starts a
+		// fresh attempt sequence and a stale generation (including after a
+		// HOT_RELOAD/probe change) leaves no retry marker behind. This is a no-op
+		// when no preparation marker is cached.
+		if stateTracker != nil {
+			completed := preparationAdmittedAt.IsZero()
+			if !preparationAdmittedAt.IsZero() {
+				if err := stateTracker.recordPreparationCompleted(
+					ctx, fnName, name, 0, preparationGeneration,
+					preparationAttempt, preparationAdmittedAt,
+				); err != nil {
+					log.Debug("Service: record preparation completion failed",
+						"app", fnName, "service", name, "error", err)
+				} else {
+					completed = true
+				}
+			}
+			if err := stateTracker.clearPreparationState(
+				ctx, fnName, name, 0, preparationGeneration,
+			); err != nil {
+				log.Debug("Service: clear preparation retry state failed",
+					"app", fnName, "service", name, "error", err)
+				if !completed {
+					// Neither the completion record nor the cleanup is durable, but
+					// THIS process knows the preparation succeeded. Drop the cached
+					// admission so the next pass does not convert its own successful
+					// outcome into a failure backoff; a restart before the next
+					// admission write stays conservative (no durable completion).
+					stateTracker.forgetPreparationState(fnName, name)
+				}
+			}
+		}
+		preparationAttempt = 0
 		// environmentFingerprint is the desired effective environment identity. It is
 		// compared against each container's relay.environment label below: the
 		// environment is the one piece of configuration the image reference
@@ -865,6 +1218,18 @@ func reconcileWithObserver(
 		// per discovered container each pass. The always-present /tmp mount is
 		// constant and not encoded.
 		desiredTmpfs := runtime.ServiceTmpfsLabel(svc.Tmpfs)
+		// A HOT_RELOAD source mount bypasses Relay healthcheck behavior entirely.
+		// No Docker probe, no healthcheck/attempt labels, and no readiness gate are
+		// applied, so a healthcheck-only template edit cannot force a replacement
+		// and source-only restarts keep their in-place semantics.
+		effectiveHealthcheck := svc.Healthcheck
+		if resolved.Mount != nil {
+			effectiveHealthcheck = nil
+		}
+		// desiredHealthcheck is the canonical identity of the service's desired
+		// healthcheck configuration. "" (no healthcheck, including HOT_RELOAD)
+		// matches an unlabeled container, preserving the historical behavior.
+		desiredHealthcheck := runtime.ServiceHealthcheckLabel(effectiveHealthcheck)
 		// desiredNetworks / desiredNetworkSet is the canonical network set the
 		// container must carry and join: the worker-global NETWORKS set every
 		// service container joins, plus the routing network for a routed
@@ -904,10 +1269,26 @@ func reconcileWithObserver(
 		if resolved.Mount != nil {
 			desiredSourceID = resolved.Mount.Identity
 		}
+		// desiredGeneration is the committed-marker generation identity. It is the
+		// exact desired implementation (including the effective healthcheck, which
+		// is empty under HOT_RELOAD). A marker only designates this container as
+		// active while this identity still matches.
+		desiredGeneration := serviceGenerationIdentity(
+			sourceRef, resolved.Ref, resolved.ID, svc.Port,
+			environmentFingerprint, resourceHash, desiredTmpfs, desiredNetworks,
+			desiredHealthcheck, desiredSourceID, resolved.Entry, routeLabels,
+		)
 		// configured reports every immutable configuration comparison except
 		// the live source fingerprint and runtime readiness, which the
 		// caller-specific checks below handle separately.
 		configured := func(ctr runtime.ServiceContainer) bool {
+			// Under HOT_RELOAD healthchecks are ignored entirely: an old
+			// relay.healthcheck label must not make the container stale and turn an
+			// in-place source restart into a replacement.
+			healthcheckMatches := true
+			if resolved.Mount == nil {
+				healthcheckMatches = ctr.Healthcheck == desiredHealthcheck
+			}
 			return ctr.SourceRef == sourceRef &&
 				ctr.Image == resolved.Ref &&
 				ctr.ImageID == resolved.ID &&
@@ -915,6 +1296,7 @@ func reconcileWithObserver(
 				ctr.EnvironmentFingerprint == environmentFingerprint &&
 				ctr.Resources == resourceHash &&
 				ctr.Tmpfs == desiredTmpfs &&
+				healthcheckMatches &&
 				ctr.Networks == desiredNetworks &&
 				ctr.Replica >= 0 &&
 				routingLabelsMatch(routeLabels, ctr.Labels)
@@ -933,24 +1315,21 @@ func reconcileWithObserver(
 			applied, ok := apply.appliedFor(ctr.ID, fnName)
 			return ok && applied == desiredSourceID
 		}
-		// converged requires the container to be running, currently
-		// configured, and ready according to the backend's current-state
-		// observation. Unknown readiness (nil) preserves Docker's behaviour.
-		converged := func(ctr runtime.ServiceContainer) bool {
-			return ctr.State == container.StateRunning &&
-				serviceContainerReady(ctr) &&
-				sourceOK(ctr) && configured(ctr)
+		// serviceReady is the pass-local readiness view. Under HOT_RELOAD, Relay's
+		// own healthcheck is ignored entirely — including a Ready=false observation
+		// left on an older container that still carries relay.healthcheck — so a
+		// previously unhealthy/starting probe cannot gate an in-place source restart
+		// as generic pending. Backend readiness on containers WITHOUT Relay's
+		// healthcheck label is still honored.
+		serviceReady := func(ctr runtime.ServiceContainer) bool {
+			if resolved.Mount != nil && ctr.Healthcheck != "" {
+				return true
+			}
+			return serviceContainerReady(ctr)
 		}
-		// notReady reports an otherwise config-matching running candidate the
-		// backend explicitly observes as not ready. It is the replacement a
-		// previous pass started: another StartService would duplicate it, and
-		// stopping the old generation would break zero-downtime convergence.
-		notReady := func(ctr runtime.ServiceContainer) bool {
-			return ctr.State == container.StateRunning &&
-				ctr.Ready != nil && !*ctr.Ready &&
-				sourceOK(ctr) && configured(ctr)
+		pickServiceFallback := func(containers []runtime.ServiceContainer) *runtime.ServiceContainer {
+			return pickFallbackWith(containers, serviceReady)
 		}
-
 		// sourceOnlyStale reports whether ctr is running and correctly configured
 		// EXCEPT for its live source fingerprint: the exact case an in-place
 		// restart resolves under HOT_RELOAD. It requires a real source mount
@@ -958,34 +1337,36 @@ func reconcileWithObserver(
 		// every other field — image, image content, port, env, resources, tmpfs,
 		// networks, replica slot, routing labels — must already match, so a
 		// configuration or dependency change still replaces rather than restarts.
-		// It also requires the backend not to observe the container as explicitly
-		// unready: restarting such a candidate and then stopping the slot's old
-		// generations would treat an unproven replacement as serving.
+		// Under HOT_RELOAD effectiveHealthcheck is nil, so health never gates the
+		// in-place source restart.
 		sourceOnlyStale := func(ctr runtime.ServiceContainer) bool {
 			return desiredSourceID != "" &&
 				ctr.SourceID != desiredSourceID &&
 				ctr.State == container.StateRunning &&
-				serviceContainerReady(ctr) &&
+				serviceReady(ctr) &&
 				configured(ctr)
 		}
 
-		// The replacement spec is built once per service and reused for every
-		// deficit slot below.
-		newSpec := func() runtime.ServiceSpec {
+		// The replacement spec is built per start so the durable retry attempt
+		// stamped on a healthcheck candidate is the current generation.
+		newSpec := func(attempt int) runtime.ServiceSpec {
 			return runtime.ServiceSpec{
-				App:         fnName,
-				Name:        name,
-				SourceRef:   sourceRef,
-				Port:        svc.Port,
-				Image:       resolved.Ref,
-				ImageID:     resolved.ID,
-				Entry:       resolved.Entry,
-				Env:         env,
-				Resources:   resources,
-				Tmpfs:       svc.Tmpfs,
-				Labels:      routeLabels,
-				Networks:    desiredNetworkSet,
-				SourceMount: resolved.Mount,
+				App:                fnName,
+				Name:               name,
+				SourceRef:          sourceRef,
+				Port:               svc.Port,
+				Image:              resolved.Ref,
+				ImageID:            resolved.ID,
+				Entry:              resolved.Entry,
+				Env:                env,
+				Resources:          resources,
+				Tmpfs:              svc.Tmpfs,
+				Labels:             routeLabels,
+				Networks:           desiredNetworkSet,
+				SourceMount:        resolved.Mount,
+				Runtime:            tmpl.Runtime,
+				Healthcheck:        effectiveHealthcheck,
+				HealthcheckAttempt: attempt,
 			}
 		}
 
@@ -1015,42 +1396,619 @@ func reconcileWithObserver(
 		// stopped. Group members are ordered deterministically by container ID
 		// (never by Docker list order), so a pass with duplicate A+B
 		// generations converges identically every time.
+		// A pending candidate in one slot must not stop unrelated slots from
+		// progressing. Every slot is attempted; only commits/stops that would
+		// compromise a pending slot are deferred.
+		addCandidate := func(ctr runtime.ServiceContainer) {
+			for _, existing := range pass.candidates {
+				if existing.ContainerID == ctr.ID {
+					return
+				}
+			}
+			pass.candidates = append(pass.candidates, runtime.ServiceHealthCandidate{
+				App: fnName, ContainerID: ctr.ID,
+			})
+		}
+		addCandidateID := func(id string) {
+			if id == "" {
+				return
+			}
+			for _, existing := range pass.candidates {
+				if existing.ContainerID == id {
+					return
+				}
+			}
+			pass.candidates = append(pass.candidates, runtime.ServiceHealthCandidate{
+				App: fnName, ContainerID: id,
+			})
+		}
+		// handlePendingStart classifies a StartService ErrServicePending result. A
+		// health-gated container that already exited/unhealthy enters the SAME hard
+		// bounded-retry lifecycle as an observed failure, and its durable failure
+		// instant must be recorded before the pass returns pending. A merely
+		// starting candidate persists its attempt/start record before returning
+		// pending, so a candidate that disappears before its failure is recorded —
+		// even across a restart — is still converted into the SAME attempt's
+		// bounded backoff instead of restarting at attempt one. The failed/old
+		// generation is always preserved.
+		//
+		// A marker write failure is NOT swallowed: the pass records it as an
+		// independent error and keeps the in-memory wake window only to avoid a
+		// hot retry loop in THIS process. The window is never durable authority —
+		// the next pass re-derives eligibility from the marker, and a later
+		// attempt cannot start a replacement unless that durable record exists.
+		handlePendingStart := func(slot int, id string, attempt int, failed []runtime.ServiceContainer) {
+			pass.pending = true
+			if effectiveHealthcheck == nil {
+				return
+			}
+			observation, outcome := observeServiceContainer(postCtx, docker, id)
+			failure := outcome == serviceProbeObserved &&
+				(observation.Missing ||
+					observation.State != container.StateRunning ||
+					observation.Health == container.Unhealthy)
+			if failure {
+				if attempt < 1 {
+					attempt = 1
+				}
+				eligibleAt := time.Now().Add(serviceHealthBackoff(
+					effectiveHealthcheck.Interval, attempt))
+				pass.retryNotBefore = earlierDeadline(pass.retryNotBefore, eligibleAt)
+				if stateTracker != nil {
+					stateTracker.noteRetryFloor(
+						candidateRetryFloorKey(fnName, name, slot, desiredGeneration),
+						eligibleAt, attempt)
+					if err := stateTracker.recordCandidateFailure(
+						ctx, fnName, name, slot, desiredGeneration, id, attempt, eligibleAt,
+					); err != nil {
+						fail(fmt.Errorf("service %q replica %d: %w", name, slot, err))
+						desiredFailed = true
+						// The hard window and floor were installed above and are
+						// retained: losing the durable write must not let a
+						// notification retry early in this process.
+					}
+				}
+			} else {
+				pass.startupDeadline = earlierDeadline(pass.startupDeadline,
+					time.Now().Add(effectiveHealthcheck.Interval))
+				if stateTracker != nil {
+					startedAt := time.Now()
+					if outcome == serviceProbeObserved && !observation.StartedAt.IsZero() {
+						startedAt = observation.StartedAt
+					}
+					if err := stateTracker.recordCandidateStarted(
+						ctx, fnName, name, slot, desiredGeneration, id, attempt, startedAt,
+					); err != nil {
+						fail(fmt.Errorf("service %q replica %d: %w", name, slot, err))
+						desiredFailed = true
+						pass.startupDeadline = earlierDeadline(pass.startupDeadline,
+							time.Now().Add(servicePreparationBackoff(
+								effectiveHealthcheck.Interval, attempt)))
+					}
+				}
+			}
+			addHealthCandidate(&pass, fnName, id)
+			for _, ctr := range failed {
+				addHealthCandidate(&pass, fnName, ctr.ID)
+			}
+		}
+		// beginCandidateAttempt persists the admitted attempt BEFORE any
+		// StartService. The attempt/start anchor is then durable even if the
+		// started record cannot be written or the candidate disappears before its
+		// failure is observed; a failed write refuses the start instead of
+		// admitting an attempt that is not durably recorded.
+		beginCandidateAttempt := func(slot, attempt int) bool {
+			if effectiveHealthcheck == nil || stateTracker == nil {
+				return true
+			}
+			if err := stateTracker.recordCandidateStarted(
+				ctx, fnName, name, slot, desiredGeneration, "", attempt, time.Now(),
+			); err != nil {
+				fail(fmt.Errorf("service %q replica %d: %w", name, slot, err))
+				desiredFailed = true
+				pass.pending = true
+				// The attempt is NOT durable, so the start is refused. Record the
+				// same hard window in the process-local floor (and hand it to the
+				// coordinator) so notifications cannot retry early; a restart
+				// re-derives conservatively.
+				floorAt := time.Now().Add(servicePreparationBackoff(
+					effectiveHealthcheck.Interval, attempt))
+				stateTracker.noteRetryFloor(
+					candidateRetryFloorKey(fnName, name, slot, desiredGeneration),
+					floorAt, attempt)
+				pass.retryNotBefore = earlierDeadline(pass.retryNotBefore, floorAt)
+				return false
+			}
+			stateTracker.clearRetryFloor(
+				candidateRetryFloorKey(fnName, name, slot, desiredGeneration))
+			return true
+		}
+		// retryStartFailure turns a start that failed before any candidate
+		// existed into a durable slot-level retry window (no container ID), so
+		// the replacement is retried with the bounded exponential backoff rather
+		// than on the app's periodic cadence. A write failure keeps the pass
+		// pending and explicit without claiming durable eligibility. A service
+		// without a declared probe keeps the historical terminal failure.
+		retryStartFailure := func(slot, attempt int) {
+			if effectiveHealthcheck == nil || stateTracker == nil {
+				return
+			}
+			pass.pending = true
+			if attempt < 1 {
+				attempt = 1
+			}
+			eligibleAt := time.Now().Add(servicePreparationBackoff(
+				effectiveHealthcheck.Interval, attempt))
+			stateTracker.noteRetryFloor(
+				candidateRetryFloorKey(fnName, name, slot, desiredGeneration),
+				eligibleAt, attempt)
+			if err := stateTracker.recordCandidateFailure(
+				ctx, fnName, name, slot, desiredGeneration, "", attempt, eligibleAt,
+			); err != nil {
+				fail(fmt.Errorf("service %q replica %d: %w", name, slot, err))
+				desiredFailed = true
+				// Not durable: the floor above retains the hard window in memory
+				// for this process, so another slot's notification cannot retry
+				// the start early.
+				pass.retryNotBefore = earlierDeadline(pass.retryNotBefore, eligibleAt)
+				return
+			}
+			pass.retryNotBefore = earlierDeadline(pass.retryNotBefore, eligibleAt)
+		}
+		// recordStartedCandidate refines the durable attempt with the accepted
+		// container ID and its start instant immediately after StartService. The
+		// pre-start write already made the ATTEMPT durable; this makes the
+		// candidate's identity durable too, so a candidate that disappears before
+		// its failure is recorded is converted with the same attempt, and a
+		// superseded pass can drop exactly the record it abandoned. A write
+		// failure keeps the pre-start attempt record and the candidate pending.
+		recordStartedCandidate := func(slot int, id string, attempt int) bool {
+			if effectiveHealthcheck == nil || stateTracker == nil {
+				return true
+			}
+			if err := stateTracker.recordCandidateStarted(
+				ctx, fnName, name, slot, desiredGeneration, id, attempt, time.Now(),
+			); err != nil {
+				fail(fmt.Errorf("service %q replica %d: %w", name, slot, err))
+				desiredFailed = true
+				pass.pending = true
+				// The pre-start attempt record is still durable; only the
+				// container identity refinement failed. Hold the same hard window
+				// in the process-local floor so notifications cannot retry early.
+				floorAt := time.Now().Add(servicePreparationBackoff(
+					effectiveHealthcheck.Interval, attempt))
+				stateTracker.noteRetryFloor(
+					candidateRetryFloorKey(fnName, name, slot, desiredGeneration),
+					floorAt, attempt)
+				pass.retryNotBefore = earlierDeadline(pass.retryNotBefore, floorAt)
+				return false
+			}
+			return true
+		}
 		for slot := 0; slot < svc.Replicas; slot++ {
+			if superseded() {
+				pass.superseded = true
+				abortPass = true
+				break
+			}
 			group := slotGroups[slot]
 			sort.Slice(group, func(i, j int) bool { return group[i].ID < group[j].ID })
-			var matches, olds []runtime.ServiceContainer
-			pendingReadiness := false
-			for _, ctr := range group {
-				switch {
-				case converged(ctr):
-					matches = append(matches, ctr)
-				case notReady(ctr):
-					pendingReadiness = true
-					olds = append(olds, ctr)
-				default:
-					olds = append(olds, ctr)
+
+			// A committed marker for THIS desired generation designates an already
+			// active replica. An active replica that later becomes unhealthy remains
+			// active: health alone must never replace it. Only its exit/death or a
+			// changed desired generation makes the marker inapplicable.
+			committed, hasCommitted := runtime.ServiceConvergenceState{}, false
+			if stateTracker != nil {
+				committed, hasCommitted = stateTracker.committedState(fnName, name, slot)
+			}
+			activeID := ""
+			if hasCommitted && committed.Generation == desiredGeneration {
+				for _, ctr := range group {
+					if ctr.ID == committed.CommittedContainerID &&
+						usableServiceContainer(ctr) &&
+						configured(ctr) && sourceOK(ctr) {
+						activeID = ctr.ID
+						break
+					}
 				}
 			}
 
+			var matches, olds, starting, failed []runtime.ServiceContainer
+			genericPending := false
+			for _, ctr := range group {
+				if ctr.ID == activeID {
+					matches = append(matches, ctr)
+					continue
+				}
+				if hasCommitted && committed.Generation == desiredGeneration &&
+					ctr.ID == committed.CommittedContainerID {
+					// The committed active replica is no longer usable (exited/dead).
+					// This is crash recovery, not a health transition and not a retry
+					// attempt: keep it as a non-serving old generation and start a fresh
+					// first-attempt replacement.
+					olds = append(olds, ctr)
+					continue
+				}
+				if effectiveHealthcheck != nil && configured(ctr) && sourceOK(ctr) {
+					switch {
+					case ctr.State == container.StateRunning && ctr.Health == container.Healthy:
+						// A healthy config-matching container without a committed
+						// marker is an uncommitted candidate ready to be adopted or
+						// committed in this pass.
+						matches = append(matches, ctr)
+					case ctr.State == container.StateRunning &&
+						(ctr.Health == container.Starting || ctr.Health == "") &&
+						!runtime.ServiceHealthCandidateExpired(ctr, effectiveHealthcheck):
+						starting = append(starting, ctr)
+					default:
+						// Unhealthy, exited/dead, or starting past its durable
+						// deadline: a failed candidate that must wait for bounded
+						// retry eligibility.
+						failed = append(failed, ctr)
+					}
+					continue
+				}
+				if configured(ctr) && sourceOK(ctr) && ctr.State == container.StateRunning {
+					if serviceReady(ctr) {
+						matches = append(matches, ctr)
+					} else {
+						// A backend readiness signal without a healthcheck keeps the
+						// historical pending-until-ready behavior.
+						genericPending = true
+						olds = append(olds, ctr)
+					}
+					continue
+				}
+				olds = append(olds, ctr)
+			}
+
 			if len(matches) > 0 {
-				// A converged replica already holds the slot: keep the lowest-ID
-				// one (stable, list-order independent) and clean up every other
-				// matching duplicate plus every superseded generation in the
-				// slot. The desired replica is already running, so stopping the
-				// rest cannot take the slot down.
-				stale = append(stale, matches[1:]...)
-				stale = append(stale, olds...)
+				keep := matches[0]
+				if activeID != "" {
+					// A committed active replica always wins over an uncommitted
+					// healthy candidate in the same slot.
+					for _, candidate := range matches {
+						if candidate.ID == activeID {
+							keep = candidate
+							break
+						}
+					}
+				}
+				// Revalidate the commit candidates immediately before writing the
+				// durable marker and stopping superseded generations. A stale list
+				// snapshot is never sufficient authority for a health-gated commit.
+				// Every already-listed healthy candidate is tried in deterministic
+				// (container ID) order: rejecting the first one must not discard the
+				// others and start a needless replacement while a sibling candidate
+				// is still viable.
+				if effectiveHealthcheck != nil && keep.ID != activeID {
+					var remaining []runtime.ServiceContainer
+					authorized := false
+					for i, candidate := range matches {
+						observation, outcome := observeServiceContainer(postCtx, docker, candidate.ID)
+						if outcome == serviceProbeUnavailable {
+							keep = candidate
+							authorized = true
+							remaining = append(remaining, matches[i+1:]...)
+							break
+						}
+						if outcome == serviceProbeFailed {
+							// An ambiguous probe must never authorize a commit, retire
+							// the old generation, or start a duplicate candidate. Keep
+							// observing this candidate and try the next match.
+							starting = append(starting, candidate)
+							continue
+						}
+						if observation.Missing || observation.State != container.StateRunning ||
+							observation.Health != container.Healthy {
+							candidate.Health = observation.Health
+							candidate.State = observation.State
+							if observation.Missing || observation.State != container.StateRunning ||
+								observation.Health == container.Unhealthy ||
+								runtime.ServiceHealthCandidateExpired(candidate, effectiveHealthcheck) {
+								failed = append(failed, candidate)
+							} else {
+								starting = append(starting, candidate)
+							}
+							continue
+						}
+						keep = candidate
+						authorized = true
+						remaining = append(remaining, matches[i+1:]...)
+						break
+					}
+					if !authorized {
+						matches = nil
+					} else {
+						// Only the authorized candidate holds the slot. The others
+						// were classified into starting/failed above, or are extra
+						// healthy duplicates queued here. Reducing `matches` to just
+						// the kept candidate means the stop loop below (which also
+						// skips the kept ID) cannot list any candidate twice.
+						matches = []runtime.ServiceContainer{keep}
+						stale = append(stale, remaining...)
+					}
+				}
+				if len(matches) > 0 {
+					if effectiveHealthcheck != nil && keep.ID != activeID {
+						if superseded() {
+							pass.superseded = true
+							abortPass = true
+							break
+						}
+						// Defer the durable marker write until the final readiness
+						// revalidation below. Writing it here would authorize retirement
+						// if the candidate later loses readiness before the deferred stop.
+						commitIntents = append(commitIntents, commitIntent{
+							name: name, replica: slot, generation: desiredGeneration,
+							id: keep.ID, attempt: serviceHealthAttemptNumber(keep),
+						})
+					}
+					// A committed/healthy replica holds the slot. Everything else in the
+					// slot is safe to stop. Exclude the kept candidate itself: with an
+					// active replica chosen out of list order (committed precedence),
+					// a plain matches[1:] could stop the replica being kept.
+					for _, candidate := range matches {
+						if candidate.ID != keep.ID {
+							stale = append(stale, candidate)
+						}
+					}
+					stale = append(stale, olds...)
+					stale = append(stale, starting...)
+					stale = append(stale, failed...)
+					continue
+				}
+			}
+
+			if len(starting) > 0 || genericPending {
+				pass.pending = true
+				for _, ctr := range starting {
+					addCandidate(ctr)
+					if effectiveHealthcheck == nil {
+						continue
+					}
+					if deadline, ok := serviceHealthStartupDeadline(ctr, effectiveHealthcheck); ok {
+						pass.startupDeadline = earlierDeadline(pass.startupDeadline, deadline)
+					} else {
+						pass.startupDeadline = earlierDeadline(pass.startupDeadline,
+							time.Now().Add(effectiveHealthcheck.Interval))
+					}
+					// Ensure the attempt/start record exists for a starting
+					// candidate this process did not just create (a previous
+					// process, or an earlier write that failed): a candidate that
+					// disappears before its failure is observed must still be
+					// converted into the SAME attempt's backoff after a restart.
+					if stateTracker == nil {
+						continue
+					}
+					if _, ok := stateTracker.startedCandidateState(
+						fnName, name, slot, desiredGeneration, ctr.ID,
+					); ok {
+						continue
+					}
+					startedAt := ctr.StartedAt
+					if startedAt.IsZero() {
+						startedAt = time.Now()
+					}
+					if err := stateTracker.recordCandidateStarted(
+						ctx, fnName, name, slot, desiredGeneration,
+						ctr.ID, serviceHealthAttemptNumber(ctr), startedAt,
+					); err != nil {
+						fail(fmt.Errorf("service %q replica %d: %w", name, slot, err))
+						desiredFailed = true
+					}
+				}
 				continue
 			}
 
-			if pendingReadiness {
-				// The backend accepted a config-matching replacement but has
-				// not terminally converged it. End the pass pending: another
-				// StartService would duplicate the candidate and stopping any
-				// old generation would remove the slot's fallback. A later wake
-				// re-reads the backend's current readiness.
-				pass.pending = true
-				break
+			if len(failed) > 0 {
+				nextAttempt := runtime.ServiceHealthAttempt(failed)
+				retryFrom := failed[0]
+				for _, ctr := range failed[1:] {
+					if serviceHealthAttemptNumber(ctr) > serviceHealthAttemptNumber(retryFrom) {
+						retryFrom = ctr
+					}
+				}
+				attempt := serviceHealthAttemptNumber(retryFrom)
+				// The durable marker is the floor, not only the exact candidate
+				// label: an attempt whose container vanished keeps its number in
+				// the marker, and a later failure in the same generation must not
+				// regress below it.
+				if stateTracker != nil {
+					if recorded, ok := stateTracker.committedState(
+						fnName, name, slot,
+					); ok && recorded.CandidateGeneration == desiredGeneration &&
+						recorded.CandidateAttempt > attempt {
+						attempt = recorded.CandidateAttempt
+						if attempt+1 > nextAttempt {
+							nextAttempt = attempt + 1
+						}
+					}
+				}
+				// Failure eligibility is durable: use the recorded failure instant
+				// when this exact candidate already persisted one, or the recorded
+				// slot-level preparation window when the last start failed before a
+				// candidate existed. Otherwise this is the first observation of the
+				// failure, so anchor the backoff at NOW and record it before
+				// returning pending. Container create time alone cannot represent a
+				// failure that happened after several probe intervals.
+				recordedRetryAt := time.Time{}
+				if stateTracker != nil {
+					if recorded, ok := stateTracker.candidateState(
+						fnName, name, slot, desiredGeneration, retryFrom.ID,
+					); ok {
+						recordedRetryAt = recorded.RetryNotBefore
+					} else if recorded, ok := stateTracker.slotPreparationState(
+						fnName, name, slot, desiredGeneration,
+					); ok {
+						// The preparation attempt already consumed this number, so
+						// the next start continues from it rather than resetting.
+						if recorded.CandidateAttempt >= attempt {
+							attempt = recorded.CandidateAttempt
+							nextAttempt = attempt + 1
+						}
+						recordedRetryAt = recorded.RetryNotBefore
+					}
+				}
+				eligibleAt := time.Now().Add(serviceHealthBackoff(
+					effectiveHealthcheck.Interval, attempt))
+				if !recordedRetryAt.IsZero() {
+					eligibleAt = recordedRetryAt
+				}
+				if stateTracker != nil {
+					floorKey := candidateRetryFloorKey(fnName, name, slot, desiredGeneration)
+					floor := stateTracker.retryFloorFor(floorKey)
+					if floor.until.After(eligibleAt) {
+						// The process-local floor can be the only record when a
+						// marker write failed; it must still gate this process.
+						eligibleAt = floor.until
+					}
+					if floor.attempt > attempt {
+						attempt = floor.attempt
+						nextAttempt = attempt + 1
+					}
+					if recordedRetryAt.IsZero() {
+						stateTracker.noteRetryFloor(floorKey, eligibleAt, attempt)
+						if err := stateTracker.recordCandidateFailure(
+							ctx, fnName, name, slot, desiredGeneration, retryFrom.ID,
+							attempt, eligibleAt,
+						); err != nil {
+							fail(fmt.Errorf("service %q replica %d: %w", name, slot, err))
+							desiredFailed = true
+							// The failed generation is retained and the slot is
+							// reported pending: no replacement can start before the
+							// window. The write failed, so the floor above keeps the
+							// SAME hard window in this process.
+							pass.pending = true
+							pass.retryNotBefore = earlierDeadline(
+								pass.retryNotBefore, eligibleAt)
+							for _, ctr := range failed {
+								addCandidate(ctr)
+							}
+							continue
+						}
+					}
+				}
+				if time.Now().Before(eligibleAt) {
+					// Bounded retry eligibility is authoritative. No start and no stop
+					// of the slot's fallback may run before it; Notify cannot bypass
+					// this because the coordinator holds the same hard deadline.
+					pass.pending = true
+					pass.retryNotBefore = earlierDeadline(pass.retryNotBefore, eligibleAt)
+					for _, ctr := range failed {
+						addCandidate(ctr)
+					}
+					continue
+				}
+				// Eligible: start exactly one new candidate with the next durable
+				// attempt. Keep only the highest-attempt failed generation as the
+				// retry-metadata/fallback carrier and remove additional failed
+				// generations before starting, so repeated failures cannot accumulate
+				// duplicate candidates. Failed generations stay until a viable
+				// replacement exists.
+				if len(failed) > 1 {
+					var extra []runtime.ServiceContainer
+					for _, ctr := range failed {
+						if ctr.ID != retryFrom.ID {
+							extra = append(extra, ctr)
+						}
+					}
+					if superseded() {
+						pass.superseded = true
+						abortPass = true
+						break
+					}
+					changed = true
+					corrective = true
+					notifyReconcile()
+					cleanupCtx, cleanupCancel := bounded()
+					stopped, known, err := stopServiceContainers(cleanupCtx, docker, extra)
+					cleanupCancel()
+					pass.stopped += stopped
+					pass.stoppedKnown = pass.stoppedKnown && known
+					if err != nil {
+						fail(fmt.Errorf("service %q failed candidates: %w", name, err))
+						desiredFailed = true
+						continue
+					}
+					failed = []runtime.ServiceContainer{retryFrom}
+				}
+				fallback := pickServiceFallback(olds)
+				changed = true
+				corrective = true
+				notifyReconcile()
+				if superseded() {
+					pass.superseded = true
+					abortPass = true
+					break
+				}
+				if !beginCandidateAttempt(slot, nextAttempt) {
+					continue
+				}
+				startedID, err := docker.StartService(postCtx, newSpec(nextAttempt), slot)
+				if err != nil {
+					if errors.Is(err, ErrServicePending) {
+						handlePendingStart(slot, startedID, nextAttempt, failed)
+						continue
+					}
+					fail(fmt.Errorf("service %q replica %d: %w", name, slot, err))
+					desiredFailed = true
+					if !requestCancelled(ctx, err) {
+						log.Warn("Service: replacement failed; keeping old replica",
+							"app", fnName, "service", name, "replica", slot, "error", err)
+					}
+					retryStartFailure(slot, nextAttempt)
+					for i := range olds {
+						if !usableServiceContainer(olds[i]) {
+							stale = append(stale, olds[i])
+						}
+					}
+					continue
+				}
+				if effectiveHealthcheck != nil {
+					if superseded() {
+						pass.superseded = true
+						abortPass = true
+						break
+					}
+					if !recordStartedCandidate(slot, startedID, nextAttempt) {
+						addCandidateID(startedID)
+						for _, ctr := range failed {
+							addCandidate(ctr)
+						}
+						continue
+					}
+					observation, outcome := observeServiceContainer(postCtx, docker, startedID)
+					if outcome == serviceProbeFailed ||
+						(outcome == serviceProbeObserved &&
+							(observation.Missing || observation.State != container.StateRunning ||
+								observation.Health != container.Healthy)) {
+						pass.pending = true
+						pass.startupDeadline = earlierDeadline(pass.startupDeadline,
+							time.Now().Add(effectiveHealthcheck.Interval))
+						addCandidateID(startedID)
+						for _, ctr := range failed {
+							addCandidate(ctr)
+						}
+						continue
+					}
+					commitIntents = append(commitIntents, commitIntent{
+						name: name, replica: slot, generation: desiredGeneration,
+						id: startedID, attempt: nextAttempt,
+					})
+				}
+				started++
+				pass.started++
+				if effectiveHealthcheck == nil && fallback != nil && startedID != "" {
+					provisional = append(provisional, runtime.ServiceContainer{
+						ID: startedID, App: fnName, Name: name,
+						State: container.StateRunning,
+					})
+				}
+				stale = append(stale, failed...)
+				stale = append(stale, olds...)
+				continue
 			}
 
 			// A source-only change under an unchanged image and configuration is
@@ -1081,10 +2039,6 @@ func reconcileWithObserver(
 							log.Warn("Service: source reload restart failed; keeping generation",
 								"app", fnName, "service", name, "replica", slot, "error", err)
 						}
-						// Preserve usable olds (the restart may have left the
-						// container running); a non-usable old can never serve, so
-						// it is cleaned up. The next pass retries the reload, or the
-						// normal crash replacement takes over.
 						for i := range olds {
 							if !usableServiceContainer(olds[i]) {
 								stale = append(stale, olds[i])
@@ -1103,61 +2057,132 @@ func reconcileWithObserver(
 				}
 			}
 
-			// No converged replica holds the slot. The lowest-ID usable
-			// (running or restarting) non-converged generation in the slot is
-			// the fallback: the replacement is started first, and the fallback
-			// is stopped only once StartService has confirmed the replacement
-			// is running. Prefer an actually-ready fallback so an explicitly
-			// unready candidate never displaces the last serving generation.
-			var fallback *runtime.ServiceContainer
-			for i := range olds {
-				if readyServiceContainer(olds[i]) {
-					fallback = &olds[i]
-					break
+			// No usable generation holds the slot. The fallback is started first; it
+			// is stopped only after a viable replacement exists.
+			fallback := pickServiceFallback(olds)
+			// A durable marker for THIS desired generation is the only remaining
+			// record of an attempt whose container is gone: a failed candidate, a
+			// STARTED candidate that disappeared before its failure was observed, or
+			// a preparation failure that never produced a container. Honor it (or
+			// convert it into a durable failure window anchored at its recorded
+			// start instant) BEFORE starting anything, so a restart can never reset
+			// the attempt or admit a retry that is not durably eligible.
+			durableAttempt := 0
+			if effectiveHealthcheck != nil && stateTracker != nil {
+				floorKey := candidateRetryFloorKey(fnName, name, slot, desiredGeneration)
+				floor := stateTracker.retryFloorFor(floorKey)
+				if time.Now().Before(floor.until) {
+					// A failed marker write can leave the process-local floor as
+					// the ONLY eligibility record. Honor it before consulting any
+					// marker or starting anything.
+					pass.pending = true
+					pass.retryNotBefore = earlierDeadline(pass.retryNotBefore, floor.until)
+					continue
 				}
-			}
-			if fallback == nil {
-				for i := range olds {
-					if usableServiceContainer(olds[i]) {
-						fallback = &olds[i]
-						break
+				if recorded, ok := stateTracker.committedState(fnName, name, slot); ok &&
+					recorded.CandidateGeneration == desiredGeneration {
+					present := false
+					if recorded.CandidateContainerID != "" {
+						for _, ctr := range group {
+							if ctr.ID == recorded.CandidateContainerID {
+								present = true
+								break
+							}
+						}
+					}
+					if !present {
+						switch {
+						case !recorded.RetryNotBefore.IsZero():
+							if time.Now().Before(recorded.RetryNotBefore) {
+								pass.pending = true
+								pass.retryNotBefore = earlierDeadline(
+									pass.retryNotBefore, recorded.RetryNotBefore)
+								continue
+							}
+							durableAttempt = recorded.CandidateAttempt
+						default:
+							// The persisted attempt/start record has no container
+							// (the start never completed) or its container vanished
+							// before its failure was recorded. Turn it into the SAME
+							// attempt's durable failed window before any new start.
+							attempt := recorded.CandidateAttempt
+							if floor.attempt > attempt {
+								attempt = floor.attempt
+							}
+							if attempt < 1 {
+								attempt = 1
+							}
+							// The FAILURE instant was never persisted — that is why
+							// this record has no RetryNotBefore. The start operation
+							// may also have run longer than the backoff, so anchoring
+							// at CandidateStartedAt could already be elapsed and start
+							// attempt N+1 immediately after the unrecorded outcome.
+							// Anchor at RECOVERY time instead: this can only delay,
+							// never start sooner than a full backoff after the
+							// outcome, and preserves the attempt number.
+							eligibleAt := time.Now().Add(serviceHealthBackoff(
+								effectiveHealthcheck.Interval, attempt))
+							stateTracker.noteRetryFloor(floorKey, eligibleAt, attempt)
+							if err := stateTracker.recordCandidateFailure(
+								ctx, fnName, name, slot, desiredGeneration,
+								recorded.CandidateContainerID, attempt, eligibleAt,
+							); err != nil {
+								fail(fmt.Errorf("service %q replica %d: %w", name, slot, err))
+								desiredFailed = true
+								pass.pending = true
+								// Not durable: the floor above keeps the same hard
+								// window in this process so notifications cannot
+								// start a replacement early. A restart re-derives.
+								pass.retryNotBefore = earlierDeadline(
+									pass.retryNotBefore, eligibleAt)
+								continue
+							}
+							if time.Now().Before(eligibleAt) {
+								pass.pending = true
+								pass.retryNotBefore = earlierDeadline(
+									pass.retryNotBefore, eligibleAt)
+								continue
+							}
+							durableAttempt = attempt
+						}
 					}
 				}
 			}
-
+			attempt := 1
+			if durableAttempt > 0 {
+				attempt = durableAttempt + 1
+			} else if effectiveHealthcheck != nil {
+				attempt = runtime.ServiceHealthAttempt(failed)
+			}
 			changed = true
 			corrective = true
 			notifyReconcile()
-			startedID, err := docker.StartService(postCtx, newSpec(), slot)
+			if superseded() {
+				pass.superseded = true
+				abortPass = true
+				break
+			}
+			if !beginCandidateAttempt(slot, attempt) {
+				continue
+			}
+			startedID, err := docker.StartService(postCtx, newSpec(attempt), slot)
 			if err != nil {
 				if errors.Is(err, ErrServicePending) {
-					// The replacement was accepted but is not terminally
-					// converged. This is not a failure: keep every usable old
-					// generation and end the pass so the coordinator can wait
-					// for a later wake. No stop may run for this service.
-					pass.pending = true
-					postCancel()
-					break
+					handlePendingStart(slot, startedID, attempt, nil)
+					continue
 				}
 				fail(fmt.Errorf("service %q replica %d: %w", name, slot, err))
 				desiredFailed = true
 				if !requestCancelled(ctx, err) {
 					if fallback != nil {
-						// The replacement failed: preserve the slot's usable old
-						// generation(s) so the service keeps serving, and retry on
-						// the next reconcile. Leaving them out of stale is the
-						// suppression: they are not stopped this pass.
 						log.Warn("Service: replacement failed; keeping old replica",
 							"app", fnName, "service", name, "replica", slot, "error", err)
 					} else {
-						// No old fallback for this slot: retain unavailable
-						// semantics and retry on the next reconcile.
 						log.Warn("Service: replica unavailable",
 							"app", fnName, "service", name, "replica", slot, "error", err)
 					}
 				}
-				// Usable olds stay as fallbacks; a non-usable old can never
-				// serve, so it is cleaned up even when the replacement failed.
+				retryStartFailure(slot, attempt)
 				for i := range olds {
 					if !usableServiceContainer(olds[i]) {
 						stale = append(stale, olds[i])
@@ -1165,16 +2190,34 @@ func reconcileWithObserver(
 				}
 				continue
 			}
-			// StartService confirmed the replacement is running: the old
-			// generations in this slot are now safe to stop.
+			if effectiveHealthcheck != nil {
+				if superseded() {
+					pass.superseded = true
+					abortPass = true
+					break
+				}
+				if !recordStartedCandidate(slot, startedID, attempt) {
+					addCandidateID(startedID)
+					continue
+				}
+				observation, outcome := observeServiceContainer(postCtx, docker, startedID)
+				if outcome == serviceProbeFailed ||
+					(outcome == serviceProbeObserved &&
+						(observation.Missing || observation.State != container.StateRunning ||
+							observation.Health != container.Healthy)) {
+					pass.pending = true
+					pass.startupDeadline = earlierDeadline(pass.startupDeadline,
+						time.Now().Add(effectiveHealthcheck.Interval))
+					addCandidateID(startedID)
+					continue
+				}
+				commitIntents = append(commitIntents, commitIntent{
+					name: name, replica: slot, generation: desiredGeneration,
+					id: startedID, attempt: attempt,
+				})
+			}
 			started++
 			pass.started++
-			// A replacement that superseded a usable old generation is
-			// uncommitted until this service's stale stop runs. Record it so a
-			// supersession discovered at that commit boundary can remove this
-			// pass's own provisional container while preserving the old one; a
-			// slot with NO usable fallback is deliberately not recorded (there
-			// the replacement is the only running generation).
 			if fallback != nil && startedID != "" {
 				provisional = append(provisional, runtime.ServiceContainer{
 					ID: startedID, App: fnName, Name: name,
@@ -1184,11 +2227,7 @@ func reconcileWithObserver(
 			stale = append(stale, olds...)
 		}
 
-		if pass.pending {
-			// The pending slot may have started a provisional replacement, but
-			// this pass must not stop any old generation, excess replica, or
-			// removed service while convergence is not terminal. The next wake
-			// re-evaluates the current desired state.
+		if abortPass {
 			postCancel()
 			break
 		}
@@ -1222,12 +2261,12 @@ func reconcileWithObserver(
 		// lowest-ID usable one) and retry next pass.
 		surviving := started
 		for _, ctr := range existing {
-			if readyServiceContainer(ctr) && !containsStaleID(stale, ctr.ID) {
+			if serviceReady(ctr) && !containsStaleID(stale, ctr.ID) {
 				surviving++
 			}
 		}
 		if svc.Replicas > 0 && surviving == 0 {
-			if keep, ok := lowestUsableStale(stale); ok {
+			if keep, ok := lowestUsableStaleWith(stale, serviceReady); ok {
 				stale = removeStaleID(stale, keep.ID)
 				if !requestCancelled(ctx, firstErr) {
 					log.Warn("Service: no replacement could be confirmed; keeping a running replica",
@@ -1252,29 +2291,165 @@ func reconcileWithObserver(
 			// the old generation serving, so they must not inflate the summary.
 			pass.started -= len(provisional)
 			cleanupProvisional(ctx, bounded, docker, fnName, name, provisional, log)
+			// The abandoned attempt belongs to no serving generation and the
+			// newer request owns a fresh attempt sequence, so drop its durable
+			// record instead of making that request wait out its backoff.
+			if stateTracker != nil {
+				for _, ctr := range provisional {
+					stateTracker.clearAttemptForContainer(
+						ctx, fnName, name, svc.Replicas, desiredGeneration, ctr.ID)
+				}
+			}
 			provisional = nil
 			abortPass = true
 			postCancel()
 			break
 		}
 
-		// Stop the stale/excess generations now that the desired slots are
-		// running.
-		if len(stale) > 0 {
-			changed = true
-			corrective = true
-			notifyReconcile()
-			stopped, known, err := stopServiceContainers(postCtx, docker, stale)
-			pass.stopped += stopped
-			pass.stoppedKnown = pass.stoppedKnown && known
-			if err != nil {
-				fail(fmt.Errorf("service %q stale: %w", name, err))
-			}
-		}
+		// Defer the stale/excess generations until every desired service and slot
+		// has been attempted below.
+		deferredStale = append(deferredStale, stale...)
 		// The service committed: its provisional replacements are now the
 		// running generation and are no longer removable by a later supersession.
 		provisional = nil
 		postCancel()
+	}
+
+	// Final readiness/commit boundary: every candidate that would become the
+	// committed generation is revalidated ONE last time immediately before its
+	// marker is written and its superseded generations are retired. A marker is
+	// never written for a candidate that lost readiness here, so the previous
+	// marker (if any) remains authoritative and the fallback is preserved across
+	// this pass and future restarts.
+	if len(commitIntents) > 0 {
+		checkCtx, checkCancel := bounded()
+		for _, intent := range commitIntents {
+			if superseded() {
+				pass.superseded = true
+				abortPass = true
+				break
+			}
+			observation, outcome := observeServiceContainer(checkCtx, docker, intent.id)
+			authorized := outcome == serviceProbeUnavailable
+			if outcome == serviceProbeObserved {
+				authorized = !observation.Missing &&
+					observation.State == container.StateRunning &&
+					observation.Health == container.Healthy
+			}
+			if authorized {
+				if superseded() {
+					pass.superseded = true
+					abortPass = true
+					break
+				}
+				// The started record is normally written immediately after
+				// StartService. An ADOPTED (already healthy) candidate has none, so
+				// record it at this commit boundary too: the durable attempt/start
+				// record is what a later failure (or a restarted worker) derives its
+				// retry window from, so an unrecorded candidate is not committed and
+				// the old marker stays authoritative.
+				if stateTracker != nil {
+					if _, recorded := stateTracker.startedCandidateState(
+						fnName, intent.name, intent.replica,
+						intent.generation, intent.id,
+					); !recorded {
+						if err := stateTracker.recordCandidateStarted(
+							ctx, fnName, intent.name, intent.replica,
+							intent.generation, intent.id, intent.attempt, time.Now(),
+						); err != nil {
+							fail(fmt.Errorf("service %q replica %d: %w",
+								intent.name, intent.replica, err))
+							desiredFailed = true
+							deferredStale = removeStaleSlot(
+								deferredStale, intent.name, intent.replica)
+							pass.pending = true
+							addHealthCandidate(&pass, fnName, intent.id)
+							if hc := desired[intent.name].Healthcheck; hc != nil {
+								pass.startupDeadline = earlierDeadline(
+									pass.startupDeadline,
+									time.Now().Add(hc.Interval))
+							}
+							continue
+						}
+					}
+				}
+				if stateTracker != nil && stateTracker.stateStore != nil {
+					if err := stateTracker.commitServiceState(
+						ctx, fnName, intent.name, intent.replica,
+						intent.generation, intent.id,
+					); err != nil {
+						fail(fmt.Errorf("service %q replica %d: %w",
+							intent.name, intent.replica, err))
+						desiredFailed = true
+						deferredStale = removeStaleSlot(
+							deferredStale, intent.name, intent.replica)
+						pass.pending = true
+						addHealthCandidate(&pass, fnName, intent.id)
+					}
+				}
+				continue
+			}
+			// The candidate did not survive the final readiness check (or the
+			// probe was ambiguous/missing). Do not write a marker and do not
+			// retire its fallback.
+			deferredStale = removeStaleSlot(
+				deferredStale, intent.name, intent.replica)
+			pass.pending = true
+			addHealthCandidate(&pass, fnName, intent.id)
+			hc := desired[intent.name].Healthcheck
+			attempt := intent.attempt
+			if attempt < 1 {
+				attempt = 1
+			}
+			switch {
+			case outcome == serviceProbeFailed:
+				// Ambiguous probe: preserve the fallback and re-observe shortly.
+				if hc != nil {
+					pass.startupDeadline = earlierDeadline(pass.startupDeadline,
+						time.Now().Add(hc.Interval))
+				}
+			case observation.Missing || observation.State != container.StateRunning ||
+				observation.Health == container.Unhealthy:
+				interval := time.Second
+				if hc != nil {
+					interval = hc.Interval
+				}
+				eligibleAt := time.Now().Add(serviceHealthBackoff(interval, attempt))
+				pass.retryNotBefore = earlierDeadline(pass.retryNotBefore, eligibleAt)
+				if stateTracker != nil {
+					if err := stateTracker.recordCandidateFailure(
+						ctx, fnName, intent.name, intent.replica,
+						intent.generation, intent.id, attempt, eligibleAt,
+					); err != nil {
+						fail(fmt.Errorf("service %q replica %d: %w",
+							intent.name, intent.replica, err))
+						desiredFailed = true
+					}
+				}
+			default:
+				if hc != nil {
+					pass.startupDeadline = earlierDeadline(pass.startupDeadline,
+						time.Now().Add(hc.Interval))
+				}
+			}
+		}
+		checkCancel()
+	}
+	// Every desired service and replica slot has now been attempted (converged,
+	// pending, or failed). Stop the safe stale/excess generations collected from
+	// converged slots; a pending slot never contributed its fallback here.
+	if !abortPass && !superseded() && len(deferredStale) > 0 {
+		changed = true
+		corrective = true
+		notifyReconcile()
+		stopCtx, stopCancel := bounded()
+		stopped, known, err := stopServiceContainers(stopCtx, docker, deferredStale)
+		stopCancel()
+		pass.stopped += stopped
+		pass.stoppedKnown = pass.stoppedKnown && known
+		if err != nil {
+			fail(fmt.Errorf("service stale: %w", err))
+		}
 	}
 
 	// Removed services are stopped LAST: their containers are no longer desired,
@@ -1324,6 +2499,19 @@ func reconcileWithObserver(
 		pass.stoppedKnown = pass.stoppedKnown && known
 		if err != nil {
 			fail(fmt.Errorf("service removed: %w", err))
+		} else if stateTracker != nil && stateTracker.stateStore != nil {
+			names := make(map[string]bool, len(removed))
+			for _, ctr := range removed {
+				names[ctr.Name] = true
+			}
+			for removedName := range names {
+				if err := stateTracker.deleteServiceStates(
+					ctx, fnName, removedName,
+				); err != nil {
+					log.Debug("Service: remove convergence state failed",
+						"app", fnName, "service", removedName, "error", err)
+				}
+			}
 		}
 		stopCancel()
 	}
@@ -1365,6 +2553,321 @@ func cleanupProvisional(
 // false keeps an otherwise config-matching candidate pending.
 func serviceContainerReady(ctr runtime.ServiceContainer) bool {
 	return ctr.Ready == nil || *ctr.Ready
+}
+
+// pickFallbackWith chooses the deterministic last-resort serving generation for
+// a slot using the caller's readiness view: the lowest-ID actually-ready
+// container, else the lowest-ID usable (running/restarting) one.
+func pickFallbackWith(
+	containers []runtime.ServiceContainer,
+	ready func(runtime.ServiceContainer) bool,
+) *runtime.ServiceContainer {
+	for i := range containers {
+		if ready(containers[i]) {
+			return &containers[i]
+		}
+	}
+	for i := range containers {
+		if usableServiceContainer(containers[i]) {
+			return &containers[i]
+		}
+	}
+	return nil
+}
+
+// pickFallback chooses the deterministic last-resort serving generation for a
+// slot: the lowest-ID actually-ready container, else the lowest-ID usable
+// (running/restarting) one. Ordering is by container ID, never Docker list order.
+func pickFallback(containers []runtime.ServiceContainer) *runtime.ServiceContainer {
+	return pickFallbackWith(containers, readyServiceContainer)
+}
+
+func serviceHealthAttemptNumber(ctr runtime.ServiceContainer) int {
+	if ctr.HealthcheckAttempt < 1 {
+		return 1
+	}
+	return ctr.HealthcheckAttempt
+}
+
+// addHealthCandidate appends one unique pending healthcheck candidate hint to a
+// pass result.
+func addHealthCandidate(pass *servicePass, app, id string) {
+	if id == "" {
+		return
+	}
+	for _, existing := range pass.candidates {
+		if existing.ContainerID == id {
+			return
+		}
+	}
+	pass.candidates = append(pass.candidates, runtime.ServiceHealthCandidate{
+		App: app, ContainerID: id,
+	})
+}
+
+// removeStaleSlot returns stale without containers belonging to one service
+// replica slot. It may reuse the backing array; the caller must not alias the
+// original.
+func removeStaleSlot(
+	stale []runtime.ServiceContainer, name string, replica int,
+) []runtime.ServiceContainer {
+	out := stale[:0]
+	for _, ctr := range stale {
+		if ctr.Name == name && ctr.Replica == replica {
+			continue
+		}
+		out = append(out, ctr)
+	}
+	return out
+}
+
+// serviceGenerationIdentity is the desired implementation identity of one
+// service replica: every input that makes a container config-current. The
+// committed-generation marker compares this value so an active replica whose
+// desired configuration changed is never mistaken for the current active
+// generation. Routing labels are included sorted; nothing secret is part of it.
+func serviceGenerationIdentity(
+	sourceRef, image, imageID string,
+	port int,
+	environment, resources, tmpfs, networks, healthcheck, sourceID string,
+	entry []string,
+	labels map[string]string,
+) string {
+	fields := []string{
+		sourceRef,
+		image,
+		imageID,
+		fmt.Sprintf("%d", port),
+		environment,
+		resources,
+		tmpfs,
+		networks,
+		healthcheck,
+		sourceID,
+	}
+	fields = append(fields, entry...)
+	return serviceIdentityHash(fields, labels)
+}
+
+// servicePreparationIdentity is the generation identity available BEFORE the
+// service's source resolves. It covers every desired input a template or app
+// generation can change at that point: source descriptor, the app image an
+// `entrypoint` service runs (a Git source update changes it while the service
+// template stays byte-identical), port, replica count, routing host/path, the
+// FULL routing configuration identity (the generated Traefik labels, which embed
+// the network, entrypoints, cert resolver, priority, and host override), the
+// EFFECTIVE probe, tmpfs, resources, runtime, env/secret bindings, and the desired
+// network set. A new desired generation therefore resets a persisted preparation
+// retry window instead of inheriting an obsolete pre-candidate wait. The resolved
+// image content and resolved secret VALUES are deliberately absent: they cannot be
+// known before preparation succeeds, and the bounded window is capped regardless.
+//
+// sourceMounted mirrors what ResolveServiceImage is about to report: under
+// HOT_RELOAD Relay's probe is bypassed entirely, so the declared healthcheck is
+// NOT part of the identity (a healthcheck-only edit must not reset the retry
+// window) and the retry policy is the no-probe historical behavior.
+func servicePreparationIdentity(
+	fnName string, tmpl *app.Template, svc app.Service, appImage string,
+	serviceNetworks []string, traefik routing.TraefikConfig, sourceMounted bool,
+) string {
+	routeNetwork := ""
+	if svc.Host != "" {
+		routeNetwork = traefik.Network
+	}
+	networkSet := runtime.NetworkSet(
+		append(append([]string(nil), serviceNetworks...), routeNetwork))
+	fields := []string{
+		svc.SourceRef(),
+		fmt.Sprintf("%d", svc.Port),
+		fmt.Sprintf("%d", svc.Replicas),
+		svc.Host,
+		svc.Path,
+		runtime.ServiceTmpfsLabel(svc.Tmpfs),
+		tmpl.ResourceLimits().Fingerprint(),
+		tmpl.Runtime,
+		runtime.NetworksLabel(networkSet...),
+	}
+	if sourceMounted {
+		fields = append(fields, "source-mounted")
+	} else {
+		fields = append(fields, runtime.ServiceHealthcheckLabel(svc.Healthcheck))
+	}
+	if svc.Entrypoint != "" {
+		// An entrypoint service runs the app's own image; an image source runs
+		// its configured image reference, already covered by SourceRef.
+		fields = append(fields, "app-image", appImage)
+	}
+	for _, ev := range tmpl.EnvList() {
+		fields = append(fields, ev.Name+"="+ev.Value)
+	}
+	for _, sb := range tmpl.SecretList() {
+		fields = append(fields, sb.Name+"="+sb.Ref.String())
+	}
+	routingLabels := routing.TraefikLabels(fnName, svc.Name, svc.Host, svc.Path, svc.Port, traefik)
+	return serviceIdentityHash(fields, routingLabels)
+}
+
+// serviceIdentityHash hashes an ordered field list (and, when non-nil, a label
+// map's sorted key/value pairs) into the short identity used by service state.
+// The field order is part of the identity and must stay stable.
+func serviceIdentityHash(fields []string, labels map[string]string) string {
+	h := sha256.New()
+	write := func(field string) {
+		_, _ = h.Write([]byte(field))
+		_, _ = h.Write([]byte{0})
+	}
+	for _, field := range fields {
+		write(field)
+	}
+	keys := make([]string, 0, len(labels))
+	for key := range labels {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		write(key)
+		write(labels[key])
+	}
+	return hex.EncodeToString(h.Sum(nil))[:runtimeServiceHashLen]
+}
+
+const runtimeServiceHashLen = 16
+
+// maxServiceHealthRetryDelay caps one retry backoff interval. It is a polling
+// cap, not an attempt limit: the durable attempt and recorded failure instant keep
+// growing the eligibility window across restarts without ever giving up.
+const maxServiceHealthRetryDelay = time.Minute
+
+// serviceHealthBackoff is the bounded exponential retry delay for one failed
+// candidate: the configured probe interval doubled once per failed attempt, from
+// the interval up to max(one minute, interval). The cap can never be shorter
+// than the configured interval, so a template that probes less often than once a
+// minute (the config allows intervals up to one hour) is never retried faster
+// than its own cadence; a template that probes faster backs off to one minute.
+// There is no attempt cutoff — only the delay is capped.
+func serviceHealthBackoff(interval time.Duration, attempt int) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	limit := maxServiceHealthRetryDelay
+	if interval > limit {
+		limit = interval
+	}
+	delay := interval
+	for i := 1; i < attempt && delay < limit; i++ {
+		delay *= 2
+		if delay > limit {
+			delay = limit
+		}
+	}
+	return delay
+}
+
+// servicePreparationBackoff is the bounded exponential delay for retrying a
+// PREPARATION failure of a healthcheck-enabled service (a source/image,
+// environment/secret, routing-network, or create/start failure before any
+// candidate exists). The probe interval is a readiness cadence, not a
+// preparation cadence, so the first retry is never slower than one minute: a
+// short interval keeps its own cadence, while a long interval (up to one hour)
+// starts at one minute and doubles toward that interval. Only the delay is
+// capped; there is no attempt cutoff.
+func servicePreparationBackoff(interval time.Duration, attempt int) time.Duration {
+	limit := maxServiceHealthRetryDelay
+	if interval > limit {
+		limit = interval
+	}
+	delay := interval
+	if delay <= 0 || delay > maxServiceHealthRetryDelay {
+		delay = maxServiceHealthRetryDelay
+	}
+	for i := 1; i < attempt && delay < limit; i++ {
+		delay *= 2
+		if delay > limit {
+			delay = limit
+		}
+	}
+	return delay
+}
+
+// serviceHealthStartupDeadline is the durable point after which a still-starting
+// candidate is a failed attempt. It is derived from the instant Docker actually
+// STARTED the container plus the desired startup grace and retry window, so the
+// coordinator can install the exact wake deadline and a restart reconstructs the
+// same instant. Create time is not a substitute: create→start can be delayed,
+// and a create-time deadline would expire a freshly started candidate early.
+// When no durable start instant is available the caller falls back to a
+// bounded re-observation from now, and expiry waits for Docker's own unhealthy
+// transition (see runtime.ServiceHealthCandidateExpired).
+func serviceHealthStartupDeadline(
+	ctr runtime.ServiceContainer, hc *app.ServiceHealthcheck,
+) (time.Time, bool) {
+	if hc == nil || ctr.StartedAt.IsZero() {
+		return time.Time{}, false
+	}
+	return ctr.StartedAt.Add(
+		hc.StartPeriod + time.Duration(hc.Retries+1)*hc.Interval), true
+}
+
+// serviceHealthProbe is the optional read-through readiness capability. The
+// production runtime Manager implements it; a minimal fake keeps using the list
+// snapshot.
+type serviceHealthProbe interface {
+	ObserveServiceHealth(
+		context.Context, []string,
+	) (map[string]runtime.ServiceHealthObservation, error)
+}
+
+// serviceSourceMountReporter is the optional capability reporting whether an
+// app's current prepared generation runs from a live source mount (HOT_RELOAD).
+// The production runtime Manager implements it; a Docker that does not (a
+// minimal fake) reports no mount, which matches the historical effective-probe
+// behavior (ResolveServiceImage would yield no mount in the same situation).
+type serviceSourceMountReporter interface {
+	ServiceSourceMounted(fnName string) bool
+}
+
+// serviceSourceMounted reports whether fnName's prepared generation bypasses
+// Relay's own Docker probe via a HOT_RELOAD source mount. It is deliberately
+// queried BEFORE source resolution (it is an in-memory record published by
+// Prepare), so preparation retries and the preparation identity follow the
+// EFFECTIVE probe: a HOT_RELOAD service ignores Relay healthchecks entirely,
+// including a healthcheck-only template edit.
+func serviceSourceMounted(docker Docker, fnName string) bool {
+	reporter, ok := docker.(serviceSourceMountReporter)
+	return ok && reporter.ServiceSourceMounted(fnName)
+}
+
+// serviceProbeOutcome distinguishes a Docker implementation that cannot probe
+// (a minimal fake, keeping the historical snapshot behavior) from a probe that
+// ran and failed to give an authoritative answer.
+type serviceProbeOutcome uint8
+
+const (
+	serviceProbeUnavailable serviceProbeOutcome = iota
+	serviceProbeObserved
+	serviceProbeFailed
+)
+
+// observeServiceContainer revalidates one candidate immediately before a commit
+// or stop. Unavailable means the seam does not implement probing (tests keep the
+// list snapshot). Observed carries a definitive Docker observation, including
+// Missing. Failed means the probe was attempted but could not produce an
+// authoritative answer; callers must fail closed.
+func observeServiceContainer(
+	ctx context.Context, docker Docker, id string,
+) (runtime.ServiceHealthObservation, serviceProbeOutcome) {
+	probe, available := docker.(serviceHealthProbe)
+	if !available || id == "" {
+		return runtime.ServiceHealthObservation{}, serviceProbeUnavailable
+	}
+	observations, err := probe.ObserveServiceHealth(ctx, []string{id})
+	if observation, ok := observations[id]; ok {
+		return observation, serviceProbeObserved
+	}
+	if err != nil {
+		return runtime.ServiceHealthObservation{}, serviceProbeFailed
+	}
+	return runtime.ServiceHealthObservation{}, serviceProbeFailed
 }
 
 // readyServiceContainer reports whether a container may be counted as an
@@ -1415,11 +2918,18 @@ func removeStaleID(stale []runtime.ServiceContainer, id string) []runtime.Servic
 // explicitly unready) container, so an unready candidate can never displace the
 // last ready generation. Only when no ready candidate exists does it fall back
 // to the lowest-ID usable running/restarting container.
-func lowestUsableStale(stale []runtime.ServiceContainer) (runtime.ServiceContainer, bool) {
-	if best, ok := lowestStaleMatching(stale, readyServiceContainer); ok {
+func lowestUsableStaleWith(
+	stale []runtime.ServiceContainer,
+	ready func(runtime.ServiceContainer) bool,
+) (runtime.ServiceContainer, bool) {
+	if best, ok := lowestStaleMatching(stale, ready); ok {
 		return best, ok
 	}
 	return lowestStaleMatching(stale, usableServiceContainer)
+}
+
+func lowestUsableStale(stale []runtime.ServiceContainer) (runtime.ServiceContainer, bool) {
+	return lowestUsableStaleWith(stale, readyServiceContainer)
 }
 
 func lowestStaleMatching(
@@ -1467,7 +2977,8 @@ func routingLabelsMatch(desired, actual map[string]string) bool {
 // RemoveAll stops and removes every service container belonging to fnName,
 // delegating to the Docker implementation's RemoveAppServiceContainers.
 // Used when an app is removed: its service containers must be stopped before
-// its images are retired (see the reconciler's RemoveServices hook ordering).
+// its images are retired (see the reconciler's deferred RemoveServices
+// settlement ordering).
 func RemoveAll(ctx context.Context, docker Docker, fnName string, log *slog.Logger) {
 	n, err := docker.RemoveAppServiceContainers(ctx, fnName)
 	if err != nil {
@@ -1613,6 +3124,1007 @@ func (c *ServiceReconciler) RemoveShutdownContainers(
 	return c.removeShutdownLocked(ctx, containers)
 }
 
+// serviceStateKey identifies one Docker-owned marker: one replica's
+// committed/candidate record on one node (kind ""), or the service-level
+// preparation retry record (kind runtime.ServiceStateKindPreparation). The kind
+// makes the two families independent, so a preparation failure and a failed
+// replica candidate never overwrite each other's attempt/window. Node scoping
+// keeps two workers sharing a daemon from consulting each other's markers.
+type serviceStateKey struct {
+	kind    string
+	nodeID  string
+	app     string
+	service string
+	replica int
+}
+
+// StateMarkerStore is the optional Docker-owned committed-generation store. The
+// production runtime Manager implements it; a minimal fake without it keeps the
+// historical in-memory behavior (every config-matching non-healthy container is
+// treated as an uncommitted candidate).
+type StateMarkerStore interface {
+	ListServiceConvergenceStates(ctx context.Context) ([]runtime.ServiceConvergenceState, error)
+	WriteServiceConvergenceState(ctx context.Context, state runtime.ServiceConvergenceState) error
+	DeleteServiceConvergenceStates(ctx context.Context, app, service, nodeID string) error
+}
+
+// stateMarkerKindDeleter is the optional marker-family delete capability. The
+// production runtime Manager implements it; a store that does not falls back to
+// a kind-scoped cleared-record write (whose write cleanup removes older markers
+// of the same family). It exists so a service's obsolete preparation-retry
+// markers can be removed without touching the replica's committed/candidate
+// markers.
+type stateMarkerKindDeleter interface {
+	DeleteServiceConvergenceStatesForKind(
+		ctx context.Context, app, service, nodeID, kind string,
+	) error
+}
+
+// serviceStateLoadDeletion records a cache deletion (one app, or one service
+// when service is non-empty) that raced the one-time marker load. It is the
+// tombstone that keeps a snapshot taken before the deletion from resurrecting
+// the deleted markers in the cache. anyKind records an app/service removal
+// (every marker family); otherwise it is scoped to one marker family (kind).
+type serviceStateLoadDeletion struct {
+	anyKind bool
+	kind    string
+	app     string
+	service string
+}
+
+// matches reports whether the deletion covers a discovered marker. Node identity
+// is deliberately not part of the match: forgetServiceState drops every cached
+// key for the app/service regardless of node, so the tombstone mirrors it.
+func (d serviceStateLoadDeletion) matches(state runtime.ServiceConvergenceState) bool {
+	if state.App != d.app {
+		return false
+	}
+	if d.service != "" && state.Service != d.service {
+		return false
+	}
+	return d.anyKind || state.Kind == d.kind
+}
+
+// ensureConvergenceStates loads the newest committed marker for every service
+// replica once per reconciler. A load failure is returned so the pass fails
+// closed rather than mistaking an active replica for an uncommitted candidate.
+//
+// Initialization is serialized by stateInitMu, NOT by the cache mutex: the
+// marker list is a Docker call, and holding the cache lock across network I/O
+// would block every concurrent pass of every app behind one daemon round trip.
+// stateMu only guards the in-memory cache. The list runs on its own bounded
+// operation context (see stateOpContext), so a hung daemon cannot pin a service
+// worker forever. A failed load leaves the reconciler uninitialized: the next
+// caller retries instead of treating an empty cache as authoritative.
+//
+// The load is a SNAPSHOT, and other operations mutate the cache (and Docker)
+// while it is in flight: Remove/deleteServiceStates and pruning delete markers,
+// and a marker write can update the cache. Replacing the cache with the raw
+// snapshot would resurrect a marker deleted from Docker during the load (for
+// example a removed app's preparation-retry window, which a re-added app with
+// the same desired identity would then wrongly inherit) or discard a newer
+// in-memory write. The merge below therefore starts the load as a tracked
+// revision: every cache write and every forget during the load is recorded, a
+// discovered entry whose key was written or deleted meanwhile is ignored (the
+// in-memory result is newer), and a written entry is re-applied from the cache.
+func (c *ServiceReconciler) ensureConvergenceStates(ctx context.Context) error {
+	c.stateInitMu.Lock()
+	defer c.stateInitMu.Unlock()
+	c.stateMu.Lock()
+	loaded := c.stateLoaded
+	c.stateMu.Unlock()
+	if loaded {
+		return nil
+	}
+	if c.stateStore == nil {
+		c.stateMu.Lock()
+		c.stateLoaded = true
+		c.stateMu.Unlock()
+		return nil
+	}
+	c.stateMu.Lock()
+	c.stateLoadActive = true
+	c.stateLoadTouched = nil
+	c.stateLoadDeletions = nil
+	c.stateMu.Unlock()
+
+	loadCtx, cancel := c.stateOpContext(ctx)
+	states, err := c.stateStore.ListServiceConvergenceStates(loadCtx)
+	cancel()
+	if err != nil {
+		c.stateMu.Lock()
+		c.stateLoadActive = false
+		c.stateLoadTouched = nil
+		c.stateLoadDeletions = nil
+		c.stateMu.Unlock()
+		return fmt.Errorf("service: load convergence state: %w", err)
+	}
+
+	c.stateMu.Lock()
+	merged := make(map[serviceStateKey]runtime.ServiceConvergenceState, len(states))
+	for _, state := range states {
+		if c.nodeID != "" && state.NodeID != c.nodeID {
+			continue
+		}
+		key := serviceStateKey{
+			kind: state.Kind, nodeID: state.NodeID, app: state.App,
+			service: state.Service, replica: state.Replica,
+		}
+		if c.stateLoadRaceLocked(key, state) {
+			continue
+		}
+		existing, ok := merged[key]
+		if ok && existing.UpdatedAt.After(state.UpdatedAt) {
+			continue
+		}
+		merged[key] = state
+	}
+	// Re-apply writes that landed while the list was in flight: they are newer
+	// than the snapshot. A key written and then forgotten has no cache entry and
+	// stays absent (the deletion tombstone already skipped the snapshot entry).
+	for key := range c.stateLoadTouched {
+		if state, ok := c.committed[key]; ok {
+			merged[key] = state
+		}
+	}
+	c.committed = merged
+	c.stateLoaded = true
+	c.stateLoadActive = false
+	c.stateLoadTouched = nil
+	c.stateLoadDeletions = nil
+	c.stateMu.Unlock()
+	return nil
+}
+
+// stateLoadRaceLocked reports whether a marker discovered by the in-flight load
+// must be ignored because the cache was mutated for it meanwhile. The caller must
+// hold stateMu.
+func (c *ServiceReconciler) stateLoadRaceLocked(
+	key serviceStateKey, state runtime.ServiceConvergenceState,
+) bool {
+	if !c.stateLoadActive {
+		return false
+	}
+	if _, touched := c.stateLoadTouched[key]; touched {
+		return true
+	}
+	for _, deletion := range c.stateLoadDeletions {
+		if deletion.matches(state) {
+			return true
+		}
+	}
+	return false
+}
+
+// serviceRetryFloorKey identifies one process-local retry window. It mirrors the
+// marker family key plus the generation, so a floor never leaks into a different
+// desired generation.
+type serviceRetryFloorKey struct {
+	kind       string
+	app        string
+	service    string
+	replica    int
+	generation string
+}
+
+// serviceRetryFloor is one process-local retry window: the earliest eligible
+// instant and the attempt it belongs to.
+type serviceRetryFloor struct {
+	until   time.Time
+	attempt int
+}
+
+// noteRetryFloor records the process-local eligibility for one key. It is called
+// whenever a retry window is installed, BEFORE the marker write is attempted, so
+// a failed write still holds the same hard eligibility and attempt in this
+// process.
+func (c *ServiceReconciler) noteRetryFloor(
+	key serviceRetryFloorKey, at time.Time, attempt int,
+) {
+	if at.IsZero() {
+		return
+	}
+	c.retryMu.Lock()
+	if c.retryFloor == nil {
+		c.retryFloor = map[serviceRetryFloorKey]serviceRetryFloor{}
+	}
+	if current, ok := c.retryFloor[key]; !ok || at.After(current.until) {
+		c.retryFloor[key] = serviceRetryFloor{until: at, attempt: attempt}
+	}
+	c.retryMu.Unlock()
+}
+
+// candidateRetryFloorKey identifies the per-replica candidate retry floor
+// (including slot-level start failures, which have no container yet).
+func candidateRetryFloorKey(app, service string, replica int, generation string) serviceRetryFloorKey {
+	return serviceRetryFloorKey{
+		app: app, service: service, replica: replica, generation: generation,
+	}
+}
+
+// preparationRetryFloorKey identifies the service-level preparation retry floor.
+func preparationRetryFloorKey(app, service, generation string) serviceRetryFloorKey {
+	return serviceRetryFloorKey{
+		kind:       runtime.ServiceStateKindPreparation,
+		app:        app,
+		service:    service,
+		generation: generation,
+	}
+}
+
+// retryFloorFor returns the process-local eligibility/attempt for one key (zero
+// when none is recorded).
+func (c *ServiceReconciler) retryFloorFor(key serviceRetryFloorKey) serviceRetryFloor {
+	c.retryMu.Lock()
+	defer c.retryMu.Unlock()
+	return c.retryFloor[key]
+}
+
+// clearRetryFloor drops one process-local window after its durable state became
+// authoritative or the attempt concluded.
+func (c *ServiceReconciler) clearRetryFloor(key serviceRetryFloorKey) {
+	c.retryMu.Lock()
+	delete(c.retryFloor, key)
+	c.retryMu.Unlock()
+}
+
+// clearRetryFloors drops every process-local window for one app (and, when
+// service is non-empty, one service). It is called when the app/service is
+// removed so the map cannot grow across generations.
+func (c *ServiceReconciler) clearRetryFloors(app, service string) {
+	c.retryMu.Lock()
+	defer c.retryMu.Unlock()
+	for key := range c.retryFloor {
+		if key.app == app && (service == "" || key.service == service) {
+			delete(c.retryFloor, key)
+		}
+	}
+}
+
+// rememberStateWriteLocked records a cache write that raced the one-time marker
+// load, so the snapshot cannot overwrite the newer in-memory value. The caller
+// must hold stateMu.
+func (c *ServiceReconciler) rememberStateWriteLocked(key serviceStateKey) {
+	if !c.stateLoadActive {
+		return
+	}
+	if c.stateLoadTouched == nil {
+		c.stateLoadTouched = map[serviceStateKey]struct{}{}
+	}
+	c.stateLoadTouched[key] = struct{}{}
+}
+
+// stateOpContext derives the bounded context for ONE Docker-owned marker
+// operation (list, write, or delete) from the pass's lifecycle context. The
+// marker store is a Docker API surface like any other, so a daemon that stops
+// answering must not hold a coordinator worker or a startup step indefinitely;
+// reconcileTimeout is the reconciler's normal-operation bound, and a
+// non-positive value leaves the operation bounded only by the lifecycle.
+// Bounding here covers every caller (pass-time writes, startup recovery, and
+// pruning) uniformly.
+func (c *ServiceReconciler) stateOpContext(
+	ctx context.Context,
+) (context.Context, context.CancelFunc) {
+	if c.reconcileTimeout > 0 {
+		return context.WithTimeout(ctx, c.reconcileTimeout)
+	}
+	return context.WithCancel(ctx)
+}
+
+func (c *ServiceReconciler) committedState(
+	app, service string, replica int,
+) (runtime.ServiceConvergenceState, bool) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	state, ok := c.committed[serviceStateKey{
+		nodeID: c.nodeID, app: app, service: service, replica: replica,
+	}]
+	return state, ok
+}
+
+// candidateState returns the durable failure metadata for the CURRENT desired
+// generation, if it belongs to the same candidate container. It is used to
+// reconstruct the exact retryNotBefore after a restart.
+func (c *ServiceReconciler) candidateState(
+	app, service string, replica int, generation, containerID string,
+) (runtime.ServiceConvergenceState, bool) {
+	state, ok := c.committedState(app, service, replica)
+	if !ok || state.CandidateGeneration != generation ||
+		state.CandidateContainerID != containerID ||
+		state.RetryNotBefore.IsZero() {
+		return runtime.ServiceConvergenceState{}, false
+	}
+	return state, true
+}
+
+// recordCandidateFailure persists the observed failure time and attempt in the
+// Docker-owned marker BEFORE the pass returns pending. It preserves the committed
+// generation fields so an old active replica remains distinguishable. Nothing is
+// cached on a failed write: the durable state is the authority a later attempt
+// (or a restarted worker) re-derives its eligibility from, so an unpersisted
+// window must never look recorded in memory.
+func (c *ServiceReconciler) recordCandidateFailure(
+	ctx context.Context, app, service string, replica int,
+	generation, containerID string, attempt int, retryAt time.Time,
+) error {
+	if c.stateStore == nil {
+		return nil
+	}
+	key := serviceStateKey{
+		nodeID: c.nodeID, app: app, service: service, replica: replica,
+	}
+	c.stateMu.Lock()
+	state := c.committed[key]
+	c.stateMu.Unlock()
+	state.App = app
+	state.Service = service
+	state.NodeID = c.nodeID
+	state.Replica = replica
+	state.CandidateGeneration = generation
+	state.CandidateContainerID = containerID
+	state.CandidateAttempt = attempt
+	state.RetryNotBefore = retryAt
+	state.UpdatedAt = time.Now()
+	writeCtx, cancel := c.stateOpContext(ctx)
+	err := c.stateStore.WriteServiceConvergenceState(writeCtx, state)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("service: record retry state: %w", err)
+	}
+	c.stateMu.Lock()
+	if c.committed == nil {
+		c.committed = map[serviceStateKey]runtime.ServiceConvergenceState{}
+	}
+	c.rememberStateWriteLocked(key)
+	c.committed[key] = state
+	c.stateMu.Unlock()
+	return nil
+}
+
+// recordCandidateStarted records a newly admitted candidate attempt: its
+// generation, attempt, container ID (empty while the attempt is admitted but no
+// container exists yet), and the instant the attempt began. It clears any prior
+// failure eligibility. The immutable attempt label is already on the container;
+// this marker makes the attempt durable BEFORE the container's outcome is known.
+// If the process then dies (or the failure write is unavailable), the attempt
+// record has no failure instant, so a restart converts it into the SAME attempt's
+// bounded window anchored at RECOVERY time — it may wait longer, but it never
+// retries sooner or resets the attempt. A write failure is returned: the caller
+// must not start or commit on an unrecorded attempt, and a failed write is never
+// cached.
+func (c *ServiceReconciler) recordCandidateStarted(
+	ctx context.Context, app, service string, replica int,
+	generation, containerID string, attempt int, startedAt time.Time,
+) error {
+	if c.stateStore == nil {
+		return nil
+	}
+	if attempt < 1 {
+		attempt = 1
+	}
+	if startedAt.IsZero() {
+		startedAt = time.Now()
+	}
+	key := serviceStateKey{
+		nodeID: c.nodeID, app: app, service: service, replica: replica,
+	}
+	c.stateMu.Lock()
+	state := c.committed[key]
+	c.stateMu.Unlock()
+	state.App = app
+	state.Service = service
+	state.NodeID = c.nodeID
+	state.Replica = replica
+	state.CandidateGeneration = generation
+	state.CandidateContainerID = containerID
+	state.CandidateAttempt = attempt
+	state.CandidateStartedAt = startedAt
+	state.RetryNotBefore = time.Time{}
+	state.UpdatedAt = time.Now()
+	writeCtx, cancel := c.stateOpContext(ctx)
+	err := c.stateStore.WriteServiceConvergenceState(writeCtx, state)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("service: record candidate state: %w", err)
+	}
+	c.stateMu.Lock()
+	if c.committed == nil {
+		c.committed = map[serviceStateKey]runtime.ServiceConvergenceState{}
+	}
+	c.rememberStateWriteLocked(key)
+	c.committed[key] = state
+	c.stateMu.Unlock()
+	return nil
+}
+
+// recordPreparationFailure persists a bounded retry window for a service whose
+// PREPARATION failed before any candidate existed (routing network unavailable,
+// source/image resolution, environment/secret resolution). It uses the DISTINCT
+// preparation marker family (ServiceStateKindPreparation), generation-fenced by
+// the preparation identity so a new desired generation starts a fresh attempt
+// sequence. It records no container: the attempt is admitted but has not produced
+// one. Because the family is separate, this write can never overwrite a replica's
+// candidate attempt/window (or a committed generation). The caller must not retry
+// before the returned window elapsed.
+func (c *ServiceReconciler) recordPreparationFailure(
+	ctx context.Context, app, service string, replica int,
+	generation string, attempt int, retryAt time.Time,
+) error {
+	if c.stateStore == nil {
+		return nil
+	}
+	if attempt < 1 {
+		attempt = 1
+	}
+	key := serviceStateKey{
+		kind:   runtime.ServiceStateKindPreparation,
+		nodeID: c.nodeID, app: app, service: service, replica: replica,
+	}
+	state := runtime.ServiceConvergenceState{
+		Kind:                runtime.ServiceStateKindPreparation,
+		App:                 app,
+		Service:             service,
+		NodeID:              c.nodeID,
+		Replica:             replica,
+		CandidateGeneration: generation,
+		CandidateAttempt:    attempt,
+		RetryNotBefore:      retryAt,
+		UpdatedAt:           time.Now(),
+	}
+	writeCtx, cancel := c.stateOpContext(ctx)
+	err := c.stateStore.WriteServiceConvergenceState(writeCtx, state)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("service: record preparation retry state: %w", err)
+	}
+	c.stateMu.Lock()
+	if c.committed == nil {
+		c.committed = map[serviceStateKey]runtime.ServiceConvergenceState{}
+	}
+	c.rememberStateWriteLocked(key)
+	c.committed[key] = state
+	c.stateMu.Unlock()
+	return nil
+}
+
+// recordPreparationAttempt persists an ADMITTED preparation attempt in the
+// preparation marker family BEFORE any source/network/env work. It records the
+// attempt number and its start instant with no retry window; a successful
+// preparation records its completion (see recordPreparationCompleted) and prunes
+// this family, while a failed attempt overwrites this record with its bounded
+// window. If the process dies in between (or the failure write is unavailable),
+// the admitted record lets a restart convert the unfinished attempt into the SAME
+// attempt's bounded failure anchored at RECOVERY time (the failure instant was
+// never persisted), so it never retries sooner or resets the attempt. An
+// admission whose exact start instant is matched by a completed record is instead
+// a leftover from a preparation that SUCCEEDED, and is never converted. The write
+// never touches a replica's committed/candidate marker.
+func (c *ServiceReconciler) recordPreparationAttempt(
+	ctx context.Context, app, service string, replica int,
+	generation string, attempt int, startedAt time.Time,
+) error {
+	if c.stateStore == nil {
+		return nil
+	}
+	if attempt < 1 {
+		attempt = 1
+	}
+	if startedAt.IsZero() {
+		startedAt = time.Now()
+	}
+	state := runtime.ServiceConvergenceState{
+		Kind:                runtime.ServiceStateKindPreparation,
+		App:                 app,
+		Service:             service,
+		NodeID:              c.nodeID,
+		Replica:             replica,
+		CandidateGeneration: generation,
+		CandidateAttempt:    attempt,
+		CandidateStartedAt:  startedAt,
+		UpdatedAt:           time.Now(),
+	}
+	writeCtx, cancel := c.stateOpContext(ctx)
+	err := c.stateStore.WriteServiceConvergenceState(writeCtx, state)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("service: record preparation attempt: %w", err)
+	}
+	key := serviceStateKey{
+		kind:   runtime.ServiceStateKindPreparation,
+		nodeID: c.nodeID, app: app, service: service, replica: replica,
+	}
+	c.stateMu.Lock()
+	if c.committed == nil {
+		c.committed = map[serviceStateKey]runtime.ServiceConvergenceState{}
+	}
+	c.rememberStateWriteLocked(key)
+	c.committed[key] = state
+	c.stateMu.Unlock()
+	return nil
+}
+
+// recordPreparationCompleted persists the successful OUTCOME of one admitted
+// preparation attempt, identified by its generation, attempt number, and start
+// instant. It is written immediately after preparation succeeds and before the
+// retry family is pruned, so a process that stops before cleanup (or a failed
+// cleanup write) leaves a durable record that the admission did not fail. The
+// completion lives in its own marker family: it can never be read as a retry
+// window, and pruning the retry family does not erase the outcome. It records no
+// container and no retry window. A later admission carries a different start
+// instant, so it never inherits this outcome.
+func (c *ServiceReconciler) recordPreparationCompleted(
+	ctx context.Context, app, service string, replica int,
+	generation string, attempt int, admittedAt time.Time,
+) error {
+	if c.stateStore == nil {
+		return nil
+	}
+	if attempt < 1 {
+		attempt = 1
+	}
+	state := runtime.ServiceConvergenceState{
+		Kind:                runtime.ServiceStateKindPreparationCompleted,
+		App:                 app,
+		Service:             service,
+		NodeID:              c.nodeID,
+		Replica:             replica,
+		CandidateGeneration: generation,
+		CandidateAttempt:    attempt,
+		CandidateStartedAt:  admittedAt,
+		UpdatedAt:           time.Now(),
+	}
+	writeCtx, cancel := c.stateOpContext(ctx)
+	err := c.stateStore.WriteServiceConvergenceState(writeCtx, state)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("service: record preparation completion: %w", err)
+	}
+	key := serviceStateKey{
+		kind:   runtime.ServiceStateKindPreparationCompleted,
+		nodeID: c.nodeID, app: app, service: service, replica: replica,
+	}
+	c.stateMu.Lock()
+	if c.committed == nil {
+		c.committed = map[serviceStateKey]runtime.ServiceConvergenceState{}
+	}
+	c.rememberStateWriteLocked(key)
+	c.committed[key] = state
+	c.stateMu.Unlock()
+	return nil
+}
+
+// preparationCompleted reports whether the exact admitted preparation attempt
+// (generation, attempt, and start instant) is durably known to have completed
+// successfully. Only that admission's outcome is matched: a different attempt or
+// a later admission of the same generation does not inherit it.
+func (c *ServiceReconciler) preparationCompleted(
+	app, service string, replica int, generation string, attempt int, admittedAt time.Time,
+) bool {
+	c.stateMu.Lock()
+	state, ok := c.committed[serviceStateKey{
+		kind:   runtime.ServiceStateKindPreparationCompleted,
+		nodeID: c.nodeID, app: app, service: service, replica: replica,
+	}]
+	c.stateMu.Unlock()
+	return ok && state.CandidateGeneration == generation &&
+		state.CandidateAttempt == attempt &&
+		state.CandidateStartedAt.Equal(admittedAt) &&
+		state.CandidateContainerID == "" && state.RetryNotBefore.IsZero()
+}
+
+// preparationAdmission returns the durable preparation-family record for one
+// replica when it is an ADMITTED attempt whose outcome was never recorded (no
+// retry window yet) for the given preparation generation.
+func (c *ServiceReconciler) preparationAdmission(
+	app, service string, replica int, generation string,
+) (runtime.ServiceConvergenceState, bool) {
+	c.stateMu.Lock()
+	state, ok := c.committed[serviceStateKey{
+		kind:   runtime.ServiceStateKindPreparation,
+		nodeID: c.nodeID, app: app, service: service, replica: replica,
+	}]
+	c.stateMu.Unlock()
+	if !ok || state.CandidateGeneration != generation ||
+		state.CandidateContainerID != "" || !state.RetryNotBefore.IsZero() ||
+		state.CandidateStartedAt.IsZero() {
+		return runtime.ServiceConvergenceState{}, false
+	}
+	return state, true
+}
+
+// preparationState returns the durable preparation retry state for one replica
+// when it belongs to the given preparation generation and records no container.
+// It reads only the preparation marker family, never a replica candidate record.
+func (c *ServiceReconciler) preparationState(
+	app, service string, replica int, generation string,
+) (runtime.ServiceConvergenceState, bool) {
+	c.stateMu.Lock()
+	state, ok := c.committed[serviceStateKey{
+		kind:   runtime.ServiceStateKindPreparation,
+		nodeID: c.nodeID, app: app, service: service, replica: replica,
+	}]
+	c.stateMu.Unlock()
+	if !ok || state.CandidateGeneration != generation ||
+		state.CandidateContainerID != "" || state.RetryNotBefore.IsZero() {
+		return runtime.ServiceConvergenceState{}, false
+	}
+	return state, true
+}
+
+// slotPreparationState returns the durable slot-level retry window recorded when
+// a start failed before any candidate existed. It lives in the CANDIDATE family
+// (kind "", no container ID) and is distinct from the service-level preparation
+// family, so a preparation failure can never overwrite a slot's candidate
+// attempt/window (and vice versa).
+func (c *ServiceReconciler) slotPreparationState(
+	app, service string, replica int, generation string,
+) (runtime.ServiceConvergenceState, bool) {
+	state, ok := c.committedState(app, service, replica)
+	if !ok || state.CandidateGeneration != generation ||
+		state.CandidateContainerID != "" || state.RetryNotBefore.IsZero() {
+		return runtime.ServiceConvergenceState{}, false
+	}
+	return state, true
+}
+
+// startedCandidateState returns the durable marker for one replica when it
+// describes the EXACT candidate container ID of the given generation (a started,
+// not-yet-failed attempt).
+func (c *ServiceReconciler) startedCandidateState(
+	app, service string, replica int, generation, containerID string,
+) (runtime.ServiceConvergenceState, bool) {
+	state, ok := c.committedState(app, service, replica)
+	if !ok || state.CandidateGeneration != generation ||
+		state.CandidateContainerID != containerID ||
+		state.CandidateContainerID == "" || !state.RetryNotBefore.IsZero() {
+		return runtime.ServiceConvergenceState{}, false
+	}
+	return state, true
+}
+
+// clearCandidateState drops a replica's persisted CANDIDATE retry record when it
+// belongs to the given generation, preserving that record's committed
+// generation fields. It never touches the service-level preparation family. It
+// is best-effort: a bounded stale window can only delay the next retry, never
+// shorten it, so callers log a failure at debug.
+func (c *ServiceReconciler) clearCandidateState(
+	ctx context.Context, app, service string, replica int, generation string,
+) error {
+	if c.stateStore == nil {
+		return nil
+	}
+	key := serviceStateKey{
+		nodeID: c.nodeID, app: app, service: service, replica: replica,
+	}
+	c.stateMu.Lock()
+	state := c.committed[key]
+	c.stateMu.Unlock()
+	if state.Kind != "" || state.CandidateGeneration != generation {
+		return nil
+	}
+	state.CandidateGeneration = ""
+	state.CandidateContainerID = ""
+	state.CandidateAttempt = 0
+	state.CandidateStartedAt = time.Time{}
+	state.RetryNotBefore = time.Time{}
+	state.UpdatedAt = time.Now()
+	writeCtx, cancel := c.stateOpContext(ctx)
+	err := c.stateStore.WriteServiceConvergenceState(writeCtx, state)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("service: clear candidate state: %w", err)
+	}
+	c.stateMu.Lock()
+	if c.committed == nil {
+		c.committed = map[serviceStateKey]runtime.ServiceConvergenceState{}
+	}
+	c.rememberStateWriteLocked(key)
+	c.committed[key] = state
+	c.stateMu.Unlock()
+	c.clearRetryFloor(candidateRetryFloorKey(app, service, replica, generation))
+	return nil
+}
+
+// clearPreparationState drops EVERY persisted preparation-RETRY marker for one
+// service after the service prepared successfully, so a later failure starts a
+// fresh attempt sequence. It is deliberately not generation-scoped: a marker
+// recorded under a previous desired identity (including a declared probe that is
+// no longer effective, e.g. after a HOT_RELOAD switch) no longer matches the
+// current preparation generation and would otherwise remain forever, because the
+// candidate-family write cleanup cannot remove another marker family.
+//
+// It never touches the completion family: the durable outcome of a successful
+// preparation is what lets a later pass tell a resolved admission apart from an
+// interrupted one. Dropping this retry family therefore cannot lose that outcome.
+//
+// The cleanup is bounded: the preparation family holds at most one volume per
+// service (write cleanup keeps it that way), so at most one list/delete round
+// trip runs, and only when a preparation marker is actually cached. It never
+// touches a replica's committed/candidate markers, and a cleanup failure is
+// returned for the caller to log at Debug: it can neither fail the pass nor
+// change what is served, and the cache is left consistent (the stale entries are
+// retained until a delete or overwrite succeeds; every reader ignores a
+// non-current preparation generation).
+func (c *ServiceReconciler) clearPreparationState(
+	ctx context.Context, app, service string, replica int, generation string,
+) error {
+	defer c.clearPreparationRetryFloors(app, service)
+	if c.stateStore == nil || !c.hasPreparationState(app, service) {
+		return nil
+	}
+	if deleter, ok := c.stateStore.(stateMarkerKindDeleter); ok {
+		deleteCtx, cancel := c.stateOpContext(ctx)
+		err := deleter.DeleteServiceConvergenceStatesForKind(
+			deleteCtx, app, service, c.nodeID, runtime.ServiceStateKindPreparation)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("service: clear preparation state: %w", err)
+		}
+		c.forgetPreparationState(app, service)
+		return nil
+	}
+	// Fallback for a store without the kind-scoped delete: write a cleared
+	// current-generation preparation record. The marker store's write cleanup is
+	// scoped to the same family, so it removes every older preparation volume for
+	// this service in the same bounded call. The cleared record itself carries no
+	// retry window and is dropped from the cache afterwards so a successful
+	// preparation does not re-write it on every pass.
+	writeCtx, cancel := c.stateOpContext(ctx)
+	err := c.stateStore.WriteServiceConvergenceState(writeCtx, runtime.ServiceConvergenceState{
+		Kind:                runtime.ServiceStateKindPreparation,
+		App:                 app,
+		Service:             service,
+		NodeID:              c.nodeID,
+		Replica:             replica,
+		CandidateGeneration: generation,
+		RetryNotBefore:      time.Time{},
+		CandidateStartedAt:  time.Time{},
+		UpdatedAt:           time.Now(),
+	})
+	cancel()
+	if err != nil {
+		return fmt.Errorf("service: clear preparation state: %w", err)
+	}
+	c.forgetPreparationState(app, service)
+	return nil
+}
+
+// hasPreparationState reports whether any preparation-family marker for the
+// service is cached. The cache is populated from Docker at initialization, so a
+// stale generation is visible here after a restart as well. A nil store has no
+// cached preparation state.
+func (c *ServiceReconciler) hasPreparationState(app, service string) bool {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	for key := range c.committed {
+		if key.kind == runtime.ServiceStateKindPreparation &&
+			key.app == app && key.service == service {
+			return true
+		}
+	}
+	return false
+}
+
+// forgetPreparationState drops every cached preparation-family marker for one
+// service. While the one-time marker load is in flight it records a
+// kind-scoped tombstone, so a snapshot taken before the deletion cannot
+// resurrect the obsolete marker (and no replica candidate marker is affected).
+func (c *ServiceReconciler) forgetPreparationState(app, service string) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	for key := range c.committed {
+		if key.kind == runtime.ServiceStateKindPreparation &&
+			key.app == app && key.service == service {
+			delete(c.committed, key)
+		}
+	}
+	if c.stateLoadActive {
+		c.stateLoadDeletions = append(c.stateLoadDeletions, serviceStateLoadDeletion{
+			kind:    runtime.ServiceStateKindPreparation,
+			app:     app,
+			service: service,
+		})
+	}
+}
+
+// clearPreparationRetryFloors drops the process-local preparation floors for one
+// service. A successful preparation resets the attempt sequence regardless of
+// whether a durable marker existed, while replica candidate floors are left
+// untouched.
+func (c *ServiceReconciler) clearPreparationRetryFloors(app, service string) {
+	c.retryMu.Lock()
+	defer c.retryMu.Unlock()
+	for key := range c.retryFloor {
+		if key.kind == runtime.ServiceStateKindPreparation &&
+			key.app == app && key.service == service {
+			delete(c.retryFloor, key)
+		}
+	}
+}
+
+// clearAttemptForContainer drops the candidate record of the container a
+// SUPERSEDED pass started and then removed as provisional. The abandoned
+// attempt belongs to no serving generation, and the newer desired request owns a
+// fresh attempt sequence; leaving the record would make that newer request wait
+// out a backoff for an attempt it never made. The scan is bounded by the
+// desired replica count and only matches the exact generation and container.
+func (c *ServiceReconciler) clearAttemptForContainer(
+	ctx context.Context, app, service string, replicas int,
+	generation, containerID string,
+) {
+	if c.stateStore == nil || containerID == "" {
+		return
+	}
+	for slot := 0; slot < replicas; slot++ {
+		state, ok := c.committedState(app, service, slot)
+		if !ok || state.CandidateGeneration != generation ||
+			state.CandidateContainerID != containerID {
+			continue
+		}
+		if err := c.clearCandidateState(ctx, app, service, slot, generation); err != nil {
+			c.log.Debug("Service: clear abandoned candidate state failed",
+				"app", app, "service", service, "replica", slot, "error", err)
+		}
+	}
+}
+
+// commitServiceState records the committed generation BEFORE any superseded
+// generation is stopped. A failed write is returned so the caller preserves the
+// old generation rather than committing without a durable marker.
+func (c *ServiceReconciler) commitServiceState(
+	ctx context.Context, app, service string, replica int, generation, containerID string,
+) error {
+	if c.stateStore == nil {
+		return nil
+	}
+	state := runtime.ServiceConvergenceState{
+		App: app, Service: service, NodeID: c.nodeID, Replica: replica,
+		CommittedContainerID: containerID,
+		Generation:           generation,
+		UpdatedAt:            time.Now(),
+	}
+	writeCtx, cancel := c.stateOpContext(ctx)
+	err := c.stateStore.WriteServiceConvergenceState(writeCtx, state)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("service: commit convergence state: %w", err)
+	}
+	c.stateMu.Lock()
+	if c.committed == nil {
+		c.committed = map[serviceStateKey]runtime.ServiceConvergenceState{}
+	}
+	key := serviceStateKey{
+		nodeID: c.nodeID, app: app, service: service, replica: replica,
+	}
+	c.rememberStateWriteLocked(key)
+	c.committed[key] = state
+	c.stateMu.Unlock()
+	// The committed generation has no pending retry; drop this slot's
+	// process-local floor so it cannot linger across generations.
+	c.clearRetryFloor(candidateRetryFloorKey(app, service, replica, generation))
+	return nil
+}
+
+// deleteServiceStates removes the durable markers for one app or service after
+// its containers are gone. The delete runs on its own bounded operation
+// context; the cache entry is dropped only when the durable delete succeeded, so
+// a failed delete does not make the in-memory view disagree with Docker.
+func (c *ServiceReconciler) deleteServiceStates(
+	ctx context.Context, app, service string,
+) error {
+	if c.stateStore == nil {
+		c.forgetServiceState(app, service)
+		return nil
+	}
+	deleteCtx, cancel := c.stateOpContext(ctx)
+	err := c.stateStore.DeleteServiceConvergenceStates(
+		deleteCtx, app, service, c.nodeID)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("service: remove convergence state: %w", err)
+	}
+	c.forgetServiceState(app, service)
+	return nil
+}
+
+// forgetServiceState removes one service's markers from the cache after the
+// service's containers are removed. While the one-time marker load is in
+// flight it also records a deletion tombstone for the app/service scope — even
+// when no cache entry exists yet — so the load snapshot cannot resurrect a
+// marker that was deleted from Docker meanwhile.
+func (c *ServiceReconciler) forgetServiceState(app, service string) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	for key := range c.committed {
+		if key.app == app && (service == "" || key.service == service) {
+			delete(c.committed, key)
+		}
+	}
+	if c.stateLoadActive {
+		c.stateLoadDeletions = append(c.stateLoadDeletions,
+			serviceStateLoadDeletion{anyKind: true, app: app, service: service})
+	}
+	// Forget the process-local retry floors for the same scope, so the map does
+	// not grow across generations and a removed service cannot be gated by a
+	// stale floor if it reappears with the same identity.
+	c.clearRetryFloors(app, service)
+}
+
+// RecoverServiceHealthCandidates reconstructs the uncommitted healthcheck
+// candidates that existed before this worker started. A container whose ID is a
+// committed active replica for this node is excluded: an active replica that
+// later becomes unhealthy is not a candidate and must not be replaced for health
+// alone. With no state store, every non-healthy healthcheck container is returned
+// (the historical best effort).
+func (c *ServiceReconciler) RecoverServiceHealthCandidates(
+	ctx context.Context,
+) ([]runtime.ServiceHealthCandidate, error) {
+	if err := c.ensureConvergenceStates(ctx); err != nil {
+		return nil, err
+	}
+	containers, err := c.docker.ServiceContainerList(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("service: recover health candidates: %w", err)
+	}
+	committedIDs := map[string]bool{}
+	c.stateMu.Lock()
+	for key, state := range c.committed {
+		if key.nodeID == c.nodeID || c.nodeID == "" {
+			committedIDs[state.CommittedContainerID] = true
+		}
+	}
+	c.stateMu.Unlock()
+	var out []runtime.ServiceHealthCandidate
+	for _, ctr := range containers {
+		if c.nodeID != "" && ctr.NodeID != c.nodeID {
+			continue
+		}
+		if ctr.Healthcheck == "" || committedIDs[ctr.ID] {
+			continue
+		}
+		if ctr.Health == container.Healthy {
+			continue
+		}
+		out = append(out, runtime.ServiceHealthCandidate{
+			App: ctr.App, ContainerID: ctr.ID,
+		})
+	}
+	return out, nil
+}
+
+// PruneServiceConvergenceStates removes committed-generation markers for apps
+// that no longer exist. It is a best-effort startup/periodic cleanup companion to
+// container orphan sweeping; only Relay service-state volumes for this node are
+// considered.
+func (c *ServiceReconciler) PruneServiceConvergenceStates(
+	ctx context.Context, liveApps map[string]bool,
+) {
+	if c.stateStore == nil {
+		return
+	}
+	listCtx, listCancel := c.stateOpContext(ctx)
+	states, err := c.stateStore.ListServiceConvergenceStates(listCtx)
+	listCancel()
+	if err != nil {
+		c.log.Debug("Service: list convergence state for pruning failed", "error", err)
+		return
+	}
+	seen := map[string]bool{}
+	for _, state := range states {
+		if c.nodeID != "" && state.NodeID != c.nodeID {
+			continue
+		}
+		if liveApps[state.App] || seen[state.App] {
+			continue
+		}
+		seen[state.App] = true
+		if err := c.deleteServiceStates(ctx, state.App, ""); err != nil {
+			c.log.Debug("Service: prune convergence state failed",
+				"app", state.App, "error", err)
+		}
+	}
+}
+
 // ServiceReconciler ties Reconcile, RemoveAll, SweepOrphans, and ShutdownCleanup
 // to a single
 // Docker implementation, secret resolver, and logger. App-scoped Apply
@@ -1664,6 +4176,37 @@ type ServiceReconciler struct {
 	// ServiceReconciler leaves it nil, which disables in-place reload (source
 	// changes then replace, the historical behavior).
 	sourceApply *sourceApplyTracker
+
+	// stateStore, when implemented by the Docker seam, persists the committed
+	// generation marker in Docker-owned volume labels so an active replica can be
+	// distinguished from an uncommitted healthcheck candidate across restarts.
+	// stateMu guards only the committed cache; stateInitMu serializes the
+	// one-time marker load without holding the cache lock across the Docker call.
+	// Every marker operation is bounded by stateOpContext.
+	stateStore  StateMarkerStore
+	stateMu     sync.Mutex
+	stateInitMu sync.Mutex
+	committed   map[serviceStateKey]runtime.ServiceConvergenceState
+	stateLoaded bool
+	// stateLoadActive is true only while the one-time marker load is in flight.
+	// stateLoadTouched and stateLoadDeletions record the cache mutations that
+	// raced it, so the snapshot merge neither resurrects a deleted marker nor
+	// discards a newer write (see ensureConvergenceStates). All three are guarded
+	// by stateMu.
+	stateLoadActive    bool
+	stateLoadTouched   map[serviceStateKey]struct{}
+	stateLoadDeletions []serviceStateLoadDeletion
+
+	// retryMu guards retryFloor, the PROCESS-LOCAL copy of the retry windows this
+	// reconciler installed (preparation and candidate failures). It is not durable
+	// state: it exists so that a marker write which failed still holds the same
+	// hard eligibility and attempt in this process, and another slot's
+	// notification cannot bypass the backoff or drive a retry loop. A restart
+	// loses it and re-derives conservatively from the (possibly absent) marker; a
+	// replacement start is independently gated by the pre-start attempt write, so
+	// neither path can start earlier than safe.
+	retryMu    sync.Mutex
+	retryFloor map[serviceRetryFloorKey]serviceRetryFloor
 
 	mu sync.Mutex
 }
@@ -1723,6 +4266,10 @@ func NewServiceReconciler(
 		log:              log,
 		reconcileTimeout: reconcileTimeout,
 		sourceApply:      newSourceApplyTracker(),
+		committed:        map[serviceStateKey]runtime.ServiceConvergenceState{},
+	}
+	if store, ok := docker.(StateMarkerStore); ok {
+		c.stateStore = store
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -1735,13 +4282,23 @@ func NewServiceReconciler(
 // ApplyResult converges fnName's services to tmpl+image and logs the outcome —
 // Info when the pass changed state, was superseded after issuing work, or ended
 // pending, Debug when it was a no-op verification pass (or a superseded pass
-// that issued nothing), Warn when it errored. It is intentionally non-fatal: a
-// service-convergence failure must not fail the app's reconcile.
+// that issued nothing), Warn when it failed or ended pending with an independent
+// error. It is intentionally non-fatal: a service-convergence failure must not
+// fail the app's reconcile.
 //
 // It distinguishes a terminal success from a pending pass (a backend accepted a
 // replacement but has not terminally converged it) and a failure. A pending
-// result is not an error; the coordinator ends the worker pass, releases the
-// image lease, and retains the logical request for a later wake.
+// result ends the worker pass, releases the image lease, and retains the logical
+// request — including its candidates and wake deadlines — for a later wake.
+//
+// PENDING WINS over an independent failure. A pass can converge most slots,
+// leave another slot's candidate pending, and still record a real error (for
+// example a marker write that could not be persisted for a different slot or
+// service). Reporting that as a terminal failure would discard the retained
+// candidates and deadlines and let the coordinator conclude a deployment that
+// has not converged; instead the result is pending WITH Err set, so the failure
+// is explicit in the result, the log, and the metric while convergence remains
+// explicitly incomplete. A lifecycle cancellation is never reported as pending.
 //
 // The Info/Debug distinction means an unchanged app (periodic self-healing
 // tick) does not log at Info; only converges that actually changed or failed do.
@@ -1770,15 +4327,60 @@ func (c *ServiceReconciler) ApplyResult(
 	// is the closed changed/unchanged/pending/error set. A nil registry is a
 	// no-op. The app label is the existing bounded dimension.
 	start := time.Now()
+	if err := c.ensureConvergenceStates(ctx); err != nil {
+		c.observeReconcile(fnName, false, false, err, 0)
+		c.log.Warn("Service: convergence state unavailable",
+			"app", fnName, "error", err)
+		return ServicePassResult{Outcome: ServicePassFailed, Err: err}
+	}
 	pass, err := reconcileWithObserver(
 		ctx, c.reconcileTimeout, c.docker, fnName, tmpl, image, preparedEnv,
 		c.networks, c.secrets, c.traefik, c.log, c.nodeID, reconcileStarted,
-		c.sourceApply,
+		c.sourceApply, c,
 	)
 	duration := time.Since(start)
 	c.observeReconcile(fnName, pass.changed, pass.pending, err, duration)
+	if pass.pending && !requestCancelled(ctx, err) {
+		// Pending is not a failure and must not mark readiness. It ends the
+		// worker pass while the coordinator retains the logical request, its
+		// candidates, and its deadlines, and resumes it on a notification, an
+		// eligible observation, or a due deadline. An independent error is
+		// carried alongside instead of replacing the pending contract.
+		attrs := []any{
+			"app", fnName,
+			"services", len(tmpl.Services),
+			"replicas", replicas,
+			"started", pass.started,
+			"restarted", pass.restarted,
+			"duration", duration,
+			"outcome", "pending",
+		}
+		if pass.stoppedKnown {
+			attrs = append(attrs, "stopped", pass.stopped)
+		}
+		if !pass.retryNotBefore.IsZero() {
+			attrs = append(attrs, "retry_not_before", pass.retryNotBefore)
+		}
+		if !pass.startupDeadline.IsZero() {
+			attrs = append(attrs, "startup_deadline", pass.startupDeadline)
+		}
+		if err != nil {
+			attrs = append(attrs, "error", err)
+			c.log.Warn("Service: convergence pending with errors", attrs...)
+		} else {
+			c.log.Info("Service: convergence pending", attrs...)
+		}
+		return ServicePassResult{
+			Outcome: ServicePassPending, Changed: pass.changed,
+			Superseded:      pass.superseded,
+			Err:             err,
+			StartupDeadline: pass.startupDeadline,
+			RetryNotBefore:  pass.retryNotBefore,
+			Candidates:      append([]runtime.ServiceHealthCandidate(nil), pass.candidates...),
+		}
+	}
 	if err != nil {
-		if errors.Is(err, context.Canceled) && errors.Is(ctx.Err(), context.Canceled) {
+		if requestCancelled(ctx, err) {
 			attrs := []any{
 				"app", fnName,
 				"services", len(tmpl.Services),
@@ -1818,28 +4420,6 @@ func (c *ServiceReconciler) ApplyResult(
 		return ServicePassResult{
 			Outcome: ServicePassFailed, Changed: pass.changed,
 			Superseded: pass.superseded, Err: err,
-		}
-	}
-	if pass.pending {
-		// Pending is not a failure and must not mark readiness. It ends the
-		// worker pass while the coordinator retains the logical request and
-		// resumes it on a notification, eligible observation, or due deadline.
-		attrs := []any{
-			"app", fnName,
-			"services", len(tmpl.Services),
-			"replicas", replicas,
-			"started", pass.started,
-			"restarted", pass.restarted,
-			"duration", duration,
-			"outcome", "pending",
-		}
-		if pass.stoppedKnown {
-			attrs = append(attrs, "stopped", pass.stopped)
-		}
-		c.log.Info("Service: convergence pending", attrs...)
-		return ServicePassResult{
-			Outcome: ServicePassPending, Changed: pass.changed,
-			Superseded: pass.superseded,
 		}
 	}
 	if pass.superseded {
@@ -1920,8 +4500,10 @@ func (c *ServiceReconciler) observeReconcile(
 }
 
 // Remove stops and removes every service container belonging to fnName that
-// THIS reconciler owns. Called by the reconciler's RemoveServices hook BEFORE
-// the app's images are retired. An unscoped reconciler (no WithNodeID)
+// THIS reconciler owns. It is the operation behind the coordinator's removal
+// request; the app's images are retired only from that request's settlement
+// callback, i.e. after this returns (or after the request was
+// superseded/cancelled). An unscoped reconciler (no WithNodeID)
 // delegates to RemoveAll and therefore removes every container of the app on
 // the daemon, preserving the historical behavior; a worker-wired reconciler
 // additionally requires relay.node_id == its NODE_ID, so removing an app
@@ -1930,11 +4512,18 @@ func (c *ServiceReconciler) Remove(ctx context.Context, fnName string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.sourceApply.forgetApp(fnName)
+	deleteState := func() {
+		if err := c.deleteServiceStates(ctx, fnName, ""); err != nil {
+			c.log.Warn("Service: remove convergence state failed", "app", fnName, "error", err)
+		}
+	}
 	if c.nodeID == "" {
 		RemoveAll(ctx, c.docker, fnName, c.log)
+		deleteState()
 		return
 	}
 	c.removeAppForWorkerLocked(ctx, fnName)
+	deleteState()
 }
 
 // removeAppForWorkerLocked removes this worker's service containers for fnName.
@@ -1987,6 +4576,7 @@ func (c *ServiceReconciler) SweepOrphans(ctx context.Context, liveApps map[strin
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.PruneServiceConvergenceStates(ctx, liveApps)
 	stale, err := c.discoverOrphansLocked(ctx, liveApps)
 	if err != nil {
 		// discoverOrphansLocked already logged the failure.
