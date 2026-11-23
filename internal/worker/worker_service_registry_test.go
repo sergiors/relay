@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -468,15 +469,20 @@ func TestServiceEndpointSyncDropsSupersededAndUnmatchedCandidates(t *testing.T) 
 	}
 }
 
-// Given a configured TRAEFIK_HOST_OVERRIDE, when the publisher syncs, then the
-// stored registry endpoint Host is the DECLARED template hostname (the routing
-// identity must survive the override), while label matching validates the
-// EFFECTIVE override labels: a container carrying the overridden rule matches,
-// and one still carrying the un-overridden (stale) rule is filtered out.
-func TestServiceEndpointRouteKeepsTemplateHostUnderOverride(t *testing.T) {
-	override := routing.TraefikConfig{HostOverride: "localhost"}
+// Given a configured ROUTING_HOST_OVERRIDE, when the publisher syncs, then the
+// stored registry endpoint Host is the EFFECTIVE host — the exact override —
+// byte-identical to the hostname inside the container's matched Traefik rule
+// (Docker labels and the registry agree), while a container carrying the
+// pre-override rule is filtered. Flipping the override later changes route
+// eligibility against the SAME apps registry — nothing is rebuilt.
+func TestServiceEndpointEffectiveHostConsistencyUnderOverride(t *testing.T) {
 	declared := "issuer.example.com"
-	effective := "issuer.localhost" // left-most label + override domain
+	override := "portal.internal.test"
+	effective := routing.EffectiveHost(declared, override)
+	if effective != override {
+		t.Fatalf("fixture: EffectiveHost(%q, %q) = %q, want the exact override",
+			declared, override, effective)
+	}
 
 	apps := &runner.Registry{}
 	apps.Set([]*runner.PreparedApp{
@@ -487,37 +493,30 @@ func TestServiceEndpointRouteKeepsTemplateHostUnderOverride(t *testing.T) {
 		}}),
 	})
 
-	// Fixture guards: the override really rewrites the host, and the generated
-	// label rule really changes with it — otherwise the filter assertion below
-	// would be vacuous.
-	if got := override.OverrideHost(declared); got != effective {
-		t.Fatalf("fixture: OverrideHost(%q) = %q, want %q", declared, got, effective)
-	}
-	effectiveLabels := routing.TraefikLabels(
-		"issuer", "web", declared, "/v2", 8080, override)
-	staleLabels := routing.TraefikLabels(
-		"issuer", "web", declared, "/v2", 8080, routing.TraefikConfig{})
-	if !registryRoutingLabelsMatch(effectiveLabels, effectiveLabels) {
-		t.Fatal("fixture: effective labels must match themselves")
-	}
-	if registryRoutingLabelsMatch(effectiveLabels, staleLabels) {
-		t.Fatal("fixture: the override must change the generated label rule " +
-			"(Host(`issuer.localhost`) vs Host(`issuer.example.com`))")
+	zero := routing.TraefikConfig{}
+	overrideLabels := routing.TraefikLabels(
+		"issuer", "web", effective, "/v2", 8080, zero)
+	declaredLabels := routing.TraefikLabels(
+		"issuer", "web", declared, "/v2", 8080, zero)
+	// Fixture guard: the two rule sets must differ, or the filter assertion
+	// below would be vacuous.
+	if registryRoutingLabelsMatch(overrideLabels, declaredLabels) {
+		t.Fatal("fixture: the override must change the generated label rule")
 	}
 
 	source := &fakeServiceEndpointSource{endpoints: []runtime.RegistryServiceEndpoint{
 		// The live container: created under the override, carrying the
 		// EFFECTIVE rule.
-		registryCandidate("issuer", "web", "ctr-effective", 0, effectiveLabels),
-		// A container whose labels predate the override (un-overridden rule):
+		registryCandidate("issuer", "web", "ctr-effective", 0, overrideLabels),
+		// A container whose labels predate the override (declared-host rule):
 		// it no longer matches the current desired labels.
-		registryCandidate("issuer", "web", "ctr-stale", 1, staleLabels),
+		registryCandidate("issuer", "web", "ctr-stale", 1, declaredLabels),
 	}}
 	store := newFakeServiceEndpointStore()
 	lease := testNodeLease()
 	publisher := newServiceEndpointFixture(t, store, source,
 		&staticLeaseSource{lease: &lease}, apps, testutil.DiscardLogger())
-	publisher.traefik = override // the publisher threads the override config
+	publisher.hostOverride = override
 
 	publisher.syncOnce()
 
@@ -528,18 +527,51 @@ func TestServiceEndpointRouteKeepsTemplateHostUnderOverride(t *testing.T) {
 			ids[i] = endpoint.ContainerID
 		}
 		t.Fatalf("published batch = %v, want only [ctr-effective]: the "+
-			"effective override labels must match and the un-overridden "+
+			"effective override labels must match and the pre-override "+
 			"(stale) labels must be filtered", ids)
 	}
 	endpoint := batch[0]
-	if endpoint.Host != declared {
-		t.Fatalf("published Host = %q, want the DECLARED template hostname %q "+
-			"(never the effective override %q)",
-			endpoint.Host, declared, effective)
+	if endpoint.Host != override {
+		t.Fatalf("published Host = %q, want the EFFECTIVE host %q "+
+			"(declared was %q)", endpoint.Host, override, declared)
+	}
+
+	// Label/registry consistency: the matched Docker rule names exactly the
+	// hostname the registry stored.
+	ruleKey := "traefik.http.routers." +
+		routing.ServiceProviderID("issuer", "web") + ".rule"
+	rule, ok := overrideLabels[ruleKey]
+	if !ok {
+		t.Fatalf("fixture: matched labels missing the rule key %q: %v",
+			ruleKey, overrideLabels)
+	}
+	if !strings.Contains(rule, "Host(`"+endpoint.Host+"`)") {
+		t.Fatalf("matched rule %q does not name the published host %q",
+			rule, endpoint.Host)
 	}
 	if endpoint.Path != "/v2" || endpoint.Service != "web" ||
 		endpoint.App != "issuer" {
 		t.Fatalf("published endpoint = %+v, want the template's route identity", endpoint)
+	}
+
+	// Eligibility flip on the SAME apps registry (no rebuild): clearing the
+	// override makes the declared-rule candidate eligible and filters the
+	// override-rule one.
+	publisher.hostOverride = ""
+	source.set([]runtime.RegistryServiceEndpoint{
+		registryCandidate("issuer", "web", "ctr-declared", 0, declaredLabels),
+	}, nil)
+
+	publisher.syncOnce()
+
+	_, flipped := store.lastPublish()
+	if store.publishCount() != 2 {
+		t.Fatalf("publish calls = %d, want 2 (one per sync)", store.publishCount())
+	}
+	if len(flipped) != 1 || flipped[0].ContainerID != "ctr-declared" ||
+		flipped[0].Host != declared {
+		t.Fatalf("flipped batch = %+v, want the declared-rule candidate with "+
+			"Host %q", flipped, declared)
 	}
 }
 

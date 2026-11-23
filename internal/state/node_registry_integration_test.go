@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -814,29 +815,719 @@ func TestIntegrationNodeRegistryPublishDeduplicatesBatchIdentities(t *testing.T)
 	}
 }
 
-// Given a batch with one invalid member, when it is published, then the whole
-// batch is rejected before any write: the stored set stays empty.
+// Given a batch mixing valid members with one invalid member, when it is
+// published, then the whole batch is rejected before any write — after EACH
+// attempt the stored set stays empty (atomicity), including an invalid
+// DUPLICATE whose later valid twin would otherwise win deduplication.
 func TestIntegrationNodeRegistryInvalidBatchPersistsNothing(t *testing.T) {
 	requireTestDB(t)
 	dsn := newTestDSN(t)
 	st := openWithIdentity(t, dsn, uniqueNodeID(t, "node-invalid"), "inst-1")
+	ctx := context.Background()
 
 	lease := mustClaimNodeLease(t, st,
 		NodeLeaseMetadata{AdvertiseAddr: "10.0.0.5:7001"}, time.Minute)
 	valid := testRegistryEndpoint("alpha", "web", "ctr-1")
-	invalid := testRegistryEndpoint("alpha", "web", "ctr-2")
-	invalid.Host = ""
 
-	err := st.PublishServiceRegistryEndpoints(context.Background(), lease,
-		[]ServiceRegistryEndpoint{valid, invalid})
-	if err == nil || !strings.Contains(err.Error(), "invalid endpoint identity") {
-		t.Fatalf("publish = %v, want the identity rejection for the batch", err)
+	for _, tc := range []struct {
+		name     string
+		endpoint ServiceRegistryEndpoint
+		want     string
+	}{
+		{"empty host", mutateRegistryEndpoint(&valid, func(e *ServiceRegistryEndpoint) {
+			e.Host = ""
+		}), "host is empty"},
+		{"malformed host", mutateRegistryEndpoint(&valid, func(e *ServiceRegistryEndpoint) {
+			e.Host = "bad_host"
+		}), "not a valid hostname"},
+		{"replica above int32 max", mutateRegistryEndpoint(&valid, func(e *ServiceRegistryEndpoint) {
+			e.Replica = math.MaxInt32 + 1
+		}), "exceeds the maximum supported value"},
+		{"host port zero", mutateRegistryEndpoint(&valid, func(e *ServiceRegistryEndpoint) {
+			e.HostPort = 0
+		}), "host port 0 is outside 1..65535"},
+		{"internal port above range", mutateRegistryEndpoint(&valid, func(e *ServiceRegistryEndpoint) {
+			e.InternalPort = 65536
+		}), "internal port 65536 is outside 1..65535"},
+		{"unspecified host IP", mutateRegistryEndpoint(&valid, func(e *ServiceRegistryEndpoint) {
+			e.HostIP = "0.0.0.0"
+		}), "is unspecified"},
+		{"multicast host IP", mutateRegistryEndpoint(&valid, func(e *ServiceRegistryEndpoint) {
+			e.HostIP = "224.0.0.1"
+		}), "is multicast"},
+		{"mapped host IP", mutateRegistryEndpoint(&valid, func(e *ServiceRegistryEndpoint) {
+			e.HostIP = "::ffff:192.0.2.1"
+		}), "is IPv4-mapped IPv6"},
+		{"missing generation", mutateRegistryEndpoint(&valid, func(e *ServiceRegistryEndpoint) {
+			e.Generation = ""
+		}), "generation is empty"},
+		{"non-canonical path", mutateRegistryEndpoint(&valid, func(e *ServiceRegistryEndpoint) {
+			e.Path = "/v2/"
+		}), "not canonical"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			other := testRegistryEndpoint("alpha", "web", "ctr-2")
+			err := st.PublishServiceRegistryEndpoints(ctx, lease,
+				[]ServiceRegistryEndpoint{valid, tc.endpoint, other})
+			if err == nil {
+				t.Fatal("publish succeeded, want the endpoint rejection")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q must contain %q", err, tc.want)
+			}
+			if errors.Is(err, ErrNodeLeaseFence) {
+				t.Fatal("a validation failure must not report a fence rejection")
+			}
+			requireRegistryContainers(t,
+				readRegistryEndpoints(t, st, ServiceRegistryFilter{}))
+		})
 	}
-	if errors.Is(err, ErrNodeLeaseFence) {
-		t.Fatal("a validation failure must not report a fence rejection")
+
+	// Raw-input validation precedes dedup: the invalid duplicate cannot hide
+	// behind its later valid twin (identical relational identity).
+	t.Run("invalid duplicate precedes valid same identity", func(t *testing.T) {
+		invalidDup := valid
+		invalidDup.HostIP = "0.0.0.0"
+		err := st.PublishServiceRegistryEndpoints(ctx, lease,
+			[]ServiceRegistryEndpoint{invalidDup, valid})
+		if err == nil || !strings.Contains(err.Error(), "is unspecified") {
+			t.Fatalf("publish = %v, want the raw-input rejection for the "+
+				"invalid duplicate", err)
+		}
+		requireRegistryContainers(t,
+			readRegistryEndpoints(t, st, ServiceRegistryFilter{}))
+	})
+}
+
+// mutateRegistryEndpoint returns a modified copy of base.
+func mutateRegistryEndpoint(
+	base *ServiceRegistryEndpoint, f func(*ServiceRegistryEndpoint),
+) ServiceRegistryEndpoint {
+	e := *base
+	f(&e)
+	return e
+}
+
+// Given usable publication inputs — IPv4, IPv6, loopback, link-local, and a
+// replica at the int32 boundary — when they are published, then every row is
+// accepted verbatim and reads back exactly (admission is shape-based, not
+// normalization).
+func TestIntegrationServiceRegistryPublishAcceptsUsableAddressesAndMaxReplica(
+	t *testing.T,
+) {
+	requireTestDB(t)
+	dsn := newTestDSN(t)
+	st := openWithIdentity(t, dsn, uniqueNodeID(t, "node-usable"), "inst-1")
+
+	lease := mustClaimNodeLease(t, st,
+		NodeLeaseMetadata{AdvertiseAddr: "10.0.0.5:7001"}, time.Minute)
+
+	v4 := testRegistryEndpoint("alpha", "web", "ctr-v4")
+	v4.HostPort = 41001
+	v6 := testRegistryEndpoint("alpha", "web", "ctr-v6")
+	v6.Host = "v6.example.com"
+	v6.HostIP = "2001:db8::1"
+	v6.HostPort = 41002
+	loopback := testRegistryEndpoint("alpha", "web", "ctr-loop")
+	loopback.Host = "loop.example.com"
+	loopback.HostIP = "127.0.0.1"
+	loopback.HostPort = 41003
+	linkLocal := testRegistryEndpoint("alpha", "web", "ctr-ll")
+	linkLocal.Host = "ll.example.com"
+	linkLocal.HostIP = "fe80::1"
+	linkLocal.HostPort = 41004
+	maxReplica := testRegistryEndpoint("alpha", "web", "ctr-max")
+	maxReplica.Host = "max.example.com"
+	maxReplica.HostPort = 41005
+	maxReplica.Replica = math.MaxInt32
+
+	publishRegistryBatch(t, st, lease,
+		[]ServiceRegistryEndpoint{v4, v6, loopback, linkLocal, maxReplica})
+
+	got := readRegistryEndpoints(t, st, ServiceRegistryFilter{})
+	requireRegistryContainers(t, got,
+		"ctr-ll", "ctr-loop", "ctr-max", "ctr-v4", "ctr-v6")
+	byContainer := map[string]ServiceRegistryEndpoint{}
+	for _, endpoint := range got {
+		byContainer[endpoint.ContainerID] = endpoint
+	}
+	for id, wantIP := range map[string]string{
+		"ctr-v4": "10.0.0.1", "ctr-v6": "2001:db8::1",
+		"ctr-loop": "127.0.0.1", "ctr-ll": "fe80::1",
+	} {
+		if endpoint := byContainer[id]; endpoint.HostIP != wantIP {
+			t.Errorf("%s HostIP = %q, want %q (stored verbatim)",
+				id, endpoint.HostIP, wantIP)
+		}
+	}
+	if endpoint := byContainer["ctr-max"]; endpoint.Replica != math.MaxInt32 {
+		t.Fatalf("max replica = %d, want %d (the int32 boundary is accepted)",
+			endpoint.Replica, math.MaxInt32)
+	}
+}
+
+// Given a publication BLOCKED on the node row lock, when the lease expires
+// before the lock is released, then publication is rejected with the fence
+// (measuring freshness AFTER the conflict wait) and writes NOTHING: after a
+// heartbeat restores the lease, the pre-blocking snapshot is still intact and
+// only a subsequent publish swaps it.
+func TestIntegrationServiceRegistryPublishRejectedWhenLeaseExpiresDuringLockWait(
+	t *testing.T,
+) {
+	requireTestDB(t)
+	dsn := newTestDSN(t)
+	node := uniqueNodeID(t, "node-lockwait")
+	st := openWithIdentity(t, dsn, node, "inst-1")
+	ctx := context.Background()
+
+	const ttl = time.Minute
+	lease := mustClaimNodeLease(t, st,
+		NodeLeaseMetadata{AdvertiseAddr: "10.0.0.5:7001"}, ttl)
+	setA := testRegistryEndpoint("alpha", "web", "ctr-a")
+	setA.Host = "a.example.com"
+	publishRegistryBatch(t, st, lease, []ServiceRegistryEndpoint{setA})
+	requireRegistryContainers(t,
+		readRegistryEndpoints(t, st, ServiceRegistryFilter{}), "ctr-a")
+
+	// The holder locks the node row and expires the lease inside its own
+	// transaction; only its commit exposes the expiry.
+	holder, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin holder tx: %v", err)
+	}
+	var probe int
+	if err := holder.QueryRowContext(ctx,
+		`SELECT 1 FROM nodes WHERE node_id = $1 FOR UPDATE`,
+		node).Scan(&probe); err != nil {
+		_ = holder.Rollback()
+		t.Fatalf("holder lock the node row: %v", err)
+	}
+	if _, err := holder.ExecContext(ctx,
+		`UPDATE nodes SET lease_expires_at = clock_timestamp()
+		   - interval '2 seconds' WHERE node_id = $1`, node); err != nil {
+		_ = holder.Rollback()
+		t.Fatalf("holder expire the lease: %v", err)
+	}
+
+	setB := testRegistryEndpoint("beta", "web", "ctr-b")
+	setB.Host = "b.example.com"
+	publishDone := make(chan error, 1)
+	go func() {
+		publishDone <- st.PublishServiceRegistryEndpoints(context.Background(),
+			lease, []ServiceRegistryEndpoint{setB})
+	}()
+
+	// Proof the publication is blocked on the row lock: its transaction waits
+	// on the holder's lock (a pending transaction lock), bounded.
+	waiting := false
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		if err := st.db.QueryRowContext(ctx,
+			`SELECT count(*) FROM pg_locks
+			  WHERE locktype = 'transactionid' AND NOT granted`).Scan(&n); err != nil {
+			_ = holder.Rollback()
+			t.Fatalf("poll waiting locks: %v", err)
+		}
+		if n > 0 {
+			waiting = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !waiting {
+		_ = holder.Rollback()
+		t.Fatal("publication never blocked on the node-row lock")
+	}
+	if err := holder.Commit(); err != nil {
+		t.Fatalf("commit holder: %v", err)
+	}
+
+	select {
+	case err := <-publishDone:
+		if !errors.Is(err, ErrNodeLeaseFence) {
+			t.Fatalf("publish after lock release = %v, want ErrNodeLeaseFence", err)
+		}
+		if !strings.Contains(err.Error(), "lease expired") {
+			t.Fatalf("error %q must report the post-lock expiry check", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("publish never returned after the lock release")
+	}
+
+	// Rejected WITHOUT writes: the lease stays expired, and once a heartbeat
+	// restores it the PRE-BLOCKING snapshot proves nothing was written.
+	var stillExpired bool
+	if err := st.db.QueryRowContext(ctx,
+		`SELECT lease_expires_at < clock_timestamp()
+		  FROM nodes WHERE node_id = $1`, node).Scan(&stillExpired); err != nil {
+		t.Fatalf("read lease state: %v", err)
+	}
+	if !stillExpired {
+		t.Fatal("the rejected publish must not renew the expired lease")
 	}
 	requireRegistryContainers(t,
 		readRegistryEndpoints(t, st, ServiceRegistryFilter{}))
+
+	if _, err := st.HeartbeatNodeLease(ctx, lease); err != nil {
+		t.Fatalf("heartbeat after the rejected publish: %v", err)
+	}
+	requireRegistryContainers(t,
+		readRegistryEndpoints(t, st, ServiceRegistryFilter{}), "ctr-a")
+
+	publishRegistryBatch(t, st, lease, []ServiceRegistryEndpoint{setB})
+	requireRegistryContainers(t,
+		readRegistryEndpoints(t, st, ServiceRegistryFilter{}), "ctr-b")
+}
+
+// Given a claim delayed behind the node-row lock (an INSERT..upsert conflict
+// wait), when it completes, then its TTL is stamped by the database clock
+// AFTER the wait — not from when the claim transaction began.
+func TestIntegrationNodeRegistryDelayedClaimStampsFreshTTL(t *testing.T) {
+	requireTestDB(t)
+	dsn := newTestDSN(t)
+	node := uniqueNodeID(t, "node-delayedclaim")
+	st := openWithIdentity(t, dsn, node, "inst-1")
+	ctx := context.Background()
+
+	first := mustClaimNodeLease(t, st,
+		NodeLeaseMetadata{AdvertiseAddr: "10.0.0.5:7001"}, time.Minute)
+
+	// A holder keeps the node row locked for ~2.6s so the second claim's
+	// upsert conflict waits measurably.
+	lockAcquired := make(chan struct{})
+	holderErr := make(chan error, 1)
+	go func() {
+		tx, err := st.db.BeginTx(context.Background(), nil)
+		if err != nil {
+			holderErr <- err
+			return
+		}
+		var probe int
+		if err := tx.QueryRowContext(context.Background(),
+			`SELECT 1 FROM nodes WHERE node_id = $1 FOR UPDATE`,
+			node).Scan(&probe); err != nil {
+			_ = tx.Rollback()
+			holderErr <- err
+			return
+		}
+		close(lockAcquired)
+		if _, err := tx.ExecContext(context.Background(),
+			`SELECT pg_sleep(2.6)`); err != nil {
+			_ = tx.Rollback()
+			holderErr <- err
+			return
+		}
+		holderErr <- tx.Commit()
+	}()
+	<-lockAcquired
+
+	const ttl = 30 * time.Second
+	start := time.Now()
+	second, err := st.ClaimNodeLease(ctx,
+		NodeLeaseMetadata{AdvertiseAddr: "10.0.0.6:7001"}, ttl)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("delayed claim: %v", err)
+	}
+	if elapsed < 2*time.Second {
+		t.Fatalf("claim returned after %v, want it blocked behind the row lock",
+			elapsed)
+	}
+	if second.Incarnation <= first.Incarnation {
+		t.Fatalf("delayed incarnation = %d, want a fresh one above %d",
+			second.Incarnation, first.Incarnation)
+	}
+	var dbNow time.Time
+	if err := st.db.QueryRowContext(ctx,
+		`SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
+		t.Fatalf("read database clock: %v", err)
+	}
+	// Fresh stamp: expiry = completion + ttl. A stamp taken when the claim
+	// transaction began would fall ttl minus the wait short of dbNow+ttl.
+	if second.ExpiresAt.Before(dbNow.Add(ttl - 2*time.Second)) {
+		t.Fatalf("claim expiry %s is stale: want >= %s (db clock + ttl - 2s); "+
+			"the TTL must be stamped AFTER the conflict wait",
+			second.ExpiresAt.Format(time.RFC3339Nano),
+			dbNow.Add(ttl-2*time.Second).Format(time.RFC3339Nano))
+	}
+	if second.ExpiresAt.After(dbNow.Add(ttl + 2*time.Second)) {
+		t.Fatalf("claim expiry %s exceeds %s (db clock + ttl + slack)",
+			second.ExpiresAt.Format(time.RFC3339Nano),
+			dbNow.Add(ttl+2*time.Second).Format(time.RFC3339Nano))
+	}
+	if err := <-holderErr; err != nil {
+		t.Fatalf("holder commit: %v", err)
+	}
+}
+
+// Given concurrent heartbeats, publications, and discovery reads on one node
+// lease over real connections, then every operation succeeds without error,
+// the final published set is exact, and the lease stays valid by the database
+// clock.
+func TestIntegrationNodeRegistryConcurrentHeartbeatAndPublication(t *testing.T) {
+	requireTestDB(t)
+	dsn := newTestDSN(t)
+	st := openWithIdentity(t, dsn, uniqueNodeID(t, "node-concurrent"), "inst-1")
+	ctx := context.Background()
+
+	lease := mustClaimNodeLease(t, st,
+		NodeLeaseMetadata{AdvertiseAddr: "10.0.0.5:7001"}, 30*time.Second)
+	set := []ServiceRegistryEndpoint{
+		testRegistryEndpoint("alpha", "web", "ctr-1"),
+		testRegistryEndpoint("alpha", "web", "ctr-2"),
+	}
+
+	const rounds = 10
+	errs := make(chan error, 3*rounds)
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		local := lease
+		for i := 0; i < rounds; i++ {
+			updated, err := st.HeartbeatNodeLease(ctx, local)
+			if err != nil {
+				errs <- fmt.Errorf("heartbeat %d: %w", i, err)
+				return
+			}
+			local = updated
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			if err := st.PublishServiceRegistryEndpoints(ctx, lease, set); err != nil {
+				errs <- fmt.Errorf("publish %d: %w", i, err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			if _, err := st.ReadEligibleServiceRegistryEndpoints(ctx,
+				ServiceRegistryFilter{}); err != nil {
+				errs <- fmt.Errorf("read %d: %w", i, err)
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent operation failed: %v", err)
+	}
+
+	requireRegistryContainers(t,
+		readRegistryEndpoints(t, st, ServiceRegistryFilter{}),
+		"ctr-1", "ctr-2")
+	var leaseValid bool
+	if err := st.db.QueryRowContext(ctx,
+		`SELECT lease_expires_at > clock_timestamp()
+		  FROM nodes WHERE node_id = $1`,
+		lease.NodeID).Scan(&leaseValid); err != nil {
+		t.Fatalf("read lease validity: %v", err)
+	}
+	if !leaseValid {
+		t.Fatal("the lease must remain valid by the database clock after the " +
+			"concurrent heartbeat/publication rounds")
+	}
+}
+
+// Given an EXPIRED node whose owner still holds the node advisory lock, when
+// cleanup runs, then the registration SURVIVES (stored JSONB owner_pid +
+// exact pg_locks key) even though its lapsed-lease endpoints are pruned, and a
+// heartbeat recovers the node followed by a fresh publication restoring
+// discovery — while expired leases exclude discovery the whole time.
+func TestIntegrationPruneRetainsExpiredNodeWhileAdvisoryLockHeld(t *testing.T) {
+	requireTestDB(t)
+	dsn := newTestDSN(t)
+	node := uniqueNodeID(t, "prune-owned")
+	st := openWithIdentity(t, dsn, node, "inst-1")
+	ctx := context.Background()
+
+	lease := mustClaimNodeLease(t, st,
+		NodeLeaseMetadata{AdvertiseAddr: "10.0.0.5:7001"}, time.Minute)
+	publishRegistryBatch(t, st, lease,
+		[]ServiceRegistryEndpoint{testRegistryEndpoint("alpha", "web", "ctr-1")})
+	execNodeRegistrySQL(t, st,
+		`UPDATE nodes SET lease_expires_at = clock_timestamp()
+		   - interval '2 seconds' WHERE node_id = $1`, node)
+
+	// Expired leases exclude discovery even while the lock is held.
+	requireRegistryContainers(t,
+		readRegistryEndpoints(t, st, ServiceRegistryFilter{}))
+
+	res, err := st.PruneExpiredNodeRegistry(ctx)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if res.Endpoints != 1 || res.Nodes != 0 {
+		t.Fatalf("prune = %+v, want {1 endpoint, 0 nodes}: the lapsed-lease "+
+			"endpoint is prunable, but the LOCK-HELD owned registration must "+
+			"survive", res)
+	}
+	if n := countRows(t, st,
+		`SELECT COUNT(*) FROM nodes WHERE node_id = $1`, node); n != 1 {
+		t.Fatalf("node rows = %d, want the owned registration retained", n)
+	}
+	if n := countRows(t, st,
+		`SELECT COUNT(*) FROM service_registry_endpoints
+		  WHERE node_id = $1`, node); n != 0 {
+		t.Fatalf("endpoint rows = %d, want the lapsed snapshot pruned", n)
+	}
+
+	// Recovery: the heartbeat (sole renewal) restores eligibility...
+	if _, err := st.HeartbeatNodeLease(ctx, lease); err != nil {
+		t.Fatalf("heartbeat recovery: %v", err)
+	}
+	var leaseValid bool
+	if err := st.db.QueryRowContext(ctx,
+		`SELECT lease_expires_at > clock_timestamp()
+		  FROM nodes WHERE node_id = $1`, node).Scan(&leaseValid); err != nil {
+		t.Fatalf("read lease validity: %v", err)
+	}
+	if !leaseValid {
+		t.Fatal("heartbeat must restore the expired lease")
+	}
+	// ...but discovery stays empty until the snapshot is re-published.
+	requireRegistryContainers(t,
+		readRegistryEndpoints(t, st, ServiceRegistryFilter{}))
+	publishRegistryBatch(t, st, lease,
+		[]ServiceRegistryEndpoint{testRegistryEndpoint("alpha", "web", "ctr-1")})
+	requireRegistryContainers(t,
+		readRegistryEndpoints(t, st, ServiceRegistryFilter{}), "ctr-1")
+
+	final, err := st.PruneExpiredNodeRegistry(ctx)
+	if err != nil {
+		t.Fatalf("final prune: %v", err)
+	}
+	if final.Endpoints != 0 || final.Nodes != 0 {
+		t.Fatalf("final prune = %+v, want {0, 0} (recovered node untouched)", final)
+	}
+}
+
+// Given a crashed node — expired lease AND its advisory lock already released —
+// when bounded cleanup runs, then ONE invocation removes its endpoints and then
+// its endpoint-free node row, and a second invocation finds nothing.
+func TestIntegrationPruneDeletesUnlockedExpiredNodeRows(t *testing.T) {
+	requireTestDB(t)
+	dsn := newTestDSN(t)
+	node := uniqueNodeID(t, "prune-crash")
+	st := openWithIdentity(t, dsn, node, "inst-1")
+	ctx := context.Background()
+
+	lease := mustClaimNodeLease(t, st,
+		NodeLeaseMetadata{AdvertiseAddr: "10.0.0.5:7001"}, time.Minute)
+	publishRegistryBatch(t, st, lease,
+		[]ServiceRegistryEndpoint{testRegistryEndpoint("alpha", "web", "ctr-1")})
+	execNodeRegistrySQL(t, st,
+		`UPDATE nodes SET lease_expires_at = clock_timestamp()
+		   - interval '2 seconds' WHERE node_id = $1`, node)
+
+	// The crash: the pinned backend's session advisory lock disappears.
+	var unlocked bool
+	if err := st.ownerConn.QueryRowContext(ctx,
+		`SELECT pg_advisory_unlock($1)`, nodeLockKey(node)).Scan(&unlocked); err != nil {
+		t.Fatalf("release node advisory lock: %v", err)
+	}
+	if !unlocked {
+		t.Fatal("pg_advisory_unlock reported the lock was not held")
+	}
+
+	// Discovery already excluded the expired lease.
+	requireRegistryContainers(t,
+		readRegistryEndpoints(t, st, ServiceRegistryFilter{}))
+
+	res, err := st.PruneExpiredNodeRegistry(ctx)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if res.Endpoints != 1 || res.Nodes != 1 {
+		t.Fatalf("prune = %+v, want {1 endpoint, 1 node}: one bounded "+
+			"invocation drains the crashed node after its lock released", res)
+	}
+	if n := countRows(t, st,
+		`SELECT COUNT(*) FROM nodes WHERE node_id = $1`, node); n != 0 {
+		t.Fatalf("node rows = %d, want the crashed registration deleted", n)
+	}
+	if n := countRows(t, st,
+		`SELECT COUNT(*) FROM service_registry_endpoints
+		  WHERE node_id = $1`, node); n != 0 {
+		t.Fatalf("endpoint rows = %d, want the crashed snapshot deleted", n)
+	}
+
+	final, err := st.PruneExpiredNodeRegistry(ctx)
+	if err != nil {
+		t.Fatalf("final prune: %v", err)
+	}
+	if final.Endpoints != 0 || final.Nodes != 0 {
+		t.Fatalf("final prune = %+v, want {0, 0} (idempotent)", final)
+	}
+}
+
+// Given expired nodes whose nodes.data owner_pid is malformed, missing, or
+// mismatched alongside healthy expired rows, when bounded cleanup runs, then:
+// the malformed candidates never abort or roll back the batch (other expired
+// endpoints and nodes are removed in the SAME invocation); an EXACT exclusive
+// advisory lock retains every such row regardless of its metadata; a SHARE-mode
+// hold on the key does NOT count as ownership; after the exclusive unlock the
+// malformed rows are reclaimed; and repeated prunes are idempotent. The read
+// path keeps failing loudly on malformed metadata (pinned by
+// TestIntegrationNodeRegistryReadSurfacesMalformedMetadata).
+func TestIntegrationPruneIsolatesMalformedNodeMetadata(t *testing.T) {
+	requireTestDB(t)
+	dsn := newTestDSN(t)
+	ctx := context.Background()
+
+	// A healthy active node with an expired endpoint: its endpoint must be
+	// pruned while its live node row survives.
+	nodeY := uniqueNodeID(t, "prune-malformed-live")
+	stY := openWithIdentity(t, dsn, nodeY, "inst-y")
+	leaseY := mustClaimNodeLease(t, stY,
+		NodeLeaseMetadata{AdvertiseAddr: "10.0.0.1:7001"}, time.Minute)
+	publishRegistryBatch(t, stY, leaseY,
+		[]ServiceRegistryEndpoint{testRegistryEndpoint("alpha", "web", "ctr-y")})
+	execNodeRegistrySQL(t, stY,
+		`UPDATE service_registry_endpoints
+		    SET expires_at = clock_timestamp() - interval '1 minute'
+		  WHERE node_id = $1`, nodeY)
+
+	// A lock-free expired node: must be pruned in the same invocation.
+	staleNode := uniqueNodeID(t, "prune-malformed-stale")
+	execNodeRegistrySQL(t, stY,
+		`INSERT INTO nodes (node_id, instance, incarnation, heartbeat_at,
+		    lease_expires_at, data)
+		  VALUES ($1, 'inst-stale', 5001,
+		   clock_timestamp() - interval '1 hour',
+		   clock_timestamp() - interval '1 hour', '{}'::jsonb)`, staleNode)
+
+	// Three expired candidates whose JSONB stays object-typed (schema-valid)
+	// but is unusable as owner_pid evidence, each still holding its EXCLUSIVE
+	// node advisory lock through its own handle.
+	type malformedNode struct {
+		node string
+		st   *State
+		data string
+		want string // substring that must survive untouched in nodes.data
+	}
+	malformed := []malformedNode{
+		{node: uniqueNodeID(t, "prune-malformed-badpid"), data: `{"owner_pid":"not-a-number"}`, want: "not-a-number"},
+		{node: uniqueNodeID(t, "prune-malformed-missing"), data: `{}`, want: "{}"},
+		{node: uniqueNodeID(t, "prune-malformed-mismatch"), data: `{"owner_pid":999999}`, want: "999999"},
+	}
+	for i := range malformed {
+		malformed[i].st = openWithIdentity(t, dsn, malformed[i].node, "inst-m")
+		mustClaimNodeLease(t, malformed[i].st,
+			NodeLeaseMetadata{AdvertiseAddr: "10.0.0.9:7001"}, time.Minute)
+		execNodeRegistrySQL(t, malformed[i].st,
+			`UPDATE nodes SET data = $2::jsonb,
+			    lease_expires_at = clock_timestamp() - interval '2 seconds'
+			  WHERE node_id = $1`,
+			malformed[i].node, malformed[i].data)
+	}
+
+	// A SHARE-mode hold on the node key must never prove ownership: convert an
+	// exclusive claim into a shared hold on the same key.
+	sharedNode := uniqueNodeID(t, "prune-malformed-shared")
+	stShared := openWithIdentity(t, dsn, sharedNode, "inst-shared")
+	mustClaimNodeLease(t, stShared,
+		NodeLeaseMetadata{AdvertiseAddr: "10.0.0.8:7001"}, time.Minute)
+	execNodeRegistrySQL(t, stShared,
+		`UPDATE nodes SET lease_expires_at = clock_timestamp()
+		   - interval '2 seconds' WHERE node_id = $1`, sharedNode)
+
+	unlock := func(st *State, node string) {
+		t.Helper()
+		var unlocked bool
+		if err := st.ownerConn.QueryRowContext(ctx,
+			`SELECT pg_advisory_unlock($1)`, nodeLockKey(node)).
+			Scan(&unlocked); err != nil {
+			t.Fatalf("unlock %s: %v", node, err)
+		}
+		if !unlocked {
+			t.Fatalf("unlock %s: the exclusive lock was not held", node)
+		}
+	}
+	unlock(stShared, sharedNode)
+	if _, err := stShared.ownerConn.ExecContext(ctx,
+		`SELECT pg_advisory_lock_shared($1)`, nodeLockKey(sharedNode)); err != nil {
+		t.Fatalf("take the shared advisory lock: %v", err)
+	}
+
+	// One bounded invocation: no decode of the malformed rows, no rollback.
+	first, err := stY.PruneExpiredNodeRegistry(ctx)
+	if err != nil {
+		t.Fatalf("prune with malformed candidates in the batch: %v (malformed "+
+			"metadata must never abort cleanup)", err)
+	}
+	if first.Endpoints != 1 || first.Nodes != 2 {
+		t.Fatalf("prune = %+v, want {1 endpoint, 2 nodes}: the healthy expired "+
+			"endpoint plus the lock-free stale node AND the shared-lock node, "+
+			"all removed in the same batch as the malformed candidates", first)
+	}
+
+	// The malformed rows survive (exclusive key held), metadata untouched —
+	// no decode, no healing, no rollback of the deletable rows above.
+	for _, m := range malformed {
+		if n := countRows(t, stY,
+			`SELECT COUNT(*) FROM nodes WHERE node_id = $1`, m.node); n != 1 {
+			t.Fatalf("malformed node %s rows = %d, want it retained by its "+
+				"exact exclusive advisory lock", m.node, n)
+		}
+		var data string
+		if err := stY.db.QueryRowContext(ctx,
+			`SELECT data::text FROM nodes WHERE node_id = $1`,
+			m.node).Scan(&data); err != nil {
+			t.Fatalf("read malformed node data: %v", err)
+		}
+		if !strings.Contains(data, m.want) {
+			t.Fatalf("malformed node %s data = %q, want it untouched (want %q)",
+				m.node, data, m.want)
+		}
+	}
+	if n := countRows(t, stY,
+		`SELECT COUNT(*) FROM nodes WHERE node_id IN ($1, $2)`,
+		staleNode, sharedNode); n != 0 {
+		t.Fatalf("lock-free/shared nodes remaining = %d, want both pruned", n)
+	}
+	if n := countRows(t, stY,
+		`SELECT COUNT(*) FROM service_registry_endpoints
+		  WHERE node_id = $1`, nodeY); n != 0 {
+		t.Fatalf("healthy expired endpoint rows = %d, want pruned", n)
+	}
+	if n := countRows(t, stY,
+		`SELECT COUNT(*) FROM nodes WHERE node_id = $1`, nodeY); n != 1 {
+		t.Fatalf("live node rows = %d, want the healthy node retained", n)
+	}
+
+	// After the exclusive unlock, every malformed expired row is reclaimable.
+	for _, m := range malformed {
+		unlock(m.st, m.node)
+	}
+	second, err := stY.PruneExpiredNodeRegistry(ctx)
+	if err != nil {
+		t.Fatalf("prune after unlock: %v", err)
+	}
+	if second.Endpoints != 0 || second.Nodes != int64(len(malformed)) {
+		t.Fatalf("prune after unlock = %+v, want {0, %d}: the malformed rows "+
+			"must be reclaimed once their exclusive locks release",
+			second, len(malformed))
+	}
+	if n := countRows(t, stY,
+		`SELECT COUNT(*) FROM nodes WHERE node_id = $1`, nodeY); n != 1 {
+		t.Fatalf("live node rows after reclaim = %d, want exactly the healthy "+
+			"node", n)
+	}
+
+	third, err := stY.PruneExpiredNodeRegistry(ctx)
+	if err != nil {
+		t.Fatalf("idempotent prune: %v", err)
+	}
+	if third.Endpoints != 0 || third.Nodes != 0 {
+		t.Fatalf("repeated prune = %+v, want {0, 0} (idempotent)", third)
+	}
 }
 
 // Given published endpoints and a live lease, when the node releases, then

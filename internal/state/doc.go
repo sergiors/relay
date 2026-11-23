@@ -267,9 +267,9 @@
 // replica, host, path, container_id, expires_at, updated_at, data JSONB) is the
 // materialized set of externally routable service replicas each node verified
 // on its own Docker daemon. Identity, the host/path query keys, incarnation
-// fencing, and expiry are relational; host is the service's configured template
-// hostname, not the effective host that TRAEFIK_HOST_OVERRIDE derives for the
-// routing labels; data holds the typed endpoint details
+// fencing, and expiry are relational; host is the service's effective routing
+// hostname (the declared host, or the exact ROUTING_HOST_OVERRIDE value when
+// configured); data holds the typed endpoint details
 // (host_ip, host_port, internal_port, generation) with no duplicate columns.
 // node_id references nodes(node_id) ON DELETE CASCADE. It is a VIEW-like
 // publication for discovery only: it never drives matching, builds,
@@ -291,10 +291,15 @@
 // NodeRegistryPruneNodeBatch expired node rows that have NO remaining endpoints
 // (so a cascade never outruns the endpoint batch). Selection orders by the
 // indexed expires_at/lease_expires_at columns and uses FOR UPDATE SKIP LOCKED
-// with an outer expiry re-check, so concurrent claim/heartbeat/publication
-// transactions are never blocked or deleted while live. Crashed nodes therefore
-// become invisible at lease expiry and their rows are eventually reclaimed
-// without an external cleanup service.
+// with an outer expiry re-check against fresh database time, so concurrent
+// claim/heartbeat/publication transactions are never blocked or deleted while
+// live. An expired row is retained while the node's exact exclusive advisory
+// key is currently held, so a delayed heartbeat can renew its registration
+// instead of losing it to cleanup; visibility still ends at expiry. Ownership
+// evidence is the exact key alone, not a PID or nodes.data value, so malformed
+// metadata cannot stall cleanup and the row is reclaimed after the lock is
+// released. Crashed nodes therefore become invisible at lease expiry and their
+// rows are eventually reclaimed without an external cleanup service.
 //
 // Development schema recreation (manual only; startup NEVER runs this, and it
 // touches no unrelated table or data):

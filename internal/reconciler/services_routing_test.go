@@ -567,17 +567,18 @@ func TestReconcilePathConvergedNoOp(t *testing.T) {
 	}
 }
 
-// A host override maps the declared host in the started container's rule while
-// the network, id, and (for a path service) the StripPrefix labels are
-// unchanged. The template's declared host is never mutated.
+// A host override replaces the declared host with the EXACT override hostname
+// in the started container's rule while the network, id, and (for a path
+// service) the StripPrefix labels are unchanged. The template's declared host
+// is never mutated.
 func TestReconcileHostOverrideMapsRule(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{
 		Name:       "service.js",
 		Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "issuer.example.com", Path: "/v2",
 	})
-	cfg := routing.TraefikConfig{Network: "proxy", HostOverride: "localhost"}
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", cfg); err != nil {
+	cfg := routing.TraefikConfig{Network: "proxy"}
+	if _, err := reconcileOverride(t, f, "fn", tmpl, "img-1", cfg, "localhost"); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	c := f.lastStartedFor("fn", "service.js")
@@ -585,8 +586,9 @@ func TestReconcileHostOverrideMapsRule(t *testing.T) {
 		t.Fatal("no started container")
 	}
 	id := routing.ServiceProviderID("fn", "service.js")
-	if got := c.labels[routingRouterPrefix+id+".rule"]; got != "Host(`issuer.localhost`) && PathPrefix(`/v2`)" {
-		t.Fatalf("rule = %q, want Host(`issuer.localhost`) && PathPrefix(`/v2`)", got)
+	if got := c.labels[routingRouterPrefix+id+".rule"]; got != "Host(`localhost`) && PathPrefix(`/v2`)" {
+		t.Fatalf("rule = %q, want Host(`localhost`) && PathPrefix(`/v2`) "+
+			"(exact full-host replacement)", got)
 	}
 	if got := c.labels["traefik.http.middlewares."+routing.PathMiddlewareID("fn", "service.js")+".stripprefix.prefixes"]; got != "/v2" {
 		t.Fatalf("stripprefix = %q, want /v2 (unchanged)", got)
@@ -600,16 +602,18 @@ func TestReconcileHostOverrideMapsRule(t *testing.T) {
 	}
 }
 
-// Two services on distinct subdomains of the same domain stay distinct after
-// the override.
-func TestReconcileHostOverrideDistinctSubdomains(t *testing.T) {
+// The override is an EXACT full-host replacement: every routed service's rule
+// names the same override hostname, while the name-keyed router/service ids
+// keep the services distinct.
+func TestReconcileHostOverrideExactReplacement(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x",
 		app.Service{Name: "issuer.js", Entrypoint: "issuer.js", Port: 3000, Replicas: 1, Host: "issuer.example.com"},
 		app.Service{Name: "admin.js", Entrypoint: "admin.js", Port: 3000, Replicas: 1, Host: "admin.example.com"},
 	)
-	cfg := routing.TraefikConfig{Network: "proxy", HostOverride: "localhost"}
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", cfg); err != nil {
+	cfg := routing.TraefikConfig{Network: "proxy"}
+	if _, err := reconcileOverride(t, f, "fn", tmpl, "img-1", cfg,
+		"portal.internal.test"); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	issuer := f.lastStartedFor("fn", "issuer.js")
@@ -617,23 +621,34 @@ func TestReconcileHostOverrideDistinctSubdomains(t *testing.T) {
 	if issuer == nil || admin == nil {
 		t.Fatal("expected both containers started")
 	}
-	if got := issuer.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "issuer.js")+".rule"]; got != "Host(`issuer.localhost`)" {
-		t.Fatalf("issuer rule = %q", got)
+	if got := issuer.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "issuer.js")+".rule"]; got != "Host(`portal.internal.test`)" {
+		t.Fatalf("issuer rule = %q, want the exact override hostname", got)
 	}
-	if got := admin.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "admin.js")+".rule"]; got != "Host(`admin.localhost`)" {
-		t.Fatalf("admin rule = %q", got)
+	if got := admin.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "admin.js")+".rule"]; got != "Host(`portal.internal.test`)" {
+		t.Fatalf("admin rule = %q, want the exact override hostname", got)
+	}
+	if routing.ServiceProviderID("fn", "issuer.js") ==
+		routing.ServiceProviderID("fn", "admin.js") {
+		t.Fatal("distinct services must keep distinct name-keyed router ids")
 	}
 }
 
-// Changing only the override replaces the routed container: the old labels
-// point at the wrong host, so the container is stale.
+// Changing only the override replaces the routed container (its old labels
+// point at the wrong host) while reusing the SAME prepared image: the route
+// update never triggers an image rebuild.
 func TestReconcileHostOverrideChangeReplaces(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test"})
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
+	if _, err := reconcileOverride(t, f, "fn", tmpl, "img-1",
+		routing.TraefikConfig{Network: "proxy"}, ""); err != nil {
 		t.Fatalf("reconcile no override: %v", err)
 	}
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{Network: "proxy", HostOverride: "localhost"}); err != nil {
+	first := f.lastStartedFor("fn", "service.js")
+	if first == nil || first.image != "img-1" {
+		t.Fatalf("initial container = %+v, want the prepared img-1", first)
+	}
+	if _, err := reconcileOverride(t, f, "fn", tmpl, "img-1",
+		routing.TraefikConfig{Network: "proxy"}, "ov.test"); err != nil {
 		t.Fatalf("reconcile override: %v", err)
 	}
 	if len(f.stops) != 1 {
@@ -643,8 +658,12 @@ func TestReconcileHostOverrideChangeReplaces(t *testing.T) {
 	if c == nil {
 		t.Fatal("no replacement container")
 	}
-	if got := c.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "service.js")+".rule"]; got != "Host(`a.localhost`)" {
-		t.Fatalf("replacement rule = %q, want Host(`a.localhost`)", got)
+	if got := c.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "service.js")+".rule"]; got != "Host(`ov.test`)" {
+		t.Fatalf("replacement rule = %q, want Host(`ov.test`)", got)
+	}
+	if c.image != "img-1" {
+		t.Fatalf("replacement image = %q, want the SAME prepared img-1 "+
+			"(an override change must never rebuild the image)", c.image)
 	}
 }
 
@@ -653,62 +672,65 @@ func TestReconcileHostOverrideChangeReplaces(t *testing.T) {
 func TestReconcileHostOverrideInvalidRefused(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1, Host: "a.test"})
-	_, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{Network: "proxy", HostOverride: "-bad"})
+	_, err := reconcileOverride(t, f, "fn", tmpl, "img-1",
+		routing.TraefikConfig{Network: "proxy"}, "-bad")
 	if err == nil {
 		t.Fatal("expected a routing-validation error")
 	}
-	if !strings.Contains(err.Error(), "TRAEFIK_HOST_OVERRIDE") {
-		t.Fatalf("error %v does not name TRAEFIK_HOST_OVERRIDE", err)
+	if !strings.Contains(err.Error(), "ROUTING_HOST_OVERRIDE") {
+		t.Fatalf("error %v does not name ROUTING_HOST_OVERRIDE", err)
 	}
 	if len(f.networkLookups) != 0 || len(f.ctrs) != 0 || len(f.stops) != 0 {
 		t.Fatalf("invalid override performed container/network work: lookups=%v ctrs=%d stops=%v", f.networkLookups, len(f.ctrs), f.stops)
 	}
 }
 
-// An override that is itself a valid hostname but derives an OVERLONG host
-// from a long declared left label is refused per service, before any network
-// or container work — no stops, no starts, NetworkExists never called.
-func TestReconcileHostOverrideOverlongDerivedHostRefused(t *testing.T) {
+// An override value that exceeds the hostname contract is refused before any
+// network or container work, naming the variable.
+func TestReconcileHostOverrideOverlongValueRefused(t *testing.T) {
 	f := newFakeDocker()
-	// 63-char left label + "." + a 201-char valid override = 265 derived chars.
-	longOverride := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." +
-		strings.Repeat("c", 63) + "." + strings.Repeat("d", 9)
+	overlong := strings.Repeat("a", 254)
 	tmpl := serviceTemplate("nodejs24.x", app.Service{
 		Name:       "service.js",
 		Entrypoint: "service.js", Port: 80, Replicas: 1,
-		Host: strings.Repeat("z", 63) + ".example.com",
+		Host: "a.test",
 	})
-	_, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{Network: "proxy", HostOverride: longOverride})
+	_, err := reconcileOverride(t, f, "fn", tmpl, "img-1",
+		routing.TraefikConfig{Network: "proxy"}, overlong)
 	if err == nil {
-		t.Fatal("expected an overlong-derived-host routing error")
+		t.Fatal("expected an overlong-override routing error")
 	}
-	if !strings.Contains(err.Error(), "253-character hostname limit") {
-		t.Fatalf("error %v does not carry the 253-character message", err)
+	if !strings.Contains(err.Error(), "253-character hostname limit") ||
+		!strings.Contains(err.Error(), "ROUTING_HOST_OVERRIDE") {
+		t.Fatalf("error %v does not carry the 253-character message naming "+
+			"ROUTING_HOST_OVERRIDE", err)
 	}
 	if len(f.networkLookups) != 0 || len(f.ctrs) != 0 || len(f.stops) != 0 {
-		t.Fatalf("overlong derived host performed network/container work: lookups=%v ctrs=%d stops=%v", f.networkLookups, len(f.ctrs), f.stops)
+		t.Fatalf("overlong override performed network/container work: lookups=%v ctrs=%d stops=%v", f.networkLookups, len(f.ctrs), f.stops)
 	}
 }
 
-// A valid overridden case that stays within the limit still reconciles: a long
-// left label plus a short override maps to a valid host and starts normally.
-func TestReconcileHostOverrideLongLabelShortDomainValid(t *testing.T) {
+// Under an override the container's rule names the EXACT override hostname;
+// the declared host's length is irrelevant to the effective route.
+func TestReconcileHostOverrideExactEffectiveHost(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{
 		Name:       "service.js",
 		Entrypoint: "service.js", Port: 3000, Replicas: 1,
 		Host: strings.Repeat("z", 63) + ".example.com",
 	})
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{Network: "proxy", HostOverride: "localhost"}); err != nil {
+	if _, err := reconcileOverride(t, f, "fn", tmpl, "img-1",
+		routing.TraefikConfig{Network: "proxy"}, "localhost"); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	c := f.lastStartedFor("fn", "service.js")
 	if c == nil {
 		t.Fatal("no started container")
 	}
-	wantRule := "Host(`" + strings.Repeat("z", 63) + ".localhost`)"
+	wantRule := "Host(`localhost`)"
 	if got := c.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "service.js")+".rule"]; got != wantRule {
-		t.Fatalf("rule = %q, want %q", got, wantRule)
+		t.Fatalf("rule = %q, want %q (exact replacement, not a left-label join)",
+			got, wantRule)
 	}
 	if len(f.networkLookups) != 1 || f.networkLookups[0] != "proxy" {
 		t.Fatalf("networkLookups = %v, want [proxy]", f.networkLookups)
@@ -720,7 +742,8 @@ func TestReconcileHostOverrideLongLabelShortDomainValid(t *testing.T) {
 func TestReconcileAbsentOverrideUsesDeclaredHost(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "issuer.example.com"})
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{Network: "proxy", HostOverride: ""}); err != nil {
+	if _, err := reconcileOverride(t, f, "fn", tmpl, "img-1",
+		routing.TraefikConfig{Network: "proxy"}, ""); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	c := f.lastStartedFor("fn", "service.js")
@@ -732,17 +755,17 @@ func TestReconcileAbsentOverrideUsesDeclaredHost(t *testing.T) {
 	}
 }
 
-// A converged override state is a no-op: identical mapped labels keep the
+// A converged override state is a no-op: identical effective labels keep the
 // container (no churn).
 func TestReconcileHostOverrideConvergedNoOp(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test"})
-	cfg := routing.TraefikConfig{Network: "proxy", HostOverride: "localhost"}
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", cfg); err != nil {
+	cfg := routing.TraefikConfig{Network: "proxy"}
+	if _, err := reconcileOverride(t, f, "fn", tmpl, "img-1", cfg, "localhost"); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	stopsSoFar := len(f.stops)
-	changed, err := reconcile(t, f, "fn", tmpl, "img-1", cfg)
+	changed, err := reconcileOverride(t, f, "fn", tmpl, "img-1", cfg, "localhost")
 	if err != nil {
 		t.Fatalf("reconcile 2: %v", err)
 	}

@@ -665,22 +665,34 @@ func TestLoadTraefikOptionalValues(t *testing.T) {
 	}
 }
 
-// TestLoadTraefikHostOverride pins the optional TRAEFIK_HOST_OVERRIDE value:
+// TestLoadRoutingHostOverride pins the optional ROUTING_HOST_OVERRIDE value:
 // empty when unset (no override, prior behavior) and passed through verbatim
-// when set. Validation is the routing layer's concern, so config does not
-// reject a non-hostname here — it is hostname-dumb passthrough like the other
-// TRAEFIK_* fields.
-func TestLoadTraefikHostOverride(t *testing.T) {
+// when set — including a whitespace-only value, which the routing layer treats
+// as "no override" (routing.HostOverrideConfigured). Validation is the routing
+// layer's concern, so config does not reject a non-hostname here — it is
+// hostname-dumb passthrough. There is NO alias: this value loads only from
+// ROUTING_HOST_OVERRIDE.
+func TestLoadRoutingHostOverride(t *testing.T) {
 	setRequiredEnv(t)
 	cfg := mustLoad(t)
-	if cfg.TraefikHostOverride != "" {
-		t.Fatalf("TraefikHostOverride = %q, want empty when unset", cfg.TraefikHostOverride)
+	if cfg.RoutingHostOverride != "" {
+		t.Fatalf("RoutingHostOverride = %q, want empty when unset", cfg.RoutingHostOverride)
 	}
 
-	t.Setenv("TRAEFIK_HOST_OVERRIDE", "localhost")
+	t.Setenv("ROUTING_HOST_OVERRIDE", "portal.internal.test")
 	cfg = mustLoad(t)
-	if cfg.TraefikHostOverride != "localhost" {
-		t.Fatalf("TraefikHostOverride = %q, want localhost", cfg.TraefikHostOverride)
+	if cfg.RoutingHostOverride != "portal.internal.test" {
+		t.Fatalf("RoutingHostOverride = %q, want portal.internal.test verbatim",
+			cfg.RoutingHostOverride)
+	}
+
+	// Whitespace-only loads verbatim; the routing layer (not config) decides it
+	// means "no override".
+	t.Setenv("ROUTING_HOST_OVERRIDE", "   ")
+	cfg = mustLoad(t)
+	if cfg.RoutingHostOverride != "   " {
+		t.Fatalf("RoutingHostOverride = %q, want the verbatim whitespace value",
+			cfg.RoutingHostOverride)
 	}
 }
 

@@ -21,7 +21,7 @@ services:
       - DATABASE_URL=postgres://relay:relay@postgres:5432/relay?sslmode=disable
 
       - TRAEFIK_NETWORK=traefik
-      - TRAEFIK_HOST_OVERRIDE=localhost
+      - ROUTING_HOST_OVERRIDE=localhost
 
       - METRICS_ADDR=:9090
       - GIT_WEBHOOK_ADDR=:8081

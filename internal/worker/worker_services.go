@@ -59,12 +59,12 @@ func startServiceConvergence(
 			EntryPoints:  cfg.TraefikEntryPoints,
 			CertResolver: cfg.TraefikCertResolver,
 			Priority:     cfg.TraefikPriority,
-			HostOverride: cfg.TraefikHostOverride,
 		},
 		logger,
 		reconcileTimeout,
 		reconciler.WithMetrics(metricsInstance),
 		reconciler.WithNetworks(cfg.Networks),
+		reconciler.WithHostOverride(cfg.RoutingHostOverride),
 		// Routed services publish their port on this static host IP when set.
 		// The advertise address is deliberately not wired here: it is
 		// presentation metadata and must not affect container identity.

@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -300,8 +301,13 @@ func TestNodeRegistryWritesRefuseForeignLeases(t *testing.T) {
 	}
 }
 
-// Endpoint identity is validated BEFORE the write transaction opens, so an
-// invalid member rejects the whole batch without persisting any row.
+// Endpoint admission validates every RAW input before deduplication and before
+// any write transaction opens: one invalid member rejects the whole batch —
+// including an invalid DUPLICATE whose later valid twin would otherwise win
+// the dedup — without persisting any row. The matrix covers identity, route
+// hostname/path rules, port bounds, replica int32 bounds, and IP usability.
+// Accepted forms (valid ports, IPv6/loopback/link-local, MaxInt32 replicas)
+// are pinned by the integration publication tests.
 func TestPublishServiceRegistryEndpointsRejectsInvalidIdentities(t *testing.T) {
 	ctx := context.Background()
 	st := &State{nodeID: "node-a", instance: "inst-1", ownerPID: 77}
@@ -317,51 +323,134 @@ func TestPublishServiceRegistryEndpointsRejectsInvalidIdentities(t *testing.T) {
 	}
 	valid := ServiceRegistryEndpoint{
 		App: "alpha", Service: "web", Replica: 0,
-		Host: "api.example.com", ContainerID: "ctr-1",
+		Host: "api.example.com", Path: "/v2",
+		HostIP: "10.0.0.1", HostPort: 41000, InternalPort: 8080,
+		ContainerID: "ctr-1", Generation: "gen-1",
+	}
+	mutate := func(f func(*ServiceRegistryEndpoint)) ServiceRegistryEndpoint {
+		e := valid
+		f(&e)
+		return e
 	}
 
 	for _, tc := range []struct {
 		name     string
 		endpoint ServiceRegistryEndpoint
+		want     string
 	}{
-		{"empty app", func() ServiceRegistryEndpoint {
-			e := valid
+		{"empty app", mutate(func(e *ServiceRegistryEndpoint) {
 			e.App = ""
-			return e
-		}()},
-		{"empty service", func() ServiceRegistryEndpoint {
-			e := valid
+		}), "endpoint app is empty"},
+		{"empty service", mutate(func(e *ServiceRegistryEndpoint) {
 			e.Service = ""
-			return e
-		}()},
-		{"empty host", func() ServiceRegistryEndpoint {
-			e := valid
-			e.Host = ""
-			return e
-		}()},
-		{"empty container", func() ServiceRegistryEndpoint {
-			e := valid
+		}), "endpoint service is empty"},
+		{"empty container", mutate(func(e *ServiceRegistryEndpoint) {
 			e.ContainerID = ""
-			return e
-		}()},
-		{"negative replica", func() ServiceRegistryEndpoint {
-			e := valid
+		}), "endpoint container is empty"},
+		{"empty host", mutate(func(e *ServiceRegistryEndpoint) {
+			e.Host = ""
+		}), "host is empty"},
+		{"malformed host", mutate(func(e *ServiceRegistryEndpoint) {
+			e.Host = "bad_host"
+		}), "not a valid hostname"},
+		{"host with whitespace", mutate(func(e *ServiceRegistryEndpoint) {
+			e.Host = "api example.com"
+		}), "contains whitespace"},
+		{"negative replica", mutate(func(e *ServiceRegistryEndpoint) {
 			e.Replica = -1
-			return e
-		}()},
+		}), "replica must not be negative"},
+		{"replica above int32 max", mutate(func(e *ServiceRegistryEndpoint) {
+			e.Replica = math.MaxInt32 + 1
+		}), "exceeds the maximum supported value"},
+		{"host port zero", mutate(func(e *ServiceRegistryEndpoint) {
+			e.HostPort = 0
+		}), "host port 0 is outside 1..65535"},
+		{"host port above range", mutate(func(e *ServiceRegistryEndpoint) {
+			e.HostPort = 65536
+		}), "host port 65536 is outside 1..65535"},
+		{"internal port zero", mutate(func(e *ServiceRegistryEndpoint) {
+			e.InternalPort = 0
+		}), "internal port 0 is outside 1..65535"},
+		{"internal port above range", mutate(func(e *ServiceRegistryEndpoint) {
+			e.InternalPort = 65536
+		}), "internal port 65536 is outside 1..65535"},
+		{"empty host IP", mutate(func(e *ServiceRegistryEndpoint) {
+			e.HostIP = ""
+		}), "is not a valid IPv4 or IPv6 address"},
+		{"unparseable host IP", mutate(func(e *ServiceRegistryEndpoint) {
+			e.HostIP = "not-an-ip"
+		}), "is not a valid IPv4 or IPv6 address"},
+		{"IPv4-mapped IPv6 host IP", mutate(func(e *ServiceRegistryEndpoint) {
+			e.HostIP = "::ffff:192.0.2.1"
+		}), "is IPv4-mapped IPv6"},
+		{"zone-scoped host IP", mutate(func(e *ServiceRegistryEndpoint) {
+			e.HostIP = "fe80::1%eth0"
+		}), "zone-scoped"},
+		{"unspecified IPv4 host IP", mutate(func(e *ServiceRegistryEndpoint) {
+			e.HostIP = "0.0.0.0"
+		}), "is unspecified"},
+		{"unspecified IPv6 host IP", mutate(func(e *ServiceRegistryEndpoint) {
+			e.HostIP = "::"
+		}), "is unspecified"},
+		{"multicast IPv4 host IP", mutate(func(e *ServiceRegistryEndpoint) {
+			e.HostIP = "224.0.0.1"
+		}), "is multicast"},
+		{"multicast IPv6 host IP", mutate(func(e *ServiceRegistryEndpoint) {
+			e.HostIP = "ff02::1"
+		}), "is multicast"},
+		{"broadcast host IP", mutate(func(e *ServiceRegistryEndpoint) {
+			e.HostIP = "255.255.255.255"
+		}), "not a usable unicast host address"},
+		{"missing generation", mutate(func(e *ServiceRegistryEndpoint) {
+			e.Generation = ""
+		}), "generation is empty"},
+		{"path without leading slash", mutate(func(e *ServiceRegistryEndpoint) {
+			e.Path = "v2"
+		}), `must start with "/"`},
+		{"non-canonical path", mutate(func(e *ServiceRegistryEndpoint) {
+			e.Path = "/v2/"
+		}), "not canonical"},
+		{"path with empty segment", mutate(func(e *ServiceRegistryEndpoint) {
+			e.Path = "/a//b"
+		}), "empty path segment"},
+		{"path with whitespace", mutate(func(e *ServiceRegistryEndpoint) {
+			e.Path = "/a b"
+		}), "contains whitespace"},
+		{"path with query", mutate(func(e *ServiceRegistryEndpoint) {
+			e.Path = "/a?b"
+		}), "query, fragment, or backslash"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// The valid member precedes the invalid one: whole-batch rejection.
 			batch := []ServiceRegistryEndpoint{valid, tc.endpoint}
 			err := st.PublishServiceRegistryEndpoints(ctx, lease, batch)
 			if err == nil {
-				t.Fatal("publish succeeded, want the identity rejection")
+				t.Fatal("publish succeeded, want the endpoint rejection")
 			}
-			if !strings.Contains(err.Error(), "invalid endpoint identity") {
-				t.Fatalf("error %q must name the identity rejection", err)
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q must contain %q", err, tc.want)
 			}
 			if errors.Is(err, ErrNodeLeaseFence) {
 				t.Fatal("a validation failure must not report a fence rejection")
 			}
 		})
 	}
+
+	// Validation runs on RAW inputs BEFORE deduplication: an invalid
+	// duplicate first cannot hide behind its later valid twin (dedup keeps the
+	// LAST row, so a post-dedup validator would wrongly accept this batch).
+	t.Run("invalid duplicate precedes valid same identity", func(t *testing.T) {
+		invalidDup := valid
+		invalidDup.HostIP = "0.0.0.0"
+		validTwin := valid // identical relational identity, usable IP
+		err := st.PublishServiceRegistryEndpoints(ctx, lease,
+			[]ServiceRegistryEndpoint{invalidDup, validTwin})
+		if err == nil {
+			t.Fatal("publish succeeded, want the raw-input rejection: an " +
+				"invalid duplicate must not collapse into its valid twin")
+		}
+		if !strings.Contains(err.Error(), "is unspecified") {
+			t.Fatalf("error %q must name the invalid duplicate's host IP", err)
+		}
+	})
 }

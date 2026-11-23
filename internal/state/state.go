@@ -894,9 +894,9 @@ func (st *State) initSchema(ctx context.Context) error {
 		// node verified on its Docker daemon. Identity (node/app/service/replica/
 		// container), the route keys (host/path), the incarnation fence, and the
 		// expiry are relational because they define ownership, uniqueness, and
-		// the query surface. host is the service's configured template hostname;
-		// TRAEFIK_HOST_OVERRIDE only affects the container's routing labels, not
-		// this stored metadata. The cohesive, non-fencing endpoint facts (host
+		// the query surface. host is the service's effective routing hostname
+		// (the declared host, or the exact ROUTING_HOST_OVERRIDE value when
+		// configured). The cohesive, non-fencing endpoint facts (host
 		// IP/port, internal port, committed generation) are one JSONB object in
 		// data. A row never carries environment, secrets, or handler payload.
 		// expires_at bounds a stale snapshot even while the node heartbeat is

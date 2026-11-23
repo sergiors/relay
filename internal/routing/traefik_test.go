@@ -384,142 +384,139 @@ func TestTraefikConfigValidate(t *testing.T) {
 	}
 }
 
-// A set HostOverride is validated with the same hostname rules as a service
-// host: valid hostnames pass, malformed ones fail with an error naming the
-// variable, and a missing network still fails first.
-func TestTraefikConfigValidateHostOverride(t *testing.T) {
+// ValidateHostOverride accepts valid hostnames, rejects malformed ones with an
+// error naming ROUTING_HOST_OVERRIDE, and treats unset/whitespace-only as "no
+// override" (valid by omission). The value is used VERBATIM as the effective
+// route host, so the full hostname contract applies to the value itself.
+func TestValidateHostOverride(t *testing.T) {
 	for _, valid := range []string{"localhost", "a.test", "123.io", "sub.domain.example.com"} {
-		if err := (TraefikConfig{Network: "proxy", HostOverride: valid}).Validate(); err != nil {
-			t.Errorf("Validate(override=%q) = %v, want nil", valid, err)
+		if err := ValidateHostOverride(valid); err != nil {
+			t.Errorf("ValidateHostOverride(%q) = %v, want nil", valid, err)
 		}
 	}
 	for _, invalid := range []string{"-bad", "bad-", "a..b", "a_b", "a b", "bad/name", "a.", ".a"} {
-		err := (TraefikConfig{Network: "proxy", HostOverride: invalid}).Validate()
+		err := ValidateHostOverride(invalid)
 		if err == nil {
-			t.Errorf("Validate(override=%q) = nil, want an error", invalid)
+			t.Errorf("ValidateHostOverride(%q) = nil, want an error", invalid)
 			continue
 		}
-		if !strings.Contains(err.Error(), "TRAEFIK_HOST_OVERRIDE") {
-			t.Errorf("Validate(override=%q) error %v does not name TRAEFIK_HOST_OVERRIDE", invalid, err)
+		if !strings.Contains(err.Error(), "ROUTING_HOST_OVERRIDE") {
+			t.Errorf("ValidateHostOverride(%q) error %v does not name ROUTING_HOST_OVERRIDE",
+				invalid, err)
 		}
 	}
-	// Unset is valid and never validated (no override, prior behavior).
-	if err := (TraefikConfig{Network: "proxy", HostOverride: ""}).Validate(); err != nil {
-		t.Fatalf("Validate with empty override = %v, want nil", err)
+	// Unset and whitespace-only both mean "no override" and are valid.
+	if err := ValidateHostOverride(""); err != nil {
+		t.Fatalf("ValidateHostOverride(\"\") = %v, want nil", err)
 	}
-	// The network requirement still wins over an invalid override.
-	err := (TraefikConfig{HostOverride: "-bad"}).Validate()
-	if err == nil || err.Error() != "TRAEFIK_NETWORK is required when Traefik routing is configured" {
-		t.Fatalf("Validate with no network = %v, want the network error", err)
+	if err := ValidateHostOverride("   \t"); err != nil {
+		t.Fatalf("ValidateHostOverride(whitespace) = %v, want nil", err)
 	}
-}
-
-// ValidateHost validates the EFFECTIVE per-service host: the declared host
-// unchanged with no override, or its override mapping with one. The combined
-// length is exactly why this is per-service — an override that is itself a
-// valid hostname can still derive an overlong host from a long left label, and
-// a global conservative cap in Validate would reject valid short-host cases.
-func TestTraefikConfigValidateHost(t *testing.T) {
-	// A 201-char valid override (four labels, each <= 63): accepted by Validate
-	// on its own, but 63-char label + "." + 201 = 265 derived chars.
-	longOverride := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." +
-		strings.Repeat("c", 63) + "." + strings.Repeat("d", 9)
-	if len(longOverride) != 201 {
-		t.Fatalf("test override length = %d, want 201", len(longOverride))
+	// The override itself must fit the 253-character hostname limit.
+	err := ValidateHostOverride(strings.Repeat("a", 254))
+	if err == nil {
+		t.Fatal("ValidateHostOverride(254 chars) = nil, want the length error")
 	}
-	if err := (TraefikConfig{Network: "proxy", HostOverride: longOverride}).Validate(); err != nil {
-		t.Fatalf("Validate(long override) = %v, want nil (201 <= 253)", err)
-	}
-
-	tests := []struct {
-		name     string
-		override string
-		host     string
-		wantErr  bool
-	}{
-		{"no override valid host", "", "issuer.example.com", false},
-		{"no override empty host is unrouted", "", "", false},
-		{"short override short host", "localhost", "issuer", false},
-		{"override maps long label to short domain", "localhost", strings.Repeat("z", 63) + ".example.com", false},
-		{"combined exactly 253", longOverride, strings.Repeat("z", 51), false},
-		{"combined one over 253", longOverride, strings.Repeat("z", 52), true},
-		{"overlong derived host", longOverride, strings.Repeat("z", 63), true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := TraefikConfig{HostOverride: tt.override}
-			err := cfg.ValidateHost(tt.host)
-			if tt.wantErr {
-				if err == nil {
-					t.Fatalf("ValidateHost(%q) with override %q = nil, want an error", tt.host, tt.override)
-				}
-				if !strings.Contains(err.Error(), "253-character hostname limit") {
-					t.Fatalf("ValidateHost(%q) = %v, want the 253-character error", tt.host, err)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("ValidateHost(%q) with override %q = %v, want nil", tt.host, tt.override, err)
-			}
-		})
+	if !strings.Contains(err.Error(), "253-character hostname limit") ||
+		!strings.Contains(err.Error(), "ROUTING_HOST_OVERRIDE") {
+		t.Fatalf("long-override error = %v, want the 253-character error naming "+
+			"ROUTING_HOST_OVERRIDE", err)
 	}
 }
 
-// OverrideHost keeps the left-most label and replaces the remaining domain.
-func TestTraefikConfigOverrideHost(t *testing.T) {
-	tests := []struct {
+// HostOverrideConfigured: unset and whitespace-only mean no override.
+func TestHostOverrideConfigured(t *testing.T) {
+	for _, unset := range []string{"", "   ", "\t\n "} {
+		if HostOverrideConfigured(unset) {
+			t.Errorf("HostOverrideConfigured(%q) = true, want false", unset)
+		}
+	}
+	for _, set := range []string{"localhost", "x", " portal.test "} {
+		if !HostOverrideConfigured(set) {
+			t.Errorf("HostOverrideConfigured(%q) = false, want true", set)
+		}
+	}
+}
+
+// EffectiveHost is an EXACT full-host replacement: the declared host verbatim
+// when the override is unset or whitespace-only, otherwise the override value
+// verbatim — never a suffix mapping or a left-label join.
+func TestEffectiveHost(t *testing.T) {
+	for _, tt := range []struct {
 		name     string
-		override string
 		host     string
+		override string
 		want     string
 	}{
-		{"absent override keeps host verbatim", "", "issuer.example.com", "issuer.example.com"},
-		{"multi-label domain replaced", "localhost", "issuer.example.com", "issuer.localhost"},
-		{"single label gets override domain", "localhost", "issuer", "issuer.localhost"},
-		{"deeper subdomain collapses to first label", "localhost", "a.b.c.d", "a.localhost"},
-		{"two-part override suffix", "local.test", "issuer.example.com", "issuer.local.test"},
-		{"hyphenated left label preserved", "localhost", "my-app.example.com", "my-app.localhost"},
-	}
-	for _, tt := range tests {
+		{"unset keeps the declared host", "issuer.example.com", "",
+			"issuer.example.com"},
+		{"whitespace-only keeps the declared host", "issuer.example.com", "   ",
+			"issuer.example.com"},
+		{"exact replacement is never a suffix mapping",
+			"issuer.example.com", "localhost", "localhost"},
+		{"multi-label override replaces wholesale",
+			"issuer.example.com", "portal.internal.test", "portal.internal.test"},
+		{"single-label declared host replaced", "issuer", "local.test", "local.test"},
+		{"declared host is passed by value, never mutated",
+			"my-app.example.com", "my-app.example.com", "my-app.example.com"},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := TraefikConfig{HostOverride: tt.override}
-			if got := cfg.OverrideHost(tt.host); got != tt.want {
-				t.Fatalf("OverrideHost(%q) with override %q = %q, want %q", tt.host, tt.override, got, tt.want)
+			if got := EffectiveHost(tt.host, tt.override); got != tt.want {
+				t.Fatalf("EffectiveHost(%q, %q) = %q, want %q",
+					tt.host, tt.override, got, tt.want)
 			}
 		})
 	}
 }
 
-// Distinct subdomains of the same domain stay distinct under an override.
-func TestTraefikLabelsOverrideDistinctSubdomains(t *testing.T) {
-	cfg := TraefikConfig{Network: "proxy", HostOverride: "localhost"}
-	a := TraefikLabels("fn", "a.js", "issuer.example.com", "", 80, cfg)
-	b := TraefikLabels("fn", "b.js", "admin.example.com", "", 80, cfg)
-	if got := a[routerPrefix+ServiceProviderID("fn", "a.js")+ruleSuffix]; got != "Host(`issuer.localhost`)" {
-		t.Fatalf("a rule = %q, want Host(`issuer.localhost`)", got)
+// The caller supplies the EFFECTIVE host explicitly (see EffectiveHost): every
+// routed service's rule names that exact hostname while the router/service ids
+// stay keyed on app+service name, so distinct services stay distinct.
+func TestTraefikLabelsExplicitEffectiveHost(t *testing.T) {
+	cfg := TraefikConfig{Network: "proxy"}
+	effective := EffectiveHost("issuer.example.com", "portal.internal.test")
+	if effective != "portal.internal.test" {
+		t.Fatalf("fixture: EffectiveHost = %q, want the exact override", effective)
 	}
-	if got := b[routerPrefix+ServiceProviderID("fn", "b.js")+ruleSuffix]; got != "Host(`admin.localhost`)" {
-		t.Fatalf("b rule = %q, want Host(`admin.localhost`)", got)
+	a := TraefikLabels("fn", "a.js", effective, "", 80, cfg)
+	b := TraefikLabels("fn", "b.js", effective, "", 80, cfg)
+	if got := a[routerPrefix+ServiceProviderID("fn", "a.js")+ruleSuffix]; got != "Host(`portal.internal.test`)" {
+		t.Fatalf("a rule = %q, want Host(`portal.internal.test`)", got)
+	}
+	if got := b[routerPrefix+ServiceProviderID("fn", "b.js")+ruleSuffix]; got != "Host(`portal.internal.test`)" {
+		t.Fatalf("b rule = %q, want Host(`portal.internal.test`)", got)
+	}
+	idA := ServiceProviderID("fn", "a.js")
+	idB := ServiceProviderID("fn", "b.js")
+	if idA == idB {
+		t.Fatalf("distinct services share the router id %q", idA)
+	}
+	if _, ok := a[routerPrefix+idA+ruleSuffix]; !ok {
+		t.Fatalf("a's rule key missing: %v", a)
+	}
+	if _, ok := b[routerPrefix+idB+ruleSuffix]; !ok {
+		t.Fatalf("b's rule key missing: %v", b)
 	}
 }
 
-// Under an override, a host+path service keeps the exact PathPrefix and
-// StripPrefix labels; only the Host term changes.
-func TestTraefikLabelsOverrideHostWithPath(t *testing.T) {
-	cfg := TraefikConfig{Network: "proxy", HostOverride: "localhost"}
-	labels := TraefikLabels("fn", "svc.js", "issuer.example.com", "/v2", 80, cfg)
+// Under an effective override host, a host+path service keeps the exact
+// PathPrefix and StripPrefix labels; only the Host term differs.
+func TestTraefikLabelsEffectiveHostWithPath(t *testing.T) {
+	cfg := TraefikConfig{Network: "proxy"}
+	effective := EffectiveHost("issuer.example.com", "localhost")
+	labels := TraefikLabels("fn", "svc.js", effective, "/v2", 80, cfg)
 	id := ServiceProviderID("fn", "svc.js")
 	mw := PathMiddlewareID("fn", "svc.js")
 	want := map[string]string{
 		enableKey:                          "true",
 		networkKey:                         "proxy",
-		routerPrefix + id + ruleSuffix:     "Host(`issuer.localhost`) && PathPrefix(`/v2`)",
+		routerPrefix + id + ruleSuffix:     "Host(`localhost`) && PathPrefix(`/v2`)",
 		servicePrefix + id + portSuffix:    "80",
 		routerPrefix + id + ".middlewares": mw,
 		"traefik.http.middlewares." + mw + ".stripprefix.prefixes": "/v2",
 	}
 	if len(labels) != len(want) {
-		t.Fatalf("override+path labels = %v (%d), want %d keys", labels, len(labels), len(want))
+		t.Fatalf("effective-host+path labels = %v (%d), want %d keys", labels, len(labels), len(want))
 	}
 	for k, v := range want {
 		if labels[k] != v {
@@ -528,40 +525,41 @@ func TestTraefikLabelsOverrideHostWithPath(t *testing.T) {
 	}
 }
 
-// An override leaves the network, entrypoints, certresolver, priority labels,
-// and the router/service naming exactly as they are without one.
-func TestTraefikLabelsOverridePreservesOtherValues(t *testing.T) {
+// An effective-host change touches ONLY the rule's Host term: network,
+// entrypoints, certresolver, priority, ids, port, and middleware labels are
+// byte-for-byte identical.
+func TestTraefikLabelsEffectiveHostPreservesOtherValues(t *testing.T) {
 	base := TraefikConfig{Network: "proxy", EntryPoints: "websecure", CertResolver: "letsencrypt", Priority: ptr(100)}
-	overridden := base
-	overridden.HostOverride = "localhost"
 	id := ServiceProviderID("fn", "svc.js")
-	withoutOverride := TraefikLabels("fn", "svc.js", "issuer.example.com", "/v2", 80, base)
-	withOverride := TraefikLabels("fn", "svc.js", "issuer.example.com", "/v2", 80, overridden)
-	for k, v := range withoutOverride {
+	declared := TraefikLabels("fn", "svc.js", "issuer.example.com", "/v2", 80, base)
+	overridden := TraefikLabels("fn", "svc.js",
+		EffectiveHost("issuer.example.com", "localhost"), "/v2", 80, base)
+	for k, v := range declared {
 		if strings.HasSuffix(k, ruleSuffix) {
 			continue // the one rule Host term is the intended difference
 		}
-		if withOverride[k] != v {
-			t.Fatalf("override changed label %q: %q -> %q", k, v, withOverride[k])
+		if overridden[k] != v {
+			t.Fatalf("effective host changed label %q: %q -> %q", k, v, overridden[k])
 		}
 	}
-	if len(withoutOverride) != len(withOverride) {
-		t.Fatalf("override changed the label count: %d -> %d", len(withoutOverride), len(withOverride))
+	if len(declared) != len(overridden) {
+		t.Fatalf("effective host changed the label count: %d -> %d",
+			len(declared), len(overridden))
 	}
-	if got := withOverride[routerPrefix+id+ruleSuffix]; got != "Host(`issuer.localhost`) && PathPrefix(`/v2`)" {
-		t.Fatalf("override rule = %q", got)
+	if got := overridden[routerPrefix+id+ruleSuffix]; got != "Host(`localhost`) && PathPrefix(`/v2`)" {
+		t.Fatalf("effective-host rule = %q", got)
 	}
 }
 
-// Host-only routing under an override (no path) is the legacy label set with
-// only the Host term mapped.
-func TestTraefikLabelsOverrideHostOnly(t *testing.T) {
-	labels := TraefikLabels("fn", "svc.js", "issuer.example.com", "", 80, TraefikConfig{Network: "proxy", HostOverride: "localhost"})
+// Host-only routing under an effective override host (no path) is the legacy
+// label set with only the Host term changed.
+func TestTraefikLabelsEffectiveHostOnly(t *testing.T) {
+	labels := TraefikLabels("fn", "svc.js", "localhost", "", 80, TraefikConfig{Network: "proxy"})
 	id := ServiceProviderID("fn", "svc.js")
 	want := map[string]string{
 		enableKey:                       "true",
 		networkKey:                      "proxy",
-		routerPrefix + id + ruleSuffix:  "Host(`issuer.localhost`)",
+		routerPrefix + id + ruleSuffix:  "Host(`localhost`)",
 		servicePrefix + id + portSuffix: "80",
 	}
 	if len(labels) != len(want) {
@@ -574,44 +572,42 @@ func TestTraefikLabelsOverrideHostOnly(t *testing.T) {
 	}
 	for k := range labels {
 		if strings.Contains(k, "middlewares") || strings.Contains(k, "stripprefix") {
-			t.Fatalf("host-only override must carry no middleware labels: %v", labels)
+			t.Fatalf("host-only labels must carry no middleware keys: %v", labels)
 		}
 	}
 }
 
-// Absent override is byte-for-byte the pre-override behavior.
+// Without an override EffectiveHost is the identity function, so routing
+// through it produces byte-for-byte the plain declared-host label set, and the
+// rule keeps the declared host verbatim.
 func TestTraefikLabelsAbsentOverrideUnchanged(t *testing.T) {
-	without := TraefikLabels("fn", "svc.js", "issuer.example.com", "/v2", 80, TraefikConfig{Network: "proxy"})
-	explicitEmpty := TraefikLabels("fn", "svc.js", "issuer.example.com", "/v2", 80, TraefikConfig{Network: "proxy", HostOverride: ""})
-	if len(without) != len(explicitEmpty) {
-		t.Fatalf("label counts differ: %v vs %v", without, explicitEmpty)
+	cfg := TraefikConfig{Network: "proxy"}
+	declared := "issuer.example.com"
+	plain := TraefikLabels("fn", "svc.js", declared, "/v2", 80, cfg)
+	viaHelper := TraefikLabels("fn", "svc.js",
+		EffectiveHost(declared, ""), "/v2", 80, cfg)
+	if len(plain) != len(viaHelper) {
+		t.Fatalf("label counts differ: %v vs %v", plain, viaHelper)
 	}
-	for k, v := range without {
-		if explicitEmpty[k] != v {
-			t.Fatalf("labels differ at %q: %q vs %q", k, v, explicitEmpty[k])
+	for k, v := range plain {
+		if viaHelper[k] != v {
+			t.Fatalf("labels differ at %q: %q vs %q", k, v, viaHelper[k])
 		}
 	}
-	if got := without[routerPrefix+ServiceProviderID("fn", "svc.js")+ruleSuffix]; got != "Host(`issuer.example.com`) && PathPrefix(`/v2`)" {
+	if got := plain[routerPrefix+ServiceProviderID("fn", "svc.js")+ruleSuffix]; got != "Host(`issuer.example.com`) && PathPrefix(`/v2`)" {
 		t.Fatalf("absent-override rule = %q, want the declared host verbatim", got)
 	}
 }
 
-// The declared host string passed in is never mutated by label generation: the
-// caller's original template value is preserved (strings are values, and
-// TraefikLabels only reads host).
+// The host string passed in is never mutated by label generation: the
+// caller's original value is preserved (strings are values, and TraefikLabels
+// only reads host).
 func TestTraefikLabelsDoesNotMutateHost(t *testing.T) {
 	original := "issuer.example.com"
 	host := original
-	_ = TraefikLabels("fn", "svc.js", host, "/v2", 80, TraefikConfig{Network: "proxy", HostOverride: "localhost"})
+	_ = TraefikLabels("fn", "svc.js", host, "/v2", 80, TraefikConfig{Network: "proxy"})
 	if host != original {
 		t.Fatalf("host mutated to %q, want %q", host, original)
-	}
-}
-
-// An unrouted service stays unrouted under an override: still a NIL map.
-func TestTraefikLabelsOverrideUnroutedNil(t *testing.T) {
-	if labels := TraefikLabels("fn", "svc.js", "", "", 80, TraefikConfig{Network: "proxy", HostOverride: "localhost"}); labels != nil {
-		t.Fatalf("unrouted labels under override = %v, want nil", labels)
 	}
 }
 

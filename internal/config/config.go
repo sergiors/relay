@@ -193,15 +193,13 @@ type Config struct {
 	// it must be a positive integer — an invalid value is a fatal
 	// configuration error — so &0 is never produced.
 	TraefikPriority *int
-	// TraefikHostOverride is the optional TRAEFIK_HOST_OVERRIDE value: the
-	// domain suffix substituted for the domain of every routed service's
-	// declared host, keeping the host's left-most label (so
-	// "issuer.example.com" routes as "issuer.localhost" when set to
-	// "localhost"). Empty (unset) means no override: hosts are used verbatim,
-	// preserving prior behavior. The value is passed through as-is here and
-	// validated by the routing layer (a routing concern); it is hostname-dumb
-	// config, like the other TRAEFIK_* fields.
-	TraefikHostOverride string
+	// RoutingHostOverride is the optional ROUTING_HOST_OVERRIDE value: a single
+	// effective hostname used for every routed service. Unset or whitespace-only
+	// leaves each service's declared host unchanged; any other value replaces the
+	// effective route hostname exactly (it is not a suffix mapping). The value is
+	// passed through as-is here and validated by the routing layer (a routing
+	// concern), like the other routing fields.
+	RoutingHostOverride string
 	// ServiceBindAddr is the optional static host IP (SERVICE_BIND_ADDR) on
 	// which routed service containers publish their TCP port. Empty (unset)
 	// disables host publication entirely, preserving the historical
@@ -523,7 +521,7 @@ func Load(logger *slog.Logger) (Config, error) {
 	}
 	cfg.TraefikPriority = priority
 
-	cfg.TraefikHostOverride = getEnv("TRAEFIK_HOST_OVERRIDE", "")
+	cfg.RoutingHostOverride = getEnv("ROUTING_HOST_OVERRIDE", "")
 
 	serviceBindAddr, serviceAdvertiseAddr, err := LoadServicePublication()
 	if err != nil {

@@ -498,14 +498,24 @@ const testReconcileTimeout = 30 * time.Second
 // derives its own per-operation bounds from the explicit timeout.
 func reconcile(t *testing.T, d Docker, fn string, tmpl *app.Template, image string, cfg routing.TraefikConfig) (bool, error) {
 	t.Helper()
-	return Reconcile(context.Background(), testReconcileTimeout, d, fn, tmpl, image, nil, nil, nil, cfg, testutil.DiscardLogger())
+	return Reconcile(context.Background(), testReconcileTimeout, d, fn, tmpl, image, nil, nil, nil, cfg, "", testutil.DiscardLogger())
 }
 
 // reconcileNetworks runs Reconcile with an explicit worker-global network set,
 // for the global-network tests.
 func reconcileNetworks(t *testing.T, d Docker, fn string, tmpl *app.Template, image string, networks []string, cfg routing.TraefikConfig) (bool, error) {
 	t.Helper()
-	return Reconcile(context.Background(), testReconcileTimeout, d, fn, tmpl, image, nil, networks, nil, cfg, testutil.DiscardLogger())
+	return Reconcile(context.Background(), testReconcileTimeout, d, fn, tmpl, image, nil, networks, nil, cfg, "", testutil.DiscardLogger())
+}
+
+// reconcileOverride runs Reconcile with an explicit worker-wide host override
+// (the ROUTING_HOST_OVERRIDE value) for the routing tests.
+func reconcileOverride(t *testing.T, d Docker, fn string, tmpl *app.Template,
+	image string, cfg routing.TraefikConfig, hostOverride string,
+) (bool, error) {
+	t.Helper()
+	return Reconcile(context.Background(), testReconcileTimeout, d, fn, tmpl,
+		image, nil, nil, nil, cfg, hostOverride, testutil.DiscardLogger())
 }
 
 func TestReconcileInitialCreation(t *testing.T) {
@@ -1055,7 +1065,7 @@ func TestBuildEnvMissingProviderErrors(t *testing.T) {
 // env/secret staleness tests.
 func reconcileEnv(t *testing.T, d Docker, fn string, tmpl *app.Template, image string, preparedEnv []string, secrets SecretResolver) (bool, error) {
 	t.Helper()
-	return Reconcile(context.Background(), testReconcileTimeout, d, fn, tmpl, image, preparedEnv, nil, secrets, routing.TraefikConfig{}, testutil.DiscardLogger())
+	return Reconcile(context.Background(), testReconcileTimeout, d, fn, tmpl, image, preparedEnv, nil, secrets, routing.TraefikConfig{}, "", testutil.DiscardLogger())
 }
 
 // TestReconcileEnvChangeReplacesContainer: changing a template env value on an

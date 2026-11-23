@@ -223,9 +223,10 @@ drives the preparation retry policy, and a healthcheck-only template edit does n
 reset that retry window.
 
 Deterministic routing-configuration problems — missing or invalid worker
-`TRAEFIK_*` configuration, or an effective host that cannot be a valid hostname —
-are reported as failures but are not retried on a backoff: the same configuration
-can never succeed until the template or worker configuration changes.
+`TRAEFIK_*` configuration, an invalid `ROUTING_HOST_OVERRIDE`, or an effective
+host that cannot be a valid hostname — are reported as failures but are not
+retried on a backoff: the same configuration can never succeed until the
+template or worker configuration changes.
 
 ## Environment, secrets, resources, networks
 
@@ -319,9 +320,12 @@ A service with a `host` is routed through operator-provided Traefik. Set
 `TRAEFIK_NETWORK` to an existing Docker network used by Traefik; Relay does not
 create it. `TRAEFIK_ENTRYPOINTS`, `TRAEFIK_CERTRESOLVER`, and
 `TRAEFIK_PRIORITY` add the corresponding router settings when configured.
-`TRAEFIK_HOST_OVERRIDE` changes the domain used for a route while preserving the
-left-most hostname label. Without these settings, Relay does not assume a
-secure entrypoint, certificate resolver, or fallback priority.
+`ROUTING_HOST_OVERRIDE` sets one exact hostname for every routed service instead
+of each service's declared `host`; unset or whitespace-only keeps the declared
+hosts. The override is not a domain suffix: services on different declared hosts
+share the override hostname, so give them distinct `path` values or run separate
+deployments. Without these settings, Relay does not assume a secure entrypoint,
+certificate resolver, or fallback priority.
 
 A `path` requires a `host`; Traefik routes requests under that prefix and removes
 the prefix before forwarding them to the service. Changing routing settings

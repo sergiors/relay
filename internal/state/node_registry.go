@@ -6,7 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"net/netip"
 	"time"
+
+	"relay/internal/app"
 )
 
 // Global node registry and service endpoint publication
@@ -89,10 +93,10 @@ type NodeLease struct {
 }
 
 // ServiceRegistryEndpoint is one routable service replica published by a node.
-// Host is the service's configured template hostname; a configured
-// TRAEFIK_HOST_OVERRIDE changes the container's routing labels but never this
-// stored value. It intentionally carries only routing/metadata: no environment,
-// secret, or handler payload ever enters the registry.
+// Host is the service's effective routing hostname: the declared template host,
+// or the exact ROUTING_HOST_OVERRIDE value when configured. It intentionally
+// carries only routing/metadata: no environment, secret, or handler payload ever
+// enters the registry.
 type ServiceRegistryEndpoint struct {
 	// NodeID and AdvertiseAddr are filled by ReadEligible... and ignored by
 	// Publish, which takes them from the fenced node lease.
@@ -272,7 +276,7 @@ func (st *State) ClaimNodeLease(
 	err = tx.QueryRowContext(ctx, claimNodeLeaseQuery,
 		fence.nodeID, fence.instance, fence.ownerPID, fence.lockKey,
 		ttl.Seconds(), data,
-	).Scan(&incarnation, &expiresAt)
+	).Scan(&incarnation)
 	if errors.Is(err, sql.ErrNoRows) {
 		return NodeLease{}, fmt.Errorf(
 			"%w: node %q advisory lock is not held by backend %d",
@@ -282,6 +286,22 @@ func (st *State) ClaimNodeLease(
 		return NodeLease{}, fmt.Errorf("node registry: claim lease: %w", err)
 	}
 	fence.incarnation = incarnation
+	// The claim INSERT may have waited on a conflicting row (and, on a
+	// conflict-delete, inserted values computed before that wait). Re-stamp the
+	// owned lease with a fresh database instant now that the row is locked, so a
+	// delayed claimant never starts with an already-shortened TTL.
+	err = tx.QueryRowContext(ctx, refreshClaimedNodeLeaseQuery,
+		fence.nodeID, fence.instance, fence.incarnation,
+		ttl.Seconds(), fence.ownerPID, fence.lockKey,
+	).Scan(&expiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return NodeLease{}, fmt.Errorf(
+			"%w: node %q claim could not be refreshed",
+			ErrNodeLeaseFence, fence.nodeID)
+	}
+	if err != nil {
+		return NodeLease{}, fmt.Errorf("node registry: refresh claim: %w", err)
+	}
 	// Startup/restart recovery: rows from a superseded incarnation are invisible
 	// to readers immediately (they join on incarnation) and are removed here so
 	// they cannot accumulate.
@@ -307,9 +327,11 @@ func (st *State) ClaimNodeLease(
 
 // HeartbeatNodeLease extends the lease only while it still belongs to this
 // process/incarnation and the pinned backend still holds the node advisory
-// lock. It is one bounded statement. A fence rejection is reported as
-// ErrNodeLeaseFence; every other error is a database failure the caller may
-// retry with the same lease.
+// lock. It is one bounded statement and deliberately does NOT require an
+// unexpired lease: a heartbeat delayed past the TTL still renews the current
+// incarnation while its lock is held, so cleanup must not have erased the row.
+// A fence rejection is reported as ErrNodeLeaseFence; every other error is a
+// database failure the caller may retry with the same lease.
 func (st *State) HeartbeatNodeLease(
 	ctx context.Context,
 	lease NodeLease,
@@ -389,9 +411,17 @@ func (st *State) ReleaseNodeLease(
 // to a currently active node) first, then node rows whose DB-time lease has
 // expired. Deleting an expired node row cascades any endpoints still attached to
 // it. Concurrent claim/heartbeat/publication transactions are handled by
-// FOR UPDATE SKIP LOCKED plus a re-check of the expiry predicate in the outer
-// DELETE, so a row renewed concurrently is retained and a live successor is
-// never removed.
+// FOR UPDATE SKIP LOCKED plus a re-check of the expiry predicate against fresh
+// database time, so a row renewed concurrently is retained and a live successor
+// is never removed.
+//
+// An expired row is retained while the node's exact exclusive advisory key is
+// currently held in pg_locks. That is the "heartbeat was delayed past TTL, but
+// the process is alive and still owns the identity" case: visibility already
+// ends at expiry, and cleanup must not erase the registration the heartbeat is
+// about to renew. Ownership is proved by the exact per-node key, never by PID or
+// nodes.data: malformed metadata cannot block cleanup, and a row is reclaimed
+// once the lock is released.
 //
 // It is a global maintenance operation owned by the node-registry lifecycle; it
 // needs no process fence because every deletion is conditioned on expiry. It
@@ -416,21 +446,213 @@ func (st *State) PruneExpiredNodeRegistry(
 		return NodeRegistryPruneResult{}, fmt.Errorf(
 			"node registry: prune expired endpoints: %w", err)
 	}
-	res, err = tx.ExecContext(ctx, pruneExpiredNodesQuery,
-		NodeRegistryPruneNodeBatch)
+	nodes, err := pruneExpiredNodeRows(ctx, tx, NodeRegistryPruneNodeBatch)
 	if err != nil {
-		return NodeRegistryPruneResult{}, fmt.Errorf(
-			"node registry: prune expired nodes: %w", err)
-	}
-	nodes, err := res.RowsAffected()
-	if err != nil {
-		return NodeRegistryPruneResult{}, fmt.Errorf(
-			"node registry: prune expired nodes: %w", err)
+		return NodeRegistryPruneResult{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return NodeRegistryPruneResult{}, fmt.Errorf("node registry: commit prune: %w", err)
 	}
 	return NodeRegistryPruneResult{Endpoints: endpoints, Nodes: nodes}, nil
+}
+
+// expiredNodePruneCandidate is one locked expired node row. Its advisory key is
+// derived from the node identity; nodes.data is deliberately not decoded, so
+// malformed metadata cannot poison the cleanup transaction.
+type expiredNodePruneCandidate struct {
+	nodeID  string
+	lockKey int64
+}
+
+// pruneExpiredNodeRows locks one bounded batch of endpoint-free expired node
+// rows, excludes rows whose exact per-node exclusive advisory key is currently
+// held, and deletes the rest. The row locks held by the selection serialize a
+// concurrent heartbeat or successor claim for the remainder of the transaction,
+// and the delete re-checks expiry against fresh database time.
+func pruneExpiredNodeRows(
+	ctx context.Context, tx *sql.Tx, limit int,
+) (int64, error) {
+	rows, err := tx.QueryContext(ctx, selectExpiredNodesForPruneQuery, limit)
+	if err != nil {
+		return 0, fmt.Errorf("node registry: select expired nodes: %w", err)
+	}
+	candidates := make([]expiredNodePruneCandidate, 0, limit)
+	for rows.Next() {
+		var nodeID string
+		if err := rows.Scan(&nodeID); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("node registry: scan expired node: %w", err)
+		}
+		candidates = append(candidates, expiredNodePruneCandidate{
+			nodeID:  nodeID,
+			lockKey: nodeLockKey(nodeID),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, fmt.Errorf("node registry: select expired nodes: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf("node registry: select expired nodes: %w", err)
+	}
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+
+	held, err := heldNodeLeaseLocks(ctx, tx, candidates)
+	if err != nil {
+		return 0, err
+	}
+	ids := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, ok := held[candidate.nodeID]; ok {
+			continue
+		}
+		ids = append(ids, candidate.nodeID)
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	res, err := tx.ExecContext(ctx, deleteExpiredNodesQuery, ids)
+	if err != nil {
+		return 0, fmt.Errorf("node registry: prune expired nodes: %w", err)
+	}
+	deleted, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("node registry: prune expired nodes: %w", err)
+	}
+	return deleted, nil
+}
+
+// heldNodeLeaseLocks returns the candidate node IDs whose exact per-node
+// exclusive advisory key is currently held. The key alone is the ownership
+// evidence: no PID and no nodes.data owner_pid is consulted.
+func heldNodeLeaseLocks(
+	ctx context.Context, tx *sql.Tx,
+	candidates []expiredNodePruneCandidate,
+) (map[string]struct{}, error) {
+	ids := make([]string, 0, len(candidates))
+	keys := make([]int64, 0, len(candidates))
+	for _, candidate := range candidates {
+		ids = append(ids, candidate.nodeID)
+		keys = append(keys, candidate.lockKey)
+	}
+	rows, err := tx.QueryContext(ctx, heldNodeLeaseLocksQuery, ids, keys)
+	if err != nil {
+		return nil, fmt.Errorf("node registry: check node advisory locks: %w", err)
+	}
+	defer rows.Close()
+	held := make(map[string]struct{}, len(ids))
+	for rows.Next() {
+		var nodeID string
+		if err := rows.Scan(&nodeID); err != nil {
+			return nil, fmt.Errorf("node registry: check node advisory locks: %w", err)
+		}
+		held[nodeID] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("node registry: check node advisory locks: %w", err)
+	}
+	return held, nil
+}
+
+// validateServiceRegistryEndpoint rejects an invalid endpoint row before any
+// registry write begins. It is the single admission check for the published
+// batch: one invalid row rejects the whole batch, and valid rows are persisted
+// verbatim rather than normalized here. The host and path rules are the service
+// template's own rules from internal/app, so a stored route always means what the
+// reconciler would accept.
+func validateServiceRegistryEndpoint(endpoint ServiceRegistryEndpoint) error {
+	if endpoint.App == "" {
+		return fmt.Errorf("service registry: endpoint app is empty")
+	}
+	if endpoint.Service == "" {
+		return fmt.Errorf("service registry: endpoint service is empty")
+	}
+	if endpoint.ContainerID == "" {
+		return fmt.Errorf("service registry: endpoint container is empty")
+	}
+	identity := fmt.Sprintf("app=%q service=%q replica=%d container=%q",
+		endpoint.App, endpoint.Service, endpoint.Replica, endpoint.ContainerID)
+	if endpoint.Host == "" {
+		return fmt.Errorf("service registry: endpoint %s: host is empty", identity)
+	}
+	if err := app.ValidateServiceHost(endpoint.Host); err != nil {
+		return fmt.Errorf("service registry: endpoint %s: host: %w", identity, err)
+	}
+	if endpoint.Replica < 0 {
+		return fmt.Errorf(
+			"service registry: endpoint %s: replica must not be negative", identity)
+	}
+	if endpoint.Replica > math.MaxInt32 {
+		return fmt.Errorf(
+			"service registry: endpoint %s: replica %d exceeds the maximum supported value %d",
+			identity, endpoint.Replica, math.MaxInt32)
+	}
+	if endpoint.HostPort < 1 || endpoint.HostPort > 65535 {
+		return fmt.Errorf(
+			"service registry: endpoint %s: host port %d is outside 1..65535",
+			identity, endpoint.HostPort)
+	}
+	if endpoint.InternalPort < 1 || endpoint.InternalPort > 65535 {
+		return fmt.Errorf(
+			"service registry: endpoint %s: internal port %d is outside 1..65535",
+			identity, endpoint.InternalPort)
+	}
+	if err := validateServiceRegistryHostIP(identity, endpoint.HostIP); err != nil {
+		return err
+	}
+	if endpoint.Generation == "" {
+		return fmt.Errorf(
+			"service registry: endpoint %s: generation is empty", identity)
+	}
+	if err := app.ValidateServicePath(endpoint.Path); err != nil {
+		return fmt.Errorf("service registry: endpoint %s: path: %w", identity, err)
+	}
+	return nil
+}
+
+// validateServiceRegistryHostIP enforces the address shape the Docker collector
+// can actually produce. servicePublishedBinding rejects invalid, unspecified,
+// and multicast bindings and returns an unmapped address; the service bind
+// address parser additionally rejects mapped, zone-scoped, and non-unicast
+// forms. A persisted registry row must fit that same contract rather than
+// admitting an address the collector could never verify. This is admission
+// only: equality with the configured SERVICE_BIND_ADDR remains the runtime
+// collector's responsibility.
+func validateServiceRegistryHostIP(identity, hostIP string) error {
+	addr, err := netip.ParseAddr(hostIP)
+	if err != nil {
+		return fmt.Errorf(
+			"service registry: endpoint %s: host IP %q is not a valid IPv4 or IPv6 address",
+			identity, hostIP)
+	}
+	if addr.Is4In6() {
+		return fmt.Errorf(
+			"service registry: endpoint %s: host IP %q is IPv4-mapped IPv6; use the IPv4 form",
+			identity, hostIP)
+	}
+	if addr.Zone() != "" {
+		return fmt.Errorf(
+			"service registry: endpoint %s: host IP %q is zone-scoped",
+			identity, hostIP)
+	}
+	if addr.IsUnspecified() {
+		return fmt.Errorf(
+			"service registry: endpoint %s: host IP %q is unspecified",
+			identity, hostIP)
+	}
+	if addr.IsMulticast() {
+		return fmt.Errorf(
+			"service registry: endpoint %s: host IP %q is multicast",
+			identity, hostIP)
+	}
+	if !addr.IsGlobalUnicast() && !addr.IsLoopback() && !addr.IsLinkLocalUnicast() {
+		return fmt.Errorf(
+			"service registry: endpoint %s: host IP %q is not a usable unicast host address",
+			identity, hostIP)
+	}
+	return nil
 }
 
 // PublishServiceRegistryEndpoints atomically publishes the EXACT eligible
@@ -450,6 +672,15 @@ func (st *State) PublishServiceRegistryEndpoints(
 	if err != nil {
 		return err
 	}
+	// Validate every RAW input first. Deduplication below keeps the LAST row for
+	// a repeated identity; validating only the deduplicated set would let an
+	// invalid earlier row disappear behind a later valid one. One invalid input
+	// always rejects the whole batch before any encoding or transaction begins.
+	for _, endpoint := range endpoints {
+		if err := validateServiceRegistryEndpoint(endpoint); err != nil {
+			return err
+		}
+	}
 	// A batch is a SET keyed by the relational identity. Deduplicate here so a
 	// caller that repeats a row produces the idempotent result instead of
 	// PostgreSQL's "ON CONFLICT DO UPDATE cannot affect row a second time".
@@ -462,14 +693,6 @@ func (st *State) PublishServiceRegistryEndpoints(
 	containerIDs := make([]string, len(endpoints))
 	payloads := make([]string, len(endpoints))
 	for i, endpoint := range endpoints {
-		if endpoint.App == "" || endpoint.Service == "" ||
-			endpoint.Host == "" || endpoint.ContainerID == "" ||
-			endpoint.Replica < 0 {
-			return fmt.Errorf(
-				"service registry: invalid endpoint identity app=%q service=%q replica=%d container=%q host=%q",
-				endpoint.App, endpoint.Service, endpoint.Replica,
-				endpoint.ContainerID, endpoint.Host)
-		}
 		payload, err := encodeServiceRegistryEndpointPayload(endpoint)
 		if err != nil {
 			return err
@@ -492,10 +715,15 @@ func (st *State) PublishServiceRegistryEndpoints(
 	// Lock the active lease row and verify the fence in the same statement. The
 	// row lock serializes a concurrent successor claim behind this transaction,
 	// and FOR UPDATE re-reads the newest row, so a just-superseded incarnation is
-	// rejected rather than publishing against a stale snapshot. lease_expires_at
-	// must still be in the future by the database clock: publication consumes the
-	// heartbeat-owned lease and never extends it, so a lapsed lease stops the
-	// endpoint snapshot from outliving node liveness.
+	// rejected rather than publishing against a stale snapshot. Expiry is
+	// checked SEPARATELY after the lock is held, using a fresh statement and
+	// clock_timestamp(): a predicate evaluated in the locking statement can be
+	// re-evaluated by READ COMMITTED's EvalPlanQual against a concurrently
+	// updated row, but only a post-lock statement necessarily measures real
+	// database time after any conflict wait. lease_expires_at must still be in
+	// the future by that clock: publication consumes the heartbeat-owned lease
+	// and never extends it, so a lapsed lease stops the endpoint snapshot from
+	// outliving node liveness.
 	var lockedIncarnation int64
 	err = tx.QueryRowContext(ctx, lockActiveNodeLeaseQuery,
 		fence.nodeID, fence.instance, fence.incarnation,
@@ -508,6 +736,18 @@ func (st *State) PublishServiceRegistryEndpoints(
 	}
 	if err != nil {
 		return fmt.Errorf("service registry: verify publish fence: %w", err)
+	}
+	var active bool
+	err = tx.QueryRowContext(ctx, recheckActiveNodeLeaseQuery,
+		fence.nodeID, fence.instance, fence.incarnation,
+	).Scan(&active)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && !active) {
+		return fmt.Errorf(
+			"%w: publish node %q incarnation %d lease expired",
+			ErrNodeLeaseFence, fence.nodeID, fence.incarnation)
+	}
+	if err != nil {
+		return fmt.Errorf("service registry: verify publish lease: %w", err)
 	}
 	if len(endpoints) > 0 {
 		if _, err := tx.ExecContext(ctx, upsertServiceRegistryEndpointsQuery,
@@ -606,11 +846,18 @@ func (st *State) checkNodeLease(lease NodeLease) (nodeLeaseFence, error) {
 // but only while the PINNED lock backend still holds the node's session advisory
 // lock. The advisory key is reconstructed from pg_locks' classid/objid exactly
 // like VerifyOwnerLock; nothing is re-acquired.
+//
+// Timestamps use clock_timestamp(), not now(): now() is the transaction start
+// time, and this INSERT may wait on a conflicting row. On conflict, the DO
+// UPDATE branch evaluates its SET expressions after that wait. The separate
+// refresh statement below then re-stamps the claimed row after the row lock is
+// held, covering the insert path of a concurrent delete as well.
 const claimNodeLeaseQuery = `
 	INSERT INTO nodes
 		(node_id, instance, incarnation, heartbeat_at, lease_expires_at, data)
 	SELECT $1, $2, nextval('nodes_incarnation_seq'),
-	       now(), now() + make_interval(secs => $5::double precision), $6::jsonb
+	       clock_timestamp(),
+	       clock_timestamp() + make_interval(secs => $5::double precision), $6::jsonb
 	 WHERE EXISTS (
 		SELECT 1 FROM pg_locks
 		 WHERE locktype = 'advisory'
@@ -622,10 +869,34 @@ const claimNodeLeaseQuery = `
 	ON CONFLICT (node_id) DO UPDATE SET
 		instance = excluded.instance,
 		incarnation = excluded.incarnation,
-		heartbeat_at = excluded.heartbeat_at,
-		lease_expires_at = excluded.lease_expires_at,
+		heartbeat_at = clock_timestamp(),
+		lease_expires_at =
+			clock_timestamp() + make_interval(secs => $5::double precision),
 		data = excluded.data
-	RETURNING incarnation, lease_expires_at`
+	RETURNING incarnation`
+
+// refreshClaimedNodeLeaseQuery re-stamps the claimed row after the INSERT above
+// has acquired its row lock. The INSERT itself may have waited on a conflicting
+// row, and its INSERT path can carry timestamps computed before that wait; this
+// follow-up statement measures the lease from the real DB instant and keeps the
+// same owner/incarnation/lock fence.
+const refreshClaimedNodeLeaseQuery = `
+	UPDATE nodes
+	   SET heartbeat_at = clock_timestamp(),
+	       lease_expires_at =
+			clock_timestamp() + make_interval(secs => $4::double precision)
+	 WHERE node_id = $1
+	   AND instance = $2
+	   AND incarnation = $3
+	   AND EXISTS (
+		SELECT 1 FROM pg_locks
+		 WHERE locktype = 'advisory'
+		   AND pid = $5
+		   AND objsubid = 1
+		   AND granted
+		   AND (classid::bigint << 32) | objid::bigint = $6
+	 )
+	RETURNING lease_expires_at`
 
 const deleteSupersededNodeEndpointsQuery = `
 	DELETE FROM service_registry_endpoints
@@ -633,8 +904,9 @@ const deleteSupersededNodeEndpointsQuery = `
 
 const heartbeatNodeLeaseQuery = `
 	UPDATE nodes
-	   SET heartbeat_at = now(),
-	       lease_expires_at = now() + make_interval(secs => $4::double precision)
+	   SET heartbeat_at = clock_timestamp(),
+	       lease_expires_at =
+			clock_timestamp() + make_interval(secs => $4::double precision)
 	 WHERE node_id = $1
 	   AND instance = $2
 	   AND incarnation = $3
@@ -670,17 +942,19 @@ const lockNodeLeaseQuery = `
 	 )
 	 FOR UPDATE`
 
-// lockActiveNodeLeaseQuery is the PUBLICATION fence. It additionally requires
-// the heartbeat-owned lease to still be valid by the database clock, because
-// endpoint publication consumes the node lease and never renews it. A lapsed
-// lease therefore stops publication until the standalone heartbeat restores it.
+// lockActiveNodeLeaseQuery is the PUBLICATION fence's LOCK step. It requires the
+// complete owner/incarnation/advisory-lock fence but deliberately does not test
+// expiry: a row predicate evaluated by this statement can be re-checked by READ
+// COMMITTED's EvalPlanQual against a concurrently updated version, and now()
+// would carry the transaction timestamp across a conflict wait. Taking the row
+// lock first and checking lease_expires_at with clock_timestamp() in a follow-up
+// statement (recheckActiveNodeLeaseQuery) measures real DB time after the lock.
 const lockActiveNodeLeaseQuery = `
 	SELECT incarnation
 	  FROM nodes
 	 WHERE node_id = $1
 	   AND instance = $2
 	   AND incarnation = $3
-	   AND lease_expires_at > now()
 	   AND EXISTS (
 		SELECT 1 FROM pg_locks
 		 WHERE locktype = 'advisory'
@@ -690,6 +964,13 @@ const lockActiveNodeLeaseQuery = `
 		   AND (classid::bigint << 32) | objid::bigint = $5
 	 )
 	 FOR UPDATE`
+
+const recheckActiveNodeLeaseQuery = `
+	SELECT lease_expires_at > clock_timestamp()
+	  FROM nodes
+	 WHERE node_id = $1
+	   AND instance = $2
+	   AND incarnation = $3`
 
 const deleteIncarnationEndpointsQuery = `
 	DELETE FROM service_registry_endpoints
@@ -708,53 +989,72 @@ const pruneExpiredServiceRegistryEndpointsQuery = `
 	 WHERE e.ctid IN (
 		SELECT c.ctid
 		  FROM service_registry_endpoints c
-		 WHERE c.expires_at <= now()
+		 WHERE c.expires_at <= clock_timestamp()
 		    OR NOT EXISTS (
 			SELECT 1 FROM nodes n
 			 WHERE n.node_id = c.node_id
 			   AND n.incarnation = c.incarnation
-			   AND n.lease_expires_at > now()
+			   AND n.lease_expires_at > clock_timestamp()
 		    )
 		 ORDER BY c.expires_at
 		 LIMIT $1
 		 FOR UPDATE SKIP LOCKED
 	 )
 	 AND (
-		e.expires_at <= now()
+		e.expires_at <= clock_timestamp()
 		OR NOT EXISTS (
 			SELECT 1 FROM nodes n
 			 WHERE n.node_id = e.node_id
 			   AND n.incarnation = e.incarnation
-			   AND n.lease_expires_at > now()
+			   AND n.lease_expires_at > clock_timestamp()
 		)
 	 )`
 
-// pruneExpiredNodesQuery deletes one bounded batch of node rows whose lease
-// lapsed by the database clock, but ONLY after no endpoint row remains attached.
-// The endpoint batch above runs first, so this deliberately avoids relying on a
-// cascade to remove unpruned endpoints: a node with remaining endpoints is
-// deferred to a later invocation, keeping both batches bounded. A concurrently
-// renewed row fails the outer re-check and is retained; a live successor has a
-// fresh lease and is never selected.
-const pruneExpiredNodesQuery = `
-	DELETE FROM nodes n
-	 WHERE n.node_id IN (
-		SELECT c.node_id
-		  FROM nodes c
-		 WHERE c.lease_expires_at <= now()
-		   AND NOT EXISTS (
-			SELECT 1 FROM service_registry_endpoints e
-			 WHERE e.node_id = c.node_id
-		   )
-		 ORDER BY c.lease_expires_at
-		 LIMIT $1
-		 FOR UPDATE SKIP LOCKED
-	 )
-	 AND n.lease_expires_at <= now()
-	 AND NOT EXISTS (
+// selectExpiredNodesForPruneQuery locks one bounded batch of expired node rows
+// that have no remaining endpoint rows. The endpoint batch above runs first, so
+// this deliberately avoids relying on a cascade to remove unpruned endpoints: a
+// node with remaining endpoints is deferred to a later invocation, keeping both
+// batches bounded. FOR UPDATE SKIP LOCKED serializes against a concurrent
+// heartbeat/claim, and READ COMMITTED re-checks the predicate against a
+// concurrently renewed row before locking it. Only the node ID is read; the
+// lock key is derived in Go, so malformed nodes.data cannot fail cleanup.
+const selectExpiredNodesForPruneQuery = `
+	SELECT n.node_id
+	  FROM nodes n
+	 WHERE n.lease_expires_at <= clock_timestamp()
+	   AND NOT EXISTS (
 		SELECT 1 FROM service_registry_endpoints e
 		 WHERE e.node_id = n.node_id
-	 )`
+	   )
+	 ORDER BY n.lease_expires_at
+	 LIMIT $1
+	 FOR UPDATE SKIP LOCKED`
+
+// heldNodeLeaseLocksQuery reports which candidate node IDs currently have their
+// exact exclusive session advisory key held. The key is reconstructed in Go from
+// the node identity; no PID or nodes.data value participates.
+const heldNodeLeaseLocksQuery = `
+	SELECT cand.node_id
+	  FROM unnest($1::text[], $2::bigint[])
+	       AS cand(node_id, lock_key)
+	  JOIN pg_locks l
+	    ON l.locktype = 'advisory'
+	   AND l.objsubid = 1
+	   AND l.granted
+	   AND l.mode = 'ExclusiveLock'
+	   AND (l.classid::bigint << 32) | l.objid::bigint = cand.lock_key`
+
+// deleteExpiredNodesQuery removes the selected rows that were not excluded for a
+// still-held owner lock. The rows are already row-locked by the selection, and
+// expiry/no-endpoints are re-checked with fresh database time.
+const deleteExpiredNodesQuery = `
+	DELETE FROM nodes n
+	 WHERE n.node_id = ANY($1::text[])
+	   AND n.lease_expires_at <= clock_timestamp()
+	   AND NOT EXISTS (
+		SELECT 1 FROM service_registry_endpoints e
+		 WHERE e.node_id = n.node_id
+	   )`
 
 const releaseNodeLeaseQuery = `
 	DELETE FROM nodes
@@ -763,14 +1063,17 @@ const releaseNodeLeaseQuery = `
 // upsertServiceRegistryEndpointsQuery inserts the published set and updates only
 // rows whose relational routing/identity fields or cohesive JSONB attributes
 // changed, or whose expiry is within the renewal threshold, so a steady-state
-// sync does not rewrite every row on every pass.
+// sync does not rewrite every row on every pass. clock_timestamp() keeps an
+// insert/update that waited on a conflicting row from carrying the transaction's
+// older start time into a shorter-than-intended renewal window.
 const upsertServiceRegistryEndpointsQuery = `
 	INSERT INTO service_registry_endpoints
 		(node_id, incarnation, app_name, service_name, replica, host, path,
 		 container_id, expires_at, updated_at, data)
 	SELECT $1, $2, u.app_name, u.service_name, u.replica, u.host, u.path,
 	       u.container_id,
-	       now() + make_interval(secs => $3::double precision), now(),
+	       clock_timestamp() + make_interval(secs => $3::double precision),
+	       clock_timestamp(),
 	       u.data::jsonb
 	  FROM unnest(
 	       $4::text[], $5::text[], $6::int[], $7::text[], $8::text[],
@@ -782,14 +1085,15 @@ const upsertServiceRegistryEndpointsQuery = `
 		host = excluded.host,
 		path = excluded.path,
 		data = excluded.data,
-		expires_at = excluded.expires_at,
-		updated_at = excluded.updated_at
+		expires_at =
+			clock_timestamp() + make_interval(secs => $3::double precision),
+		updated_at = clock_timestamp()
 	WHERE service_registry_endpoints.incarnation IS DISTINCT FROM excluded.incarnation
 	   OR service_registry_endpoints.host IS DISTINCT FROM excluded.host
 	   OR service_registry_endpoints.path IS DISTINCT FROM excluded.path
 	   OR service_registry_endpoints.data IS DISTINCT FROM excluded.data
 	   OR service_registry_endpoints.expires_at <
-	      now() + make_interval(secs => $3::double precision / 2)`
+	      clock_timestamp() + make_interval(secs => $3::double precision / 2)`
 
 const deleteServiceRegistryEndpointsQuery = `
 	DELETE FROM service_registry_endpoints e
@@ -807,6 +1111,10 @@ const deleteServiceRegistryEndpointsQuery = `
 		)
 	   )`
 
+// readServiceRegistryEndpointsQuery exposes only endpoints whose node
+// incarnation matches and whose node lease and own expiry are still in the
+// future at the instant of the read. Visibility is expiry-only: a held advisory
+// lock never keeps an expired node or endpoint discoverable.
 const readServiceRegistryEndpointsQuery = `
 	SELECT e.node_id, n.data::text,
 	       e.app_name, e.service_name, e.replica,
@@ -814,8 +1122,8 @@ const readServiceRegistryEndpointsQuery = `
 	  FROM service_registry_endpoints e
 	  JOIN nodes n ON n.node_id = e.node_id
 	 WHERE n.incarnation = e.incarnation
-	   AND n.lease_expires_at > now()
-	   AND e.expires_at > now()
+	   AND n.lease_expires_at > clock_timestamp()
+	   AND e.expires_at > clock_timestamp()
 	   AND ($1 = '' OR e.node_id = $1)
 	   AND ($2 = '' OR e.app_name = $2)
 	   AND ($3 = '' OR e.service_name = $3)

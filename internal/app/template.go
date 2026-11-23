@@ -1404,10 +1404,12 @@ func validateServiceImage(image string) error {
 // whitespace rejection below.
 var hostnamePattern = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$`)
 
-// validateServiceHost validates the optional service `host`. Empty is valid
+// ValidateServiceHost validates the optional service `host`. Empty is valid
 // (an internal unrouted service); anything else must be a valid hostname,
 // because the value is handed to the routing layer verbatim, and a malformed
 // host would silently never match any request.
+func ValidateServiceHost(host string) error { return validateServiceHost(host) }
+
 func validateServiceHost(host string) error {
 	if host == "" {
 		return nil
@@ -1462,6 +1464,21 @@ func canonicalizeServicePath(path string) (string, error) {
 		return "", fmt.Errorf("path %q contains an empty path segment", path)
 	}
 	return canonical, nil
+}
+
+// ValidateServicePath validates an optional service `path` without normalizing
+// it. Empty is valid (host-only routing). A non-empty value must already be
+// canonical, because persisted routing values are not silently rewritten: a
+// trailing slash is reported instead of being stripped.
+func ValidateServicePath(path string) error {
+	canonical, err := canonicalizeServicePath(path)
+	if err != nil {
+		return err
+	}
+	if canonical != path {
+		return fmt.Errorf("path %q is not canonical; use %q", path, canonical)
+	}
+	return nil
 }
 
 // validateHandler requires the form module.function (splitting at the last dot)

@@ -1,11 +1,12 @@
 // Package routing holds Traefik-specific routing logic for Relay's persistent
 // services: the label set stamped on a routed service container, the
 // deterministic Traefik-safe router/service id, and the small config surface
-// (TRAEFIK_NETWORK and the optional TRAEFIK_HOST_OVERRIDE) the worker-level
-// reconciler consults. NOTHING here talks to Docker or knows about templates —
-// Traefik is the only routing integration supported (no provider abstraction),
-// and the reconciler owns applying these labels and validating the network
-// before starting routed containers.
+// (TRAEFIK_NETWORK plus the optional router-slice values) the worker-level
+// reconciler consults. It also owns the generic effective-host helper used by
+// both reconciliation and registry publication. NOTHING here talks to Docker or
+// knows about templates — Traefik is the only routing integration supported (no
+// provider abstraction), and the reconciler owns applying these labels and
+// validating the network before starting routed containers.
 package routing
 
 import (
@@ -38,10 +39,11 @@ const TraefikLabelPrefix = "traefik."
 // TraefikConfig is the worker-level Traefik routing configuration: the Docker
 // network Traefik is attached to (from the TRAEFIK_NETWORK environment
 // variable), plus the optional router-slice values TRAEFIK_ENTRYPOINTS,
-// TRAEFIK_CERTRESOLVER, and TRAEFIK_PRIORITY, and the optional host override
-// TRAEFIK_HOST_OVERRIDE. Empty/unset optional values mean the corresponding
-// label is simply omitted — nothing is defaulted here (no implicit
-// "websecure" entrypoint, "letsencrypt" resolver, or priority).
+// TRAEFIK_CERTRESOLVER, and TRAEFIK_PRIORITY. Empty/unset optional values mean
+// the corresponding label is simply omitted — nothing is defaulted here (no
+// implicit "websecure" entrypoint, "letsencrypt" resolver, or priority). It does
+// NOT carry the worker-wide host override: that is generic routing config and
+// is resolved into an explicit effective host before labels are built.
 type TraefikConfig struct {
 	Network string
 	// EntryPoints is the optional TRAEFIK_ENTRYPOINTS value: one or more
@@ -63,17 +65,6 @@ type TraefikConfig struct {
 	// int cannot express that, and the ability to CLEAR the value
 	// (converging the priority label away) is part of reconciliation.
 	Priority *int
-	// HostOverride is the optional TRAEFIK_HOST_OVERRIDE value: the domain
-	// suffix that replaces the domain part of every routed service's declared
-	// host, keeping the host's left-most label. It is the operator escape
-	// hatch for running a template whose hosts belong to a real domain (e.g.
-	// "issuer.example.com") on a local/inner environment (e.g.
-	// "issuer.localhost") without editing the template. Empty = no override:
-	// the declared host is used verbatim, byte-for-byte the pre-override
-	// behavior. When set it must itself be a valid hostname (see
-	// validateHostname), and the host derived from it is validated per service
-	// against the hostname length limit (see ValidateHost).
-	HostOverride string
 }
 
 // hostnamePattern mirrors the service `host` hostname rule in
@@ -89,8 +80,8 @@ var hostnamePattern = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z
 // rules as the service `host` validation in internal/app: non-empty, at
 // most 253 characters, no whitespace, and matching hostnamePattern. Empty is
 // NOT valid here — callers that allow the "no host" (unrouted) case exclude it
-// first. This helper is the shared rule for the override value (Validate) and
-// for the effective host derived from it (ValidateHost).
+// first. This helper is the shared rule for the worker-wide override value and
+// for an explicitly supplied effective host.
 func validateHostname(host string) error {
 	if host == "" {
 		return fmt.Errorf("host is empty")
@@ -107,34 +98,37 @@ func validateHostname(host string) error {
 	return nil
 }
 
-// OverrideHost returns the effective host for a routed service: the declared
-// host unchanged when cfg.HostOverride is empty, or the host's left-most label
-// joined to the override suffix otherwise. The declared host is never mutated
-// (strings are values), so callers keep using the template's original host for
-// logs, fingerprinting, and stale-container detection.
-//
-// The mapping keeps ONLY the first dot-separated label of the declared host:
-// "issuer.example.com" with override "localhost" becomes
-// "issuer.localhost". A single-label host ("issuer") has no domain to replace,
-// so it is treated the same way — the label is kept and the override appended
-// ("issuer.localhost"). This is the only interpretation consistent with the
-// multi-label case: the override supplies the domain (everything after the
-// first label), and a label-only host has an empty domain, so that empty
-// domain is exactly what gets replaced.
-//
-// OverrideHost itself does NOT re-validate: it stays a pure mapping app
-// so the label builder needs no error path. Validation of the derived host
-// belongs with the per-service routing check (see ValidateHost), which runs
-// before any container/network work.
-func (c TraefikConfig) OverrideHost(host string) string {
-	if c.HostOverride == "" {
+// EffectiveHost returns the routing hostname for a service: the declared host
+// unchanged when override is unset or whitespace-only, otherwise the exact
+// override hostname. The override is a single effective hostname, never a
+// suffix or a rewrite of the declared host. The declared host is passed by
+// value, so template/logging/fingerprinting code keeps the original.
+func EffectiveHost(host, override string) string {
+	if !HostOverrideConfigured(override) {
 		return host
 	}
-	label := host
-	if i := strings.IndexByte(host, '.'); i >= 0 {
-		label = host[:i]
+	return override
+}
+
+// HostOverrideConfigured reports whether the optional worker-wide override is
+// set. Empty and whitespace-only values mean "no override".
+func HostOverrideConfigured(override string) bool {
+	return strings.TrimSpace(override) != ""
+}
+
+// ValidateHostOverride validates the optional worker-wide ROUTING_HOST_OVERRIDE
+// value using the service-host hostname contract (see validateHostname). Unset
+// and whitespace-only values mean no override and are valid. The value is used
+// verbatim as the effective route host, so a malformed value would silently
+// never match; it is rejected before any container or network work.
+func ValidateHostOverride(override string) error {
+	if !HostOverrideConfigured(override) {
+		return nil
 	}
-	return label + "." + c.HostOverride
+	if err := validateHostname(override); err != nil {
+		return fmt.Errorf("invalid ROUTING_HOST_OVERRIDE: %w", err)
+	}
+	return nil
 }
 
 // Validate reports whether the config is usable for a routed service. The
@@ -143,52 +137,11 @@ func (c TraefikConfig) OverrideHost(host string) string {
 // provider-side network and routing would silently not work. The optional
 // entrypoint/certresolver/priority values need no validation here — unset
 // simply means the corresponding label is omitted.
-//
-// HostOverride is validated when set, using the same hostname rules as a
-// service `host` (see validateHostname): the override becomes part of every
-// routed rule, and a malformed suffix would silently produce hosts Traefik
-// never matches. Unset (empty) means no override and needs no validation.
-//
-// Validate is deliberately host-independent: it cannot see a template host, so
-// it cannot check the COMBINED length of a derived host. That check is
-// per-service (ValidateHost) because a conservative global override length
-// cap here would reject valid short-host cases (e.g. override "localhost"
-// with host "issuer").
 func (c TraefikConfig) Validate() error {
 	if c.Network == "" {
 		return fmt.Errorf("TRAEFIK_NETWORK is required when Traefik routing is configured")
 	}
-	if c.HostOverride != "" {
-		if err := validateHostname(c.HostOverride); err != nil {
-			return fmt.Errorf("invalid TRAEFIK_HOST_OVERRIDE: %w", err)
-		}
-	}
 	return nil
-}
-
-// ValidateHost reports whether host is a usable EFFECTIVE host for a routed
-// service under this config: the declared host unchanged when no override is
-// set, or the host derived from the override otherwise (see OverrideHost). It
-// applies exactly the same hostname rules the template parser applies to a
-// declared service host (validateHostname), so an override can never smuggle
-// in a value that is accepted here but rejected upstream — or vice versa.
-//
-// This is the per-service counterpart to Validate. It exists because the
-// combined host is only knowable with the template host in hand: an override
-// that is itself a valid hostname ("localhost") can still derive an overlong
-// host from a long declared host (a 63-char left label + "." + the override
-// can exceed 253). Validating the derived value here, with the actual host,
-// accepts valid short-host cases a global conservative cap would reject.
-//
-// Empty host is VALID and returns nil: an empty host means unrouted (no
-// Traefik labels at all), so there is no effective host to validate. Callers
-// only run this for services declaring a host, but the empty case is harmless
-// and keeps the helper total.
-func (c TraefikConfig) ValidateHost(host string) error {
-	if host == "" {
-		return nil
-	}
-	return validateHostname(c.OverrideHost(host))
 }
 
 // MissingNetwork is the user-facing error for a configured Traefik network that
@@ -215,10 +168,10 @@ func MissingNetwork(network string) error {
 //	traefik.http.routers.<id>.rule                              = Host(`<effective host>`)
 //	traefik.http.services.<id>.loadbalancer.server.port         = <port>
 //
-// <effective host> is the declared host when cfg.HostOverride is unset, or its
-// override mapping otherwise (see cfg.OverrideHost). Only the host value in the
-// rule changes under an override; the id, port, network, and optional router
-// values are untouched.
+// <effective host> is supplied explicitly by the caller (see EffectiveHost):
+// the declared host when no override is configured, otherwise the exact
+// override hostname. Only the host value in the rule changes under an
+// override; the id, port, network, and optional router values are untouched.
 //
 // When path is non-empty the rule ALSO constrains the request path and a
 // StripPrefix middleware is attached to the router, so the upstream service
@@ -254,12 +207,12 @@ func MissingNetwork(network string) error {
 // leading "/", no trailing slash except root, no "//". TraefikLabels treats it
 // as opaque and does not re-validate it.
 //
-// When cfg.HostOverride is set, the declared host is mapped through
-// cfg.OverrideHost (left-most label + override domain) before the rule is
-// built; the path, id, port, network, and optional router values are
-// unaffected. host itself is passed by value and never mutated, so the
-// template's original host is preserved for callers. An empty host still
-// yields a NIL map regardless of the override: unrouted means unrouted.
+// When an override is configured, the caller passes the effective hostname
+// (routing.EffectiveHost) instead of the declared host; the path, id, port,
+// network, and optional router values are unaffected. The host argument is
+// passed by value and never mutated, so the template's original host is
+// preserved for callers. An empty host still yields a NIL map regardless of the
+// effective-host choice: unrouted means unrouted.
 func TraefikLabels(
 	appName, serviceName, host, path string, port int, cfg TraefikConfig,
 ) map[string]string {
@@ -268,7 +221,7 @@ func TraefikLabels(
 	}
 
 	id := ServiceProviderID(appName, serviceName)
-	rule := fmt.Sprintf("Host(`%s`)", cfg.OverrideHost(host))
+	rule := fmt.Sprintf("Host(`%s`)", host)
 	if path != "" {
 		rule = fmt.Sprintf("%s && PathPrefix(`%s`)", rule, path)
 	}

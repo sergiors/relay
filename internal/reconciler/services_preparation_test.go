@@ -432,7 +432,7 @@ func TestServicePreparationIdentityKeysImageRoutingAndEffectiveProbe(t *testing.
 		svc app.Service, appImage string, cfg routing.TraefikConfig, mounted bool,
 	) string {
 		return servicePreparationIdentity("fn", tmpl, svc, appImage,
-			[]string{"net"}, "", cfg, mounted)
+			[]string{"net"}, "", cfg, "", mounted)
 	}
 	routed := app.Service{
 		Name: "web", Entrypoint: "service.js", Port: 8080, Replicas: 1,
@@ -472,6 +472,26 @@ func TestServicePreparationIdentityKeysImageRoutingAndEffectiveProbe(t *testing.
 		}
 	})
 
+	t.Run("a host override keys a routed service", func(t *testing.T) {
+		// The effective host (declared host or the exact
+		// ROUTING_HOST_OVERRIDE value) feeds the router labels, so it keys the
+		// routed preparation identity: toggling the override re-prepares the
+		// route WITHOUT any image rebuild (the app image is unchanged).
+		without := servicePreparationIdentity("fn", tmpl, routed, "img-a",
+			[]string{"net"}, "", base, "", false)
+		with := servicePreparationIdentity("fn", tmpl, routed, "img-a",
+			[]string{"net"}, "", base, "portal.internal.test", false)
+		same := servicePreparationIdentity("fn", tmpl, routed, "img-a",
+			[]string{"net"}, "", base, "portal.internal.test", false)
+		if without == with {
+			t.Fatal("the effective host must be part of the routed " +
+				"preparation key so an override change updates the route")
+		}
+		if with != same {
+			t.Fatal("the preparation identity must be deterministic for equal inputs")
+		}
+	})
+
 	t.Run("routing configuration is not a key without a declared host",
 		func(t *testing.T) {
 			plain := app.Service{
@@ -487,6 +507,22 @@ func TestServicePreparationIdentityKeysImageRoutingAndEffectiveProbe(t *testing.
 				t.Fatal("without a declared host there is no router to configure; " +
 					"operator routing config must not change the key")
 			}
+			// ROUTING_HOST_OVERRIDE is operator routing config too: it must
+			// not key an UNROUTED service, whose identity must be byte-equal
+			// with empty vs non-empty override (no router exists to
+			// configure, so no Traefik labels may be hashed in).
+			withoutOverride := servicePreparationIdentity("fn", tmpl, plain,
+				"img-a", []string{"net"}, "", base, "", false)
+			withOverride := servicePreparationIdentity("fn", tmpl, plain,
+				"img-a", []string{"net"}, "", base, "portal.internal.test", false)
+			if withoutOverride != withOverride {
+				t.Fatal("ROUTING_HOST_OVERRIDE must not change an unrouted " +
+					"service's preparation identity: with svc.Host == \"\" no " +
+					"Traefik labels exist to hash")
+			}
+			// The routed contrast stays: the same override DOES key a service
+			// that declares a host (asserted in "a host override keys a routed
+			// service" above).
 			reported := plain
 			reported.Port = 9001
 			if idOf(plain, "img-a", base, false) == idOf(reported, "img-a", base, false) {

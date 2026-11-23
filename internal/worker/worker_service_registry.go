@@ -77,7 +77,8 @@ type serviceEndpointPublisher struct {
 	log      *slog.Logger
 	reporter *registryFailureReporter
 
-	bindAddr string
+	bindAddr     string
+	hostOverride string
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -112,11 +113,11 @@ func startServiceEndpointPublisher(
 			EntryPoints:  cfg.TraefikEntryPoints,
 			CertResolver: cfg.TraefikCertResolver,
 			Priority:     cfg.TraefikPriority,
-			HostOverride: cfg.TraefikHostOverride,
 		},
-		log:      logger,
-		reporter: nodes.reporter,
-		bindAddr: cfg.ServiceBindAddr,
+		log:          logger,
+		reporter:     nodes.reporter,
+		bindAddr:     cfg.ServiceBindAddr,
+		hostOverride: cfg.RoutingHostOverride,
 	}
 	r.Start(lifecycle)
 	if shutdown != nil {
@@ -205,12 +206,11 @@ func (r *serviceEndpointPublisher) syncOnce() {
 
 // collectEndpoints builds the exact batch this node may advertise: each
 // Docker-verified committed replica must also match the CURRENT template's
-// route (configured host, path, port, and full Traefik label set). A container
-// left from a superseded template therefore drops out instead of advertising a
-// stale route. The published host is the template's configured hostname, not
-// the effective host derived from TRAEFIK_HOST_OVERRIDE: the registry records
-// what the app declares, while label matching above still uses the effective
-// host.
+// route (effective host, path, port, and full Traefik label set). A container
+// left from a superseded template or an earlier host override therefore drops
+// out instead of advertising a stale route. The published host is the effective
+// hostname used by the container's routing labels (see routing.EffectiveHost),
+// so registry consumers and Traefik agree on the advertised name.
 func (r *serviceEndpointPublisher) collectEndpoints(
 	ctx context.Context,
 ) ([]state.ServiceRegistryEndpoint, error) {
@@ -309,11 +309,12 @@ func (r *serviceEndpointPublisher) desiredRoutes() map[serviceRegistryRouteKey]s
 			if svc.Host == "" {
 				continue
 			}
+			host := routing.EffectiveHost(svc.Host, r.hostOverride)
 			routes[serviceRegistryRouteKey{app: name, service: svc.Name}] = serviceRegistryRoute{
-				host: svc.Host,
+				host: host,
 				path: svc.Path,
 				labels: routing.TraefikLabels(
-					name, svc.Name, svc.Host, svc.Path, svc.Port, r.traefik),
+					name, svc.Name, host, svc.Path, svc.Port, r.traefik),
 			}
 		}
 	}
