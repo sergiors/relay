@@ -3,8 +3,10 @@
 // Lifecycle-line and runtime-metadata tests for the split Node bootstrap: the
 // INIT_START report from the generated runtime metadata document, the
 // START/END invocation boundary lines on the process's native stdout, and the
-// guarantee that application stdout/stderr stay unchanged native logs beside
-// them. The lifecycle lines carry the invocation context's STABLE LOGICAL
+// guarantee that application stdout/stderr remain native container streams
+// beside them: console method logs carry the bootstrap's timestamp/level
+// format while direct process.stdout/stderr writes stay unchanged. The
+// lifecycle lines carry the invocation context's STABLE LOGICAL
 // requestId — deliberately different from the transport correlation id the
 // frames carry — while the result frame still echoes the transport id. See
 // lifecycle.mjs; the Python mirrors live in the python package.
@@ -40,6 +42,19 @@ func lifecycleLineCount(out, want string) int {
 		}
 	}
 	return count
+}
+
+// windowLineIndexContaining returns the index of the FIRST line containing
+// frag, or -1. Application output may carry the console formatter's
+// timestamp/level prefix, so it is located by content while lifecycle lines
+// stay exact-line matched.
+func windowLineIndexContaining(window, frag string) int {
+	for i, line := range strings.Split(window, "\n") {
+		if strings.Contains(line, frag) {
+			return i
+		}
+	}
+	return -1
 }
 
 // writeLifecycleMetadata stages the runtime metadata document beside the
@@ -100,8 +115,11 @@ func requireLogicalLifecycleLines(t *testing.T, window, logical, transportID, ap
 	if start == -1 || end == -1 {
 		t.Fatalf("window must carry START/END for the logical requestId %q:\n%s", logical, window)
 	}
-	if appOut != "" && !(start < lifecycleLineIndex(window, appOut) && lifecycleLineIndex(window, appOut) < end) {
-		t.Fatalf("window must order START < app output < END:\n%s", window)
+	if appOut != "" {
+		outIdx := windowLineIndexContaining(window, appOut)
+		if outIdx < 0 || start >= outIdx || outIdx >= end {
+			t.Fatalf("window must order START < app output < END:\n%s", window)
+		}
 	}
 	for _, field := range []string{"START RequestId: ", "END RequestId: "} {
 		if n := lifecycleLineCount(window, field+transportID); n != 0 {

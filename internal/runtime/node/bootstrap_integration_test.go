@@ -2196,10 +2196,11 @@ export function remain(event, context) {
 			t.Fatalf("invoke with deadline %q failed: %s", deadline, r.Err)
 		}
 		// The invocation window carries the START/END lifecycle lines beside
-		// the handler's print; read the LAST ms line of the window.
+		// the handler's console output, which the formatter prefixes with a
+		// timestamp and level; read the LAST ms=<int> value in the window.
 		msText := ""
 		for _, line := range strings.Split(r.Out, "\n") {
-			if v, ok := strings.CutPrefix(strings.TrimSpace(line), "ms="); ok && v != "" {
+			if _, v, ok := strings.Cut(line, "ms="); ok && v != "" {
 				msText = v
 			}
 		}

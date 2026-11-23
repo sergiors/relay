@@ -29,11 +29,17 @@ are released with it.
 """
 
 import asyncio
+import logging
 import sys
 
 import _relay_lifecycle as lifecycle
 from _relay_config import load_execution_config
 from _relay_server import runtime_loop
+
+# Configure a default logging format before importing application modules.
+# Keep Python's default WARNING level. Applications can change the level
+# using logging.getLogger().setLevel() or replace the configuration explicitly.
+logging.basicConfig(format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 
 # The function sources live in /app; put it on sys.path so imports resolve
 # regardless of where this bootstrap script is located. It is inserted after the
