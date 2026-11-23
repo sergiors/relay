@@ -189,8 +189,8 @@
 // Internal control networking: each node owns one persistent user-defined
 // bridge network named deterministically from NODE_ID
 // (`relay-control-<NODE_ID>`). Execution containers join that network plus the
-// optional NETWORKS application set; persistent services join only NETWORKS
-// (and TRAEFIK_NETWORK when routed). The execution channel's address is always
+// optional NETWORKS application set; persistent services join only NETWORKS.
+// The execution channel's address is always
 // taken from the control network, never an application network. The network is
 // created or revalidated by EnsureControlNetwork during worker startup
 // preflight: a same-name network is reused only when its Relay ownership labels

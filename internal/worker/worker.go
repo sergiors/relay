@@ -777,6 +777,9 @@ func Run(logger *slog.Logger) (runErr error) {
 	); err != nil {
 		return err
 	}
+	if err := startDiscoveryServer(logger, cfg, st, shutdown); err != nil {
+		return err
+	}
 
 	startBackgroundLoops(
 		ctx, logger, cfg, client, st, statsFlusher, metricsLoggerDone, shutdown,

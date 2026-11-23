@@ -624,7 +624,7 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 
 	// A dedicated network with a unique name, created here (the test is the
 	// infra owner) and removed in cleanup along with any service containers.
-	networkName := "relay-test-traefik-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	networkName := "relay-test-external-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	if _, err := cli.NetworkCreate(ctx, networkName, client.NetworkCreateOptions{Driver: "bridge"}); err != nil {
 		t.Fatalf("create test network: %v", err)
 	}
@@ -639,8 +639,8 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 
 	_, image := buildServiceHost(t, ctx, "svc-network")
 
-	// Happy path: start a routed-looking service with the network + an extra
-	// Traefik label; assert both reach the container.
+	// Happy path: start a service with the external network + an extra
+	// caller-supplied label; assert both reach the container.
 	id, err := m.StartService(ctx, ServiceSpec{
 		App:  "svc-network",
 		Name: "svc", SourceRef: "app/service.js",
@@ -648,7 +648,7 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 		Image:    image,
 		Entry:    []string{"node", "/app/app/service.js"},
 		Env:      []string{"PORT=3000"},
-		Labels:   map[string]string{"traefik.enable": "true"},
+		Labels:   map[string]string{"custom.routing": "true"},
 		Networks: []string{networkName},
 	}, 0)
 	if err != nil {
@@ -665,8 +665,8 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 	}
 	labels := insp.Container.Config.Labels
 	// The supplied extra label and the Relay ownership labels coexist.
-	if labels["traefik.enable"] != "true" {
-		t.Fatalf("extra routing label missing on container: %v", labels)
+	if labels["custom.routing"] != "true" {
+		t.Fatalf("caller-supplied extra label missing on container: %v", labels)
 	}
 	if labels[labelType] != ContainerTypeService || labels[labelApp] != "svc-network" ||
 		labels[labelIdentity] != "app/service.js" || labels[labelImage] != image ||

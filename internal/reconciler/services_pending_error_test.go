@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
 )
@@ -87,8 +86,7 @@ func mixedTemplate(hc *app.ServiceHealthcheck) *app.Template {
 // the coordinator can retain and resume the request.
 func TestApplyResultPendingCarriesIndependentErrorAndKeepsCandidates(t *testing.T) {
 	docker := newMixedPendingDocker()
-	c := NewServiceReconciler(docker, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), 0)
+	c := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	hc := testServiceHealthcheck(time.Second)
 
 	before := time.Now()
@@ -129,8 +127,7 @@ func TestApplyResultPendingCarriesIndependentErrorAndKeepsCandidates(t *testing.
 // the request conclude exactly once.
 func TestServiceCoordinatorPendingWithErrorRetainsRequestAndNeverCompletes(t *testing.T) {
 	docker := newMixedPendingDocker()
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)

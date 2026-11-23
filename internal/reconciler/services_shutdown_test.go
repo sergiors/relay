@@ -8,7 +8,6 @@ import (
 
 	"github.com/moby/moby/api/types/container"
 
-	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
 )
@@ -33,7 +32,7 @@ func TestShutdownCleanupRemovesOwnContainers(t *testing.T) {
 		t.Fatalf("start replica 1: %v", err)
 	}
 
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	n, err := c.ShutdownCleanup(context.Background(), defaultFakeNodeID)
 	if err != nil {
 		t.Fatalf("shutdown cleanup: %v", err)
@@ -65,7 +64,7 @@ func TestShutdownCleanupPreservesOtherWorkers(t *testing.T) {
 	seed("w2-a", "w2")
 	seed("none-a", "") // no nodeID label: never claimed by any worker
 
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	n, err := c.ShutdownCleanup(context.Background(), "w1")
 	if err != nil {
 		t.Fatalf("shutdown cleanup: %v", err)
@@ -98,7 +97,7 @@ func TestShutdownCleanupEmptyNodeIDSelectsNothing(t *testing.T) {
 		port: 80, replica: 0, state: container.StateRunning, nodeID: "",
 	}
 
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	n, err := c.ShutdownCleanup(context.Background(), "")
 	if err != nil {
 		t.Fatalf("shutdown cleanup: %v", err)
@@ -130,7 +129,7 @@ func TestShutdownCleanupStopFailureDoesNotBlock(t *testing.T) {
 	f.failStopFor = "fail-1"
 
 	logger, capture := newCaptureLogger(slog.LevelWarn)
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, logger, testReconcileTimeout)
 	n, err := c.ShutdownCleanup(context.Background(), "w1")
 	if err == nil {
 		t.Fatal("expected the stop failure to be surfaced")
@@ -174,7 +173,7 @@ func TestDiscoverShutdownContainersSelectsOwnNodeID(t *testing.T) {
 	seed("w2-a", "w2")
 	seed("none-a", "")
 
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	own, err := c.DiscoverShutdownContainers(context.Background(), "w1")
 	if err != nil {
 		t.Fatalf("discover: %v", err)
@@ -208,7 +207,7 @@ func TestRemoveShutdownContainersRemovesCapturedOnlyAndPreservesReplacement(t *t
 			port: 80, replica: 0, state: container.StateRunning, nodeID: "w1",
 		}
 	}
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 	own, err := c.DiscoverShutdownContainers(context.Background(), "w1")
 	if err != nil {

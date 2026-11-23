@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
@@ -299,7 +298,7 @@ func TestServiceLoggingDistinguishesCorrectiveWorkNoOpAndErrors(t *testing.T) {
 		docker := newFakeDocker()
 		var logs testutil.SyncBuffer
 		serviceLog := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-		services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, serviceLog, testReconcileTimeout)
+		services := NewServiceReconciler(docker, nil, serviceLog, testReconcileTimeout)
 		tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 		if result := services.ApplyResult(context.Background(), "fn", tmpl, "img-current", nil, nil); result.Err != nil {
 			t.Fatalf("apply: %v", result.Err)
@@ -336,7 +335,7 @@ func TestServiceLoggingDistinguishesCorrectiveWorkNoOpAndErrors(t *testing.T) {
 		docker := newFakeDocker()
 		var logs testutil.SyncBuffer
 		serviceLog := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-		services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, serviceLog, testReconcileTimeout)
+		services := NewServiceReconciler(docker, nil, serviceLog, testReconcileTimeout)
 		tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 		if result := services.ApplyResult(context.Background(), "fn", tmpl, "img-current", nil, nil); result.Err != nil {
 			t.Fatalf("initial apply: %v", result.Err)
@@ -356,7 +355,7 @@ func TestServiceLoggingDistinguishesCorrectiveWorkNoOpAndErrors(t *testing.T) {
 		serviceLog := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 		services := NewServiceReconciler(
 			cancelledResolveDocker{fakeDocker: newFakeDocker()},
-			nil, routing.TraefikConfig{}, serviceLog, testReconcileTimeout,
+			nil, serviceLog, testReconcileTimeout,
 		)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
@@ -392,7 +391,7 @@ func TestServiceLoggingDistinguishesCorrectiveWorkNoOpAndErrors(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		services := NewServiceReconciler(
 			partialStopCancelDocker{fakeDocker: f, cancel: cancel},
-			nil, routing.TraefikConfig{}, serviceLog, testReconcileTimeout,
+			nil, serviceLog, testReconcileTimeout,
 		)
 		tmpl := serviceTemplate("nodejs24.x", app.Service{
 			Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
@@ -413,7 +412,7 @@ func TestServiceLoggingDistinguishesCorrectiveWorkNoOpAndErrors(t *testing.T) {
 		docker.resolveErr["service.js"] = errors.New("source unavailable")
 		var logs testutil.SyncBuffer
 		serviceLog := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-		services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, serviceLog, testReconcileTimeout)
+		services := NewServiceReconciler(docker, nil, serviceLog, testReconcileTimeout)
 		tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 		if result := services.ApplyResult(context.Background(), "fn", tmpl, "img-current", nil, nil); result.Err == nil {
 			t.Fatal("ApplyResult unexpectedly succeeded")
@@ -552,8 +551,7 @@ func TestNoRuntimeAppLifecycleLogsOmitEmptyImageAttributes(t *testing.T) {
 
 	var serviceLogs testutil.SyncBuffer
 	services := NewServiceReconciler(
-		newFakeDocker(), nil, routing.TraefikConfig{},
-		slog.New(slog.NewJSONHandler(&serviceLogs,
+		newFakeDocker(), nil, slog.New(slog.NewJSONHandler(&serviceLogs,
 			&slog.HandlerOptions{Level: slog.LevelDebug})),
 		testReconcileTimeout,
 	)

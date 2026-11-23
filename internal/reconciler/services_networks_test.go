@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
 )
@@ -19,7 +18,7 @@ func serviceNetworks(networks ...string) string { return runtime.NetworksLabel(n
 func TestReconcileServiceNoNetworksUnrouted(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", nil, routing.TraefikConfig{}); err != nil {
+	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", nil); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	c := f.lastStartedFor("fn", "service.js")
@@ -36,7 +35,7 @@ func TestReconcileServiceNoNetworksUnrouted(t *testing.T) {
 func TestReconcileServiceGlobalNetworksUnrouted(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend", "frontend"}, routing.TraefikConfig{}); err != nil {
+	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend", "frontend"}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if len(f.networkLookups) != 0 {
@@ -51,53 +50,32 @@ func TestReconcileServiceGlobalNetworksUnrouted(t *testing.T) {
 	}
 }
 
-// A routed service joins the global set PLUS its routing network, de-duplicated
-// deterministically when TRAEFIK_NETWORK is also a global network.
-func TestReconcileServiceGlobalAndRoutingNetworksMerge(t *testing.T) {
-	t.Run("distinct routing network", func(t *testing.T) {
-		f := newFakeDocker()
-		tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1, Host: "a.test"})
-		if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend"}, routing.TraefikConfig{Network: "proxy"}); err != nil {
-			t.Fatalf("reconcile: %v", err)
-		}
-		c := f.lastStartedFor("fn", "service.js")
-		if c == nil {
-			t.Fatal("no started container")
-		}
-		if got := serviceNetworks(c.networks...); got != "backend,proxy" {
-			t.Fatalf("relay.networks = %q, want backend,proxy", got)
-		}
-		// Only the routing network is verified per reconcile; the global set is
-		// startup configuration verified once at worker startup.
-		if len(f.networkLookups) != 1 || f.networkLookups[0] != "proxy" {
-			t.Fatalf("networkLookups = %v, want [proxy]", f.networkLookups)
-		}
-	})
-
-	t.Run("routing network duplicated in global set joins once", func(t *testing.T) {
-		f := newFakeDocker()
-		tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1, Host: "a.test"})
-		if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"proxy", "backend"}, routing.TraefikConfig{Network: "proxy"}); err != nil {
-			t.Fatalf("reconcile: %v", err)
-		}
-		c := f.lastStartedFor("fn", "service.js")
-		if c == nil {
-			t.Fatal("no started container")
-		}
-		if got := serviceNetworks(c.networks...); got != "backend,proxy" {
-			t.Fatalf("relay.networks = %q, want backend,proxy (proxy once)", got)
-		}
-		if len(c.networks) != 2 {
-			t.Fatalf("spec networks = %v, want exactly two", c.networks)
-		}
-	})
+// A routed service joins exactly the global NETWORKS set: routing is served
+// through published host ports by an external provider, so no provider network
+// is added or verified during reconciliation.
+func TestReconcileServiceRoutedUsesOnlyGlobalNetworks(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1, Host: "a.test"})
+	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend"}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	c := f.lastStartedFor("fn", "service.js")
+	if c == nil {
+		t.Fatal("no started container")
+	}
+	if got := serviceNetworks(c.networks...); got != "backend" {
+		t.Fatalf("relay.networks = %q, want backend", got)
+	}
+	if len(f.networkLookups) != 0 {
+		t.Fatalf("networkLookups = %v, want none", f.networkLookups)
+	}
 }
 
 // A single global network (no routing) is applied exactly once.
 func TestReconcileServiceSingleGlobalNetwork(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend"}, routing.TraefikConfig{}); err != nil {
+	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend"}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	c := f.lastStartedFor("fn", "service.js")
@@ -117,10 +95,10 @@ func TestReconcileServiceSingleGlobalNetwork(t *testing.T) {
 func TestReconcileServiceGlobalNetworkAddedReplaces(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend"}, routing.TraefikConfig{}); err != nil {
+	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend"}); err != nil {
 		t.Fatalf("reconcile backend: %v", err)
 	}
-	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend", "frontend"}, routing.TraefikConfig{}); err != nil {
+	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend", "frontend"}); err != nil {
 		t.Fatalf("reconcile backend+frontend: %v", err)
 	}
 	if len(f.stops) != 1 {
@@ -136,10 +114,10 @@ func TestReconcileServiceGlobalNetworkAddedReplaces(t *testing.T) {
 func TestReconcileServiceGlobalNetworkRemovedReplaces(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend", "frontend"}, routing.TraefikConfig{}); err != nil {
+	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend", "frontend"}); err != nil {
 		t.Fatalf("reconcile both: %v", err)
 	}
-	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend"}, routing.TraefikConfig{}); err != nil {
+	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend"}); err != nil {
 		t.Fatalf("reconcile backend: %v", err)
 	}
 	if len(f.stops) != 1 {
@@ -155,10 +133,10 @@ func TestReconcileServiceGlobalNetworkRemovedReplaces(t *testing.T) {
 func TestReconcileServiceGlobalNetworkSwitchReplaces(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend"}, routing.TraefikConfig{}); err != nil {
+	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend"}); err != nil {
 		t.Fatalf("reconcile backend: %v", err)
 	}
-	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"other"}, routing.TraefikConfig{}); err != nil {
+	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"other"}); err != nil {
 		t.Fatalf("reconcile other: %v", err)
 	}
 	if len(f.stops) != 1 {
@@ -175,11 +153,11 @@ func TestReconcileServiceGlobalNetworkSwitchReplaces(t *testing.T) {
 func TestReconcileServiceGlobalNetworkOrderNoReplacement(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend", "frontend"}, routing.TraefikConfig{}); err != nil {
+	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend", "frontend"}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	stopsSoFar := len(f.stops)
-	changed, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"frontend", "backend"}, routing.TraefikConfig{})
+	changed, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"frontend", "backend"})
 	if err != nil {
 		t.Fatalf("reconcile reordered: %v", err)
 	}
@@ -191,16 +169,15 @@ func TestReconcileServiceGlobalNetworkOrderNoReplacement(t *testing.T) {
 	}
 }
 
-// A converged service with global + routing networks is a no-op on the next
-// pass.
+// A converged service with its global networks is a no-op on the next pass.
 func TestReconcileServiceNetworksConvergedNoOp(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1, Host: "a.test"})
-	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend"}, routing.TraefikConfig{Network: "proxy"}); err != nil {
+	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend"}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	stopsSoFar := len(f.stops)
-	changed, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend"}, routing.TraefikConfig{Network: "proxy"})
+	changed, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend"})
 	if err != nil {
 		t.Fatalf("reconcile 2: %v", err)
 	}
@@ -212,12 +189,38 @@ func TestReconcileServiceNetworksConvergedNoOp(t *testing.T) {
 	}
 }
 
+// A repeated entry in the worker-global NETWORKS set joins the container once:
+// the set is normalized (sorted, de-duplicated) before it reaches both the
+// container spec and the relay.networks label.
+func TestReconcileServiceDuplicateGlobalNetworkJoinsOnce(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("nodejs24.x", app.Service{
+		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
+	})
+	if _, err := reconcileNetworks(t, f, "fn", tmpl, "img-1",
+		[]string{"backend", "backend", "frontend"}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	c := f.lastStartedFor("fn", "service.js")
+	if c == nil {
+		t.Fatal("no started container")
+	}
+	if len(c.networks) != 2 || c.networks[0] != "backend" ||
+		c.networks[1] != "frontend" {
+		t.Fatalf("spec networks = %v, want the de-duplicated sorted set "+
+			"[backend frontend]", c.networks)
+	}
+	if got := serviceNetworks(c.networks...); got != "backend,frontend" {
+		t.Fatalf("relay.networks = %q, want backend,frontend", got)
+	}
+}
+
 // ServiceReconciler.WithNetworks wires the global set through ApplyResult (the
 // production shape), so the reconciler — not the caller — owns the network set.
 func TestServiceReconcilerWithNetworksAppliesGlobals(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout,
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout,
 		WithNetworks([]string{"backend", "frontend"}))
 	if result := c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil, nil); result.Err != nil {
 		t.Fatalf("apply: %v", result.Err)
@@ -232,7 +235,7 @@ func TestServiceReconcilerWithNetworksAppliesGlobals(t *testing.T) {
 // construction cannot change the reconciler's configuration.
 func TestServiceReconcilerWithNetworksCopies(t *testing.T) {
 	configured := []string{"backend"}
-	c := NewServiceReconciler(newFakeDocker(), nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout,
+	c := NewServiceReconciler(newFakeDocker(), nil, testutil.DiscardLogger(), testReconcileTimeout,
 		WithNetworks(configured))
 	configured[0] = "mutated"
 	if len(c.networks) != 1 || c.networks[0] != "backend" {

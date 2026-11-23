@@ -636,7 +636,7 @@ func TestServiceLabelsSpecMergedOwnershipWins(t *testing.T) {
 		Port:  3000,
 		Image: "relay-app-user-events:deadbeef",
 		Labels: map[string]string{
-			"traefik.enable": "true",
+			"custom.routing": "true",
 			// Attempted spoof of Relay ownership keys.
 			labelType:        ContainerTypeEvent,
 			labelApp:         "spoofed",
@@ -659,8 +659,8 @@ func TestServiceLabelsSpecMergedOwnershipWins(t *testing.T) {
 	if got[labelEnvironment] != EnvironmentFingerprint(nil) {
 		t.Fatalf("relay.environment = %q, want the authoritative environment fingerprint (ownership must win)", got[labelEnvironment])
 	}
-	if got["traefik.enable"] != "true" {
-		t.Fatalf("extra routing label missing: %v", got)
+	if got["custom.routing"] != "true" {
+		t.Fatalf("caller-supplied extra label missing: %v", got)
 	}
 	if got["custom.key"] != "custom-value" {
 		t.Fatalf("custom label missing: %v", got)
@@ -910,12 +910,11 @@ func TestStartServiceEntryOnlyForEntrypointSource(t *testing.T) {
 // so the service's final network set is proven to reach Docker's
 // NetworkingConfig.EndpointsConfig exactly as the service reconciler intends.
 //
-// The reconciler merges the worker-global NETWORKS set with the routing network
-// (TRAEFIK_NETWORK) for a routed service, de-duplicated and sorted, and passes
-// that FINAL set as spec.Networks. These cases assert that final set as the
-// Docker request layer sees it: the exact endpoint key set (order-independent;
-// EndpointsConfig is a map) and the canonical relay.networks label the
-// reconciler later compares to decide whether a container is stale.
+// The reconciler normalizes the worker-global NETWORKS set — de-duplicated and
+// sorted — and passes that FINAL set as spec.Networks. These cases assert that
+// final set as the Docker request layer sees it: the exact endpoint key set
+// (order-independent; EndpointsConfig is a map) and the canonical relay.networks
+// label the reconciler later compares to decide whether a container is stale.
 func TestStartServiceNetworkingConfig(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -923,23 +922,23 @@ func TestStartServiceNetworkingConfig(t *testing.T) {
 		want []string // exact expected endpoints / relay.networks members
 	}{
 		{
-			// Unrouted service: exactly the worker-global backend +
-			// observability set, no routing network.
-			name: "unrouted global backend and observability",
+			// Exactly the worker-global backend + observability set, each
+			// network joined once.
+			name: "global backend and observability",
 			spec: []string{"backend", "observability"},
 			want: []string{"backend", "observability"},
 		},
 		{
-			// Routed service: the global backend + observability set plus the
-			// routing proxy, each joined exactly once.
-			name: "routed global backend observability and proxy",
+			// An additional selected network joins the same set, each network
+			// joined exactly once.
+			name: "global backend observability and proxy",
 			spec: []string{"backend", "observability", "proxy"},
 			want: []string{"backend", "observability", "proxy"},
 		},
 		{
-			// The routing proxy also appears in the global set: the merged set
-			// contains proxy once, so the endpoints are exactly backend+proxy.
-			name: "global backend and proxy overlapping routing",
+			// Two selected networks reach the request as exactly those
+			// endpoints.
+			name: "global backend and proxy",
 			spec: []string{"backend", "proxy"},
 			want: []string{"backend", "proxy"},
 		},
@@ -1065,9 +1064,8 @@ func TestStartServiceDeletedNetworkCreateFailure(t *testing.T) {
 // guard is enforced by Relay before Docker ContainerCreate: a selected network
 // carrying ONLY relay.network.role=execution-control (no managed/node
 // ownership labels) fails the start and no create request is issued — both for
-// a plain service network and for the routing network of a routed service,
-// which the reconciler passes through spec.Networks like any other selected
-// network.
+// a lone selected network and for one member of a multi-network set; every
+// network in spec.Networks is checked the same way.
 func TestStartServiceRejectsControlNetworkBeforeCreate(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -1078,9 +1076,9 @@ func TestStartServiceRejectsControlNetworkBeforeCreate(t *testing.T) {
 			networks: []string{"control"},
 		},
 		{
-			// A routed service's final set includes TRAEFIK_NETWORK; when the
-			// routing network carries the role it is refused the same way.
-			name:     "routed service routing network carrying only the execution-control role",
+			// A multi-network set with a control-role member is refused the
+			// same way.
+			name:     "multi-network set with a member carrying only the execution-control role",
 			networks: []string{"backend", "proxy"},
 		},
 	} {

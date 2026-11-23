@@ -9,7 +9,6 @@ import (
 	"github.com/moby/moby/api/types/container"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/testutil"
 )
 
@@ -61,7 +60,7 @@ func TestReconcileNoRuntimeExternalImageResourceHotChange(t *testing.T) {
 	f := newFakeDocker()
 	b := &resourceRecordingBuilder{}
 	var svcErrs []error
-	svc := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	svc := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	r, reg := newTestReconciler(t, root, b, nil, func(cfg *Config) {
 		cfg.UpdateServices = func(name string, tmpl *app.Template, image string) {
 			if result := svc.ApplyResult(context.Background(), name, tmpl, image, nil, nil); result.Err != nil {
@@ -176,7 +175,7 @@ func TestReconcileResourceChangeReplacesContainer(t *testing.T) {
 			// desired fingerprint changes and the running container is replaced.
 			withResources := serviceTemplate("nodejs24.x", tc.spec)
 			withResources.Resources = app.ResourceLimits{MemoryBytes: 512 << 20, NanoCPUs: 2_000_000_000, PidsLimit: 64}
-			if _, err := reconcile(t, f, "fn", withResources, "img-1", routing.TraefikConfig{}); err != nil {
+			if _, err := reconcile(t, f, "fn", withResources, "img-1"); err != nil {
 				t.Fatalf("reconcile 1: %v", err)
 			}
 			first := f.lastStartedFor("fn", identity)
@@ -189,7 +188,7 @@ func TestReconcileResourceChangeReplacesContainer(t *testing.T) {
 
 			// Change only the resource config (same image, env, port).
 			defaulted := serviceTemplate("nodejs24.x", tc.spec)
-			changed, err := reconcile(t, f, "fn", defaulted, "img-1", routing.TraefikConfig{})
+			changed, err := reconcile(t, f, "fn", defaulted, "img-1")
 			if err != nil {
 				t.Fatalf("reconcile 2: %v", err)
 			}
@@ -216,11 +215,11 @@ func TestReconcileUnchangedResourcesNoChurn(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	tmpl.Resources = app.ResourceLimits{MemoryBytes: 256 << 20, NanoCPUs: 1_000_000_000, PidsLimit: 128}
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
+	if _, err := reconcile(t, f, "fn", tmpl, "img-1"); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
 	}
 	stopsSoFar := len(f.stops)
-	changed, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{})
+	changed, err := reconcile(t, f, "fn", tmpl, "img-1")
 	if err != nil {
 		t.Fatalf("reconcile 2: %v", err)
 	}
@@ -241,7 +240,7 @@ func TestReconcileLegacyContainerWithoutResourcesReplaced(t *testing.T) {
 		environmentFingerprint: serviceEnvironmentFingerprint(80), // env correct, resources label absent
 	}
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
+	if _, err := reconcile(t, f, "fn", tmpl, "img-1"); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if len(f.stops) != 1 || f.stops[0] != "legacy-1" {
@@ -254,7 +253,7 @@ func TestReconcileLegacyContainerWithoutResourcesReplaced(t *testing.T) {
 
 	// A second pass is now converged: no further churn.
 	stopsSoFar := len(f.stops)
-	changed, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{})
+	changed, err := reconcile(t, f, "fn", tmpl, "img-1")
 	if err != nil {
 		t.Fatalf("reconcile 2: %v", err)
 	}

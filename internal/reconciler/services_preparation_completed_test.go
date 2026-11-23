@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
 )
@@ -48,8 +47,7 @@ func completionMatchesAdmission(
 // newPreparationWorker builds a worker over the given store, standing in for a
 // fresh process when called again over the same store.
 func newPreparationWorker(md *markerStoreDocker) *ServiceReconciler {
-	return NewServiceReconciler(md, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), testReconcileTimeout)
+	return NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 }
 
 // seedUnfinishedPreparationAdmission leaves the durable state a process that

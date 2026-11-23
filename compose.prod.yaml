@@ -18,12 +18,12 @@ services:
       - .env
 
     environment:
-      NETWORKS: relay,traefik
+      NETWORKS: runtime
       NODE_ID: ${NODE_ID:?Set NODE_ID}
 
-      TRAEFIK_NETWORK: traefik
-      TRAEFIK_ENTRYPOINTS: websecure
-      TRAEFIK_CERTRESOLVER: letsencrypt
+      SERVICE_BIND_ADDR: ${SERVICE_BIND_ADDR:?Set SERVICE_BIND_ADDR}
+      SERVICE_ADVERTISE_ADDR: ${SERVICE_ADVERTISE_ADDR:-}
+      DISCOVERY_ADDR: :8082
 
       METRICS_ADDR: :9090
 
@@ -40,7 +40,6 @@ services:
 
     networks:
       - runtime
-      - edge
 
     healthcheck:
       test: ["CMD", "relay", "health"]
@@ -55,14 +54,20 @@ services:
     logging: *default-logging
 
     command:
+      - --providers.http.endpoint=http://relay:8082/discovery/traefik
+      - --providers.http.pollInterval=5s
+      - --providers.http.pollTimeout=5s
+
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
-      - --providers.docker.network=traefik
+      - --providers.docker.network=runtime
 
       - --entrypoints.web.address=:80
       - --entrypoints.web.http.redirections.entrypoint.to=websecure
       - --entrypoints.web.http.redirections.entrypoint.scheme=https
       - --entrypoints.websecure.address=:443
+      - --entrypoints.websecure.http.tls=true
+      - --entrypoints.websecure.http.tls.certresolver=letsencrypt
 
       - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:?Set ACME_EMAIL}
       - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
@@ -78,7 +83,7 @@ services:
       - letsencrypt-data:/letsencrypt
 
     networks:
-      - edge
+      - runtime
 
   prometheus:
     image: prom/prometheus:v3.7.0
@@ -179,10 +184,8 @@ services:
 
     environment:
       GF_SERVER_ROOT_URL: https://${GRAFANA_DOMAIN:?Set GRAFANA_DOMAIN}
-
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_AUTH_ANONYMOUS_ENABLED: "false"
-
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:?Set GRAFANA_ADMIN_USER}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD}
 
@@ -192,34 +195,31 @@ services:
 
     networks:
       - runtime
-      - edge
 
     labels:
       - traefik.enable=true
-      - traefik.docker.network=traefik
-
+      - traefik.docker.network=runtime
       - traefik.http.routers.grafana.rule=Host(`${GRAFANA_DOMAIN:?Set GRAFANA_DOMAIN}`)
       - traefik.http.routers.grafana.entrypoints=websecure
       - traefik.http.routers.grafana.tls=true
       - traefik.http.routers.grafana.tls.certresolver=letsencrypt
-
       - traefik.http.services.grafana.loadbalancer.server.port=3000
 
 volumes:
   relay-apps:
   relay-data:
-
   prometheus-data:
   loki-data:
   tempo-data:
   grafana-data:
   alloy-data:
-
   letsencrypt-data:
 
 networks:
   runtime:
-    name: relay
-
-  edge:
-    name: traefik
+    name: runtime
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+          gateway: 172.30.0.1

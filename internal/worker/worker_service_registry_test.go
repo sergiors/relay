@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -142,7 +141,6 @@ func newServiceEndpointFixture(
 		manager:  src,
 		apps:     apps,
 		nodes:    nodes,
-		traefik:  routing.TraefikConfig{},
 		log:      logger,
 		reporter: newRegistryFailureReporter(logger),
 		bindAddr: "127.0.0.1",
@@ -169,13 +167,6 @@ func registryRoutedApps() *runner.Registry {
 	return apps
 }
 
-// registryRoutedLabels is the Traefik label set the web service of
-// registryRoutedApps stamps on its containers.
-func registryRoutedLabels() map[string]string {
-	return routing.TraefikLabels(
-		"alpha", "web", "api.example.com", "/v2", 8080, routing.TraefikConfig{})
-}
-
 func registryCandidate(
 	appName, service, container string, replica int, labels map[string]string,
 ) runtime.RegistryServiceEndpoint {
@@ -190,26 +181,6 @@ func registryCandidate(
 		HostPort:     49155,
 		Labels:       labels,
 	}
-}
-
-func registryLabelsWith(base map[string]string, key, value string) map[string]string {
-	out := make(map[string]string, len(base)+1)
-	for k, v := range base {
-		out[k] = v
-	}
-	out[key] = value
-	return out
-}
-
-func registryLabelsWithout(base map[string]string, key string) map[string]string {
-	out := make(map[string]string, len(base))
-	for k, v := range base {
-		if k == key {
-			continue
-		}
-		out[k] = v
-	}
-	return out
 }
 
 func testNodeLease() state.NodeLease {
@@ -308,7 +279,7 @@ func TestServiceEndpointPublisherConsumesGlobalLeaseWithoutOwnHeartbeat(t *testi
 
 	store := newFakeServiceEndpointStore()
 	source := &fakeServiceEndpointSource{endpoints: []runtime.RegistryServiceEndpoint{
-		registryCandidate("alpha", "web", "ctr-web", 0, registryRoutedLabels()),
+		registryCandidate("alpha", "web", "ctr-web", 0, nil),
 	}}
 	publisher := newServiceEndpointFixture(t, store, source, registry,
 		registryRoutedApps(), logger)
@@ -344,7 +315,7 @@ func TestServiceEndpointPublisherConsumesGlobalLeaseWithoutOwnHeartbeat(t *testi
 func TestServiceEndpointSyncWaitsForGlobalLease(t *testing.T) {
 	store := newFakeServiceEndpointStore()
 	source := &fakeServiceEndpointSource{endpoints: []runtime.RegistryServiceEndpoint{
-		registryCandidate("alpha", "web", "ctr-web", 0, registryRoutedLabels()),
+		registryCandidate("alpha", "web", "ctr-web", 0, nil),
 	}}
 	publisher := newServiceEndpointFixture(t, store, source,
 		&staticLeaseSource{lease: nil}, registryRoutedApps(),
@@ -366,10 +337,8 @@ func TestServiceEndpointSyncWaitsForGlobalLease(t *testing.T) {
 // derived from the CURRENT template's routes under the supplied global lease.
 func TestServiceEndpointSyncPublishesCurrentTemplateRoutes(t *testing.T) {
 	lease := testNodeLease()
-	wantLabels := registryRoutedLabels()
 	source := &fakeServiceEndpointSource{endpoints: []runtime.RegistryServiceEndpoint{
-		registryCandidate("alpha", "web", "ctr-web", 0,
-			registryLabelsWith(wantLabels, "custom.owner", "x")),
+		registryCandidate("alpha", "web", "ctr-web", 0, nil),
 		// No route for an unrouted service: never advertised.
 		registryCandidate("alpha", "internal", "ctr-internal", 0, nil),
 	}}
@@ -407,16 +376,10 @@ func TestServiceEndpointSyncPublishesCurrentTemplateRoutes(t *testing.T) {
 	}
 }
 
-// Given a container whose routing labels belong to a superseded template (or
-// that carry extra/missing Traefik keys), or a candidate with no current
-// route, when sync runs, then none of them are advertised; the current,
-// exact-match candidate is — and a repeated container identity is deduplicated.
-func TestServiceEndpointSyncDropsSupersededAndUnmatchedCandidates(t *testing.T) {
-	current := routing.TraefikLabels(
-		"alpha", "web", "new.example.com", "", 8080, routing.TraefikConfig{})
-	superseded := routing.TraefikLabels(
-		"alpha", "web", "old.example.com", "", 8080, routing.TraefikConfig{})
-
+// Given candidates for a service with no current route, or repeated
+// relational identities, when sync runs, then only the current routed
+// candidate is advertised and the duplicate identity is published once.
+func TestServiceEndpointSyncDropsUnroutedAndDuplicateCandidates(t *testing.T) {
 	apps := &runner.Registry{}
 	apps.Set([]*runner.PreparedApp{
 		runner.NewUnavailable(app.App{Name: "alpha", Template: &app.Template{
@@ -426,19 +389,12 @@ func TestServiceEndpointSyncDropsSupersededAndUnmatchedCandidates(t *testing.T) 
 		}}),
 	})
 
-	kept := registryCandidate("alpha", "web", "ctr-kept", 0,
-		registryLabelsWith(current, "custom.owner", "x"))
+	kept := registryCandidate("alpha", "web", "ctr-kept", 0, nil)
 	duplicate := kept
 	duplicate.HostPort = 49166 // same relational identity: must not double-publish
 	source := &fakeServiceEndpointSource{endpoints: []runtime.RegistryServiceEndpoint{
-		registryCandidate("alpha", "web", "ctr-stale", 0, superseded),
-		registryCandidate("alpha", "web", "ctr-extra", 0,
-			registryLabelsWith(current, "traefik.http.routers.hijack.rule",
-				"Host(`evil`)")),
-		registryCandidate("alpha", "web", "ctr-missing", 0,
-			registryLabelsWithout(current, "traefik.enable")),
 		// No route in the current template.
-		registryCandidate("alpha", "other", "ctr-foreign", 0, current),
+		registryCandidate("alpha", "other", "ctr-foreign", 0, nil),
 		kept,
 		duplicate,
 	}}
@@ -455,9 +411,8 @@ func TestServiceEndpointSyncDropsSupersededAndUnmatchedCandidates(t *testing.T) 
 		for i, endpoint := range batch {
 			ids[i] = endpoint.ContainerID
 		}
-		t.Fatalf("published batch = %v, want only the exact current match "+
-			"[ctr-kept] (superseded/extra/missing/unrouted/duplicate excluded)",
-			ids)
+		t.Fatalf("published batch = %v, want only the current routed match "+
+			"[ctr-kept] (unrouted/duplicate excluded)", ids)
 	}
 	if batch[0].Host != "new.example.com" {
 		t.Fatalf("published host = %q, want the current template's route",
@@ -470,12 +425,10 @@ func TestServiceEndpointSyncDropsSupersededAndUnmatchedCandidates(t *testing.T) 
 }
 
 // Given a configured ROUTING_HOST_OVERRIDE, when the publisher syncs, then the
-// stored registry endpoint Host is the EFFECTIVE host — the exact override —
-// byte-identical to the hostname inside the container's matched Traefik rule
-// (Docker labels and the registry agree), while a container carrying the
-// pre-override rule is filtered. Flipping the override later changes route
-// eligibility against the SAME apps registry — nothing is rebuilt.
-func TestServiceEndpointEffectiveHostConsistencyUnderOverride(t *testing.T) {
+// stored registry endpoint Host is the EFFECTIVE host — the exact override.
+// Flipping the override later changes the published route against the SAME
+// apps registry; nothing is rebuilt.
+func TestServiceEndpointEffectiveHostUnderOverride(t *testing.T) {
 	declared := "issuer.example.com"
 	override := "portal.internal.test"
 	effective := routing.EffectiveHost(declared, override)
@@ -493,24 +446,8 @@ func TestServiceEndpointEffectiveHostConsistencyUnderOverride(t *testing.T) {
 		}}),
 	})
 
-	zero := routing.TraefikConfig{}
-	overrideLabels := routing.TraefikLabels(
-		"issuer", "web", effective, "/v2", 8080, zero)
-	declaredLabels := routing.TraefikLabels(
-		"issuer", "web", declared, "/v2", 8080, zero)
-	// Fixture guard: the two rule sets must differ, or the filter assertion
-	// below would be vacuous.
-	if registryRoutingLabelsMatch(overrideLabels, declaredLabels) {
-		t.Fatal("fixture: the override must change the generated label rule")
-	}
-
 	source := &fakeServiceEndpointSource{endpoints: []runtime.RegistryServiceEndpoint{
-		// The live container: created under the override, carrying the
-		// EFFECTIVE rule.
-		registryCandidate("issuer", "web", "ctr-effective", 0, overrideLabels),
-		// A container whose labels predate the override (declared-host rule):
-		// it no longer matches the current desired labels.
-		registryCandidate("issuer", "web", "ctr-stale", 1, declaredLabels),
+		registryCandidate("issuer", "web", "ctr-effective", 0, nil),
 	}}
 	store := newFakeServiceEndpointStore()
 	lease := testNodeLease()
@@ -526,40 +463,21 @@ func TestServiceEndpointEffectiveHostConsistencyUnderOverride(t *testing.T) {
 		for i, endpoint := range batch {
 			ids[i] = endpoint.ContainerID
 		}
-		t.Fatalf("published batch = %v, want only [ctr-effective]: the "+
-			"effective override labels must match and the pre-override "+
-			"(stale) labels must be filtered", ids)
+		t.Fatalf("published batch = %v, want only [ctr-effective]", ids)
 	}
 	endpoint := batch[0]
 	if endpoint.Host != override {
 		t.Fatalf("published Host = %q, want the EFFECTIVE host %q "+
 			"(declared was %q)", endpoint.Host, override, declared)
 	}
-
-	// Label/registry consistency: the matched Docker rule names exactly the
-	// hostname the registry stored.
-	ruleKey := "traefik.http.routers." +
-		routing.ServiceProviderID("issuer", "web") + ".rule"
-	rule, ok := overrideLabels[ruleKey]
-	if !ok {
-		t.Fatalf("fixture: matched labels missing the rule key %q: %v",
-			ruleKey, overrideLabels)
-	}
-	if !strings.Contains(rule, "Host(`"+endpoint.Host+"`)") {
-		t.Fatalf("matched rule %q does not name the published host %q",
-			rule, endpoint.Host)
-	}
 	if endpoint.Path != "/v2" || endpoint.Service != "web" ||
 		endpoint.App != "issuer" {
 		t.Fatalf("published endpoint = %+v, want the template's route identity", endpoint)
 	}
 
-	// Eligibility flip on the SAME apps registry (no rebuild): clearing the
-	// override makes the declared-rule candidate eligible and filters the
-	// override-rule one.
 	publisher.hostOverride = ""
 	source.set([]runtime.RegistryServiceEndpoint{
-		registryCandidate("issuer", "web", "ctr-declared", 0, declaredLabels),
+		registryCandidate("issuer", "web", "ctr-declared", 0, nil),
 	}, nil)
 
 	publisher.syncOnce()
@@ -570,8 +488,8 @@ func TestServiceEndpointEffectiveHostConsistencyUnderOverride(t *testing.T) {
 	}
 	if len(flipped) != 1 || flipped[0].ContainerID != "ctr-declared" ||
 		flipped[0].Host != declared {
-		t.Fatalf("flipped batch = %+v, want the declared-rule candidate with "+
-			"Host %q", flipped, declared)
+		t.Fatalf("flipped batch = %+v, want the declared host %q",
+			flipped, declared)
 	}
 }
 
@@ -580,7 +498,7 @@ func TestServiceEndpointEffectiveHostConsistencyUnderOverride(t *testing.T) {
 // sync publishes the fresh snapshot with the SAME global lease.
 func TestServiceEndpointFailedCollectionKeepsPreviousSnapshot(t *testing.T) {
 	source := &fakeServiceEndpointSource{endpoints: []runtime.RegistryServiceEndpoint{
-		registryCandidate("alpha", "web", "ctr-web", 0, registryRoutedLabels()),
+		registryCandidate("alpha", "web", "ctr-web", 0, nil),
 	}}
 	store := newFakeServiceEndpointStore()
 	lease := testNodeLease()
@@ -603,7 +521,7 @@ func TestServiceEndpointFailedCollectionKeepsPreviousSnapshot(t *testing.T) {
 	}
 
 	source.set([]runtime.RegistryServiceEndpoint{
-		registryCandidate("alpha", "web", "ctr-web", 0, registryRoutedLabels()),
+		registryCandidate("alpha", "web", "ctr-web", 0, nil),
 	}, nil)
 	publisher.syncOnce()
 	secondLease, batch := store.lastPublish()
@@ -625,8 +543,8 @@ func TestServiceEndpointFailedCollectionKeepsPreviousSnapshot(t *testing.T) {
 func TestServiceEndpointPartialCollectionPublishesVerifiedSubset(t *testing.T) {
 	source := &fakeServiceEndpointSource{
 		endpoints: []runtime.RegistryServiceEndpoint{
-			registryCandidate("alpha", "web", "ctr-1", 0, registryRoutedLabels()),
-			registryCandidate("alpha", "web", "ctr-2", 1, registryRoutedLabels()),
+			registryCandidate("alpha", "web", "ctr-1", 0, nil),
+			registryCandidate("alpha", "web", "ctr-2", 1, nil),
 		},
 		err: errors.New("inspect c3 failed"),
 	}
@@ -671,7 +589,7 @@ func TestServiceEndpointEmptyCollectionPublishesEmptyBatch(t *testing.T) {
 // an expected rejection, not a failure transition.
 func TestServiceEndpointFencedPublishKeepsLeaseAndStaysQuiet(t *testing.T) {
 	source := &fakeServiceEndpointSource{endpoints: []runtime.RegistryServiceEndpoint{
-		registryCandidate("alpha", "web", "ctr-web", 0, registryRoutedLabels()),
+		registryCandidate("alpha", "web", "ctr-web", 0, nil),
 	}}
 	store := newFakeServiceEndpointStore()
 	store.err = fmt.Errorf("publish superseded: %w", state.ErrNodeLeaseFence)
@@ -701,7 +619,7 @@ func TestServiceEndpointFencedPublishKeepsLeaseAndStaysQuiet(t *testing.T) {
 // publish reports exactly one recovery at Info.
 func TestServiceEndpointTransientPublishFailureRateLimited(t *testing.T) {
 	source := &fakeServiceEndpointSource{endpoints: []runtime.RegistryServiceEndpoint{
-		registryCandidate("alpha", "web", "ctr-web", 0, registryRoutedLabels()),
+		registryCandidate("alpha", "web", "ctr-web", 0, nil),
 	}}
 	store := newFakeServiceEndpointStore()
 	store.err = errors.New("connection refused")
@@ -753,7 +671,7 @@ func TestServiceEndpointPublisherShutdownOnlyJoins(t *testing.T) {
 
 	store := newFakeServiceEndpointStore()
 	source := &fakeServiceEndpointSource{endpoints: []runtime.RegistryServiceEndpoint{
-		registryCandidate("alpha", "web", "ctr-web", 0, registryRoutedLabels()),
+		registryCandidate("alpha", "web", "ctr-web", 0, nil),
 	}}
 	publisher := newServiceEndpointFixture(t, store, source, registry,
 		registryRoutedApps(), logger)
@@ -826,7 +744,7 @@ func TestServiceEndpointCancellationIsNotAFailureTransition(t *testing.T) {
 		store := newFakeServiceEndpointStore()
 		store.err = context.Canceled
 		source := &fakeServiceEndpointSource{endpoints: []runtime.RegistryServiceEndpoint{
-			registryCandidate("alpha", "web", "ctr-web", 0, registryRoutedLabels()),
+			registryCandidate("alpha", "web", "ctr-web", 0, nil),
 		}}
 		lease := testNodeLease()
 		logger, handler := newRecordingLogger(t)
@@ -882,7 +800,7 @@ func TestServiceEndpointCancellationIsNotAFailureTransition(t *testing.T) {
 		store := newFakeServiceEndpointStore()
 		store.err = fmt.Errorf("publish superseded: %w", state.ErrNodeLeaseFence)
 		source := &fakeServiceEndpointSource{endpoints: []runtime.RegistryServiceEndpoint{
-			registryCandidate("alpha", "web", "ctr-web", 0, registryRoutedLabels()),
+			registryCandidate("alpha", "web", "ctr-web", 0, nil),
 		}}
 		lease := testNodeLease()
 		logger, handler := newRecordingLogger(t)
@@ -908,38 +826,4 @@ func TestServiceEndpointCancellationIsNotAFailureTransition(t *testing.T) {
 				store.publishCount())
 		}
 	})
-}
-
-// Given the current template's desired Traefik labels and a container's actual
-// labels, when they are compared, then every desired key/value must match and
-// the container must carry no extra Traefik-owned key; unrelated labels are
-// ignored.
-func TestRegistryRoutingLabelsMatch(t *testing.T) {
-	desired := registryRoutedLabels()
-	if len(desired) == 0 {
-		t.Fatal("fixture: TraefikLabels produced no labels to match against")
-	}
-
-	for _, tc := range []struct {
-		name   string
-		actual map[string]string
-		want   bool
-	}{
-		{"exact match", desired, true},
-		{"changed value",
-			registryLabelsWith(desired, "traefik.enable", "false"), false},
-		{"missing key",
-			registryLabelsWithout(desired, "traefik.enable"), false},
-		{"extra traefik key",
-			registryLabelsWith(desired, "traefik.http.routers.other.rule",
-				"Host(`evil`)"), false},
-		{"extra non-traefik key",
-			registryLabelsWith(desired, "custom.owner", "x"), true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := registryRoutingLabelsMatch(desired, tc.actual); got != tc.want {
-				t.Fatalf("registryRoutingLabelsMatch = %v, want %v", got, tc.want)
-			}
-		})
-	}
 }

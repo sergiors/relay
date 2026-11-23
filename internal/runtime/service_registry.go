@@ -14,13 +14,13 @@ import (
 // prove is currently serving, with the host endpoint Docker actually assigned.
 // It is deliberately a REGISTRY collection view, separate from ServiceEndpoint
 // (the raw `relay app inspect` view): only committed, running, ready replicas
-// with a verified host binding are returned, and the caller still decides
-// whether the container's routing configuration matches the current template.
+// with a verified host binding are returned. The caller maps the replica to the
+// current template's effective host/path when it publishes the global registry.
 //
 // Generation is the Docker-owned committed-generation identity recorded by the
 // service reconciler; ContainerID is the exact committed container. Labels is
-// the container's full label set, used by the caller to match the container's
-// configured route (never to infer identity here).
+// the container's full label set, retained for callers that need provider
+// metadata; routing no longer depends on container labels.
 type RegistryServiceEndpoint struct {
 	App          string
 	Service      string

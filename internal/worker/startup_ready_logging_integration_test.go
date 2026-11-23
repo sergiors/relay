@@ -15,7 +15,6 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/reconciler"
-	"relay/internal/routing"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/state"
@@ -134,7 +133,7 @@ func TestStartupReadyLogCarriesImageOnlyWhenTheGenerationHasOne(t *testing.T) {
 	logger, logs := captureStartupLog()
 
 	svcCtrl := reconciler.NewServiceReconciler(
-		&startupReadyDocker{}, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+		&startupReadyDocker{}, nil, logger, reconcileTimeout)
 	coordinator, stop := startCoordinatorFixture(t, svcCtrl)
 	defer stop()
 

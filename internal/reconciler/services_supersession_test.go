@@ -10,7 +10,6 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/observability/metrics"
-	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
 )
@@ -28,7 +27,7 @@ import (
 // between "B abandoned" and "C accepted".
 func TestServiceCoordinatorSupersededPassPreservesOldGeneration(t *testing.T) {
 	f := newFakeDocker()
-	services := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(f, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -150,7 +149,7 @@ func TestServiceCoordinatorSupersededPassPreservesOldGeneration(t *testing.T) {
 // guard.
 func TestServiceCoordinatorSupersededPassPreservesRemovedSourceRef(t *testing.T) {
 	f := newFakeDocker()
-	services := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(f, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -298,8 +297,7 @@ func newSupersessionSummaryHarness(t *testing.T) (
 	logs := &testutil.SyncBuffer{}
 	m := metrics.New()
 	c := NewServiceReconciler(
-		f, nil, routing.TraefikConfig{},
-		slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		f, nil, slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		testReconcileTimeout, WithMetrics(m),
 	)
 	return f, tmpl, c, m, logs
@@ -420,8 +418,7 @@ func TestServiceErrorSummaryReportsPartialStops(t *testing.T) {
 	})
 	logs := &testutil.SyncBuffer{}
 	c := NewServiceReconciler(
-		f, nil, routing.TraefikConfig{},
-		slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		f, nil, slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		testReconcileTimeout,
 	)
 

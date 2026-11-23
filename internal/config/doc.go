@@ -10,15 +10,15 @@
 // non-retention tuning knobs are RETURNED as errors from Load, not fatal: the
 // caller propagates them to
 // cmd/main.go, the sole process boundary that prints the error and owns
-// os.Exit. The optional addresses, Traefik routing, and the NETWORKS list stay
-// zero/empty when unset. The retention windows default when unset
+// os.Exit. The optional addresses, routing host override, and the NETWORKS
+// list stay zero/empty when unset. The retention windows default when unset
 // (REDIS_STREAM_RETENTION 24h, DLQ_RETENTION 7d,
 // REDIS_INVOCATION_RETENTION 48h, STATS_RETENTION 7d); an explicitly empty,
 // zero, or negative value disables them, and a malformed value logs and
 // disables instead of failing. SECRETS_PROVIDER defaults to the local file
 // provider; selecting Infisical requires its project, environment, and
 // Universal Auth credentials, and the site URL must be https. The parse
-// helpers (ParsePositiveInt, ParsePositiveDuration, ParseOptionalPositiveInt,
+// helpers (ParsePositiveInt, ParsePositiveDuration,
 // ParseLogLevel, ParseMaxEventBytes, ParseNetworks) are exported and pure so
 // they are directly testable; RedisOptions maps a Redis address or DSN to
 // go-redis options without echoing credentials.

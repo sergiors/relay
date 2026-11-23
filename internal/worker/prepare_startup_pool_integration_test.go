@@ -10,7 +10,6 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/reconciler"
-	"relay/internal/routing"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/state"
@@ -122,7 +121,7 @@ func TestPrepareAppsStartupUsesExactPerAppFencingToken(t *testing.T) {
 
 	docker := newCtxRecordDocker()
 	serviceReconciler := reconciler.NewServiceReconciler(
-		docker, nil, routing.TraefikConfig{}, discardLogger(), reconcileTimeout,
+		docker, nil, discardLogger(), reconcileTimeout,
 	)
 	coordinator, stop := startCoordinatorFixture(t, serviceReconciler)
 	defer stop()

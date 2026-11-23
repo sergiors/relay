@@ -70,6 +70,7 @@ const (
 	shutdownStepStatsFlush       = "stats-flush"
 	shutdownStepMetrics          = "metrics"
 	shutdownStepWebhook          = "webhook"
+	shutdownStepDiscovery        = "discovery"
 	shutdownStepManager          = "manager"
 	shutdownStepState            = "state"
 	shutdownStepTracing          = "tracing"
@@ -107,8 +108,8 @@ const (
 //     lease is released.
 //   - BEST-EFFORT CLEANUP (everything else): bounded, logged on timeout or
 //     failure, and never joined past its bound. Cleanup:
-//     socket, service-cleanup, stats-flush, metrics, webhook, manager, state,
-//     tracing, redis.
+//     socket, service-cleanup, stats-flush, metrics, webhook, discovery,
+//     manager, state, tracing, redis.
 //
 // Only barrier steps gate shared-dependency teardown. A cleanup step that
 // ignores its context is surfaced as a timeout and left running by design; none
@@ -129,6 +130,7 @@ var shutdownStepOrder = []string{
 	shutdownStepStatsFlush,
 	shutdownStepMetrics,
 	shutdownStepWebhook,
+	shutdownStepDiscovery,
 	shutdownStepManager,
 	shutdownStepState,
 	shutdownStepTracing,

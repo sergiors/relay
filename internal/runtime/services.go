@@ -90,22 +90,19 @@ type ServiceSpec struct {
 	// bounded, safe mount options itself, so a direct caller cannot inject mount
 	// options. An empty list preserves the historical /tmp-only HostConfig.
 	Tmpfs []string
-	// Labels are EXTRA labels the caller wants on the container (routing
-	// labels supplied by the service reconciler). They are merged onto the
-	// relay ownership set, with Relay ownership keys always winning: a caller
-	// can never spoof or clobber relay.* labels, which define ownership and
-	// discovery.
+	// Labels are EXTRA labels the caller wants on the container. They are
+	// merged onto the relay ownership set, with Relay ownership keys always
+	// winning: a caller can never spoof or clobber relay.* labels, which define
+	// ownership and discovery.
 	Labels map[string]string
 	// Networks is the set of Docker networks the container must join at create
-	// time: the worker-global NETWORKS set every service container joins, plus
-	// the routing network (TRAEFIK_NETWORK) for a routed service. Empty means no
-	// extra network (default bridge/network mode only). Each name is applied
-	// exactly once (see NetworkSet); order is not significant — Docker's
+	// time: the worker-global NETWORKS set every service container joins. Empty
+	// means no extra network (default bridge/network mode only). Each name is
+	// applied exactly once (see NetworkSet); order is not significant — Docker's
 	// EndpointsConfig is a map and the relay.networks label is canonicalized.
 	//
 	// The networks themselves are infrastructure owned OUTSIDE Relay — they are
-	// never created here — and the caller (the service reconciler) validates the
-	// routing network exists before starting routed containers while the worker
+	// never created here — and the worker
 	// verifies the global set at startup. A network that disappears after
 	// verification surfaces as a create error rather than a chaos fix-up.
 	Networks []string
@@ -196,10 +193,9 @@ type ServiceContainer struct {
 	Tmpfs string
 	// Networks is the canonical, sorted, comma-separated set of Docker
 	// networks the container was created attached to (the worker-global
-	// NETWORKS set plus the routing network for a routed service), parsed from
-	// relay.networks. It is "" for a container with no networks (or one created
-	// before the label existed). The service reconciler compares it to the
-	// desired set to detect a network change.
+	// NETWORKS set), parsed from relay.networks. It is "" for a container with
+	// no networks (or one created before the label existed). The service
+	// reconciler compares it to the desired set to detect a network change.
 	Networks string
 	// Healthcheck is the canonical identity of the healthcheck configuration the
 	// container was created with, parsed from relay.healthcheck. It is "" for a
@@ -238,8 +234,8 @@ type ServiceContainer struct {
 	// place (or replace it where in-place restart is unavailable).
 	SourceID string
 	// Labels is the container's FULL label set (nil-safe; nil when the
-	// container has none). The service reconciler compares routing metadata
-	// through it without Relay parsing or interpreting foreign label names.
+	// container has none). It preserves provider/operator metadata for callers
+	// without Relay parsing or interpreting foreign label names.
 	Labels map[string]string
 	// Ready is the backend's CURRENT readiness observation for a running
 	// service container. nil means the backend reports no readiness signal,
@@ -301,11 +297,10 @@ const serviceContainerNameTokenCap = 16
 // serviceIdentityHashLen is the number of hex characters in the
 // collision-resistant suffix appended to a generated service container name. 16
 // hex chars = 64 bits, matching the short-handle convention used for Relay's
-// content-addressed image tags (see tagPrefixLen) and the routing layer's
-// provider-id suffix. The routing and runtime layers derive their suffixes
-// independently (routing is a leaf package that runtime does not import); both
-// use the same full-input SHA-256/NUL-separated construction so the two stay
-// consistent. A birthday collision at Relay's scale is astronomically unlikely.
+// content-addressed image tags (see tagPrefixLen) and discovery's provider-id
+// suffix. The layers derive their suffixes independently; both use the same
+// full-input SHA-256/NUL-separated construction so the two stay consistent. A
+// birthday collision at Relay's scale is astronomically unlikely.
 const serviceIdentityHashLen = 16
 
 // sanitizeContainerNamePart replaces any character outside [A-Za-z0-9_.-] with
@@ -434,9 +429,8 @@ func serviceEndpoints(networks []string) map[string]*network.EndpointSettings {
 // label sees equality whenever the SET of networks matches.
 //
 // It is used for persistent service containers, whose networks are the
-// worker-global set (NETWORKS) plus the routing layer's (TRAEFIK_NETWORK) for a
-// routed service; the canonical form makes the comparison order- and
-// duplicate-invariant.
+// worker-global set (NETWORKS); the canonical form makes the comparison order-
+// and duplicate-invariant.
 func NetworksLabel(networks ...string) string {
 	set := NetworkSet(networks)
 	if len(set) == 0 {
@@ -903,10 +897,8 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		// Join every configured network at create time (containers must belong to
 		// a network from creation to be on it at start). The worker-global
 		// NETWORKS set applies to service containers exactly as it does to
-		// execution containers; a routed service additionally joins the routing
-		// network. All are infrastructure owned OUTSIDE Relay — they are never
-		// created here — and the caller (the service reconciler for the routing
-		// network, the worker at startup for the global set) validates them
+		// execution containers. All are infrastructure owned OUTSIDE Relay — they
+		// are never created here — and the worker validates them at startup
 		// before starting containers; a network that disappears after
 		// verification surfaces as a create error below rather than a chaos
 		// fix-up.
@@ -1155,8 +1147,8 @@ func (m *Manager) serviceContainerList(ctx context.Context, admit dockerOpAdmitt
 			healthcheckAttempt = a
 		}
 		// The full label set is copied as-is (nil when the container has none)
-		// so the reconciler can compare routing metadata without Relay owning
-		// or interpreting foreign label names.
+		// so callers retain provider/operator metadata without Relay owning or
+		// interpreting foreign label names.
 		var labelsCopy map[string]string
 		if len(c.Labels) > 0 {
 			labelsCopy = make(map[string]string, len(c.Labels))
@@ -1416,8 +1408,8 @@ func servicePublishedBinding(
 
 // NetworkExists reports whether a Docker network exists on the daemon. It is
 // verification only — Relay NEVER creates networking infrastructure — used by
-// the service reconciler to refuse starting routed containers whose routing
-// network does not exist. Others' networks are inspected but never modified.
+// worker startup to verify configured workload networks. Others' networks are
+// inspected but never modified.
 //
 // Not-found matching uses cerrdefs.IsNotFound rather than errors.Is against the
 // sentinel: the containerd helper recognizes BOTH the errdefs.ErrNotFound
@@ -1455,8 +1447,8 @@ const networkRoleLabel = "relay.network.role"
 // executionControlNetworkRole marks a Docker network as Relay's execution
 // control plane. A workload container must never join it: that network is for
 // Relay itself (and operator control-plane services), so an app that names it
-// in NETWORKS, TRAEFIK_NETWORK, or a persistent service's Networks would
-// otherwise gain a path into Relay's private management surface.
+// in NETWORKS or a persistent service's Networks would otherwise gain a path
+// into Relay's private management surface.
 const executionControlNetworkRole = "execution-control"
 
 // validateWorkloadNetworks refuses selected networks that would break the

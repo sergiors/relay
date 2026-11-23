@@ -32,18 +32,15 @@ fallback. See [Operations](operations.md#node-identity-loss).
 | `PYTHON_ZUVLOOP`              | `false`                                                   | Boolean; use `zuvloop` for Python event and schedule handlers.                               |
 | `METRICS_ADDR`                | unset                                                     | Listen address for Prometheus metrics; empty disables metrics.                               |
 | `GIT_WEBHOOK_ADDR`            | unset                                                     | Listen address for the optional GitHub webhook. Requires a configured webhook secret.        |
+| `DISCOVERY_ADDR`              | unset                                                     | Listen address for the read-only discovery API (Traefik HTTP provider). Empty disables it.   |
 | `NETWORKS`                    | unset                                                     | Optional comma-separated existing, operator-managed Docker networks for app connectivity.    |
 | `REDIS_STREAM_RETENTION`      | `24h`                                                     | Age window for trimming acknowledged stream entries; see below.                              |
 | `DLQ_RETENTION`               | `168h`                                                    | Age window for settled PostgreSQL DLQ rows; see below.                                       |
 | `REDIS_INVOCATION_RETENTION`  | `48h`                                                     | Retention for terminal invocation state after ACK.                                           |
 | `STATS_RETENTION`             | `168h`                                                    | Retention for stale node statistics.                                                         |
-| `TRAEFIK_NETWORK`             | unset                                                     | Additional Docker network; required for services with routed hosts.                          |
-| `TRAEFIK_ENTRYPOINTS`         | unset                                                     | Comma-separated Traefik entrypoint names.                                                    |
-| `TRAEFIK_CERTRESOLVER`        | unset                                                     | Traefik certificate resolver; enables TLS when set.                                          |
-| `TRAEFIK_PRIORITY`            | unset                                                     | Positive router priority.                                                                    |
 | `ROUTING_HOST_OVERRIDE`       | unset                                                     | Sets one exact routable hostname for every routed service; unset/blank keeps declared hosts. |
 | `SERVICE_BIND_ADDR`           | unset                                                     | Static host IP routed services publish their port on; unset keeps them internal-only.        |
-| `SERVICE_ADVERTISE_ADDR`      | `SERVICE_BIND_ADDR` when unset, empty, or whitespace-only | Static IP operators should use to reach a published service; display metadata only.          |
+| `SERVICE_ADVERTISE_ADDR`      | `SERVICE_BIND_ADDR` when unset, empty, or whitespace-only | Static IP advertised as the backend address; defaults to bind.                               |
 | `SECRETS_PROVIDER`            | `local`                                                   | `local` or `infisical`; selects the worker-wide secret provider.                             |
 | `INFISICAL_SITE_URL`          | `https://app.infisical.com`                               | Infisical HTTPS origin; used only with `SECRETS_PROVIDER=infisical`.                         |
 | `INFISICAL_PROJECT_ID`        | Required with Infisical                                   | Infisical project; required only with `SECRETS_PROVIDER=infisical`.                          |
@@ -69,10 +66,9 @@ Relay automatically manages the connectivity used to execute handlers; users
 do not configure an internal execution network. `NETWORKS` is optional
 additional connectivity for app containers, and every listed network must
 already exist. Networks marked `relay.network.role=execution-control` are
-reserved and rejected for `NETWORKS` and `TRAEFIK_NETWORK`. This marker does
-not prove ownership or isolate containers. `TRAEFIK_NETWORK` remains the
-additional network for routed services. Most worker settings require a restart
-to change. App-level concurrency and resources are documented in [Apps](apps.md).
+reserved and rejected for `NETWORKS`. This marker does not prove ownership or
+isolate containers. Most worker settings require a restart to change.
+App-level concurrency and resources are documented in [Apps](apps.md).
 
 Boolean settings accept `1`, `t`, `true`, `0`, `f`, or `false`. Durations use Go
 syntax such as `90s` or `1h30m`; retention settings do not accept a `d` suffix.
@@ -174,15 +170,50 @@ state persistent. See
 
 ### Service routing
 
-`TRAEFIK_*` settings apply to services that declare routed hosts.
-`TRAEFIK_NETWORK` is required for routed services and must already exist. Relay
-does not manage the network; see [Services](services.md).
+Routing is handled by an external proxy. Relay provides service discovery
+through its HTTP API, allowing the proxy to discover available services and
+route traffic to their published host ports.
 
-`ROUTING_HOST_OVERRIDE` is independent of the Traefik-specific settings. When
-set to a hostname, every routed service uses that exact hostname instead of its
-declared `host`. Unset, empty, or whitespace-only keeps each service's declared
-host. With several routed services, setting one override makes their routes
-share the same hostname, so use distinct `path` values or separate deployments.
+The proxy independently manages its entrypoints, TLS, certificates, and
+routing configuration.
+
+A service that declares a `host` is published in Relay's service registry and
+in the optional discovery API. The discovery API is enabled only when
+`DISCOVERY_ADDR` is set (for example `:8082`) and exposes:
+
+- `GET /discovery/traefik` — a Traefik HTTP-provider dynamic configuration.
+
+Other paths return `404`; other methods, including `HEAD`, return `405` with
+`Allow: GET`. The endpoint has no authentication and exposes internal host and
+replica topology, so bind it to a private address or restrict access at the
+network boundary. A registry read failure returns `503` (rather than an empty
+configuration), which lets Traefik
+keep its last successful routes. Configure Traefik to poll the endpoint, for
+example:
+
+```yaml
+providers:
+  http:
+    endpoint: "http://relay:8082/discovery/traefik"
+    pollInterval: "5s"
+    pollTimeout: "5s"
+```
+
+A provider reaches each service replica through its published host port, so
+`SERVICE_BIND_ADDR` must be set and the advertised address (which defaults to
+the bind address) must be reachable from the proxy. See
+[Service publication](#service-publication).
+
+`ROUTING_HOST_OVERRIDE` sets one exact hostname for every routed service
+instead of its declared `host`. Unset, empty, or whitespace-only keeps each
+service's declared host. With several routed services, setting one override
+makes their routes share the same hostname, so use distinct `path` values or
+separate deployments. A duplicate `host`/`path` within one template is
+rejected at parse time; across apps, discovery omits ambiguous routes.
+
+Distinct paths on the same host are supported, and a path route strips its
+prefix before forwarding. Overlapping prefixes are ordered with explicit
+priorities, so the longest matching prefix wins.
 
 ### Service publication
 
@@ -206,21 +237,27 @@ or link; Relay does not verify that the address exists on the host.
 defaults to `SERVICE_BIND_ADDR` when unset, empty, or whitespace-only, and may
 differ, for example when the host is reached through another address. Setting a
 non-empty value without `SERVICE_BIND_ADDR` is a configuration error because
-nothing is published. It is display metadata only and changing it never
-replaces a container. Both settings are read at worker startup, so restart the
-worker after changing either one.
+nothing is published. It is discovery/presentation metadata: changing it never
+replaces a container, but it does change the backend addresses in the discovery
+response.
+
+Docker still listens only on `SERVICE_BIND_ADDR`. If `SERVICE_ADVERTISE_ADDR`
+differs, the operator must ensure traffic to `advertisedIP:hostPort` reaches the
+bound interface and port through forwarding or NAT; advertising a different
+mesh IP alone does not make the port listen there. In a multi-node deployment,
+set each node's bind address to a host IP that exists on that node and is
+usable/reachable from the routing provider. The advertise address must identify
+that node. Both settings are read at worker startup, so restart the worker after
+changing either one.
 
 Publishing a host port does not by itself make a service reachable outside the
 host. Open the chosen ports in the host firewall, and configure any routing,
 VPN, or NAT between clients and the host yourself; Relay does not manage those.
 Binding to a specific IP selects the interface Docker listens on but is not a
 complete network isolation boundary, because anything that can reach the host
-address can reach the published port.
-
-Publishing may temporarily overlap with existing Traefik labels on the same
-service: both the published host port and the Traefik route can forward to the
-container. Remove the labels only when you have moved clients to the published
-endpoint. See [Services](services.md#host-publication-optional).
+address can reach the published port. The discovery API advertises the
+`SERVICE_ADVERTISE_ADDR` with each replica's Docker-allocated host port, so the
+proxy must be able to reach that address and port range.
 
 ## Environment owned by other libraries
 

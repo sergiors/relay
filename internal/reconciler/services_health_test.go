@@ -11,7 +11,6 @@ import (
 	"github.com/moby/moby/api/types/container"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
 )
@@ -469,8 +468,7 @@ func TestReconcileHealthcheckReplacementStartsThenCommitsThenStopsOld(t *testing
 		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
 		Healthcheck: hc,
 	})
-	c := NewServiceReconciler(md, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 	result := healthApply(t, c, "fn", tmpl, "img-new")
 
@@ -520,8 +518,7 @@ func TestReconcileProbeOnlyEditReplacesConvergedContainer(t *testing.T) {
 		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
 		Healthcheck: changed,
 	})
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 	result := healthApply(t, c, "fn", tmpl, "img-1")
 
@@ -556,8 +553,7 @@ func TestReconcileActiveUnhealthyReplicaIsNotReplaced(t *testing.T) {
 		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
 		Healthcheck: hc,
 	})
-	c := NewServiceReconciler(md, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 	healthApply(t, c, "fn", tmpl, "img-1")
 	active := f.lastStartedFor("fn", "service.js")
@@ -598,8 +594,7 @@ func TestReconcileActiveUnhealthyReplicaIsNotReplaced(t *testing.T) {
 	plain := newFakeDocker()
 	seedConvergedHealthService(plain, "cand-1", "fn", "service.js", "img-1",
 		80, 0, hc, container.Unhealthy, 1)
-	plainC := NewServiceReconciler(plain, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), testReconcileTimeout)
+	plainC := NewServiceReconciler(plain, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	pendingResult := healthApply(t, plainC, "fn", tmpl, "img-1")
 	if !pendingResult.Pending() {
 		t.Fatalf("result = %+v, want pending for an uncommitted unhealthy candidate", pendingResult)
@@ -639,8 +634,7 @@ func TestReconcileStartingCandidatePreservesOldGenerationUntilHealthy(t *testing
 		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
 		Healthcheck: hc,
 	})
-	c := NewServiceReconciler(md, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 	result := healthApply(t, c, "fn", tmpl, "img-1")
 
@@ -721,8 +715,7 @@ func TestReconcileCommitProbeAmbiguityFailsClosed(t *testing.T) {
 		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
 		Healthcheck: hc,
 	})
-	c := NewServiceReconciler(pd, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(pd, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 	result := healthApply(t, c, "fn", tmpl, "img-1")
 
@@ -794,8 +787,7 @@ func TestReconcileFirstProbeFailurePreservesCandidateAndFallback(t *testing.T) {
 		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
 		Healthcheck: hc,
 	})
-	c := NewServiceReconciler(pd, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(pd, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 	before := time.Now()
 	result := healthApply(t, c, "fn", tmpl, "img-1")
@@ -913,8 +905,7 @@ func TestReconcileCandidateLosingReadinessAtFinalCheckRecordsFailureOnly(t *test
 		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
 		Healthcheck: hc,
 	})
-	c := NewServiceReconciler(pd, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(pd, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 	result := healthApply(t, c, "fn", tmpl, "img-1")
 
@@ -969,8 +960,7 @@ func TestReconcilePendingSlotDoesNotBlockOtherProgressAndRemovedCleanup(t *testi
 			Healthcheck: hc},
 		app.Service{Name: "api.js", Entrypoint: "api.js", Port: 80, Replicas: 1},
 	)
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 	result := healthApply(t, c, "fn", tmpl, "img-new")
 	if !result.Pending() {
@@ -1035,8 +1025,7 @@ func TestReconcileSupersededHealthcheckPassPreservesOldGeneration(t *testing.T) 
 		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
 		Healthcheck: hc,
 	})
-	c := NewServiceReconciler(md, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 	superseded := false
 	f.mu.Lock()
@@ -1107,8 +1096,7 @@ func TestReconcileHotReloadKeepsHealthLabeledContainerInPlace(t *testing.T) {
 		f := newRestartFakeDocker()
 		f.setMountIdentity("service.js", "fp2")
 		seedLive(f, "fp1")
-		c := NewServiceReconciler(f, nil, routing.TraefikConfig{},
-			testutil.DiscardLogger(), testReconcileTimeout)
+		c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 		result := healthApply(t, c, "fn", tmpl, "img-1")
 
@@ -1151,8 +1139,7 @@ func TestReconcileHotReloadKeepsHealthLabeledContainerInPlace(t *testing.T) {
 		f := newRestartFakeDocker()
 		f.setMountIdentity("service.js", "fp1")
 		seedLive(f, "fp1")
-		c := NewServiceReconciler(f, nil, routing.TraefikConfig{},
-			testutil.DiscardLogger(), testReconcileTimeout)
+		c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 		result := healthApply(t, c, "fn", tmpl, "img-1")
 
@@ -1172,8 +1159,7 @@ func TestReconcileHotReloadKeepsHealthLabeledContainerInPlace(t *testing.T) {
 		f.mu.Lock()
 		f.ctrs["live-1"].healthcheck = ""
 		f.mu.Unlock()
-		c := NewServiceReconciler(f, nil, routing.TraefikConfig{},
-			testutil.DiscardLogger(), testReconcileTimeout)
+		c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 		result := healthApply(t, c, "fn", tmpl, "img-1")
 
@@ -1215,8 +1201,7 @@ func TestReconcileFailedCandidateCleanupStartsExactlyOneNextAttempt(t *testing.T
 		Healthcheck: hc,
 	})
 	newWorker := func() *ServiceReconciler {
-		return NewServiceReconciler(md, nil, routing.TraefikConfig{},
-			testutil.DiscardLogger(), testReconcileTimeout)
+		return NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	}
 
 	// First observation: still inside the bounded retry for the highest
@@ -1331,8 +1316,7 @@ func multiMatchFixture(
 		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
 		Healthcheck: hc,
 	})
-	c := NewServiceReconciler(pd, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(pd, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	return f, pd, tmpl, c
 }
 
@@ -1533,8 +1517,7 @@ func TestReconcileCommittedActiveWinsOverLowerIDDuplicate(t *testing.T) {
 		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
 		Healthcheck: hc,
 	})
-	c := NewServiceReconciler(pd, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(pd, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 	// Pass 1 commits cand-z as the slot's active replica.
 	first := healthApply(t, c, "fn", tmpl, "img-1")

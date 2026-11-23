@@ -27,21 +27,41 @@ syntax, `up` may create missing host paths as empty files or directories, so
 check the sources explicitly before starting.
 
 Create `.env` beside `compose.prod.yaml`. Compose requires `RELAY_IMAGE`,
-`NODE_ID`, `ACME_EMAIL`, `TEMPO_VERSION`, `OTEL_VERSION`, `ALLOY_VERSION`,
-`GRAFANA_VERSION`, `GRAFANA_DOMAIN`, `GRAFANA_ADMIN_USER`, and
-`GRAFANA_ADMIN_PASSWORD`. The same file must configure Relay's external
-dependencies with `REDIS_URI`, `REDIS_STREAM`, `REDIS_GROUP`, and
-`DATABASE_URL`. Choose values appropriate to your deployment; do not use
-development credentials or an untested Relay image.
+`NODE_ID`, `SERVICE_BIND_ADDR`, `ACME_EMAIL`, `TEMPO_VERSION`,
+`OTEL_VERSION`, `ALLOY_VERSION`, `GRAFANA_VERSION`, `GRAFANA_DOMAIN`,
+`GRAFANA_ADMIN_USER`, and `GRAFANA_ADMIN_PASSWORD`. `SERVICE_ADVERTISE_ADDR`
+is optional and defaults to `SERVICE_BIND_ADDR` when empty. The same file must
+configure Relay's external dependencies with `REDIS_URI`, `REDIS_STREAM`,
+`REDIS_GROUP`, and `DATABASE_URL`. Choose values appropriate to your
+deployment; do not use development credentials or an untested Relay image.
 
 `NODE_ID` must be unique among concurrent nodes, stable across restarts,
 and at most 128 characters using only ASCII letters, digits, `.`, `_`, and `-`.
 
+`SERVICE_BIND_ADDR` is the per-node host IP Docker actually binds published
+service ports on. It must exist on that host and be usable/reachable from
+Traefik. For a single-host deployment, the Compose edge bridge gateway
+(`172.30.0.1`) is a valid example; for multiple hosts, use each node's unique
+LAN, VPN, or other routable address. `SERVICE_ADVERTISE_ADDR` defaults to the
+bind address and only changes the backend address returned by discovery. If it
+differs from the bind address, traffic to `advertisedIP:hostPort` must reach the
+bound interface/port through operator-managed forwarding or NAT. Do not use the
+same bind or advertised address on multiple hosts unless that traffic really
+reaches the intended node.
+
 The production Compose file mounts the host Docker socket read-only into Relay,
-sets `NETWORKS=relay,traefik` for optional app connectivity, and configures
-Relay's Traefik network, HTTPS entrypoint, and certificate resolver. Routed
-services additionally use `TRAEFIK_NETWORK`. See
-[Configuration](configuration.md) and [Services](services.md).
+sets `NETWORKS=relay` for optional app connectivity, publishes routed service
+ports with `SERVICE_BIND_ADDR`/`SERVICE_ADVERTISE_ADDR`, and enables the
+discovery API with `DISCOVERY_ADDR`. Traefik reads that API with its HTTP
+provider; Relay generates no Traefik labels. The Relay worker/container may
+join an operator-managed private network (the Compose `edge` network, named
+`traefik`, in this example) so Traefik can reach the discovery API. Relay no
+longer adds routed SERVICE containers to a special proxy network; their
+reachability is through published host ports, and operator `NETWORKS` still
+apply. The discovery listener is not published on a host port; it is only
+reachable from the networks Relay joins, and it has no authentication.
+See [Configuration](configuration.md#service-routing) and
+[Services](services.md#routing-provider).
 
 If using a Docker socket proxy, allow Relay's required Docker network
 management and container create, inspect, and removal operations. The read-only
@@ -216,9 +236,11 @@ or have working dashboards until those files are supplied and reviewed. Relay's
 `relay stats` is also available through the CLI without Grafana.
 Relay's metrics endpoint on port `9090` is not published on a host port; it is
 reachable from networks joined by Relay (`runtime` and `edge`).
-Grafana is routed through Traefik using the configured domain. Its HTTPS
-certificate uses HTTP-01, so the domain must resolve publicly to this ingress
-and be reachable on ports 80 and 443.
+Grafana is routed through Traefik using the configured domain. Traefik still
+loads file/dynamic configuration for externally managed services such as
+Grafana; Relay's own services are discovered through the HTTP provider. Traefik's
+HTTPS certificate uses HTTP-01, so the domain must resolve publicly to this
+ingress and be reachable on ports 80 and 443.
 
 ## Updates and Persistence
 
@@ -256,7 +278,8 @@ requirements; do not remove volumes as part of routine updates. See
 
 `compose.yaml` is a standalone local quick-start that runs the published Relay
 image, bind-mounts `./apps` at `/apps`, mounts the host Docker socket read-only,
-and provisions local Redis, PostgreSQL, and Traefik. Place an app under `./apps`
-to run it. This development stack is not a substitute for the production
+and provisions local Redis, PostgreSQL, and Traefik. Relay publishes routed
+service ports on the compose bridge gateway and Traefik reads its discovery API.
+Place an app under `./apps` to run it. This development stack is not a substitute for the production
 deployment described above, which uses externally managed dependencies and
 production configuration.

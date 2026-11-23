@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/testutil"
 )
 
@@ -21,7 +20,7 @@ import (
 // progressing on the free worker the whole time.
 func TestServiceCoordinatorWaitAndExclusiveBlockedThroughTerminalHooks(t *testing.T) {
 	docker := &coordinatorDocker{entered: make(chan struct{}, 8), release: make(chan struct{})}
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)
@@ -196,7 +195,7 @@ func TestServiceCoordinatorWaitAndExclusiveBlockedThroughTerminalHooks(t *testin
 func TestServiceCoordinatorCallbackTriggeredSupersessionAndNotifyAreSafe(t *testing.T) {
 	docker := &coordinatorDocker{entered: make(chan struct{}, 8), release: make(chan struct{})}
 	close(docker.release) // resolution never parks; the callback work is the subject
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)
@@ -278,7 +277,7 @@ func TestServiceCoordinatorCallbackTriggeredSupersessionAndNotifyAreSafe(t *test
 func TestServiceCoordinatorShutdownDuringSettlementSettlesOnce(t *testing.T) {
 	docker := &coordinatorDocker{entered: make(chan struct{}, 8), release: make(chan struct{})}
 	close(docker.release)
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)
@@ -358,7 +357,7 @@ func TestServiceCoordinatorShutdownDuringSettlementSettlesOnce(t *testing.T) {
 // completion and the composed observer callback fire exactly once.
 func TestServiceCoordinatorCoalescedObservationCompletionPreserved(t *testing.T) {
 	docker := &coordinatorDocker{entered: make(chan struct{}, 8), release: make(chan struct{})}
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)

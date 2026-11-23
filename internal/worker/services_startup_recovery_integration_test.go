@@ -31,7 +31,6 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/reconciler"
-	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/state"
 	"relay/internal/testutil"
@@ -344,7 +343,7 @@ func TestIntegrationStartupRecoveryAdoptsServiceAfterAbruptExit(t *testing.T) {
 	t.Cleanup(func() { _ = currentManager.Close() })
 
 	svcCtrl := reconciler.NewServiceReconciler(
-		currentManager, nil, routing.TraefikConfig{}, logger, reconcileTimeout,
+		currentManager, nil, logger, reconcileTimeout,
 		reconciler.WithNodeID(nodeID),
 	)
 
@@ -721,7 +720,7 @@ func TestIntegrationStartupSweepsSkipRemovalAfterOwnershipLoss(t *testing.T) {
 	t.Cleanup(func() { _ = manager.Close() })
 
 	svcCtrl := reconciler.NewServiceReconciler(
-		manager, nil, routing.TraefikConfig{}, logger, reconcileTimeout,
+		manager, nil, logger, reconcileTimeout,
 		reconciler.WithNodeID(nodeID),
 	)
 

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
 )
@@ -65,7 +64,7 @@ func TestServiceCoordinatorLimitsConcurrencyAndCoalescesLatest(t *testing.T) {
 		entered: make(chan struct{}, 8),
 		release: make(chan struct{}),
 	}
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)
@@ -132,7 +131,7 @@ func TestServiceCoordinatorStatusAuthority(t *testing.T) {
 				release:    make(chan struct{}),
 				resolveErr: tc.err,
 			}
-			services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+			services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 			coordinator := NewServiceCoordinator(services)
 			lifecycle, cancel := context.WithCancel(context.Background())
 			coordinator.Start(lifecycle)
@@ -174,7 +173,7 @@ func TestServiceCoordinatorStatusAuthority(t *testing.T) {
 
 func TestServiceCoordinatorNewMeaningfulRequestSupersedesStatus(t *testing.T) {
 	docker := &coordinatorDocker{entered: make(chan struct{}, 8), release: make(chan struct{})}
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)
@@ -216,7 +215,7 @@ func newBlockingCoordinator(t *testing.T) (*ServiceCoordinator, *coordinatorDock
 		entered: make(chan struct{}, 8),
 		release: make(chan struct{}),
 	}
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)
@@ -303,7 +302,7 @@ func TestServiceCoordinatorJoinBoundedThenDrains(t *testing.T) {
 // that has already exited.
 func TestServiceCoordinatorEnqueueAfterShutdownIsSafe(t *testing.T) {
 	docker := &coordinatorDocker{entered: make(chan struct{}, 8), release: make(chan struct{})}
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)
@@ -374,7 +373,7 @@ func (d *removalBlockingDocker) NetworkExists(context.Context, string) (bool, er
 // the assertion would catch it.
 func TestServiceCoordinatorRemoveAndWaitWaitsForCompletion(t *testing.T) {
 	docker := &removalBlockingDocker{entered: make(chan struct{}), release: make(chan struct{})}
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), time.Minute)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), time.Minute)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -421,7 +420,7 @@ func TestServiceCoordinatorRemoveAndWaitWaitsForCompletion(t *testing.T) {
 func TestServiceCoordinatorRemoveOperationBoundedByReconcileTimeout(t *testing.T) {
 	const bound = 50 * time.Millisecond
 	docker := &removalBlockingDocker{entered: make(chan struct{}), release: make(chan struct{})}
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), bound)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), bound)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -455,7 +454,7 @@ func TestServiceCoordinatorRemoveOperationBoundedByReconcileTimeout(t *testing.T
 // still executed and coalesces like any other desired state.
 func TestServiceCoordinatorEnqueueRemoveNonBlocking(t *testing.T) {
 	docker := &removalBlockingDocker{entered: make(chan struct{}), release: make(chan struct{})}
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), time.Minute)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), time.Minute)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -498,7 +497,7 @@ func TestServiceCoordinatorEnqueueRemoveNonBlocking(t *testing.T) {
 // template passed to ResolveServiceImage; the mutation must not be visible.
 func TestServiceCoordinatorSnapshotsTemplateAtEnqueue(t *testing.T) {
 	docker := &snapshotDocker{}
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -631,7 +630,7 @@ func (d *pauseProbeDocker) peak() int {
 // be scheduled once the window closes.
 func TestServiceCoordinatorRunExclusivePausesScheduling(t *testing.T) {
 	docker := &pauseProbeDocker{entered: make(chan string, 8)}
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -821,7 +820,7 @@ func enqueueMeaningfulWithHooks(
 // exactly once.
 func TestServiceCoordinatorPendingReleasesWorkerAndNotifyCompletesOnce(t *testing.T) {
 	docker := newPendingServiceDocker()
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)
@@ -939,7 +938,7 @@ func TestServiceCoordinatorPendingReleasesWorkerAndNotifyCompletesOnce(t *testin
 // only the newest request's callback runs.
 func TestServiceCoordinatorMidPassDoubleEnqueueSupersedesIntermediateRequest(t *testing.T) {
 	docker := &coordinatorDocker{entered: make(chan struct{}, 8), release: make(chan struct{})}
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)
@@ -1055,7 +1054,7 @@ func TestServiceCoordinatorMidPassDoubleEnqueueSupersedesIntermediateRequest(t *
 // deadline is cleared.
 func TestServiceCoordinatorObservationDoesNotReplacePendingRequestOrAdvanceDeadline(t *testing.T) {
 	docker := newPendingServiceDocker()
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)
@@ -1208,7 +1207,7 @@ func TestServiceCoordinatorObservationDoesNotReplacePendingRequestOrAdvanceDeadl
 // removal actually returns.
 func TestServiceCoordinatorRemoveAndWaitSupersedesPendingRequest(t *testing.T) {
 	docker := newPendingServiceDocker()
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), time.Minute)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), time.Minute)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)
@@ -1311,7 +1310,7 @@ func TestServiceCoordinatorRemoveAndWaitSupersedesPendingRequest(t *testing.T) {
 func TestServiceCoordinatorStatusLessDesiredSupersedesExecutingMeaningful(t *testing.T) {
 	f := newFakeDocker()
 	seedOldService(f, "old-1", "alpha", "service.js", "img-old", 80, 0)
-	services := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), time.Minute)
+	services := NewServiceReconciler(f, nil, testutil.DiscardLogger(), time.Minute)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)
@@ -1397,7 +1396,7 @@ func TestServiceCoordinatorStatusLessDesiredSupersedesExecutingMeaningful(t *tes
 func TestServiceCoordinatorStatusLessEnqueueAfterTerminalDecisionKeepsCallback(t *testing.T) {
 	docker := &coordinatorDocker{entered: make(chan struct{}, 8), release: make(chan struct{})}
 	close(docker.release)
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)
@@ -1470,7 +1469,7 @@ func TestServiceCoordinatorStatusLessEnqueueAfterTerminalDecisionKeepsCallback(t
 func TestServiceCoordinatorShutdownAfterTerminalDecisionSuppressesCallback(t *testing.T) {
 	docker := &coordinatorDocker{entered: make(chan struct{}, 8), release: make(chan struct{})}
 	close(docker.release)
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)
@@ -1529,7 +1528,7 @@ func TestServiceCoordinatorShutdownAfterTerminalDecisionSuppressesCallback(t *te
 // that runs after it, while settlement and waiter closure still complete.
 func TestServiceCoordinatorShutdownDuringCompletionSuppressesComposedObserver(t *testing.T) {
 	docker := &coordinatorDocker{entered: make(chan struct{}, 8), release: make(chan struct{})}
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)
@@ -1609,7 +1608,7 @@ func TestServiceCoordinatorShutdownDuringCompletionSuppressesComposedObserver(t 
 // remain busy until the cancellation settlement and waiter closure finish.
 func TestServiceCoordinatorCancelPendingKeepsIdleBarrierThroughSettlement(t *testing.T) {
 	docker := &coordinatorDocker{entered: make(chan struct{}, 8), release: make(chan struct{})}
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)

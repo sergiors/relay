@@ -10,7 +10,6 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/config"
-	"relay/internal/routing"
 	"relay/internal/testutil"
 )
 
@@ -27,8 +26,7 @@ func reconcileServiceBind(
 // returns the pass error, for tests that assert on failure outcomes.
 func applyServiceBind(f *fakeDocker, fn string, tmpl *app.Template, image, bind string) error {
 	services := NewServiceReconciler(
-		f, nil, routing.TraefikConfig{Network: "proxy"},
-		testutil.DiscardLogger(), testReconcileTimeout,
+		f, nil, testutil.DiscardLogger(), testReconcileTimeout,
 		WithServiceBindAddr(bind),
 		WithNodeID(defaultFakeNodeID),
 	)

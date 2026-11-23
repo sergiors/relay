@@ -6,7 +6,6 @@ import (
 	"github.com/moby/moby/api/types/container"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 )
 
 // runningSourceIDs returns the relay.source identities of the running containers
@@ -32,7 +31,7 @@ func TestReconcileReplacesOnSourceMountChange(t *testing.T) {
 	f.setMountIdentity("service.py", "fp1")
 	tmpl := serviceTemplate("python3.14", app.Service{Name: "svc", Entrypoint: "service.py", Port: 8000, Replicas: 1})
 
-	if _, err := reconcile(t, f, "fn", tmpl, "relay-app-fn:tag", routing.TraefikConfig{}); err != nil {
+	if _, err := reconcile(t, f, "fn", tmpl, "relay-app-fn:tag"); err != nil {
 		t.Fatalf("first reconcile: %v", err)
 	}
 	if got := runningSourceIDs(f, "fn", "svc"); len(got) != 1 || got[0] != "fp1" {
@@ -41,7 +40,7 @@ func TestReconcileReplacesOnSourceMountChange(t *testing.T) {
 
 	// Unchanged source: the converged container is kept, so no further start/stop.
 	events := len(f.order())
-	if _, err := reconcile(t, f, "fn", tmpl, "relay-app-fn:tag", routing.TraefikConfig{}); err != nil {
+	if _, err := reconcile(t, f, "fn", tmpl, "relay-app-fn:tag"); err != nil {
 		t.Fatalf("unchanged reconcile: %v", err)
 	}
 	if got := len(f.order()); got != events {
@@ -50,7 +49,7 @@ func TestReconcileReplacesOnSourceMountChange(t *testing.T) {
 
 	// Source-only change: same image reference, new fingerprint -> replacement.
 	f.setMountIdentity("service.py", "fp2")
-	if _, err := reconcile(t, f, "fn", tmpl, "relay-app-fn:tag", routing.TraefikConfig{}); err != nil {
+	if _, err := reconcile(t, f, "fn", tmpl, "relay-app-fn:tag"); err != nil {
 		t.Fatalf("changed reconcile: %v", err)
 	}
 	if got := len(f.order()); got <= events {

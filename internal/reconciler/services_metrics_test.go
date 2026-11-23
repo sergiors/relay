@@ -7,7 +7,6 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/observability/metrics"
-	"relay/internal/routing"
 	"relay/internal/testutil"
 )
 
@@ -18,7 +17,7 @@ func TestServiceReconcilerMetricsChanged(t *testing.T) {
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	m := metrics.New()
 
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout, WithMetrics(m))
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout, WithMetrics(m))
 	if result := c.ApplyResult(context.Background(), "fn", tmpl, "img", nil, nil); result.Err != nil {
 		t.Fatalf("apply: %v", result.Err)
 	}
@@ -41,7 +40,7 @@ func TestServiceReconcilerMetricsUnchanged(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	m := metrics.New()
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout, WithMetrics(m))
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout, WithMetrics(m))
 
 	if result := c.ApplyResult(context.Background(), "fn", tmpl, "img", nil, nil); result.Err != nil {
 		t.Fatalf("apply 1: %v", result.Err)
@@ -70,7 +69,7 @@ func TestServiceReconcilerMetricsError(t *testing.T) {
 	f.resolveErr["service.js"] = errServiceConverge
 	m := metrics.New()
 
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout, WithMetrics(m))
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout, WithMetrics(m))
 	if result := c.ApplyResult(context.Background(), "fn", tmpl, "img", nil, nil); result.Err == nil {
 		t.Fatal("apply: err = nil, want the resolve failure surfaced")
 	}
@@ -91,7 +90,7 @@ func TestServiceReconcilerMetricsError(t *testing.T) {
 func TestServiceReconcilerMetricsNilRegistryNoPanic(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	if result := c.ApplyResult(context.Background(), "fn", tmpl, "img", nil, nil); result.Err != nil {
 		t.Fatalf("apply: %v", result.Err)
 	}

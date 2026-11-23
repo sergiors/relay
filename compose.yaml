@@ -20,14 +20,15 @@ services:
 
       - DATABASE_URL=postgres://relay:relay@postgres:5432/relay?sslmode=disable
 
-      - TRAEFIK_NETWORK=traefik
       - ROUTING_HOST_OVERRIDE=localhost
+      - SERVICE_BIND_ADDR=172.28.0.1
+      - SERVICE_ADVERTISE_ADDR=172.28.0.1
+      - DISCOVERY_ADDR=:8082
 
       - METRICS_ADDR=:9090
       - GIT_WEBHOOK_ADDR=:8081
 
       - LOG_LEVEL=DEBUG
-
       - HOT_RELOAD=1
 
     volumes:
@@ -36,7 +37,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
 
     networks:
-      - default
+      - runtime
 
     healthcheck:
       test: ["CMD", "relay", "health"]
@@ -50,30 +51,31 @@ services:
     image: traefik:v3.7.13
     restart: unless-stopped
 
+    depends_on:
+      relay:
+        condition: service_healthy
+
     command:
-      - --providers.docker=true
-      - --providers.docker.exposedbydefault=false
+      - --providers.http.endpoint=http://relay:8082/discovery/traefik
+      - --providers.http.pollInterval=5s
+      - --providers.http.pollTimeout=5s
       - --entrypoints.web.address=:80
 
     ports:
       - 80:80
 
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-
     networks:
-      - traefik
-
+      - runtime
 
   redis:
     image: redis:8-alpine
     container_name: redis
 
-    ports:
-      - 6379:6379
-
     volumes:
       - redis-data:/data
+
+    networks:
+      - runtime
 
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -82,13 +84,9 @@ services:
       retries: 5
       start_period: 5s
 
-
   postgres:
     image: postgres:17-alpine
     container_name: postgres
-
-    ports:
-      - 5432:5432
 
     environment:
       - POSTGRES_USER=relay
@@ -98,12 +96,16 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
 
+    networks:
+      - runtime
+
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
       interval: 5s
       timeout: 3s
       retries: 10
       start_period: 5s
+
 
 volumes:
   redis-data:
@@ -112,5 +114,9 @@ volumes:
 
 
 networks:
-  traefik:
-    name: traefik
+  runtime:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1

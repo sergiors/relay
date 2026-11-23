@@ -40,7 +40,6 @@ import (
 	"github.com/moby/moby/client"
 
 	"relay/internal/reconciler"
-	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/state"
 	"relay/internal/testutil"
@@ -204,7 +203,7 @@ func TestIntegrationShutdownServiceCleanupRemovesServiceAndCloseJoinsInFlight(t 
 	})
 
 	svcCtrl := reconciler.NewServiceReconciler(
-		manager, nil, routing.TraefikConfig{}, logger, reconcileTimeout,
+		manager, nil, logger, reconcileTimeout,
 	)
 
 	containerID := createTrappingServiceContainer(t, dcli, labels)
@@ -315,7 +314,7 @@ func TestIntegrationShutdownServiceCleanupSkipsAfterFailedOwnershipProof(t *test
 	t.Cleanup(func() { _ = manager.Close() })
 
 	svcCtrl := reconciler.NewServiceReconciler(
-		manager, nil, routing.TraefikConfig{}, logger, reconcileTimeout,
+		manager, nil, logger, reconcileTimeout,
 	)
 
 	containerID := createTrappingServiceContainer(t, dcli, labels)

@@ -12,7 +12,6 @@ import (
 	"github.com/moby/moby/api/types/container"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
 )
@@ -85,8 +84,7 @@ func TestServiceMarkerLoadIsBoundedAndCancellationAware(t *testing.T) {
 		<-ctx.Done()
 		return ctx.Err()
 	}
-	c := NewServiceReconciler(store, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), budget)
+	c := NewServiceReconciler(store, nil, testutil.DiscardLogger(), budget)
 	tmpl := &app.Template{}
 
 	t.Run("a hung daemon fails at the marker budget", func(t *testing.T) {
@@ -155,8 +153,7 @@ func TestCandidateAdmissionWriteFailureRefusesStart(t *testing.T) {
 		Healthcheck: hc,
 	})
 	newWorker := func() *ServiceReconciler {
-		return NewServiceReconciler(md, nil, routing.TraefikConfig{},
-			testutil.DiscardLogger(), testReconcileTimeout)
+		return NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	}
 
 	// The first pass records the durable failure window normally.
@@ -245,8 +242,7 @@ func TestCandidateFailureWriteFailureKeepsPendingWithoutDurableEligibility(t *te
 		Healthcheck: hc,
 	})
 	newWorker := func() *ServiceReconciler {
-		return NewServiceReconciler(md, nil, routing.TraefikConfig{},
-			testutil.DiscardLogger(), testReconcileTimeout)
+		return NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	}
 	worker := newWorker()
 
@@ -338,8 +334,7 @@ func TestServiceConcurrentPassesShareMarkerInitWithoutBlockingCache(t *testing.T
 			return ctx.Err()
 		}
 	}
-	c := NewServiceReconciler(store, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(store, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	tmpl := &app.Template{}
 
 	firstDone := make(chan ServicePassResult, 1)
@@ -400,8 +395,7 @@ func TestServiceConvergenceStateLoadRetriesAfterFailure(t *testing.T) {
 	md := newMarkerStoreDocker(f)
 	md.failList = true
 	store := &hookMarkerStore{markerStoreDocker: md}
-	c := NewServiceReconciler(store, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(store, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	tmpl := &app.Template{}
 
 	first := c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil, nil)
@@ -424,29 +418,27 @@ func TestServiceConvergenceStateLoadRetriesAfterFailure(t *testing.T) {
 	}
 }
 
-// The preparation admission is written AFTER the deterministic routing-config
+// The preparation admission is written AFTER the deterministic routing-override
 // validation but BEFORE any Docker call of the pre-resolution phase: when that
-// write fails, the pass skips the routing-network check and the source
-// resolution entirely, starts nothing, classifies nothing, and keeps only a
+// write fails, the pass skips the source resolution entirely, starts nothing, classifies nothing, and keeps only a
 // process-local hard window — a restart can never find an admitted attempt that
 // was never durably recorded. Once the store recovers, the very next pass
 // performs the skipped work and converges.
 func TestPreparationAdmissionWriteFailureSkipsPreResolutionAndStart(t *testing.T) {
 	f := newFakeDocker()
 	md := newMarkerStoreDocker(f)
-	traefik := routing.TraefikConfig{Network: "traefik"}
 	hc := testServiceHealthcheck(time.Second)
 	tmpl := serviceTemplate("nodejs24.x", app.Service{
 		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
 		Host: "web.example.com", Healthcheck: hc,
 	})
 	newWorker := func() *ServiceReconciler {
-		return NewServiceReconciler(md, nil, traefik,
+		return NewServiceReconciler(md, nil,
 			testutil.DiscardLogger(), testReconcileTimeout)
 	}
 
 	// Pass 1 (healthy store): the attempt is admitted, then the routed service
-	// converges — exactly one network check and one resolution ran.
+	// converges — one resolution ran and no provider-network check is involved.
 	first := healthApply(t, newWorker(), "fn", tmpl, "img-1")
 	if first.Pending() || !first.Changed {
 		t.Fatalf("first result = %+v, want terminal convergence", first)
@@ -454,8 +446,8 @@ func TestPreparationAdmissionWriteFailureSkipsPreResolutionAndStart(t *testing.T
 	if got := f.resolveCount(); got != 1 {
 		t.Fatalf("resolve calls = %d, want 1", got)
 	}
-	if got := f.networkLookupCount(); got != 1 {
-		t.Fatalf("routing-network lookups = %d, want 1", got)
+	if got := f.networkLookupCount(); got != 0 {
+		t.Fatalf("routing-network lookups = %d, want 0 (routing is provider-driven)", got)
 	}
 	assertPreparationAdmittedThenPruned(t, md, "fn", "service.js")
 	eventsAfterFirst := f.order()
@@ -481,8 +473,8 @@ func TestPreparationAdmissionWriteFailureSkipsPreResolutionAndStart(t *testing.T
 		t.Fatalf("candidates = %+v, want none (the service was skipped before "+
 			"classification)", second.Candidates)
 	}
-	if got := f.networkLookupCount(); got != 1 {
-		t.Fatalf("routing-network lookups = %d, want 1 (no pre-resolution Docker "+
+	if got := f.networkLookupCount(); got != 0 {
+		t.Fatalf("routing-network lookups = %d, want 0 (no pre-resolution Docker "+
 			"work after the failed admission)", got)
 	}
 	if got := f.resolveCount(); got != 1 {
@@ -513,9 +505,8 @@ func TestPreparationAdmissionWriteFailureSkipsPreResolutionAndStart(t *testing.T
 	if got := f.resolveCount(); got != 2 {
 		t.Fatalf("resolve calls = %d, want 2 (work resumes once the admission persists)", got)
 	}
-	if got := f.networkLookupCount(); got != 2 {
-		t.Fatalf("routing-network lookups = %d, want 2 (work resumes once the "+
-			"admission persists)", got)
+	if got := f.networkLookupCount(); got != 0 {
+		t.Fatalf("routing-network lookups = %d, want 0 (routing is provider-driven)", got)
 	}
 	if got := f.order(); !slices.Equal(got, eventsAfterFirst) {
 		t.Fatalf("events = %v, want %v (a converged replica is only verified)",

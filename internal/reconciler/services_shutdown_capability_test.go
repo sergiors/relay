@@ -6,7 +6,6 @@ import (
 
 	"github.com/moby/moby/api/types/container"
 
-	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
 )
@@ -82,7 +81,7 @@ func TestShutdownCleanupSelectsShutdownCapabilityWhenAvailable(t *testing.T) {
 	seedService(f.fakeDocker, "w1-b", "w1")
 	seedService(f.fakeDocker, "w2-a", "w2")
 
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 	own, err := c.DiscoverShutdownContainers(context.Background(), "w1")
 	if err != nil {
@@ -116,7 +115,7 @@ func TestShutdownCleanupFallsBackWithoutCapability(t *testing.T) {
 	f := &ordinaryOnlyDocker{fakeDocker: newFakeDocker()}
 	seedService(f.fakeDocker, "w1-a", "w1")
 
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 	own, err := c.DiscoverShutdownContainers(context.Background(), "w1")
 	if err != nil {

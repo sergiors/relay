@@ -73,7 +73,6 @@ type serviceEndpointPublisher struct {
 	manager  serviceEndpointSource
 	apps     *runner.Registry
 	nodes    nodeLeaseSource
-	traefik  routing.TraefikConfig
 	log      *slog.Logger
 	reporter *registryFailureReporter
 
@@ -104,16 +103,10 @@ func startServiceEndpointPublisher(
 		return nil
 	}
 	r := &serviceEndpointPublisher{
-		st:      st,
-		manager: manager,
-		apps:    apps,
-		nodes:   nodes,
-		traefik: routing.TraefikConfig{
-			Network:      cfg.TraefikNetwork,
-			EntryPoints:  cfg.TraefikEntryPoints,
-			CertResolver: cfg.TraefikCertResolver,
-			Priority:     cfg.TraefikPriority,
-		},
+		st:           st,
+		manager:      manager,
+		apps:         apps,
+		nodes:        nodes,
 		log:          logger,
 		reporter:     nodes.reporter,
 		bindAddr:     cfg.ServiceBindAddr,
@@ -206,11 +199,10 @@ func (r *serviceEndpointPublisher) syncOnce() {
 
 // collectEndpoints builds the exact batch this node may advertise: each
 // Docker-verified committed replica must also match the CURRENT template's
-// route (effective host, path, port, and full Traefik label set). A container
-// left from a superseded template or an earlier host override therefore drops
-// out instead of advertising a stale route. The published host is the effective
-// hostname used by the container's routing labels (see routing.EffectiveHost),
-// so registry consumers and Traefik agree on the advertised name.
+// route (effective host and path). A container left from a superseded template
+// or an earlier host override therefore drops out instead of advertising a
+// stale route. The published host is the effective hostname (see
+// routing.EffectiveHost), so discovery consumers agree on the advertised name.
 func (r *serviceEndpointPublisher) collectEndpoints(
 	ctx context.Context,
 ) ([]state.ServiceRegistryEndpoint, error) {
@@ -227,9 +219,6 @@ func (r *serviceEndpointPublisher) collectEndpoints(
 			app: candidate.App, service: candidate.Service,
 		}]
 		if !ok {
-			continue
-		}
-		if !registryRoutingLabelsMatch(route.labels, candidate.Labels) {
 			continue
 		}
 		key := keyForEndpoint(candidate)
@@ -313,8 +302,6 @@ func (r *serviceEndpointPublisher) desiredRoutes() map[serviceRegistryRouteKey]s
 			routes[serviceRegistryRouteKey{app: name, service: svc.Name}] = serviceRegistryRoute{
 				host: host,
 				path: svc.Path,
-				labels: routing.TraefikLabels(
-					name, svc.Name, host, svc.Path, svc.Port, r.traefik),
 			}
 		}
 	}
@@ -322,29 +309,8 @@ func (r *serviceEndpointPublisher) desiredRoutes() map[serviceRegistryRouteKey]s
 }
 
 type serviceRegistryRoute struct {
-	host   string
-	path   string
-	labels map[string]string
-}
-
-// registryRoutingLabelsMatch mirrors the service reconciler's routing-label
-// comparison: every desired Traefik key/value must match and the container must
-// carry no extra Traefik-owned key. Non-Traefik labels are ignored.
-func registryRoutingLabelsMatch(desired, actual map[string]string) bool {
-	for key, want := range desired {
-		if actual[key] != want {
-			return false
-		}
-	}
-	for key := range actual {
-		if _, ok := desired[key]; ok {
-			continue
-		}
-		if routing.IsTraefikLabel(key) {
-			return false
-		}
-	}
-	return true
+	host string
+	path string
 }
 
 // shutdown stops the publication loop and strictly joins it through the

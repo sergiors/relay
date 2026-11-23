@@ -39,7 +39,7 @@ do not expose this stack to untrusted networks.
   cluster-wide deduplication, publication recovery, and startup catch-up.
 - **Persistent services** — Run APIs, workers, gateways, and other long-running
   processes using managed runtimes or container images, with replicas,
-  health-aware rolling replacement, networking, and optional Traefik routing.
+  health-aware rolling replacement, networking, and optional proxy discovery.
 - **Git-based deployments** — Connect a Git repository, synchronize application
   code, and deploy updates without rebuilding or restarting Relay.
 - **Resource controls** — Per-container memory, CPU, and PID limits for

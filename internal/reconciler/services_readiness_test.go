@@ -10,7 +10,6 @@ import (
 	"github.com/moby/moby/api/types/container"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/testutil"
 )
 
@@ -52,7 +51,7 @@ func TestServiceCoordinatorUnreadyCandidateStaysPendingUntilReady(t *testing.T) 
 		resources:              serviceResources(),
 		ready:                  &notReady,
 	}
-	services := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), time.Minute)
+	services := NewServiceReconciler(f, nil, testutil.DiscardLogger(), time.Minute)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)

@@ -640,28 +640,19 @@ func TestLoadNoLegacyConcurrencyAlias(t *testing.T) {
 	}
 }
 
-// TestLoadTraefikOptionalValues pins the three optional Traefik routing
-// values: all empty/nil when unset (labels omitted; no defaults forced), and
-// passed through as-is when set (including TRAEFIK_PRIORITY to a pointer).
-func TestLoadTraefikOptionalValues(t *testing.T) {
+// TestLoadDiscoveryAddr pins the optional discovery address: empty when unset
+// (no HTTP server) and passed through verbatim when configured.
+func TestLoadDiscoveryAddr(t *testing.T) {
 	setRequiredEnv(t)
 	cfg := mustLoad(t)
-	if cfg.TraefikEntryPoints != "" || cfg.TraefikCertResolver != "" || cfg.TraefikPriority != nil {
-		t.Fatalf("Traefik optional fields = %+v, want zero/nil when unset", cfg)
+	if cfg.DiscoveryAddr != "" {
+		t.Fatalf("DiscoveryAddr = %q, want empty when unset", cfg.DiscoveryAddr)
 	}
 
-	t.Setenv("TRAEFIK_ENTRYPOINTS", "websecure")
-	t.Setenv("TRAEFIK_CERTRESOLVER", "letsencrypt")
-	t.Setenv("TRAEFIK_PRIORITY", "100")
+	t.Setenv("DISCOVERY_ADDR", ":8082")
 	cfg = mustLoad(t)
-	if cfg.TraefikEntryPoints != "websecure" {
-		t.Fatalf("TraefikEntryPoints = %q, want websecure", cfg.TraefikEntryPoints)
-	}
-	if cfg.TraefikCertResolver != "letsencrypt" {
-		t.Fatalf("TraefikCertResolver = %q, want letsencrypt", cfg.TraefikCertResolver)
-	}
-	if cfg.TraefikPriority == nil || *cfg.TraefikPriority != 100 {
-		t.Fatalf("TraefikPriority = %v, want &100", cfg.TraefikPriority)
+	if cfg.DiscoveryAddr != ":8082" {
+		t.Fatalf("DiscoveryAddr = %q, want :8082", cfg.DiscoveryAddr)
 	}
 }
 
@@ -693,60 +684,6 @@ func TestLoadRoutingHostOverride(t *testing.T) {
 	if cfg.RoutingHostOverride != "   " {
 		t.Fatalf("RoutingHostOverride = %q, want the verbatim whitespace value",
 			cfg.RoutingHostOverride)
-	}
-}
-
-// TestParseOptionalPositiveInt pins the ParseOptionalPositiveInt contract:
-// unset/empty/whitespace → (nil, nil) — the "not configured" pointer-nil state;
-// positive ints parse to a pointer; zero, negative, non-numeric, and float
-// values error naming the variable. Load surfaces that error unchanged (no
-// os.Exit); this exported helper is where the validation logic lives.
-func TestParseOptionalPositiveInt(t *testing.T) {
-	tests := []struct {
-		name      string
-		value     string
-		wantNil   bool
-		want      int
-		wantError bool
-	}{
-		{"unset → nil", "", true, 0, false},
-		{"empty → nil", "  ", true, 0, false},
-		{"whitespace → nil", "\t\n ", true, 0, false},
-		{"positive parses to pointer", "100", false, 100, false},
-		{"trimmed positive", " 7 ", false, 7, false},
-		{"zero rejected", "0", true, 0, true},
-		{"negative rejected", "-1", true, 0, true},
-		{"non-numeric rejected", "abc", true, 0, true},
-		{"float rejected", "1.5", true, 0, true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := ParseOptionalPositiveInt("TRAEFIK_PRIORITY", tt.value)
-			if tt.wantError {
-				if err == nil {
-					t.Fatalf("ParseOptionalPositiveInt(%q) = %v, nil; want error", tt.value, got)
-				}
-				if !strings.Contains(err.Error(), "TRAEFIK_PRIORITY") {
-					t.Fatalf("error should name the variable: %v", err)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("ParseOptionalPositiveInt(%q) error: %v", tt.value, err)
-			}
-			if tt.wantNil {
-				if got != nil {
-					t.Fatalf("ParseOptionalPositiveInt(%q) = %v, want nil", tt.value, *got)
-				}
-				return
-			}
-			if got == nil {
-				t.Fatalf("ParseOptionalPositiveInt(%q) = nil, want non-nil pointer", tt.value)
-			}
-			if *got != tt.want {
-				t.Fatalf("ParseOptionalPositiveInt(%q) = %d, want %d", tt.value, *got, tt.want)
-			}
-		})
 	}
 }
 

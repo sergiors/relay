@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
 )
@@ -96,8 +95,7 @@ func TestPreparationRetryWindowResetsAfterSuccessfulPreparation(t *testing.T) {
 		Healthcheck: hc,
 	})
 	newWorker := func() *ServiceReconciler {
-		return NewServiceReconciler(md, nil, routing.TraefikConfig{},
-			testutil.DiscardLogger(), testReconcileTimeout)
+		return NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	}
 	setResolveError := func(err error) {
 		f.mu.Lock()

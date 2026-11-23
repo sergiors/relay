@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
 )
@@ -18,7 +17,7 @@ func TestServiceCoordinatorLeasedRequestHoldsLeaseThroughRun(t *testing.T) {
 		entered: make(chan struct{}, 8),
 		release: make(chan struct{}),
 	}
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -64,7 +63,7 @@ func TestServiceCoordinatorCoalescedRequestReleasesLease(t *testing.T) {
 		entered: make(chan struct{}, 8),
 		release: make(chan struct{}),
 	}
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -116,7 +115,7 @@ func TestServiceCoordinatorCancellationReleasesPendingLease(t *testing.T) {
 		entered: make(chan struct{}, 8),
 		release: make(chan struct{}),
 	}
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)

@@ -9,7 +9,6 @@ import (
 	"github.com/moby/moby/api/types/container"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
 )
@@ -104,7 +103,7 @@ func TestServiceReconcileUnreadySourceCandidateIsNotRestarted(t *testing.T) {
 	tmpl := serviceTemplate("nodejs24.x", app.Service{
 		Name: "service.py", Entrypoint: "service.py", Port: 80, Replicas: 1,
 	})
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	result := c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil, nil)
 	if result.Err != nil {
 		t.Fatalf("apply: %v", result.Err)
@@ -148,7 +147,7 @@ func TestServiceReconcileRestartedUnreadyCandidateRemainsPending(t *testing.T) {
 	tmpl := serviceTemplate("nodejs24.x", app.Service{
 		Name: "service.py", Entrypoint: "service.py", Port: 80, Replicas: 1,
 	})
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	first := c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil, nil)
 	if first.Err != nil || first.Pending() {
 		t.Fatalf("first pass = %+v, want a terminal in-place restart", first)
@@ -216,7 +215,7 @@ func TestServiceReconcileSourceOnlyChangeRestartsInPlace(t *testing.T) {
 	f := newRestartFakeDocker()
 	f.setMountIdentity("service.py", "fp1")
 	tmpl := serviceTemplate("python3.14", app.Service{Name: "svc", Entrypoint: "service.py", Port: 8000, Replicas: 1})
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 	if err := applyServices(t, c, "fn", tmpl, "relay-app-fn:tag"); err != nil {
 		t.Fatalf("initial apply: %v", err)
@@ -276,7 +275,7 @@ func TestServiceReconcileImageChangeStillReplaces(t *testing.T) {
 	f := newRestartFakeDocker()
 	f.setMountIdentity("service.py", "fp1")
 	tmpl := serviceTemplate("python3.14", app.Service{Name: "svc", Entrypoint: "service.py", Port: 8000, Replicas: 1})
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 	if err := applyServices(t, c, "fn", tmpl, "relay-app-fn:v1"); err != nil {
 		t.Fatalf("initial apply: %v", err)
@@ -305,7 +304,7 @@ func TestServiceReconcileConfigChangeStillReplaces(t *testing.T) {
 	f := newRestartFakeDocker()
 	f.setMountIdentity("service.py", "fp1")
 	tmpl := serviceTemplate("python3.14", app.Service{Name: "svc", Entrypoint: "service.py", Port: 8000, Replicas: 1})
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 	if err := applyServices(t, c, "fn", tmpl, "relay-app-fn:tag"); err != nil {
 		t.Fatalf("initial apply: %v", err)
@@ -331,7 +330,7 @@ func TestServiceReconcileRestartFailurePreservesAndRetries(t *testing.T) {
 	f := newRestartFakeDocker()
 	f.setMountIdentity("service.py", "fp1")
 	tmpl := serviceTemplate("python3.14", app.Service{Name: "svc", Entrypoint: "service.py", Port: 8000, Replicas: 1})
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 	if err := applyServices(t, c, "fn", tmpl, "relay-app-fn:tag"); err != nil {
 		t.Fatalf("initial apply: %v", err)

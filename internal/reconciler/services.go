@@ -53,15 +53,14 @@
 //     re-add settles without retiring a live app's images. The runner-side
 //     reference guard remains the second line of defense for a partial
 //     supersession.
-//   - Routing (Traefik) for routed services (a service declaring a host) is
-//     validated before any container action for that service: the routing
-//     config must be present, the optional ROUTING_HOST_OVERRIDE must be a valid
-//     hostname, and the routing network must exist (Relay never creates it); a
-//     routed service failing routing validation is reported and skipped, not
-//     half-reconciled.
+//   - Routing for routed services (a service declaring a host) is validated
+//     before any container action for that service: the optional
+//     ROUTING_HOST_OVERRIDE must be a valid hostname. A routed service failing
+//     routing validation is reported and skipped, not half-reconciled. The
+//     route itself is served by an external provider from the discovery API.
 //   - A source that cannot be resolved (a failed pull, a missing image, an
-//     unlaunchable entrypoint), an unresolvable environment/secret, or a
-//     missing routing network is reported and leaves the existing containers
+//     unlaunchable entrypoint), or an unresolvable environment/secret is
+//     reported and leaves the existing containers
 //     untouched: nothing is stopped or started for that service.
 //   - Reconcile takes the LIFECYCLE context and derives a FRESH normal-operation
 //     bound (the injected reconcileTimeout) for each Docker operation itself. The
@@ -127,10 +126,6 @@ type Docker interface {
 	// RemoveAppServiceContainers stops and removes every service container
 	// belonging to one app, returning how many were removed.
 	RemoveAppServiceContainers(ctx context.Context, fnName string) (int, error)
-	// NetworkExists reports whether a Docker network exists on the daemon. The
-	// service reconciler uses it to refuse routed services whose routing
-	// network is missing; Relay never creates networks.
-	NetworkExists(ctx context.Context, network string) (bool, error)
 }
 
 type serviceStopResult interface {
@@ -472,8 +467,7 @@ type servicePass struct {
 // transient daemon error on one container does not abort convergence of the rest.
 //
 // serviceNetworks is the worker-global Docker network set (NETWORKS) every
-// service container joins, exactly as it applies to execution containers; a
-// routed service additionally joins its routing network (TRAEFIK_NETWORK). The
+// service container joins, exactly as it applies to execution containers. The
 // networks are infrastructure owned OUTSIDE Relay — Relay never creates them —
 // and are normalized into a set (see runtime.NetworkSet), so a container is
 // joined/replaced based on the SET of networks, not the declaration order.
@@ -538,13 +532,12 @@ func Reconcile(
 	preparedEnv []string,
 	serviceNetworks []string,
 	secrets SecretResolver,
-	traefik routing.TraefikConfig,
 	hostOverride string,
 	log *slog.Logger,
 ) (bool, error) {
 	pass, err := reconcileWithObserver(
 		ctx, reconcileTimeout, docker, fnName, tmpl, appImage, preparedEnv,
-		serviceNetworks, "", secrets, traefik, hostOverride, log, "", nil, nil, nil,
+		serviceNetworks, "", secrets, hostOverride, log, "", nil, nil, nil,
 	)
 	if pass.pending && !requestCancelled(ctx, err) {
 		// Pending is reported as ErrServicePending for the direct API. An
@@ -566,7 +559,6 @@ func reconcileWithObserver(
 	serviceNetworks []string,
 	serviceBindAddr string,
 	secrets SecretResolver,
-	traefik routing.TraefikConfig,
 	hostOverride string,
 	log *slog.Logger,
 	nodeID string,
@@ -706,9 +698,8 @@ func reconcileWithObserver(
 	//     candidate readiness contract or Docker-owned attempt state to persist
 	//     for it, so the bounded scheme is deliberately not applied.
 	//
-	//   - Routing CONFIG validation (missing/invalid worker Traefik config, an
-	//     invalid ROUTING_HOST_OVERRIDE) is deterministic for the running
-	//     process: the same inputs always fail until the template or worker
+	//   - Routing validation (an invalid ROUTING_HOST_OVERRIDE) is deterministic
+	//     for the running process: the same inputs always fail until the worker
 	//     config changes, so it stays a terminal per-pass failure rather than
 	//     entering a retry loop that cannot succeed.
 	//
@@ -855,8 +846,7 @@ func reconcileWithObserver(
 			desiredBindAddr = serviceBindAddr
 		}
 		preparationGeneration := servicePreparationIdentity(
-			fnName, tmpl, svc, appImage, serviceNetworks, desiredBindAddr,
-			traefik, hostOverride, sourceMounted)
+			tmpl, svc, appImage, serviceNetworks, desiredBindAddr, sourceMounted)
 		preparationAttempt := 0
 		preparationRetry := svc.Healthcheck != nil && !sourceMounted && stateTracker != nil
 		// preparationAdmittedAt is the start instant of the admission this pass
@@ -1030,28 +1020,17 @@ func reconcileWithObserver(
 			preCtx, preCancel = context.WithTimeout(ctx, reconcileTimeout)
 		}
 
-		// Routing validation runs FIRST, before any classification or stops:
-		// a routed service (one declaring a host) whose routing config is
-		// unusable must be reported and skipped entirely — no stops, no
-		// starts — replacing it half-way would break the existing container
-		// for nothing. The deterministic config checks run before the preparation
-		// admission so a terminal config failure cannot leave an admitted attempt
-		// behind.
-		var routeLabels map[string]string
-		routeNetwork := ""
+		// A routed service (one declaring a host) is validated before any
+		// classification or stops: an invalid worker-wide host override must be
+		// reported and the service skipped entirely — no stops, no starts —
+		// replacing it half-way would break the existing container for nothing.
+		// Routing itself is served by an external provider from the discovery
+		// API, so there is no routing network or provider config to validate here.
 		if svc.Host != "" {
-			if err := traefik.Validate(); err != nil {
-				preCancel()
-				err := fmt.Errorf("service %q: %w", name, err)
-				fail(err)
-				desiredFailed = true
-				log.Warn("Service: routing validation failed", "service", name, "error", err)
-				continue
-			}
 			// The worker-wide override is a single effective hostname, not a
 			// suffix mapping. It is validated with the same hostname contract as
-			// a service host before any network/container work; whitespace-only
-			// means unset.
+			// a service host before any container work; whitespace-only means
+			// unset.
 			if err := routing.ValidateHostOverride(hostOverride); err != nil {
 				preCancel()
 				err := fmt.Errorf("service %q: %w", name, err)
@@ -1066,62 +1045,19 @@ func reconcileWithObserver(
 			continue
 		}
 		if svc.Host != "" {
-			// The routing network (e.g. the Traefik network) is infrastructure
-			// owned outside Relay; Relay verifies it exists and refuses to
-			// start routed containers otherwise — it never creates it.
-			ok, err := docker.NetworkExists(preCtx, traefik.Network)
-			if err != nil {
-				preCancel()
-				err := fmt.Errorf("service %q: check routing network: %w", name, err)
-				fail(err)
-				if !requestCancelled(ctx, err) {
-					log.Warn("Service: routing validation failed", "service", name, "error", err)
-				}
-				if retryPreparation() {
-					continue
-				}
-				desiredFailed = true
-				continue
-			}
-			if !ok {
-				preCancel()
-				err := fmt.Errorf("service %q: %w", name, routing.MissingNetwork(traefik.Network))
-				fail(err)
-				log.Warn("Service: routing validation failed", "service", name, "error", err)
-				if retryPreparation() {
-					continue
-				}
-				desiredFailed = true
-				continue
-			}
 			effectiveHost := routing.EffectiveHost(svc.Host, hostOverride)
-			routeLabels = routing.TraefikLabels(fnName, name, effectiveHost, svc.Path, svc.Port, traefik)
-			routeNetwork = traefik.Network
-			// Optional routing values log only when set, omitting empty
-			// ones; the generated labels themselves are never logged.
-			var attrs []any
+			attrs := []any{
+				"app", fnName,
+				"service", name,
+				"host", effectiveHost,
+			}
 			if svc.Path != "" {
 				attrs = append(attrs, "path", svc.Path)
-			}
-			if traefik.EntryPoints != "" {
-				attrs = append(attrs, "entrypoints", traefik.EntryPoints)
-			}
-			if traefik.CertResolver != "" {
-				attrs = append(attrs, "certresolver", traefik.CertResolver)
-			}
-			if traefik.Priority != nil {
-				attrs = append(attrs, "priority", *traefik.Priority)
 			}
 			if routing.HostOverrideConfigured(hostOverride) {
 				attrs = append(attrs, "host_override", hostOverride)
 			}
-			log.Debug("Service: routing configured",
-				append([]any{
-					"app", fnName,
-					"service", name,
-					"host", effectiveHost,
-					"network", routeNetwork,
-				}, attrs...)...)
+			log.Debug("Service: routing configured", attrs...)
 		}
 
 		// Resolve the source's image BEFORE any container action. A source that
@@ -1246,14 +1182,13 @@ func reconcileWithObserver(
 		desiredHealthcheck := runtime.ServiceHealthcheckLabel(effectiveHealthcheck)
 		// desiredNetworks / desiredNetworkSet is the canonical network set the
 		// container must carry and join: the worker-global NETWORKS set every
-		// service container joins, plus the routing network for a routed
-		// service (none otherwise). Normalizing to a sorted, de-duplicated set
+		// service container joins. Normalizing to a sorted, de-duplicated set
 		// makes the comparison order- and duplicate-invariant, so a
 		// relay.networks label discovered on a container matches whenever the
 		// SET is the same — a reordered or repeated declaration never replaces a
-		// container. A routing-network change (or a global change) makes the
-		// running container stale and replaces it.
-		desiredNetworkSet := runtime.NetworkSet(append(append([]string(nil), serviceNetworks...), routeNetwork))
+		// container. A global network change makes the running container stale
+		// and replaces it.
+		desiredNetworkSet := runtime.NetworkSet(append([]string(nil), serviceNetworks...))
 		desiredNetworks := runtime.NetworksLabel(desiredNetworkSet...)
 
 		// A container is CONVERGED (a keep candidate) only when it is both
@@ -1267,12 +1202,11 @@ func reconcileWithObserver(
 		// env/secret (environment fingerprint mismatch), changed resource
 		// configuration, tmpfs list, network set, mounted source
 		// (relay.source), or an unlabeled legacy container (Replica == -1) — is a
-		// non-converged generation that a converged replacement supersedes. In
-		// addition, the container's labels must match the desired routing label
-		// set exactly: a changed host/path/port leaves
-		// stale Traefik labels pointing traffic at whatever the old container
-		// served, so the container is replaced. SourceRef comparison matters for
-		// an `image` source whose two references resolve to the same bytes: the
+		// non-converged generation that a converged replacement supersedes.
+		// Routing host/path is deliberately NOT part of container identity:
+		// discovery reads it from the current template, so a route change does
+		// not replace a healthy container. SourceRef comparison matters for an
+		// `image` source whose two references resolve to the same bytes: the
 		// container still carries the old relay.identity and must be replaced so
 		// its label reflects the configured source.
 		//
@@ -1292,7 +1226,6 @@ func reconcileWithObserver(
 			sourceRef, resolved.Ref, resolved.ID, svc.Port,
 			environmentFingerprint, resourceHash, desiredTmpfs, desiredNetworks,
 			desiredBindAddr, desiredHealthcheck, desiredSourceID, resolved.Entry,
-			routeLabels,
 		)
 		// configured reports every immutable configuration comparison except
 		// the live source fingerprint and runtime readiness, which the
@@ -1315,8 +1248,7 @@ func reconcileWithObserver(
 				ctr.Tmpfs == desiredTmpfs &&
 				healthcheckMatches &&
 				ctr.Networks == desiredNetworks &&
-				ctr.Replica >= 0 &&
-				routingLabelsMatch(routeLabels, ctr.Labels)
+				ctr.Replica >= 0
 		}
 		// sourceOK accepts a container whose immutable relay.source label
 		// equals the desired fingerprint, OR one already reloaded in place onto
@@ -1379,7 +1311,6 @@ func reconcileWithObserver(
 				Env:                env,
 				Resources:          resources,
 				Tmpfs:              svc.Tmpfs,
-				Labels:             routeLabels,
 				Networks:           desiredNetworkSet,
 				SourceMount:        resolved.Mount,
 				Runtime:            tmpl.Runtime,
@@ -2643,13 +2574,14 @@ func removeStaleSlot(
 // service replica: every input that makes a container config-current. The
 // committed-generation marker compares this value so an active replica whose
 // desired configuration changed is never mistaken for the current active
-// generation. Routing labels are included sorted; nothing secret is part of it.
+// generation. Routing host/path is not part of it: discovery reads routes from
+// the current template, so a route change does not replace a container. Nothing
+// secret is part of it.
 func serviceGenerationIdentity(
 	sourceRef, image, imageID string,
 	port int,
 	environment, resources, tmpfs, networks, bindAddr, healthcheck, sourceID string,
 	entry []string,
-	labels map[string]string,
 ) string {
 	fields := []string{
 		sourceRef,
@@ -2665,46 +2597,36 @@ func serviceGenerationIdentity(
 		sourceID,
 	}
 	fields = append(fields, entry...)
-	return serviceIdentityHash(fields, labels)
+	return serviceIdentityHash(fields)
 }
 
 // servicePreparationIdentity is the generation identity available BEFORE the
 // service's source resolves. It covers every desired input a template or app
 // generation can change at that point: source descriptor, the app image an
 // `entrypoint` service runs (a Git source update changes it while the service
-// template stays byte-identical), port, replica count, routing host/path, the
-// host bind address, the FULL routing configuration identity (the generated
-// Traefik labels, which embed the network, entrypoints, cert resolver, priority,
-// and the effective hostname), the EFFECTIVE probe, tmpfs, resources, runtime,
-// env/secret bindings, and the desired network set. It deliberately excludes
-// the advertised service address, which is presentation metadata and must never
+// template stays byte-identical), port, replica count, the host bind address,
+// the EFFECTIVE probe, tmpfs, resources, runtime, env/secret bindings, and the
+// desired network set. It deliberately excludes routing host/path and the
+// advertised service address: routing is served from discovery and must never
 // replace a container. A new desired generation therefore resets a persisted
-// preparation
-// retry window instead of inheriting an obsolete pre-candidate wait. The resolved
-// image content and resolved secret VALUES are deliberately absent: they cannot be
-// known before preparation succeeds, and the bounded window is capped regardless.
+// preparation retry window instead of inheriting an obsolete pre-candidate
+// wait. The resolved image content and resolved secret VALUES are deliberately
+// absent: they cannot be known before preparation succeeds, and the bounded
+// window is capped regardless.
 //
 // sourceMounted mirrors what ResolveServiceImage is about to report: under
 // HOT_RELOAD Relay's probe is bypassed entirely, so the declared healthcheck is
 // NOT part of the identity (a healthcheck-only edit must not reset the retry
 // window) and the retry policy is the no-probe historical behavior.
 func servicePreparationIdentity(
-	fnName string, tmpl *app.Template, svc app.Service, appImage string,
-	serviceNetworks []string, bindAddr string, traefik routing.TraefikConfig,
-	hostOverride string, sourceMounted bool,
+	tmpl *app.Template, svc app.Service, appImage string,
+	serviceNetworks []string, bindAddr string, sourceMounted bool,
 ) string {
-	routeNetwork := ""
-	if svc.Host != "" {
-		routeNetwork = traefik.Network
-	}
-	networkSet := runtime.NetworkSet(
-		append(append([]string(nil), serviceNetworks...), routeNetwork))
+	networkSet := runtime.NetworkSet(append([]string(nil), serviceNetworks...))
 	fields := []string{
 		svc.SourceRef(),
 		fmt.Sprintf("%d", svc.Port),
 		fmt.Sprintf("%d", svc.Replicas),
-		svc.Host,
-		svc.Path,
 		bindAddr,
 		runtime.ServiceTmpfsLabel(svc.Tmpfs),
 		tmpl.ResourceLimits().Fingerprint(),
@@ -2727,39 +2649,17 @@ func servicePreparationIdentity(
 	for _, sb := range tmpl.SecretList() {
 		fields = append(fields, sb.Name+"="+sb.Ref.String())
 	}
-	// Routing labels exist only for a routed service: an unrouted service never
-	// receives them, regardless of a configured host override. Passing an
-	// override-derived host here would make the preparation identity (and its
-	// retry window) depend on routing configuration that is never applied.
-	var routingLabels map[string]string
-	if svc.Host != "" {
-		routingLabels = routing.TraefikLabels(
-			fnName, svc.Name, routing.EffectiveHost(svc.Host, hostOverride),
-			svc.Path, svc.Port, traefik)
-	}
-	return serviceIdentityHash(fields, routingLabels)
+	return serviceIdentityHash(fields)
 }
 
-// serviceIdentityHash hashes an ordered field list (and, when non-nil, a label
-// map's sorted key/value pairs) into the short identity used by service state.
-// The field order is part of the identity and must stay stable.
-func serviceIdentityHash(fields []string, labels map[string]string) string {
+// serviceIdentityHash hashes an ordered field list into the short identity used
+// by service state. The field order is part of the identity and must stay
+// stable.
+func serviceIdentityHash(fields []string) string {
 	h := sha256.New()
-	write := func(field string) {
+	for _, field := range fields {
 		_, _ = h.Write([]byte(field))
 		_, _ = h.Write([]byte{0})
-	}
-	for _, field := range fields {
-		write(field)
-	}
-	keys := make([]string, 0, len(labels))
-	for key := range labels {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		write(key)
-		write(labels[key])
 	}
 	return hex.EncodeToString(h.Sum(nil))[:runtimeServiceHashLen]
 }
@@ -2798,7 +2698,7 @@ func serviceHealthBackoff(interval time.Duration, attempt int) time.Duration {
 
 // servicePreparationBackoff is the bounded exponential delay for retrying a
 // PREPARATION failure of a healthcheck-enabled service (a source/image,
-// environment/secret, routing-network, or create/start failure before any
+// environment/secret, or create/start failure before any
 // candidate exists). The probe interval is a readiness cadence, not a
 // preparation cadence, so the first retry is never slower than one minute: a
 // short interval keeps its own cadence, while a long interval (up to one hour)
@@ -2980,31 +2880,6 @@ func lowestStaleMatching(
 		}
 	}
 	return best, found
-}
-
-// routingLabelsMatch reports whether a container's actual label set matches the
-// desired routing label set: every desired key/value must be present equal in
-// the actual set, and the actual set must carry NO extra Traefik-owned key
-// (routing.IsTraefikLabel) — stale routing labels from a previous host/config
-// would keep routing old traffic, so they make the container stale. nil-vs-nil
-// (an unrouted service and an unlabeled container) matches. Non-Traefik extra
-// labels (Relay ownership itself, future additions) are ignored here — Relay
-// ownership matching happens via the structured fields above.
-func routingLabelsMatch(desired, actual map[string]string) bool {
-	for k, want := range desired {
-		if actual[k] != want {
-			return false
-		}
-	}
-	for k := range actual {
-		if _, isDesired := desired[k]; isDesired {
-			continue
-		}
-		if routing.IsTraefikLabel(k) {
-			return false
-		}
-	}
-	return true
 }
 
 // RemoveAll stops and removes every service container belonging to fnName,
@@ -4169,11 +4044,11 @@ func (c *ServiceReconciler) PruneServiceConvergenceStates(
 type ServiceReconciler struct {
 	docker  Docker
 	secrets SecretResolver
-	traefik routing.TraefikConfig
-	// hostOverride is the optional worker-wide ROUTING_HOST_OVERRIDE value. It
-	// is generic routing configuration (not a TraefikConfig field): when set, it
-	// replaces the effective hostname of every routed service exactly; when
-	// unset or whitespace-only, each service's declared host is used unchanged.
+	// hostOverride is the optional worker-wide ROUTING_HOST_OVERRIDE value. When
+	// set, it replaces the effective hostname of every routed service exactly;
+	// when unset or whitespace-only, each service's declared host is used
+	// unchanged. Routing itself is served by an external provider from the
+	// discovery API.
 	hostOverride string
 	// networks is the worker-global Docker network set (NETWORKS) every service
 	// container joins, exactly as it applies to execution containers. It is set
@@ -4303,15 +4178,12 @@ func WithNodeID(nodeID string) ServiceReconcilerOption {
 }
 
 // WithHostOverride sets the worker-wide ROUTING_HOST_OVERRIDE value. It is
-// generic routing configuration shared by every routed service, not a
-// Traefik-specific field; whitespace-only values mean "no override".
+// shared by every routed service; whitespace-only values mean "no override".
 func WithHostOverride(override string) ServiceReconcilerOption {
 	return func(c *ServiceReconciler) { c.hostOverride = override }
 }
 
-// NewServiceReconciler builds a ServiceReconciler. traefik is the worker-level
-// Traefik routing config (empty = routing not configured; required only for
-// services whose template declares a host). hostOverride is the optional
+// NewServiceReconciler builds a ServiceReconciler. hostOverride is the optional
 // worker-wide ROUTING_HOST_OVERRIDE passed to Reconcile for every routed
 // service. reconcileTimeout is the worker's normal-service-operation budget,
 // applied by Reconcile to every pre-resolution and post-resolution Docker
@@ -4320,7 +4192,6 @@ func WithHostOverride(override string) ServiceReconcilerOption {
 func NewServiceReconciler(
 	docker Docker,
 	secrets SecretResolver,
-	traefik routing.TraefikConfig,
 	log *slog.Logger,
 	reconcileTimeout time.Duration,
 	opts ...ServiceReconcilerOption,
@@ -4328,7 +4199,6 @@ func NewServiceReconciler(
 	c := &ServiceReconciler{
 		docker:           docker,
 		secrets:          secrets,
-		traefik:          traefik,
 		log:              log,
 		reconcileTimeout: reconcileTimeout,
 		sourceApply:      newSourceApplyTracker(),
@@ -4401,7 +4271,7 @@ func (c *ServiceReconciler) ApplyResult(
 	}
 	pass, err := reconcileWithObserver(
 		ctx, c.reconcileTimeout, c.docker, fnName, tmpl, image, preparedEnv,
-		c.networks, c.serviceBindAddr, c.secrets, c.traefik, c.hostOverride,
+		c.networks, c.serviceBindAddr, c.secrets, c.hostOverride,
 		c.log, c.nodeID, reconcileStarted, c.sourceApply, c,
 	)
 	duration := time.Since(start)

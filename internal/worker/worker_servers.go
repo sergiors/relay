@@ -9,10 +9,12 @@ import (
 	"go.opentelemetry.io/otel/codes"
 
 	"relay/internal/config"
+	"relay/internal/discovery"
 	gitwh "relay/internal/git/webhook"
 	"relay/internal/observability/metrics"
 	"relay/internal/observability/tracing"
 	"relay/internal/runtime"
+	"relay/internal/state"
 )
 
 // startRuntimeSocket opens the worker's live runtime-pool query socket, wires
@@ -131,5 +133,32 @@ func startWebhookServer(
 		run:     server.Stop,
 	})
 	logger.Info("Webhook http server listening", "addr", cfg.GitWebhookAddr)
+	return nil
+}
+
+// startDiscoveryServer starts the optional read-only discovery server. It binds
+// synchronously and fails fast on a taken/unparseable DISCOVERY_ADDR, matching
+// metrics and the webhook server. The server reuses the worker's existing State
+// handle; an unset address disables it entirely. Its teardown step is registered
+// only after a successful Start.
+func startDiscoveryServer(
+	logger *slog.Logger,
+	cfg config.Config,
+	st *state.State,
+	shutdown *shutdownRegistry,
+) error {
+	server := discovery.NewServer(cfg.DiscoveryAddr, st, logger)
+	if server == nil {
+		return nil
+	}
+	if err := server.Start(); err != nil {
+		return fmt.Errorf("discovery server: start failed: %w", err)
+	}
+	shutdown.register(shutdownStep{
+		name:    shutdownStepDiscovery,
+		timeout: shutdownStepTimeout,
+		run:     server.Stop,
+	})
+	logger.Info("Discovery http server listening", "addr", cfg.DiscoveryAddr)
 	return nil
 }

@@ -9,7 +9,6 @@ import (
 	"relay/internal/config"
 	"relay/internal/observability/metrics"
 	"relay/internal/reconciler"
-	"relay/internal/routing"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/secrets"
@@ -37,10 +36,10 @@ import (
 // GC run inside the coordinator's exclusive housekeeping window in the
 // background pass. Startup reconciliation remains the crash-recovery path when
 // shutdown cleanup did not execute. The service reconciler itself decides
-// whether routing applies (only services declaring a host are routed) and
-// validates TRAEFIK_NETWORK per routed service; wiring only forwards the
-// configured value. The same worker-global NETWORKS set applied to execution
-// containers is forwarded too, so every service container joins it.
+// whether a service declares a host (and therefore publishes a route); wiring
+// only forwards the configured host override. The same worker-global NETWORKS
+// set applied to execution containers is forwarded too, so every service
+// container joins it.
 func startServiceConvergence(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -54,12 +53,6 @@ func startServiceConvergence(
 	svcCtrl := reconciler.NewServiceReconciler(
 		manager,
 		secretProvider,
-		routing.TraefikConfig{
-			Network:      cfg.TraefikNetwork,
-			EntryPoints:  cfg.TraefikEntryPoints,
-			CertResolver: cfg.TraefikCertResolver,
-			Priority:     cfg.TraefikPriority,
-		},
 		logger,
 		reconcileTimeout,
 		reconciler.WithMetrics(metricsInstance),

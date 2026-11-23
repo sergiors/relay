@@ -10,7 +10,6 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/reconciler"
-	"relay/internal/routing"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/state"
@@ -145,7 +144,7 @@ func TestPublishStartupAppsRejectsStaleAndKeepsOnlyAcceptedGenerations(t *testin
 	// service declarations but its unavailable placeholder must not enqueue a
 	// service request; the accepted service app is the only one with a service.
 	docker := &svcDeadlineDocker{}
-	serviceReconciler := reconciler.NewServiceReconciler(docker, nil, routing.TraefikConfig{}, discardLogger(), reconcileTimeout)
+	serviceReconciler := reconciler.NewServiceReconciler(docker, nil, discardLogger(), reconcileTimeout)
 	coordinator, stop := startCoordinatorFixture(t, serviceReconciler)
 	defer stop()
 	enqueueStartupServices(context.Background(), published, coordinator, nil, nil, discardLogger())

@@ -9,7 +9,6 @@ import (
 	"github.com/moby/moby/api/types/container"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/testutil"
 )
 
@@ -29,8 +28,7 @@ func healthServiceTemplate(hc *app.ServiceHealthcheck) *app.Template {
 // concludes it exactly once.
 func TestServiceCoordinatorHealthStartupWakeAndNotifyResumesEarly(t *testing.T) {
 	docker := newPendingServiceDocker()
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)
@@ -138,8 +136,7 @@ func TestServiceCoordinatorHealthStartupWakeAndNotifyResumesEarly(t *testing.T) 
 // concludes, proving the wake comes from the pass's own scheduled deadline.
 func TestServiceCoordinatorHealthStartupDeadlineWakesWithoutNotify(t *testing.T) {
 	docker := newPendingServiceDocker()
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)
@@ -209,8 +206,7 @@ func TestServiceCoordinatorHardRetryHoldsAgainstNotifyUntilEligible(t *testing.T
 	hc := testServiceHealthcheck(time.Second)
 	seedConvergedHealthService(f, "old-cand", "fn", "service.js", "img-1",
 		80, 0, hc, container.Unhealthy, 1)
-	services := NewServiceReconciler(md, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), testReconcileTimeout)
+	services := NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)

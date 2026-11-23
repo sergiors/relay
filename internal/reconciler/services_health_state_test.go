@@ -9,7 +9,6 @@ import (
 	"github.com/moby/moby/api/types/container"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
 )
@@ -33,8 +32,7 @@ func TestServiceReconcilerDurableRetrySurvivesRestartAndResetsBackoff(t *testing
 		Healthcheck: hc,
 	})
 	newWorker := func() *ServiceReconciler {
-		return NewServiceReconciler(md, nil, routing.TraefikConfig{},
-			testutil.DiscardLogger(), testReconcileTimeout)
+		return NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	}
 
 	// Pass 1 observes the failure and records eligibility before returning
@@ -137,8 +135,7 @@ func TestServiceReconcilerDurableRetrySurvivesRestartAndResetsBackoff(t *testing
 	if _, ok := md.markerState("fn", "service.js", 0); !ok {
 		t.Fatal("precondition: the marker must exist before removal")
 	}
-	c := NewServiceReconciler(md, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	c.Remove(context.Background(), "fn")
 	if _, ok := md.markerState("fn", "service.js", 0); ok {
 		t.Fatal("marker survived app removal; it must be deleted with the app")
@@ -204,8 +201,7 @@ func TestRecoverServiceHealthCandidatesExcludesCommittedActiveAndHealthy(t *test
 			}); err != nil {
 			t.Fatalf("seed marker: %v", err)
 		}
-		c := NewServiceReconciler(md, nil, routing.TraefikConfig{},
-			testutil.DiscardLogger(), testReconcileTimeout)
+		c := NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 		got, err := c.RecoverServiceHealthCandidates(context.Background())
 		if err != nil {
 			t.Fatalf("recover: %v", err)
@@ -220,8 +216,7 @@ func TestRecoverServiceHealthCandidatesExcludesCommittedActiveAndHealthy(t *test
 	t.Run("historical best effort without a store", func(t *testing.T) {
 		f := newFakeDocker()
 		seed(f)
-		c := NewServiceReconciler(f, nil, routing.TraefikConfig{},
-			testutil.DiscardLogger(), testReconcileTimeout)
+		c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 		got, err := c.RecoverServiceHealthCandidates(context.Background())
 		if err != nil {
 			t.Fatalf("recover: %v", err)
@@ -248,8 +243,7 @@ func TestServiceReconcilerConvergenceStateLoadFailureFailsClosed(t *testing.T) {
 		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
 		Healthcheck: hc,
 	})
-	c := NewServiceReconciler(md, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 	result := c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil, nil)
 	if result.Outcome != ServicePassFailed || result.Err == nil ||
@@ -283,8 +277,7 @@ func TestServiceReconcilerDurableRetryRecoversWhenCandidateDisappeared(t *testin
 		Healthcheck: hc,
 	})
 	newWorker := func() *ServiceReconciler {
-		return NewServiceReconciler(md, nil, routing.TraefikConfig{},
-			testutil.DiscardLogger(), testReconcileTimeout)
+		return NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	}
 
 	// The failure is recorded while the candidate still exists.

@@ -23,7 +23,6 @@ import (
 	"github.com/moby/moby/client"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
@@ -90,7 +89,7 @@ func TestServicesReconcileIntegration(t *testing.T) {
 	// reconciler, so discovery/update converge service containers and removal
 	// stops them (before the images would be retired by the worker's removal
 	// hook, which this test does not wire).
-	svcCtrl := NewServiceReconciler(m, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
+	svcCtrl := NewServiceReconciler(m, nil, logger, testReconcileTimeout)
 	rec := New(
 		Config{
 			Root:     root,
@@ -181,7 +180,7 @@ func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
 
 	reg := &runner.Registry{}
 	reg.Set(nil)
-	svcCtrl := NewServiceReconciler(m, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
+	svcCtrl := NewServiceReconciler(m, nil, logger, testReconcileTimeout)
 
 	// apply builds/prepares the app (through the adapter) and converges its
 	// service containers, so each pass observes the current template's env.
@@ -489,7 +488,7 @@ func TestIntegrationShutdownCleanupNodeScoped(t *testing.T) {
 	// the ordered teardown steps.
 	cancelLifecycle1()
 
-	svcW1 := NewServiceReconciler(m1, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
+	svcW1 := NewServiceReconciler(m1, nil, logger, testReconcileTimeout)
 	n, err := svcW1.ShutdownCleanup(context.Background(), w1host)
 	if err != nil {
 		t.Fatalf("shutdown cleanup w1: %v", err)

@@ -285,9 +285,8 @@ outside those limits.
 ### Docker networks
 
 `NETWORKS` adds optional connectivity for execution and service containers;
-listed networks must already exist. Routed services also require
-`TRAEFIK_NETWORK`. Changing `NETWORKS` requires a worker restart. See
-[Configuration](configuration.md) for networking behavior.
+listed networks must already exist. Changing `NETWORKS` requires a worker
+restart. See [Configuration](configuration.md) for networking behavior.
 
 ### Hot reload
 

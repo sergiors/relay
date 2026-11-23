@@ -10,7 +10,6 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/reconciler"
-	"relay/internal/routing"
 	"relay/internal/runtime"
 )
 
@@ -84,7 +83,7 @@ func (d *deadlineBlockingDocker) recordedDeadlines() []time.Time {
 func TestStartupHousekeepingSweepBoundReleasesExclusive(t *testing.T) {
 	fake := newDeadlineBlockingDocker()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, logger, reconcileTimeout)
 
 	coordinator := reconciler.NewServiceCoordinator(svcCtrl)
 	coordCtx, cancelCoord := context.WithCancel(context.Background())

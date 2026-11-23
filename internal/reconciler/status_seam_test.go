@@ -7,7 +7,6 @@ import (
 	"github.com/moby/moby/api/types/container"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/testutil"
 )
 
@@ -26,7 +25,7 @@ func TestReconcileWithStatusCallbackOrdering(t *testing.T) {
 		entryTmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 		var order []string
-		c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+		c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 		if result := c.ApplyResult(context.Background(), "fn", entryTmpl, "img", nil, func() {
 			order = append(order, "reconciling")
 		}); result.Err != nil {
@@ -42,7 +41,7 @@ func TestReconcileWithStatusCallbackOrdering(t *testing.T) {
 		imgTmpl := serviceTemplate("", app.Service{Name: "nginx:1.27", Image: "nginx:1.27", Port: 80, Replicas: 1})
 
 		var order []string
-		c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+		c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 		if result := c.ApplyResult(context.Background(), "fn", imgTmpl, "img", nil, func() {
 			order = append(order, "reconciling")
 		}); result.Err != nil {
@@ -69,7 +68,7 @@ func TestReconcileWithStatusNoOpVerificationDoesNotNotifyReconciling(t *testing.
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	var reconciling int
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	if result := c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil,
 		func() { reconciling++ },
 	); result.Err != nil {
@@ -88,7 +87,7 @@ func TestReconcileWithStatusCorrectiveStartNotifiesReconciling(t *testing.T) {
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	var reconciling int
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	if result := c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil,
 		func() { reconciling++ },
 	); result.Err != nil {
@@ -114,7 +113,7 @@ func TestReconcileWithStatusRemovedServiceNotifiesReconciling(t *testing.T) {
 	tmpl := serviceTemplate("nodejs24.x") // old.js is no longer desired
 
 	var reconciling int
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	c := NewServiceReconciler(f, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	if result := c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil,
 		func() { reconciling++ },
 	); result.Err != nil {

@@ -163,42 +163,25 @@ type Config struct {
 	MaxEventBytes int
 	// Networks is the NETWORKS value: the ordered, de-duplicated global
 	// workload network set. It applies to both execution containers and
-	// persistent service containers this worker creates (a routed service
-	// additionally joins TraefikNetwork), as one order-independent set. It is
-	// empty (nil) when NETWORKS is unset. The names are parsed once at startup
-	// (see ParseNetworks) and are startup configuration: changing them requires
-	// a worker restart. The networks are infrastructure owned OUTSIDE Relay —
-	// Relay verifies they exist at startup and never creates them.
+	// persistent service containers this worker creates, as one
+	// order-independent set. It is empty (nil) when NETWORKS is unset. The
+	// names are parsed once at startup (see ParseNetworks) and are startup
+	// configuration: changing them requires a worker restart. The networks are
+	// infrastructure owned OUTSIDE Relay — Relay verifies they exist at startup
+	// and never creates them.
 	Networks []string
-	// TraefikNetwork is the optional TRAEFIK_NETWORK value: the Docker network
-	// Traefik is attached to. It is required only when an app's template
-	// service declares a `host` (routed service); Relay never creates the
-	// network itself and verifies it exists on every routed reconcile. Empty
-	// means routing is not configured (unrouted services are unaffected).
-	TraefikNetwork string
-	// TraefikEntryPoints is the optional TRAEFIK_ENTRYPOINTS value: one or
-	// more comma-separated Traefik entrypoint names (e.g. "websecure" or
-	// "web,websecure", passed through verbatim). When set on a routed service
-	// Relay generates the Traefik router `entrypoints` label. Empty = the
-	// label is omitted (no default).
-	TraefikEntryPoints string
-	// TraefikCertResolver is the optional TRAEFIK_CERTRESOLVER value (e.g.
-	// "letsencrypt"): when set on a routed service Relay generates both the
-	// Traefik router `tls=true` and `tls.certresolver` labels. Empty = both
-	// labels are omitted (no default; TLS stays off on the router).
-	TraefikCertResolver string
-	// TraefikPriority is the optional TRAEFIK_PRIORITY value: nil when unset
-	// (the router `priority` label is omitted and Traefik's own default
-	// priority behavior applies; no value is ever defaulted). When provided
-	// it must be a positive integer — an invalid value is a fatal
-	// configuration error — so &0 is never produced.
-	TraefikPriority *int
+	// DiscoveryAddr is the optional DISCOVERY_ADDR value: the listen address of
+	// the read-only HTTP discovery server (e.g. ":8082"). Empty disables the
+	// server entirely, preserving a worker with no extra listener. The server
+	// exposes GET /discovery/traefik for an external Traefik HTTP provider; it
+	// has no authentication, so bind it to a private address or restrict access
+	// at the network boundary. A bind failure is a fatal startup error.
+	DiscoveryAddr string
 	// RoutingHostOverride is the optional ROUTING_HOST_OVERRIDE value: a single
 	// effective hostname used for every routed service. Unset or whitespace-only
 	// leaves each service's declared host unchanged; any other value replaces the
 	// effective route hostname exactly (it is not a suffix mapping). The value is
-	// passed through as-is here and validated by the routing layer (a routing
-	// concern), like the other routing fields.
+	// passed through as-is here and validated by the routing layer.
 	RoutingHostOverride string
 	// ServiceBindAddr is the optional static host IP (SERVICE_BIND_ADDR) on
 	// which routed service containers publish their TCP port. Empty (unset)
@@ -212,10 +195,11 @@ type Config struct {
 	// ServiceAdvertiseAddr is the optional static IP (SERVICE_ADVERTISE_ADDR)
 	// operators and clients should use to reach a published service. It
 	// defaults to ServiceBindAddr when unset, empty, or whitespace-only. It is
-	// presentation metadata only: it never participates in container creation or
-	// reconciliation, so changing it alone does not replace containers. Setting
-	// it without SERVICE_BIND_ADDR is a configuration error (nothing is
-	// published).
+	// discovery/presentation metadata: it never participates in container
+	// creation or reconciliation, so changing it alone does not replace
+	// containers, but it does change the backend addresses in the discovery
+	// response. Setting it without SERVICE_BIND_ADDR is a configuration error
+	// (nothing is published).
 	ServiceAdvertiseAddr string
 	// WarmContainerIdleTimeout is the WARM_CONTAINER_IDLE_TIMEOUT value: how
 	// long a healthy idle warm execution container is kept before the runtime
@@ -366,10 +350,11 @@ const (
 // generated fallback. InstanceID is always a fresh random "instance-<hex>" token
 // unique to this process. The optional variables are read with os.Getenv and
 // stay zero/empty when
-// unset: the metrics and git-webhook addresses (METRICS_ADDR, GIT_WEBHOOK_ADDR)
-// stay "" (no HTTP server), as do the Traefik routing fields and the NETWORKS
-// list, preserving their opt-in semantics through the caller's non-empty
-// guards. The retention windows are the exception to
+// unset: the metrics, git-webhook, and discovery addresses (METRICS_ADDR,
+// GIT_WEBHOOK_ADDR, DISCOVERY_ADDR) stay "" (no HTTP server), as do the
+// NETWORKS list and the routing host override, preserving their opt-in
+// semantics through the caller's non-empty guards. The retention windows are
+// the exception to
 // the "zero when unset" rule: REDIS_STREAM_RETENTION defaults to
 // DefaultStreamRetention (24h), DLQ_RETENTION to DefaultDLQRetention (7
 // days), REDIS_INVOCATION_RETENTION to DefaultInvocationRetention (48h), and
@@ -454,6 +439,7 @@ func Load(logger *slog.Logger) (Config, error) {
 	cfg.StatsRetention = retentionEnv(logger, "STATS_RETENTION", DefaultStatsRetention)
 	cfg.MetricsAddr = getEnv("METRICS_ADDR", "")
 	cfg.GitWebhookAddr = getEnv("GIT_WEBHOOK_ADDR", "")
+	cfg.DiscoveryAddr = getEnv("DISCOVERY_ADDR", "")
 
 	secretsCfg, err := LoadSecretsConfig()
 	if err != nil {
@@ -511,15 +497,6 @@ func Load(logger *slog.Logger) (Config, error) {
 	cfg.MaxEventBytes = maxEventBytes
 
 	cfg.Networks = ParseNetworks(getEnv("NETWORKS", ""))
-	cfg.TraefikNetwork = getEnv("TRAEFIK_NETWORK", "")
-	cfg.TraefikEntryPoints = getEnv("TRAEFIK_ENTRYPOINTS", "")
-	cfg.TraefikCertResolver = getEnv("TRAEFIK_CERTRESOLVER", "")
-
-	priority, err := ParseOptionalPositiveInt("TRAEFIK_PRIORITY", getEnv("TRAEFIK_PRIORITY", ""))
-	if err != nil {
-		return Config{}, err
-	}
-	cfg.TraefikPriority = priority
 
 	cfg.RoutingHostOverride = getEnv("ROUTING_HOST_OVERRIDE", "")
 
@@ -751,24 +728,6 @@ func ParseNetworks(value string) []string {
 		out = append(out, name)
 	}
 	return out
-}
-
-// ParseOptionalPositiveInt parses an optional positive-integer environment
-// value where absence is meaningful: unset/empty/whitespace-only returns
-// (nil, nil) — the pointer-nil "not configured" state — while any provided
-// value must parse as a positive integer (delegating to ParsePositiveInt,
-// whose error names the variable). A nil return is what distinguishes an unset
-// TRAEFIK_PRIORITY style value from &0: Relay never allows 0, but only
-// nil-vs-non-nil can express "no value provided" through a *int config field.
-func ParseOptionalPositiveInt(name, value string) (*int, error) {
-	if strings.TrimSpace(value) == "" {
-		return nil, nil
-	}
-	n, err := ParsePositiveInt(name, value)
-	if err != nil {
-		return nil, err
-	}
-	return &n, nil
 }
 
 // ParseNodeID validates a NODE_ID value into the stable node identity.

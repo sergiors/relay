@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/testutil"
 )
 
@@ -72,8 +71,7 @@ func (d *gatedRemovalDocker) RemoveAppServiceContainers(
 // only after the removal has actually concluded — in that order.
 func TestServiceCoordinatorRemovalSettlementFollowsRemovalWhilePumpStaysFree(t *testing.T) {
 	docker := newGatedRemovalDocker()
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)
@@ -153,8 +151,7 @@ func TestServiceCoordinatorRemovalSupersededByReAddSettlesWithoutRemoving(t *tes
 		entered: make(chan struct{}, 8),
 		release: make(chan struct{}),
 	}
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{},
-		testutil.DiscardLogger(), 0)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), 0)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)

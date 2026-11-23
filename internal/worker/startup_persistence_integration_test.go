@@ -14,7 +14,6 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/reconciler"
-	"relay/internal/routing"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/state"
@@ -351,7 +350,7 @@ func TestStartupServiceReadyLoggedAfterAsyncCompletion(t *testing.T) {
 
 		docker := newGatedStartupDocker()
 		svcCtrl := reconciler.NewServiceReconciler(
-			docker, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+			docker, nil, logger, reconcileTimeout)
 		coordinator, stop := startCoordinatorFixture(t, svcCtrl)
 		defer stop()
 
@@ -409,7 +408,7 @@ func TestStartupServiceReadyLoggedAfterAsyncCompletion(t *testing.T) {
 		docker := newGatedStartupDocker()
 		docker.startErr = errors.New("start exploded")
 		svcCtrl := reconciler.NewServiceReconciler(
-			docker, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+			docker, nil, logger, reconcileTimeout)
 		coordinator, stop := startCoordinatorFixture(t, svcCtrl)
 		defer stop()
 
@@ -484,7 +483,7 @@ func TestStartupEmptyServiceReadinessWaitsForCleanup(t *testing.T) {
 				stopErr: tc.stopErr,
 			}
 			svcCtrl := reconciler.NewServiceReconciler(
-				docker, nil, routing.TraefikConfig{}, logger, reconcileTimeout,
+				docker, nil, logger, reconcileTimeout,
 			)
 			coordinator, stop := startCoordinatorFixture(t, svcCtrl)
 			defer stop()

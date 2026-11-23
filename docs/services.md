@@ -51,17 +51,22 @@ service and adds a new one.
 - `port` (optional) is the internal TCP port the application listens on.
   Default `80`, range `1`–`65535`. Relay injects it as the `PORT` environment
   variable (it cannot be overridden by template env or secrets) and exposes it
-  as container metadata. A routed service's Traefik rule targets this port. When
-  host publication is configured, a routed service also publishes this port on
-  the host; see [Host publication](#host-publication-optional).
+  as container metadata. When host publication is configured, a routed service
+  publishes this port on the host for the routing provider to reach; see
+  [Host publication](#host-publication-optional).
 - `host` (optional) is a hostname (e.g. `api.example.com`) exposing the service
-  through Traefik. Empty/omitted means an unrouted service. Validated as a
-  hostname at parse time.
+  through the routing provider. Empty/omitted means an unrouted service.
+  Validated as a hostname at parse time.
 - `path` (optional) is a URL path prefix (e.g. `/v2`) under which the service is
   exposed on its host. It requires a `host` (`path` alone is rejected). A
   configured path must start with `/`; whitespace, query, fragment, backslash,
-  and empty segments are rejected. It is canonicalized (trailing slashes
-  removed, except `/`), so `/v2` and `/v2/` are the same configured path.
+  and empty segments are rejected, as is a backtick (it would break a proxy
+  rule string). It is canonicalized (trailing slashes
+  removed, except `/`), so `/v2` and `/v2/` are the same configured path. An
+  omitted/empty path is host-only; an explicit `/` is a root prefix and keeps
+  its PathPrefix + StripPrefix behavior. For duplicate-route detection the two
+  are equivalent. Two services in one app may not claim the same effective
+  host and path; that is rejected at parse time.
 - `replicas` (optional) is the desired replica count Relay maintains. Default
   `1`; must be a positive integer. There is **no autoscaling** — the count is
   exactly what the template declares.
@@ -76,15 +81,21 @@ stays internal-only. The address must be a static IPv4 or IPv6 literal; Relay
 does not resolve names, and wildcard, multicast, broadcast, mapped, and
 zone-scoped forms are refused. `SERVICE_ADVERTISE_ADDR` optionally names the
 address operators and clients should use; it defaults to `SERVICE_BIND_ADDR`
-when unset, empty, or whitespace-only. It is display metadata only. See
+when unset, empty, or whitespace-only. It changes the discovery response's
+backend addresses but never replaces a container. See
 [Configuration](configuration.md#service-publication).
 
 Binding to a specific IP selects the interface Docker listens on, but it is not
 complete network isolation: anything able to reach that host address can reach
 the published port. Open the ports in the host firewall and arrange any VPN or
-NAT yourself; Relay does not manage them. A published service may temporarily
-still carry its existing Traefik labels, so both paths can forward to the
-container until you remove them.
+NAT yourself; Relay does not manage them. The discovery API advertises the
+advertise address and each replica's Docker-allocated host port, so the routing
+provider must be able to reach them. If the advertise address differs from the
+bind address, traffic to `advertisedIP:hostPort` must be forwarded or NATed to
+the bound interface and port; advertising a different address does not move the
+Docker-published port. In a multi-node deployment, set each node's bind address
+to that node's host IP and leave the advertise address matching it unless you
+have such routing.
 
 Changing `SERVICE_BIND_ADDR` updates the affected containers through the normal
 start-before-stop replacement. Changing only `SERVICE_ADVERTISE_ADDR` does not
@@ -196,9 +207,9 @@ Docker and does not change Relay's convergence decisions.
 ### Preparation failures versus healthcheck retries
 
 The same bounded exponential retry policy applies to a healthcheck-enabled
-service that fails before a candidate exists: an unavailable routing network, a
-source or image that cannot be resolved, an environment value or secret that
-cannot be resolved, or a create/start error. Relay records the admitted attempt in
+service that fails before a candidate exists: a source or image that cannot be
+resolved, an environment value or secret that cannot be resolved, or a
+create/start error. Relay records the admitted attempt in
 Docker-owned state before preparing, and the next eligible instant when it fails;
 it keeps the existing replicas serving and retries when the window elapses — not
 only on the app's normal reconciliation cadence. The first retry is at most one
@@ -221,12 +232,6 @@ apply: under `HOT_RELOAD` the live source is mounted and Relay's healthcheck is
 bypassed entirely, so the declared probe neither gates a container replacement nor
 drives the preparation retry policy, and a healthcheck-only template edit does not
 reset that retry window.
-
-Deterministic routing-configuration problems — missing or invalid worker
-`TRAEFIK_*` configuration, an invalid `ROUTING_HOST_OVERRIDE`, or an effective
-host that cannot be a valid hostname — are reported as failures but are not
-retried on a backoff: the same configuration can never succeed until the
-template or worker configuration changes.
 
 ## Environment, secrets, resources, networks
 
@@ -262,8 +267,7 @@ covers it with an additional `tmpfs` at the exact path (see below); Relay never
 adds one automatically.
 
 Services use the optional worker-wide `NETWORKS` list for additional
-connectivity; a routed service also requires `TRAEFIK_NETWORK`. These
-operator-managed networks must already exist. See
+connectivity. These operator-managed networks must already exist. See
 [Configuration](configuration.md).
 
 ## Additional writable tmpfs
@@ -301,8 +305,9 @@ before stopping the old container, so a failed update does not take the service
 to zero replicas.
 
 Changing a service's image, environment (including a rotated secret), resources,
-networks, port, host bind address, routing, tmpfs settings, or healthcheck
-updates its containers.
+networks, port, host bind address, tmpfs settings, or healthcheck updates its
+containers. A routing `host`/`path` change does not replace a container: the
+route is read from the current template when discovery builds its response.
 Scaling starts
 or stops only the replicas needed to reach the declared count; there is no
 autoscaling. A crashed replica is recreated during reconciliation. Removing a
@@ -314,26 +319,39 @@ most once per hour per app and image reference. A changed image is adopted
 during reconciliation. Relay never removes external images.
 
 
-## Traefik routing (optional)
+## Routing provider
 
-A service with a `host` is routed through operator-provided Traefik. Set
-`TRAEFIK_NETWORK` to an existing Docker network used by Traefik; Relay does not
-create it. `TRAEFIK_ENTRYPOINTS`, `TRAEFIK_CERTRESOLVER`, and
-`TRAEFIK_PRIORITY` add the corresponding router settings when configured.
-`ROUTING_HOST_OVERRIDE` sets one exact hostname for every routed service instead
-of each service's declared `host`; unset or whitespace-only keeps the declared
-hosts. The override is not a domain suffix: services on different declared hosts
-share the override hostname, so give them distinct `path` values or run separate
-deployments. Without these settings, Relay does not assume a secure entrypoint,
-certificate resolver, or fallback priority.
+Routing is provided by an external proxy. Relay publishes the effective routes
+through the optional discovery API; it does not generate proxy labels or manage
+entrypoints, TLS, or certificate resolvers. Routed service containers no longer
+need to join a proxy network solely for routing: the proxy reaches them through
+their published host ports. The Relay worker container may still join an
+operator-managed private network so the proxy can reach the discovery API (as
+the Compose production example does), and operator `NETWORKS` still apply to
+service containers.
 
-A `path` requires a `host`; Traefik routes requests under that prefix and removes
-the prefix before forwarding them to the service. Changing routing settings
-updates the service container configuration.
+A service with a `host` is published only while this node has a live registry
+lease, the committed replica is running and healthy, and its host port is
+verified. Set `DISCOVERY_ADDR` (for example `:8082`) to enable the read-only
+endpoint `GET /discovery/traefik`. The response groups replicas of the same
+app/service across nodes, strips a `path` prefix before forwarding, and gives
+overlapping prefixes explicit priorities so the longest prefix wins. Distinct
+paths on the same host are valid; if different services claim the same effective
+host and path, every route at that key is omitted and Relay logs the conflict.
 
+The endpoint has no authentication and exposes internal topology. Bind it to a
+private address or restrict access at the network boundary, and configure the
+proxy to poll it. `ROUTING_HOST_OVERRIDE` sets one exact hostname for every
+routed service instead of each service's declared `host`; unset or
+whitespace-only keeps the declared hosts. The override is not a domain suffix:
+services on different declared hosts share the override hostname, so give them
+distinct `path` values or run separate deployments.
+
+See [Configuration](configuration.md#service-routing) for the provider setup and
+[Host publication](#host-publication-optional) for backend reachability.
 
 ## Out of scope
 
-Autoscaling and request-level handler invocation are not implemented. Routing is
-Traefik-only; Relay does not create or manage an ingress proxy of its own, and it
-does not manage host firewalls, VPNs, or NAT for published ports.
+Autoscaling and request-level handler invocation are not implemented. Relay does
+not create or manage an ingress proxy of its own, and it does not manage host
+firewalls, VPNs, or NAT for published ports.

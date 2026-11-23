@@ -7,15 +7,6 @@ import (
 	"github.com/moby/moby/api/types/container"
 
 	"relay/internal/app"
-	"relay/internal/routing"
-)
-
-// Traefik-label helpers used by the routing tests below.
-const (
-	routingEnableKey     = "traefik.enable"
-	routingNetworkKey    = "traefik.docker.network"
-	routingRouterPrefix  = "traefik.http.routers."
-	routingServicePrefix = "traefik.http.services."
 )
 
 // lastStartedFor returns the most recently started fakeContainer for fn/entry.
@@ -41,12 +32,12 @@ func hasTraefikKey(labels map[string]string) bool {
 	return false
 }
 
-// An unrouted service with a zero TraefikConfig reconciles normally: no
-// NetworkExists lookup, no traefik.* labels on the started container.
+// An unrouted service reconciles normally: no routing-network lookup and no
+// provider labels on the started container.
 func TestReconcileUnroutedNoRoutingActivity(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
+	if _, err := reconcile(t, f, "fn", tmpl, "img-1"); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if len(f.networkLookups) != 0 {
@@ -64,24 +55,87 @@ func TestReconcileUnroutedNoRoutingActivity(t *testing.T) {
 	}
 }
 
-// A routed service with an empty TraefikConfig fails validation and performs
-// no container action: no stops, no starts, existing containers left alone.
-func TestReconcileRoutedMissingTraefikConfig(t *testing.T) {
+// A routed service no longer needs a provider network or provider-specific
+// configuration: it starts without routing labels, and its route is published
+// separately by the registry/discovery path.
+func TestReconcileRoutedStartsWithoutProviderLabels(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("nodejs24.x", app.Service{
+		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
+		Host: "service.test", Path: "/v2",
+	})
+	if _, err := reconcile(t, f, "fn", tmpl, "img-1"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(f.networkLookups) != 0 {
+		t.Fatalf("NetworkExists called %d times, want 0 (no provider network)", len(f.networkLookups))
+	}
+	c := f.lastStartedFor("fn", "service.js")
+	if c == nil {
+		t.Fatal("no started container")
+	}
+	if hasTraefikKey(c.labels) {
+		t.Fatalf("routed container labels contain traefik keys: %v", c.labels)
+	}
+	if len(c.networks) != 0 {
+		t.Fatalf("routed container networks = %v, want none", c.networks)
+	}
+}
+
+// A changed route (host or path) is served from the current template and must
+// not replace an otherwise-converged container.
+func TestReconcileRouteChangeDoesNotReplace(t *testing.T) {
+	f := newFakeDocker()
+	start := serviceTemplate("nodejs24.x", app.Service{
+		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
+		Host: "old.example.com", Path: "/v1",
+	})
+	if _, err := reconcile(t, f, "fn", start, "img-1"); err != nil {
+		t.Fatalf("reconcile start: %v", err)
+	}
+	before := f.lastStartedFor("fn", "service.js")
+	if before == nil {
+		t.Fatal("no started container")
+	}
+
+	moved := serviceTemplate("nodejs24.x", app.Service{
+		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
+		Host: "new.example.com", Path: "/v2",
+	})
+	changed, err := reconcile(t, f, "fn", moved, "img-1")
+	if err != nil {
+		t.Fatalf("reconcile moved: %v", err)
+	}
+	if changed {
+		t.Fatal("a routing host/path change must not replace the container")
+	}
+	after := f.lastStartedFor("fn", "service.js")
+	if after == nil || after.id != before.id {
+		t.Fatalf("container replaced: before=%v after=%v", before, after)
+	}
+}
+
+// An invalid ROUTING_HOST_OVERRIDE is refused before any container action.
+func TestReconcileHostOverrideInvalidRefused(t *testing.T) {
 	f := newFakeDocker()
 	f.mu.Lock()
-	f.ctrs["keep-1"] = &fakeContainer{id: "keep-1", appName: "fn", entrypoint: "service.js", image: "img-1", port: 80, replica: 0, state: container.StateRunning}
+	f.ctrs["keep-1"] = &fakeContainer{
+		id: "keep-1", appName: "fn", entrypoint: "service.js",
+		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
+	}
 	f.mu.Unlock()
-	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1, Host: "service.test"})
+	tmpl := serviceTemplate("nodejs24.x", app.Service{
+		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
+		Host: "service.test",
+	})
 
-	_, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{})
+	_, err := reconcileOverride(t, f, "fn", tmpl, "img-1", "-bad")
 	if err == nil {
 		t.Fatal("expected a routing-validation error")
 	}
-	if !strings.Contains(err.Error(), `service "service.js": TRAEFIK_NETWORK is required when Traefik routing is configured`) {
+	if !strings.Contains(err.Error(), `service "service.js"`) ||
+		!strings.Contains(err.Error(), "ROUTING_HOST_OVERRIDE") {
 		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(f.networkLookups) != 0 {
-		t.Fatalf("NetworkExists called, want 0 (validate fails first)")
 	}
 	if len(f.stops) != 0 {
 		t.Fatalf("stops = %v, want none (existing containers left alone)", f.stops)
@@ -91,284 +145,54 @@ func TestReconcileRoutedMissingTraefikConfig(t *testing.T) {
 	}
 }
 
-// A routed service whose configured network does not exist is refused; Relay
-// does NOT create the network (zero StartService calls). The error wraps the
-// routing package's MissingNetwork sentinel so callers can classify it.
-func TestReconcileRoutedMissingNetwork(t *testing.T) {
+// A host-override change is operator routing configuration only: it must not
+// replace a converged container.
+func TestReconcileHostOverrideChangeDoesNotReplace(t *testing.T) {
 	f := newFakeDocker()
-	f.missingNetworks["proxy"] = true
-	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1, Host: "service.test"})
-
-	_, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{Network: "proxy"})
-	if err == nil {
-		t.Fatal("expected a missing-network error")
+	tmpl := serviceTemplate("nodejs24.x", app.Service{
+		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
+		Host: "issuer.example.com",
+	})
+	if _, err := reconcileOverride(t, f, "fn", tmpl, "img-1", "one.test"); err != nil {
+		t.Fatalf("reconcile start: %v", err)
 	}
-	if !strings.Contains(err.Error(), routing.MissingNetwork("proxy").Error()) {
-		t.Fatalf("error %v does not carry the MissingNetwork message", err)
-	}
-	if len(f.networkLookups) != 1 || f.networkLookups[0] != "proxy" {
-		t.Fatalf("networkLookups = %v, want a single [proxy] lookup", f.networkLookups)
-	}
-	if len(f.ctrs) != 0 {
-		t.Fatalf("StartService was called for a missing routing network; want none, ctrs = %v", f.ctrs)
-	}
-	if len(f.stops) != 0 {
-		t.Fatalf("stops = %v, want none", f.stops)
-	}
-}
-
-// A routed service happy path: labels and network reach the started container.
-func TestReconcileRoutedHappyPath(t *testing.T) {
-	f := newFakeDocker()
-	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "service.test"})
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	c := f.lastStartedFor("fn", "service.js")
-	if c == nil {
+	before := f.lastStartedFor("fn", "service.js")
+	if before == nil {
 		t.Fatal("no started container")
 	}
-	if c.labels[routingEnableKey] != "true" {
-		t.Fatalf("traefik.enable = %q, want true", c.labels[routingEnableKey])
+
+	changed, err := reconcileOverride(t, f, "fn", tmpl, "img-1", "two.test")
+	if err != nil {
+		t.Fatalf("reconcile override change: %v", err)
 	}
-	if c.labels[routingNetworkKey] != "proxy" {
-		t.Fatalf("traefik.docker.network = %q, want proxy", c.labels[routingNetworkKey])
+	if changed {
+		t.Fatal("a host-override change must not replace the container")
 	}
-	id := routing.ServiceProviderID("fn", "service.js") // relay-<fn>-<identity>-<hash>
-	wantRule := "Host(`service.test`)"
-	if c.labels[routingRouterPrefix+id+".rule"] != wantRule {
-		t.Fatalf("router rule = %q, want %q", c.labels[routingRouterPrefix+id+".rule"], wantRule)
-	}
-	if _, ok := c.labels[routingServicePrefix+id+".loadbalancer.server.port"]; !ok {
-		t.Fatalf("loadbalancer port label missing in %v", c.labels)
-	}
-	if len(c.networks) != 1 || c.networks[0] != "proxy" {
-		t.Fatalf("started networks = %v, want [proxy]", c.networks)
-	}
-	if len(f.networkLookups) != 1 || f.networkLookups[0] != "proxy" {
-		t.Fatalf("networkLookups = %v, want [proxy]", f.networkLookups)
-	}
-	// Network-only config: no optional HTTPS labels at all.
-	for k := range c.labels {
-		if strings.Contains(k, ".entrypoints") || strings.HasSuffix(k, ".tls") ||
-			strings.Contains(k, "certresolver") || strings.Contains(k, ".priority") {
-			t.Fatalf("network-only routed container has optional label %s: %v", k, c.labels)
-		}
+	after := f.lastStartedFor("fn", "service.js")
+	if after == nil || after.id != before.id {
+		t.Fatalf("container replaced: before=%v after=%v", before, after)
 	}
 }
 
-// A routed service under a full HTTPS Traefik config: the started container
-// carries the four base labels PLUS all four optional ones on the same id.
-func TestReconcileRoutedFullHTTPSConfig(t *testing.T) {
+// A routed (host + path) service converges like any other: a second pass over
+// an unchanged routed template is a no-op — no stops, no starts, the same
+// container kept.
+func TestReconcileRoutedConvergedIsNoOp(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "service.test"})
-	cfg := routing.TraefikConfig{Network: "proxy", EntryPoints: "websecure", CertResolver: "letsencrypt", Priority: intPtr(100)}
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", cfg); err != nil {
+	tmpl := serviceTemplate("nodejs24.x", app.Service{
+		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
+		Host: "service.test", Path: "/v2",
+	})
+	if _, err := reconcile(t, f, "fn", tmpl, "img-1"); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	c := f.lastStartedFor("fn", "service.js")
-	if c == nil {
+	first := f.lastStartedFor("fn", "service.js")
+	if first == nil {
 		t.Fatal("no started container")
-	}
-	if len(c.networks) != 1 || c.networks[0] != "proxy" {
-		t.Fatalf("networks = %v, want [proxy]", c.networks)
-	}
-	id := routing.ServiceProviderID("fn", "service.js")
-	want := map[string]string{
-		routingEnableKey:                   "true",
-		routingNetworkKey:                  "proxy",
-		routingRouterPrefix + id + ".rule": "Host(`service.test`)",
-		"traefik.http.services." + id + ".loadbalancer.server.port": "3000",
-		routingRouterPrefix + id + ".entrypoints":                   "websecure",
-		routingRouterPrefix + id + ".tls":                           "true",
-		routingRouterPrefix + id + ".tls.certresolver":              "letsencrypt",
-		routingRouterPrefix + id + ".priority":                      "100",
-	}
-	if len(c.labels) != len(want) {
-		t.Fatalf("labels = %v (%d), want %d keys", c.labels, len(c.labels), len(want))
-	}
-	for k, v := range want {
-		if c.labels[k] != v {
-			t.Fatalf("label %q = %q, want %q (all: %v)", k, c.labels[k], v, c.labels)
-		}
-	}
-}
-
-// Changing any routing option replaces the routed container. Here the
-// certresolver (and thus both tls labels) is cleared: the old container is
-// stopped and the replacement carries NO tls/tls.certresolver labels.
-func TestReconcileCertResolverClearedReplacesWithoutTLS(t *testing.T) {
-	f := newFakeDocker()
-	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test"})
-	start := routing.TraefikConfig{Network: "proxy", EntryPoints: "websecure", CertResolver: "letsencrypt", Priority: intPtr(100)}
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", start); err != nil {
-		t.Fatalf("reconcile https: %v", err)
-	}
-
-	cleared := routing.TraefikConfig{Network: "proxy", EntryPoints: "websecure", Priority: intPtr(100)}
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", cleared); err != nil {
-		t.Fatalf("reconcile cleared: %v", err)
-	}
-	if len(f.stops) != 1 {
-		t.Fatalf("stops = %v, want one replaced container", f.stops)
-	}
-	c := f.lastStartedFor("fn", "service.js")
-	if c == nil {
-		t.Fatal("no replacement container")
-	}
-	id := routing.ServiceProviderID("fn", "service.js")
-	for _, k := range []string{routingRouterPrefix + id + ".tls", routingRouterPrefix + id + ".tls.certresolver"} {
-		if _, ok := c.labels[k]; ok {
-			t.Fatalf("replacement label %s present after clearing certresolver: %v", k, c.labels)
-		}
-	}
-	if c.labels[routingRouterPrefix+id+".entrypoints"] != "websecure" {
-		t.Fatalf("replacement entrypoints = %q, want websecure (still set)", c.labels[routingRouterPrefix+id+".entrypoints"])
-	}
-	if c.labels[routingRouterPrefix+id+".priority"] != "100" {
-		t.Fatalf("replacement priority = %q, want 100 (still set)", c.labels[routingRouterPrefix+id+".priority"])
-	}
-}
-
-// Clearing the priority (nil) also replaces the routed container: the
-// replacement carries NO priority label while entrypoints stays.
-func TestReconcilePriorityClearedReplacesWithoutPriority(t *testing.T) {
-	f := newFakeDocker()
-	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test"})
-	start := routing.TraefikConfig{Network: "proxy", EntryPoints: "websecure", Priority: intPtr(42)}
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", start); err != nil {
-		t.Fatalf("reconcile priority: %v", err)
-	}
-
-	cleared := routing.TraefikConfig{Network: "proxy", EntryPoints: "websecure"}
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", cleared); err != nil {
-		t.Fatalf("reconcile cleared: %v", err)
-	}
-	if len(f.stops) != 1 {
-		t.Fatalf("stops = %v, want one replaced container", f.stops)
-	}
-	c := f.lastStartedFor("fn", "service.js")
-	if c == nil {
-		t.Fatal("no replacement container")
-	}
-	if _, ok := c.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "service.js")+".priority"]; ok {
-		t.Fatalf("replacement priority label present after clearing priority: %v", c.labels)
-	}
-	if c.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "service.js")+".entrypoints"] != "websecure" {
-		t.Fatalf("replacement entrypoints = %q, want websecure", c.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "service.js")+".entrypoints"])
-	}
-}
-
-// Unrouted service with all HTTPS config values set: still no traefik labels
-// and no network lookup.
-func TestReconcileUnroutedWithHTTPSConfigNoRouting(t *testing.T) {
-	f := newFakeDocker()
-	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
-	cfg := routing.TraefikConfig{Network: "proxy", EntryPoints: "websecure", CertResolver: "letsencrypt", Priority: intPtr(100)}
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", cfg); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	if len(f.networkLookups) != 0 {
-		t.Fatalf("NetworkExists called for an unrouted service, want 0")
-	}
-	c := f.lastStartedFor("fn", "service.js")
-	if c == nil {
-		t.Fatal("no started container")
-	}
-	if hasTraefikKey(c.labels) {
-		t.Fatalf("unrouted container labels contain traefik keys: %v", c.labels)
-	}
-	if len(c.networks) != 0 {
-		t.Fatalf("networks = %v, want none", c.networks)
-	}
-}
-
-func intPtr(i int) *int { return &i }
-
-// A host change (a.test -> b.test) replaces the existing routed container: the
-// old one is stopped and the replacement carries the new rule.
-func TestReconcileHostChangeReplaces(t *testing.T) {
-	f := newFakeDocker()
-	start := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test"})
-	if _, err := reconcile(t, f, "fn", start, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
-		t.Fatalf("reconcile a.test: %v", err)
-	}
-
-	changed := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "b.test"})
-	if _, err := reconcile(t, f, "fn", changed, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
-		t.Fatalf("reconcile b.test: %v", err)
-	}
-	if len(f.stops) != 1 {
-		t.Fatalf("stops = %v, want one replaced container", f.stops)
-	}
-	c := f.lastStartedFor("fn", "service.js")
-	if c == nil {
-		t.Fatal("no replacement container")
-	}
-	id := routing.ServiceProviderID("fn", "service.js")
-	if c.labels[routingRouterPrefix+id+".rule"] != "Host(`b.test`)" {
-		t.Fatalf("replacement rule = %q, want Host(`b.test`)", c.labels[routingRouterPrefix+id+".rule"])
-	}
-}
-
-// A TRAEFIK_NETWORK change also replaces the routed container.
-func TestReconcileNetworkChangeReplaces(t *testing.T) {
-	f := newFakeDocker()
-	start := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test"})
-	if _, err := reconcile(t, f, "fn", start, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
-		t.Fatalf("reconcile proxy: %v", err)
-	}
-	if _, err := reconcile(t, f, "fn", start, "img-1", routing.TraefikConfig{Network: "proxy2"}); err != nil {
-		t.Fatalf("reconcile proxy2: %v", err)
-	}
-	if len(f.stops) != 1 {
-		t.Fatalf("stops = %v, want one replaced container", f.stops)
-	}
-	c := f.lastStartedFor("fn", "service.js")
-	if c == nil || len(c.networks) != 1 || c.networks[0] != "proxy2" || c.labels[routingNetworkKey] != "proxy2" {
-		t.Fatalf("replacement container = %+v, want network/labels proxy2", c)
-	}
-}
-
-// A HOST removed from a routed template makes the previously routed container
-// stale: it is replaced with an unlabeled (no traefik.*) container and it no
-// longer joins the routing network.
-func TestReconcileHostRemovedReplacesUnrouted(t *testing.T) {
-	f := newFakeDocker()
-	routed := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test"})
-	if _, err := reconcile(t, f, "fn", routed, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
-		t.Fatalf("reconcile routed: %v", err)
-	}
-
-	unrouted := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 3000, Replicas: 1})
-	if _, err := reconcile(t, f, "fn", unrouted, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
-		t.Fatalf("reconcile unrouted: %v", err)
-	}
-	if len(f.stops) != 1 {
-		t.Fatalf("stops = %v, want the routed container replaced", f.stops)
-	}
-	c := f.lastStartedFor("fn", "service.js")
-	if c == nil {
-		t.Fatal("no replacement container")
-	}
-	if hasTraefikKey(c.labels) {
-		t.Fatalf("replacement labels contain traefik keys: %v", c.labels)
-	}
-	if len(c.networks) != 0 {
-		t.Fatalf("replacement networks = %v, want none", c.networks)
-	}
-}
-
-// A converged ROUTED state (running container with matching labels) is a no-op
-// pass: changed == false, no stops, no starts.
-func TestReconcileRoutedConvergedNoOp(t *testing.T) {
-	f := newFakeDocker()
-	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test"})
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
-		t.Fatalf("reconcile: %v", err)
 	}
 	stopsSoFar := len(f.stops)
-	changed, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{Network: "proxy"})
+
+	changed, err := reconcile(t, f, "fn", tmpl, "img-1")
 	if err != nil {
 		t.Fatalf("reconcile 2: %v", err)
 	}
@@ -376,436 +200,38 @@ func TestReconcileRoutedConvergedNoOp(t *testing.T) {
 		t.Fatal("converged routed state must be a no-op (changed = false)")
 	}
 	if len(f.stops) != stopsSoFar {
-		t.Fatalf("stops grew from %d to %d on a converged pass", stopsSoFar, len(f.stops))
+		t.Fatalf("stops grew from %d to %d on a converged routed pass",
+			stopsSoFar, len(f.stops))
+	}
+	second := f.lastStartedFor("fn", "service.js")
+	if second == nil || second.id != first.id {
+		t.Fatalf("container replaced: first=%v second=%v", first, second)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 1 {
 		t.Fatalf("running = %d, want 1 (untouched)", got)
 	}
 }
 
-// routingLabelsMatch unit tests pin the nil-vs-nil and extra-traefik-key rules.
-func TestRoutingLabelsMatch(t *testing.T) {
-	if !routingLabelsMatch(nil, nil) {
-		t.Error("nil-vs-nil must match (unrouted, unlabeled)")
-	}
-	desired := map[string]string{"traefik.enable": "true", "traefik.docker.network": "proxy"}
-	if !routingLabelsMatch(desired, map[string]string{
-		"relay.type":             "service",
-		"relay.app":              "fn",
-		"traefik.enable":         "true",
-		"traefik.docker.network": "proxy",
-	}) {
-		t.Error("actual with all desired keys plus non-traefik extras must match")
-	}
-	if routingLabelsMatch(desired, map[string]string{"traefik.enable": "false"}) {
-		t.Error("wrong desired value must not match")
-	}
-	if routingLabelsMatch(nil, map[string]string{"traefik.enable": "true"}) {
-		t.Error("a container with traefik labels must never match an unrouted service")
-	}
-	if routingLabelsMatch(desired, map[string]string{"traefik.enable": "true", "traefik.docker.network": "proxy", "traefik.http.routers.old.rule": "Host(`old.test`)"}) {
-		t.Error("a stale extra traefik key must not match")
-	}
-	// The desired nil actual case: routed service, container without the labels.
-	if routingLabelsMatch(map[string]string{"traefik.enable": "true"}, nil) {
-		t.Error("routed desired vs unlabeled container must not match")
-	}
-}
-
-// A routed service with a path reaches the started container with the exact
-// PathPrefix rule and the StripPrefix middleware referenced by the router.
-func TestReconcileRoutedPathLabels(t *testing.T) {
-	f := newFakeDocker()
-	tmpl := serviceTemplate("nodejs24.x", app.Service{
-		Name:       "service.js",
-		Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "service.test", Path: "/v2",
-	})
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	c := f.lastStartedFor("fn", "service.js")
-	if c == nil {
-		t.Fatal("no started container")
-	}
-	id := routing.ServiceProviderID("fn", "service.js")
-	mw := routing.PathMiddlewareID("fn", "service.js")
-	if got := c.labels[routingRouterPrefix+id+".rule"]; got != "Host(`service.test`) && PathPrefix(`/v2`)" {
-		t.Fatalf("rule = %q", got)
-	}
-	if got := c.labels[routingRouterPrefix+id+".middlewares"]; got != mw {
-		t.Fatalf("middlewares = %q, want %q", got, mw)
-	}
-	if got := c.labels["traefik.http.middlewares."+mw+".stripprefix.prefixes"]; got != "/v2" {
-		t.Fatalf("stripprefix.prefixes = %q, want /v2", got)
-	}
-}
-
-// Two services on the same host with different paths start with distinct router
-// and middleware labels (no collision).
-func TestReconcileSameHostDifferentPathsDistinct(t *testing.T) {
-	f := newFakeDocker()
-	tmpl := serviceTemplate("nodejs24.x",
-		app.Service{Name: "v1.js", Entrypoint: "v1.js", Port: 3000, Replicas: 1, Host: "same.test", Path: "/v1"},
-		app.Service{Name: "v2.js", Entrypoint: "v2.js", Port: 3000, Replicas: 1, Host: "same.test", Path: "/v2"},
-	)
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	v1 := f.lastStartedFor("fn", "v1.js")
-	v2 := f.lastStartedFor("fn", "v2.js")
-	if v1 == nil || v2 == nil {
-		t.Fatal("expected both containers started")
-	}
-	v1id := routing.ServiceProviderID("fn", "v1.js")
-	v2id := routing.ServiceProviderID("fn", "v2.js")
-	if v1.labels[routingRouterPrefix+v1id+".rule"] != "Host(`same.test`) && PathPrefix(`/v1`)" {
-		t.Fatalf("v1 rule = %q", v1.labels[routingRouterPrefix+v1id+".rule"])
-	}
-	if v2.labels[routingRouterPrefix+v2id+".rule"] != "Host(`same.test`) && PathPrefix(`/v2`)" {
-		t.Fatalf("v2 rule = %q", v2.labels[routingRouterPrefix+v2id+".rule"])
-	}
-	v1mw := v1.labels[routingRouterPrefix+v1id+".middlewares"]
-	v2mw := v2.labels[routingRouterPrefix+v2id+".middlewares"]
-	if v1mw == "" || v1mw == v2mw {
-		t.Fatalf("same-host services must not share a middleware name: %q vs %q", v1mw, v2mw)
-	}
-}
-
-// Changing a service path makes the running container stale: it is stopped and
-// replaced with one carrying the new PathPrefix rule and middleware.
-func TestReconcilePathChangeReplaces(t *testing.T) {
-	f := newFakeDocker()
-	start := serviceTemplate("nodejs24.x", app.Service{
-		Name:       "service.js",
-		Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test", Path: "/v1",
-	})
-	if _, err := reconcile(t, f, "fn", start, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
-		t.Fatalf("reconcile v1: %v", err)
-	}
-
-	changed := serviceTemplate("nodejs24.x", app.Service{
-		Name:       "service.js",
-		Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test", Path: "/v2",
-	})
-	if _, err := reconcile(t, f, "fn", changed, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
-		t.Fatalf("reconcile v2: %v", err)
-	}
-	if len(f.stops) != 1 {
-		t.Fatalf("stops = %v, want one replaced container", f.stops)
-	}
-	c := f.lastStartedFor("fn", "service.js")
-	if c == nil {
-		t.Fatal("no replacement container")
-	}
-	id := routing.ServiceProviderID("fn", "service.js")
-	if got := c.labels[routingRouterPrefix+id+".rule"]; got != "Host(`a.test`) && PathPrefix(`/v2`)" {
-		t.Fatalf("replacement rule = %q", got)
-	}
-	if got := c.labels["traefik.http.middlewares."+routing.PathMiddlewareID("fn", "service.js")+".stripprefix.prefixes"]; got != "/v2" {
-		t.Fatalf("replacement stripprefix = %q", got)
-	}
-}
-
-// Removing a path (back to host-only) makes the path-routed container stale: it
-// is replaced with the legacy host-only label set and no middleware labels.
-func TestReconcilePathRemovedReplacesWithoutMiddleware(t *testing.T) {
-	f := newFakeDocker()
-	routed := serviceTemplate("nodejs24.x", app.Service{
-		Name:       "service.js",
-		Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test", Path: "/v2",
-	})
-	if _, err := reconcile(t, f, "fn", routed, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
-		t.Fatalf("reconcile path: %v", err)
-	}
-
-	hostOnly := serviceTemplate("nodejs24.x", app.Service{
-		Name:       "service.js",
-		Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test",
-	})
-	if _, err := reconcile(t, f, "fn", hostOnly, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
-		t.Fatalf("reconcile host-only: %v", err)
-	}
-	if len(f.stops) != 1 {
-		t.Fatalf("stops = %v, want the path-routed container replaced", f.stops)
-	}
-	c := f.lastStartedFor("fn", "service.js")
-	if c == nil {
-		t.Fatal("no replacement container")
-	}
-	id := routing.ServiceProviderID("fn", "service.js")
-	if got := c.labels[routingRouterPrefix+id+".rule"]; got != "Host(`a.test`)" {
-		t.Fatalf("replacement host-only rule = %q", got)
-	}
-	for k := range c.labels {
-		if strings.Contains(k, "middlewares") || strings.Contains(k, "stripprefix") {
-			t.Fatalf("host-only replacement must carry no middleware labels: %v", c.labels)
-		}
-	}
-}
-
-// A converged path-routed state is a no-op: identical path labels keep the
-// container (no churn).
-func TestReconcilePathConvergedNoOp(t *testing.T) {
-	f := newFakeDocker()
-	tmpl := serviceTemplate("nodejs24.x", app.Service{
-		Name:       "service.js",
-		Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test", Path: "/v2",
-	})
-	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	stopsSoFar := len(f.stops)
-	changed, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{Network: "proxy"})
-	if err != nil {
-		t.Fatalf("reconcile 2: %v", err)
-	}
-	if changed {
-		t.Fatal("converged path-routed state must be a no-op (changed = false)")
-	}
-	if len(f.stops) != stopsSoFar {
-		t.Fatalf("stops grew from %d to %d on a converged pass", stopsSoFar, len(f.stops))
-	}
-}
-
-// A host override replaces the declared host with the EXACT override hostname
-// in the started container's rule while the network, id, and (for a path
-// service) the StripPrefix labels are unchanged. The template's declared host
-// is never mutated.
-func TestReconcileHostOverrideMapsRule(t *testing.T) {
-	f := newFakeDocker()
-	tmpl := serviceTemplate("nodejs24.x", app.Service{
-		Name:       "service.js",
-		Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "issuer.example.com", Path: "/v2",
-	})
-	cfg := routing.TraefikConfig{Network: "proxy"}
-	if _, err := reconcileOverride(t, f, "fn", tmpl, "img-1", cfg, "localhost"); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	c := f.lastStartedFor("fn", "service.js")
-	if c == nil {
-		t.Fatal("no started container")
-	}
-	id := routing.ServiceProviderID("fn", "service.js")
-	if got := c.labels[routingRouterPrefix+id+".rule"]; got != "Host(`localhost`) && PathPrefix(`/v2`)" {
-		t.Fatalf("rule = %q, want Host(`localhost`) && PathPrefix(`/v2`) "+
-			"(exact full-host replacement)", got)
-	}
-	if got := c.labels["traefik.http.middlewares."+routing.PathMiddlewareID("fn", "service.js")+".stripprefix.prefixes"]; got != "/v2" {
-		t.Fatalf("stripprefix = %q, want /v2 (unchanged)", got)
-	}
-	if c.labels[routingNetworkKey] != "proxy" || len(c.networks) != 1 || c.networks[0] != "proxy" {
-		t.Fatalf("network = labels %q / spec %v, want proxy", c.labels[routingNetworkKey], c.networks)
-	}
-	// The template host is untouched.
-	if tmpl.Services[0].Host != "issuer.example.com" {
-		t.Fatalf("template host mutated to %q", tmpl.Services[0].Host)
-	}
-}
-
-// The override is an EXACT full-host replacement: every routed service's rule
-// names the same override hostname, while the name-keyed router/service ids
-// keep the services distinct.
-func TestReconcileHostOverrideExactReplacement(t *testing.T) {
-	f := newFakeDocker()
-	tmpl := serviceTemplate("nodejs24.x",
-		app.Service{Name: "issuer.js", Entrypoint: "issuer.js", Port: 3000, Replicas: 1, Host: "issuer.example.com"},
-		app.Service{Name: "admin.js", Entrypoint: "admin.js", Port: 3000, Replicas: 1, Host: "admin.example.com"},
-	)
-	cfg := routing.TraefikConfig{Network: "proxy"}
-	if _, err := reconcileOverride(t, f, "fn", tmpl, "img-1", cfg,
-		"portal.internal.test"); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	issuer := f.lastStartedFor("fn", "issuer.js")
-	admin := f.lastStartedFor("fn", "admin.js")
-	if issuer == nil || admin == nil {
-		t.Fatal("expected both containers started")
-	}
-	if got := issuer.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "issuer.js")+".rule"]; got != "Host(`portal.internal.test`)" {
-		t.Fatalf("issuer rule = %q, want the exact override hostname", got)
-	}
-	if got := admin.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "admin.js")+".rule"]; got != "Host(`portal.internal.test`)" {
-		t.Fatalf("admin rule = %q, want the exact override hostname", got)
-	}
-	if routing.ServiceProviderID("fn", "issuer.js") ==
-		routing.ServiceProviderID("fn", "admin.js") {
-		t.Fatal("distinct services must keep distinct name-keyed router ids")
-	}
-}
-
-// Changing only the override replaces the routed container (its old labels
-// point at the wrong host) while reusing the SAME prepared image: the route
-// update never triggers an image rebuild.
-func TestReconcileHostOverrideChangeReplaces(t *testing.T) {
-	f := newFakeDocker()
-	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test"})
-	if _, err := reconcileOverride(t, f, "fn", tmpl, "img-1",
-		routing.TraefikConfig{Network: "proxy"}, ""); err != nil {
-		t.Fatalf("reconcile no override: %v", err)
-	}
-	first := f.lastStartedFor("fn", "service.js")
-	if first == nil || first.image != "img-1" {
-		t.Fatalf("initial container = %+v, want the prepared img-1", first)
-	}
-	if _, err := reconcileOverride(t, f, "fn", tmpl, "img-1",
-		routing.TraefikConfig{Network: "proxy"}, "ov.test"); err != nil {
-		t.Fatalf("reconcile override: %v", err)
-	}
-	if len(f.stops) != 1 {
-		t.Fatalf("stops = %v, want one replaced container", f.stops)
-	}
-	c := f.lastStartedFor("fn", "service.js")
-	if c == nil {
-		t.Fatal("no replacement container")
-	}
-	if got := c.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "service.js")+".rule"]; got != "Host(`ov.test`)" {
-		t.Fatalf("replacement rule = %q, want Host(`ov.test`)", got)
-	}
-	if c.image != "img-1" {
-		t.Fatalf("replacement image = %q, want the SAME prepared img-1 "+
-			"(an override change must never rebuild the image)", c.image)
-	}
-}
-
-// An invalid override fails routing validation and performs no container
-// action, matching the missing-network path.
-func TestReconcileHostOverrideInvalidRefused(t *testing.T) {
-	f := newFakeDocker()
-	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1, Host: "a.test"})
-	_, err := reconcileOverride(t, f, "fn", tmpl, "img-1",
-		routing.TraefikConfig{Network: "proxy"}, "-bad")
-	if err == nil {
-		t.Fatal("expected a routing-validation error")
-	}
-	if !strings.Contains(err.Error(), "ROUTING_HOST_OVERRIDE") {
-		t.Fatalf("error %v does not name ROUTING_HOST_OVERRIDE", err)
-	}
-	if len(f.networkLookups) != 0 || len(f.ctrs) != 0 || len(f.stops) != 0 {
-		t.Fatalf("invalid override performed container/network work: lookups=%v ctrs=%d stops=%v", f.networkLookups, len(f.ctrs), f.stops)
-	}
-}
-
-// An override value that exceeds the hostname contract is refused before any
-// network or container work, naming the variable.
+// An overlong ROUTING_HOST_OVERRIDE fails the hostname contract before any
+// container or network work, naming both the variable and the length limit.
 func TestReconcileHostOverrideOverlongValueRefused(t *testing.T) {
 	f := newFakeDocker()
-	overlong := strings.Repeat("a", 254)
 	tmpl := serviceTemplate("nodejs24.x", app.Service{
-		Name:       "service.js",
-		Entrypoint: "service.js", Port: 80, Replicas: 1,
-		Host: "a.test",
+		Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1,
+		Host: "service.test",
 	})
-	_, err := reconcileOverride(t, f, "fn", tmpl, "img-1",
-		routing.TraefikConfig{Network: "proxy"}, overlong)
+	overlong := strings.Repeat("a", 254)
+
+	_, err := reconcileOverride(t, f, "fn", tmpl, "img-1", overlong)
 	if err == nil {
 		t.Fatal("expected an overlong-override routing error")
 	}
-	if !strings.Contains(err.Error(), "253-character hostname limit") ||
-		!strings.Contains(err.Error(), "ROUTING_HOST_OVERRIDE") {
-		t.Fatalf("error %v does not carry the 253-character message naming "+
-			"ROUTING_HOST_OVERRIDE", err)
+	if !strings.Contains(err.Error(), "ROUTING_HOST_OVERRIDE") ||
+		!strings.Contains(err.Error(), "253-character hostname limit") {
+		t.Fatalf("error %v must name ROUTING_HOST_OVERRIDE and the length limit", err)
 	}
 	if len(f.networkLookups) != 0 || len(f.ctrs) != 0 || len(f.stops) != 0 {
-		t.Fatalf("overlong override performed network/container work: lookups=%v ctrs=%d stops=%v", f.networkLookups, len(f.ctrs), f.stops)
-	}
-}
-
-// Under an override the container's rule names the EXACT override hostname;
-// the declared host's length is irrelevant to the effective route.
-func TestReconcileHostOverrideExactEffectiveHost(t *testing.T) {
-	f := newFakeDocker()
-	tmpl := serviceTemplate("nodejs24.x", app.Service{
-		Name:       "service.js",
-		Entrypoint: "service.js", Port: 3000, Replicas: 1,
-		Host: strings.Repeat("z", 63) + ".example.com",
-	})
-	if _, err := reconcileOverride(t, f, "fn", tmpl, "img-1",
-		routing.TraefikConfig{Network: "proxy"}, "localhost"); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	c := f.lastStartedFor("fn", "service.js")
-	if c == nil {
-		t.Fatal("no started container")
-	}
-	wantRule := "Host(`localhost`)"
-	if got := c.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "service.js")+".rule"]; got != wantRule {
-		t.Fatalf("rule = %q, want %q (exact replacement, not a left-label join)",
-			got, wantRule)
-	}
-	if len(f.networkLookups) != 1 || f.networkLookups[0] != "proxy" {
-		t.Fatalf("networkLookups = %v, want [proxy]", f.networkLookups)
-	}
-}
-
-// An absent override (empty) reconciles exactly as before: the declared host
-// verbatim.
-func TestReconcileAbsentOverrideUsesDeclaredHost(t *testing.T) {
-	f := newFakeDocker()
-	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "issuer.example.com"})
-	if _, err := reconcileOverride(t, f, "fn", tmpl, "img-1",
-		routing.TraefikConfig{Network: "proxy"}, ""); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	c := f.lastStartedFor("fn", "service.js")
-	if c == nil {
-		t.Fatal("no started container")
-	}
-	if got := c.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "service.js")+".rule"]; got != "Host(`issuer.example.com`)" {
-		t.Fatalf("rule = %q, want the declared host verbatim", got)
-	}
-}
-
-// A converged override state is a no-op: identical effective labels keep the
-// container (no churn).
-func TestReconcileHostOverrideConvergedNoOp(t *testing.T) {
-	f := newFakeDocker()
-	tmpl := serviceTemplate("nodejs24.x", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test"})
-	cfg := routing.TraefikConfig{Network: "proxy"}
-	if _, err := reconcileOverride(t, f, "fn", tmpl, "img-1", cfg, "localhost"); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	stopsSoFar := len(f.stops)
-	changed, err := reconcileOverride(t, f, "fn", tmpl, "img-1", cfg, "localhost")
-	if err != nil {
-		t.Fatalf("reconcile 2: %v", err)
-	}
-	if changed {
-		t.Fatal("converged override state must be a no-op (changed = false)")
-	}
-	if len(f.stops) != stopsSoFar {
-		t.Fatalf("stops grew from %d to %d on a converged pass", stopsSoFar, len(f.stops))
-	}
-}
-
-// TestReconcileRoutingIDStableAcrossSameNameSourceChange pins the Traefik id
-// contract: the router/service id is keyed on the service NAME, so a source
-// change under the same name keeps the same id (the replacement swaps in place
-// and the old route is not orphaned). A name change yields a new id.
-func TestReconcileRoutingIDStableAcrossSameNameSourceChange(t *testing.T) {
-	f := newFakeDocker()
-	v1 := serviceTemplate("", app.Service{Name: "api", Image: "ghcr.io/acme/api:1", Port: 3000, Replicas: 1, Host: "svc.test"})
-	if _, err := reconcile(t, f, "fn", v1, "", routing.TraefikConfig{Network: "proxy"}); err != nil {
-		t.Fatalf("reconcile v1: %v", err)
-	}
-	id1 := routing.ServiceProviderID("fn", "api")
-	c1 := f.lastStartedFor("fn", "api")
-	if c1 == nil || c1.labels[routingRouterPrefix+id1+".rule"] == "" {
-		t.Fatalf("v1 container missing the name-keyed router rule: %+v", c1)
-	}
-
-	// Same name, new source: the routing id is unchanged.
-	v2 := serviceTemplate("", app.Service{Name: "api", Image: "ghcr.io/acme/api:2", Port: 3000, Replicas: 1, Host: "svc.test"})
-	if _, err := reconcile(t, f, "fn", v2, "", routing.TraefikConfig{Network: "proxy"}); err != nil {
-		t.Fatalf("reconcile v2: %v", err)
-	}
-	c2 := f.lastStartedFor("fn", "api")
-	if c2 == nil {
-		t.Fatal("no v2 container")
-	}
-	if c2.labels[routingRouterPrefix+id1+".rule"] == "" {
-		t.Fatalf("id changed across a same-name source change: want %q still present in %v", id1, c2.labels)
-	}
-	if routing.ServiceProviderID("fn", "api") != id1 {
-		t.Fatal("ServiceProviderID must depend only on function + service name")
+		t.Fatalf("overlong override performed container/network work: "+
+			"lookups=%v ctrs=%d stops=%v", f.networkLookups, len(f.ctrs), f.stops)
 	}
 }

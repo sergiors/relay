@@ -10,7 +10,6 @@ import (
 	"github.com/moby/moby/api/types/container"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
 )
@@ -66,8 +65,7 @@ func TestPreparationFailureWriteConvertsDurableAdmissionSameAttemptAfterRestart(
 	tmpl := preparationTestTemplate(hc)
 	f.setResolveError("service.js", errors.New("registry unavailable"))
 	newWorker := func() *ServiceReconciler {
-		return NewServiceReconciler(md, nil, routing.TraefikConfig{},
-			testutil.DiscardLogger(), testReconcileTimeout)
+		return NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	}
 
 	// Pass 1: the attempt is admitted durably, resolution fails, and the
@@ -281,8 +279,7 @@ func TestSuccessfulPreparationPrunesStalePreparationMarkersOnly(t *testing.T) {
 		f := newFakeDocker()
 		md := newMarkerStoreDocker(f)
 		newWorker := func() *ServiceReconciler {
-			return NewServiceReconciler(md, nil, routing.TraefikConfig{},
-				testutil.DiscardLogger(), testReconcileTimeout)
+			return NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 		}
 
 		// Pass 1 converges and commits the replica.
@@ -346,8 +343,7 @@ func TestSuccessfulPreparationPrunesStalePreparationMarkersOnly(t *testing.T) {
 		if !ok {
 			t.Fatal("precondition: the committed marker must be present before the pass")
 		}
-		c := NewServiceReconciler(md, nil, routing.TraefikConfig{},
-			testutil.DiscardLogger(), testReconcileTimeout)
+		c := NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 		result := healthApply(t, c, "fn", tmpl, "img-1")
 
@@ -385,8 +381,7 @@ func TestSuccessfulPreparationPrunesStalePreparationMarkersOnly(t *testing.T) {
 			if _, ok := store.inner.preparationMarkerState("fn", "service.js"); !ok {
 				t.Fatal("precondition: the stale marker must be present before the pass")
 			}
-			c := NewServiceReconciler(store, nil, routing.TraefikConfig{},
-				testutil.DiscardLogger(), testReconcileTimeout)
+			c := NewServiceReconciler(store, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 			first := healthApply(t, c, "fn", tmpl, "img-1")
 			if first.Pending() || !first.Changed {
@@ -418,21 +413,20 @@ func TestSuccessfulPreparationPrunesStalePreparationMarkersOnly(t *testing.T) {
 
 // The preparation retry key covers every desired input knowable before
 // resolution: the app image an entrypoint service runs (a Git source update
-// under a byte-identical template), the FULL routing configuration of a routed
-// service, and the EFFECTIVE probe — Relay's declared probe only while it is
-// actually applied (never under a HOT_RELOAD source mount). An image service's
-// own reference already keys it, and a non-routed service ignores routing
-// configuration that produces no router.
-func TestServicePreparationIdentityKeysImageRoutingAndEffectiveProbe(t *testing.T) {
+// under a byte-identical template) and the EFFECTIVE probe — Relay's declared
+// probe only while it is actually applied (never under a HOT_RELOAD source
+// mount). An image service's own reference already keys it. Routing host/path
+// is deliberately excluded: routes are served from discovery and never replace
+// a container.
+func TestServicePreparationIdentityKeysImageAndEffectiveProbe(t *testing.T) {
 	hc := testServiceHealthcheck(time.Second)
 	probeEdit := testServiceHealthcheck(30 * time.Second)
 	tmpl := serviceTemplate("nodejs24.x")
-	base := routing.TraefikConfig{Network: "traefik"}
 	idOf := func(
-		svc app.Service, appImage string, cfg routing.TraefikConfig, mounted bool,
+		svc app.Service, appImage string, mounted bool,
 	) string {
-		return servicePreparationIdentity("fn", tmpl, svc, appImage,
-			[]string{"net"}, "", cfg, "", mounted)
+		return servicePreparationIdentity(tmpl, svc, appImage,
+			[]string{"net"}, "", mounted)
 	}
 	routed := app.Service{
 		Name: "web", Entrypoint: "service.js", Port: 8080, Replicas: 1,
@@ -440,7 +434,7 @@ func TestServicePreparationIdentityKeysImageRoutingAndEffectiveProbe(t *testing.
 	}
 
 	t.Run("app image keys an entrypoint service", func(t *testing.T) {
-		if idOf(routed, "img-a", base, false) == idOf(routed, "img-b", base, false) {
+		if idOf(routed, "img-a", false) == idOf(routed, "img-b", false) {
 			t.Fatal("a Git source update (a new app image under a byte-identical " +
 				"template) must change the preparation key")
 		}
@@ -448,100 +442,38 @@ func TestServicePreparationIdentityKeysImageRoutingAndEffectiveProbe(t *testing.
 
 	t.Run("an image service is keyed by its own reference", func(t *testing.T) {
 		imageSvc := app.Service{Name: "ext", Image: "nginx:1.27", Port: 80, Replicas: 1}
-		if idOf(imageSvc, "img-a", base, false) != idOf(imageSvc, "img-b", base, false) {
+		if idOf(imageSvc, "img-a", false) != idOf(imageSvc, "img-b", false) {
 			t.Fatal("the app image must not key an image service (its configured " +
 				"reference already does)")
 		}
 		otherRef := imageSvc
 		otherRef.Image = "nginx:1.28"
-		if idOf(imageSvc, "img-a", base, false) ==
-			idOf(otherRef, "img-a", base, false) {
+		if idOf(imageSvc, "img-a", false) == idOf(otherRef, "img-a", false) {
 			t.Fatal("the image service's own reference must be part of its key")
 		}
 	})
 
-	t.Run("full routing configuration keys a routed service", func(t *testing.T) {
-		priority := 5
-		alt := routing.TraefikConfig{
-			Network: "traefik-websecure", EntryPoints: "websecure",
-			CertResolver: "letsencrypt", Priority: &priority,
-		}
-		if idOf(routed, "img-a", base, false) == idOf(routed, "img-a", alt, false) {
-			t.Fatal("network/entrypoints/cert-resolver/priority must be part of " +
-				"the routed preparation key")
+	t.Run("routing is not part of the key", func(t *testing.T) {
+		moved := routed
+		moved.Host = "other.example.com"
+		moved.Path = "/other"
+		if idOf(routed, "img-a", false) != idOf(moved, "img-a", false) {
+			t.Fatal("a routing host/path change must not re-key container preparation")
 		}
 	})
-
-	t.Run("a host override keys a routed service", func(t *testing.T) {
-		// The effective host (declared host or the exact
-		// ROUTING_HOST_OVERRIDE value) feeds the router labels, so it keys the
-		// routed preparation identity: toggling the override re-prepares the
-		// route WITHOUT any image rebuild (the app image is unchanged).
-		without := servicePreparationIdentity("fn", tmpl, routed, "img-a",
-			[]string{"net"}, "", base, "", false)
-		with := servicePreparationIdentity("fn", tmpl, routed, "img-a",
-			[]string{"net"}, "", base, "portal.internal.test", false)
-		same := servicePreparationIdentity("fn", tmpl, routed, "img-a",
-			[]string{"net"}, "", base, "portal.internal.test", false)
-		if without == with {
-			t.Fatal("the effective host must be part of the routed " +
-				"preparation key so an override change updates the route")
-		}
-		if with != same {
-			t.Fatal("the preparation identity must be deterministic for equal inputs")
-		}
-	})
-
-	t.Run("routing configuration is not a key without a declared host",
-		func(t *testing.T) {
-			plain := app.Service{
-				Name: "worker", Entrypoint: "worker.js", Port: 9000, Replicas: 1,
-				Healthcheck: hc,
-			}
-			priority := 5
-			alt := routing.TraefikConfig{
-				Network: "traefik-websecure", EntryPoints: "websecure",
-				CertResolver: "letsencrypt", Priority: &priority,
-			}
-			if idOf(plain, "img-a", base, false) != idOf(plain, "img-a", alt, false) {
-				t.Fatal("without a declared host there is no router to configure; " +
-					"operator routing config must not change the key")
-			}
-			// ROUTING_HOST_OVERRIDE is operator routing config too: it must
-			// not key an UNROUTED service, whose identity must be byte-equal
-			// with empty vs non-empty override (no router exists to
-			// configure, so no Traefik labels may be hashed in).
-			withoutOverride := servicePreparationIdentity("fn", tmpl, plain,
-				"img-a", []string{"net"}, "", base, "", false)
-			withOverride := servicePreparationIdentity("fn", tmpl, plain,
-				"img-a", []string{"net"}, "", base, "portal.internal.test", false)
-			if withoutOverride != withOverride {
-				t.Fatal("ROUTING_HOST_OVERRIDE must not change an unrouted " +
-					"service's preparation identity: with svc.Host == \"\" no " +
-					"Traefik labels exist to hash")
-			}
-			// The routed contrast stays: the same override DOES key a service
-			// that declares a host (asserted in "a host override keys a routed
-			// service" above).
-			reported := plain
-			reported.Port = 9001
-			if idOf(plain, "img-a", base, false) == idOf(reported, "img-a", base, false) {
-				t.Fatal("the service's own port must still key it")
-			}
-		})
 
 	t.Run("the probe only keys while it is effective", func(t *testing.T) {
 		edited := routed
 		edited.Healthcheck = probeEdit
-		if idOf(routed, "img-a", base, false) == idOf(edited, "img-a", base, false) {
+		if idOf(routed, "img-a", false) == idOf(edited, "img-a", false) {
 			t.Fatal("without a source mount the declared probe applies, so a " +
 				"probe-only edit is a new preparation key")
 		}
-		if idOf(routed, "img-a", base, true) != idOf(edited, "img-a", base, true) {
+		if idOf(routed, "img-a", true) != idOf(edited, "img-a", true) {
 			t.Fatal("under a HOT_RELOAD source mount the probe is bypassed, so a " +
 				"probe-only edit must not change the key")
 		}
-		if idOf(routed, "img-a", base, false) == idOf(routed, "img-a", base, true) {
+		if idOf(routed, "img-a", false) == idOf(routed, "img-a", true) {
 			t.Fatal("the mount state itself is part of the effective-probe key")
 		}
 	})
@@ -559,8 +491,7 @@ func TestPreparationRetryFollowsEffectiveProbeUnderHotReload(t *testing.T) {
 		f := newFakeDocker()
 		md := newMarkerStoreDocker(f)
 		f.setResolveError("service.js", errors.New("registry unavailable"))
-		c := NewServiceReconciler(md, nil, routing.TraefikConfig{},
-			testutil.DiscardLogger(), testReconcileTimeout)
+		c := NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 		result := c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil, nil)
 
@@ -597,8 +528,7 @@ func TestPreparationRetryFollowsEffectiveProbeUnderHotReload(t *testing.T) {
 		f.setMountIdentity("service.js", "fp1")
 		f.setSourceMounted(true)
 		f.setResolveError("service.js", errors.New("registry unavailable"))
-		c := NewServiceReconciler(md, nil, routing.TraefikConfig{},
-			testutil.DiscardLogger(), testReconcileTimeout)
+		c := NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 
 		result := c.ApplyResult(context.Background(), "fn", tmpl, "img-1", nil, nil)
 
@@ -636,8 +566,7 @@ func TestVanishedStartedCandidateRecoveryAnchorsFullBackoffAndPersistsExactWindo
 		80, 0, hc, container.Unhealthy, 5)
 	tmpl := preparationTestTemplate(hc)
 	newWorker := func() *ServiceReconciler {
-		return NewServiceReconciler(md, nil, routing.TraefikConfig{},
-			testutil.DiscardLogger(), testReconcileTimeout)
+		return NewServiceReconciler(md, nil, testutil.DiscardLogger(), testReconcileTimeout)
 	}
 
 	// Pass 1 records the observed failure durably while the candidate exists

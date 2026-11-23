@@ -14,7 +14,6 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/reconciler"
-	"relay/internal/routing"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 )
@@ -137,7 +136,7 @@ func (f *blockingListDocker) NetworkExists(_ context.Context, _ string) (bool, e
 func TestEnqueueStartupServicesRootedInLifecycle(t *testing.T) {
 	fake := &blockingListDocker{entered: make(chan struct{})}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, logger, reconcileTimeout)
 
 	coordinator := reconciler.NewServiceCoordinator(svcCtrl)
 	lifecycle, cancelLifecycle := context.WithCancel(context.Background())
@@ -181,7 +180,7 @@ func TestEnqueueStartupServicesRootedInLifecycle(t *testing.T) {
 func TestEnqueueStartupServicesBoundedPerApp(t *testing.T) {
 	fake := &svcDeadlineDocker{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, logger, reconcileTimeout)
 	coordinator, stop := startCoordinatorFixture(t, svcCtrl)
 	defer stop()
 
@@ -319,7 +318,7 @@ func TestStartupHousekeepingExcludesLiveUpdates(t *testing.T) {
 	fake := newCtxRecordDocker()
 	fake.block["list"] = true // the orphan sweep's listing parks until released
 	logger := discardLogger()
-	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, logger, reconcileTimeout)
 
 	coordinator := reconciler.NewServiceCoordinator(svcCtrl)
 	lifecycle, cancel := context.WithCancel(context.Background())
@@ -500,7 +499,7 @@ func TestWorkerShutdownServicesNodeScopedAndBounded(t *testing.T) {
 	fake.addService("own-2", "relay-worker-a")
 	fake.addService("other-1", "relay-worker-b")
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, logger, reconcileTimeout)
 
 	// The shutdown registry owns the step's bound; apply the same 30s bound
 	// here so the bounded cleanup path is exercised as production runs it.
@@ -555,7 +554,7 @@ func TestWorkerShutdownServiceCleanupStepFailureReachesRegistry(t *testing.T) {
 	// Debug level so the lower-level ShutdownCleanup Warn is captured too; the
 	// test asserts both layers, not just the registry's.
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, logger, reconcileTimeout)
 
 	reg := &shutdownRegistry{}
 	reg.register(shutdownStep{
@@ -624,7 +623,7 @@ func TestWorkerShutdownServicesSkipsAdoptedContainerAfterOwnershipLoss(t *testin
 			// it; a replacement reusing NODE_ID would adopt the SAME physical id.
 			fake.addService("adopted-1", "relay-worker-a")
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+			svcCtrl := reconciler.NewServiceReconciler(fake, nil, logger, reconcileTimeout)
 
 			step := shutdownServices(svcCtrl, "relay-worker-a", tc.proof, logger)
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), shutdownServiceTimeout)
@@ -654,7 +653,7 @@ func TestSweepStartupServiceOrphansSnapshotsProofsThenRemoves(t *testing.T) {
 	fake.addServiceForApp("ghost-b", "ghost", "relay-worker-a")
 	fake.addServiceForApp("live-1", "live", "relay-worker-a")
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, logger, reconcileTimeout)
 
 	var (
 		sawListAtProof  int
@@ -743,7 +742,7 @@ func TestSweepStartupServiceOrphansSkipsRemovalOnOwnershipLoss(t *testing.T) {
 			fake := newSvcShutdownDocker()
 			fake.addServiceForApp("ghost-a", "ghost", "relay-worker-a")
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+			svcCtrl := reconciler.NewServiceReconciler(fake, nil, logger, reconcileTimeout)
 
 			sweepStartupServiceOrphans(context.Background(), svcCtrl, map[string]bool{"live": true}, tc.proof, logger)
 

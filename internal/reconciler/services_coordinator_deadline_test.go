@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"relay/internal/app"
-	"relay/internal/routing"
 	"relay/internal/testutil"
 )
 
@@ -29,7 +28,7 @@ func newPendingCoordinator(
 ) (*ServiceCoordinator, *pendingServiceDocker, context.CancelFunc) {
 	t.Helper()
 	docker := newPendingServiceDocker()
-	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), timeout)
+	services := NewServiceReconciler(docker, nil, testutil.DiscardLogger(), timeout)
 	coordinator := NewServiceCoordinator(services)
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)

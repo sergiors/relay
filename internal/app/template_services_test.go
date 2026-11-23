@@ -672,11 +672,11 @@ services:
     path: /v2
   - name: blank
     entrypoint: blank.js
-    host: api.example.com
+    host: blank.example.com
     path: ""
   - name: plain
     entrypoint: plain.js
-    host: api.example.com
+    host: plain.example.com
 `)
 	if len(tmpl.Services) != 3 {
 		t.Fatalf("services = %d, want 3", len(tmpl.Services))

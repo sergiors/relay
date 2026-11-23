@@ -10,7 +10,6 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/reconciler"
-	"relay/internal/routing"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 )
@@ -221,7 +220,7 @@ func startCoordinatorFixture(t *testing.T, svcCtrl *reconciler.ServiceReconciler
 // consume the post-resolution start's deadline.
 func TestEnqueueLiveServicesBoundsEachOperationToReconcileTimeout(t *testing.T) {
 	fake := newCtxRecordDocker()
-	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, discardLogger(), reconcileTimeout)
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, discardLogger(), reconcileTimeout)
 	coordinator, stop := startCoordinatorFixture(t, svcCtrl)
 
 	reg := &runner.Registry{}
@@ -255,7 +254,7 @@ func TestEnqueueLiveServicesBoundsEachOperationToReconcileTimeout(t *testing.T) 
 func TestEnqueueLiveServicesRootedInLifecycle(t *testing.T) {
 	fake := newCtxRecordDocker()
 	fake.block["list"] = true
-	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, discardLogger(), reconcileTimeout)
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, discardLogger(), reconcileTimeout)
 
 	coordinator := reconciler.NewServiceCoordinator(svcCtrl)
 	lifecycle, cancel := context.WithCancel(context.Background())
@@ -288,7 +287,7 @@ func TestEnqueueLiveServicesUsesRegistryPreparedEnv(t *testing.T) {
 	// this pins that the helper tolerates both a present and an absent registry
 	// entry.
 	fake := newCtxRecordDocker()
-	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, discardLogger(), reconcileTimeout)
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, discardLogger(), reconcileTimeout)
 	coordinator, stop := startCoordinatorFixture(t, svcCtrl)
 
 	reg := &runner.Registry{}
@@ -309,7 +308,7 @@ func TestEnqueueLiveServicesUsesRegistryPreparedEnv(t *testing.T) {
 	// Absent registry entry: nil Prepared falls back to no plan env and still
 	// converges.
 	fake2 := newCtxRecordDocker()
-	svcCtrl2 := reconciler.NewServiceReconciler(fake2, nil, routing.TraefikConfig{}, discardLogger(), reconcileTimeout)
+	svcCtrl2 := reconciler.NewServiceReconciler(fake2, nil, discardLogger(), reconcileTimeout)
 	coordinator2, stop2 := startCoordinatorFixture(t, svcCtrl2)
 	enqueueLiveServices(coordinator2, nil, reg, "missing", applyServiceTemplate(), "img")
 	if err := coordinator2.Wait(context.Background()); err != nil {
@@ -330,7 +329,7 @@ func TestEnqueueStartupServicesApplyUsesLifecycleNotPassBudget(t *testing.T) {
 	fake := newCtxRecordDocker()
 	fake.block["list"] = true
 	logger := discardLogger()
-	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, logger, reconcileTimeout)
 
 	coordinator := reconciler.NewServiceCoordinator(svcCtrl)
 	lifecycle, cancel := context.WithCancel(context.Background())
@@ -365,7 +364,7 @@ func TestEnqueueStartupServicesApplyUsesLifecycleNotPassBudget(t *testing.T) {
 func TestEnqueueStartupServicesStandaloneRemoveBounded(t *testing.T) {
 	fake := newCtxRecordDocker()
 	logger := discardLogger()
-	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, logger, reconcileTimeout)
 	coordinator, stop := startCoordinatorFixture(t, svcCtrl)
 	defer stop()
 
@@ -399,7 +398,7 @@ func TestEnqueueStartupServicesStandaloneRemoveNonBlocking(t *testing.T) {
 	fake := newCtxRecordDocker()
 	fake.block["remove"] = true
 	logger := discardLogger()
-	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, logger, reconcileTimeout)
 	coordinator, stop := startCoordinatorFixture(t, svcCtrl)
 	defer stop()
 
@@ -429,7 +428,7 @@ func TestEnqueueStartupServicesStandaloneRemoveNonBlocking(t *testing.T) {
 func TestEnqueueStartupServicesUnavailableWithServicesSkips(t *testing.T) {
 	fake := newCtxRecordDocker()
 	logger := discardLogger()
-	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, logger, reconcileTimeout)
 	coordinator, stop := startCoordinatorFixture(t, svcCtrl)
 	defer stop()
 

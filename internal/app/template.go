@@ -341,20 +341,21 @@ type Service struct {
 	// inspected locally and pulled when needed. Relay never cleans it up.
 	Image string
 	// Host is the optional hostname (e.g. "api.example.com") this service is
-	// exposed through the routing layer (Traefik, at the wiring level); empty
-	// means an internal unrouted service with no routing labels. It is generic
-	// template config (a plain hostname), never a Traefik-specific term. It
-	// must be a valid hostname and is validated at parse time.
+	// exposed through the routing layer; empty means an internal unrouted
+	// service with no discovered route. It is generic template config (a plain
+	// hostname), never a proxy-specific term. It must be a valid hostname and is
+	// validated at parse time.
 	Host string
 	// Path is the optional URL path prefix this service is exposed under on its
 	// Host (e.g. "/v2"). It is generic template config (a URL path), never a
-	// Traefik-specific term. Empty (omitted or explicitly "") means the service
+	// proxy-specific term. Empty (omitted or explicitly "") means the service
 	// is routed by host alone, exactly as before paths existed. When set, the
-	// routing layer adds a PathPrefix rule and a StripPrefix middleware. A
-	// configured path requires a host: path without host is rejected at parse
-	// time. After ParseTemplate the value is canonicalized: it starts with "/",
-	// has no trailing slash except for the root "/", and contains no empty
-	// ("//") segments — a non-root value therefore never has a trailing slash.
+	// discovered route constrains the request path and strips the prefix before
+	// forwarding it to the service. A configured path requires a host: path
+	// without host is rejected at parse time. After ParseTemplate the value is
+	// canonicalized: it starts with "/", has no trailing slash except for the
+	// root "/", and contains no empty ("//") segments — a non-root value
+	// therefore never has a trailing slash.
 	Path     string
 	Port     int
 	Replicas int
@@ -909,6 +910,7 @@ func ParseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 	// Services are optional — a template without the `services` key parses
 	// exactly as before.
 	seenServiceNames := make(map[string]bool, len(raw.Services))
+	seenServiceRoutes := make(map[serviceRouteKey]string, len(raw.Services))
 	for _, s := range raw.Services {
 		if s.Name == "" {
 			return nil, fmt.Errorf("service is missing a name")
@@ -978,6 +980,20 @@ func ParseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		path, err := canonicalizeServicePath(s.Path)
 		if err != nil {
 			return nil, fmt.Errorf("service %q: %w", s.Name, err)
+		}
+		// A host/path pair is an externally addressable route: two services in
+		// the same app claiming the same route would race for every matching
+		// request, and discovery must omit both. Reject the ambiguity at parse
+		// time. Host names are case-insensitive, and an empty path and the root
+		// "/" are equivalent for duplicate detection.
+		if s.Host != "" {
+			key := normalizeServiceRoute(s.Host, path)
+			if previous, ok := seenServiceRoutes[key]; ok {
+				return nil, fmt.Errorf(
+					"duplicate route: services %q and %q both declare host %q path %q",
+					previous, s.Name, s.Host, displayServiceRoutePath(key.path))
+			}
+			seenServiceRoutes[key] = s.Name
 		}
 		// Additional tmpfs destinations are validated against the narrow
 		// ephemeral-path policy and the app's effective per-container memory
@@ -1426,6 +1442,44 @@ func validateServiceHost(host string) error {
 	return nil
 }
 
+// serviceRouteKey is the normalized routing identity of a service declaration.
+// Host names are case-insensitive and an empty path and the root "/" are
+// equivalent, so both spellings collapse to one key.
+type serviceRouteKey struct {
+	host string
+	path string
+}
+
+// normalizeServiceRoute reduces a host/path pair to the routing identity used
+// for duplicate detection. The declared host is preserved in the template; only
+// the comparison key is lowercased.
+func normalizeServiceRoute(host, path string) serviceRouteKey {
+	return serviceRouteKey{
+		host: strings.ToLower(host),
+		path: normalizeServiceRoutePath(path),
+	}
+}
+
+// normalizeServiceRoutePath makes an empty path and "/" equivalent for
+// duplicate detection only; the template preserves the declared path so an
+// explicit "/" keeps its root-prefix routing semantics. Non-root paths are
+// already canonical after canonicalizeServicePath.
+func normalizeServiceRoutePath(path string) string {
+	if path == "/" {
+		return ""
+	}
+	return path
+}
+
+// displayServiceRoutePath renders a normalized path for operator-facing
+// messages, where the host-only route is shown as "/".
+func displayServiceRoutePath(path string) string {
+	if path == "" {
+		return "/"
+	}
+	return path
+}
+
 // canonicalizeServicePath validates the optional service `path` and returns its
 // canonical form. Empty is valid (host-only routing, exactly as before).
 //
@@ -1449,8 +1503,8 @@ func canonicalizeServicePath(path string) (string, error) {
 	if strings.ContainsAny(path, " \t\r\n") {
 		return "", fmt.Errorf("path %q contains whitespace", path)
 	}
-	if strings.ContainsAny(path, "?#\\") {
-		return "", fmt.Errorf("path %q must not contain a query, fragment, or backslash", path)
+	if strings.ContainsAny(path, "?#\\`") {
+		return "", fmt.Errorf("path %q must not contain a query, fragment, or backslash, or a backtick", path)
 	}
 	canonical := strings.TrimRight(path, "/")
 	if canonical == "" {
