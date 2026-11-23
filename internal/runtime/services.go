@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -56,7 +57,15 @@ type ServiceSpec struct {
 	// is used only for source resolution and implementation comparison.
 	SourceRef string
 	Port      int
-	Image     string
+	// BindAddr is the static host IP the container port is published on, or ""
+	// for no host publication. The reconciler sets it only for a routed service
+	// (one declaring a host) when SERVICE_BIND_ADDR is configured; an unrouted
+	// service stays internal-only. Docker allocates the host port and Relay
+	// stamps BindAddr as relay.bind_addr so a bind-address change replaces the
+	// container. It is never the advertise address, which is presentation
+	// metadata only.
+	BindAddr string
+	Image    string
 	// ImageID is the local content ID of Image (relay.image_id), or "" when the
 	// reference itself encodes the content (a Relay-built image tag). It lets
 	// Reconcile detect a moved external tag pointing at different bytes and
@@ -153,6 +162,13 @@ type ServiceContainer struct {
 	// The service reconciler uses it to detect a port change (a stale-config
 	// container whose labelPort != the template's desired port is replaced).
 	Port int
+	// BindAddr is the static host IP the container published its port on,
+	// parsed from relay.bind_addr. It is "" for a container with no host
+	// publication (every unrouted service, and every routed service while
+	// SERVICE_BIND_ADDR is unset). The service reconciler compares it to the
+	// desired bind address and replaces the container when it differs; the
+	// advertise address is never part of this identity.
+	BindAddr string
 	// EnvironmentFingerprint is the identity of the effective environment the
 	// container was created with, parsed from relay.environment. It is "" for a
 	// container created before the label existed (or with a missing/invalid value),
@@ -238,6 +254,34 @@ type ServiceContainer struct {
 	// derived from Docker's health summary (healthy => true, starting/unhealthy
 	// => false); for a service without one it remains nil.
 	Ready *bool
+}
+
+// ServiceEndpoint is one service replica as observed on this worker's Docker
+// daemon, plus the host endpoint Docker actually assigned for its container
+// port. It is a live read-only view for `relay app inspect`; nothing here is
+// persisted.
+//
+// HostIP and HostPort are filled ONLY when inspection proves a complete,
+// expected binding: the container exposes the service's internal TCP port, has
+// exactly one host binding for it, and that binding targets the configured bind
+// address. Any absent, malformed, or unexpected binding leaves HostPort 0 and
+// HostIP empty so callers render "not published" instead of guessing. State and
+// Health remain Docker's actual observation even then (and for a stopped
+// container), so callers can distinguish an inactive container from a missing
+// or unpublished endpoint.
+type ServiceEndpoint struct {
+	Service     string
+	Replica     int
+	ContainerID string
+	State       container.ContainerState
+	// Missing reports that the container disappeared between discovery and
+	// inspection. It carries no State; callers render it as not found rather
+	// than substituting a stale label-derived state.
+	Missing  bool
+	Health   container.HealthStatus
+	Port     int
+	HostIP   string
+	HostPort int
 }
 
 // serviceContainerNameLenCap caps the deterministic (logical) container name of
@@ -563,6 +607,14 @@ func serviceLabels(spec ServiceSpec, nodeID string, replica int) map[string]stri
 	} else {
 		delete(labels, labelNetworks)
 	}
+	// The bind address is configuration identity too; re-apply it last and
+	// clear a spoofed value when the service publishes no host port. The
+	// advertise address is deliberately never stamped.
+	if spec.BindAddr != "" {
+		labels[labelBindAddr] = spec.BindAddr
+	} else {
+		delete(labels, labelBindAddr)
+	}
 	// The source fingerprint is ownership metadata too; re-apply it last and
 	// clear a spoofed value when the service has no source mount.
 	if sourceID != "" {
@@ -594,14 +646,41 @@ func serviceReplicaAttrs(appName, service, image string, replica int) []any {
 	return attrs
 }
 
+// parseServiceBindAddr validates the optional static host IP a service port is
+// published on. Empty means no publication and returns the zero Addr. The
+// policy mirrors config.ParseServiceAddress: only a usable unicast IPv4 or IPv6
+// literal is accepted, never a hostname, wildcard, multicast, broadcast,
+// IPv4-mapped, or zone-scoped address. It is repeated here as the last line of
+// defense for direct StartService callers; configuration is the user-facing
+// validation point.
+func parseServiceBindAddr(value string) (netip.Addr, error) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return netip.Addr{}, nil
+	}
+	addr, err := netip.ParseAddr(v)
+	if err != nil ||
+		addr.Is4In6() ||
+		addr.Zone() != "" ||
+		addr.IsUnspecified() ||
+		addr.IsMulticast() ||
+		(!addr.IsGlobalUnicast() && !addr.IsLoopback() && !addr.IsLinkLocalUnicast()) {
+		return netip.Addr{}, fmt.Errorf("invalid bind address %q", value)
+	}
+	return addr, nil
+}
+
 // StartService creates and starts ONE persistent service container. spec.Env is
 // applied verbatim (container env semantics — the caller must assemble it,
 // including PORT=<spec.Port> plus the template env values and resolved secrets;
 // nothing here resolves secrets). The hardened HostConfig mirrors runContainer
 // EXCEPT AutoRemove is deliberately FALSE: a service container is persistent and
 // long-lived, so the reconciler owns its removal, never the daemon. The internal
-// port is exposed as metadata only (ExposedPorts) with NO HostConfig.PortBindings
-// — no host port is published this iteration.
+// TCP port is always exposed as container metadata (ExposedPorts). When
+// spec.BindAddr is non-empty the port is additionally published on that exact
+// host IP with a Docker-allocated host port; the caller (the service reconciler)
+// supplies a bind address only for a routed service while SERVICE_BIND_ADDR is
+// configured, so an unrouted service remains internal-only.
 //
 // After ContainerStart, StartService performs a synchronous, deterministic Docker
 // INSPECT and requires the container to report State.Running. Return only after
@@ -658,6 +737,22 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		return "", fmt.Errorf("service: %w", err)
 	}
 
+	// Validate and canonicalize the optional host bind address BEFORE any
+	// container config is built. The reconciler supplies a startup-validated
+	// address, but this is also the enforcement point for a direct caller: a
+	// wildcard, multicast, broadcast, mapped, or zone-scoped value is refused
+	// rather than silently widening publication. Canonicalizing here keeps
+	// relay.bind_addr spelling-invariant with configuration.
+	bindAddr, err := parseServiceBindAddr(spec.BindAddr)
+	if err != nil {
+		return "", fmt.Errorf("service: %w", err)
+	}
+	if bindAddr.IsValid() {
+		spec.BindAddr = bindAddr.String()
+	} else {
+		spec.BindAddr = ""
+	}
+
 	// Pin the service image for the whole create+start window. For a Relay-owned
 	// image (an entrypoint-source service runs the app image) this prevents
 	// a concurrent retirement from committing removal between the caller's
@@ -684,8 +779,9 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		Image:  spec.Image,
 		Env:    spec.Env,
 		Labels: serviceLabels(spec, m.nodeID, replica),
-		// ExposedPorts is metadata only (informational). Relay does NOT publish a
-		// host port this iteration: no HostConfig.PortBindings.
+		// ExposedPorts describes the container's TCP port. Host publication is
+		// added below only when the caller supplied a bind address; an unrouted
+		// service remains internal-only.
 		ExposedPorts: network.PortSet{network.MustParsePort(fmt.Sprintf("%d/tcp", spec.Port)): {}},
 	}
 	if spec.Healthcheck != nil && spec.SourceMount == nil {
@@ -727,6 +823,16 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 	// added here, before create: StartService validates the same destination
 	// policy as template parsing and builds the bounded option strings itself.
 	hostConfig := hardenedServiceHostConfig(spec.Resources, spec.Port)
+	if bindAddr.IsValid() {
+		// Publish the service's TCP port on the configured static host IP.
+		// The host port is deliberately blank so Docker allocates a free one;
+		// Relay reads the actual assignment from Docker for inspection.
+		hostConfig.PortBindings = network.PortMap{
+			network.MustParsePort(fmt.Sprintf("%d/tcp", spec.Port)): {
+				{HostIP: bindAddr},
+			},
+		}
+	}
 	if err := applyServiceTmpfs(
 		hostConfig, spec.Tmpfs, spec.Resources,
 	); err != nil {
@@ -871,6 +977,23 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 				"%w: container %s exited before readiness", ErrServicePending, id)
 		}
 		return "", discard("not_running", fmt.Errorf("service: started container is not running"))
+	}
+
+	// A published service is only a viable replacement once Docker reports the
+	// expected host mapping. A container can be running while the daemon has not
+	// materialized (or has mangled) the requested binding; handing it back as
+	// success would let the reconciler stop the old, still-serving generation
+	// despite having no verified published endpoint. The immediate post-start
+	// inspect is authoritative: no polling and no ephemeral-port assumption.
+	// Unpublished services keep the historical behavior below.
+	if bindAddr.IsValid() {
+		if _, _, ok := servicePublishedBinding(
+			insp.Container, spec.Port, bindAddr,
+		); !ok {
+			return "", discard("publish_unverified", fmt.Errorf(
+				"service: container %s did not report exactly one %d/tcp host binding on %s after start",
+				id, spec.Port, bindAddr))
+		}
 	}
 
 	// A healthcheck-configured replacement is not a viable swap target until
@@ -1070,6 +1193,7 @@ func (m *Manager) serviceContainerList(ctx context.Context, admit dockerOpAdmitt
 			State:                  c.State,
 			Replica:                replica,
 			Port:                   port,
+			BindAddr:               c.Labels[labelBindAddr],
 			EnvironmentFingerprint: c.Labels[labelEnvironment],
 			Resources:              c.Labels[labelResources],
 			Tmpfs:                  c.Labels[labelTmpfs],
@@ -1129,6 +1253,165 @@ func parseDockerStartInstant(value string) time.Time {
 		return time.Time{}
 	}
 	return startedAt
+}
+
+// ServiceEndpoints returns the service replicas of one app owned by THIS node
+// plus the host endpoint Docker actually assigned for each. It is a read-only
+// inspection view for `relay app inspect`; nothing is persisted and no
+// container is mutated.
+//
+// Discovery is a container list, but every endpoint fact comes from a
+// ContainerInspect: Relay never derives a host port from a label. A container
+// is reported as published ONLY when inspection proves the expected internal
+// TCP port is exposed, Docker reports exactly one host binding for it, and that
+// binding targets expectedBindAddr. Absent, malformed, unexpected, or
+// non-matching bindings leave the endpoint unpublished; the replica's actual
+// Docker state and health are still reported so a stopped or starting container
+// remains visible. Containers with no relay.bind_addr label (unrouted services,
+// or every service while publication is disabled) are omitted: they have no
+// local endpoint to report.
+//
+// A container that disappears between the list and its inspect is reported as
+// Missing rather than failing the whole query. Any other inspect failure is
+// returned as an error, so the caller renders the live view unavailable
+// instead of substituting stale or guessed values. Results are sorted by
+// service, replica, and container ID for deterministic output.
+func (m *Manager) ServiceEndpoints(
+	ctx context.Context, appName, expectedBindAddr string,
+) ([]ServiceEndpoint, error) {
+	expectedBind, err := parseServiceBindAddr(expectedBindAddr)
+	if err != nil {
+		return nil, fmt.Errorf("service: %w", err)
+	}
+	callerCtx := ctx
+	opCtx, release, err := m.beginDockerOp(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	ctx = opCtx
+	list, err := m.cli.ContainerList(ctx, client.ContainerListOptions{All: true})
+	if err != nil {
+		return nil, fmt.Errorf("service: list containers: %w", m.classifyDockerErr(callerCtx, err))
+	}
+	var out []ServiceEndpoint
+	for _, c := range list.Items {
+		if !isServiceContainer(c.Labels) || c.Labels[labelApp] != appName {
+			continue
+		}
+		if m.nodeID != "" && c.Labels[labelNodeID] != m.nodeID {
+			continue
+		}
+		if c.Labels[labelBindAddr] == "" {
+			continue
+		}
+		replica := -1
+		if r, parseErr := strconv.Atoi(c.Labels[labelReplica]); parseErr == nil {
+			replica = r
+		}
+		port := 0
+		if p, parseErr := strconv.Atoi(c.Labels[labelPort]); parseErr == nil {
+			port = p
+		}
+		endpoint := ServiceEndpoint{
+			Service:     c.Labels[labelService],
+			Replica:     replica,
+			ContainerID: c.ID,
+			Port:        port,
+		}
+		insp, inspectErr := m.cli.ContainerInspect(
+			ctx, c.ID, client.ContainerInspectOptions{})
+		if inspectErr != nil {
+			if cerrdefs.IsNotFound(inspectErr) {
+				endpoint.Missing = true
+				out = append(out, endpoint)
+				continue
+			}
+			return nil, fmt.Errorf(
+				"service: inspect container %s: %w",
+				c.ID, m.classifyDockerErr(callerCtx, inspectErr))
+		}
+		if state := insp.Container.State; state != nil {
+			endpoint.State = state.Status
+			if state.Health != nil {
+				endpoint.Health = state.Health.Status
+			}
+		}
+		if hostIP, hostPort, ok := servicePublishedBinding(
+			insp.Container, port, expectedBind,
+		); ok {
+			endpoint.HostIP = hostIP
+			endpoint.HostPort = hostPort
+		}
+		out = append(out, endpoint)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Service != out[j].Service {
+			return out[i].Service < out[j].Service
+		}
+		if out[i].Replica != out[j].Replica {
+			return out[i].Replica < out[j].Replica
+		}
+		return out[i].ContainerID < out[j].ContainerID
+	})
+	return out, nil
+}
+
+// servicePublishedBinding extracts the one host binding Docker actually
+// assigned for a service's internal TCP port. It returns ok=false for every
+// incomplete or unexpected shape: an invalid port, missing network settings or
+// exposed-port metadata, an absent or multiple binding, any other
+// published port, a malformed host port, or a host IP that differs from the
+// configured bind address. The returned address is Docker's actual binding
+// (unmapped to a plain IPv4/IPv6 form), never a label or configuration value.
+func servicePublishedBinding(
+	insp container.InspectResponse, port int, expected netip.Addr,
+) (string, int, bool) {
+	if !expected.IsValid() || port < 1 || port > 65535 {
+		return "", 0, false
+	}
+	portKey, ok := network.PortFrom(uint16(port), network.TCP)
+	if !ok {
+		return "", 0, false
+	}
+	if insp.Config == nil || len(insp.Config.ExposedPorts) == 0 {
+		return "", 0, false
+	}
+	if _, exposed := insp.Config.ExposedPorts[portKey]; !exposed {
+		return "", 0, false
+	}
+	if insp.NetworkSettings == nil {
+		return "", 0, false
+	}
+	published := insp.NetworkSettings.Ports
+	bindings, ok := published[portKey]
+	if !ok || len(bindings) != 1 {
+		return "", 0, false
+	}
+	// Relay publishes exactly one port. Any other live host binding is an
+	// unexpected shape, so this container is not reported as a valid endpoint.
+	for other, extra := range published {
+		if other == portKey {
+			continue
+		}
+		if len(extra) > 0 {
+			return "", 0, false
+		}
+	}
+	binding := bindings[0]
+	if !binding.HostIP.IsValid() || binding.HostIP.IsUnspecified() ||
+		binding.HostIP.IsMulticast() {
+		return "", 0, false
+	}
+	hostIP := binding.HostIP.Unmap()
+	if hostIP != expected.Unmap() {
+		return "", 0, false
+	}
+	hostPort, err := strconv.Atoi(binding.HostPort)
+	if err != nil || hostPort < 1 || hostPort > 65535 {
+		return "", 0, false
+	}
+	return hostIP.String(), hostPort, true
 }
 
 // NetworkExists reports whether a Docker network exists on the daemon. It is

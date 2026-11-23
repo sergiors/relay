@@ -94,6 +94,10 @@ func TestHardenedHostConfigSecurityBaseline(t *testing.T) {
 	if hc.NetworkMode != "" {
 		t.Errorf("NetworkMode = %q, want the default (no host/container sharing)", hc.NetworkMode)
 	}
+	if len(hc.PortBindings) != 0 {
+		t.Errorf("PortBindings = %v, want none: SERVICE_BIND_ADDR never publishes function containers",
+			hc.PortBindings)
+	}
 	if len(hc.CapAdd) != 0 {
 		t.Errorf("CapAdd = %v, want none", hc.CapAdd)
 	}
@@ -114,6 +118,10 @@ func TestHardenedHostConfigSecurityBaseline(t *testing.T) {
 	}
 	if len(svc.CapAdd) != 0 {
 		t.Errorf("service CapAdd = %v for an unprivileged port, want none", svc.CapAdd)
+	}
+	if len(svc.PortBindings) != 0 {
+		t.Errorf("service PortBindings = %v at construction, want none (StartService adds them only for a configured bind address)",
+			svc.PortBindings)
 	}
 
 	lowPort := hardenedServiceHostConfig(app.DefaultResourceLimits(), 80)

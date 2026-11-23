@@ -232,6 +232,108 @@ func TestStartServiceHealthcheckStatesReportPendingAndRetainCandidate(t *testing
 	})
 }
 
+// Publication verification never disturbs the healthcheck candidate contract.
+// A RUNNING published candidate with a VERIFIED binding that is not yet healthy
+// still reports ErrServicePending with its ID and no discard; an EXCITED
+// published candidate (whose live mapping is gone with its sandbox) still
+// reports pending and is retained — the mapping gate runs only after the
+// running gate; and a RUNNING candidate whose mapping is NOT verified is
+// discarded with the hard verification error instead of being observed as
+// pending forever.
+func TestStartServicePublishedCandidatePendingRetention(t *testing.T) {
+	startPublished := func(t *testing.T, inspect string) (string, error, int) {
+		t.Helper()
+		removed := 0
+		cli := newScriptedDockerClient(t,
+			imageWithoutDeclaredVolumesRoute("img"),
+			dockerRoute{method: http.MethodPost, path: "/containers/create",
+				body: `{"Id":"cid-1"}`},
+			dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
+			dockerRoute{method: http.MethodGet, path: "/containers/cid-1/json",
+				body: inspect},
+			dockerRoute{method: http.MethodDelete, path: "/containers/cid-1",
+				body: `{}`, onMatch: func() { removed++ }},
+		)
+		m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "h"}
+		id, err := m.StartService(context.Background(), ServiceSpec{
+			App: "fn", Name: "svc", SourceRef: "service.js", Port: 8080,
+			Image: "img", Env: []string{"PORT=8080"}, BindAddr: "127.0.0.1",
+			Runtime: "nodejs24.x", Entry: []string{"node", "/app/service.js"},
+			Healthcheck: healthcheckSpec(), HealthcheckAttempt: 2,
+		}, 0)
+		return id, err, removed
+	}
+	const exposed = `"Config":{"ExposedPorts":{"8080/tcp":{}}}`
+	const verified = `"NetworkSettings":{"Ports":{"8080/tcp":[` +
+		`{"HostIp":"127.0.0.1","HostPort":"49152"}]}}`
+	const noMapping = `"NetworkSettings":{"Ports":{}}`
+
+	t.Run("running with verified binding reports pending", func(t *testing.T) {
+		id, err, removed := startPublished(t,
+			`{"Id":"cid-1","State":{"Running":true,"Health":{"Status":"starting"}},`+
+				exposed+`,`+verified+`}`)
+		if !errors.Is(err, ErrServicePending) {
+			t.Fatalf("error = %v, want ErrServicePending", err)
+		}
+		if id != "cid-1" {
+			t.Fatalf("id = %q, want the created candidate cid-1", id)
+		}
+		if removed != 0 {
+			t.Fatalf("discard removals = %d, want 0 (candidate retained)", removed)
+		}
+	})
+
+	t.Run("exited before readiness still retains the candidate", func(t *testing.T) {
+		id, err, removed := startPublished(t,
+			`{"Id":"cid-1","State":{"Running":false,"Status":"exited"},`+
+				exposed+`,`+noMapping+`}`)
+		if !errors.Is(err, ErrServicePending) {
+			t.Fatalf("error = %v, want ErrServicePending (the running gate decides first)", err)
+		}
+		if id != "cid-1" {
+			t.Fatalf("id = %q, want the created candidate cid-1", id)
+		}
+		if removed != 0 {
+			t.Fatalf("discard removals = %d, want 0 (candidate retained)", removed)
+		}
+	})
+
+	t.Run("healthy with verified binding converges", func(t *testing.T) {
+		id, err, removed := startPublished(t,
+			`{"Id":"cid-1","State":{"Running":true,"Health":{"Status":"healthy"}},`+
+				exposed+`,`+verified+`}`)
+		if err != nil {
+			t.Fatalf("StartService = %v, want success for a healthy published candidate", err)
+		}
+		if id != "cid-1" {
+			t.Fatalf("id = %q, want cid-1", id)
+		}
+		if removed != 0 {
+			t.Fatalf("discard removals = %d, want 0", removed)
+		}
+	})
+
+	t.Run("running without a verified mapping is discarded", func(t *testing.T) {
+		id, err, removed := startPublished(t,
+			`{"Id":"cid-1","State":{"Running":true,"Health":{"Status":"starting"}},`+
+				exposed+`,`+noMapping+`}`)
+		if err == nil || errors.Is(err, ErrServicePending) {
+			t.Fatalf("error = %v, want the hard mapping failure, not pending", err)
+		}
+		if !strings.Contains(err.Error(),
+			"did not report exactly one 8080/tcp host binding on 127.0.0.1") {
+			t.Fatalf("error = %v, want the actionable mapping-verification message", err)
+		}
+		if id != "" {
+			t.Fatalf("id = %q, want empty on a discarded candidate", id)
+		}
+		if removed != 1 {
+			t.Fatalf("discard removals = %d, want 1 (an unverifiable candidate must not survive)",
+				removed)
+		}
+	})
+}
+
 // A direct ServiceSpec caller with a probe but no entrypoint source fails
 // closed before any daemon call, mirroring the template parser's rejection of
 // a probe on an external image.

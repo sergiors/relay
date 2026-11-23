@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -201,6 +202,23 @@ type Config struct {
 	// validated by the routing layer (a routing concern); it is hostname-dumb
 	// config, like the other TRAEFIK_* fields.
 	TraefikHostOverride string
+	// ServiceBindAddr is the optional static host IP (SERVICE_BIND_ADDR) on
+	// which routed service containers publish their TCP port. Empty (unset)
+	// disables host publication entirely, preserving the historical
+	// internal-only service behavior. It must be a single static IPv4 or IPv6
+	// address — never a hostname or a wildcard/unspecified address — because
+	// Docker binds the exact interface and Relay never widens it. A configured
+	// bind address is part of a service container's desired configuration, so
+	// changing it replaces the affected containers during reconciliation.
+	ServiceBindAddr string
+	// ServiceAdvertiseAddr is the optional static IP (SERVICE_ADVERTISE_ADDR)
+	// operators and clients should use to reach a published service. It
+	// defaults to ServiceBindAddr when unset, empty, or whitespace-only. It is
+	// presentation metadata only: it never participates in container creation or
+	// reconciliation, so changing it alone does not replace containers. Setting
+	// it without SERVICE_BIND_ADDR is a configuration error (nothing is
+	// published).
+	ServiceAdvertiseAddr string
 	// WarmContainerIdleTimeout is the WARM_CONTAINER_IDLE_TIMEOUT value: how
 	// long a healthy idle warm execution container is kept before the runtime
 	// evicts it. Unset/empty defaults to DefaultWarmContainerIdleTimeout (5m);
@@ -507,6 +525,13 @@ func Load(logger *slog.Logger) (Config, error) {
 
 	cfg.TraefikHostOverride = getEnv("TRAEFIK_HOST_OVERRIDE", "")
 
+	serviceBindAddr, serviceAdvertiseAddr, err := LoadServicePublication()
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ServiceBindAddr = serviceBindAddr
+	cfg.ServiceAdvertiseAddr = serviceAdvertiseAddr
+
 	warmTimeout, err := ParsePositiveDuration(
 		"WARM_CONTAINER_IDLE_TIMEOUT",
 		getEnv("WARM_CONTAINER_IDLE_TIMEOUT", DefaultWarmContainerIdleTimeout.String()),
@@ -540,6 +565,95 @@ func Load(logger *slog.Logger) (Config, error) {
 // the real cause instead of a connection failure.
 func LoadDatabaseURL() (string, error) {
 	return requiredEnv("DATABASE_URL")
+}
+
+// LoadServicePublication resolves the optional service host-publication settings
+// (SERVICE_BIND_ADDR and SERVICE_ADVERTISE_ADDR) for administrative commands
+// that must know whether publication is configured without building the worker
+// configuration. It applies the same validation and advertise defaulting as
+// Load, so `relay app inspect` reports the same effective values the worker
+// uses. Both values are empty when publication is disabled.
+//
+// SERVICE_ADVERTISE_ADDR defaults to SERVICE_BIND_ADDR whenever it is omitted,
+// empty, or whitespace-only. SERVICE_BIND_ADDR treats an empty value as unset:
+// publication is disabled.
+func LoadServicePublication() (string, string, error) {
+	return parseServicePublication(
+		os.Getenv("SERVICE_BIND_ADDR"),
+		os.Getenv("SERVICE_ADVERTISE_ADDR"),
+	)
+}
+
+// parseServicePublication validates SERVICE_BIND_ADDR and
+// SERVICE_ADVERTISE_ADDR and applies the advertise default. Both must be empty
+// or a single static IP address; a non-empty advertise without bind is rejected
+// because nothing would be published. The parsed addresses are canonicalized
+// through netip so equivalent spellings compare equal. An empty or
+// whitespace-only advertise inherits the bind address.
+func parseServicePublication(bindValue, advertiseValue string) (string, string, error) {
+	bind, err := ParseServiceAddress("SERVICE_BIND_ADDR", bindValue)
+	if err != nil {
+		return "", "", err
+	}
+	advertise, err := ParseServiceAddress(
+		"SERVICE_ADVERTISE_ADDR", advertiseValue)
+	if err != nil {
+		return "", "", err
+	}
+	if advertise == "" {
+		advertise = bind
+	}
+	if advertise != "" && bind == "" {
+		return "", "", fmt.Errorf(
+			"SERVICE_ADVERTISE_ADDR requires SERVICE_BIND_ADDR")
+	}
+	return bind, advertise, nil
+}
+
+// ParseServiceAddress parses one static host IP used for service publication.
+// Empty is valid and means "not configured". Hostnames, wildcard/unspecified
+// addresses (0.0.0.0, ::), multicast addresses, IPv4 broadcast
+// (255.255.255.255), IPv4-mapped IPv6 addresses (::ffff:192.0.2.1), and
+// zone-scoped IPv6 addresses are rejected: Relay binds exactly the configured
+// interface and must never silently widen publication to every interface.
+// Loopback and link-local unicast addresses are accepted because they are real
+// host addresses, but they limit reachability to the local host or link.
+//
+// The address family is explicit in the literal (there is no interface or
+// family selection and no DNS resolution), and both IPv4 and IPv6 are
+// supported. The address is returned in netip's canonical form so configuration
+// comparisons are spelling-invariant.
+func ParseServiceAddress(name, value string) (string, error) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return "", nil
+	}
+	addr, err := netip.ParseAddr(v)
+	if err != nil {
+		return "", fmt.Errorf(
+			"invalid %s %q: must be a static IPv4 or IPv6 address", name, value)
+	}
+	if addr.Is4In6() {
+		return "", fmt.Errorf(
+			"invalid %s %q: IPv4-mapped IPv6 addresses are not supported; use the IPv4 form", name, value)
+	}
+	if addr.Zone() != "" {
+		return "", fmt.Errorf(
+			"invalid %s %q: zone-scoped addresses are not supported", name, value)
+	}
+	if addr.IsUnspecified() {
+		return "", fmt.Errorf(
+			"invalid %s %q: wildcard addresses are not allowed", name, value)
+	}
+	if addr.IsMulticast() {
+		return "", fmt.Errorf(
+			"invalid %s %q: multicast addresses are not allowed", name, value)
+	}
+	if !addr.IsGlobalUnicast() && !addr.IsLoopback() && !addr.IsLinkLocalUnicast() {
+		return "", fmt.Errorf(
+			"invalid %s %q: must be a usable unicast host address", name, value)
+	}
+	return addr.String(), nil
 }
 
 // ParseBool parses a boolean environment value using strconv.ParseBool's

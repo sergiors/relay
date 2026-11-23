@@ -161,6 +161,16 @@ type ReadinessChecker interface {
 	Ready(ctx context.Context) (bool, string)
 }
 
+// ServiceEndpointProvider is the optional live Docker view the service-endpoint
+// query needs. *runtime.Manager satisfies it via ServiceEndpoints, which lists
+// this node's service containers and inspects each to report Docker's actual
+// host binding against the configured bind address. The socket type-asserts the
+// manager it already holds, so a fake without the capability answers
+// service_endpoints_unavailable instead of guessing.
+type ServiceEndpointProvider interface {
+	ServiceEndpoints(ctx context.Context, appName, bindAddr string) ([]runtime.ServiceEndpoint, error)
+}
+
 // SocketServer is the worker-owned live query socket. It accepts one request
 // per connection, answers with a single newline-JSON frame, and is stopped as a
 // unit: Close stops accepting, closes every in-flight connection (each already
@@ -187,7 +197,14 @@ type SocketServer struct {
 	// readiness source is not ready). It is installed by Run before the socket
 	// starts serving, so a query always sees a checker.
 	readiness ReadinessChecker
-	ln        net.Listener
+	// serviceBindAddr/serviceAdvertiseAddr are the worker's effective
+	// publication configuration reported with live endpoints. They are set via
+	// SetServicePublication during worker startup (before the worker becomes
+	// ready) and read under s.mu. The advertise address is presentation metadata
+	// only.
+	serviceBindAddr      string
+	serviceAdvertiseAddr string
+	ln                   net.Listener
 
 	// baseCtx is cancelled by Close, so an in-flight manual invocation (whose
 	// own context bounds it to invokeTimeout) is cancelled promptly on shutdown
@@ -318,6 +335,29 @@ func (s *SocketServer) currentReadiness() ReadinessChecker {
 	return s.readiness
 }
 
+// SetServicePublication wires the worker's effective SERVICE_BIND_ADDR and
+// SERVICE_ADVERTISE_ADDR so the service-endpoint query reports the addresses
+// the worker actually uses. Both may be empty (publication disabled). The
+// assignment is mutex-guarded and happens during worker startup, before the
+// worker is ready to serve queries.
+func (s *SocketServer) SetServicePublication(bindAddr, advertiseAddr string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.serviceBindAddr = bindAddr
+	s.serviceAdvertiseAddr = advertiseAddr
+	s.mu.Unlock()
+}
+
+// servicePublication returns the wired bind and advertise addresses under the
+// mutex, so a concurrent setter cannot produce a torn pair.
+func (s *SocketServer) servicePublication() (string, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.serviceBindAddr, s.serviceAdvertiseAddr
+}
+
 // currentReplayer returns the wired DLQ replayer, or nil when none is set. It
 // takes the mutex so a concurrent SetReplayer is race-free.
 func (s *SocketServer) currentReplayer() HandlerReplayer {
@@ -439,6 +479,8 @@ func (s *SocketServer) handle(conn net.Conn) {
 		s.handleReplayDLQ(conn, req.App, req.Handler, req.Event, req.Trace, req.SourceMessageID)
 	case cmdReady:
 		s.handleReady(conn)
+	case cmdServiceEndpoints:
+		s.handleServiceEndpoints(conn, req.App)
 	default:
 		s.respond(conn, socketResponse{Error: errCodeMalformedRequest})
 	}
@@ -668,6 +710,59 @@ func (s *SocketServer) handleReady(conn net.Conn) {
 	_ = conn.SetDeadline(time.Now().Add(readinessProbeTimeout + runtimeStateRequestTimeout))
 	ready, reason := checker.Ready(s.baseCtx)
 	s.respond(conn, socketResponse{ReadyResult: &ReadyResult{Ready: ready, Reason: reason}})
+}
+
+// handleServiceEndpoints answers the live service-endpoint query for one app.
+// An empty app name is malformed. A manager without the ServiceEndpoints
+// capability, or a Docker inspection failure, answers
+// service_endpoints_unavailable so the CLI renders the endpoints unavailable
+// rather than substituting persisted state. The response carries the worker's
+// effective bind/advertise addresses and Docker's current container/port facts;
+// nothing is persisted and no container is mutated.
+func (s *SocketServer) handleServiceEndpoints(conn net.Conn, name string) {
+	if name == "" {
+		s.respond(conn, socketResponse{Error: errCodeMalformedRequest})
+		return
+	}
+	provider, ok := s.manager.(ServiceEndpointProvider)
+	if !ok || provider == nil {
+		s.respond(conn, socketResponse{Error: errCodeServiceEndpointsUnavailable})
+		return
+	}
+	// The inspection walk can exceed the default query budget, so give this
+	// command its own bounded deadline while it runs.
+	_ = conn.SetDeadline(time.Now().Add(serviceEndpointsRequestTimeout))
+	bindAddr, advertiseAddr := s.servicePublication()
+	ctx, cancel := context.WithTimeout(s.baseCtx, serviceEndpointsRequestTimeout)
+	defer cancel()
+	endpoints, err := provider.ServiceEndpoints(ctx, name, bindAddr)
+	if err != nil {
+		s.log.Warn("Service endpoints: live query failed",
+			"app", name,
+			"error", err,
+		)
+		s.respond(conn, socketResponse{Error: errCodeServiceEndpointsUnavailable})
+		return
+	}
+	result := &ServiceEndpointsResult{
+		BindAddr:      bindAddr,
+		AdvertiseAddr: advertiseAddr,
+		Endpoints:     make([]ServiceEndpoint, 0, len(endpoints)),
+	}
+	for _, ep := range endpoints {
+		result.Endpoints = append(result.Endpoints, ServiceEndpoint{
+			Service:     ep.Service,
+			Replica:     ep.Replica,
+			ContainerID: ep.ContainerID,
+			State:       string(ep.State),
+			Missing:     ep.Missing,
+			Health:      string(ep.Health),
+			Port:        ep.Port,
+			HostIP:      ep.HostIP,
+			HostPort:    ep.HostPort,
+		})
+	}
+	s.respond(conn, socketResponse{ServiceEndpointsResult: result})
 }
 
 // replayErrorCode maps a runner DLQ-replay error onto a stable wire code. The

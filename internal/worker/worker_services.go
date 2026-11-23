@@ -65,6 +65,10 @@ func startServiceConvergence(
 		reconcileTimeout,
 		reconciler.WithMetrics(metricsInstance),
 		reconciler.WithNetworks(cfg.Networks),
+		// Routed services publish their port on this static host IP when set.
+		// The advertise address is deliberately not wired here: it is
+		// presentation metadata and must not affect container identity.
+		reconciler.WithServiceBindAddr(cfg.ServiceBindAddr),
 		// Scope every service-container operation to this worker's stable node
 		// identity (relay.node_id). A same-NODE_ID restart still adopts its
 		// own running services; a different node's containers are untouched.

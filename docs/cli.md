@@ -99,8 +99,15 @@ read-only Docker image inspect when the app has an active image, to show the
 base image that image was built from. Unavailable provenance is reported
 honestly rather than falling back to current configuration. `inspect` shows app
 status, handlers, schedules, services, environment variable names, secret
-references, and runtime pool information. Some live pool values are unavailable
-when the worker is not running. `relay apps` is equivalent to `relay app ls`.
+references, and runtime pool information. When service host publication is
+configured (`SERVICE_BIND_ADDR`), it also shows the bind and advertise addresses
+and each replica's current local Docker state and host endpoint, queried from
+the running worker. The bind and advertised endpoints share the host port Docker
+actually assigned; a stopped or starting replica remains visible even when it
+has no active listener. Those endpoints are live facts, not persisted state;
+when the worker or Docker is unavailable they are reported as unavailable. Some
+live pool values are likewise unavailable when the worker is not running.
+`relay apps` is equivalent to `relay app ls`.
 
 ### relay app invoke
 

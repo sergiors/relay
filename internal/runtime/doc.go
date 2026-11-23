@@ -197,7 +197,9 @@
 // and bridge configuration match, a conflicting one fails startup closed, and
 // Relay never removes it on shutdown. A containerized Relay inspects and
 // attaches its own verified container; a host process must prove native bridge
-// routing from its own namespace. No host ports are published; the HMAC
+// routing from its own namespace. Execution containers publish no host ports;
+// service containers expose their internal port as metadata and publish it on
+// the host only when the worker configures a service bind address. The HMAC
 // execution channel remains the authentication boundary.
 //
 // Security baseline: every execution and service container is hardened. It runs

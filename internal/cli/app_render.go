@@ -40,20 +40,22 @@ func renderAppList(w io.Writer, rows []state.Row) error {
 // focused tests; `app inspect` uses renderAppDetailWithProvenance.
 func renderAppDetail(w io.Writer, detail state.Detail, stats state.AppStats) error {
 	return renderAppDetailWithProvenance(
-		w, detail, stats, appProvenance{})
+		w, detail, stats, appProvenance{}, nil)
 }
 
 // renderAppDetailWithProvenance renders the full detail record, its persisted
-// per-app stats, and the active image's provenance. A caller that also has live
-// pool gauges appends them with renderRuntimePool. Labels are tab-aligned
+// per-app stats, the active image's provenance, and (when publication is
+// configured) the live service endpoints. A caller that also has live pool
+// gauges appends them with renderRuntimePool. Labels are tab-aligned
 // through a tabwriter so padding matches the longest label without
-// hand-maintained spaces. The Stats, Events, Schedules, and Services sections
-// use a wider padding for visual grouping.
+// hand-maintained spaces. The Stats, Events, Schedules, Services, and
+// Service endpoints sections use a wider padding for visual grouping.
 func renderAppDetailWithProvenance(
 	w io.Writer,
 	detail state.Detail,
 	stats state.AppStats,
 	provenance appProvenance,
+	endpoints *serviceEndpointView,
 ) error {
 	out := newOutput(w)
 	renderAppOverview(out, detail, provenance)
@@ -79,6 +81,8 @@ func renderAppDetailWithProvenance(
 		out.line("Services:")
 		renderAppServices(out, detail.Services)
 	}
+
+	renderAppServiceEndpoints(out, endpoints)
 
 	if len(detail.Env) > 0 {
 		out.blank()

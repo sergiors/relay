@@ -33,6 +33,7 @@ type fakeContainer struct {
 	image                  string
 	imageID                string
 	port                   int
+	bindAddr               string // relay.bind_addr as stamped at create (spec.BindAddr)
 	replica                int
 	state                  container.ContainerState
 	entry                  []string // the long-lived process command passed to StartService
@@ -179,6 +180,7 @@ func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, r
 		image:      spec.Image,
 		imageID:    spec.ImageID,
 		port:       spec.Port,
+		bindAddr:   spec.BindAddr,
 		replica:    replica,
 		state:      container.StateRunning,
 		entry:      spec.Entry,
@@ -237,6 +239,7 @@ func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceCon
 			State:                  c.state,
 			Replica:                c.replica,
 			Port:                   c.port,
+			BindAddr:               c.bindAddr,
 			NodeID:                 c.nodeID,
 			EnvironmentFingerprint: c.environmentFingerprint,
 			Resources:              c.resources,

@@ -37,6 +37,14 @@ const (
 	// allocate unboundedly.
 	runtimeStateMaxRequest  = 64 << 10
 	runtimeStateMaxResponse = 64 << 10
+	// serviceEndpointsRequestTimeout bounds the live service-endpoint query.
+	// It is longer than runtimeStateRequestTimeout because the worker inspects
+	// every replica container (one Docker call each) rather than answering from
+	// memory; the connection deadline still prevents an unbounded handler.
+	serviceEndpointsRequestTimeout = 5 * time.Second
+	// serviceEndpointsMaxResponse bounds the service-endpoint response, which
+	// can carry one row per replica of every published service.
+	serviceEndpointsMaxResponse = 256 << 10
 	// invokeTimeout bounds one manual invocation end to end on the WORKER side:
 	// it is the context deadline the runner's executor runs under, so a wedged
 	// container cannot hold the socket handler (and the CLI's dial) open
@@ -70,6 +78,11 @@ const (
 	// failed. The CLI keeps the DLQ entry in both cases.
 	errCodeHandlerNotFound = "handler_not_found"
 	errCodeReplayFailed    = "replay_failed"
+	// errCodeServiceEndpointsUnavailable reports that the worker has no live
+	// Docker service-endpoint source (a manager without the capability), so
+	// `relay app inspect` renders the endpoints as unavailable instead of
+	// guessing from persisted state.
+	errCodeServiceEndpointsUnavailable = "service_endpoints_unavailable"
 )
 
 // Wire commands. Every request frame MUST name its command explicitly:
@@ -87,6 +100,11 @@ const (
 	cmdInvokeApp     = "invoke_app"
 	cmdReplayDLQ     = "replay_dlq"
 	cmdReady         = "ready"
+	// cmdServiceEndpoints requests app's live locally published service
+	// endpoints from this worker's Docker daemon. It carries no storage or
+	// routing details: the worker reports its own container facts and the
+	// configured bind/advertise addresses.
+	cmdServiceEndpoints = "service_endpoints"
 )
 
 // ErrRuntimeStateUnavailable reports that the live worker query socket could not
@@ -165,6 +183,13 @@ var ErrNotReady = errors.New("worker not ready")
 // operator can tell "no worker" from "worker answered not-ready".
 var ErrReadyUnavailable = errors.New("readiness unavailable")
 
+// ErrServiceEndpointsUnavailable reports that the live service-endpoint query
+// could not be answered: the worker socket is unreachable, the exchange failed,
+// or the worker has no Docker service-endpoint source. `relay app inspect`
+// renders the endpoints as unavailable rather than substituting persisted or
+// guessed values.
+var ErrServiceEndpointsUnavailable = errors.New("service endpoints unavailable")
+
 // RuntimeState is the live, worker-local runtime-pool gauge view returned by the
 // query socket. Every field is a valid zero for an app with an existing but
 // empty pool, so callers must key "known" on the query succeeding, never on the
@@ -192,6 +217,36 @@ type InvokeResult struct {
 type ReadyResult struct {
 	Ready  bool   `json:"ready"`
 	Reason string `json:"reason,omitempty"`
+}
+
+// ServiceEndpoint is one service replica returned by the query socket. State
+// and Health are Docker's current observation; Port is the service's internal
+// TCP port and HostIP/HostPort are the host binding Docker actually assigned.
+// HostPort 0 means no valid published endpoint (absent, malformed, stopped, or
+// not matching the configured bind address), not a guessed port. Missing
+// reports a container that disappeared before inspection. ContainerID is
+// diagnostic only and is not used as a metric label.
+type ServiceEndpoint struct {
+	Service     string `json:"service"`
+	Replica     int    `json:"replica"`
+	ContainerID string `json:"container_id,omitempty"`
+	State       string `json:"state,omitempty"`
+	Missing     bool   `json:"missing,omitempty"`
+	Health      string `json:"health,omitempty"`
+	Port        int    `json:"port,omitempty"`
+	HostIP      string `json:"host_ip,omitempty"`
+	HostPort    int    `json:"host_port,omitempty"`
+}
+
+// ServiceEndpointsResult is the live service-publication view returned by the
+// query socket. BindAddr and AdvertiseAddr are the worker's effective
+// configuration (advertise defaults to bind when unset or empty, so it is empty
+// only when publication is disabled); Endpoints are the current local Docker
+// facts for this worker's containers. It is never persisted.
+type ServiceEndpointsResult struct {
+	BindAddr      string            `json:"bind_addr,omitempty"`
+	AdvertiseAddr string            `json:"advertise_addr,omitempty"`
+	Endpoints     []ServiceEndpoint `json:"endpoints,omitempty"`
 }
 
 // socketRequest is the newline-JSON request frame. Command selects the
@@ -232,6 +287,7 @@ type socketResponse struct {
 	*RuntimeState
 	*InvokeResult
 	*ReadyResult
+	*ServiceEndpointsResult
 	ResetStats bool   `json:"reset_stats,omitempty"`
 	Replayed   bool   `json:"replayed,omitempty"`
 	Error      string `json:"error,omitempty"`

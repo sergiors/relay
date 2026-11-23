@@ -539,7 +539,7 @@ func Reconcile(
 ) (bool, error) {
 	pass, err := reconcileWithObserver(
 		ctx, reconcileTimeout, docker, fnName, tmpl, appImage, preparedEnv,
-		serviceNetworks, secrets, traefik, log, "", nil, nil, nil,
+		serviceNetworks, "", secrets, traefik, log, "", nil, nil, nil,
 	)
 	if pass.pending && !requestCancelled(ctx, err) {
 		// Pending is reported as ErrServicePending for the direct API. An
@@ -559,6 +559,7 @@ func reconcileWithObserver(
 	appImage string,
 	preparedEnv []string,
 	serviceNetworks []string,
+	serviceBindAddr string,
 	secrets SecretResolver,
 	traefik routing.TraefikConfig,
 	log *slog.Logger,
@@ -840,8 +841,16 @@ func reconcileWithObserver(
 		// it has no candidate readiness contract or Docker-owned attempt state to
 		// persist.
 		sourceMounted := serviceSourceMounted(docker, fnName)
+		// Host publication applies only to a routed service. An unrouted
+		// service stays internal-only even when SERVICE_BIND_ADDR is set, so its
+		// container carries no bind label and no HostConfig port binding.
+		desiredBindAddr := ""
+		if svc.Host != "" {
+			desiredBindAddr = serviceBindAddr
+		}
 		preparationGeneration := servicePreparationIdentity(
-			fnName, tmpl, svc, appImage, serviceNetworks, traefik, sourceMounted)
+			fnName, tmpl, svc, appImage, serviceNetworks, desiredBindAddr,
+			traefik, sourceMounted)
 		preparationAttempt := 0
 		preparationRetry := svc.Healthcheck != nil && !sourceMounted && stateTracker != nil
 		// preparationAdmittedAt is the start instant of the admission this pass
@@ -1244,9 +1253,10 @@ func reconcileWithObserver(
 
 		// A container is CONVERGED (a keep candidate) only when it is both
 		// healthy (running) and currently configured correctly (source reference,
-		// image, image content, port, effective environment, resources, additional
-		// tmpfs destinations, source mount, and Docker networks all match the
-		// desired values) and carries a real replica label. Anything else —
+		// image, image content, port, host bind address, effective environment,
+		// resources, additional tmpfs destinations, source mount, and Docker
+		// networks all match the desired values) and carries a real replica label.
+		// Anything else —
 		// exited/dead/removing, a changed source, a changed image, a moved
 		// external tag (image content changed), a changed port, a changed
 		// env/secret (environment fingerprint mismatch), changed resource
@@ -1276,7 +1286,8 @@ func reconcileWithObserver(
 		desiredGeneration := serviceGenerationIdentity(
 			sourceRef, resolved.Ref, resolved.ID, svc.Port,
 			environmentFingerprint, resourceHash, desiredTmpfs, desiredNetworks,
-			desiredHealthcheck, desiredSourceID, resolved.Entry, routeLabels,
+			desiredBindAddr, desiredHealthcheck, desiredSourceID, resolved.Entry,
+			routeLabels,
 		)
 		// configured reports every immutable configuration comparison except
 		// the live source fingerprint and runtime readiness, which the
@@ -1293,6 +1304,7 @@ func reconcileWithObserver(
 				ctr.Image == resolved.Ref &&
 				ctr.ImageID == resolved.ID &&
 				ctr.Port == svc.Port &&
+				ctr.BindAddr == desiredBindAddr &&
 				ctr.EnvironmentFingerprint == environmentFingerprint &&
 				ctr.Resources == resourceHash &&
 				ctr.Tmpfs == desiredTmpfs &&
@@ -1355,6 +1367,7 @@ func reconcileWithObserver(
 				Name:               name,
 				SourceRef:          sourceRef,
 				Port:               svc.Port,
+				BindAddr:           desiredBindAddr,
 				Image:              resolved.Ref,
 				ImageID:            resolved.ID,
 				Entry:              resolved.Entry,
@@ -2629,7 +2642,7 @@ func removeStaleSlot(
 func serviceGenerationIdentity(
 	sourceRef, image, imageID string,
 	port int,
-	environment, resources, tmpfs, networks, healthcheck, sourceID string,
+	environment, resources, tmpfs, networks, bindAddr, healthcheck, sourceID string,
 	entry []string,
 	labels map[string]string,
 ) string {
@@ -2642,6 +2655,7 @@ func serviceGenerationIdentity(
 		resources,
 		tmpfs,
 		networks,
+		bindAddr,
 		healthcheck,
 		sourceID,
 	}
@@ -2654,10 +2668,12 @@ func serviceGenerationIdentity(
 // generation can change at that point: source descriptor, the app image an
 // `entrypoint` service runs (a Git source update changes it while the service
 // template stays byte-identical), port, replica count, routing host/path, the
-// FULL routing configuration identity (the generated Traefik labels, which embed
-// the network, entrypoints, cert resolver, priority, and host override), the
-// EFFECTIVE probe, tmpfs, resources, runtime, env/secret bindings, and the desired
-// network set. A new desired generation therefore resets a persisted preparation
+// host bind address, the FULL routing configuration identity (the generated
+// Traefik labels, which embed the network, entrypoints, cert resolver, priority,
+// and host override), the EFFECTIVE probe, tmpfs, resources, runtime, env/secret
+// bindings, and the desired network set. It deliberately excludes the advertised
+// service address, which is presentation metadata and must never replace a
+// container. A new desired generation therefore resets a persisted preparation
 // retry window instead of inheriting an obsolete pre-candidate wait. The resolved
 // image content and resolved secret VALUES are deliberately absent: they cannot be
 // known before preparation succeeds, and the bounded window is capped regardless.
@@ -2668,7 +2684,8 @@ func serviceGenerationIdentity(
 // window) and the retry policy is the no-probe historical behavior.
 func servicePreparationIdentity(
 	fnName string, tmpl *app.Template, svc app.Service, appImage string,
-	serviceNetworks []string, traefik routing.TraefikConfig, sourceMounted bool,
+	serviceNetworks []string, bindAddr string, traefik routing.TraefikConfig,
+	sourceMounted bool,
 ) string {
 	routeNetwork := ""
 	if svc.Host != "" {
@@ -2682,6 +2699,7 @@ func servicePreparationIdentity(
 		fmt.Sprintf("%d", svc.Replicas),
 		svc.Host,
 		svc.Path,
+		bindAddr,
 		runtime.ServiceTmpfsLabel(svc.Tmpfs),
 		tmpl.ResourceLimits().Fingerprint(),
 		tmpl.Runtime,
@@ -4144,7 +4162,16 @@ type ServiceReconciler struct {
 	// behavior (no global networks). It is copied at construction and is
 	// startup configuration: changing it requires a worker restart.
 	networks []string
-	log      *slog.Logger
+	// serviceBindAddr is the static host IP (SERVICE_BIND_ADDR) routed services
+	// publish their port on. It is set through WithServiceBindAddr (the worker
+	// wires config's resolved value) and is "" for a direct call without the
+	// option, preserving internal-only behavior. It is startup configuration:
+	// changing it requires a worker restart, after which the bind label mismatch
+	// replaces the affected routed containers. The advertise address is never
+	// stored here because it is presentation metadata and must not affect
+	// reconciliation.
+	serviceBindAddr string
+	log             *slog.Logger
 
 	// reconcileTimeout is the bound Reconcile derives for each normal
 	// service-operation context, rooted in the lifecycle context its caller
@@ -4230,6 +4257,17 @@ func WithMetrics(reg *metrics.Registry) ServiceReconcilerOption {
 // startup configuration: changing it requires a worker restart.
 func WithNetworks(networks []string) ServiceReconcilerOption {
 	return func(c *ServiceReconciler) { c.networks = append([]string(nil), networks...) }
+}
+
+// WithServiceBindAddr wires the static host IP (SERVICE_BIND_ADDR) routed
+// services publish their port on. The worker passes config's resolved value;
+// omitting the option (or passing "") leaves services internal-only. The value
+// participates in the desired container configuration, so a changed address
+// replaces the affected routed containers through the normal start-before-stop
+// path. The advertise address is deliberately not an option here: it must never
+// affect container identity or replacement.
+func WithServiceBindAddr(addr string) ServiceReconcilerOption {
+	return func(c *ServiceReconciler) { c.serviceBindAddr = addr }
 }
 
 // WithNodeID scopes every service-container operation of this reconciler to
@@ -4335,8 +4373,8 @@ func (c *ServiceReconciler) ApplyResult(
 	}
 	pass, err := reconcileWithObserver(
 		ctx, c.reconcileTimeout, c.docker, fnName, tmpl, image, preparedEnv,
-		c.networks, c.secrets, c.traefik, c.log, c.nodeID, reconcileStarted,
-		c.sourceApply, c,
+		c.networks, c.serviceBindAddr, c.secrets, c.traefik, c.log, c.nodeID,
+		reconcileStarted, c.sourceApply, c,
 	)
 	duration := time.Since(start)
 	c.observeReconcile(fnName, pass.changed, pass.pending, err, duration)

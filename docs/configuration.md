@@ -19,36 +19,38 @@ fallback. See [Operations](operations.md#node-identity-loss).
 
 ## Optional
 
-| Variable                      | Default                     | Purpose and accepted values                                                               |
-| ----------------------------- | --------------------------- | ----------------------------------------------------------------------------------------- |
-| `LOG_LEVEL`                   | `INFO`                      | `DEBUG`, `INFO`, `WARN`, or `ERROR`, case-insensitive; `WARNING` is not accepted.         |
-| `MAX_CONCURRENT_INVOCATIONS`  | `8`                         | Positive integer; maximum concurrently executing invocations per worker.                  |
-| `MAX_CONCURRENT_BUILDS`       | `2`                         | Positive integer; concurrent image builds per worker.                                     |
-| `MAX_WARM_CONTAINERS`         | `8`                         | Positive integer; worker-wide cap on pooled execution containers.                         |
-| `MAX_BUFFERED_EVENTS`         | `16`                        | Positive integer; maximum messages held locally by one worker.                            |
-| `MAX_EVENT_BYTES`             | `256KiB`                    | Raw Redis `value` size limit; accepts binary sizes up to `1MiB`.                          |
-| `WARM_CONTAINER_IDLE_TIMEOUT` | `5m`                        | Positive Go duration.                                                                     |
-| `HOT_RELOAD`                  | `false`                     | Boolean; mount live source for supported runtimes instead of baking it into the image.    |
-| `PYTHON_ZUVLOOP`              | `false`                     | Boolean; use `zuvloop` for Python event and schedule handlers.                            |
-| `METRICS_ADDR`                | unset                       | Listen address for Prometheus metrics; empty disables metrics.                            |
-| `GIT_WEBHOOK_ADDR`            | unset                       | Listen address for the optional GitHub webhook. Requires a configured webhook secret.     |
-| `NETWORKS`                    | unset                       | Optional comma-separated existing, operator-managed Docker networks for app connectivity. |
-| `REDIS_STREAM_RETENTION`      | `24h`                       | Age window for trimming acknowledged stream entries; see below.                           |
-| `DLQ_RETENTION`               | `168h`                      | Age window for settled PostgreSQL DLQ rows; see below.                                    |
-| `REDIS_INVOCATION_RETENTION`  | `48h`                       | Retention for terminal invocation state after ACK.                                        |
-| `STATS_RETENTION`             | `168h`                      | Retention for stale node statistics.                                                      |
-| `TRAEFIK_NETWORK`             | unset                       | Additional Docker network; required for services with routed hosts.                       |
-| `TRAEFIK_ENTRYPOINTS`         | unset                       | Comma-separated Traefik entrypoint names.                                                 |
-| `TRAEFIK_CERTRESOLVER`        | unset                       | Traefik certificate resolver; enables TLS when set.                                       |
-| `TRAEFIK_PRIORITY`            | unset                       | Positive router priority.                                                                 |
-| `TRAEFIK_HOST_OVERRIDE`       | unset                       | Replaces the domain of each routed host with this suffix.                                 |
-| `SECRETS_PROVIDER`            | `local`                     | `local` or `infisical`; selects the worker-wide secret provider.                          |
-| `INFISICAL_SITE_URL`          | `https://app.infisical.com` | Infisical HTTPS origin; used only with `SECRETS_PROVIDER=infisical`.                      |
-| `INFISICAL_PROJECT_ID`        | Required with Infisical     | Infisical project; required only with `SECRETS_PROVIDER=infisical`.                       |
-| `INFISICAL_ENVIRONMENT`       | Required with Infisical     | Infisical environment; required only with `SECRETS_PROVIDER=infisical`.                   |
-| `INFISICAL_SECRET_PATH`       | `/`                         | Secret path; used only with Infisical and must begin with `/`.                            |
-| `INFISICAL_CLIENT_ID`         | Required with Infisical     | Universal Auth Machine Identity client ID.                                                |
-| `INFISICAL_CLIENT_SECRET`     | Required with Infisical     | Universal Auth client secret.                                                             |
+| Variable                      | Default                          | Purpose and accepted values                                                               |
+| ----------------------------- | -------------------------------- | ----------------------------------------------------------------------------------------- |
+| `LOG_LEVEL`                   | `INFO`                           | `DEBUG`, `INFO`, `WARN`, or `ERROR`, case-insensitive; `WARNING` is not accepted.         |
+| `MAX_CONCURRENT_INVOCATIONS`  | `8`                              | Positive integer; maximum concurrently executing invocations per worker.                  |
+| `MAX_CONCURRENT_BUILDS`       | `2`                              | Positive integer; concurrent image builds per worker.                                     |
+| `MAX_WARM_CONTAINERS`         | `8`                              | Positive integer; worker-wide cap on pooled execution containers.                         |
+| `MAX_BUFFERED_EVENTS`         | `16`                             | Positive integer; maximum messages held locally by one worker.                            |
+| `MAX_EVENT_BYTES`             | `256KiB`                         | Raw Redis `value` size limit; accepts binary sizes up to `1MiB`.                          |
+| `WARM_CONTAINER_IDLE_TIMEOUT` | `5m`                             | Positive Go duration.                                                                     |
+| `HOT_RELOAD`                  | `false`                          | Boolean; mount live source for supported runtimes instead of baking it into the image.    |
+| `PYTHON_ZUVLOOP`              | `false`                          | Boolean; use `zuvloop` for Python event and schedule handlers.                            |
+| `METRICS_ADDR`                | unset                            | Listen address for Prometheus metrics; empty disables metrics.                            |
+| `GIT_WEBHOOK_ADDR`            | unset                            | Listen address for the optional GitHub webhook. Requires a configured webhook secret.     |
+| `NETWORKS`                    | unset                            | Optional comma-separated existing, operator-managed Docker networks for app connectivity. |
+| `REDIS_STREAM_RETENTION`      | `24h`                            | Age window for trimming acknowledged stream entries; see below.                           |
+| `DLQ_RETENTION`               | `168h`                           | Age window for settled PostgreSQL DLQ rows; see below.                                    |
+| `REDIS_INVOCATION_RETENTION`  | `48h`                            | Retention for terminal invocation state after ACK.                                        |
+| `STATS_RETENTION`             | `168h`                           | Retention for stale node statistics.                                                      |
+| `TRAEFIK_NETWORK`             | unset                            | Additional Docker network; required for services with routed hosts.                       |
+| `TRAEFIK_ENTRYPOINTS`         | unset                            | Comma-separated Traefik entrypoint names.                                                 |
+| `TRAEFIK_CERTRESOLVER`        | unset                            | Traefik certificate resolver; enables TLS when set.                                       |
+| `TRAEFIK_PRIORITY`            | unset                            | Positive router priority.                                                                 |
+| `TRAEFIK_HOST_OVERRIDE`       | unset                            | Replaces the domain of each routed host with this suffix.                                 |
+| `SERVICE_BIND_ADDR`           | unset                            | Static host IP routed services publish their port on; unset keeps them internal-only.     |
+| `SERVICE_ADVERTISE_ADDR`      | `SERVICE_BIND_ADDR` when unset, empty, or whitespace-only | Static IP operators should use to reach a published service; display metadata only. |
+| `SECRETS_PROVIDER`            | `local`                          | `local` or `infisical`; selects the worker-wide secret provider.                          |
+| `INFISICAL_SITE_URL`          | `https://app.infisical.com`      | Infisical HTTPS origin; used only with `SECRETS_PROVIDER=infisical`.                      |
+| `INFISICAL_PROJECT_ID`        | Required with Infisical          | Infisical project; required only with `SECRETS_PROVIDER=infisical`.                       |
+| `INFISICAL_ENVIRONMENT`       | Required with Infisical          | Infisical environment; required only with `SECRETS_PROVIDER=infisical`.                   |
+| `INFISICAL_SECRET_PATH`       | `/`                              | Secret path; used only with Infisical and must begin with `/`.                            |
+| `INFISICAL_CLIENT_ID`         | Required with Infisical          | Universal Auth Machine Identity client ID.                                                |
+| `INFISICAL_CLIENT_SECRET`     | Required with Infisical          | Universal Auth client secret.                                                             |
 
 Set `INFISICAL_SITE_URL` to the self-hosted HTTPS origin when applicable. Other
 Infisical settings are ignored with the local provider. When Infisical is
@@ -175,6 +177,44 @@ state persistent. See
 `TRAEFIK_*` settings apply to services that declare routed hosts.
 `TRAEFIK_NETWORK` is required for routed services and must already exist. Relay
 does not manage the network; see [Services](services.md).
+
+### Service publication
+
+`SERVICE_BIND_ADDR` optionally publishes the TCP port of every routed service
+(one declaring a `host`) on a single static host IP. Each replica gets a
+Docker-allocated host port, so several replicas can publish at once. Unrouted
+services remain internal-only, and leaving the setting unset preserves
+internal-only behavior for every service.
+
+The value must be one static IPv4 or IPv6 address literal. Relay does not
+resolve hostnames, select an interface, or guess a family, and it binds exactly
+the configured address rather than widening publication to every interface.
+Wildcard (`0.0.0.0`, `::`), multicast, IPv4 broadcast
+(`255.255.255.255`), IPv4-mapped IPv6 (`::ffff:192.0.2.1`), and zone-scoped
+IPv6 forms are rejected. Relay cannot detect a subnet broadcast address without
+a prefix, so always supply a unicast host address. Loopback and link-local
+unicast addresses are accepted, but they limit reachability to the local host
+or link; Relay does not verify that the address exists on the host.
+
+`SERVICE_ADVERTISE_ADDR` is the address shown to operators and clients; it
+defaults to `SERVICE_BIND_ADDR` when unset, empty, or whitespace-only, and may
+differ, for example when the host is reached through another address. Setting a
+non-empty value without `SERVICE_BIND_ADDR` is a configuration error because
+nothing is published. It is display metadata only and changing it never
+replaces a container. Both settings are read at worker startup, so restart the
+worker after changing either one.
+
+Publishing a host port does not by itself make a service reachable outside the
+host. Open the chosen ports in the host firewall, and configure any routing,
+VPN, or NAT between clients and the host yourself; Relay does not manage those.
+Binding to a specific IP selects the interface Docker listens on but is not a
+complete network isolation boundary, because anything that can reach the host
+address can reach the published port.
+
+Publishing may temporarily overlap with existing Traefik labels on the same
+service: both the published host port and the Traefik route can forward to the
+container. Remove the labels only when you have moved clients to the published
+endpoint. See [Services](services.md#host-publication-optional).
 
 ## Environment owned by other libraries
 

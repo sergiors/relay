@@ -432,7 +432,7 @@ func TestServicePreparationIdentityKeysImageRoutingAndEffectiveProbe(t *testing.
 		svc app.Service, appImage string, cfg routing.TraefikConfig, mounted bool,
 	) string {
 		return servicePreparationIdentity("fn", tmpl, svc, appImage,
-			[]string{"net"}, cfg, mounted)
+			[]string{"net"}, "", cfg, mounted)
 	}
 	routed := app.Service{
 		Name: "web", Entrypoint: "service.js", Port: 8080, Replicas: 1,

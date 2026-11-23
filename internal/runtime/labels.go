@@ -139,6 +139,16 @@ const (
 	// table. It is omitted when no Relay healthcheck applies.
 	labelHealthcheckAttempt = "relay.healthcheck_attempt"
 
+	// labelBindAddr records the static host IP a routed service replica
+	// published its container port on, or is absent when no host publication was
+	// configured. It is configuration identity, not live port state: the
+	// ephemeral host port Docker allocates is read from the container's live
+	// inspect port bindings for `relay app inspect`, never persisted in a label.
+	// Comparing the label lets the reconciler replace a container when
+	// SERVICE_BIND_ADDR changes; the advertise address is deliberately not part
+	// of it.
+	labelBindAddr = "relay.bind_addr"
+
 	// Service convergence state marker labels. Relay records the committed
 	// generation in a tiny Docker volume (labels only, never mounted) so an
 	// active replica can be distinguished from an uncommitted healthcheck

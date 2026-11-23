@@ -716,7 +716,8 @@ func Run(logger *slog.Logger) (runErr error) {
 	// The live runtime-pool query socket; its readiness checker stays not-ready
 	// until the ready-to-consume boundary installs the live probe.
 	rtSocket, err := startRuntimeSocket(
-		startupCtx, logger, manager, statsFlusher, workerReady, shutdown,
+		startupCtx, logger, manager, statsFlusher, workerReady,
+		cfg.ServiceBindAddr, cfg.ServiceAdvertiseAddr, shutdown,
 	)
 	if err != nil {
 		return err

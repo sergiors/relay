@@ -85,6 +85,13 @@ type ImageProvenanceLookup func(
 // come from the persisted per-app stats row.
 type PoolSnapshotProvider func(name string) (runtime.PoolSnapshot, bool)
 
+// ServicePublicationLoader resolves the effective SERVICE_BIND_ADDR and
+// SERVICE_ADVERTISE_ADDR for `relay app inspect`, which must know whether
+// host publication is configured before deciding to render live endpoints. It
+// returns empty addresses when publication is disabled. Production:
+// config.LoadServicePublication. Tests inject fixed values.
+type ServicePublicationLoader func() (bindAddr, advertiseAddr string, err error)
+
 // Dependencies carries the CLI's injectable process seams: the filesystem
 // locations plus the state-database and DLQ-store openers the administrative
 // commands need, and the optional in-process runtime-pool provider and git sync
@@ -124,6 +131,11 @@ type Dependencies struct {
 	// live pool. Nil in production (the standalone CLI); an embedding host or a
 	// test may set it. It never supplies the cumulative counters.
 	PoolSnapshotProvider PoolSnapshotProvider
+	// LoadServicePublication resolves the effective service host-publication
+	// settings so `app inspect` renders live endpoints only when publication is
+	// configured. Production: config.LoadServicePublication. Tests inject fixed
+	// values.
+	LoadServicePublication ServicePublicationLoader
 	// LockPath is the process-level lock file `relay start` holds for its
 	// lifetime; its parent directory is created before the lock is acquired.
 	// Production: processlock.DefaultPath.
@@ -179,6 +191,7 @@ func DefaultDependencies() Dependencies {
 		OpenRuntimeImageResolver: openDistributionResolver,
 		ReadImageProvenance:      readDockerImageProvenance,
 		SocketPath:               worker.SocketPath,
+		LoadServicePublication:   config.LoadServicePublication,
 		LockPath:                 processlock.DefaultPath,
 		GitConfigPath:            git.ConfigPath,
 		GitCheckoutDir:           git.CheckoutDir,

@@ -43,7 +43,7 @@ func renderInspectWithProvenance(
 	t.Helper()
 	var w bytes.Buffer
 	if err := renderAppDetailWithProvenance(
-		&w, detail, state.AppStats{}, provenance,
+		&w, detail, state.AppStats{}, provenance, nil,
 	); err != nil {
 		t.Fatalf("render app detail: %v", err)
 	}

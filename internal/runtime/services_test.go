@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -771,6 +772,18 @@ func captureServiceCreate(t *testing.T, spec ServiceSpec) []byte {
 	if spec.ImageID != "" {
 		inspectImage = spec.ImageID
 	}
+	// The running gate inspects the started container and requires Running. A
+	// published service additionally needs Docker's actual host binding in that
+	// same inspect, so the scripted daemon reports one on the configured address.
+	inspectBody := `{"Id":"cid-1","State":{"Running":true}}`
+	if spec.BindAddr != "" {
+		bind := netip.MustParseAddr(spec.BindAddr)
+		inspectBody = fmt.Sprintf(
+			`{"Id":"cid-1","State":{"Running":true},`+
+				`"Config":{"ExposedPorts":{"%d/tcp":{}}},`+
+				`"NetworkSettings":{"Ports":{"%d/tcp":[{"HostIp":%q,"HostPort":"49152"}]}}}`,
+			spec.Port, spec.Port, bind.String())
+	}
 	cli := newScriptedDockerClient(t,
 		imageWithoutDeclaredVolumesRoute(inspectImage),
 		// Pre-create validation inspects every selected network. The scripted
@@ -782,8 +795,7 @@ func captureServiceCreate(t *testing.T, spec ServiceSpec) []byte {
 			onBody: func(b []byte) { createBody = append([]byte(nil), b...) },
 		},
 		dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
-		// The running gate inspects the started container and requires Running.
-		dockerRoute{method: http.MethodGet, path: "/containers/cid-1/json", body: `{"Id":"cid-1","State":{"Running":true}}`},
+		dockerRoute{method: http.MethodGet, path: "/containers/cid-1/json", body: inspectBody},
 	)
 	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "test-host"}
 	if _, err := m.StartService(context.Background(), spec, 0); err != nil {
@@ -1181,5 +1193,440 @@ func TestNetworkSet(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("NetworkSet[%d] = %q, want %q (full %v)", i, got[i], want[i], got)
 		}
+	}
+}
+
+func TestServicePublishedBinding(t *testing.T) {
+	makeInspect := func(
+		bindings network.PortMap,
+		exposed ...string,
+	) container.InspectResponse {
+		ports := network.PortSet{}
+		for _, p := range exposed {
+			ports[network.MustParsePort(p)] = struct{}{}
+		}
+		return container.InspectResponse{
+			Config:          &container.Config{ExposedPorts: ports},
+			NetworkSettings: &container.NetworkSettings{Ports: bindings},
+		}
+	}
+	port8080 := network.MustParsePort("8080/tcp")
+	port8443 := network.MustParsePort("8443/tcp")
+	port9090 := network.MustParsePort("9090/tcp")
+	valid := network.PortMap{
+		port8080: {{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: "49152"}},
+	}
+	tests := []struct {
+		name     string
+		insp     container.InspectResponse
+		port     int
+		expected string
+		wantIP   string
+		wantPort int
+		wantOK   bool
+	}{
+		{
+			name: "valid ipv4", insp: makeInspect(valid, "8080/tcp"),
+			port: 8080, expected: "127.0.0.1",
+			wantIP: "127.0.0.1", wantPort: 49152, wantOK: true,
+		},
+		{
+			// Some daemons report an IPv4 binding in mapped form; the endpoint
+			// must still match and be returned unmapped.
+			name: "ipv4-mapped binding unmapped",
+			insp: makeInspect(network.PortMap{
+				port8080: {{HostIP: netip.MustParseAddr("::ffff:127.0.0.1"), HostPort: "49152"}},
+			}, "8080/tcp"),
+			port: 8080, expected: "127.0.0.1",
+			wantIP: "127.0.0.1", wantPort: 49152, wantOK: true,
+		},
+		{
+			name: "valid ipv6",
+			insp: makeInspect(network.PortMap{
+				port8443: {{HostIP: netip.MustParseAddr("2001:db8::1"), HostPort: "32768"}},
+			}, "8443/tcp"),
+			port: 8443, expected: "2001:db8::1",
+			wantIP: "2001:db8::1", wantPort: 32768, wantOK: true,
+		},
+		{
+			name: "absent binding", insp: makeInspect(nil, "8080/tcp"),
+			port: 8080, expected: "127.0.0.1",
+		},
+		{
+			name: "multiple bindings",
+			insp: makeInspect(network.PortMap{
+				port8080: {
+					{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: "49152"},
+					{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: "49153"},
+				},
+			}, "8080/tcp"),
+			port: 8080, expected: "127.0.0.1",
+		},
+		{
+			name: "unexpected bind ip", insp: makeInspect(valid, "8080/tcp"),
+			port: 8080, expected: "127.0.0.2",
+		},
+		{
+			name: "wildcard actual binding",
+			insp: makeInspect(network.PortMap{
+				port8080: {{HostPort: "49152"}},
+			}, "8080/tcp"),
+			port: 8080, expected: "127.0.0.1",
+		},
+		{
+			name: "explicit 0.0.0.0 binding",
+			insp: makeInspect(network.PortMap{
+				port8080: {{HostIP: netip.MustParseAddr("0.0.0.0"), HostPort: "49152"}},
+			}, "8080/tcp"),
+			port: 8080, expected: "127.0.0.1",
+		},
+		{
+			name: "multicast binding",
+			insp: makeInspect(network.PortMap{
+				port8080: {{HostIP: netip.MustParseAddr("224.0.0.1"), HostPort: "49152"}},
+			}, "8080/tcp"),
+			port: 8080, expected: "127.0.0.1",
+		},
+		{
+			name: "extra published port",
+			insp: makeInspect(network.PortMap{
+				port8080: {{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: "49152"}},
+				port9090: {{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: "49153"}},
+			}, "8080/tcp", "9090/tcp"),
+			port: 8080, expected: "127.0.0.1",
+		},
+		{
+			name: "malformed host port",
+			insp: makeInspect(network.PortMap{
+				port8080: {{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: "notaport"}},
+			}, "8080/tcp"),
+			port: 8080, expected: "127.0.0.1",
+		},
+		{
+			name: "host port out of range",
+			insp: makeInspect(network.PortMap{
+				port8080: {{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: "70000"}},
+			}, "8080/tcp"),
+			port: 8080, expected: "127.0.0.1",
+		},
+		{
+			name: "invalid service port", insp: makeInspect(valid, "8080/tcp"),
+			port: 0, expected: "127.0.0.1",
+		},
+		{
+			name: "service port not exposed", insp: makeInspect(valid, "9090/tcp"),
+			port: 8080, expected: "127.0.0.1",
+		},
+		{
+			name: "no expected address", insp: makeInspect(valid, "8080/tcp"),
+			port: 8080,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			expected := netip.Addr{}
+			if tc.expected != "" {
+				expected = netip.MustParseAddr(tc.expected)
+			}
+			ip, port, ok := servicePublishedBinding(tc.insp, tc.port, expected)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v (ip=%q port=%d)", ok, tc.wantOK, ip, port)
+			}
+			if ip != tc.wantIP || port != tc.wantPort {
+				t.Fatalf("binding = %q/%d, want %q/%d", ip, port, tc.wantIP, tc.wantPort)
+			}
+		})
+	}
+}
+
+func TestServiceEndpointsReadsInspectedBinding(t *testing.T) {
+	labels := `{"relay.type":"service","relay.app":"fn","relay.service":"web",` +
+		`"relay.identity":"svc.js","relay.port":"8080","relay.replica":"0",` +
+		`"relay.node_id":"h1","relay.bind_addr":"127.0.0.1"}`
+	list := `[{"Id":"c1","Labels":` + labels + `,` +
+		`"Ports":[{"PrivatePort":8080,"PublicPort":9999,"Type":"tcp","IP":"10.0.0.9"}]}]`
+	inspect := `{"Id":"c1","State":{"Status":"running","Running":true,` +
+		`"Health":{"Status":"healthy"}},` +
+		`"Config":{"ExposedPorts":{"8080/tcp":{}},"Labels":` + labels + `},` +
+		`"NetworkSettings":{"Ports":{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]}}}`
+	cli := newScriptedDockerClient(t,
+		dockerRoute{method: http.MethodGet, path: "/containers/json", body: list},
+		dockerRoute{method: http.MethodGet, path: "/containers/c1/json", body: inspect},
+	)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "h1"}
+
+	endpoints, err := m.ServiceEndpoints(context.Background(), "fn", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("ServiceEndpoints: %v", err)
+	}
+	if len(endpoints) != 1 {
+		t.Fatalf("endpoints = %+v, want one", endpoints)
+	}
+	got := endpoints[0]
+	if got.Service != "web" || got.Replica != 0 || got.Port != 8080 {
+		t.Fatalf("identity = %+v, want web[0] port 8080", got)
+	}
+	if got.State != container.StateRunning || got.Health != container.Healthy {
+		t.Fatalf("state/health = %q/%q, want running/healthy", got.State, got.Health)
+	}
+	if got.HostIP != "127.0.0.1" || got.HostPort != 49152 {
+		t.Fatalf("binding = %q/%d, want the inspected 127.0.0.1/49152 (never the list summary)",
+			got.HostIP, got.HostPort)
+	}
+}
+
+func TestServiceEndpointsReportsStoppedAndMissingContainers(t *testing.T) {
+	labelsFor := func(replica string) string {
+		return `{"relay.type":"service","relay.app":"fn","relay.service":"web",` +
+			`"relay.identity":"svc.js","relay.port":"8080","relay.replica":"` + replica + `",` +
+			`"relay.node_id":"h1","relay.bind_addr":"127.0.0.1"}`
+	}
+	unrouted := `{"relay.type":"service","relay.app":"fn","relay.service":"worker",` +
+		`"relay.identity":"svc.js","relay.port":"9000","relay.replica":"0",` +
+		`"relay.node_id":"h1"}`
+	list := `[{"Id":"c1","Labels":` + labelsFor("0") + `},` +
+		`{"Id":"c2","Labels":` + labelsFor("1") + `},` +
+		`{"Id":"c3","Labels":` + unrouted + `}]`
+	stopped := `{"Id":"c1","State":{"Status":"exited","Running":false},` +
+		`"Config":{"ExposedPorts":{"8080/tcp":{}},"Labels":` + labelsFor("0") + `},` +
+		`"NetworkSettings":{"Ports":{}}}`
+	cli := newScriptedDockerClient(t,
+		dockerRoute{method: http.MethodGet, path: "/containers/json", body: list},
+		dockerRoute{method: http.MethodGet, path: "/containers/c1/json", body: stopped},
+		dockerRoute{
+			method: http.MethodGet, path: "/containers/c2/json",
+			status: http.StatusNotFound, body: `{"message":"no such container"}`,
+		},
+		// c3 is unrouted and must never be inspected.
+	)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "h1"}
+
+	endpoints, err := m.ServiceEndpoints(context.Background(), "fn", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("ServiceEndpoints: %v", err)
+	}
+	if len(endpoints) != 2 {
+		t.Fatalf("endpoints = %+v, want stopped + missing (unrouted omitted)", endpoints)
+	}
+	if endpoints[0].Replica != 0 || endpoints[0].State != container.StateExited {
+		t.Fatalf("stopped endpoint = %+v, want replica 0 exited", endpoints[0])
+	}
+	if endpoints[0].HostPort != 0 || endpoints[0].HostIP != "" {
+		t.Fatalf("stopped endpoint binding = %q/%d, want not published",
+			endpoints[0].HostIP, endpoints[0].HostPort)
+	}
+	if !endpoints[1].Missing {
+		t.Fatalf("missing endpoint = %+v, want Missing", endpoints[1])
+	}
+}
+
+func TestServiceEndpointsInspectionFailureIsAnError(t *testing.T) {
+	labels := `{"relay.type":"service","relay.app":"fn","relay.service":"web",` +
+		`"relay.identity":"svc.js","relay.port":"8080","relay.replica":"0",` +
+		`"relay.node_id":"h1","relay.bind_addr":"127.0.0.1"}`
+	list := `[{"Id":"c1","Labels":` + labels + `}]`
+	cli := newScriptedDockerClient(t,
+		dockerRoute{method: http.MethodGet, path: "/containers/json", body: list},
+		dockerRoute{
+			method: http.MethodGet, path: "/containers/c1/json",
+			status: http.StatusInternalServerError, body: `{"message":"boom"}`,
+		},
+	)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "h1"}
+
+	if _, err := m.ServiceEndpoints(context.Background(), "fn", "127.0.0.1"); err == nil {
+		t.Fatal("ServiceEndpoints returned nil error for a failed inspect; want unavailable")
+	}
+}
+
+func TestStartServicePublishesPortOnlyWhenBindConfigured(t *testing.T) {
+	spec := ServiceSpec{
+		App: "fn", Name: "web", SourceRef: "svc.js", Port: 8080, Image: "img",
+		Networks: []string{"backend"},
+	}
+	without := decodeCreateRequest(t, captureServiceCreate(t, spec))
+	if len(without.HostConfig.PortBindings) != 0 {
+		t.Fatalf("PortBindings = %v without a bind address, want none", without.HostConfig.PortBindings)
+	}
+	if _, ok := without.Config.Labels[labelBindAddr]; ok {
+		t.Fatalf("relay.bind_addr must be absent without publication, got %q",
+			without.Config.Labels[labelBindAddr])
+	}
+
+	spec.BindAddr = "2001:0db8::1"
+	with := decodeCreateRequest(t, captureServiceCreate(t, spec))
+	bindings := with.HostConfig.PortBindings[network.MustParsePort("8080/tcp")]
+	if len(bindings) != 1 {
+		t.Fatalf("PortBindings = %v, want exactly one", with.HostConfig.PortBindings)
+	}
+	if bindings[0].HostIP != netip.MustParseAddr("2001:db8::1") {
+		t.Fatalf("HostIP = %v, want the canonical IPv6 bind", bindings[0].HostIP)
+	}
+	if bindings[0].HostPort != "" {
+		t.Fatalf("HostPort = %q, want Docker-allocated (empty)", bindings[0].HostPort)
+	}
+	if got := with.Config.Labels[labelBindAddr]; got != "2001:db8::1" {
+		t.Fatalf("relay.bind_addr = %q, want canonical bind", got)
+	}
+}
+
+func TestStartServiceRejectsUnusableDirectBindAddresses(t *testing.T) {
+	for _, bind := range []string{
+		"0.0.0.0", "::", "224.0.0.1", "255.255.255.255",
+		"::ffff:127.0.0.1", "fe80::1%eth0", "relay.example.com",
+	} {
+		t.Run(bind, func(t *testing.T) {
+			cli := newScriptedDockerClient(t)
+			m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "h1"}
+			_, err := m.StartService(context.Background(), ServiceSpec{
+				App: "fn", Name: "web", SourceRef: "svc.js", Port: 8080,
+				Image: "img", BindAddr: bind,
+			}, 0)
+			if err == nil {
+				t.Fatalf("StartService accepted unusable bind address %q", bind)
+			}
+		})
+	}
+}
+
+// The endpoint view is scoped to THIS node's containers of the queried app:
+// another app's published service and another node's replica of the same app
+// are never inspected or reported.
+func TestServiceEndpointsScopesToAppAndNode(t *testing.T) {
+	labels := func(app, node string) string {
+		return `{"relay.type":"service","relay.app":"` + app +
+			`","relay.service":"web","relay.identity":"svc.js","relay.port":"8080",` +
+			`"relay.replica":"0","relay.node_id":"` + node +
+			`","relay.bind_addr":"127.0.0.1"}`
+	}
+	list := `[{"Id":"c1","Labels":` + labels("fn", "h1") + `},` +
+		`{"Id":"c2","Labels":` + labels("other", "h1") + `},` +
+		`{"Id":"c3","Labels":` + labels("fn", "h2") + `}]`
+	inspect := `{"Id":"c1","State":{"Status":"running","Running":true},` +
+		`"Config":{"ExposedPorts":{"8080/tcp":{}},"Labels":` + labels("fn", "h1") + `},` +
+		`"NetworkSettings":{"Ports":{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]}}}`
+	// Only c1 has an inspect route: inspecting c2 or c3 fails the scripted
+	// daemon loudly instead of passing unnoticed.
+	cli := newScriptedDockerClient(t,
+		dockerRoute{method: http.MethodGet, path: "/containers/json", body: list},
+		dockerRoute{method: http.MethodGet, path: "/containers/c1/json", body: inspect},
+	)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "h1"}
+
+	endpoints, err := m.ServiceEndpoints(context.Background(), "fn", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("ServiceEndpoints: %v", err)
+	}
+	if len(endpoints) != 1 || endpoints[0].ContainerID != "c1" {
+		t.Fatalf("endpoints = %+v, want only this node's container of this app", endpoints)
+	}
+}
+
+// An unusable expected bind address is refused before any Docker call: the
+// query must never report endpoints against a wildcard, hostname, or
+// zone-scoped address that would misrepresent the actual publication.
+func TestServiceEndpointsRejectsUnusableExpectedBind(t *testing.T) {
+	cli := newScriptedDockerClient(t)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "h1"}
+
+	for _, expected := range []string{"0.0.0.0", "::", "relay.example.com", "fe80::1%eth0"} {
+		t.Run(expected, func(t *testing.T) {
+			_, err := m.ServiceEndpoints(context.Background(), "fn", expected)
+			if err == nil || !strings.Contains(err.Error(), "invalid bind address") {
+				t.Fatalf("ServiceEndpoints(%q) error = %v, want an invalid bind address error",
+					expected, err)
+			}
+		})
+	}
+}
+
+// Equivalent spellings of the configured address still match Docker's
+// canonical binding: configuration is canonicalized, and the inspection path
+// compares parsed addresses, never raw strings.
+func TestServiceEndpointsMatchesCanonicalBindSpelling(t *testing.T) {
+	labels := `{"relay.type":"service","relay.app":"fn","relay.service":"web",` +
+		`"relay.identity":"svc.js","relay.port":"8443","relay.replica":"0",` +
+		`"relay.node_id":"h1","relay.bind_addr":"2001:db8::1"}`
+	list := `[{"Id":"c1","Labels":` + labels + `}]`
+	inspect := `{"Id":"c1","State":{"Status":"running","Running":true},` +
+		`"Config":{"ExposedPorts":{"8443/tcp":{}},"Labels":` + labels + `},` +
+		`"NetworkSettings":{"Ports":{"8443/tcp":[{"HostIp":"2001:db8::1","HostPort":"32768"}]}}}`
+	cli := newScriptedDockerClient(t,
+		dockerRoute{method: http.MethodGet, path: "/containers/json", body: list},
+		dockerRoute{method: http.MethodGet, path: "/containers/c1/json", body: inspect},
+	)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "h1"}
+
+	endpoints, err := m.ServiceEndpoints(context.Background(), "fn", "2001:0db8::1")
+	if err != nil {
+		t.Fatalf("ServiceEndpoints: %v", err)
+	}
+	if len(endpoints) != 1 || endpoints[0].HostIP != "2001:db8::1" ||
+		endpoints[0].HostPort != 32768 {
+		t.Fatalf("endpoints = %+v, want the canonical IPv6 binding matched and reported",
+			endpoints)
+	}
+}
+
+// A published service is handed back only when the post-start inspect proves
+// the requested mapping. Each case below leaves the container RUNNING yet
+// unverifiable: StartService must fail with the actionable verification
+// message and discard the container — never report success (the caller would
+// stop the still-serving generation for an endpoint that was never published)
+// and never report pending (there is no probe to observe).
+func TestStartServiceUnverifiedBindingDiscardsAndFails(t *testing.T) {
+	const valid = `{"HostIp":"127.0.0.1","HostPort":"49152"}`
+	cases := []struct{ name, ports string }{
+		{"missing mapping", `"Ports":{}`},
+		{"malformed host port",
+			`"Ports":{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"notaport"}]}`},
+		{"multiple bindings",
+			`"Ports":{"8080/tcp":[` + valid +
+				`,{"HostIp":"127.0.0.1","HostPort":"49153"}]}`},
+		{"extra published port",
+			`"Ports":{"8080/tcp":[` + valid +
+				`],"9090/tcp":[{"HostIp":"127.0.0.1","HostPort":"49153"}]}`},
+		{"mismatched bind address",
+			`"Ports":{"8080/tcp":[{"HostIp":"127.0.0.2","HostPort":"49152"}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			removed := 0
+			inspect := `{"Id":"cid-1","State":{"Running":true},` +
+				`"Config":{"ExposedPorts":{"8080/tcp":{}}},` +
+				`"NetworkSettings":{` + tc.ports + `}}`
+			cli := newScriptedDockerClient(t,
+				imageWithoutDeclaredVolumesRoute("img"),
+				dockerRoute{method: http.MethodPost, path: "/containers/create",
+					body: `{"Id":"cid-1"}`},
+				dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
+				dockerRoute{method: http.MethodGet, path: "/containers/cid-1/json",
+					body: inspect},
+				dockerRoute{method: http.MethodDelete, path: "/containers/cid-1",
+					body: `{}`, onMatch: func() { removed++ }},
+			)
+			m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "h"}
+			id, err := m.StartService(context.Background(), ServiceSpec{
+				App: "fn", Name: "svc", SourceRef: "service.js", Port: 8080,
+				Image: "img", Env: []string{"PORT=8080"}, BindAddr: "127.0.0.1",
+			}, 0)
+			if err == nil {
+				t.Fatal("an unverified mapping must fail StartService")
+			}
+			if !strings.Contains(err.Error(),
+				"did not report exactly one 8080/tcp host binding on 127.0.0.1") {
+				t.Fatalf("error = %v, want the actionable mapping-verification message", err)
+			}
+			if errors.Is(err, ErrServicePending) {
+				t.Fatalf("error = %v, want a hard failure, not a pending candidate", err)
+			}
+			if id != "" {
+				t.Fatalf("id = %q, want empty on failure", id)
+			}
+			if removed != 1 {
+				t.Fatalf("discard removals = %d, want 1 (the unverified container must not survive)",
+					removed)
+			}
+		})
 	}
 }

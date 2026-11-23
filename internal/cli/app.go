@@ -146,8 +146,15 @@ func appInspect(ctx context.Context, w io.Writer, name string, deps Dependencies
 	if detail.Image != "" {
 		provenance = lookupAppProvenance(ctx, detail.Image, deps)
 	}
+	// Service endpoints are live worker/Docker facts, not persisted state. They
+	// are resolved only when host publication is configured, so an inspect
+	// against an internal-only deployment keeps its existing output.
+	endpoints, err := resolveServiceEndpoints(name, deps)
+	if err != nil {
+		return err
+	}
 	if err := renderAppDetailWithProvenance(
-		w, detail, stats, provenance,
+		w, detail, stats, provenance, endpoints,
 	); err != nil {
 		return err
 	}

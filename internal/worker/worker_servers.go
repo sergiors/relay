@@ -31,6 +31,7 @@ func startRuntimeSocket(
 	manager *runtime.Manager,
 	statsFlusher *statsFlusher,
 	workerReady *readiness,
+	serviceBindAddr, serviceAdvertiseAddr string,
 	shutdown *shutdownRegistry,
 ) (*SocketServer, error) {
 	_, socketSpan := tracing.Start(startupCtx, "runtime.socket")
@@ -43,6 +44,7 @@ func startRuntimeSocket(
 	}
 	socketSpan.End()
 	rtSocket.SetReadiness(workerReady)
+	rtSocket.SetServicePublication(serviceBindAddr, serviceAdvertiseAddr)
 	// rtSocket.Close takes no context; the shutdown registry bounds its wait.
 	shutdown.register(shutdownStep{
 		name:    shutdownStepSocket,

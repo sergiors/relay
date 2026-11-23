@@ -1266,3 +1266,300 @@ func TestLoadInvalidPythonZuvloopReturnsError(t *testing.T) {
 		})
 	}
 }
+
+// unsetEnv unsets key for the duration of the test and restores its previous
+// value (or absence) on cleanup. t.Setenv cannot model an OMITTED variable
+// because it always sets one, so this helper keeps omitted and empty
+// environment values distinguishable in tests.
+func unsetConfigEnvForTest(t *testing.T, key string) {
+	t.Helper()
+	prev, existed := os.LookupEnv(key)
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatalf("unset %s: %v", key, err)
+	}
+	t.Cleanup(func() {
+		if existed {
+			_ = os.Setenv(key, prev)
+			return
+		}
+		_ = os.Unsetenv(key)
+	})
+}
+
+func TestParseServiceAddress(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		want    string
+		wantErr string
+	}{
+		{name: "empty disables", value: "", want: ""},
+		{name: "whitespace disables", value: "  ", want: ""},
+		{name: "ipv4 canonical", value: "10.0.0.1", want: "10.0.0.1"},
+		{name: "ipv4 loopback", value: "127.0.0.1", want: "127.0.0.1"},
+		{name: "ipv6 canonical", value: "2001:0db8::1", want: "2001:db8::1"},
+		{name: "ipv6 loopback", value: "::1", want: "::1"},
+		{name: "link local ipv4", value: "169.254.10.1", want: "169.254.10.1"},
+		{name: "hostname rejected", value: "relay.example.com", wantErr: "IPv4 or IPv6"},
+		{name: "ipv4 wildcard rejected", value: "0.0.0.0", wantErr: "wildcard"},
+		{name: "ipv6 wildcard rejected", value: "::", wantErr: "wildcard"},
+		{name: "multicast rejected", value: "224.0.0.1", wantErr: "multicast"},
+		{name: "ipv4 broadcast rejected", value: "255.255.255.255", wantErr: "unicast"},
+		{name: "mapped ipv6 rejected", value: "::ffff:10.0.0.1", wantErr: "IPv4-mapped"},
+		{name: "zone rejected", value: "fe80::1%eth0", wantErr: "zone-scoped"},
+		{name: "port rejected", value: "10.0.0.1:80", wantErr: "IPv4 or IPv6"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseServiceAddress("SERVICE_BIND_ADDR", tc.value)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("ParseServiceAddress(%q) error = %v, want containing %q",
+						tc.value, err, tc.wantErr)
+				}
+				for _, want := range []string{"SERVICE_BIND_ADDR", tc.value} {
+					if !strings.Contains(err.Error(), want) {
+						t.Fatalf("error %q does not name %q", err, want)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseServiceAddress(%q): %v", tc.value, err)
+			}
+			if got != tc.want {
+				t.Fatalf("ParseServiceAddress(%q) = %q, want %q", tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseServicePublicationDefaultsAndValidation(t *testing.T) {
+	tests := []struct {
+		name      string
+		bind      string
+		advertise string
+		wantBind  string
+		wantAdv   string
+		wantErr   string
+	}{
+		{
+			name: "both omitted disables publication",
+		},
+		{
+			name:     "bind only defaults advertise",
+			bind:     "10.0.0.1",
+			wantBind: "10.0.0.1",
+			wantAdv:  "10.0.0.1",
+		},
+		{
+			name:      "explicit advertise",
+			bind:      "10.0.0.1",
+			advertise: "203.0.113.7",
+			wantBind:  "10.0.0.1",
+			wantAdv:   "203.0.113.7",
+		},
+		{
+			name:     "empty advertise inherits bind",
+			bind:     "10.0.0.1",
+			wantBind: "10.0.0.1",
+			wantAdv:  "10.0.0.1",
+		},
+		{
+			name:      "whitespace advertise inherits bind",
+			bind:      "10.0.0.1",
+			advertise: "   ",
+			wantBind:  "10.0.0.1",
+			wantAdv:   "10.0.0.1",
+		},
+		{
+			name:      "advertise without bind rejected",
+			advertise: "10.0.0.1",
+			wantErr:   "requires SERVICE_BIND_ADDR",
+		},
+		{
+			name: "empty advertise without bind is allowed",
+		},
+		{
+			name:      "whitespace advertise without bind is allowed",
+			advertise: "  ",
+		},
+		{
+			name:    "invalid bind rejected",
+			bind:    "0.0.0.0",
+			wantErr: "wildcard",
+		},
+		{
+			name:      "invalid advertise rejected",
+			bind:      "10.0.0.1",
+			advertise: "relay.example.com",
+			wantErr:   "IPv4 or IPv6",
+		},
+		{
+			name:     "ipv6 values canonicalized",
+			bind:     "2001:0db8::1",
+			wantBind: "2001:db8::1",
+			wantAdv:  "2001:db8::1",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bind, advertise, err := parseServicePublication(
+				tc.bind, tc.advertise)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error = %v, want containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseServicePublication: %v", err)
+			}
+			if bind != tc.wantBind || advertise != tc.wantAdv {
+				t.Fatalf("got bind=%q advertise=%q, want %q/%q",
+					bind, advertise, tc.wantBind, tc.wantAdv)
+			}
+		})
+	}
+}
+
+func TestLoadServicePublicationDefaultsAdvertiseToBind(t *testing.T) {
+	unsetConfigEnvForTest(t, "SERVICE_BIND_ADDR")
+	unsetConfigEnvForTest(t, "SERVICE_ADVERTISE_ADDR")
+
+	bind, advertise, err := LoadServicePublication()
+	if err != nil || bind != "" || advertise != "" {
+		t.Fatalf("disabled publication = %q/%q/%v, want empty/empty/nil", bind, advertise, err)
+	}
+
+	t.Setenv("SERVICE_BIND_ADDR", "127.0.0.1")
+	bind, advertise, err = LoadServicePublication()
+	if err != nil || bind != "127.0.0.1" || advertise != "127.0.0.1" {
+		t.Fatalf("omitted advertise = %q/%q/%v, want 127.0.0.1 twice", bind, advertise, err)
+	}
+
+	t.Setenv("SERVICE_ADVERTISE_ADDR", "")
+	bind, advertise, err = LoadServicePublication()
+	if err != nil || bind != "127.0.0.1" || advertise != "127.0.0.1" {
+		t.Fatalf("explicit empty advertise = %q/%q/%v, want bind twice", bind, advertise, err)
+	}
+
+	t.Setenv("SERVICE_ADVERTISE_ADDR", "   ")
+	bind, advertise, err = LoadServicePublication()
+	if err != nil || bind != "127.0.0.1" || advertise != "127.0.0.1" {
+		t.Fatalf("whitespace advertise = %q/%q/%v, want bind twice", bind, advertise, err)
+	}
+
+	t.Setenv("SERVICE_ADVERTISE_ADDR", "10.0.0.9")
+	bind, advertise, err = LoadServicePublication()
+	if err != nil || bind != "127.0.0.1" || advertise != "10.0.0.9" {
+		t.Fatalf("explicit advertise = %q/%q/%v", bind, advertise, err)
+	}
+}
+
+// TestLoadResolvesServicePublication pins how publication settings reach the
+// worker Config: unset or explicitly empty SERVICE_BIND_ADDR disables
+// publication entirely, and an omitted, empty, or whitespace-only advertise
+// address defaults to the bind address.
+func TestLoadResolvesServicePublication(t *testing.T) {
+	setRequiredEnv(t)
+	unsetConfigEnvForTest(t, "SERVICE_BIND_ADDR")
+	unsetConfigEnvForTest(t, "SERVICE_ADVERTISE_ADDR")
+
+	cfg := mustLoad(t)
+	if cfg.ServiceBindAddr != "" || cfg.ServiceAdvertiseAddr != "" {
+		t.Fatalf("omitted publication = %q/%q, want empty/empty",
+			cfg.ServiceBindAddr, cfg.ServiceAdvertiseAddr)
+	}
+
+	t.Setenv("SERVICE_BIND_ADDR", "")
+	cfg = mustLoad(t)
+	if cfg.ServiceBindAddr != "" || cfg.ServiceAdvertiseAddr != "" {
+		t.Fatalf("explicit empty bind = %q/%q, want publication disabled",
+			cfg.ServiceBindAddr, cfg.ServiceAdvertiseAddr)
+	}
+
+	t.Setenv("SERVICE_BIND_ADDR", "127.0.0.1")
+	cfg = mustLoad(t)
+	if cfg.ServiceBindAddr != "127.0.0.1" || cfg.ServiceAdvertiseAddr != "127.0.0.1" {
+		t.Fatalf("omitted advertise = %q/%q, want 127.0.0.1 twice",
+			cfg.ServiceBindAddr, cfg.ServiceAdvertiseAddr)
+	}
+
+	t.Setenv("SERVICE_ADVERTISE_ADDR", "")
+	cfg = mustLoad(t)
+	if cfg.ServiceBindAddr != "127.0.0.1" || cfg.ServiceAdvertiseAddr != "127.0.0.1" {
+		t.Fatalf("explicit empty advertise = %q/%q, want bind twice",
+			cfg.ServiceBindAddr, cfg.ServiceAdvertiseAddr)
+	}
+
+	t.Setenv("SERVICE_ADVERTISE_ADDR", "   ")
+	cfg = mustLoad(t)
+	if cfg.ServiceBindAddr != "127.0.0.1" || cfg.ServiceAdvertiseAddr != "127.0.0.1" {
+		t.Fatalf("whitespace advertise = %q/%q, want bind twice",
+			cfg.ServiceBindAddr, cfg.ServiceAdvertiseAddr)
+	}
+
+	t.Setenv("SERVICE_ADVERTISE_ADDR", "2001:0db8::9")
+	cfg = mustLoad(t)
+	if cfg.ServiceAdvertiseAddr != "2001:db8::9" {
+		t.Fatalf("advertise = %q, want the canonical IPv6 address", cfg.ServiceAdvertiseAddr)
+	}
+}
+
+// TestLoadRejectsInvalidServicePublication pins startup failing closed on an
+// unusable publication configuration: a wildcard or hostname bind must never
+// widen publication, and an advertise address without a bind would advertise
+// nothing reachable.
+func TestLoadRejectsInvalidServicePublication(t *testing.T) {
+	tests := []struct {
+		name      string
+		bind      string
+		advertise string
+		wantErr   string
+	}{
+		{name: "wildcard bind", bind: "0.0.0.0", wantErr: "SERVICE_BIND_ADDR"},
+		{name: "ipv6 wildcard bind", bind: "::", wantErr: "SERVICE_BIND_ADDR"},
+		{name: "hostname bind", bind: "relay.example.com", wantErr: "SERVICE_BIND_ADDR"},
+		{name: "advertise without bind", advertise: "10.0.0.1", wantErr: "SERVICE_ADVERTISE_ADDR"},
+		{
+			name: "invalid advertise", bind: "10.0.0.1", advertise: "0.0.0.0",
+			wantErr: "SERVICE_ADVERTISE_ADDR",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			unsetConfigEnvForTest(t, "SERVICE_BIND_ADDR")
+			unsetConfigEnvForTest(t, "SERVICE_ADVERTISE_ADDR")
+			t.Setenv("SERVICE_BIND_ADDR", tc.bind)
+			if tc.advertise != "" {
+				t.Setenv("SERVICE_ADVERTISE_ADDR", tc.advertise)
+			}
+			_, err := Load(discardLogger())
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Load error = %v, want one naming %s", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestLoadServicePublicationRejectsInvalidEnvironment covers the
+// administrative loader behind `relay app inspect`: unusable environment values
+// must surface as errors, never as effective configuration to render.
+func TestLoadServicePublicationRejectsInvalidEnvironment(t *testing.T) {
+	unsetConfigEnvForTest(t, "SERVICE_ADVERTISE_ADDR")
+
+	t.Setenv("SERVICE_BIND_ADDR", "0.0.0.0")
+	if _, _, err := LoadServicePublication(); err == nil ||
+		!strings.Contains(err.Error(), "SERVICE_BIND_ADDR") {
+		t.Fatalf("LoadServicePublication with wildcard bind error = %v, want one naming SERVICE_BIND_ADDR", err)
+	}
+
+	t.Setenv("SERVICE_BIND_ADDR", "127.0.0.1")
+	t.Setenv("SERVICE_ADVERTISE_ADDR", "relay.example.com")
+	if _, _, err := LoadServicePublication(); err == nil ||
+		!strings.Contains(err.Error(), "SERVICE_ADVERTISE_ADDR") {
+		t.Fatalf("LoadServicePublication with hostname advertise error = %v, want one naming SERVICE_ADVERTISE_ADDR", err)
+	}
+}

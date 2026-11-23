@@ -51,8 +51,9 @@ service and adds a new one.
 - `port` (optional) is the internal TCP port the application listens on.
   Default `80`, range `1`–`65535`. Relay injects it as the `PORT` environment
   variable (it cannot be overridden by template env or secrets) and exposes it
-  as container metadata only — **no host port is published**. A routed service's
-  Traefik rule targets this port.
+  as container metadata. A routed service's Traefik rule targets this port. When
+  host publication is configured, a routed service also publishes this port on
+  the host; see [Host publication](#host-publication-optional).
 - `host` (optional) is a hostname (e.g. `api.example.com`) exposing the service
   through Traefik. Empty/omitted means an unrouted service. Validated as a
   hostname at parse time.
@@ -64,6 +65,32 @@ service and adds a new one.
 - `replicas` (optional) is the desired replica count Relay maintains. Default
   `1`; must be a positive integer. There is **no autoscaling** — the count is
   exactly what the template declares.
+
+## Host publication (optional)
+
+Set `SERVICE_BIND_ADDR` to a static host IP to publish the `port` of every
+routed service (one with a `host`) on the host. Each replica receives a
+Docker-allocated host port, so all replicas of a service can be reached.
+Unrouted services remain internal-only, and with the setting unset every service
+stays internal-only. The address must be a static IPv4 or IPv6 literal; Relay
+does not resolve names, and wildcard, multicast, broadcast, mapped, and
+zone-scoped forms are refused. `SERVICE_ADVERTISE_ADDR` optionally names the
+address operators and clients should use; it defaults to `SERVICE_BIND_ADDR`
+when unset, empty, or whitespace-only. It is display metadata only. See
+[Configuration](configuration.md#service-publication).
+
+Binding to a specific IP selects the interface Docker listens on, but it is not
+complete network isolation: anything able to reach that host address can reach
+the published port. Open the ports in the host firewall and arrange any VPN or
+NAT yourself; Relay does not manage them. A published service may temporarily
+still carry its existing Traefik labels, so both paths can forward to the
+container until you remove them.
+
+Changing `SERVICE_BIND_ADDR` updates the affected containers through the normal
+start-before-stop replacement. Changing only `SERVICE_ADVERTISE_ADDR` does not
+replace any container. Use `relay app inspect` to see the bind and advertise
+addresses and each replica's current local Docker endpoint. See
+[CLI](cli.md#relay-app).
 
 ## Health checks
 
@@ -273,7 +300,8 @@ before stopping the old container, so a failed update does not take the service
 to zero replicas.
 
 Changing a service's image, environment (including a rotated secret), resources,
-networks, port, routing, tmpfs settings, or healthcheck updates its containers.
+networks, port, host bind address, routing, tmpfs settings, or healthcheck
+updates its containers.
 Scaling starts
 or stops only the replicas needed to reach the declared count; there is no
 autoscaling. A crashed replica is recreated during reconciliation. Removing a
@@ -302,5 +330,6 @@ updates the service container configuration.
 
 ## Out of scope
 
-Host port publishing, autoscaling, and request-level handler invocation are not
-implemented. Routing is Traefik-only.
+Autoscaling and request-level handler invocation are not implemented. Routing is
+Traefik-only; Relay does not create or manage an ingress proxy of its own, and it
+does not manage host firewalls, VPNs, or NAT for published ports.

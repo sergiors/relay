@@ -58,6 +58,39 @@ func QueryRuntimeState(path, name string) (RuntimeState, error) {
 	return *resp.RuntimeState, nil
 }
 
+// QueryServiceEndpoints dials the live worker query socket at path and asks for
+// app's live locally published service endpoints. It is the CLI's
+// `relay app inspect` client surface: the returned result carries the worker's
+// effective bind/advertise addresses and Docker's current container/port facts.
+// Any failure — no worker, a stale socket, a Docker query failure, or a worker
+// without the capability — wraps ErrServiceEndpointsUnavailable so the caller
+// renders the endpoints unavailable instead of substituting persisted state.
+func QueryServiceEndpoints(path, name string) (ServiceEndpointsResult, error) {
+	dialer := net.Dialer{Timeout: runtimeStateDialTimeout}
+	conn, err := dialer.Dial("unix", path)
+	if err != nil {
+		return ServiceEndpointsResult{}, fmt.Errorf("%w: %v", ErrServiceEndpointsUnavailable, err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(serviceEndpointsRequestTimeout))
+
+	if err := json.NewEncoder(conn).Encode(socketRequest{Command: cmdServiceEndpoints, App: name}); err != nil {
+		return ServiceEndpointsResult{}, fmt.Errorf("%w: %v", ErrServiceEndpointsUnavailable, err)
+	}
+	var resp socketResponse
+	if err := json.NewDecoder(io.LimitReader(conn, serviceEndpointsMaxResponse)).Decode(&resp); err != nil {
+		return ServiceEndpointsResult{}, fmt.Errorf("%w: %v", ErrServiceEndpointsUnavailable, err)
+	}
+	if resp.Error != "" {
+		return ServiceEndpointsResult{}, fmt.Errorf(
+			"%w: %s", ErrServiceEndpointsUnavailable, messageOr(resp.Message, resp.Error))
+	}
+	if resp.ServiceEndpointsResult == nil {
+		return ServiceEndpointsResult{}, fmt.Errorf("%w: empty response", ErrServiceEndpointsUnavailable)
+	}
+	return *resp.ServiceEndpointsResult, nil
+}
+
 // ResetRuntimeStatsForNode asks the live worker at path to reset the selected
 // node's accumulated Relay statistics through the socket's semantic "reset
 // stats" command, so the worker's in-memory snapshot source and persisted stats
