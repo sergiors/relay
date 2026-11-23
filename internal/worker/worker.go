@@ -533,6 +533,11 @@ func Run(logger *slog.Logger) (runErr error) {
 		timeout: 10 * time.Second,
 		run:     func(context.Context) error { return st.Close() },
 	})
+	// Global node registration/lease. It starts immediately after state
+	// ownership is established and runs for EVERY worker, including an
+	// event-only deployment or one with host publication disabled. The service
+	// endpoint publisher consumes this lease; it never owns a heartbeat.
+	nodeReg := startNodeRegistry(ctx, logger, cfg, st, shutdown)
 
 	// Load the initial runtime base-image pin snapshot directly after the state
 	// database opens and before any app is loaded, fingerprinted, or prepared.
@@ -739,6 +744,14 @@ func Run(logger *slog.Logger) (runErr error) {
 	// its authoritative selection check. It is wired for consumption only after
 	// the registry population is complete.
 	runWorker := newWorkerRunnerShell(logger, metricsInstance)
+	// Endpoint publication participates only when host-port publication is
+	// configured. It consumes the global node lease and starts before
+	// preparation, so a restart republishes the exact current batch as soon as
+	// templates and Docker-owned commit markers are visible; it never blocks or
+	// influences startup convergence.
+	startServiceEndpointPublisher(
+		ctx, logger, cfg, st, manager, runWorker.Registry(), nodeReg, shutdown,
+	)
 	prepared, retryStartup := prepareAndStartApps(
 		ctx, startupCtx, logger, manager, runWorker, st, startupSet,
 		services, svcCtrl, proof, shutdown,

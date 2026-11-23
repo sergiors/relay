@@ -661,8 +661,10 @@ func (st *State) acquireNodeLock(ctx context.Context) (*sql.Conn, error) {
 // identity so shared-database workers never overwrite each other, with an
 // instance fencing column), app_stats the per-app counterpart (keyed by app name
 // + node_id), stats_meta the single-row global reset generation,
-// schedule_pending the durable schedule-publication outbox, and dlq the durable
-// dead-letter store.
+// schedule_pending the durable schedule-publication outbox, dlq the durable
+// dead-letter store, nodes the PostgreSQL-backed, lease-fenced global node
+// registration, and service_registry_endpoints the published service endpoint
+// view.
 func (st *State) initSchema(ctx context.Context) error {
 	tx, err := st.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -864,6 +866,65 @@ func (st *State) initSchema(ctx context.Context) error {
 			data JSONB NOT NULL,
 			PRIMARY KEY (node_id, app_name, generation)
 		)`,
+		// nodes is the GLOBAL registration/lease of every live Relay worker,
+		// independent of whether it publishes service endpoints. Identity,
+		// incarnation fencing, and lease timestamps are relational; the only
+		// payload is the typed nodes.data object (bind/advertise address and the
+		// owner backend PID), which is diagnostic/presentation metadata with no
+		// relational duplicate. Availability is the current incarnation plus an
+		// unexpired lease measured by the PostgreSQL clock; there is no status
+		// column. Every write is accepted only while the pinned lock backend still
+		// holds the node advisory lock and the incarnation is current (see
+		// node_registry.go).
+		`CREATE TABLE IF NOT EXISTS nodes (
+			node_id TEXT PRIMARY KEY,
+			instance TEXT NOT NULL,
+			incarnation BIGINT NOT NULL CHECK (incarnation > 0),
+			heartbeat_at TIMESTAMPTZ NOT NULL,
+			lease_expires_at TIMESTAMPTZ NOT NULL,
+			data JSONB NOT NULL CHECK (jsonb_typeof(data) = 'object')
+		)`,
+		`CREATE SEQUENCE IF NOT EXISTS nodes_incarnation_seq AS BIGINT CACHE 1 START WITH 1`,
+		// Bounded expired-node cleanup orders by lease_expires_at; this index
+		// makes the batch selection proportional to the deleted rows rather than
+		// the whole table.
+		`CREATE INDEX IF NOT EXISTS nodes_lease_expiry
+			ON nodes (lease_expires_at)`,
+		// service_registry_endpoints is the current routable replica set each
+		// node verified on its Docker daemon. Identity (node/app/service/replica/
+		// container), the route keys (host/path), the incarnation fence, and the
+		// expiry are relational because they define ownership, uniqueness, and
+		// the query surface. host is the service's configured template hostname;
+		// TRAEFIK_HOST_OVERRIDE only affects the container's routing labels, not
+		// this stored metadata. The cohesive, non-fencing endpoint facts (host
+		// IP/port, internal port, committed generation) are one JSONB object in
+		// data. A row never carries environment, secrets, or handler payload.
+		// expires_at bounds a stale snapshot even while the node heartbeat is
+		// alive (for example while Docker inspection is unavailable). The node_id
+		// FK cascades only when a node lease row is actually released.
+		`CREATE TABLE IF NOT EXISTS service_registry_endpoints (
+			node_id TEXT NOT NULL REFERENCES nodes (node_id) ON DELETE CASCADE,
+			incarnation BIGINT NOT NULL CHECK (incarnation > 0),
+			app_name TEXT NOT NULL,
+			service_name TEXT NOT NULL,
+			replica INTEGER NOT NULL CHECK (replica >= 0),
+			host TEXT NOT NULL,
+			path TEXT NOT NULL DEFAULT '',
+			container_id TEXT NOT NULL,
+			expires_at TIMESTAMPTZ NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL,
+			data JSONB NOT NULL CHECK (jsonb_typeof(data) = 'object'),
+			CHECK (app_name <> '' AND service_name <> '' AND host <> '' AND container_id <> ''),
+			PRIMARY KEY (node_id, app_name, service_name, replica, container_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS service_registry_endpoints_lookup
+			ON service_registry_endpoints (app_name, service_name, host, path)`,
+		`CREATE INDEX IF NOT EXISTS service_registry_endpoints_route
+			ON service_registry_endpoints (host, path)`,
+		// Bounded expired-endpoint cleanup orders by expires_at, including
+		// endpoints under an active node.
+		`CREATE INDEX IF NOT EXISTS service_registry_endpoints_expiry
+			ON service_registry_endpoints (expires_at)`,
 	}
 
 	for _, s := range stmts {

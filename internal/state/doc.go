@@ -248,6 +248,67 @@
 // generation ordering and runtime base-image pin CAS never substitute for one
 // another.
 //
+// Global node registry and service endpoint publication:
+//
+// nodes(node_id PRIMARY KEY, instance, incarnation, heartbeat_at,
+// lease_expires_at, data JSONB) is every live worker's lease-fenced
+// registration, allocated from nodes_incarnation_seq. Identity, incarnation
+// fencing, and lease timestamps are relational; data holds only the typed
+// noncritical metadata (bind_addr, advertise_addr, owner_pid) and duplicates no
+// column. A worker claims it only while its PINNED lock backend still holds the
+// node's session advisory lock (proved from pg_locks at the operation boundary,
+// not from a process-local check), so a successor cannot take over while the
+// existing lock is held and a process that lost its lock cannot claim,
+// heartbeat, publish, or release. Availability is the current incarnation plus
+// an unexpired lease measured by the PostgreSQL clock; there is no status
+// column.
+//
+// service_registry_endpoints(node_id, incarnation, app_name, service_name,
+// replica, host, path, container_id, expires_at, updated_at, data JSONB) is the
+// materialized set of externally routable service replicas each node verified
+// on its own Docker daemon. Identity, the host/path query keys, incarnation
+// fencing, and expiry are relational; host is the service's configured template
+// hostname, not the effective host that TRAEFIK_HOST_OVERRIDE derives for the
+// routing labels; data holds the typed endpoint details
+// (host_ip, host_port, internal_port, generation) with no duplicate columns.
+// node_id references nodes(node_id) ON DELETE CASCADE. It is a VIEW-like
+// publication for discovery only: it never drives matching, builds,
+// reconciliation, or execution, and it carries route/endpoint metadata (never
+// environment or secret values). Rows are visible only while the node
+// incarnation matches and both the node lease and endpoint expiry are in the
+// future by the PostgreSQL clock. Endpoint publication consumes the node lease
+// and never renews it: the standalone node heartbeat is the sole lease-renewal
+// owner, and a fenced publish requires a currently valid database-time lease.
+// Publishing the exact batch is atomic and idempotent; unchanged rows are not
+// rewritten, removed routes are withdrawn, and each endpoint expiry is
+// refreshed. A graceful shutdown releases this incarnation's endpoints and node
+// row in one fenced transaction.
+//
+// Bounded registry cleanup is owned by the global node-registry lifecycle, not
+// service publication or execution. One infrequent (minutes) invocation deletes
+// at most NodeRegistryPruneEndpointBatch endpoints that are endpoint-expired or
+// whose node/incarnation is absent/expired, then at most
+// NodeRegistryPruneNodeBatch expired node rows that have NO remaining endpoints
+// (so a cascade never outruns the endpoint batch). Selection orders by the
+// indexed expires_at/lease_expires_at columns and uses FOR UPDATE SKIP LOCKED
+// with an outer expiry re-check, so concurrent claim/heartbeat/publication
+// transactions are never blocked or deleted while live. Crashed nodes therefore
+// become invisible at lease expiry and their rows are eventually reclaimed
+// without an external cleanup service.
+//
+// Development schema recreation (manual only; startup NEVER runs this, and it
+// touches no unrelated table or data):
+//
+//	DROP TABLE IF EXISTS service_registry_endpoints;
+//	DROP TABLE IF EXISTS service_registry_nodes;
+//	DROP TABLE IF EXISTS nodes;
+//	DROP SEQUENCE IF EXISTS service_registry_incarnation_seq;
+//	DROP SEQUENCE IF EXISTS nodes_incarnation_seq;
+//
+// The FK-safe order drops the endpoint table before either node table; the
+// intermediate service_registry_nodes name is included only for a developer
+// database created by an earlier uncommitted revision.
+//
 // Secret values are never stored: only the reference names appear in the
 // snapshot. Literal env values are never stored either: env entries keep the
 // env-var name only, with a fixed redaction marker as the value.

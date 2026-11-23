@@ -63,6 +63,8 @@ const (
 	shutdownStepDeploymentListen = "deployment-listen"
 	shutdownStepHousekeeping     = "housekeeping"
 	shutdownStepServicesJoin     = "services-join"
+	shutdownStepServiceEndpoints = "service-endpoints"
+	shutdownStepNodeRegistry     = "node-registry"
 	shutdownStepServiceCleanup   = "service-cleanup"
 	shutdownStepLoops            = "loops"
 	shutdownStepStatsFlush       = "stats-flush"
@@ -95,9 +97,14 @@ const (
 //     supervisor before its consumer), deployment (joins the convergence loop
 //     that the supervisor wakes), housekeeping (startup sweeps use the
 //     manager and state DB), services-join (coordinator workers use manager and
-//     state DB), loops (the stats and retention loops use the state DB and
-//     Redis). A producer of work joined by a later barrier must itself be
-//     joined first: the listener is stopped before the coordinator it wakes.
+//     state DB), service-endpoints (the endpoint publisher's Docker collection
+//     and PostgreSQL publication loops use the manager and state DB),
+//     node-registry (its heartbeat loop uses the state DB and it releases the
+//     node lease before state teardown), loops (the stats and retention loops
+//     use the state DB and Redis). A producer of work joined by a later barrier
+//     must itself be joined first: the listener is stopped before the
+//     coordinator it wakes, and endpoint publication stops before the node
+//     lease is released.
 //   - BEST-EFFORT CLEANUP (everything else): bounded, logged on timeout or
 //     failure, and never joined past its bound. Cleanup:
 //     socket, service-cleanup, stats-flush, metrics, webhook, manager, state,
@@ -115,6 +122,8 @@ var shutdownStepOrder = []string{
 	shutdownStepDeployment,
 	shutdownStepHousekeeping,
 	shutdownStepServicesJoin,
+	shutdownStepServiceEndpoints,
+	shutdownStepNodeRegistry,
 	shutdownStepServiceCleanup,
 	shutdownStepLoops,
 	shutdownStepStatsFlush,
