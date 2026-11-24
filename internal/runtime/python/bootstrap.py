@@ -15,6 +15,8 @@ source mount), so application files cannot shadow them:
   _relay_handlers     "module.function" handler resolution
   _relay_invocation   one handler call on the process-lifetime loop
   _relay_lifecycle    INIT_START/START/END lines on the native stdout
+  _relay_memory       once-per-process cgroup memory discovery and sampling
+  _relay_report       per-invocation duration and memory REPORT line
   _relay_server       listener, connection admission, invoke/result exchange
 
 Application stdout/stderr stay native container logs: no protocol traffic uses
@@ -33,6 +35,7 @@ import logging
 import sys
 
 import _relay_lifecycle as lifecycle
+import _relay_memory as memory
 from _relay_config import load_execution_config
 from _relay_server import runtime_loop
 
@@ -71,6 +74,7 @@ def main():
     # channel exists; a missing or malformed configuration fails startup
     # before any handler can be imported.
     lifecycle.initialize()
+    memory.initialize()
     config = load_execution_config()
 
     # The enabled branch requires the module installed by the engine's managed

@@ -132,11 +132,18 @@ replace it; apps should explicitly configure or add handlers, or use
 `console.debug` uses `DEBUG` on stdout; `console.warn` and `console.error` use
 `WARN` and `ERROR` prefixes on stderr.
 Runtime bootstraps write `INIT_START` once per process and `START`/`END` lines
-with the invocation request ID. These lifecycle lines and direct writes to
-stdout or stderr remain unformatted; lifecycle lines do not alter or enrich
-handler output. An `END` line may be absent when an invocation is interrupted
-or its process is terminated. Treat handler output as application data and
-avoid printing secrets.
+with the invocation request ID. Completed successful and handled-failure
+invocations also emit a `REPORT` line after `END`, with duration in milliseconds
+and available memory values. Memory values are cgroup/container-wide;
+`Container Memory Peak` covers the container's lifetime since creation and may
+include warm-reuse history. Unavailable memory fields are omitted. Interrupted
+invocations produce neither `END` nor `REPORT`. These lifecycle lines and direct
+writes to stdout or stderr remain plain output: lifecycle records are single
+lines without runtime console/logging prefixes, and direct writes remain
+unformatted. Lifecycle lines do not alter or enrich handler output. Treat handler
+output as application data and avoid printing secrets.
+
+Example: `REPORT RequestId: abc Duration: 12.34 ms Memory Used: 45 MiB Container Memory Peak: 78 MiB`
 
 ## Secrets
 

@@ -14,10 +14,13 @@ a private container network; this port is never published.
 
 import asyncio
 import sys
+import time
 
 import _relay_environment as environment
 import _relay_lifecycle as lifecycle
+import _relay_memory as memory
 import _relay_protocol as protocol
+import _relay_report as report
 from _relay_config import ExecutionConfig
 from _relay_context import REQUIRED_CONTEXT_FIELDS
 from _relay_invocation import invoke
@@ -127,24 +130,31 @@ async def serve_invocations(reader, writer):
     START is written once the frame is accepted, before its environment or
     handler runs; END is written only after the invocation completes. A
     cancellation raised by the handler propagates past END, so an interrupted
-    invocation is not reported as completed.
+    invocation is not reported as completed. A completed invocation (success or
+    handled failure) is followed by one REPORT line carrying its monotonic
+    duration and memory sample.
     """
     while True:
         request = protocol.decode_json(
             await protocol.read_frame(reader, protocol.MAX_REQUEST_BYTES)
         )
         req_id, handler, env, context, trace = validate_invoke_request(request)
+        request_id = context["requestId"]
 
-        lifecycle.start_invocation(context["requestId"])
+        lifecycle.start_invocation(request_id)
+        started_at = time.perf_counter()
         environment.apply_invocation_env(env, handler)
-
         error = await invoke(
             handler,
             request.get("event"),
             context,
             trace,
         )
-        lifecycle.end_invocation(context["requestId"])
+        duration_ms = (time.perf_counter() - started_at) * 1000.0
+
+        memory_usage = memory.sample_memory()
+        lifecycle.end_invocation(request_id)
+        report.report_invocation(request_id, duration_ms, memory_usage)
 
         if error is not None:
             print(f"handler {handler!r} failed: {error}", file=sys.stderr)

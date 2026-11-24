@@ -283,10 +283,11 @@ export function raw(event, context) {
 }
 
 // TestNodeRuntimeLoggingLeavesLifecycleLinesUnchanged pins the lifecycle
-// exemption: START/END stay exact plain lines with no timestamp/level
-// prefix, even though console.log is wrapped — and even when the application
-// itself replaces console.log entirely, because the lifecycle writer bound
-// the native method before any handler could be imported.
+// exemption: START/END and the post-END REPORT stay exact plain lines with no
+// timestamp/level prefix, even though console.log is wrapped — and even when
+// the application itself replaces console.log entirely, because the lifecycle
+// and report writers bound the native method before any handler could be
+// imported.
 func TestNodeRuntimeLoggingLeavesLifecycleLinesUnchanged(t *testing.T) {
 	requireNode(t)
 	root := appRoot(t)
@@ -305,13 +306,18 @@ export function hijack(event, context) {
 		t.Fatalf("invoke failed: %s", r.Err)
 	}
 
-	// Lifecycle lines stay exact plain lines: a decorated variant would
-	// appear as a line that merely contains the RequestId marker.
+	// Lifecycle and report lines stay exact plain lines: a decorated variant
+	// would appear as a line that merely contains the RequestId marker.
 	for _, line := range strings.Split(r.Out, "\n") {
 		if !strings.Contains(line, "RequestId:") {
 			continue
 		}
-		if line != "START RequestId: test-request" && line != "END RequestId: test-request" {
+		switch {
+		case line == "START RequestId: test-request":
+		case line == "END RequestId: test-request":
+		case strings.HasPrefix(line, "REPORT RequestId: "):
+			// Validated below against the full report contract.
+		default:
 			t.Errorf("lifecycle line %q must stay an exact plain line:\n%s", line, r.Out)
 		}
 	}
@@ -319,6 +325,9 @@ export function hijack(event, context) {
 		lifecycleLineIndex(r.Out, "END RequestId: test-request") == -1 {
 		t.Errorf("window must carry the exact START/END lines:\n%s", r.Out)
 	}
+	// Exactly one REPORT, in the exact report grammar, after END — its
+	// plain-line exemption is pinned here, its format by the helper.
+	requireInvocationReport(t, r.Out, "test-request", "t0")
 
 	// The application's own replacement took effect for application code,
 	// beside the untouched lifecycle lines.

@@ -401,7 +401,14 @@ export function hang(event, context) {
 	if err := p.waitExit(t, 10*time.Second); err != nil {
 		t.Logf("bootstrap exit after discarding the channel: %v; stderr:\n%s", err, p.stderrString())
 	}
-	if out := p.stdoutString(); lifecycleLineIndex(out, "END RequestId: "+logical) != -1 {
+	out = p.stdoutString()
+	if lifecycleLineIndex(out, "END RequestId: "+logical) != -1 {
 		t.Fatalf("END must never be fabricated for an interrupted invocation; stdout:\n%s", out)
+	}
+	if n := countLinesWithPrefix(out, "REPORT RequestId: "+logical); n != 0 {
+		t.Fatalf("REPORT must never be fabricated for an interrupted invocation; stdout:\n%s", out)
+	}
+	if n := countLinesWithPrefix(out, "REPORT RequestId: "+transportID); n != 0 {
+		t.Fatalf("REPORT must not carry the transport correlation id %q; stdout:\n%s", transportID, out)
 	}
 }

@@ -1985,9 +1985,9 @@ async def cancelled(event, context):
 	}
 
 	// The interrupted lifecycle contract: the cancelled invocation STARTed
-	// under its logical requestId but its END must never be fabricated — a
-	// task cancellation is not a completed invocation — and neither line may
-	// carry the transport correlation id.
+	// under its logical requestId but its END and REPORT must never be
+	// fabricated — a task cancellation is not a completed invocation — and
+	// none of those lines may carry the transport correlation id.
 	stdout := p.stdoutString()
 	if index := strings.Index(stdout, "START RequestId: "+cancelledLogical); index < 0 {
 		t.Errorf("the cancelled invocation must have STARTed under its logical requestId, stdout:\n%s", stdout)
@@ -1995,7 +1995,10 @@ async def cancelled(event, context):
 	if strings.Contains(stdout, "END RequestId: "+cancelledLogical) {
 		t.Errorf("END must never be fabricated for a cancelled invocation; stdout:\n%s", stdout)
 	}
-	for _, field := range []string{"START RequestId: ", "END RequestId: "} {
+	if strings.Contains(stdout, "REPORT RequestId: "+cancelledLogical) {
+		t.Errorf("REPORT must never be fabricated for a cancelled invocation; stdout:\n%s", stdout)
+	}
+	for _, field := range []string{"START RequestId: ", "END RequestId: ", "REPORT RequestId: "} {
 		if strings.Contains(stdout, field+cancelledTransport) {
 			t.Errorf("lifecycle lines must not carry the transport correlation id %q; stdout:\n%s", cancelledTransport, stdout)
 		}

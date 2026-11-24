@@ -16,6 +16,10 @@ invocation. END follows an invocation that completed, including one whose
 failure was caught and reported, and is never written for cancellation,
 interruption, or forced termination.
 
+The per-invocation REPORT line is formatted in ``_relay_report`` but written
+through ``write_line`` here, so every lifecycle record shares the same captured
+native stdout.
+
 Every write is best-effort: lifecycle output must never affect invocation
 results or startup, and it never captures, buffers, or forwards application
 output.
@@ -33,7 +37,8 @@ RUNTIME_METADATA_PATH = "/relay/runtime-metadata.json"
 _STDOUT = sys.stdout
 
 
-def _write(line):
+def write_line(line):
+    """Write one lifecycle line to the captured native stdout, best-effort."""
     try:
         _STDOUT.write(line + "\n")
         _STDOUT.flush()
@@ -64,14 +69,14 @@ def initialize():
     if not isinstance(runtime, str) or not isinstance(base_image, str):
         return
 
-    _write(f"INIT_START Runtime: {runtime} BaseImage: {base_image}")
+    write_line(f"INIT_START Runtime: {runtime} BaseImage: {base_image}")
 
 
 def start_invocation(request_id):
     """Emit START for an accepted invocation, before its handler runs."""
-    _write(f"START RequestId: {request_id}")
+    write_line(f"START RequestId: {request_id}")
 
 
 def end_invocation(request_id):
     """Emit END for a completed invocation, including a caught failure."""
-    _write(f"END RequestId: {request_id}")
+    write_line(f"END RequestId: {request_id}")
