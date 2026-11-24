@@ -55,6 +55,252 @@ func newDeploymentCoordinator(
 	return nil, fmt.Errorf("deployment: invalid local git source: %w", err)
 }
 
+// validateRecoveredDeploymentAuthorization exercises the authorization proof
+// with candidates and issues from a real loader scan. Production startup instead
+// validates the exact scan it consumes through deploymentStartupValidation and
+// loadStartupAppsChecked.
+func validateRecoveredDeploymentAuthorization(
+	ctx context.Context,
+	logger *slog.Logger,
+	appsRoot string,
+	snapshot deployment.Snapshot,
+) error {
+	if !snapshot.Authoritative {
+		if snapshot.Error == nil {
+			return nil
+		}
+		return startupAuthorizationError(snapshot,
+			"published deployment revision could not be materialized and no previous "+
+				"generation is authorized")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	apps, issues, err := app.NewLoader(appsRoot, logger).LoadWithDiagnostics()
+	if err != nil {
+		return fmt.Errorf(
+			"cannot verify the materialized apps tree before consuming: %w", err)
+	}
+	return validateStartupAuthorization(
+		appsRoot, snapshot, selectAndFingerprintApps(apps, logger), issues)
+}
+
+// deploymentStartupValidation returns the coordinated-deployment recovery check
+// for the startup loader's own candidates and issues. It is nil for a standalone
+// worker, so local-mode startup is unchanged. Production startup uses this
+// instead of a separate validation scan, so a source edit cannot land between
+// the validated tree and the consumed tree.
+func deploymentStartupValidation(
+	ctx context.Context,
+	appsRoot string,
+	snapshot deployment.Snapshot,
+	active bool,
+) func([]startupApp, []app.LoadIssue) error {
+	if !active {
+		return nil
+	}
+	return func(candidates []startupApp, issues []app.LoadIssue) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if verr := validateStartupAuthorization(
+			appsRoot, snapshot, candidates, issues,
+		); verr != nil {
+			return fmt.Errorf("deployment: startup authorization incomplete: %w", verr)
+		}
+		return nil
+	}
+}
+
+// validateStartupAuthorization is the pure startup-authorization proof over the
+// loader's already-computed candidates and issues. It fails startup closed when
+// the authorization the worker is about to consume cannot be served from the
+// local /apps tree: an authoritative recovered generation must have every
+// persisted valid app present locally with its materialized content fingerprint,
+// and — when a failed materialization is being recovered — its recorded template
+// identity as well, because the content fingerprint excludes runtime-only
+// template fields. Otherwise the app would silently leave the startup registry
+// and its matched deliveries could be ACKed unmatched.
+//
+// Strictness depends on how the snapshot was obtained. When a published desired
+// revision could not be materialized (Snapshot.Error set), Git may have left
+// /apps partially synchronized to that revision, so ANY extra app candidate also
+// fails the check, desired-invalid apps must still be present with their recorded
+// identity matched exactly (an unreadable local template is not proof), and a
+// locally VALID app cannot stand in for one the generation materialized as
+// invalid (a valid parse is never proof of invalid content). Without a failed
+// materialization, ordinary local drift — a local-only app, a local invalid edit,
+// or a runtime-only template edit that leaves the content fingerprint unchanged —
+// is still filtered by the normal startup authorization path and restored by the
+// reconciler; it does not fail startup. With neither an authoritative generation
+// nor a failed materialization (nothing published yet), there is nothing to
+// verify.
+func validateStartupAuthorization(
+	appsRoot string,
+	snapshot deployment.Snapshot,
+	candidates []startupApp,
+	issues []app.LoadIssue,
+) error {
+	if !snapshot.Authoritative {
+		if snapshot.Error == nil {
+			return nil
+		}
+		return startupAuthorizationError(snapshot,
+			"published deployment revision could not be materialized and no previous "+
+				"generation is authorized")
+	}
+	byName := make(map[string]startupApp, len(candidates))
+	for _, candidate := range candidates {
+		byName[candidate.App.Name] = candidate
+	}
+	issuesByName := make(map[string]app.LoadIssue, len(issues))
+	for _, issue := range issues {
+		issuesByName[issue.Name] = issue
+	}
+	// A failed materialization can leave the tree partially synchronized to the
+	// published revision, which makes an extra candidate evidence of an
+	// incomplete target rather than ordinary local drift.
+	partialTarget := snapshot.Error != nil
+
+	for name, expected := range snapshot.Fingerprints {
+		if _, unloadable := issuesByName[name]; unloadable {
+			return startupAuthorizationError(snapshot,
+				"authorized app %q can no longer be loaded from the local tree", name)
+		}
+		candidate, found := byName[name]
+		if !found {
+			return startupAuthorizationError(snapshot,
+				"authorized app %q is missing from the local tree; the apps tree may be "+
+					"only partially materialized", name)
+		}
+		if candidate.Fingerprint != expected {
+			return startupAuthorizationError(snapshot,
+				"authorized app %q no longer matches its materialized fingerprint; the "+
+					"apps tree may be only partially materialized", name)
+		}
+		if partialTarget {
+			// Runtime-only template fields (resources, healthcheck, tmpfs) are stripped
+			// from the content fingerprint, so only a failed-materialization recovery
+			// must also prove the recorded raw template identity. Ordinary startup
+			// leaves a template-only local edit to the reconciler's existing drift
+			// filter and restore behavior.
+			expectedIdentity := snapshot.TemplateIdentities[name]
+			if expectedIdentity == "" {
+				return startupAuthorizationError(snapshot,
+					"authorized app %q has no recorded template identity; the apps tree "+
+						"cannot be proven to belong to the previous authorized generation", name)
+			}
+			if err := verifyMaterializedTemplateIdentity(appsRoot, name,
+				expectedIdentity); err != nil {
+				return wrapStartupAuthorizationError(snapshot, err)
+			}
+		}
+	}
+	for _, candidate := range candidates {
+		name := candidate.App.Name
+		if _, authorized := snapshot.Fingerprints[name]; authorized {
+			continue
+		}
+		if _, invalid := snapshot.Invalid[name]; invalid {
+			// A VALID local candidate for a name the previous generation materialized
+			// as invalid is not proof of that generation: a successful parse cannot be
+			// the invalid materialization (even when a recorded identity happens to
+			// match a fingerprint-walk failure), and after a failed materialization it
+			// may be newly corrected target content. Ordinary non-partial startup keeps
+			// the existing filtering: the name is simply not authorized to activate.
+			if partialTarget {
+				return startupAuthorizationError(snapshot,
+					"local app %q loads as a valid app but the previous generation "+
+						"materialized it as invalid; the apps tree may belong to a "+
+						"partially materialized target", name)
+			}
+			continue
+		}
+		if partialTarget {
+			return startupAuthorizationError(snapshot,
+				"local app %q is not part of the previous authorized generation; the "+
+					"apps tree may be only partially materialized", name)
+		}
+	}
+	for _, issue := range issues {
+		name := issue.Name
+		if _, authorized := snapshot.Fingerprints[name]; authorized {
+			// Rejected by the authorized-app pass above.
+			continue
+		}
+		if _, invalid := snapshot.Invalid[name]; invalid {
+			// A desired-invalid app is part of the materialized revision but is never
+			// authorized to activate. While a partially materialized target is being
+			// recovered its local invalid bytes are part of the proof, so a recorded
+			// identity must be matched exactly: an unreadable/unhashable local template
+			// cannot be proven equal to it either.
+			if expected := snapshot.InvalidTemplates[name]; partialTarget && expected != "" &&
+				issue.Identity != expected {
+				return startupAuthorizationError(snapshot,
+					"desired-invalid app %q template bytes cannot be proven to match the "+
+						"materialized revision", name)
+			}
+			continue
+		}
+		if partialTarget {
+			return startupAuthorizationError(snapshot,
+				"local app %q is not part of the previous authorized generation; the "+
+					"apps tree may be only partially materialized", name)
+		}
+	}
+	if partialTarget {
+		for name := range snapshot.Invalid {
+			if _, ok := byName[name]; ok {
+				continue
+			}
+			if _, ok := issuesByName[name]; ok {
+				continue
+			}
+			return startupAuthorizationError(snapshot,
+				"desired-invalid app %q is missing from the local tree", name)
+		}
+	}
+	return nil
+}
+
+// startupAuthorizationError builds a fail-closed startup diagnostic. A failed
+// materialization's own diagnosis is wrapped too, so the operator sees both the
+// incomplete recovery and its underlying cause.
+func startupAuthorizationError(snapshot deployment.Snapshot, format string, args ...any) error {
+	message := fmt.Sprintf(format, args...)
+	if snapshot.Error != nil {
+		return fmt.Errorf("%s: %w", message, snapshot.Error)
+	}
+	return errors.New(message)
+}
+
+// wrapStartupAuthorizationError attaches a failed materialization's diagnosis to
+// a local verification failure without losing either cause.
+func wrapStartupAuthorizationError(snapshot deployment.Snapshot, cause error) error {
+	if snapshot.Error != nil {
+		return fmt.Errorf("%w: %w", cause, snapshot.Error)
+	}
+	return cause
+}
+
+// verifyMaterializedTemplateIdentity re-reads an app's raw template bytes when
+// the materialization recorded a deterministic identity for them. Bytes that can
+// no longer be read or no longer match mean the local tree cannot be proven to be
+// the previous authorized generation.
+func verifyMaterializedTemplateIdentity(appsRoot, name, expected string) error {
+	if expected == "" {
+		return nil
+	}
+	source, err := app.ReadTemplateSource(appsRoot, name)
+	if err != nil {
+		return fmt.Errorf("app %q template identity cannot be verified: %w", name, err)
+	}
+	if source.Identity != expected {
+		return fmt.Errorf("app %q template bytes no longer match the materialized revision", name)
+	}
+	return nil
+}
+
 // newGitWebhookServer constructs the optional Git webhook server, gated on
 // GIT_WEBHOOK_ADDR. NewServer owns assembly and returns nil when disabled; the
 // worker only starts and registers its teardown (see startWebhookServer).

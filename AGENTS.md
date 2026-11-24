@@ -52,7 +52,10 @@ worker; admin commands communicate with it or read persistent state.
   coordination dependency. With one, only the materialized/published Git
   generation authorizes app reconciliation; local `/apps` drift is ignored and
   restored, never published. The shared desired revision is a separate
-  PostgreSQL row, never the global app lifecycle row.
+  PostgreSQL row, never the global app lifecycle row. A node materialization
+  commits its complete authorization and applied generation atomically; a later
+  failure report never rolls that commit back, and startup does not consume a
+  recovered authorization that the local tree cannot prove still matches it.
 - Unavailable apps and valid pending generations remain matched and pending;
   availability alone must not cause ACK or DLQ. Keep the old active generation
   serving until its replacement is prepared. A committed active service replica

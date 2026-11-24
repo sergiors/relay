@@ -5,6 +5,7 @@ package deployment
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -594,5 +595,294 @@ func TestReportAppPreservesInvalidTemplateIdentity(t *testing.T) {
 		row.Error != "template invalid" || row.TemplateIdentity != "tid-x" {
 		t.Fatalf("row = %+v, want the Failed phase, diagnostic, and tid-x preserved "+
 			"across a stale Drifted report", row)
+	}
+}
+
+// TestResolveUncertainAppliedAdoptsEqualGenerationReplacement pins the
+// same-generation half of ambiguous-commit recovery: when a re-materialization
+// of the ALREADY applied generation landed without its acknowledgement, the
+// persisted row set is the complete authorization that transaction committed,
+// while the in-memory snapshot may still hold the previous (for example legacy
+// partial) authorization for the SAME generation. The uncertain path must adopt
+// the persisted snapshot rather than keep the stale set, and a later
+// same-generation failure report must preserve the committed applied generation,
+// commit, and rows instead of reintroducing the stale authorization.
+func TestResolveUncertainAppliedAdoptsEqualGenerationReplacement(t *testing.T) {
+	env := newCoordinatorEnv(t)
+	ctx := context.Background()
+
+	// Legacy state: generation 1 is applied with an INCOMPLETE authorization
+	// ("kept" only), as an earlier non-atomic writer could leave behind.
+	seedAppliedNode(t, env.st, env.cfg.NodeID, env.cfg.InstanceID, 1, commitOne,
+		seededApp{name: "kept", fingerprint: "fp-kept", templateID: "tid-kept",
+			phase: state.DeploymentAppPending})
+
+	acquired, err := env.st.AcquireDeploymentNode(ctx, env.cfg.NodeID,
+		env.cfg.InstanceID, 1, state.DeploymentNodeProgress{
+			NodeID: env.cfg.NodeID, Generation: 1,
+			Phase: state.DeploymentNodeMaterializing, Commit: commitOne,
+		})
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	// The same-generation replacement whose commit landed before the client lost
+	// the acknowledgement: the complete authorization for generation 1.
+	landed, err := env.st.CommitDeploymentMaterialization(ctx,
+		state.DeploymentMaterialization{
+			NodeID:      env.cfg.NodeID,
+			Generation:  1,
+			Instance:    env.cfg.InstanceID,
+			Incarnation: acquired.Incarnation,
+			Commit:      commitOne,
+			Apps: []state.DeploymentAppAuthorization{
+				{App: "kept", Phase: state.DeploymentAppPending,
+					Fingerprint: "fp-kept", TemplateIdentity: "tid-kept"},
+				{App: "repaired", Phase: state.DeploymentAppPending,
+					Fingerprint: "fp-repaired", TemplateIdentity: "tid-repaired"},
+			},
+		})
+	if err != nil || !landed {
+		t.Fatalf("commit same-generation replacement = (%v, %v)", landed, err)
+	}
+
+	c := New(env.cfg)
+	stale := Snapshot{
+		Generation:         1,
+		Commit:             commitOne,
+		Fingerprints:       map[string]string{"kept": "fp-kept"},
+		TemplateIdentities: map[string]string{"kept": "tid-kept"},
+		Invalid:            map[string]string{},
+		InvalidTemplates:   map[string]string{},
+		Authoritative:      true,
+	}
+	c.setApplied(stale)
+	c.setAppliedIncarnation(acquired.Incarnation)
+	c.setAppliedUncertain(true)
+
+	recovered := stale
+	resolved, err := c.resolveUncertainApplied(ctx, &recovered)
+	if err != nil {
+		t.Fatalf("resolveUncertainApplied: %v", err)
+	}
+	if !resolved {
+		t.Fatal("resolveUncertainApplied reported no persisted re-read after an " +
+			"uncertain outcome")
+	}
+	if recovered.Fingerprints["kept"] != "fp-kept" ||
+		recovered.Fingerprints["repaired"] != "fp-repaired" {
+		t.Fatalf("recovered = %+v, want the complete persisted same-generation "+
+			"authorization adopted", recovered)
+	}
+	c.mu.Lock()
+	inMemory := c.applied
+	c.mu.Unlock()
+	if inMemory.Fingerprints["repaired"] != "fp-repaired" {
+		t.Fatalf("in-memory applied = %+v, want the repaired same-generation "+
+			"authorization in place of the stale set", inMemory)
+	}
+
+	// A retry of the same generation that cannot materialize reports an observed
+	// failure only: the committed applied generation, commit, and complete rows
+	// survive, and the stale set is not written back anywhere.
+	desired := state.DeploymentDesired{
+		Generation: 1, Commit: commitOne, Repository: deployRepo, Ref: "main",
+	}
+	if _, err := c.materialize(ctx, recovered, desired); err == nil {
+		t.Fatal("materialize without a local Git source = nil, want a reported failure")
+	}
+	node, found, err := env.st.ReadDeploymentNode(ctx, env.cfg.NodeID)
+	if err != nil || !found {
+		t.Fatalf("ReadDeploymentNode = (%+v, %v, %v)", node, found, err)
+	}
+	if node.AppliedGeneration != 1 || node.AppliedCommit != commitOne ||
+		node.Phase != state.DeploymentNodeFailed {
+		t.Fatalf("node = %+v, want a failed retry still applying generation 1 (%s)",
+			node, commitOne)
+	}
+	rows, err := env.st.ReadDeploymentAppProgress(ctx, env.cfg.NodeID, 1)
+	if err != nil {
+		t.Fatalf("ReadDeploymentAppProgress: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %+v, want the complete committed authorization retained", rows)
+	}
+}
+
+// seedSameGenerationReplacement plants the state of a same-generation
+// re-materialization that committed without its acknowledgement: the applied
+// generation carries the COMPLETE authorization, while the caller passes the
+// stale in-memory snapshot that predates it. It returns the committed snapshot's
+// fingerprints/identities and the incarnation the commit was fenced by.
+func seedSameGenerationReplacement(
+	t *testing.T, env *coordinatorEnv,
+) (fingerprints, templateIdentities map[string]string) {
+	t.Helper()
+	ctx := context.Background()
+	fingerprints = map[string]string{}
+	templateIdentities = map[string]string{}
+	for _, name := range []string{"kept", "repaired"} {
+		fp, tid := writeCoordinatorApp(t, env.cfg.AppsDir, name)
+		fingerprints[name], templateIdentities[name] = fp, tid
+	}
+
+	seedAppliedNode(t, env.st, env.cfg.NodeID, env.cfg.InstanceID, 1, commitOne,
+		seededApp{name: "kept", fingerprint: fingerprints["kept"],
+			templateID: templateIdentities["kept"], phase: state.DeploymentAppPending})
+	acquired, err := env.st.AcquireDeploymentNode(ctx, env.cfg.NodeID,
+		env.cfg.InstanceID, 1, state.DeploymentNodeProgress{
+			NodeID: env.cfg.NodeID, Generation: 1,
+			Phase: state.DeploymentNodeMaterializing, Commit: commitOne,
+		})
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	apps := make([]state.DeploymentAppAuthorization, 0, len(fingerprints))
+	for name, fingerprint := range fingerprints {
+		apps = append(apps, state.DeploymentAppAuthorization{
+			App: name, Phase: state.DeploymentAppPending,
+			Fingerprint: fingerprint, TemplateIdentity: templateIdentities[name],
+		})
+	}
+	landed, err := env.st.CommitDeploymentMaterialization(ctx,
+		state.DeploymentMaterialization{
+			NodeID:      env.cfg.NodeID,
+			Generation:  1,
+			Instance:    env.cfg.InstanceID,
+			Incarnation: acquired.Incarnation,
+			Commit:      commitOne,
+			Apps:        apps,
+		})
+	if err != nil || !landed {
+		t.Fatalf("commit same-generation replacement = (%v, %v)", landed, err)
+	}
+	publishDesired(t, env.st, commitOne, "main")
+	return fingerprints, templateIdentities
+}
+
+// staleCoordinator mirrors the running coordinator after an ambiguous
+// same-generation commit: it still holds the older authorization for the applied
+// generation, the retry of that attempt is armed, and the outcome is uncertain.
+func staleCoordinator(
+	env *coordinatorEnv,
+	fingerprints, templateIdentities map[string]string,
+) *Coordinator {
+	env.cfg.RetryInterval = time.Hour
+	env.cfg.PollInterval = time.Hour
+	c := New(env.cfg)
+	c.setApplied(Snapshot{
+		Generation:         1,
+		Commit:             commitOne,
+		Fingerprints:       map[string]string{"kept": fingerprints["kept"]},
+		TemplateIdentities: map[string]string{"kept": templateIdentities["kept"]},
+		Invalid:            map[string]string{},
+		InvalidTemplates:   map[string]string{},
+		Authoritative:      true,
+	})
+	c.setAppliedUncertain(true)
+	c.mu.Lock()
+	c.retryGeneration = 1
+	c.retryCommit = commitOne
+	c.mu.Unlock()
+	return c
+}
+
+// TestMaterializeConfirmsAmbiguousSameGenerationCommit pins the live retry path
+// after an ambiguous same-generation commit: when the persisted applied
+// generation/commit equals the requested desired revision and the local /apps tree
+// still matches its authorization, materialize confirms that persisted snapshot as
+// a success without any Git work. syncOnce then publishes the confirmed
+// authorization to the reconciler and enqueues its apps instead of leaving the
+// reconciler on the stale set while a fetch keeps failing. No Git source is
+// configured, so any fall-through to the normal path would fail materialization.
+func TestMaterializeConfirmsAmbiguousSameGenerationCommit(t *testing.T) {
+	env := newCoordinatorEnv(t)
+	fingerprints, templateIdentities := seedSameGenerationReplacement(t, env)
+	c := staleCoordinator(env, fingerprints, templateIdentities)
+	c.setAppliedIncarnation(1) // any positive fence; the short-circuit never acquires
+
+	var notified Snapshot
+	c.mu.Lock()
+	c.onMaterialized = func(snapshot Snapshot) { notified = snapshot }
+	c.mu.Unlock()
+	enqueued := make(chan string, 8)
+	c.syncOnce(context.Background(), func(name string) { enqueued <- name }, false)
+
+	if notified.Generation != 1 ||
+		notified.Fingerprints["kept"] != fingerprints["kept"] ||
+		notified.Fingerprints["repaired"] != fingerprints["repaired"] {
+		t.Fatalf("notified = %+v, want the confirmed persisted authorization "+
+			"(kept=%q repaired=%q)", notified,
+			fingerprints["kept"], fingerprints["repaired"])
+	}
+	names := map[string]bool{}
+	for len(enqueued) > 0 {
+		names[<-enqueued] = true
+	}
+	if !names["kept"] || !names["repaired"] {
+		t.Fatalf("enqueued = %v, want both confirmed apps", names)
+	}
+	if !strings.Contains(env.log.String(),
+		"confirmed materialized revision after an ambiguous commit") {
+		t.Fatalf("confirmation was not reported:\n%s", env.log.String())
+	}
+
+	// The persisted authorization is unchanged by the confirmation.
+	node, found, err := env.st.ReadDeploymentNode(context.Background(), env.cfg.NodeID)
+	if err != nil || !found {
+		t.Fatalf("ReadDeploymentNode = (%+v, %v, %v)", node, found, err)
+	}
+	if node.AppliedGeneration != 1 || node.AppliedCommit != commitOne {
+		t.Fatalf("node = %+v, want applied generation 1 (%s) preserved", node, commitOne)
+	}
+	rows, err := env.st.ReadDeploymentAppProgress(
+		context.Background(), env.cfg.NodeID, 1)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("rows = (%+v, %v), want the complete committed authorization", rows, err)
+	}
+}
+
+// TestMaterializeDoesNotPublishUnprovenSameGenerationCommit pins the other side:
+// a confirmed same-generation commit is NOT published when the local tree can no
+// longer be proven to match it (here an authorized app is missing). The retry
+// falls through to the normal path, the reconciler is not notified, and the
+// persisted applied generation, commit, and rows are left untouched.
+func TestMaterializeDoesNotPublishUnprovenSameGenerationCommit(t *testing.T) {
+	env := newCoordinatorEnv(t)
+	fingerprints, templateIdentities := seedSameGenerationReplacement(t, env)
+	if err := os.RemoveAll(filepath.Join(env.cfg.AppsDir, "repaired")); err != nil {
+		t.Fatalf("remove authorized app: %v", err)
+	}
+	c := staleCoordinator(env, fingerprints, templateIdentities)
+	c.setAppliedIncarnation(1)
+
+	notified := false
+	c.mu.Lock()
+	c.onMaterialized = func(Snapshot) { notified = true }
+	c.mu.Unlock()
+	enqueued := make(chan string, 8)
+	c.syncOnce(context.Background(), func(name string) { enqueued <- name }, false)
+
+	if notified {
+		t.Fatal("an unproven same-generation authorization was published")
+	}
+	if len(enqueued) != 0 {
+		t.Fatalf("enqueued %d apps, want none for an unproven authorization",
+			len(enqueued))
+	}
+	if !strings.Contains(env.log.String(),
+		"materialization failed; retaining active generation") {
+		t.Fatalf("fall-through failure was not reported:\n%s", env.log.String())
+	}
+	node, found, err := env.st.ReadDeploymentNode(context.Background(), env.cfg.NodeID)
+	if err != nil || !found {
+		t.Fatalf("ReadDeploymentNode = (%+v, %v, %v)", node, found, err)
+	}
+	if node.AppliedGeneration != 1 || node.AppliedCommit != commitOne {
+		t.Fatalf("node = %+v, want applied generation 1 (%s) preserved", node, commitOne)
+	}
+	rows, err := env.st.ReadDeploymentAppProgress(
+		context.Background(), env.cfg.NodeID, 1)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("rows = (%+v, %v), want the complete committed authorization", rows, err)
 	}
 }

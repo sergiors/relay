@@ -27,7 +27,10 @@ const coordinatorTemplate = "runtime: nodejs24.x\nevents:\n  - handler: index.hi
 
 // coordinatorEnv bundles one coordinator test's state handle and config.
 type coordinatorEnv struct {
-	st  *state.State
+	st *state.State
+	// dsn is the schema-pinned DSN behind st, retained for fixtures that need
+	// raw SQL against the SAME schema (test-local failure triggers).
+	dsn string
 	cfg Config
 	log *bytes.Buffer
 }
@@ -39,9 +42,11 @@ func newCoordinatorEnv(t *testing.T) *coordinatorEnv {
 	t.Helper()
 	gitDir := t.TempDir()
 	logBuf := &bytes.Buffer{}
-	st := testutil.NewState(t)
+	dsn := testutil.NewStateDSN(t)
+	st := testutil.OpenState(t, dsn)
 	return &coordinatorEnv{
-		st: st,
+		st:  st,
+		dsn: dsn,
 		cfg: Config{
 			State:          st,
 			NodeID:         "node-1",

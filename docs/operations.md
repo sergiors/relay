@@ -212,6 +212,15 @@ or activating an update. A failed update leaves the previous working apps active
 Relay retries, and the node catches up when it is available and the problem is
 resolved.
 
+At startup Relay verifies that `/apps` matches the last successfully
+materialized revision. If it cannot prove the authorized app set is present and
+unchanged—for example, an interrupted update left an app missing or changed—the
+node refuses to start rather than serve an incomplete app set, so events for
+missing apps are not acknowledged as unmatched. Resolve the reported source or
+materialization error and restart the node; the published revision is then
+materialized. A node with no previously deployed revision also waits for its
+first successful deploy instead of starting with no apps.
+
 Check the desired revision and node/app progress with:
 
 ```sh

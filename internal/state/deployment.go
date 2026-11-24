@@ -26,6 +26,14 @@ import (
 // incarnation (process generation) and the deployment generation. A stale
 // process incarnation or a stale generation therefore cannot overwrite shared
 // desired state or another incarnation's progress.
+//
+// A materialization commit is atomic: CommitDeploymentMaterialization writes the
+// node's applied generation, the COMPLETE per-app authorization, and the
+// materialized phase in one short transaction under a FOR UPDATE node-row fence.
+// Git has already changed /apps by then, so a failed commit must leave the
+// previous applied generation authorized and must never be rolled back by a later
+// failure report. RecordDeploymentNodeFailure therefore updates only the observed
+// failure and preserves the applied generation, incarnation, and commit.
 
 // Deployment phases for the per-node materialization progress.
 const (
@@ -921,6 +929,239 @@ func (st *State) RecordDeploymentAppProgress(
 		return false, fmt.Errorf("record deployment app %q/%q: %w", nodeID, appName, err)
 	}
 	return affected > 0, nil
+}
+
+// DeploymentAppAuthorization is one app's materialized state within a
+// deployment materialization commit: a valid app's pending activation with its
+// content fingerprint and template identity, a materialized-but-invalid app's
+// failed diagnostic with its template identity, or a removal.
+type DeploymentAppAuthorization struct {
+	App              string
+	Phase            string
+	Fingerprint      string
+	TemplateIdentity string
+	Error            string
+}
+
+// DeploymentMaterialization is one node's COMPLETE authorization for a
+// successfully materialized deployment generation. Apps must describe every app
+// of the generation; an empty set is a legitimate empty deployment.
+type DeploymentMaterialization struct {
+	NodeID      string
+	Generation  int64
+	Instance    string
+	Incarnation int64
+	Commit      string
+	Apps        []DeploymentAppAuthorization
+}
+
+// CommitDeploymentMaterialization persists the complete per-app authorization of
+// one materialized generation and advances the node's applied generation in ONE
+// transaction. The node row is locked FOR UPDATE and the supplied incarnation,
+// observed generation, and instance must all still be current; a stale fence
+// writes nothing, so the previous applied generation and its authorization keep
+// serving.
+//
+// Rows are upserted with RecordDeploymentAppProgress' change predicate (only a
+// different instance or payload is written, so identical re-commits keep
+// updated_at), and same-generation rows absent from the supplied set are removed.
+// An earlier incomplete attempt for the SAME generation is therefore replaced
+// without permitting stale activation or authorization progress to survive, and
+// re-committing the same generation is idempotent. The validated row fence, not an
+// upsert row count, is the transaction's authority: a 0-row upsert is an
+// idempotent no-op, never an error.
+//
+// It deliberately does not take the deployment publication advisory lock: this
+// transaction writes only this node's progress and never reads or writes the
+// shared desired revision. The returned bool reports whether the fence accepted
+// the commit; false (with a nil error) means nothing was written.
+func (st *State) CommitDeploymentMaterialization(
+	ctx context.Context,
+	m DeploymentMaterialization,
+) (bool, error) {
+	if strings.TrimSpace(m.NodeID) == "" || m.Generation <= 0 || m.Incarnation <= 0 {
+		return false, fmt.Errorf(
+			"commit deployment materialization: node ID, generation, and incarnation are required")
+	}
+	if strings.TrimSpace(m.Instance) == "" {
+		return false, fmt.Errorf("commit deployment materialization: instance is required")
+	}
+	commit, err := NormalizeDeploymentCommit(m.Commit)
+	if err != nil {
+		return false, err
+	}
+	if err := validateDeploymentAppAuthorizations(m.Apps); err != nil {
+		return false, err
+	}
+	now := st.nowTime().UTC()
+	nodeData, err := json.Marshal(deploymentNodePayload{
+		Phase:         DeploymentNodeMaterialized,
+		Commit:        commit,
+		AppliedCommit: commit,
+	})
+	if err != nil {
+		return false, fmt.Errorf("encode deployment node %q: %w", m.NodeID, err)
+	}
+
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin deployment materialization: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var instance string
+	err = tx.QueryRowContext(ctx,
+		`SELECT instance FROM deployment_nodes
+		 WHERE node_id = $1 AND generation = $2 AND incarnation = $3
+		 FOR UPDATE`,
+		m.NodeID, m.Generation, m.Incarnation,
+	).Scan(&instance)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lock deployment node %q: %w", m.NodeID, err)
+	}
+	if instance != m.Instance {
+		return false, nil
+	}
+
+	// The row lock above is this transaction's explicit authority. A 0-row
+	// upsert therefore means the stored row already carries this exact instance
+	// and payload (an idempotent re-commit), never a stale fence, and must not be
+	// treated as an error. Identical payloads keep their updated_at, matching
+	// RecordDeploymentAppProgress.
+	names := make([]string, 0, len(m.Apps))
+	for _, app := range m.Apps {
+		payload, err := json.Marshal(deploymentAppPayload{
+			Phase:            app.Phase,
+			Fingerprint:      app.Fingerprint,
+			TemplateIdentity: app.TemplateIdentity,
+			Commit:           commit,
+			Error:            app.Error,
+		})
+		if err != nil {
+			return false, fmt.Errorf("encode deployment app %q/%q: %w", m.NodeID, app.App, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO deployment_apps
+				(node_id, app_name, generation, instance, updated_at, data)
+			 VALUES ($1, $2, $3, $4, $5, $6)
+			 ON CONFLICT (node_id, app_name, generation) DO UPDATE SET
+				instance = excluded.instance,
+				updated_at = excluded.updated_at,
+				data = excluded.data
+			 WHERE deployment_apps.instance IS DISTINCT FROM excluded.instance
+			    OR deployment_apps.data IS DISTINCT FROM excluded.data`,
+			m.NodeID, app.App, m.Generation, m.Instance, now, string(payload)); err != nil {
+			return false, fmt.Errorf("write deployment app %q/%q: %w", m.NodeID, app.App, err)
+		}
+		names = append(names, app.App)
+	}
+	// Remove same-generation rows an earlier incomplete attempt left behind that
+	// the complete set does not contain, so stale activation or authorization
+	// progress can never survive a re-materialization.
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM deployment_apps
+		 WHERE node_id = $1 AND generation = $2 AND app_name <> ALL($3::text[])`,
+		m.NodeID, m.Generation, names); err != nil {
+		return false, fmt.Errorf("replace deployment app progress for %q: %w", m.NodeID, err)
+	}
+	res, err := tx.ExecContext(ctx,
+		`UPDATE deployment_nodes
+		 SET applied_generation = $1, applied_incarnation = $2, updated_at = $3, data = $4
+		 WHERE node_id = $5 AND generation = $1 AND incarnation = $6`,
+		m.Generation, m.Incarnation, now, string(nodeData), m.NodeID, m.Incarnation)
+	if err != nil {
+		return false, fmt.Errorf("record deployment materialization for %q: %w", m.NodeID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("record deployment materialization for %q: %w", m.NodeID, err)
+	}
+	if affected == 0 {
+		return false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit deployment materialization for %q: %w", m.NodeID, err)
+	}
+	return true, nil
+}
+
+func validateDeploymentAppAuthorizations(apps []DeploymentAppAuthorization) error {
+	seen := make(map[string]struct{}, len(apps))
+	for _, app := range apps {
+		if strings.TrimSpace(app.App) == "" {
+			return fmt.Errorf("commit deployment materialization: app name is empty")
+		}
+		if _, duplicate := seen[app.App]; duplicate {
+			return fmt.Errorf("commit deployment materialization: duplicate app %q", app.App)
+		}
+		seen[app.App] = struct{}{}
+	}
+	return nil
+}
+
+// RecordDeploymentNodeFailure records a failed materialization attempt for the
+// node's observed generation. It updates only the observed phase, commit, and
+// error: the applied generation, applied incarnation, and applied commit are
+// written exclusively by a successful materialization commit and must survive a
+// later failure report, including a retry whose earlier commit outcome was
+// ambiguous. It reports whether the fence accepted the write.
+func (st *State) RecordDeploymentNodeFailure(
+	ctx context.Context,
+	nodeID string,
+	generation,
+	incarnation int64,
+	commit,
+	cause string,
+) (bool, error) {
+	if strings.TrimSpace(nodeID) == "" || generation <= 0 || incarnation <= 0 {
+		return false, fmt.Errorf(
+			"deployment node failure: node ID, generation, and incarnation are required")
+	}
+	now := st.nowTime().UTC()
+
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin deployment node failure: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var stored string
+	err = tx.QueryRowContext(ctx,
+		`SELECT data::text FROM deployment_nodes
+		 WHERE node_id = $1 AND generation = $2 AND incarnation = $3
+		 FOR UPDATE`,
+		nodeID, generation, incarnation,
+	).Scan(&stored)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lock deployment node %q: %w", nodeID, err)
+	}
+	var payload deploymentNodePayload
+	if err := json.Unmarshal([]byte(stored), &payload); err != nil {
+		return false, fmt.Errorf("decode deployment node %q: %w", nodeID, err)
+	}
+	payload.Phase = DeploymentNodeFailed
+	payload.Commit = commit
+	payload.Error = cause
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return false, fmt.Errorf("encode deployment node %q: %w", nodeID, err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE deployment_nodes SET updated_at = $1, data = $2
+		 WHERE node_id = $3 AND generation = $4 AND incarnation = $5`,
+		now, string(data), nodeID, generation, incarnation); err != nil {
+		return false, fmt.Errorf("record deployment node %q: %w", nodeID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit deployment node failure %q: %w", nodeID, err)
+	}
+	return true, nil
 }
 
 // ReadDeploymentNode returns one node's deployment progress.

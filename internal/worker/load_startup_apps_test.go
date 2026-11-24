@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -423,5 +424,234 @@ func TestLoadStartupAppsIsolatesInvalidWriteFailure(t *testing.T) {
 		!store.invalids[0].hasObservation {
 		t.Fatalf("invalid writes = %+v, want the observed broken attempt",
 			store.invalids)
+	}
+}
+
+// TestLoadStartupAppsCheckedValidatesUnfilteredScanBeforePersistence pins the
+// in-load authorization check: the check receives the EXACT unfiltered
+// candidates and issues this load computed — including the local-only candidate
+// and drift issue that authoritative filtering would later drop — so the
+// validated tree and the consumed tree are one scan and no source edit can slip
+// between them. A rejection aborts the load BEFORE any rebuild, discovery,
+// prune, or invalid write reaches state. The positive control proves that when
+// the same check allows the extras, ordinary local-only candidates are still
+// filtered out of the loaded and persisted set.
+func TestLoadStartupAppsCheckedValidatesUnfilteredScanBeforePersistence(t *testing.T) {
+	// given: one authorized app, a local-only extra, and two broken
+	// definitions (one materialized-invalid, one local drift)
+	root := t.TempDir()
+	writeWorkerApp(t, root, "authorized", "def handler(e, context): return 1\n")
+	writeWorkerApp(t, root, "local-add", "def handler(e, context): return 2\n")
+	writeBrokenWorkerApp(t, root, "mat-bad", "runtime: python9.9\n")
+	writeBrokenWorkerApp(t, root, "drift-bad", "runtime: python9.9\n")
+
+	fns, err := app.NewLoader(root, discardLogger()).Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	computed := map[string]string{}
+	for _, record := range selectAndFingerprintApps(fns, discardLogger()) {
+		computed[record.App.Name] = record.Fingerprint
+	}
+	if computed["authorized"] == "" || computed["local-add"] == "" {
+		t.Fatal("precondition: both valid apps must fingerprint")
+	}
+	authorized := map[string]string{"authorized": computed["authorized"]}
+	materializedInvalid := map[string]string{"mat-bad": ""}
+
+	var (
+		errMissingAuthorized = errors.New("authorized candidate missing from the scan")
+		errUnauthorizedExtra = errors.New("candidate is not part of the authorization")
+	)
+
+	// authorizeCheck stands in for deploymentStartupValidation: it records the
+	// exact scan it receives and rejects a missing (or changed) authorized
+	// candidate or — unless extras are allowed — any candidate the
+	// authorization does not account for.
+	type observedScan struct {
+		candidates   []string
+		fingerprints map[string]string
+		issues       []string
+	}
+	checkAllowing := func(allowExtras bool) (
+		func([]startupApp, []app.LoadIssue) error, *observedScan,
+	) {
+		seen := &observedScan{fingerprints: map[string]string{}}
+		return func(candidates []startupApp, issues []app.LoadIssue) error {
+			byName := make(map[string]startupApp, len(candidates))
+			for _, record := range candidates {
+				seen.candidates = append(seen.candidates, record.App.Name)
+				seen.fingerprints[record.App.Name] = record.Fingerprint
+				byName[record.App.Name] = record
+			}
+			for _, issue := range issues {
+				seen.issues = append(seen.issues, issue.Name)
+			}
+			for name, want := range authorized {
+				record, ok := byName[name]
+				if !ok {
+					return fmt.Errorf("startup authorization: %q: %w",
+						name, errMissingAuthorized)
+				}
+				if record.Fingerprint != want {
+					return fmt.Errorf(
+						"startup authorization: %q fingerprint %q, want %q: %w",
+						name, record.Fingerprint, want, errMissingAuthorized)
+				}
+			}
+			if !allowExtras {
+				for _, record := range candidates {
+					if _, ok := authorized[record.App.Name]; ok {
+						continue
+					}
+					return fmt.Errorf("startup authorization: %q: %w",
+						record.App.Name, errUnauthorizedExtra)
+				}
+			}
+			return nil
+		}, seen
+	}
+
+	requireNoStateWrites := func(store *fakeStartupState) {
+		t.Helper()
+		if len(store.rebuilds) != 0 || len(store.discoveries) != 0 ||
+			len(store.pruneDirs) != 0 || len(store.invalids) != 0 {
+			t.Fatalf("state writes reached before the check finished: rebuilds=%d "+
+				"discoveries=%d prunes=%d invalids=%d — the check must run before "+
+				"any persistence",
+				len(store.rebuilds), len(store.discoveries),
+				len(store.pruneDirs), len(store.invalids))
+		}
+	}
+	nameSet := func(names []string) map[string]bool {
+		set := make(map[string]bool, len(names))
+		for _, name := range names {
+			set[name] = true
+		}
+		return set
+	}
+
+	// when: the load runs with a check that rejects the unauthorized extra
+	rejecting, seen := checkAllowing(false)
+	store := &fakeStartupState{}
+	set, err := loadStartupAppsChecked(context.Background(), discardLogger(),
+		store, root, metrics.New(), 42, authorized, materializedInvalid, true,
+		rejecting)
+
+	// then: the load fails with the check's rejection and none of the load
+	// surfaced to the caller
+	if !errors.Is(err, errUnauthorizedExtra) {
+		t.Fatalf("load = %v, want the check's unauthorized-extra rejection", err)
+	}
+	if len(set.loaded) != 0 || len(set.records) != 0 || set.fencingTokens != nil {
+		t.Fatalf("returned set = %+v, want empty on a rejected check", set)
+	}
+
+	// and the check saw the EXACT unfiltered scan: both valid candidates and
+	// BOTH issues — local-add and drift-bad would not survive the authoritative
+	// filter this rejection prevented
+	if candidates := nameSet(seen.candidates); len(seen.candidates) != 2 ||
+		!candidates["authorized"] || !candidates["local-add"] {
+		t.Fatalf("check candidates = %v, want the unfiltered "+
+			"[authorized local-add]", seen.candidates)
+	}
+	if issues := nameSet(seen.issues); len(seen.issues) != 2 ||
+		!issues["mat-bad"] || !issues["drift-bad"] {
+		t.Fatalf("check issues = %v, want the unfiltered [mat-bad drift-bad]",
+			seen.issues)
+	}
+	if seen.fingerprints["authorized"] != computed["authorized"] {
+		t.Fatalf("checked fingerprint = %q, want the exact value this load "+
+			"computed %q", seen.fingerprints["authorized"],
+			computed["authorized"])
+	}
+
+	// and no rebuild/discovery/prune/invalid write reached state
+	requireNoStateWrites(store)
+
+	// when: the authorized candidate is absent from the scanned tree
+	missingRoot := t.TempDir()
+	writeWorkerApp(t, missingRoot, "local-add", "def handler(e, context): return 2\n")
+	writeBrokenWorkerApp(t, missingRoot, "mat-bad", "runtime: python9.9\n")
+	missingCheck, missingSeen := checkAllowing(false)
+	missingStore := &fakeStartupState{}
+	missingSet, err := loadStartupAppsChecked(context.Background(),
+		discardLogger(), missingStore, missingRoot, metrics.New(), 42,
+		authorized, materializedInvalid, true, missingCheck)
+
+	// then: the check rejects over ITS scan, which holds only what was actually
+	// loaded there, and nothing is persisted
+	if !errors.Is(err, errMissingAuthorized) {
+		t.Fatalf("load = %v, want the check's missing-authorized rejection", err)
+	}
+	if candidates := nameSet(missingSeen.candidates); len(missingSeen.candidates) != 1 ||
+		!candidates["local-add"] {
+		t.Fatalf("check candidates = %v, want exactly the scanned [local-add]",
+			missingSeen.candidates)
+	}
+	if len(missingSet.loaded) != 0 || missingSet.fencingTokens != nil {
+		t.Fatalf("returned set = %+v, want empty on a rejected check", missingSet)
+	}
+	requireNoStateWrites(missingStore)
+
+	// positive control: the SAME full scan when the check allows the extras
+	allowing, allowedSeen := checkAllowing(true)
+	allowedStore := &fakeStartupState{}
+	allowed, err := loadStartupAppsChecked(context.Background(), discardLogger(),
+		allowedStore, root, metrics.New(), 42, authorized, materializedInvalid,
+		true, allowing)
+	if err != nil {
+		t.Fatalf("load with an allowing check: %v", err)
+	}
+
+	// the check still saw the unfiltered scan...
+	if candidates := nameSet(allowedSeen.candidates); len(allowedSeen.candidates) != 2 ||
+		!candidates["local-add"] {
+		t.Fatalf("check candidates = %v, want the unfiltered scan with local-add",
+			allowedSeen.candidates)
+	}
+	if issues := nameSet(allowedSeen.issues); len(allowedSeen.issues) != 2 ||
+		!issues["drift-bad"] {
+		t.Fatalf("check issues = %v, want the unfiltered scan with drift-bad",
+			allowedSeen.issues)
+	}
+
+	// ...while ordinary authoritative filtering keeps local-only candidates out
+	// of the loaded and persisted set
+	if names := loadedAppNames(allowed); len(names) != 1 || names[0] != "authorized" {
+		t.Fatalf("loaded apps = %v, want only the authorized app", names)
+	}
+	if len(allowed.issues) != 1 || allowed.issues[0].Name != "mat-bad" {
+		t.Fatalf("issues = %+v, want only the materialized mat-bad", allowed.issues)
+	}
+	if len(allowedStore.rebuilds) != 1 ||
+		allowedStore.rebuilds[0].App.Name != "authorized" ||
+		len(allowedStore.discoveries) != 1 ||
+		allowedStore.discoveries[0].fn.Name != "authorized" ||
+		len(allowedStore.invalids) != 1 ||
+		allowedStore.invalids[0].name != "mat-bad" ||
+		len(allowedStore.pruneDirs) != 1 {
+		t.Fatalf("persisted state = rebuilds %+v / discoveries %+v / invalids "+
+			"%+v / prunes %+v, want only the authorized app and its materialized "+
+			"invalid",
+			allowedStore.rebuilds, allowedStore.discoveries,
+			allowedStore.invalids, allowedStore.pruneDirs)
+	}
+
+	// the persisted discovery carries the SAME fingerprint the check validated —
+	// the check saw the records this load actually consumes
+	if allowed.fingerprints["authorized"] !=
+		allowedSeen.fingerprints["authorized"] ||
+		allowedStore.discoveries[0].fingerprint !=
+			allowedSeen.fingerprints["authorized"] {
+		t.Fatalf("checked fingerprint %q / loaded %q / persisted %q, want the "+
+			"one scan used throughout",
+			allowedSeen.fingerprints["authorized"],
+			allowed.fingerprints["authorized"],
+			allowedStore.discoveries[0].fingerprint)
+	}
+	if _, ok := allowed.fencingTokens["local-add"]; ok {
+		t.Fatal("local-only candidate surfaced a fencing token; it must stay " +
+			"filtered")
 	}
 }

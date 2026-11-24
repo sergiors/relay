@@ -26,6 +26,18 @@
 // tree is not hashed twice per cadence and no verification is trusted by two
 // checks.
 //
+// Git updates /apps per app before any authorization exists for the new
+// generation. The materialization is therefore committed atomically: the node's
+// applied generation, the complete per-app authorization, and the materialized
+// phase are written in one short, incarnation-fenced transaction. A failed or
+// fenced commit writes nothing, so the previous generation keeps serving, and a
+// later failure report never rolls a committed applied generation back. Because
+// /apps can be left partially synchronized by a failed attempt, the worker's
+// startup validator refuses to consume when a published revision could not be
+// materialized and the local tree can no longer be proven to be exactly the
+// previous authorized generation. Without such proof the node fails closed
+// instead of ACKing previously matched deliveries unmatched.
+//
 // Rollback is a NEW generation carrying an older commit. A manual publication may
 // pin that revision; while pinned, automatic webhook pushes are ignored so a
 // later or out-of-order branch delivery cannot silently undo the rollback.
@@ -181,6 +193,13 @@ type Coordinator struct {
 	// stateRetry records a failed desired-state read that must be retried on
 	// the short retry cadence instead of waiting for the fallback poll.
 	stateRetry bool
+	// appliedUncertain records that a materialization commit returned an outcome
+	// the coordinator could not resolve from persisted state. The next attempt
+	// re-reads the persisted applied authorization before it uses the in-memory
+	// view as the previous generation or reports a failure, so a commit that
+	// landed is never rolled back to a stale generation, commit, or same-generation
+	// authorization set.
+	appliedUncertain bool
 	// onMaterialized publishes a newly applied authorization to the reconciler.
 	onMaterialized func(Snapshot)
 }
@@ -231,8 +250,11 @@ func (c *Coordinator) SetVerificationLedger(verified func(since time.Time) map[s
 // ObserveStartup reads the shared desired revision and, when one exists, fetches
 // and materializes its exact commit before the worker loads /apps. A failed
 // attempt is reported in the snapshot Error and leaves the previously
-// materialized generation authoritative, so startup continues serving the old
-// generation and retries in the background.
+// materialized generation authoritative, so the node keeps serving the old
+// generation and retries in the background. Git may already have changed parts of
+// /apps by then; the worker's startup validator decides whether that previous
+// authorization can still be proven intact locally before consumption is
+// allowed.
 //
 // A state read failure is returned: a coordinator-active node cannot converge
 // without the shared row, and silently treating it as "nothing published" would
@@ -621,10 +643,13 @@ func (c *Coordinator) enqueueSnapshot(enqueue func(string), snapshot Snapshot) {
 	}
 }
 
-// materialize runs one complete attempt for desired. It reports node progress
-// before and after the attempt and records the per-app authorization only after
-// Git materialization succeeds. No database transaction spans the network or
-// filesystem work.
+// materialize runs one complete attempt for desired. Git materialization and
+// authorization happen outside any transaction; the resulting complete
+// authorization is then persisted atomically with the node's materialized
+// progress. Only that commit advances the in-memory applied snapshot. A retry
+// whose earlier commit outcome was ambiguous first confirms the persisted
+// authorization: when it already covers the requested revision and the local tree
+// still matches, it is published without another fetch that could keep failing.
 func (c *Coordinator) materialize(
 	ctx context.Context,
 	previous Snapshot,
@@ -638,6 +663,36 @@ func (c *Coordinator) materialize(
 		return Snapshot{}, err
 	}
 	desired.Commit = commit
+	resolved, err := c.resolveUncertainApplied(ctx, &previous)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if resolved && previous.Authoritative &&
+		previous.Generation == desired.Generation &&
+		strings.EqualFold(previous.Commit, desired.Commit) &&
+		c.authorizationIntact(ctx, previous) {
+		// The ambiguous commit is confirmed to have persisted this exact
+		// generation, and the local tree still matches its authorization. Publishing
+		// it is the safe success path: no Git work is needed, and the reconciler and
+		// its enqueue set must advance with the confirmed authorization instead of
+		// waiting for a later fetch that may keep failing.
+		c.setApplied(previous)
+		if err := c.cfg.State.PruneDeploymentAppProgress(
+			ctx, c.cfg.NodeID, previous.Generation); err != nil && c.cfg.Logger != nil {
+			c.cfg.Logger.Warn("Deployment: prune old app progress failed", "error", err)
+		}
+
+		if c.cfg.Logger != nil {
+			c.cfg.Logger.InfoContext(ctx,
+				"Deployment: confirmed materialized revision after an ambiguous commit",
+				"generation", previous.Generation,
+				"commit", previous.Commit,
+				"apps", len(previous.Fingerprints),
+				"removed", len(previous.Removed))
+		}
+
+		return previous, nil
+	}
 	observed := state.DeploymentNodeProgress{
 		NodeID:            c.cfg.NodeID,
 		Generation:        desired.Generation,
@@ -648,7 +703,8 @@ func (c *Coordinator) materialize(
 		AppliedCommit:     previous.Commit,
 	}
 	acquired, err := c.cfg.State.AcquireDeploymentNode(
-		ctx, c.cfg.NodeID, c.cfg.InstanceID, desired.Generation, observed)
+		ctx, c.cfg.NodeID, c.cfg.InstanceID, desired.Generation, observed,
+	)
 	if err != nil {
 		if errors.Is(err, state.ErrDeploymentNodeSuperseded) {
 			return Snapshot{}, err
@@ -666,29 +722,24 @@ func (c *Coordinator) materialize(
 
 	fail := func(cause error) (Snapshot, error) {
 		// The failed attempt must not destroy the previous generation's
-		// authorization. Adopt the current process incarnation for the still
-		// applied generation so this process can keep reporting its activation
-		// progress while the target is retried.
-		progress := state.DeploymentNodeProgress{
-			NodeID:             c.cfg.NodeID,
-			Generation:         desired.Generation,
-			AppliedGeneration:  previous.Generation,
-			Instance:           c.cfg.InstanceID,
-			Incarnation:        acquired.Incarnation,
-			AppliedIncarnation: acquired.Incarnation,
-			Phase:              state.DeploymentNodeFailed,
-			Commit:             desired.Commit,
-			AppliedCommit:      previous.Commit,
-			Error:              cause.Error(),
-		}
-		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		// authorization, and a later failure report must never roll back an
+		// applied generation a concurrent (or ambiguously completed) commit
+		// already persisted. RecordDeploymentNodeFailure therefore updates only
+		// the observed phase/commit/error.
+		progressCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		if _, werr := c.cfg.State.RecordDeploymentNodeProgress(
-			writeCtx, c.cfg.NodeID, desired.Generation,
-			acquired.Incarnation, progress); werr != nil && c.cfg.Logger != nil {
+		landed, werr := c.cfg.State.RecordDeploymentNodeFailure(
+			progressCtx, c.cfg.NodeID, desired.Generation,
+			acquired.Incarnation, desired.Commit, cause.Error(),
+		)
+		if werr != nil && c.cfg.Logger != nil {
 			c.cfg.Logger.Warn("Deployment: record node failure failed", "error", werr)
+		} else if !landed && c.cfg.Logger != nil {
+			c.cfg.Logger.Debug("Deployment: node failure report was fenced out")
 		}
+
 		c.setAppliedIncarnation(acquired.Incarnation)
+
 		return Snapshot{}, cause
 	}
 
@@ -732,38 +783,55 @@ func (c *Coordinator) materialize(
 		previousNames[name] = ""
 	}
 	removed := missingApps(previousNames, fingerprints, appErrors)
-	for name, fingerprint := range fingerprints {
-		c.recordAppProgress(ctx, desired.Generation, acquired.Incarnation, name,
-			state.DeploymentAppPending, fingerprint, templateIdentities[name], desired.Commit, "")
-	}
-	for name, message := range appErrors {
-		c.recordAppProgress(ctx, desired.Generation, acquired.Incarnation, name,
-			state.DeploymentAppFailed, "", invalidTemplates[name], desired.Commit, message)
-	}
-	for _, name := range removed {
-		c.recordAppProgress(ctx, desired.Generation, acquired.Incarnation, name,
-			state.DeploymentAppRemoved, "", "", desired.Commit, "")
-	}
 
-	progress := state.DeploymentNodeProgress{
-		NodeID:             c.cfg.NodeID,
-		Generation:         desired.Generation,
-		AppliedGeneration:  desired.Generation,
-		Instance:           c.cfg.InstanceID,
-		Incarnation:        acquired.Incarnation,
-		AppliedIncarnation: acquired.Incarnation,
-		Phase:              state.DeploymentNodeMaterialized,
-		Commit:             desired.Commit,
-		AppliedCommit:      desired.Commit,
+	var confirmed *Snapshot
+	committed, commitErr := c.cfg.State.CommitDeploymentMaterialization(ctx,
+		state.DeploymentMaterialization{
+			NodeID:      c.cfg.NodeID,
+			Generation:  desired.Generation,
+			Instance:    c.cfg.InstanceID,
+			Incarnation: acquired.Incarnation,
+			Commit:      desired.Commit,
+			Apps: materializationApps(
+				fingerprints, templateIdentities,
+				invalidTemplates, appErrors, removed,
+			),
+		})
+	if commitErr != nil {
+		// The commit may have reached PostgreSQL before the client observed the
+		// failure. Resolve the outcome from persisted state instead of reporting a
+		// failure that would write the previous applied generation back.
+		landed, resolveErr := c.resolveMaterializationCommit(ctx, desired, acquired.Incarnation)
+		if resolveErr != nil {
+			// Unresolved: leave the applied authorization untouched and let the
+			// retry re-read it before doing anything else.
+			c.setAppliedUncertain(true)
+			return Snapshot{}, fmt.Errorf(
+				"deployment: commit materialization (outcome unknown): %w", commitErr)
+		}
+		if !landed {
+			return fail(fmt.Errorf("deployment: commit materialization: %w", commitErr))
+		}
+		// The commit landed, but this process never saw its acknowledgement.
+		// Adopt the authorization persisted by that commit rather than assuming the
+		// in-memory set was the one committed.
+		persisted, loadErr := c.loadApplied(ctx)
+		if loadErr != nil || !persisted.Authoritative ||
+			persisted.Generation != desired.Generation {
+			c.setAppliedUncertain(true)
+			return Snapshot{}, fmt.Errorf(
+				"deployment: materialization commit cannot be confirmed: %w", commitErr)
+		}
+		committed = true
+		confirmed = &persisted
 	}
-	wrote, err := c.cfg.State.RecordDeploymentNodeProgress(
-		ctx, c.cfg.NodeID, desired.Generation, acquired.Incarnation, progress)
-	if err != nil {
-		return fail(fmt.Errorf("deployment: record materialized progress: %w", err))
+	if !committed {
+		// The generation/incarnation fence no longer matches this process, so
+		// nothing was written and no failure progress may be recorded.
+		return Snapshot{}, fmt.Errorf(
+			"deployment: materialization of generation %d was superseded", desired.Generation)
 	}
-	if !wrote {
-		return fail(fmt.Errorf("deployment: materialized progress was superseded"))
-	}
+	c.setAppliedUncertain(false)
 	if err := c.cfg.State.PruneDeploymentAppProgress(
 		ctx, c.cfg.NodeID, desired.Generation); err != nil && c.cfg.Logger != nil {
 		c.cfg.Logger.Warn("Deployment: prune old app progress failed", "error", err)
@@ -785,16 +853,171 @@ func (c *Coordinator) materialize(
 		Removed:            removed,
 		Authoritative:      true,
 	}
+	if confirmed != nil {
+		snapshot = *confirmed
+	}
 	c.setApplied(snapshot)
 	c.setAppliedIncarnation(acquired.Incarnation)
 	if c.cfg.Logger != nil {
 		c.cfg.Logger.InfoContext(ctx, "Deployment: revision materialized",
 			"generation", desired.Generation,
 			"commit", desired.Commit,
-			"apps", len(fingerprints),
-			"removed", len(removed))
+			"apps", len(snapshot.Fingerprints),
+			"removed", len(snapshot.Removed))
 	}
 	return snapshot, nil
+}
+
+// resolveUncertainApplied re-reads the persisted applied authorization after a
+// materialization commit whose outcome could not be resolved, updating previous
+// in place. Persisted applied progress is written only by a complete atomic
+// commit, so the re-read state is the only safe previous authorization to reuse —
+// including a same-generation replacement that repaired the generation's row set.
+// It reports whether the persisted authorization was re-read.
+func (c *Coordinator) resolveUncertainApplied(
+	ctx context.Context,
+	previous *Snapshot,
+) (bool, error) {
+	c.mu.Lock()
+	uncertain := c.appliedUncertain
+	c.mu.Unlock()
+	if !uncertain {
+		return false, nil
+	}
+	persisted, err := c.loadApplied(ctx)
+	if err != nil {
+		return false, fmt.Errorf(
+			"deployment: resolve uncertain materialization commit: %w", err)
+	}
+	// The persisted applied generation is authoritative even when it EQUALS the
+	// in-memory generation: a landed same-generation re-materialization replaces
+	// that generation's complete authorization, while the in-memory snapshot may
+	// still hold the older set (for example a legacy partial authorization the
+	// atomic replacement repaired). Keeping the stale set would let activation
+	// reporting and the next removal computation use an authorization a restart
+	// would never reconstruct.
+	if persisted.Authoritative && persisted.Generation >= previous.Generation {
+		*previous = persisted
+		c.setApplied(persisted)
+	}
+	c.setAppliedUncertain(false)
+	return true, nil
+}
+
+// authorizationIntact reports whether the current /apps tree still matches a
+// persisted authorization exactly: every authorized app (valid or
+// materialized-invalid) is present with its recorded fingerprint/template
+// identity, and no extra app candidate exists. It is the narrow proof required
+// before an ambiguous-commit retry may publish a confirmed authorization without
+// re-materializing; anything unprovable falls back to the normal Git path.
+func (c *Coordinator) authorizationIntact(ctx context.Context, snapshot Snapshot) bool {
+	fingerprints, templateIdentities, invalidTemplates, appErrors, err := c.authorize(ctx)
+	if err != nil {
+		return false
+	}
+	current := make(map[string]struct{}, len(fingerprints)+len(appErrors))
+	for name, fingerprint := range fingerprints {
+		expected, authorized := snapshot.Fingerprints[name]
+		if !authorized || expected != fingerprint {
+			return false
+		}
+		if expectedIdentity := snapshot.TemplateIdentities[name]; expectedIdentity != "" &&
+			templateIdentities[name] != expectedIdentity {
+			return false
+		}
+		current[name] = struct{}{}
+	}
+	for name := range appErrors {
+		if name == "" {
+			continue
+		}
+		if _, invalid := snapshot.Invalid[name]; !invalid {
+			return false
+		}
+		if expectedIdentity := snapshot.InvalidTemplates[name]; expectedIdentity != "" &&
+			invalidTemplates[name] != expectedIdentity {
+			return false
+		}
+		current[name] = struct{}{}
+	}
+	if len(current) != len(snapshot.Fingerprints)+len(snapshot.Invalid) {
+		return false
+	}
+	for name := range snapshot.Fingerprints {
+		if _, ok := current[name]; !ok {
+			return false
+		}
+	}
+	for name := range snapshot.Invalid {
+		if _, ok := current[name]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveMaterializationCommit reads the node's persisted progress after a commit
+// whose outcome was unknown. The authorization and the applied generation are
+// written in one transaction, so a matching applied generation, commit, and
+// incarnation prove that the complete row set landed. A read error leaves the
+// outcome unresolved for the retry instead of assuming either result.
+func (c *Coordinator) resolveMaterializationCommit(
+	ctx context.Context,
+	desired state.DeploymentDesired,
+	incarnation int64,
+) (bool, error) {
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	node, found, err := c.cfg.State.ReadDeploymentNode(readCtx, c.cfg.NodeID)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, nil
+	}
+	return node.Generation == desired.Generation &&
+		node.Incarnation == incarnation &&
+		node.AppliedGeneration == desired.Generation &&
+		node.Phase == state.DeploymentNodeMaterialized &&
+		strings.EqualFold(node.AppliedCommit, desired.Commit), nil
+}
+
+// materializationApps assembles the COMPLETE authorization persisted atomically
+// with the materialized node progress: valid apps as pending with their
+// materialized fingerprint and template identity, materialized-but-invalid apps
+// as failed with their diagnostic, and genuinely removed apps as removals.
+func materializationApps(
+	fingerprints, templateIdentities, invalidTemplates, appErrors map[string]string,
+	removed []string,
+) []state.DeploymentAppAuthorization {
+	apps := make([]state.DeploymentAppAuthorization, 0,
+		len(fingerprints)+len(appErrors)+len(removed))
+	for name, fingerprint := range fingerprints {
+		apps = append(apps, state.DeploymentAppAuthorization{
+			App:              name,
+			Phase:            state.DeploymentAppPending,
+			Fingerprint:      fingerprint,
+			TemplateIdentity: templateIdentities[name],
+		})
+	}
+	for name, message := range appErrors {
+		if name == "" {
+			continue
+		}
+		apps = append(apps, state.DeploymentAppAuthorization{
+			App:              name,
+			Phase:            state.DeploymentAppFailed,
+			TemplateIdentity: invalidTemplates[name],
+			Error:            message,
+		})
+	}
+	for _, name := range removed {
+		apps = append(apps, state.DeploymentAppAuthorization{
+			App:   name,
+			Phase: state.DeploymentAppRemoved,
+		})
+	}
+	return apps
 }
 
 func deploymentSourceMismatch(desired state.DeploymentDesired, local git.Config) string {
@@ -876,37 +1099,6 @@ func missingApps(previous, current, invalid map[string]string) []string {
 	return removed
 }
 
-func (c *Coordinator) recordAppProgress(
-	ctx context.Context,
-	generation,
-	incarnation int64,
-	name,
-	phase,
-	fingerprint,
-	templateIdentity,
-	commit,
-	message string,
-) {
-	_, err := c.cfg.State.RecordDeploymentAppProgress(
-		ctx, c.cfg.NodeID, name, generation, incarnation,
-		state.DeploymentAppProgress{
-			NodeID:           c.cfg.NodeID,
-			App:              name,
-			Generation:       generation,
-			Instance:         c.cfg.InstanceID,
-			Phase:            phase,
-			Fingerprint:      fingerprint,
-			TemplateIdentity: templateIdentity,
-			Commit:           commit,
-			Error:            message,
-		},
-	)
-	if err != nil && c.cfg.Logger != nil {
-		c.cfg.Logger.Warn("Deployment: record app progress failed",
-			"app", name, "phase", phase, "error", err)
-	}
-}
-
 // loadApplied reconstructs the last materialized authorization from persisted
 // node/app progress. It deliberately uses the node's APPLIED generation, not its
 // observed target, so a failed newer target never erases the previous
@@ -931,10 +1123,11 @@ func (c *Coordinator) loadApplied(ctx context.Context) (Snapshot, error) {
 		Invalid:            map[string]string{},
 		InvalidTemplates:   map[string]string{},
 	}
-	// A successful empty deployment writes no app rows; any other applied
-	// generation with rows is recoverable authorization even if the LATEST
-	// attempt for a newer target failed.
-	snapshot.Authoritative = node.Phase == state.DeploymentNodeMaterialized || len(rows) > 0
+	// applied_generation advances only through the atomic materialization commit,
+	// which writes the complete authorization in the same transaction, so any
+	// applied generation reconstructs an authoritative set — including a
+	// legitimately EMPTY deployment, which stores no app rows.
+	snapshot.Authoritative = true
 	for _, row := range rows {
 		switch row.Phase {
 		case state.DeploymentAppRemoved:
@@ -1179,5 +1372,11 @@ func (c *Coordinator) setApplied(snapshot Snapshot) {
 func (c *Coordinator) setAppliedIncarnation(incarnation int64) {
 	c.mu.Lock()
 	c.appliedIncarnation = incarnation
+	c.mu.Unlock()
+}
+
+func (c *Coordinator) setAppliedUncertain(uncertain bool) {
+	c.mu.Lock()
+	c.appliedUncertain = uncertain
 	c.mu.Unlock()
 }

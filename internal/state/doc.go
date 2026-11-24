@@ -231,7 +231,23 @@
 // so a failed newer materialization never destroys the previous generation's
 // recovery authorization. App progress writes are accepted only while the
 // node's observed/applied generation matches and the caller presents the current
-// incarnation. No leader, executor, or global barrier participates: every node
+// incarnation.
+//
+// A materialization is committed atomically. CommitDeploymentMaterialization
+// locks the node row FOR UPDATE, verifies the incarnation/generation/instance
+// fence, upserts the COMPLETE authorization set (writing only changed rows, like
+// RecordDeploymentAppProgress), removes same-generation rows the set omits, and
+// advances applied_generation/applied_incarnation in the same transaction. A
+// stale fence or a failed transaction writes nothing, so the previous generation
+// remains authorized; an earlier incomplete attempt for the same generation is
+// replaced, so it can never authorize an app the complete set does not contain. It
+// does not take the publication advisory lock, which orders shared desired
+// revisions and has nothing to do with one node's local progress.
+// RecordDeploymentNodeFailure records an observed failure only and never rewrites
+// the applied generation, incarnation, or commit: a materialization commit whose
+// client outcome was ambiguous must not be rolled back by a later retry.
+//
+// No leader, executor, or global barrier participates: every node
 // reads the same desired row and converges independently after the publisher's
 // commit. A committed generation additionally emits a PostgreSQL NOTIFY hint on
 // a dedicated session channel (see ListenDeploymentDesired); it only shortens

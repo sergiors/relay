@@ -650,7 +650,7 @@ func Run(logger *slog.Logger) (runErr error) {
 		}
 	}
 
-	startupSet, err := loadStartupApps(
+	startupSet, err := loadStartupAppsChecked(
 		startupCtx, logger, st, app.Dir, metricsInstance,
 		deploymentSnapshot.Generation,
 		deploymentSnapshot.Fingerprints,
@@ -660,8 +660,17 @@ func Run(logger *slog.Logger) (runErr error) {
 		// prepared. This is what makes a local /apps edit inert rather than a
 		// desired generation.
 		deploymentSnapshot.Authoritative || deploymentCoordinator != nil,
+		// Validate the recovered authorization against the SAME scan this load
+		// consumes, before authorization filtering, discovery persistence,
+		// preparation, or Consume. A source edit therefore cannot slip between a
+		// separate validation scan and the consumed tree.
+		deploymentStartupValidation(
+			startupCtx, app.Dir, deploymentSnapshot, deploymentCoordinator != nil),
 	)
 	if err != nil {
+		if startupInterrupted(startupCtx, err) {
+			return startupResult(errStartupInterrupted)
+		}
 		return startupResult(err)
 	}
 	if deploymentCoordinator != nil {

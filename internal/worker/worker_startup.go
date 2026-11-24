@@ -160,6 +160,30 @@ func loadStartupApps(
 	materializedInvalid map[string]string,
 	authoritative bool,
 ) (startupAppSet, error) {
+	return loadStartupAppsChecked(
+		startupCtx, logger, st, appsRoot, metricsInstance, sourceGeneration,
+		authorized, materializedInvalid, authoritative, nil,
+	)
+}
+
+// loadStartupAppsChecked is loadStartupApps plus an optional check over the SAME
+// pre-authorization candidates and issues this load computed, run after
+// fingerprinting and before authorization filtering or discovery persistence. It
+// exists so startup can validate the coordinated-deployment authorization it is
+// about to consume against the exact scan that produces the consumed set: a
+// separate validation scan could miss a source edit that lands between the two.
+func loadStartupAppsChecked(
+	startupCtx context.Context,
+	logger *slog.Logger,
+	st startupState,
+	appsRoot string,
+	metricsInstance *metrics.Registry,
+	sourceGeneration int64,
+	authorized map[string]string,
+	materializedInvalid map[string]string,
+	authoritative bool,
+	check func([]startupApp, []app.LoadIssue) error,
+) (startupAppSet, error) {
 	_, loaderSpan := tracing.Start(startupCtx, "apps.load")
 	loader := app.NewLoader(appsRoot, logger)
 	observed := make(map[string]state.AppObservation)
@@ -200,6 +224,18 @@ func loadStartupApps(
 	_, fingerprintSpan := tracing.Start(startupCtx, "apps.fingerprint")
 	fingerprintStart := time.Now()
 	startup := selectAndFingerprintApps(apps, logger)
+	// Validate the authorization this startup is about to consume against these
+	// exact unfiltered candidates and issues. Running before filtering,
+	// discovery persistence, preparation, and Consume means a source edit cannot
+	// slip between a separate validation scan and the scan being consumed.
+	if check != nil {
+		if err := check(startup, loadIssues); err != nil {
+			fingerprintSpan.RecordError(err)
+			fingerprintSpan.SetStatus(codes.Error, err.Error())
+			fingerprintSpan.End()
+			return startupAppSet{}, err
+		}
+	}
 	if authoritative {
 		startup = filterAuthorizedStartupApps(startup, authorized, logger)
 		loadIssues = filterAuthorizedStartupIssues(loadIssues, materializedInvalid)
