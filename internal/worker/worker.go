@@ -729,7 +729,7 @@ func Run(logger *slog.Logger) (runErr error) {
 	}
 
 	// Persistent service controller/coordinator; see startServiceConvergence.
-	svcCtrl, services := startServiceConvergence(
+	svcCtrl, services, healthObserver := startServiceConvergence(
 		ctx, logger, cfg, manager, secretProvider, proof, metricsInstance, shutdown,
 	)
 
@@ -756,6 +756,11 @@ func Run(logger *slog.Logger) (runErr error) {
 		ctx, startupCtx, logger, manager, runWorker, st, startupSet,
 		services, svcCtrl, proof, shutdown,
 	)
+	// Start health observation only after preparation has installed the accepted
+	// generations' source-mount state. Its startup recovery excludes
+	// source-mounted (HOT_RELOAD) apps, so a reused container's stale
+	// relay.healthcheck label can never re-register a health-driven gate or retry.
+	healthObserver.Start(ctx)
 	wireWorkerRunner(runWorker, cfg, secretProvider, rtSocket)
 
 	// Runner before consumer: the consumer wires it as its ScheduleRunner seam.

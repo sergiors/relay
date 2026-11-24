@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"relay/internal/app"
 	"relay/internal/testutil"
 )
 
@@ -31,10 +33,13 @@ type listedService struct {
 	Replica  int
 	NodeID   string
 	BindAddr string // relay.bind_addr; empty omits the label (no publication)
-	Probe    bool   // carries Relay's relay.healthcheck label
-	State    string // Docker's list-level state; empty defaults to "running"
-	Port     int    // relay.port; zero defaults to 8080
-	Health   string // Docker's list-level health summary; empty omits it
+	Probe    bool   // carries Relay's relay.healthcheck label ("probe-v1")
+	// HC, when set, stamps relay.healthcheck with an EXACT identity (a current
+	// or stale probe generation), taking precedence over Probe.
+	HC     string
+	State  string // Docker's list-level state; empty defaults to "running"
+	Port   int    // relay.port; zero defaults to 8080
+	Health string // Docker's list-level health summary; empty omits it
 }
 
 func listedServiceJSON(t *testing.T, c listedService) string {
@@ -56,7 +61,9 @@ func listedServiceJSON(t *testing.T, c listedService) string {
 	if c.BindAddr != "" {
 		labels[labelBindAddr] = c.BindAddr
 	}
-	if c.Probe {
+	if c.HC != "" {
+		labels[labelHealthcheck] = c.HC
+	} else if c.Probe {
 		labels[labelHealthcheck] = "probe-v1"
 	}
 	item := map[string]any{
@@ -247,7 +254,7 @@ func TestRegistryServiceEndpointsFiltersToCommittedHealthyBoundReplicas(t *testi
 		nodeID: registryTestNodeID,
 	}
 
-	got, err := m.RegistryServiceEndpoints(context.Background(), "127.0.0.1")
+	got, err := m.RegistryServiceEndpoints(context.Background(), "127.0.0.1", nil)
 	if err != nil {
 		t.Fatalf("RegistryServiceEndpoints: %v", err)
 	}
@@ -298,7 +305,7 @@ func TestRegistryServiceEndpointsDisabledWithoutBind(t *testing.T) {
 	)
 	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: registryTestNodeID}
 
-	got, err := m.RegistryServiceEndpoints(context.Background(), "")
+	got, err := m.RegistryServiceEndpoints(context.Background(), "", nil)
 	if err != nil {
 		t.Fatalf("RegistryServiceEndpoints with no bind address: %v", err)
 	}
@@ -317,7 +324,7 @@ func TestRegistryServiceEndpointsDisabledWithoutBind(t *testing.T) {
 func TestRegistryServiceEndpointsRejectsInvalidBindAddr(t *testing.T) {
 	m := &Manager{log: testutil.DiscardLogger()} // no client: rejected before use
 	for _, value := range []string{"0.0.0.0", "example.com", "127.0.0.1:8080"} {
-		got, err := m.RegistryServiceEndpoints(context.Background(), value)
+		got, err := m.RegistryServiceEndpoints(context.Background(), value, nil)
 		if err == nil || !strings.Contains(err.Error(), "invalid bind address") {
 			t.Errorf("RegistryServiceEndpoints(%q) = (%v, %v), want an "+
 				"invalid-bind-address error", value, got, err)
@@ -337,7 +344,7 @@ func TestRegistryServiceEndpointsDiscoveryFailuresReturnNoResult(t *testing.T) {
 			body:   `{"message":"daemon wedge"}`,
 		})
 		m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: registryTestNodeID}
-		got, err := m.RegistryServiceEndpoints(context.Background(), "127.0.0.1")
+		got, err := m.RegistryServiceEndpoints(context.Background(), "127.0.0.1", nil)
 		if err == nil {
 			t.Fatal("RegistryServiceEndpoints succeeded, want the list error")
 		}
@@ -355,7 +362,7 @@ func TestRegistryServiceEndpointsDiscoveryFailuresReturnNoResult(t *testing.T) {
 				body:   `{"message":"volume api down"}`},
 		)
 		m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: registryTestNodeID}
-		got, err := m.RegistryServiceEndpoints(context.Background(), "127.0.0.1")
+		got, err := m.RegistryServiceEndpoints(context.Background(), "127.0.0.1", nil)
 		if err == nil {
 			t.Fatal("RegistryServiceEndpoints succeeded, want the marker error")
 		}
@@ -403,7 +410,7 @@ func TestRegistryServiceEndpointsPartialInspectFailureReturnsVerifiedBatch(t *te
 	)
 	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: registryTestNodeID}
 
-	got, err := m.RegistryServiceEndpoints(context.Background(), "127.0.0.1")
+	got, err := m.RegistryServiceEndpoints(context.Background(), "127.0.0.1", nil)
 	if err == nil {
 		t.Fatal("RegistryServiceEndpoints succeeded, want the inspect error " +
 			"reported alongside the verified batch")
@@ -417,6 +424,226 @@ func TestRegistryServiceEndpointsPartialInspectFailureReturnsVerifiedBatch(t *te
 	}
 	if len(got) != 1 || got[0].ContainerID != "c-ok" ||
 		got[0].HostPort != 49201 {
+		t.Fatalf("endpoints = %+v, want the one verified replica c-ok", got)
+	}
+}
+
+// Given one node's committed replicas and a caller-supplied EFFECTIVE probe
+// policy, when the registry collects, then an explicit policy decides
+// publication: a matching, healthy replica is returned; starting, unhealthy,
+// stale-identity (created under a different probe), unlabeled (created while
+// HOT_RELOAD was active, policy now normal), uncommitted, stopped, and
+// wrong-binding replicas are rejected — and one unhealthy replica never
+// suppresses its healthy sibling. An app whose effective probe is nil
+// (no declared probe, or HOT_RELOAD) ignores stale relay.healthcheck labels and
+// Docker health entirely while still requiring running, ownership, the exact
+// committed marker, and the verified binding. A nil policy keeps the legacy
+// label-based gate byte-for-byte.
+func TestRegistryServiceEndpointsEffectiveProbePolicyGatesPublication(t *testing.T) {
+	current := ServiceHealthcheckLabel(healthcheckSpec())
+	staleSpec := healthcheckSpec()
+	staleSpec.Interval = 30 * time.Second
+	stale := ServiceHealthcheckLabel(staleSpec)
+
+	markers := []scriptedVolume{
+		committedMarkerVolume("alpha", "web", registryTestNodeID, 0, "c-ok", "gen-ok"),
+		committedMarkerVolume("alpha", "web", registryTestNodeID, 1, "c-start", "gen-start"),
+		committedMarkerVolume("alpha", "web", registryTestNodeID, 2, "c-stale", "gen-stale"),
+		committedMarkerVolume("alpha", "web", registryTestNodeID, 3, "c-unlabeled", "gen-unlabeled"),
+		// The slot is committed to a different container: never eligible.
+		committedMarkerVolume("alpha", "web", registryTestNodeID, 4, "c-other", "gen-other"),
+		committedMarkerVolume("alpha", "web", registryTestNodeID, 5, "c-exited", "gen-exited"),
+		committedMarkerVolume("alpha", "web", registryTestNodeID, 6, "c-bind", "gen-bind"),
+		committedMarkerVolume("hot", "web", registryTestNodeID, 0, "c-hot", "gen-hot"),
+	}
+	listed := []listedService{
+		// The eligible healthy replica of alpha/web.
+		{ID: "c-ok", App: "alpha", Service: "web", Replica: 0,
+			NodeID: registryTestNodeID, BindAddr: "127.0.0.1",
+			HC: current, Health: "healthy"},
+		// Docker still starting: rejected without suppressing c-ok.
+		{ID: "c-start", App: "alpha", Service: "web", Replica: 1,
+			NodeID: registryTestNodeID, BindAddr: "127.0.0.1",
+			HC: current, Health: "starting"},
+		// Carries a STALE probe identity (created before a probe edit).
+		{ID: "c-stale", App: "alpha", Service: "web", Replica: 2,
+			NodeID: registryTestNodeID, BindAddr: "127.0.0.1",
+			HC: stale, Health: "healthy"},
+		// Created while HOT_RELOAD was active (no label); the current policy is
+		// a normal-mode probe, so it does not match. The list-level health is
+		// the image's own HEALTHCHECK — never Relay's contract.
+		{ID: "c-unlabeled", App: "alpha", Service: "web", Replica: 3,
+			NodeID: registryTestNodeID, BindAddr: "127.0.0.1",
+			Health: "unhealthy"},
+		// Committed to c-other: a candidate, not the active replica.
+		{ID: "c-candidate", App: "alpha", Service: "web", Replica: 4,
+			NodeID: registryTestNodeID, BindAddr: "127.0.0.1",
+			HC: current, Health: "healthy"},
+		// Not running.
+		{ID: "c-exited", App: "alpha", Service: "web", Replica: 5,
+			NodeID: registryTestNodeID, BindAddr: "127.0.0.1",
+			HC: current, State: "exited"},
+		// Healthy, but its inspect binds an unexpected host IP.
+		{ID: "c-bind", App: "alpha", Service: "web", Replica: 6,
+			NodeID: registryTestNodeID, BindAddr: "127.0.0.1",
+			HC: current, Health: "healthy"},
+		// HOT_RELOAD replica from a normal-mode era: stale label plus
+		// starting/Ready=false health. The effective policy for "hot" is nil,
+		// so none of that may gate it.
+		{ID: "c-hot", App: "hot", Service: "web", Replica: 0,
+			NodeID: registryTestNodeID, BindAddr: "127.0.0.1",
+			HC: current, Health: "starting"},
+	}
+	items := make([]string, 0, len(listed))
+	for _, ctr := range listed {
+		items = append(items, listedServiceJSON(t, ctr))
+	}
+
+	routes := []dockerRoute{
+		{method: http.MethodGet, path: "/containers/json",
+			body: serviceListJSON(items...)},
+		{method: http.MethodGet, path: "/volumes",
+			body: volumeListJSON(t, markers)},
+		{method: http.MethodGet, path: "/containers/c-ok/json",
+			body: registryInspectJSON(
+				t, "c-ok", "running", "healthy", 8080, "127.0.0.1", "49201")},
+		// Discovery inspects a still-starting candidate once to fill its durable
+		// start instant; the registry's own gates reject it before inspecting.
+		{method: http.MethodGet, path: "/containers/c-start/json",
+			body: registryInspectJSON(
+				t, "c-start", "running", "starting", 8080, "127.0.0.1", "49206")},
+		{method: http.MethodGet, path: "/containers/c-stale/json",
+			body: registryInspectJSON(
+				t, "c-stale", "running", "healthy", 8080, "127.0.0.1", "49202")},
+		// The image's native health summary is never inspected as policy for a
+		// legacy (label-less) replica: running plus a verified binding decides.
+		{method: http.MethodGet, path: "/containers/c-unlabeled/json",
+			body: registryInspectJSON(
+				t, "c-unlabeled", "running", "unhealthy", 8080, "127.0.0.1", "49203")},
+		// Under an effective-nil policy the inspect health is not policy
+		// either: the starting replica still publishes.
+		{method: http.MethodGet, path: "/containers/c-hot/json",
+			body: registryInspectJSON(
+				t, "c-hot", "running", "starting", 8080, "127.0.0.1", "49204")},
+		// Bound on an address other than the expected bind address.
+		{method: http.MethodGet, path: "/containers/c-bind/json",
+			body: registryInspectJSON(
+				t, "c-bind", "running", "healthy", 8080, "10.0.0.9", "49205")},
+	}
+	m := &Manager{
+		cli:    newScriptedDockerClient(t, routes...),
+		log:    testutil.DiscardLogger(),
+		nodeID: registryTestNodeID,
+	}
+	// alpha/web runs under the declared probe; "hot" is HOT_RELOAD, so its
+	// effective probe is nil; anything else declares none.
+	policy := func(appName, service string) *app.ServiceHealthcheck {
+		if appName == "alpha" && service == "web" {
+			return healthcheckSpec()
+		}
+		return nil
+	}
+	endpointIDs := func(endpoints []RegistryServiceEndpoint) []string {
+		ids := make([]string, 0, len(endpoints))
+		for _, endpoint := range endpoints {
+			ids = append(ids, endpoint.ContainerID)
+		}
+		return ids
+	}
+
+	got, err := m.RegistryServiceEndpoints(
+		context.Background(), "127.0.0.1", policy)
+	if err != nil {
+		t.Fatalf("RegistryServiceEndpoints with an explicit policy: %v", err)
+	}
+	if ids := endpointIDs(got); !slices.Equal(ids, []string{"c-ok", "c-hot"}) {
+		t.Fatalf("endpoints = %v, want [c-ok c-hot]: only the policy-matching "+
+			"healthy alpha replica and the effective-nil hot replica publish "+
+			"(the unhealthy c-start sibling never suppresses c-ok)", ids)
+	}
+	if ok := got[0]; ok.HostIP != "127.0.0.1" || ok.HostPort != 49201 ||
+		ok.Generation != "gen-ok" || ok.Replica != 0 {
+		t.Fatalf("c-ok endpoint = %+v, want its verified bound facts", ok)
+	}
+	if hot := got[1]; hot.HostIP != "127.0.0.1" || hot.HostPort != 49204 ||
+		hot.Generation != "gen-hot" {
+		t.Fatalf("c-hot endpoint = %+v, want its verified bound facts despite "+
+			"the stale label and starting health", hot)
+	}
+
+	// A nil policy keeps the legacy label-based gate exactly: the stale-labeled
+	// healthy replica and the label-less (native-unhealthy) replica publish,
+	// while the starting labeled replica and the stale-labeled starting HOT_
+	// RELOAD replica are rejected by their own labels.
+	legacy, err := m.RegistryServiceEndpoints(
+		context.Background(), "127.0.0.1", nil)
+	if err != nil {
+		t.Fatalf("RegistryServiceEndpoints with a nil policy: %v", err)
+	}
+	if ids := endpointIDs(legacy); !slices.Equal(ids,
+		[]string{"c-ok", "c-stale", "c-unlabeled"}) {
+		t.Fatalf("legacy endpoints = %v, want [c-ok c-stale c-unlabeled] "+
+			"(the historical label-presence gate, unchanged)", ids)
+	}
+}
+
+// Given three committed, policy-matching replicas where one inspect fails with
+// a daemon error and another vanished, when the registry collects under an
+// explicit policy, then the verified endpoint is published ALONGSIDE the first
+// inspect error — one unreadable container must not suppress every healthy
+// endpoint — while the vanished container is omitted without an error.
+func TestRegistryServiceEndpointsPartialInspectFailureUnderProbePolicy(t *testing.T) {
+	current := ServiceHealthcheckLabel(healthcheckSpec())
+	markers := []scriptedVolume{
+		committedMarkerVolume("alpha", "web", registryTestNodeID, 0, "c-ok", "gen-ok"),
+		committedMarkerVolume("alpha", "web", registryTestNodeID, 1, "c-broken", "gen-broken"),
+		committedMarkerVolume("alpha", "web", registryTestNodeID, 2, "c-gone", "gen-gone"),
+	}
+	listed := serviceListJSON(
+		listedServiceJSON(t, listedService{ID: "c-ok", App: "alpha",
+			Service: "web", Replica: 0, NodeID: registryTestNodeID,
+			BindAddr: "127.0.0.1", HC: current, Health: "healthy"}),
+		listedServiceJSON(t, listedService{ID: "c-broken", App: "alpha",
+			Service: "web", Replica: 1, NodeID: registryTestNodeID,
+			BindAddr: "127.0.0.1", HC: current, Health: "healthy"}),
+		listedServiceJSON(t, listedService{ID: "c-gone", App: "alpha",
+			Service: "web", Replica: 2, NodeID: registryTestNodeID,
+			BindAddr: "127.0.0.1", HC: current, Health: "healthy"}),
+	)
+	cli := newScriptedDockerClient(t,
+		dockerRoute{method: http.MethodGet, path: "/containers/json", body: listed},
+		dockerRoute{method: http.MethodGet, path: "/volumes",
+			body: volumeListJSON(t, markers)},
+		dockerRoute{method: http.MethodGet, path: "/containers/c-ok/json",
+			body: registryInspectJSON(
+				t, "c-ok", "running", "healthy", 8080, "127.0.0.1", "49301")},
+		dockerRoute{method: http.MethodGet, path: "/containers/c-broken/json",
+			status: http.StatusInternalServerError,
+			body:   `{"message":"inspect failed"}`},
+		dockerRoute{method: http.MethodGet, path: "/containers/c-gone/json",
+			status: http.StatusNotFound,
+			body:   `{"message":"no such container"}`},
+	)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: registryTestNodeID}
+	policy := func(appName, service string) *app.ServiceHealthcheck {
+		return healthcheckSpec()
+	}
+
+	got, err := m.RegistryServiceEndpoints(
+		context.Background(), "127.0.0.1", policy)
+	if err == nil {
+		t.Fatal("RegistryServiceEndpoints succeeded, want the inspect error " +
+			"reported alongside the verified batch")
+	}
+	if !strings.Contains(err.Error(), "inspect container c-broken") {
+		t.Fatalf("error %q must identify the unreadable container", err)
+	}
+	if strings.Contains(err.Error(), "c-gone") {
+		t.Fatalf("error %q must not report a vanished container: a not-found "+
+			"inspect is an ordinary omission", err)
+	}
+	if len(got) != 1 || got[0].ContainerID != "c-ok" ||
+		got[0].HostPort != 49301 {
 		t.Fatalf("endpoints = %+v, want the one verified replica c-ok", got)
 	}
 }

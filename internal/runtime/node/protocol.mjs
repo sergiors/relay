@@ -21,31 +21,47 @@ class ChunkReader {
   async readExact(size, allowCleanEnd = false) {
     const result = Buffer.allocUnsafe(size);
     let received = 0;
+
     while (received < size) {
       if (this.chunk === null || this.offset === this.chunk.length) {
         const next = await this.iterator.next();
         if (next.done) {
-          if (received === 0 && allowCleanEnd) return null;
+          if (received === 0 && allowCleanEnd) {
+            return null;
+          }
+
           throw new ProtocolError("incomplete frame");
         }
+
         this.chunk = next.value;
         this.offset = 0;
+
         continue;
       }
+
       const length = Math.min(size - received, this.chunk.length - this.offset);
       this.chunk.copy(result, received, this.offset, this.offset + length);
       this.offset += length;
       received += length;
     }
+
     return result;
   }
 }
 
 async function readFrame(reader, limit, allowCleanEnd = false) {
   const header = await reader.readExact(4, allowCleanEnd);
-  if (header === null) return null;
+
+  if (header === null) {
+    return null;
+  }
+
   const size = header.readUInt32BE(0);
-  if (size === 0 || size > limit) throw new ProtocolError("invalid frame size");
+
+  if (size === 0 || size > limit) {
+    throw new ProtocolError("invalid frame size");
+  }
+
   const payload = await reader.readExact(size);
   let text;
   try {
@@ -148,7 +164,11 @@ export async function runProtocol(invoke) {
   }
   executionSecret = executionSecretValue;
   const executionPort = Number(executionPortValue);
-  if (!Number.isInteger(executionPort) || executionPort < 1 || executionPort > 65535) {
+  if (
+    !Number.isInteger(executionPort) ||
+    executionPort < 1 ||
+    executionPort > 65535
+  ) {
     throw new Error("invalid Relay execution configuration");
   }
 

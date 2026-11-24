@@ -359,14 +359,33 @@ func TestSuccessfulPreparationPrunesStalePreparationMarkersOnly(t *testing.T) {
 			t.Fatalf("stale preparation marker survived with zero preparation "+
 				"writes = %+v, want the kind-scoped delete to have removed it", stale)
 		}
-		if writes := md.candidateWrites(); len(writes) != 0 {
-			t.Fatalf("candidate-family writes = %+v, want none (a probe-less "+
-				"service commits no marker state)", writes)
+		// The bypassed probe writes no CANDIDATE/attempt state, but the started
+		// no-probe replica still earns exactly one durable replica-family write:
+		// its commit — no attempt record, no candidate identity, no retry window.
+		writes := md.candidateWrites()
+		if len(writes) != 1 {
+			t.Fatalf("candidate-family writes = %+v, want exactly the started "+
+				"replica's commit", writes)
+		}
+		commit := writes[0]
+		if commit.CommittedContainerID == "" || commit.Generation == "" {
+			t.Fatalf("commit = %+v, want the running replica with its generation",
+				commit)
+		}
+		if commit.CandidateContainerID != "" || commit.CandidateAttempt != 0 ||
+			!commit.RetryNotBefore.IsZero() {
+			t.Fatalf("commit = %+v, want no candidate attempt or retry state for "+
+				"a no-probe service", commit)
 		}
 		committedAfter, ok := md.markerState("fn", "service.js", 0)
-		if !ok || committedAfter != committedBefore {
-			t.Fatalf("committed/candidate marker = (%+v, %v), want it untouched: "+
-				"%+v", committedAfter, ok, committedBefore)
+		if !ok || committedAfter != commit {
+			t.Fatalf("committed/candidate marker = (%+v, %v), want exactly the "+
+				"recorded commit %+v", committedAfter, ok, commit)
+		}
+		if committedAfter.CommittedContainerID == committedBefore.CommittedContainerID {
+			t.Fatalf("committed marker = %q, still the seeded live-1; want the "+
+				"actually running replica (the seeded container does not exist on "+
+				"the daemon)", committedAfter.CommittedContainerID)
 		}
 		if got := f.runningCount("fn", "service.js"); got != 1 {
 			t.Fatalf("running containers = %d, want exactly the started replica", got)

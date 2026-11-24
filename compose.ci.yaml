@@ -13,6 +13,7 @@ services:
       timeout: 3s
       retries: 10
 
+
   redis:
     image: redis:8-alpine
     healthcheck:
@@ -20,6 +21,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
 
   ci:
     build:
@@ -51,6 +53,7 @@ services:
       - go-build:/home/ci/.cache/go-build
       - uv-cache:/home/ci/.cache/uv
       - pnpm-cache:/home/ci/.local/share/pnpm/store
+
 
 volumes:
   go-mod:

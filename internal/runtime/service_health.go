@@ -39,6 +39,19 @@ func ServiceHealthcheckLabel(hc *app.ServiceHealthcheck) string {
 	return hex.EncodeToString(h.Sum(nil))[:serviceIdentityHashLen]
 }
 
+// EffectiveServiceHealthcheck returns the healthcheck Relay actually applies to
+// a service: the declared probe, unless the service's current generation runs
+// from a live source mount (HOT_RELOAD). Callers pass the source-mount fact they
+// already resolved so reconciliation and discovery share one policy rule.
+func EffectiveServiceHealthcheck(
+	hc *app.ServiceHealthcheck, sourceMounted bool,
+) *app.ServiceHealthcheck {
+	if sourceMounted {
+		return nil
+	}
+	return hc
+}
+
 // serviceHealthConfig builds Docker's native HEALTHCHECK configuration for a
 // managed entrypoint service. The probe is an exec-form command using the same
 // node/python executable the service entrypoint runs with, so it relies on no

@@ -8,7 +8,16 @@ import (
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
+
+	"relay/internal/app"
 )
+
+// ServiceProbePolicy reports Relay's CURRENT effective healthcheck for one
+// (app, service) slot. A nil result means Relay's probe is not in effect:
+// none was declared, or HOT_RELOAD bypasses it. The caller derives this from
+// the live template and the app's source-mount state, so the registry never
+// keeps its own copy of that policy.
+type ServiceProbePolicy func(app, service string) *app.ServiceHealthcheck
 
 // RegistryServiceEndpoint is one persistent service replica this manager can
 // prove is currently serving, with the host endpoint Docker actually assigned.
@@ -41,12 +50,21 @@ type RegistryServiceEndpoint struct {
 //   - a Docker-owned committed/candidate marker names this exact container as
 //     the committed replica for its (app, service, replica) slot, with a
 //     non-empty generation identity;
-//   - it is running and, when Relay applied a healthcheck, Docker reports it
-//     healthy (a service without Relay's healthcheck keeps the running-is-ready
-//     behavior; an image-declared HEALTHCHECK never changes this decision);
+//   - it is running and, when Relay's CURRENT effective policy applies a
+//     healthcheck, the container carries that exact probe identity and Docker
+//     reports it healthy (a service without an effective probe keeps the
+//     running-is-ready behavior; an image-declared HEALTHCHECK never changes
+//     this decision);
 //   - it publishes its port on expectedBindAddr, and inspection proves exactly
 //     one host binding for the service's internal TCP port on that exact
 //     address.
+//
+// probe supplies the live effective policy. A nil probe keeps the legacy
+// label-based gate: the container's own relay.healthcheck label decides whether
+// readiness is required. That fallback is conservative; callers that know the
+// current template always supply the policy so a stale label cannot gate a
+// HOT_RELOAD replica, and a current normal-mode probe cannot be bypassed by a
+// container created while HOT_RELOAD was active.
 //
 // A missing marker, a stopped/unhealthy container, an absent or unexpected
 // binding, and a container that disappeared before inspection are all simply
@@ -63,6 +81,7 @@ type RegistryServiceEndpoint struct {
 func (m *Manager) RegistryServiceEndpoints(
 	ctx context.Context,
 	expectedBindAddr string,
+	probe ServiceProbePolicy,
 ) ([]RegistryServiceEndpoint, error) {
 	expected, err := parseServiceBindAddr(expectedBindAddr)
 	if err != nil {
@@ -104,11 +123,21 @@ func (m *Manager) RegistryServiceEndpoints(
 		if ctr.State != container.StateRunning || ctr.Port < 1 || ctr.Replica < 0 {
 			continue
 		}
-		if ctr.Ready != nil && !*ctr.Ready {
-			continue
-		}
-		if ctr.Healthcheck != "" && ctr.Health != container.Healthy {
-			continue
+		probeLabel := serviceRegistryProbeLabel(probe, ctr)
+		if probeLabel != "" {
+			// Relay's effective policy applies a probe: the committed
+			// container must belong to that exact probe generation. Checking
+			// the label identity also rejects a replica created under a
+			// different policy (for example before HOT_RELOAD was enabled).
+			if ctr.Healthcheck != probeLabel {
+				continue
+			}
+			if ctr.Ready != nil && !*ctr.Ready {
+				continue
+			}
+			if ctr.Health != container.Healthy {
+				continue
+			}
 		}
 		insp, err := m.cli.ContainerInspect(opCtx, ctr.ID, client.ContainerInspectOptions{})
 		if err != nil {
@@ -128,7 +157,7 @@ func (m *Manager) RegistryServiceEndpoints(
 		if state == nil || state.Status != container.StateRunning {
 			continue
 		}
-		if ctr.Healthcheck != "" &&
+		if probeLabel != "" &&
 			(state.Health == nil || state.Health.Status != container.Healthy) {
 			continue
 		}
@@ -167,6 +196,19 @@ type serviceRegistrySlot struct {
 	app     string
 	service string
 	replica int
+}
+
+// serviceRegistryProbeLabel returns the effective Relay healthcheck label that
+// gates one container's publication. "" means no Relay probe is in effect, so
+// neither the container's historical relay.healthcheck label nor Docker health
+// is policy. A nil policy preserves the legacy label-based gate.
+func serviceRegistryProbeLabel(
+	probe ServiceProbePolicy, ctr ServiceContainer,
+) string {
+	if probe == nil {
+		return ctr.Healthcheck
+	}
+	return ServiceHealthcheckLabel(probe(ctr.App, ctr.Name))
 }
 
 // committedServiceReplicas reduces the marker volumes to the newest committed

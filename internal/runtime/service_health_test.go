@@ -59,6 +59,29 @@ func TestServiceHealthcheckLabelIdentity(t *testing.T) {
 	}
 }
 
+// The effective probe is the declared probe unless the current generation runs
+// from a live HOT_RELOAD source mount: reconciliation and discovery share this
+// single rule so a bypassed probe never gates a mounted service.
+func TestEffectiveServiceHealthcheckFollowsSourceMount(t *testing.T) {
+	hc := healthcheckSpec()
+
+	if got := EffectiveServiceHealthcheck(hc, false); got != hc {
+		t.Fatalf("effective(%v, unmounted) = %v, want the declared probe verbatim",
+			hc, got)
+	}
+	if got := EffectiveServiceHealthcheck(hc, true); got != nil {
+		t.Fatalf("effective(%v, mounted) = %v, want nil (HOT_RELOAD bypasses the "+
+			"probe)", hc, got)
+	}
+	if got := EffectiveServiceHealthcheck(nil, false); got != nil {
+		t.Fatalf("effective(nil, unmounted) = %v, want nil (nothing declared)",
+			got)
+	}
+	if got := EffectiveServiceHealthcheck(nil, true); got != nil {
+		t.Fatalf("effective(nil, mounted) = %v, want nil", got)
+	}
+}
+
 // The Docker HEALTHCHECK is built from the runtime's own executable in exec
 // form — no shell — with the configured probe path, port, and timings mapped
 // onto Docker's native fields.

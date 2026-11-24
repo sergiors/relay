@@ -57,13 +57,16 @@ const baselineEnv = new Map();
 
 function applyEnv(env) {
   const incoming = new Map();
+
   if (env && typeof env === "object") {
     for (const [k, v] of Object.entries(env)) {
       if (k === "RELAY_EXECUTION_SECRET") continue;
       incoming.set(String(k), String(v));
     }
   }
+
   delete process.env.RELAY_EXECUTION_SECRET;
+
   for (const key of Array.from(appliedEnv)) {
     if (!incoming.has(key)) {
       if (baselineEnv.get(key) === MISSING || !baselineEnv.has(key)) {
@@ -75,6 +78,7 @@ function applyEnv(env) {
       appliedEnv.delete(key);
     }
   }
+
   for (const [key, value] of incoming) {
     if (!appliedEnv.has(key)) {
       baselineEnv.set(
@@ -90,7 +94,12 @@ function applyEnv(env) {
 }
 
 function boundedError(id, message) {
-  const emptyResult = JSON.stringify({ type: "result", id, ok: false, error: "" });
+  const emptyResult = JSON.stringify({
+    type: "result",
+    id,
+    ok: false,
+    error: "",
+  });
   const budget = Math.min(
     MAX_ERROR_BYTES,
     MAX_RESPONSE_BYTES - Buffer.byteLength(emptyResult, "utf8"),
@@ -99,18 +108,27 @@ function boundedError(id, message) {
 
   let result = "";
   let used = 0;
+
   for (const cp of message) {
     const quoted = JSON.stringify(cp);
     const bytes = Buffer.byteLength(quoted.slice(1, -1), "utf8");
-    if (used + bytes > budget) break;
+
+    if (used + bytes > budget) {
+      break;
+    }
+
     result += cp;
     used += bytes;
   }
+
   return result;
 }
 
 function makeResult(id, ok, error) {
-  if (ok) return { type: "result", id, ok: true };
+  if (ok) {
+    return { type: "result", id, ok: true };
+  }
+
   return {
     type: "result",
     id,
@@ -165,7 +183,6 @@ async function invoke(req, loadHandler) {
 
   return makeResult(id, error === null, error ?? undefined);
 }
-
 
 export function createInvoker(loadHandler) {
   return (req) => invoke(req, loadHandler);

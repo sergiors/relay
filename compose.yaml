@@ -12,24 +12,24 @@ services:
         condition: service_healthy
 
     environment:
-      - REDIS_URI=redis:6379
-      - REDIS_STREAM=events
-      - REDIS_GROUP=relay
+      REDIS_URI: redis:6379
+      REDIS_STREAM: events
+      REDIS_GROUP: relay
 
-      - NODE_ID=relay
+      NODE_ID: relay
 
-      - DATABASE_URL=postgres://relay:relay@postgres:5432/relay?sslmode=disable
+      DATABASE_URL: postgres://relay:relay@postgres:5432/relay?sslmode=disable
 
-      - ROUTING_HOST_OVERRIDE=localhost
-      - SERVICE_BIND_ADDR=172.28.0.1
-      - SERVICE_ADVERTISE_ADDR=172.28.0.1
-      - DISCOVERY_ADDR=:8082
+      ROUTING_HOST_OVERRIDE: localhost
+      SERVICE_BIND_ADDR: 172.28.0.1
+      SERVICE_ADVERTISE_ADDR: 172.28.0.1
+      DISCOVERY_ADDR: :8082
 
-      - METRICS_ADDR=:9090
-      - GIT_WEBHOOK_ADDR=:8081
+      METRICS_ADDR: :9090
+      GIT_WEBHOOK_ADDR: :8081
 
-      - LOG_LEVEL=DEBUG
-      - HOT_RELOAD=1
+      LOG_LEVEL: DEBUG
+      HOT_RELOAD: 1
 
     volumes:
       - relay-data:/var/lib/relay
@@ -66,6 +66,7 @@ services:
 
     networks:
       - runtime
+
 
   redis:
     image: redis:8-alpine

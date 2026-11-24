@@ -4,6 +4,7 @@ x-logging: &default-logging
     max-size: 10m
     max-file: 3
 
+
 services:
   relay:
     image: ghcr.io/sergiors/relay:latest
@@ -18,7 +19,6 @@ services:
       - .env
 
     environment:
-      NETWORKS: runtime
       NODE_ID: ${NODE_ID:?Set NODE_ID}
 
       SERVICE_BIND_ADDR: ${SERVICE_BIND_ADDR:?Set SERVICE_BIND_ADDR}
@@ -47,6 +47,7 @@ services:
       timeout: 3s
       retries: 3
       start_period: 20s
+
 
   traefik:
     image: traefik:v3.7.13
@@ -85,6 +86,7 @@ services:
     networks:
       - runtime
 
+
   prometheus:
     image: prom/prometheus:v3.7.0
     restart: unless-stopped
@@ -103,6 +105,7 @@ services:
     networks:
       - runtime
 
+
   loki:
     image: grafana/loki:3.7.0
     restart: unless-stopped
@@ -118,6 +121,7 @@ services:
     networks:
       - runtime
 
+
   tempo:
     image: grafana/tempo:${TEMPO_VERSION:?Set TEMPO_VERSION}
     restart: unless-stopped
@@ -132,6 +136,7 @@ services:
 
     networks:
       - runtime
+
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:${OTEL_VERSION:?Set OTEL_VERSION}
@@ -150,6 +155,7 @@ services:
 
     networks:
       - runtime
+
 
   alloy:
     image: grafana/alloy:${ALLOY_VERSION:?Set ALLOY_VERSION}
@@ -171,6 +177,7 @@ services:
 
     networks:
       - runtime
+
 
   grafana:
     image: grafana/grafana:${GRAFANA_VERSION:?Set GRAFANA_VERSION}
@@ -205,6 +212,7 @@ services:
       - traefik.http.routers.grafana.tls.certresolver=letsencrypt
       - traefik.http.services.grafana.loadbalancer.server.port=3000
 
+
 volumes:
   relay-apps:
   relay-data:
@@ -214,6 +222,7 @@ volumes:
   grafana-data:
   alloy-data:
   letsencrypt-data:
+
 
 networks:
   runtime:

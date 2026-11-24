@@ -28,11 +28,19 @@ type fakeContainer struct {
 	// sourceRef is the configured source descriptor (relay.identity); when empty
 	// it defaults to entrypoint, so a fixture that does not distinguish name from
 	// source still converges.
-	sourceRef              string
-	image                  string
-	imageID                string
-	port                   int
-	bindAddr               string // relay.bind_addr as stamped at create (spec.BindAddr)
+	sourceRef string
+	image     string
+	imageID   string
+	port      int
+	bindAddr  string // relay.bind_addr as stamped at create (spec.BindAddr)
+	// boundAddr is the host address the daemon ACTUALLY published the
+	// service's port on; "" models a container whose bind label claims
+	// publication but whose real mapping is missing (or, when it differs from
+	// bindAddr, bound elsewhere). StartService stamps it beside the label —
+	// production verifies the mapping before a start succeeds — so a
+	// directly seeded container is the seam for the label-without-binding
+	// regression.
+	boundAddr              string
 	replica                int
 	state                  container.ContainerState
 	entry                  []string // the long-lived process command passed to StartService
@@ -180,6 +188,7 @@ func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, r
 		imageID:    spec.ImageID,
 		port:       spec.Port,
 		bindAddr:   spec.BindAddr,
+		boundAddr:  spec.BindAddr,
 		replica:    replica,
 		state:      container.StateRunning,
 		entry:      spec.Entry,

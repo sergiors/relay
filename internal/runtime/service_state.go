@@ -34,6 +34,15 @@ type ServiceHealthObservation struct {
 	// transient inspect failure, which is reported through the call error and
 	// leaves the container out of the result map.
 	Missing bool
+	// PublishedInternalPort, PublishedHostIP, and PublishedHostPort are Docker's
+	// actual single host binding for the container's service TCP port, parsed
+	// from relay.port. They are zero/empty when the container has no service
+	// port label, no binding, or an ambiguous/unexpected binding. A commit
+	// boundary can therefore prove host publication from the same inspect that
+	// produced State/Health.
+	PublishedInternalPort int
+	PublishedHostIP       string
+	PublishedHostPort     int
 }
 
 // ServiceStateKindPreparation is the marker family for the service-level
@@ -113,11 +122,12 @@ type StateMarkerStore interface {
 }
 
 // ObserveServiceHealth inspects exactly the given service containers and returns
-// their current state and Docker health. It is the observer's narrow Docker seam:
-// only pending candidates are inspected, never every service container. A
-// container that no longer exists is omitted from the result; a genuine inspect
-// failure is returned with the partial observation map so the caller can log it
-// and retry on the next tick.
+// their current state, Docker health, and — when the container carries a
+// relay.port label — Docker's single validated host binding for that service
+// port. It is the narrow Docker seam shared by the health observer and the
+// commit boundary's final revalidation. A container that no longer exists is
+// reported Missing; a genuine inspect failure is returned with the partial
+// observation map so the caller can fail closed and retry on the next tick.
 func (m *Manager) ObserveServiceHealth(
 	ctx context.Context,
 	ids []string,
@@ -155,6 +165,15 @@ func (m *Manager) ObserveServiceHealth(
 			observation.StartedAt = parseDockerStartInstant(insp.Container.State.StartedAt)
 			if insp.Container.State.Health != nil {
 				observation.Health = insp.Container.State.Health.Status
+			}
+		}
+		if insp.Container.Config != nil {
+			if port, err := strconv.Atoi(insp.Container.Config.Labels[labelPort]); err == nil {
+				if hostIP, hostPort, ok := serviceObservedBinding(insp.Container, port); ok {
+					observation.PublishedInternalPort = port
+					observation.PublishedHostIP = hostIP
+					observation.PublishedHostPort = hostPort
+				}
 			}
 		}
 		out[id] = observation

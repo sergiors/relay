@@ -428,10 +428,27 @@ func (d *probeDocker) ObserveServiceHealth(
 			out[id] = runtime.ServiceHealthObservation{Missing: true}
 			continue
 		}
-		out[id] = runtime.ServiceHealthObservation{State: ctr.state, Health: ctr.health}
+		obs := runtime.ServiceHealthObservation{State: ctr.state, Health: ctr.health}
+		// Mirror the production Manager's inspect: a container the daemon
+		// ACTUALLY published reports its binding facts (internal port, host
+		// IP, host port); an unbound container reports none, so a bind label
+		// whose mapping never materialized fails the commit boundary's
+		// binding proof.
+		if ctr.boundAddr != "" {
+			obs.PublishedInternalPort = ctr.port
+			obs.PublishedHostIP = ctr.boundAddr
+			obs.PublishedHostPort = fakePublishedHostPort
+		}
+		out[id] = obs
 	}
 	return out, firstErr
 }
+
+// fakePublishedHostPort is the host port a bound fake container reports: the
+// fake never allocates ephemeral ports, and only the exact host IP plus the
+// internal port identity are contractual for the commit boundary's binding
+// proof.
+const fakePublishedHostPort = 49155
 
 // countEventPrefix counts ordered events carrying the prefix.
 func countEventPrefix(events []string, prefix string) int {

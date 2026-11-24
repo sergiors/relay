@@ -85,6 +85,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"sort"
 	"sync"
 	"time"
@@ -798,6 +799,18 @@ func reconcileWithObserver(
 		generation string
 		id         string
 		attempt    int
+		// healthcheck is the EFFECTIVE probe for this intent (nil when none is
+		// applied, including HOT_RELOAD), so the final boundary uses the same
+		// policy the candidate was started under.
+		healthcheck *app.ServiceHealthcheck
+		// port and bindAddr are the service's internal TCP port and expected
+		// host publication address. When bindAddr is non-empty the final
+		// boundary proves the exact Docker host binding from the observation
+		// before writing the marker, so an adopted existing replica is never
+		// committed while unbound or misbound. "" keeps internal-only services
+		// exempt.
+		port     int
+		bindAddr string
 	}
 	var commitIntents []commitIntent
 	for _, svc := range tmpl.Services {
@@ -848,7 +861,8 @@ func reconcileWithObserver(
 		preparationGeneration := servicePreparationIdentity(
 			tmpl, svc, appImage, serviceNetworks, desiredBindAddr, sourceMounted)
 		preparationAttempt := 0
-		preparationRetry := svc.Healthcheck != nil && !sourceMounted && stateTracker != nil
+		preparationRetry := runtime.EffectiveServiceHealthcheck(
+			svc.Healthcheck, sourceMounted) != nil && stateTracker != nil
 		// preparationAdmittedAt is the start instant of the admission this pass
 		// writes. It identifies that admission's successful completion, so it is
 		// zero when no admission was written (no effective probe, or a failed
@@ -1172,10 +1186,9 @@ func reconcileWithObserver(
 		// No Docker probe, no healthcheck/attempt labels, and no readiness gate are
 		// applied, so a healthcheck-only template edit cannot force a replacement
 		// and source-only restarts keep their in-place semantics.
-		effectiveHealthcheck := svc.Healthcheck
-		if resolved.Mount != nil {
-			effectiveHealthcheck = nil
-		}
+		effectiveHealthcheck := runtime.EffectiveServiceHealthcheck(
+			svc.Healthcheck, resolved.Mount != nil,
+		)
 		// desiredHealthcheck is the canonical identity of the service's desired
 		// healthcheck configuration. "" (no healthcheck, including HOT_RELOAD)
 		// matches an unlabeled container, preserving the historical behavior.
@@ -1680,7 +1693,7 @@ func reconcileWithObserver(
 					}
 				}
 				if len(matches) > 0 {
-					if effectiveHealthcheck != nil && keep.ID != activeID {
+					if keep.ID != activeID {
 						if superseded() {
 							pass.superseded = true
 							abortPass = true
@@ -1689,9 +1702,14 @@ func reconcileWithObserver(
 						// Defer the durable marker write until the final readiness
 						// revalidation below. Writing it here would authorize retirement
 						// if the candidate later loses readiness before the deferred stop.
+						// This intent is also written for a no-probe replica: the final
+						// boundary verifies it is still running before the marker is
+						// committed, so a no-effective-probe generation is durable too.
 						commitIntents = append(commitIntents, commitIntent{
 							name: name, replica: slot, generation: desiredGeneration,
 							id: keep.ID, attempt: serviceHealthAttemptNumber(keep),
+							healthcheck: effectiveHealthcheck,
+							port:        svc.Port, bindAddr: desiredBindAddr,
 						})
 					}
 					// A committed/healthy replica holds the slot. Everything else in the
@@ -1945,6 +1963,8 @@ func reconcileWithObserver(
 					commitIntents = append(commitIntents, commitIntent{
 						name: name, replica: slot, generation: desiredGeneration,
 						id: startedID, attempt: nextAttempt,
+						healthcheck: effectiveHealthcheck,
+						port:        svc.Port, bindAddr: desiredBindAddr,
 					})
 				}
 				started++
@@ -1997,6 +2017,18 @@ func reconcileWithObserver(
 					}
 					apply.record(restartTarget.ID, fnName, desiredSourceID)
 					pass.restarted++
+					// An in-place source reload keeps the container identity but
+					// advances the desired source generation. Commit that generation
+					// before the other slot generations are retired, so a probe-less
+					// (HOT_RELOAD) replica becomes durable and publishable in this
+					// pass instead of waiting for a later reconcile.
+					commitIntents = append(commitIntents, commitIntent{
+						name: name, replica: slot, generation: desiredGeneration,
+						id:          restartTarget.ID,
+						attempt:     serviceHealthAttemptNumber(*restartTarget),
+						healthcheck: effectiveHealthcheck,
+						port:        svc.Port, bindAddr: desiredBindAddr,
+					})
 					for i := range olds {
 						if olds[i].ID != restartTarget.ID {
 							stale = append(stale, olds[i])
@@ -2163,6 +2195,17 @@ func reconcileWithObserver(
 				commitIntents = append(commitIntents, commitIntent{
 					name: name, replica: slot, generation: desiredGeneration,
 					id: startedID, attempt: attempt,
+					healthcheck: effectiveHealthcheck,
+					port:        svc.Port, bindAddr: desiredBindAddr,
+				})
+			} else if startedID != "" {
+				// A no-probe replica has no readiness contract, but it still needs a
+				// durable commit. The final boundary verifies it is running before
+				// writing the marker and retiring the superseded generation.
+				commitIntents = append(commitIntents, commitIntent{
+					name: name, replica: slot, generation: desiredGeneration,
+					id: startedID, attempt: attempt,
+					port: svc.Port, bindAddr: desiredBindAddr,
 				})
 			}
 			started++
@@ -2283,7 +2326,25 @@ func reconcileWithObserver(
 			if outcome == serviceProbeObserved {
 				authorized = !observation.Missing &&
 					observation.State == container.StateRunning &&
-					observation.Health == container.Healthy
+					(intent.healthcheck == nil ||
+						observation.Health == container.Healthy)
+			}
+			if authorized && intent.bindAddr != "" {
+				// A routed replica must prove the daemon's ACTUAL host binding,
+				// not just the relay.bind_addr label stamped at create time.
+				// StartService proves a NEW container, but an adopted existing
+				// replica or an in-place restart has never passed that check.
+				// The observation's inspect already carries the binding facts.
+				if outcome == serviceProbeObserved {
+					authorized = serviceBindingPublished(
+						observation, intent.port, intent.bindAddr)
+				} else if intent.healthcheck == nil &&
+					stateTracker != nil && stateTracker.stateStore != nil {
+					// A no-probe committed marker would be written, but this
+					// Docker cannot prove the actual binding: fail closed
+					// instead of trusting the label claim.
+					authorized = false
+				}
 			}
 			if authorized {
 				if superseded() {
@@ -2296,8 +2357,9 @@ func reconcileWithObserver(
 				// record it at this commit boundary too: the durable attempt/start
 				// record is what a later failure (or a restarted worker) derives its
 				// retry window from, so an unrecorded candidate is not committed and
-				// the old marker stays authoritative.
-				if stateTracker != nil {
+				// the old marker stays authoritative. A no-probe intent has no
+				// attempt semantics and needs no such record.
+				if stateTracker != nil && intent.healthcheck != nil {
 					if _, recorded := stateTracker.startedCandidateState(
 						fnName, intent.name, intent.replica,
 						intent.generation, intent.id,
@@ -2313,7 +2375,7 @@ func reconcileWithObserver(
 								deferredStale, intent.name, intent.replica)
 							pass.pending = true
 							addHealthCandidate(&pass, fnName, intent.id)
-							if hc := desired[intent.name].Healthcheck; hc != nil {
+							if hc := intent.healthcheck; hc != nil {
 								pass.startupDeadline = earlierDeadline(
 									pass.startupDeadline,
 									time.Now().Add(hc.Interval))
@@ -2333,7 +2395,12 @@ func reconcileWithObserver(
 						deferredStale = removeStaleSlot(
 							deferredStale, intent.name, intent.replica)
 						pass.pending = true
-						addHealthCandidate(&pass, fnName, intent.id)
+						// Only an effective Relay probe has a health observer hint.
+						// A no-probe commit failure keeps the fallback serving and
+						// relies on ordinary reconciliation to retry the marker.
+						if intent.healthcheck != nil {
+							addHealthCandidate(&pass, fnName, intent.id)
+						}
 					}
 				}
 				continue
@@ -2344,8 +2411,15 @@ func reconcileWithObserver(
 			deferredStale = removeStaleSlot(
 				deferredStale, intent.name, intent.replica)
 			pass.pending = true
+			hc := intent.healthcheck
+			if hc == nil {
+				// No effective probe: the candidate is simply not running at this
+				// boundary. Keep superseded generations serving and rely on
+				// ordinary reconciliation; native/stale health is not a retry
+				// signal, so register no observer candidate or health backoff.
+				continue
+			}
 			addHealthCandidate(&pass, fnName, intent.id)
-			hc := desired[intent.name].Healthcheck
 			attempt := intent.attempt
 			if attempt < 1 {
 				attempt = 1
@@ -2353,17 +2427,11 @@ func reconcileWithObserver(
 			switch {
 			case outcome == serviceProbeFailed:
 				// Ambiguous probe: preserve the fallback and re-observe shortly.
-				if hc != nil {
-					pass.startupDeadline = earlierDeadline(pass.startupDeadline,
-						time.Now().Add(hc.Interval))
-				}
+				pass.startupDeadline = earlierDeadline(pass.startupDeadline,
+					time.Now().Add(hc.Interval))
 			case observation.Missing || observation.State != container.StateRunning ||
 				observation.Health == container.Unhealthy:
-				interval := time.Second
-				if hc != nil {
-					interval = hc.Interval
-				}
-				eligibleAt := time.Now().Add(serviceHealthBackoff(interval, attempt))
+				eligibleAt := time.Now().Add(serviceHealthBackoff(hc.Interval, attempt))
 				pass.retryNotBefore = earlierDeadline(pass.retryNotBefore, eligibleAt)
 				if stateTracker != nil {
 					if err := stateTracker.recordCandidateFailure(
@@ -2376,10 +2444,8 @@ func reconcileWithObserver(
 					}
 				}
 			default:
-				if hc != nil {
-					pass.startupDeadline = earlierDeadline(pass.startupDeadline,
-						time.Now().Add(hc.Interval))
-				}
+				pass.startupDeadline = earlierDeadline(pass.startupDeadline,
+					time.Now().Add(hc.Interval))
 			}
 		}
 		checkCancel()
@@ -2801,6 +2867,34 @@ func observeServiceContainer(
 		return runtime.ServiceHealthObservation{}, serviceProbeFailed
 	}
 	return runtime.ServiceHealthObservation{}, serviceProbeFailed
+}
+
+// serviceBindingPublished reports whether an observation proves the container
+// publishes the service's internal port on bindAddr. It is only authoritative
+// when the observation came from an actual inspect (serviceProbeObserved); an
+// empty bindAddr is an internal-only service with no host publication to prove.
+// StartService proves a NEW container's binding, but an adopted existing replica
+// (including an in-place restart) must not be committed while unbound or bound
+// to a different address.
+func serviceBindingPublished(
+	observation runtime.ServiceHealthObservation, port int, bindAddr string,
+) bool {
+	if bindAddr == "" {
+		return true
+	}
+	if observation.PublishedInternalPort != port ||
+		observation.PublishedHostPort < 1 || observation.PublishedHostIP == "" {
+		return false
+	}
+	expected, err := netip.ParseAddr(bindAddr)
+	if err != nil {
+		return false
+	}
+	published, err := netip.ParseAddr(observation.PublishedHostIP)
+	if err != nil {
+		return false
+	}
+	return published.Unmap() == expected.Unmap()
 }
 
 // readyServiceContainer reports whether a container may be counted as an
@@ -3962,8 +4056,14 @@ func (c *ServiceReconciler) forgetServiceState(app, service string) {
 // candidates that existed before this worker started. A container whose ID is a
 // committed active replica for this node is excluded: an active replica that
 // later becomes unhealthy is not a candidate and must not be replaced for health
-// alone. With no state store, every non-healthy healthcheck container is returned
-// (the historical best effort).
+// alone. A container of an app whose current prepared generation is source-mounted
+// (HOT_RELOAD) is also excluded: Relay's probe is bypassed entirely, so a reused
+// container's stale relay.healthcheck label must not re-register a health-driven
+// gate. The caller must invoke this after app preparation has installed the
+// accepted generations' source-mount state (the worker starts the health observer
+// only then); otherwise a HOT_RELOAD app is indistinguishable from a non-mounted
+// one. With no state store, every other non-healthy healthcheck container is
+// returned (the historical best effort).
 func (c *ServiceReconciler) RecoverServiceHealthCandidates(
 	ctx context.Context,
 ) ([]runtime.ServiceHealthCandidate, error) {
@@ -3988,6 +4088,9 @@ func (c *ServiceReconciler) RecoverServiceHealthCandidates(
 			continue
 		}
 		if ctr.Healthcheck == "" || committedIDs[ctr.ID] {
+			continue
+		}
+		if serviceSourceMounted(c.docker, ctr.App) {
 			continue
 		}
 		if ctr.Health == container.Healthy {

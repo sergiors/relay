@@ -8,8 +8,12 @@ const req = http.get({ host: "127.0.0.1", port, path, timeout }, (res) => {
     process.exit(res.statusCode >= 200 && res.statusCode < 400 ? 0 : 1),
   );
 });
+
 req.on("timeout", () => {
   req.destroy();
   process.exit(1);
 });
-req.on("error", () => process.exit(1));
+
+req.on("error", () => {
+  process.exit(1);
+});

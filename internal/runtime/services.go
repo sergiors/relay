@@ -1350,16 +1350,41 @@ func (m *Manager) ServiceEndpoints(
 }
 
 // servicePublishedBinding extracts the one host binding Docker actually
-// assigned for a service's internal TCP port. It returns ok=false for every
-// incomplete or unexpected shape: an invalid port, missing network settings or
-// exposed-port metadata, an absent or multiple binding, any other
-// published port, a malformed host port, or a host IP that differs from the
-// configured bind address. The returned address is Docker's actual binding
-// (unmapped to a plain IPv4/IPv6 form), never a label or configuration value.
+// assigned for a service's internal TCP port and proves it targets expected.
+// It returns ok=false for every incomplete or unexpected shape: an invalid
+// port, missing network settings or exposed-port metadata, an absent or
+// multiple binding, any other published port, a malformed host port, or a host
+// IP that differs from the configured bind address. The returned address is
+// Docker's actual binding (unmapped to a plain IPv4/IPv6 form), never a label
+// or configuration value.
 func servicePublishedBinding(
 	insp container.InspectResponse, port int, expected netip.Addr,
 ) (string, int, bool) {
-	if !expected.IsValid() || port < 1 || port > 65535 {
+	if !expected.IsValid() {
+		return "", 0, false
+	}
+	hostIP, hostPort, ok := serviceObservedBinding(insp, port)
+	if !ok {
+		return "", 0, false
+	}
+	published, err := netip.ParseAddr(hostIP)
+	if err != nil || published.Unmap() != expected.Unmap() {
+		return "", 0, false
+	}
+	return hostIP, hostPort, true
+}
+
+// serviceObservedBinding extracts the one host binding Docker actually assigned
+// for a service's internal TCP port, without comparing it to an expected
+// address. It returns ok=false for every incomplete or unexpected shape: an
+// invalid port, missing network settings or exposed-port metadata, an absent or
+// multiple binding, any other published port, a malformed host port, or an
+// unusable host IP. The returned address is Docker's actual binding (unmapped to
+// a plain IPv4/IPv6 form), never a label or configuration value.
+func serviceObservedBinding(
+	insp container.InspectResponse, port int,
+) (string, int, bool) {
+	if port < 1 || port > 65535 {
 		return "", 0, false
 	}
 	portKey, ok := network.PortFrom(uint16(port), network.TCP)
@@ -1396,9 +1421,6 @@ func servicePublishedBinding(
 		return "", 0, false
 	}
 	hostIP := binding.HostIP.Unmap()
-	if hostIP != expected.Unmap() {
-		return "", 0, false
-	}
 	hostPort, err := strconv.Atoi(binding.HostPort)
 	if err != nil || hostPort < 1 || hostPort > 65535 {
 		return "", 0, false

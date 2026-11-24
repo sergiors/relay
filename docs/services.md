@@ -150,20 +150,22 @@ that declares `healthcheck` is rejected at template parse time: Relay cannot
 assume probe tooling inside an image it does not build, and it will not report a
 readiness state it cannot prove.
 
-Healthcheck-enabled services also use Relay-managed Docker volumes to retain
-readiness and retry state across worker restarts. The Docker Engine access Relay
-uses must therefore permit volume create, list, and remove. If that metadata
-cannot be read or written, Relay fails closed: it keeps the previous generation
-serving and does not treat the service as converged.
+All services use Relay-managed Docker volumes to record the committed replica
+generation; services with a healthcheck additionally retain readiness and retry
+state there across worker restarts. The Docker Engine access Relay uses must
+therefore permit volume create, list, and remove. If that metadata cannot be read
+or written, Relay fails closed: it keeps the previous generation serving and does
+not treat the service as converged. Host-port publication requires the committed
+marker, so a replica is not advertised until Relay can record it.
 
 ### Rollout behavior
 
-A replacement replica is started, then observed until Docker reports it healthy,
-before the replica it supersedes is stopped. The previous generation keeps
-serving throughout. While a candidate is still starting, Relay observes it at a
-bounded one-second cadence (plus an exact scheduled wake at its startup
-deadline), so a readiness transition prompts convergence promptly without
-starting a duplicate candidate.
+A replacement replica is started, then observed until it is running and, when
+Relay applies a healthcheck, healthy, before the replica it supersedes is
+stopped. The previous generation keeps serving throughout. While a candidate is
+still starting, Relay observes it at a bounded one-second cadence (plus an exact
+scheduled wake at its startup deadline), so a readiness transition prompts
+convergence promptly without starting a duplicate candidate.
 
 A candidate that Docker reports unhealthy, that exits, or that is still starting
 past `start_period + (retries + 1) × interval` **measured from the instant Docker
@@ -331,8 +333,17 @@ the Compose production example does), and operator `NETWORKS` still apply to
 service containers.
 
 A service with a `host` is published only while this node has a live registry
-lease, the committed replica is running and healthy, and its host port is
-verified. Set `DISCOVERY_ADDR` (for example `:8082`) to enable the read-only
+lease, the committed replica is running (and, when Relay applies a healthcheck,
+healthy), and its host port is verified. Relay also verifies Docker's actual host
+binding before committing a routed replica; a missing or misdirected binding
+keeps the previous generation serving and leaves the replica pending. A
+replacement is not advertised before Relay commits it, and a probe configuration
+change waits for the new generation to be committed before it is advertised. A
+service with no healthcheck is advertised as soon as its committed replica is
+running. Under `HOT_RELOAD`, Relay's probe is bypassed, so a running committed
+replica is published without a health result.
+
+Set `DISCOVERY_ADDR` (for example `:8082`) to enable the read-only
 endpoint `GET /discovery/traefik`. The response groups replicas of the same
 app/service across nodes, strips a `path` prefix before forwarding, and gives
 overlapping prefixes explicit priorities so the longest prefix wins. Distinct

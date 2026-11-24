@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"relay/internal/app"
 	"relay/internal/config"
 	"relay/internal/routing"
 	"relay/internal/runner"
@@ -59,6 +60,7 @@ type serviceEndpointStore interface {
 type serviceEndpointSource interface {
 	RegistryServiceEndpoints(
 		ctx context.Context, expectedBindAddr string,
+		probe runtime.ServiceProbePolicy,
 	) ([]runtime.RegistryServiceEndpoint, error)
 }
 
@@ -78,6 +80,11 @@ type serviceEndpointPublisher struct {
 
 	bindAddr     string
 	hostOverride string
+	// sourceMounted reports whether an app's current prepared generation runs
+	// from a live source mount (HOT_RELOAD). It is captured from the runtime
+	// Manager so discovery applies the same effective-probe policy as
+	// reconciliation; nil is treated as "not mounted".
+	sourceMounted func(app string) bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -103,14 +110,15 @@ func startServiceEndpointPublisher(
 		return nil
 	}
 	r := &serviceEndpointPublisher{
-		st:           st,
-		manager:      manager,
-		apps:         apps,
-		nodes:        nodes,
-		log:          logger,
-		reporter:     nodes.reporter,
-		bindAddr:     cfg.ServiceBindAddr,
-		hostOverride: cfg.RoutingHostOverride,
+		st:            st,
+		manager:       manager,
+		apps:          apps,
+		nodes:         nodes,
+		log:           logger,
+		reporter:      nodes.reporter,
+		bindAddr:      cfg.ServiceBindAddr,
+		hostOverride:  cfg.RoutingHostOverride,
+		sourceMounted: manager.ServiceSourceMounted,
 	}
 	r.Start(lifecycle)
 	if shutdown != nil {
@@ -199,19 +207,29 @@ func (r *serviceEndpointPublisher) syncOnce() {
 
 // collectEndpoints builds the exact batch this node may advertise: each
 // Docker-verified committed replica must also match the CURRENT template's
-// route (effective host and path). A container left from a superseded template
-// or an earlier host override therefore drops out instead of advertising a
-// stale route. The published host is the effective hostname (see
-// routing.EffectiveHost), so discovery consumers agree on the advertised name.
+// route (effective host and path) and be eligible under the CURRENT effective
+// probe policy. A container left from a superseded template or an earlier host
+// override therefore drops out instead of advertising a stale route, and a
+// replica created under a different probe policy is not published until the
+// reconciler commits one that matches. The published host is the effective
+// hostname (see routing.EffectiveHost), so discovery consumers agree on the
+// advertised name.
 func (r *serviceEndpointPublisher) collectEndpoints(
 	ctx context.Context,
 ) ([]state.ServiceRegistryEndpoint, error) {
-	candidates, collectErr := r.manager.RegistryServiceEndpoints(ctx, r.bindAddr)
+	templates := r.desiredTemplates()
+	probes := desiredProbes(templates, r.sourceMounted)
+	candidates, collectErr := r.manager.RegistryServiceEndpoints(
+		ctx, r.bindAddr, func(appName, serviceName string) *app.ServiceHealthcheck {
+			return probes[serviceRegistryRouteKey{
+				app: appName, service: serviceName,
+			}]
+		})
 	if len(candidates) == 0 {
 		return nil, collectErr
 	}
 
-	routes := r.desiredRoutes()
+	routes := desiredRoutes(templates, r.hostOverride)
 	out := make([]state.ServiceRegistryEndpoint, 0, len(candidates))
 	seen := make(map[serviceRegistryEndpointKey]struct{}, len(candidates))
 	for _, candidate := range candidates {
@@ -281,31 +299,65 @@ func keyForEndpoint(endpoint runtime.RegistryServiceEndpoint) serviceRegistryEnd
 	}
 }
 
-func (r *serviceEndpointPublisher) desiredRoutes() map[serviceRegistryRouteKey]serviceRegistryRoute {
+type serviceRegistryTemplate struct {
+	name string
+	tmpl *app.Template
+}
+
+// desiredTemplates snapshots the currently registered templates once, so the
+// route and probe views used for one publication describe the same generation.
+func (r *serviceEndpointPublisher) desiredTemplates() []serviceRegistryTemplate {
 	names := r.apps.Names()
 	sort.Strings(names)
-	routes := make(map[serviceRegistryRouteKey]serviceRegistryRoute, len(names))
+	out := make([]serviceRegistryTemplate, 0, len(names))
 	for _, name := range names {
 		pf := r.apps.GetByName(name)
 		if pf == nil {
 			continue
 		}
-		tmpl := pf.App().Template
-		if tmpl == nil {
-			continue
+		if tmpl := pf.App().Template; tmpl != nil {
+			out = append(out, serviceRegistryTemplate{name: name, tmpl: tmpl})
 		}
-		for _, svc := range tmpl.Services {
+	}
+	return out
+}
+
+func desiredRoutes(
+	templates []serviceRegistryTemplate, hostOverride string,
+) map[serviceRegistryRouteKey]serviceRegistryRoute {
+	routes := make(map[serviceRegistryRouteKey]serviceRegistryRoute)
+	for _, entry := range templates {
+		for _, svc := range entry.tmpl.Services {
 			if svc.Host == "" {
 				continue
 			}
-			host := routing.EffectiveHost(svc.Host, r.hostOverride)
-			routes[serviceRegistryRouteKey{app: name, service: svc.Name}] = serviceRegistryRoute{
-				host: host,
+			routes[serviceRegistryRouteKey{
+				app: entry.name, service: svc.Name,
+			}] = serviceRegistryRoute{
+				host: routing.EffectiveHost(svc.Host, hostOverride),
 				path: svc.Path,
 			}
 		}
 	}
 	return routes
+}
+
+// desiredProbes resolves the effective probe for every configured service: a
+// declared healthcheck unless the app currently runs from a HOT_RELOAD source
+// mount. The publisher posts this to the registry so publication follows the
+// policy reconciliation actually applies.
+func desiredProbes(
+	templates []serviceRegistryTemplate, sourceMounted func(string) bool,
+) map[serviceRegistryRouteKey]*app.ServiceHealthcheck {
+	probes := make(map[serviceRegistryRouteKey]*app.ServiceHealthcheck)
+	for _, entry := range templates {
+		mounted := sourceMounted != nil && sourceMounted(entry.name)
+		for _, svc := range entry.tmpl.Services {
+			probes[serviceRegistryRouteKey{app: entry.name, service: svc.Name}] =
+				runtime.EffectiveServiceHealthcheck(svc.Healthcheck, mounted)
+		}
+	}
+	return probes
 }
 
 type serviceRegistryRoute struct {

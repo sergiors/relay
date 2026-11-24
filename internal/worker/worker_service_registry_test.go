@@ -83,10 +83,12 @@ func (f *fakeServiceEndpointStore) leaseAt(index int) state.NodeLease {
 	return f.leases[index]
 }
 
-// fakeServiceEndpointSource is an in-memory serviceEndpointSource.
+// fakeServiceEndpointSource is an in-memory serviceEndpointSource recording the
+// bind address and EFFECTIVE probe policy each collection received.
 type fakeServiceEndpointSource struct {
 	mu        sync.Mutex
 	binds     []string
+	policy    runtime.ServiceProbePolicy
 	endpoints []runtime.RegistryServiceEndpoint
 	err       error
 
@@ -96,7 +98,7 @@ type fakeServiceEndpointSource struct {
 }
 
 func (f *fakeServiceEndpointSource) RegistryServiceEndpoints(
-	_ context.Context, expectedBindAddr string,
+	_ context.Context, expectedBindAddr string, probe runtime.ServiceProbePolicy,
 ) ([]runtime.RegistryServiceEndpoint, error) {
 	if f.onCall != nil {
 		f.onCall()
@@ -104,6 +106,7 @@ func (f *fakeServiceEndpointSource) RegistryServiceEndpoints(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.binds = append(f.binds, expectedBindAddr)
+	f.policy = probe
 	return f.endpoints, f.err
 }
 
@@ -120,6 +123,13 @@ func (f *fakeServiceEndpointSource) boundTo() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.binds...)
+}
+
+// probePolicy returns the policy supplied to the most recent collection.
+func (f *fakeServiceEndpointSource) probePolicy() runtime.ServiceProbePolicy {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.policy
 }
 
 // staticLeaseSource serves one fixed global lease.
@@ -826,4 +836,126 @@ func TestServiceEndpointCancellationIsNotAFailureTransition(t *testing.T) {
 				store.publishCount())
 		}
 	})
+}
+
+// Given one sync over the CURRENT registry snapshot, when the publisher
+// collects, then the published route and the EFFECTIVE probe policy handed to
+// the registry both derive from that same snapshot with the app's
+// ServiceSourceMounted fact: a declared normal-mode probe passes its exact
+// identity, a no-healthcheck service passes nil, and a source-mounted
+// (HOT_RELOAD) app passes nil despite its declared probe. A template change
+// between syncs flips the route and the policy together, and a failed
+// collection keeps the previously published batch.
+func TestServiceEndpointProbePolicyFollowsCurrentTemplateAndSourceMount(t *testing.T) {
+	hcV1 := &app.ServiceHealthcheck{
+		Path: "/health", Interval: 10 * time.Second, Timeout: 3 * time.Second,
+		Retries: 3, StartPeriod: 10 * time.Second,
+	}
+	hcV2 := *hcV1
+	hcV2.Interval = 30 * time.Second
+	templateOf := func(host string, hc *app.ServiceHealthcheck) *app.Template {
+		return &app.Template{
+			Runtime: "nodejs24.x",
+			Services: []app.Service{
+				{Name: "web", Entrypoint: "service.js", Host: host,
+					Path: "/v2", Port: 8080, Replicas: 1, Healthcheck: hc},
+				// No declared probe: its effective policy must be nil.
+				{Name: "internal", Entrypoint: "service.js",
+					Port: 9090, Replicas: 1},
+			},
+		}
+	}
+	apps := &runner.Registry{}
+	apps.Set([]*runner.PreparedApp{
+		runner.NewUnavailable(app.App{Name: "alpha",
+			Template: templateOf("api.example.com", hcV1)}),
+		// A HOT_RELOAD app: its declared probe is bypassed while source-mounted.
+		runner.NewUnavailable(app.App{Name: "hot",
+			Template: templateOf("hot.example.com", hcV1)}),
+	})
+	source := &fakeServiceEndpointSource{endpoints: []runtime.RegistryServiceEndpoint{
+		registryCandidate("alpha", "web", "ctr-web", 0, nil),
+	}}
+	store := newFakeServiceEndpointStore()
+	lease := testNodeLease()
+	publisher := newServiceEndpointFixture(t, store, source,
+		&staticLeaseSource{lease: &lease}, apps, testutil.DiscardLogger())
+	publisher.sourceMounted = func(name string) bool { return name == "hot" }
+
+	publisher.syncOnce()
+
+	policy := source.probePolicy()
+	if policy == nil {
+		t.Fatal("collection received no probe policy, want the template-derived " +
+			"effective policy")
+	}
+	if got := policy("alpha", "web"); got == nil ||
+		runtime.ServiceHealthcheckLabel(got) !=
+			runtime.ServiceHealthcheckLabel(hcV1) {
+		t.Fatalf("policy(alpha, web) = %+v, want the declared probe's exact "+
+			"identity in normal mode", got)
+	}
+	if got := policy("alpha", "internal"); got != nil {
+		t.Fatalf("policy(alpha, internal) = %+v, want nil (no probe declared)",
+			got)
+	}
+	if got := policy("hot", "web"); got != nil {
+		t.Fatalf("policy(hot, web) = %+v, want nil (HOT_RELOAD source mount "+
+			"bypasses the declared probe)", got)
+	}
+	if got := policy("ghost", "web"); got != nil {
+		t.Fatalf("policy(ghost, web) = %+v, want nil (service not in any "+
+			"current template)", got)
+	}
+	_, batch := store.lastPublish()
+	if len(batch) != 1 || batch[0].Host != "api.example.com" {
+		t.Fatalf("published batch = %+v, want the snapshot's route "+
+			"api.example.com alongside its policy", batch)
+	}
+
+	// A template change between syncs flips the route AND the policy together:
+	// both views come from the same current snapshot, never from a cached one.
+	apps.Set([]*runner.PreparedApp{
+		runner.NewUnavailable(app.App{Name: "alpha",
+			Template: templateOf("new.example.com", &hcV2)}),
+		runner.NewUnavailable(app.App{Name: "hot",
+			Template: templateOf("hot.example.com", hcV1)}),
+	})
+	publisher.syncOnce()
+
+	_, flipped := store.lastPublish()
+	if store.publishCount() != 2 {
+		t.Fatalf("publish calls = %d, want 2 (one per sync)", store.publishCount())
+	}
+	if len(flipped) != 1 || flipped[0].Host != "new.example.com" {
+		t.Fatalf("flipped batch = %+v, want the new snapshot's route", flipped)
+	}
+	flippedPolicy := source.probePolicy()
+	if flippedPolicy == nil {
+		t.Fatal("flipped collection received no probe policy")
+	}
+	if got := flippedPolicy("alpha", "web"); got == nil ||
+		runtime.ServiceHealthcheckLabel(got) !=
+			runtime.ServiceHealthcheckLabel(&hcV2) {
+		t.Fatalf("policy(alpha, web) after the template change = %+v, want the "+
+			"edited probe identity from the same snapshot as the route", got)
+	}
+	if runtime.ServiceHealthcheckLabel(flippedPolicy("hot", "web")) != "" {
+		t.Fatal("the source-mounted app must keep a nil effective probe across " +
+			"the unrelated template change")
+	}
+
+	// A failed collection keeps the previously published batch: no destructive
+	// empty publish, no new snapshot at all.
+	source.set(nil, errors.New("docker inspection wedged"))
+	publisher.syncOnce()
+	if store.publishCount() != 2 {
+		t.Fatalf("publish calls after failed discovery = %d, want 2 (a failure "+
+			"keeps the previous batch)", store.publishCount())
+	}
+	_, kept := store.lastPublish()
+	if len(kept) != 1 || kept[0].Host != "new.example.com" {
+		t.Fatalf("last batch after failed discovery = %+v, want the previous "+
+			"snapshot untouched", kept)
+	}
 }

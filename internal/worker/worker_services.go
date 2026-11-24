@@ -15,10 +15,15 @@ import (
 	"relay/internal/state"
 )
 
-// startServiceConvergence constructs and starts the persistent service
-// controller/coordinator and registers its shutdown steps. It returns both
-// because Run still drives startup/live service enqueue through the coordinator
-// and the startup housekeeping sweep through the controller.
+// startServiceConvergence constructs the persistent service
+// controller/coordinator and health observer and registers their shutdown
+// steps. It returns all three because Run still drives startup/live service
+// enqueue through the coordinator, the startup housekeeping sweep through the
+// controller, and starts the observer after app preparation. The observer is
+// deliberately not started here: its startup recovery consults the prepared
+// source-mount state, so it must run after preparation has installed the
+// accepted generations' state and cannot re-register a HOT_RELOAD app's stale
+// relay.healthcheck candidates.
 //
 // The service reconciler converges each app's persistent service containers to
 // its template (manager is the Docker seam; secretProvider is the shared
@@ -49,7 +54,7 @@ func startServiceConvergence(
 	proof ownershipProof,
 	metricsInstance *metrics.Registry,
 	shutdown *shutdownRegistry,
-) (*reconciler.ServiceReconciler, *reconciler.ServiceCoordinator) {
+) (*reconciler.ServiceReconciler, *reconciler.ServiceCoordinator, *reconciler.ServiceHealthObserver) {
 	svcCtrl := reconciler.NewServiceReconciler(
 		manager,
 		secretProvider,
@@ -80,7 +85,6 @@ func startServiceConvergence(
 		// it no longer reports is retired instead of being polled forever.
 		reconciler.WithTrackedServiceApps(services.TrackedServiceApps),
 	)
-	healthObserver.Start(ctx)
 	// Joining the coordinator releases its workers and waiters and drains
 	// in-flight Applys; the observer is joined first because it only hints the
 	// coordinator and must not outlive it. The join is a strict barrier whose
@@ -113,7 +117,7 @@ func startServiceConvergence(
 		// residual.
 		run: shutdownServices(svcCtrl, cfg.NodeID, proof, logger),
 	})
-	return svcCtrl, services
+	return svcCtrl, services, healthObserver
 }
 
 // enqueueLiveServices snapshots the current prepared environment and publishes
