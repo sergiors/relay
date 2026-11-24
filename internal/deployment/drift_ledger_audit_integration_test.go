@@ -47,14 +47,18 @@ func loadAppsSeam(
 }
 
 // coordinatorAppFor builds the app.App the loader would return for a valid
-// app directory under appsDir.
+// app directory under appsDir, carrying the raw-template identity of the
+// exact bytes it parsed (as the real loader does).
 func coordinatorAppFor(t *testing.T, appsDir, name string) app.App {
 	t.Helper()
 	tmpl, err := app.ParseTemplate([]byte(coordinatorTemplate))
 	if err != nil {
 		t.Fatalf("parse template: %v", err)
 	}
-	return app.App{Name: name, Dir: filepath.Join(appsDir, name), Template: tmpl}
+	return app.App{
+		Name: name, Dir: filepath.Join(appsDir, name), Template: tmpl,
+		TemplateIdentity: app.TemplateIdentity([]byte(coordinatorTemplate)),
+	}
 }
 
 // newDriftAuditEnv seeds an authoritative generation-1 authorization with a

@@ -213,13 +213,23 @@ Relay retries, and the node catches up when it is available and the problem is
 resolved.
 
 At startup Relay verifies that `/apps` matches the last successfully
-materialized revision. If it cannot prove the authorized app set is present and
-unchanged—for example, an interrupted update left an app missing or changed—the
-node refuses to start rather than serve an incomplete app set, so events for
-missing apps are not acknowledged as unmatched. Resolve the reported source or
-materialization error and restart the node; the published revision is then
-materialized. A node with no previously deployed revision also waits for its
-first successful deploy instead of starting with no apps.
+materialized revision. If an authorized app is missing or its content or
+template identity no longer matches, the node refuses to consume events rather
+than expose an incomplete registry. Otherwise, an event for that app could
+appear unmatched and be acknowledged before its handler is restored. Relay exits
+on this authorization inconsistency; it does not confuse it with an image-build
+failure. After authorization succeeds, a build failure keeps the app registered
+as unavailable, so matching events remain pending rather than being acknowledged.
+
+Resolve the reported source or materialization problem. Then restart the node or
+let its supervisor restart it; the next startup attempts to materialize the
+published revision and verifies the resulting app set again. The production
+Compose service uses `restart: unless-stopped`; configure an equivalent restart
+policy with other supervisors. If app source content changes after verification
+but before preparation completes, Relay rejects the changed generation and keeps
+the app registered as unavailable; matching events remain pending while Relay
+reconciles the authorized revision. A node with no previously deployed revision
+also waits for its first successful deploy instead of starting with no apps.
 
 Check the desired revision and node/app progress with:
 

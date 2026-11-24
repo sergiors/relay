@@ -209,8 +209,11 @@ func TestPersistStartupDiscoveryRebuildFailureKeepsObservationsConsistent(t *tes
 }
 
 // TestPrepareAppsFailsClosedWithoutFencingToken pins the startup handoff: an app
-// without the exact token from its discovery write is not prepared at all, while
-// an app that has one is prepared normally.
+// without the exact token from its discovery write is not prepared at all, but
+// it KEEPS its slot as an unavailable candidate (matched-but-unavailable, never
+// dropped — a nil slot would silently remove a matched app and let its
+// deliveries be ACKed unmatched), while an app that has one is prepared
+// normally.
 func TestPrepareAppsFailsClosedWithoutFencingToken(t *testing.T) {
 	root := t.TempDir()
 	writeWorkerApp(t, root, "alpha", "def handler(e, context): return 1\n")
@@ -240,8 +243,39 @@ func TestPrepareAppsFailsClosedWithoutFencingToken(t *testing.T) {
 	if _, ok := spy.callsByFn["beta"]; ok {
 		t.Fatal("beta must never reach Prepare without a fencing token")
 	}
-	if len(prepared) != 1 || prepared[0].Name() != "alpha" {
-		t.Fatalf("prepared = %+v, want only alpha", prepared)
+
+	// Every startup app keeps its slot: beta is unavailable, not omitted.
+	if len(prepared) != len(startup) {
+		t.Fatalf("prepared = %d entries, want every startup app to keep a slot "+
+			"(no nil-slot omission)", len(prepared))
+	}
+	candidates := make(map[string]*runner.PreparedApp, len(prepared))
+	for i, pf := range prepared {
+		if pf == nil {
+			t.Fatalf("prepared[%d] = nil; a missing slot would drop the matched "+
+				"app", i)
+		}
+		if pf.Name() != startup[i].App.Name {
+			t.Fatalf("prepared[%d] = %q, want startup order %q", i, pf.Name(),
+				startup[i].App.Name)
+		}
+		candidates[pf.Name()] = pf
+	}
+	alpha := candidates["alpha"]
+	if alpha == nil || alpha.Prepared() == nil {
+		t.Fatalf("alpha candidate = %+v, want the prepared generation", alpha)
+	}
+	beta := candidates["beta"]
+	if beta == nil {
+		t.Fatal("beta has no slot; a missing fencing token must keep it " +
+			"matched-but-unavailable")
+	}
+	if beta.Prepared() != nil {
+		t.Fatalf("beta candidate = %+v, want unavailable", beta.Prepared())
+	}
+	if beta.App().Template == nil || len(beta.App().Template.Events) == 0 {
+		t.Fatal("beta's unavailable candidate lost its desired event rules; " +
+			"matching would drop it")
 	}
 }
 

@@ -150,13 +150,13 @@ func TestLoadStartupAppsStandaloneDiscoversRestoresAndRecordsInvalid(t *testing.
 	store := &fakeStartupState{snapshot: snapshot}
 	m := metrics.New()
 
-	// when the startup app phase runs in standalone mode
-	set, err := loadStartupApps(
+	// when the startup app phase runs in standalone mode (no deployment check)
+	set, err := loadStartupAppsChecked(
 		context.Background(), discardLogger(), store, root, m,
-		0, nil, nil, false,
+		0, nil, nil, false, nil,
 	)
 	if err != nil {
-		t.Fatalf("loadStartupApps: %v", err)
+		t.Fatalf("loadStartupAppsChecked: %v", err)
 	}
 
 	// then only the valid app is loaded, with the invalid one kept as an issue
@@ -295,12 +295,12 @@ func TestLoadStartupAppsAuthoritativeKeepsOnlyMaterializedApps(t *testing.T) {
 	m := metrics.New()
 
 	// when the startup app phase runs coordinator-authoritative
-	set, err := loadStartupApps(
+	set, err := loadStartupAppsChecked(
 		context.Background(), discardLogger(), store, root, m,
-		42, authorized, materializedInvalid, true,
+		42, authorized, materializedInvalid, true, nil,
 	)
 	if err != nil {
-		t.Fatalf("loadStartupApps: %v", err)
+		t.Fatalf("loadStartupAppsChecked: %v", err)
 	}
 
 	// then only the fingerprint-matching app loads, with the materialized
@@ -375,9 +375,9 @@ func TestLoadStartupAppsDiscoveryFailureIsCritical(t *testing.T) {
 	store := &fakeStartupState{discoverErr: injected}
 
 	// when the startup app phase runs
-	_, err := loadStartupApps(
+	_, err := loadStartupAppsChecked(
 		context.Background(), discardLogger(), store, root, metrics.New(),
-		0, nil, nil, false,
+		0, nil, nil, false, nil,
 	)
 
 	// then the phase fails closed on the discovery write
@@ -403,9 +403,9 @@ func TestLoadStartupAppsIsolatesInvalidWriteFailure(t *testing.T) {
 	store := &fakeStartupState{invalidErr: errors.New("invalid write refused")}
 
 	// when the startup app phase runs
-	set, err := loadStartupApps(
+	set, err := loadStartupAppsChecked(
 		context.Background(), discardLogger(), store, root, metrics.New(),
-		0, nil, nil, false,
+		0, nil, nil, false, nil,
 	)
 
 	// then startup succeeds, the valid app keeps its authority, and the

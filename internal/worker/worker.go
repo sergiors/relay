@@ -200,7 +200,9 @@ func startupInterrupted(ctx context.Context, err error) bool {
 // warnings (the barrier already skips sweeps wholesale on a cancelled
 // lifecycle; this covers a cancellation landing mid-pass). The message is
 // identical in both cases so a genuine failure stays recognisable.
-func logStartupCleanupFailure(ctx context.Context, logger *slog.Logger, msg string, err error) {
+func logStartupCleanupFailure(
+	ctx context.Context, logger *slog.Logger, msg string, err error,
+) {
 	if startupInterrupted(ctx, err) {
 		logger.Debug(msg, "error", err)
 		return
@@ -665,7 +667,7 @@ func Run(logger *slog.Logger) (runErr error) {
 		// preparation, or Consume. A source edit therefore cannot slip between a
 		// separate validation scan and the consumed tree.
 		deploymentStartupValidation(
-			startupCtx, app.Dir, deploymentSnapshot, deploymentCoordinator != nil),
+			startupCtx, deploymentSnapshot, deploymentCoordinator != nil),
 	)
 	if err != nil {
 		if startupInterrupted(startupCtx, err) {
@@ -786,9 +788,7 @@ func Run(logger *slog.Logger) (runErr error) {
 	if err != nil {
 		return err
 	}
-	if err := startWebhookServer(
-		logger, cfg, gitWebhookServer, shutdown,
-	); err != nil {
+	if err := startWebhookServer(logger, cfg, gitWebhookServer, shutdown); err != nil {
 		return err
 	}
 	if err := startDiscoveryServer(logger, cfg, st, shutdown); err != nil {

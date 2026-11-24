@@ -125,9 +125,13 @@ type Config struct {
 // when no materialized generation is known yet, in which case the reconciler
 // must not authorize cluster-mode local reconciliation.
 type Snapshot struct {
-	Generation         int64
-	Commit             string
-	Fingerprints       map[string]string
+	Generation   int64
+	Commit       string
+	Fingerprints map[string]string
+	// TemplateIdentities is the raw template identity carried by the same
+	// materialized scan that produced each authorized app's fingerprint. Startup
+	// requires it for every authorized app because the content fingerprint
+	// excludes runtime-only template fields.
 	TemplateIdentities map[string]string
 	// Invalid holds app names that were materialized but whose fingerprint or
 	// load failed, with a diagnostic. Invalid template bytes are never authorized
@@ -1040,7 +1044,18 @@ func deploymentSourceMismatch(desired state.DeploymentDesired, local git.Config)
 
 // authorize computes the app-name -> fingerprint set for the materialized /apps
 // tree. Invalid app candidates are reported per app and excluded from the
-// authorized set; they are never activated.
+// authorized set; they are never activated. Each valid app's raw template
+// identity comes from the same loaded record that produced its parsed template
+// and fingerprint, so the persisted authorization never pairs content from one
+// scan with template bytes from a later read. A valid record without that
+// carried identity cannot be authorized safely and fails the pass.
+//
+// A loaded app whose source cannot be fingerprinted also fails the whole pass.
+// Recording it as a per-app invalid desired state would commit an incomplete
+// applied authorization with no fingerprint for a parseable app: startup would
+// then filter it out and could acknowledge a matching event unmatched. The
+// caller retains the previous applied generation instead. Cancellation is
+// likewise a root failure, never a per-app invalid definition.
 func (c *Coordinator) authorize(
 	ctx context.Context,
 ) (fingerprints, templateIdentities, invalidTemplates, appErrors map[string]string, err error) {
@@ -1048,10 +1063,19 @@ func (c *Coordinator) authorize(
 	templateIdentities = map[string]string{}
 	invalidTemplates = map[string]string{}
 	appErrors = map[string]string{}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, nil, err
+	}
 	apps, issues, err := c.cfg.LoadApps(c.cfg.AppsDir)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf(
 			"deployment: load materialized apps from %s: %w", c.cfg.AppsDir, err)
+	}
+	// A cancellation that lands during the scan must abort as a root failure
+	// even when the scan yielded only issues: committing any authorization from
+	// a cancelled attempt is not safe.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, nil, err
 	}
 	for _, issue := range issues {
 		appErrors[issue.Name] = issue.Err.Error()
@@ -1061,24 +1085,22 @@ func (c *Coordinator) authorize(
 	}
 	for _, fn := range apps {
 		if err := ctx.Err(); err != nil {
-			appErrors[fn.Name] = err.Error()
-			continue
+			return nil, nil, nil, nil, err
 		}
-		templateSource, err := app.ReadTemplateSource(c.cfg.AppsDir, fn.Name)
-		if err != nil {
-			appErrors[fn.Name] = err.Error()
-			continue
+		identity := fn.TemplateIdentity
+		if identity == "" {
+			return nil, nil, nil, nil, fmt.Errorf(
+				"deployment: app %q has no template identity from the materialized "+
+					"scan; refusing to authorize unprovable content", fn.Name)
 		}
 		_, fingerprint, err := app.SelectAndFingerprintApp(fn.Dir, fn.Template)
 		if err != nil {
-			appErrors[fn.Name] = err.Error()
-			if templateSource.Identity != "" {
-				invalidTemplates[fn.Name] = templateSource.Identity
-			}
-			continue
+			return nil, nil, nil, nil, fmt.Errorf(
+				"deployment: app %q: fingerprint materialized source: %w",
+				fn.Name, err)
 		}
 		fingerprints[fn.Name] = fingerprint
-		templateIdentities[fn.Name] = templateSource.Identity
+		templateIdentities[fn.Name] = identity
 	}
 	return fingerprints, templateIdentities, invalidTemplates, appErrors, nil
 }

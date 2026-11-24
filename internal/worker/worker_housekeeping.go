@@ -573,6 +573,38 @@ type startupPublicationState interface {
 	RecordReconcileFailure(context.Context, string, error, state.FencingToken) (bool, error)
 }
 
+// errStartupPreparedIdentityChanged marks a startup candidate whose actual
+// prepared identity no longer matches the coordinated deployment's authorized
+// fingerprint. It is rejected before activation, like a stale runtime selection.
+var errStartupPreparedIdentityChanged = errors.New(
+	"startup: prepared source identity changed before publication")
+
+// startupPreparedIdentityError reports whether an actual prepared generation
+// still matches the coordinated deployment's authorized fingerprint. Standalone
+// startup authorizes nothing and keeps its built identity. A mismatch means the
+// source tree changed between the startup validation scan and Prepare capturing
+// its snapshot, so activating it would serve content the shared generation never
+// authorized.
+func startupPreparedIdentityError(
+	startup startupAppSet,
+	name string,
+	built *runtime.Prepared,
+) error {
+	if startup.authorized == nil {
+		return nil
+	}
+	expected, ok := startup.authorized[name]
+	if !ok {
+		return fmt.Errorf("%w: app %q is not part of the authorized generation",
+			errStartupPreparedIdentityChanged, name)
+	}
+	if built.Fingerprint != expected {
+		return fmt.Errorf("%w: app %q prepared %q but %q is authorized",
+			errStartupPreparedIdentityChanged, name, built.Fingerprint, expected)
+	}
+	return nil
+}
+
 // publishStartupApps performs the startup check-and-publish handoff for prepared
 // candidates. It is deliberately separate from background housekeeping so the
 // registry/status/retry decisions are directly testable with a fake publisher
@@ -591,7 +623,10 @@ func publishStartupApps(
 	// SAME authoritative per-runtime selection fence live reconciliation uses.
 	// The registry add happens inside the check-plus-publication critical section,
 	// so a selection CAS cannot slip between the authoritative read and the initial
-	// registry add. Warm-pool activation also happens only after acceptance.
+	// registry add. Warm-pool activation also happens only after acceptance. In a
+	// coordinated deployment the candidate must additionally still carry the
+	// authorized content fingerprint; the source tree is captured again by
+	// Prepare, so a change after the validated scan is rejected here.
 	//
 	// A rejected generation is replaced with an unavailable placeholder built from
 	// the current template. That preserves matching (a delivery remains
@@ -624,7 +659,10 @@ func publishStartupApps(
 			registry.Replace(fn.Name, pf)
 			return nil
 		}
-		pubErr := manager.PublishPrepared(lifecycle, built, publish)
+		pubErr := startupPreparedIdentityError(startup, fn.Name, built)
+		if pubErr == nil {
+			pubErr = manager.PublishPrepared(lifecycle, built, publish)
+		}
 		if pubErr != nil {
 			// The generation was not accepted: drop its publication lease and
 			// never enqueue a service request or activate warm state for it.
@@ -639,7 +677,13 @@ func publishStartupApps(
 					"app", fn.Name, "error", pubErr)
 				continue
 			}
-			if errors.Is(pubErr, runtime.ErrRuntimeImageSelectionStale) {
+			if errors.Is(pubErr, errStartupPreparedIdentityChanged) {
+				logger.Info(
+					"Startup: source changed between validation and build; app will reprepare",
+					"app", fn.Name,
+					"error", pubErr,
+				)
+			} else if errors.Is(pubErr, runtime.ErrRuntimeImageSelectionStale) {
 				logger.Info(
 					"Startup: runtime image selection changed before publication; app will reprepare",
 					"app", fn.Name,

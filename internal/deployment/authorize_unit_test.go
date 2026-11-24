@@ -115,38 +115,131 @@ func TestAuthorizeEmptyWithoutErrorIsValid(t *testing.T) {
 	})
 }
 
-// TestAuthorizePersistsIdentityForRecoverableFingerprintError pins that a
-// per-app FINGERPRINT failure (a recoverable read error on one source file,
-// not a root failure) keeps authorization running while persisting the
-// app's materialized template identity alongside the diagnostic. On restart
-// the persisted identity lets the reconciler RETRY the app while its template
-// bytes still match the recorded identity; invalid template bytes, by
-// contrast, never activate — they stay desired-invalid diagnostics.
-func TestAuthorizePersistsIdentityForRecoverableFingerprintError(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("read permission is not enforced as root")
-	}
+// TestAuthorizeFingerprintFailureFormsNoIncompleteAuthorization replaces the
+// obsolete "persists identity for a recoverable fingerprint error"
+// expectation: a parseable app whose SOURCE cannot be fingerprinted is no
+// longer recorded as a per-app appErrors/invalidTemplates row. That committed
+// an incomplete applied authorization with no fingerprint for a parseable app:
+// loadApplied put the app in Snapshot.Invalid, startup dropped its valid
+// candidate, and a matching delivery could be ACKed unmatched. The whole pass
+// now fails with every map nil, so the caller keeps the prior applied
+// authorization and retries. Cancellation fails the pass the same way. (An
+// end-to-end materialization of such a tree is impractical here: every
+// coordinator test uses the fake Git remote fixture, so no test runs
+// SyncCommitFromConfig to completion. The prior-applied-auth preservation on a
+// root authorize error is the caller contract already pinned by
+// TestAuthorizeReportsRootLoadFailure and the
+// TestObserveStartupSourceMismatchRetainsPreviousGeneration atomic path.)
+// Ordinary image BUILD failures with a known fingerprint are unaffected: they
+// stay unavailable/matched at the worker's startup publication boundary.
+func TestAuthorizeFingerprintFailureFormsNoIncompleteAuthorization(t *testing.T) {
 	// A runtime-backed template (same shape the coordinator materializes).
 	const authorizeTemplate = "runtime: nodejs24.x\nevents:\n  - handler: index.hi\n" +
 		"    pattern:\n      event_name: [INSERT]\n"
+	writeApp := func(t *testing.T) (string, string, *app.Template) {
+		t.Helper()
+		appsDir := t.TempDir()
+		fnDir := filepath.Join(appsDir, "fpfail")
+		if err := os.MkdirAll(fnDir, 0o755); err != nil {
+			t.Fatalf("mkdir app: %v", err)
+		}
+		templatePath := filepath.Join(fnDir, "template.yaml")
+		if err := os.WriteFile(templatePath, []byte(authorizeTemplate), 0o644); err != nil {
+			t.Fatalf("write template: %v", err)
+		}
+		tmpl, err := app.ParseTemplate([]byte(authorizeTemplate))
+		if err != nil {
+			t.Fatalf("parse template: %v", err)
+		}
+		return appsDir, fnDir, tmpl
+	}
+	seamFor := func(appsDir, fnDir string, tmpl *app.Template) Config {
+		return Config{
+			AppsDir: appsDir,
+			LoadApps: func(string) ([]app.App, []app.LoadIssue, error) {
+				return []app.App{{
+					Name: "fpfail", Dir: fnDir, Template: tmpl,
+					// The loaded record carries the identity of the exact bytes
+					// it parsed, as the real loader does.
+					TemplateIdentity: app.TemplateIdentity([]byte(authorizeTemplate)),
+				}}, nil, nil
+			},
+		}
+	}
+
+	t.Run("source fingerprint failure is a root failure", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("read permission is not enforced as root")
+		}
+		appsDir, fnDir, tmpl := writeApp(t)
+		unreadable := filepath.Join(fnDir, "a-unreadable.txt")
+		if err := os.WriteFile(unreadable, []byte("secret"), 0o644); err != nil {
+			t.Fatalf("write source file: %v", err)
+		}
+		if err := os.Chmod(unreadable, 0o000); err != nil {
+			t.Fatalf("chmod source file: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(unreadable, 0o644) })
+		c := New(seamFor(appsDir, fnDir, tmpl))
+
+		fingerprints, templates, invalid, appErrors, err := c.authorize(context.Background())
+
+		if err == nil ||
+			!strings.Contains(err.Error(), `app "fpfail"`) ||
+			!strings.Contains(err.Error(), "fingerprint materialized source") {
+			t.Fatalf("authorize err = %v, want the root fingerprint failure "+
+				"naming the app", err)
+		}
+		if fingerprints != nil || templates != nil || invalid != nil || appErrors != nil {
+			t.Fatalf("authorize maps = (%v, %v, %v, %v), want all nil — a "+
+				"fingerprint failure must never form an incomplete authorization "+
+				"(no appErrors row, no fingerprint-less invalid entry)",
+				fingerprints, templates, invalid, appErrors)
+		}
+	})
+
+	t.Run("cancellation is a root failure", func(t *testing.T) {
+		appsDir, fnDir, tmpl := writeApp(t)
+		c := New(seamFor(appsDir, fnDir, tmpl))
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		fingerprints, templates, invalid, appErrors, err := c.authorize(ctx)
+
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("authorize err = %v, want the cancellation as a root "+
+				"failure", err)
+		}
+		if fingerprints != nil || templates != nil || invalid != nil || appErrors != nil {
+			t.Fatalf("authorize maps = (%v, %v, %v, %v), want all nil on "+
+				"cancellation (never a per-app definition)", fingerprints,
+				templates, invalid, appErrors)
+		}
+	})
+}
+
+// TestAuthorizeRefusesRecordWithoutTemplateIdentity pins the conservative
+// boundary of the carried-identity contract: a valid loaded record that cannot
+// prove which template bytes produced its parse is NOT authorized — the whole
+// attempt fails closed (root-failure semantics, all maps nil) instead of
+// pairing the fingerprint with unprovable template bytes or silently re-reading
+// template.yaml after the scan.
+func TestAuthorizeRefusesRecordWithoutTemplateIdentity(t *testing.T) {
+	const authorizeTemplate = "runtime: nodejs24.x\nevents:\n  - handler: index.hi\n" +
+		"    pattern:\n      event_name: [INSERT]\n"
 	appsDir := t.TempDir()
-	fnDir := filepath.Join(appsDir, "fpfail")
+	fnDir := filepath.Join(appsDir, "no-identity")
 	if err := os.MkdirAll(fnDir, 0o755); err != nil {
 		t.Fatalf("mkdir app: %v", err)
 	}
-	templatePath := filepath.Join(fnDir, "template.yaml")
-	if err := os.WriteFile(templatePath, []byte(authorizeTemplate), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(fnDir, "template.yaml"),
+		[]byte(authorizeTemplate), 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
 	}
-	unreadable := filepath.Join(fnDir, "a-unreadable.txt")
-	if err := os.WriteFile(unreadable, []byte("secret"), 0o644); err != nil {
-		t.Fatalf("write source file: %v", err)
+	if err := os.WriteFile(filepath.Join(fnDir, "index.js"),
+		[]byte("export function hi(e, context){}\n"), 0o644); err != nil {
+		t.Fatalf("write handler: %v", err)
 	}
-	if err := os.Chmod(unreadable, 0o000); err != nil {
-		t.Fatalf("chmod source file: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(unreadable, 0o644) })
-
 	tmpl, err := app.ParseTemplate([]byte(authorizeTemplate))
 	if err != nil {
 		t.Fatalf("parse template: %v", err)
@@ -154,33 +247,88 @@ func TestAuthorizePersistsIdentityForRecoverableFingerprintError(t *testing.T) {
 	c := New(Config{
 		AppsDir: appsDir,
 		LoadApps: func(string) ([]app.App, []app.LoadIssue, error) {
+			// A valid record whose carried identity is absent — the only shape
+			// the real loader can no longer produce, but a seam or a future
+			// caller could.
+			return []app.App{{Name: "no-identity", Dir: fnDir, Template: tmpl}},
+				nil, nil
+		},
+	})
+
+	fingerprints, templates, invalid, appErrors, err := c.authorize(context.Background())
+
+	if err == nil || !strings.Contains(err.Error(), "has no template identity") {
+		t.Fatalf("authorize err = %v, want the missing-identity refusal", err)
+	}
+	if fingerprints != nil || templates != nil || invalid != nil || appErrors != nil {
+		t.Fatalf("authorize maps = (%v, %v, %v, %v), want all nil on a missing "+
+			"identity refusal (never an authorization with unprovable content)",
+			fingerprints, templates, invalid, appErrors)
+	}
+}
+
+// TestAuthorizePersistsCarriedIdentityFromLoadedRecord pins that the
+// authorization records the identity carried by the loaded parse itself, not a
+// later re-read of template.yaml: when the file changes after the scan, the
+// persisted identity still describes the exact bytes that produced the parsed
+// template and fingerprint the authorization pairs it with.
+func TestAuthorizePersistsCarriedIdentityFromLoadedRecord(t *testing.T) {
+	const authorizeTemplate = "runtime: nodejs24.x\nevents:\n  - handler: index.hi\n" +
+		"    pattern:\n      event_name: [INSERT]\n"
+	appsDir := t.TempDir()
+	fnDir := filepath.Join(appsDir, "fn")
+	if err := os.MkdirAll(fnDir, 0o755); err != nil {
+		t.Fatalf("mkdir app: %v", err)
+	}
+	templatePath := filepath.Join(fnDir, "template.yaml")
+	if err := os.WriteFile(templatePath, []byte(authorizeTemplate), 0o644); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(fnDir, "index.js"),
+		[]byte("export function hi(e, context){}\n"), 0o644); err != nil {
+		t.Fatalf("write handler: %v", err)
+	}
+	tmpl, err := app.ParseTemplate([]byte(authorizeTemplate))
+	if err != nil {
+		t.Fatalf("parse template: %v", err)
+	}
+	carried := app.TemplateIdentity([]byte(authorizeTemplate))
+	c := New(Config{
+		AppsDir: appsDir,
+		LoadApps: func(string) ([]app.App, []app.LoadIssue, error) {
 			return []app.App{{
-				Name: "fpfail", Dir: fnDir, Template: tmpl,
+				Name: "fn", Dir: fnDir, Template: tmpl,
+				TemplateIdentity: carried,
 			}}, nil, nil
 		},
 	})
 
+	// when template.yaml changes after the loaded record was produced
+	editedTemplate := authorizeTemplate + "resources:\n  memory: 1GiB\n"
+	if err := os.WriteFile(templatePath, []byte(editedTemplate), 0o644); err != nil {
+		t.Fatalf("rewrite template: %v", err)
+	}
+	editedIdentity := app.TemplateIdentity([]byte(editedTemplate))
+	if editedIdentity == carried {
+		t.Fatal("precondition: the edit must change the raw template identity")
+	}
+
 	fingerprints, templateIdentities, invalid, appErrors, err := c.authorize(context.Background())
+
+	// then the carried identity — the bytes the parse actually saw — is the
+	// one persisted alongside the fingerprint, never the re-read value
 	if err != nil {
-		t.Fatalf("authorize err = %v, want nil (a fingerprint error is not a root failure)",
-			err)
+		t.Fatalf("authorize err = %v, want nil", err)
 	}
-	if appErrors["fpfail"] == "" {
-		t.Fatalf("appErrors = %v, want the fingerprint diagnostic", appErrors)
+	if len(appErrors) != 0 || len(invalid) != 0 {
+		t.Fatalf("app errors/invalid = %v/%v, want none", appErrors, invalid)
 	}
-	src, err := app.ReadTemplateSource(appsDir, "fpfail")
-	if err != nil {
-		t.Fatalf("template source: %v", err)
+	if fingerprints["fn"] == "" {
+		t.Fatalf("fingerprints = %v, want the loaded app fingerprinted",
+			fingerprints)
 	}
-	if invalid["fpfail"] != src.Identity {
-		t.Fatalf("invalid templates = %v, want the persisted materialized identity %q",
-			invalid, src.Identity)
-	}
-	if _, ok := fingerprints["fpfail"]; ok {
-		t.Fatalf("fingerprints = %v, want the unfingerprintable app excluded", fingerprints)
-	}
-	if _, ok := templateIdentities["fpfail"]; ok {
-		t.Fatalf("template identities = %v, want the app excluded until it fingerprints",
-			templateIdentities)
+	if templateIdentities["fn"] != carried {
+		t.Fatalf("template identity = %q, want the carried parse identity %q, "+
+			"not a re-read of %q", templateIdentities["fn"], carried, editedIdentity)
 	}
 }

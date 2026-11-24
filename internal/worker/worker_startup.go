@@ -44,6 +44,12 @@ type startupAppSet struct {
 	// reject a prepared generation when the shared desired revision is not the
 	// generation that was materialized. Nil preserves standalone behavior.
 	publicationFence func(context.Context, func()) error
+	// authorized, when non-nil, maps each app in a coordinated deployment to the
+	// fingerprint materialized for the generation being consumed. Startup
+	// publication refuses a candidate whose actual prepared identity differs
+	// from this set; nil preserves standalone startup, where the built identity
+	// wins and the reconciler detects any later drift.
+	authorized map[string]string
 }
 
 // startupState is the narrow state view the startup app phase needs: the
@@ -147,31 +153,14 @@ func (g *startupParseGate) SkipParse(name, identity string) (bool, error) {
 // sourceGeneration is stamped on this startup's desired-state writes;
 // authoritative filters the loaded set to the exact fingerprints materialized
 // for that generation, so a local /apps edit can never be prepared or published
-// as a desired generation on a coordinator-active worker. A nil map with
-// authoritative false preserves the standalone behavior.
-func loadStartupApps(
-	startupCtx context.Context,
-	logger *slog.Logger,
-	st startupState,
-	appsRoot string,
-	metricsInstance *metrics.Registry,
-	sourceGeneration int64,
-	authorized map[string]string,
-	materializedInvalid map[string]string,
-	authoritative bool,
-) (startupAppSet, error) {
-	return loadStartupAppsChecked(
-		startupCtx, logger, st, appsRoot, metricsInstance, sourceGeneration,
-		authorized, materializedInvalid, authoritative, nil,
-	)
-}
-
-// loadStartupAppsChecked is loadStartupApps plus an optional check over the SAME
-// pre-authorization candidates and issues this load computed, run after
-// fingerprinting and before authorization filtering or discovery persistence. It
-// exists so startup can validate the coordinated-deployment authorization it is
-// about to consume against the exact scan that produces the consumed set: a
-// separate validation scan could miss a source edit that lands between the two.
+// as a desired generation on a coordinator-active worker. The same set is
+// carried to publication, where the identity Prepare actually captured must
+// still match it. A nil map with authoritative false preserves standalone
+// behavior.
+// loadStartupAppsChecked loads and fingerprints the app tree, then runs an
+// optional check over the SAME pre-authorization candidates and issues before
+// filtering or discovery persistence. This lets startup validate the coordinated
+// deployment authorization against the exact scan that produces the consumed set.
 func loadStartupAppsChecked(
 	startupCtx context.Context,
 	logger *slog.Logger,
@@ -236,7 +225,15 @@ func loadStartupAppsChecked(
 			return startupAppSet{}, err
 		}
 	}
+	var authorizedFingerprints map[string]string
 	if authoritative {
+		authorizedFingerprints = authorized
+		if authorizedFingerprints == nil {
+			// Coordinated deployment with nothing authorized yet: keep the
+			// non-nil empty set so publication distinguishes it from standalone
+			// startup and refuses any candidate that escapes the filter.
+			authorizedFingerprints = map[string]string{}
+		}
 		startup = filterAuthorizedStartupApps(startup, authorized, logger)
 		loadIssues = filterAuthorizedStartupIssues(loadIssues, materializedInvalid)
 		apps = apps[:0]
@@ -297,6 +294,7 @@ func loadStartupAppsChecked(
 		issues:        loadIssues,
 		records:       startup,
 		fingerprints:  fingerprints,
+		authorized:    authorizedFingerprints,
 		fencingTokens: fencingTokens,
 		statsRestore:  statsRestore,
 	}, nil
@@ -439,7 +437,7 @@ func filterAuthorizedStartupApps(
 	for _, record := range startup {
 		fingerprint, ok := authorized[record.App.Name]
 		if !ok || fingerprint != record.Fingerprint {
-			logger.Warn("Deployment: local app does not match the materialized revision; ignoring",
+			logger.Debug("Deployment: local app does not match the materialized revision; ignoring",
 				"app", record.App.Name)
 			continue
 		}
@@ -819,12 +817,15 @@ schedule:
 		if st != nil && fencingToken <= 0 {
 			// Fail closed: without the exact token from this app's discovery
 			// write there is no fencing authority for its build/service
-			// callbacks. Do not build, publish, or admit it to the registry. A
-			// later reconcile retries it with a freshly persisted generation.
+			// callbacks. Do not build or admit it to the registry as available,
+			// but keep it matched-but-unavailable so its deliveries are never
+			// ACKed unmatched. A later reconcile retries it with a freshly
+			// persisted generation.
 			logger.Error(
 				"App: startup preparation skipped without fencing token",
 				"app", fn.Name,
 			)
+			slots[i] = runner.NewUnavailable(fn)
 			continue
 		}
 		select {
@@ -847,9 +848,12 @@ schedule:
 
 	prepared := make([]*runner.PreparedApp, 0, len(slots))
 	preparedCount := 0
-	for _, pf := range slots {
+	for i, pf := range slots {
 		if pf == nil {
-			continue
+			// Every admitted job fills its slot and unassigned slots were
+			// filled above. A nil here would silently drop a matched app, so
+			// preserve it as unavailable rather than skipping it.
+			pf = runner.NewUnavailable(startup[i].App)
 		}
 		prepared = append(prepared, pf)
 		if pf.Prepared() != nil {

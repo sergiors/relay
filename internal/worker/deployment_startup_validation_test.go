@@ -1,10 +1,10 @@
 package worker
 
 import (
-	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"relay/internal/app"
@@ -60,6 +60,26 @@ func emptyAuthorization() deployment.Snapshot {
 	}
 }
 
+// validateTreeAuthorization is the test-local replacement for the removed
+// production recovery wrapper: it loads candidates and issues ONCE from the
+// tree and runs the pure startup-authorization proof over that single scan.
+// Production validates the consumed scan through deploymentStartupValidation
+// inside loadStartupAppsChecked (pinned separately in
+// deployment_startup_checked_test.go); no production re-scan helper exists.
+func validateTreeAuthorization(
+	t *testing.T,
+	root string,
+	snapshot deployment.Snapshot,
+) error {
+	t.Helper()
+	apps, issues, err := app.NewLoader(root, discardLogger()).LoadWithDiagnostics()
+	if err != nil {
+		t.Fatalf("load %s: %v", root, err)
+	}
+	return validateStartupAuthorization(
+		snapshot, selectAndFingerprintApps(apps, discardLogger()), issues)
+}
+
 // TestValidateRecoveredDeploymentAuthorizationRejectsValidInvalidStandIn pins
 // the invalid-to-valid half of the startup guard: when a published revision could
 // not be materialized, a locally VALID candidate for a name the previous
@@ -79,28 +99,24 @@ func TestValidateRecoveredDeploymentAuthorizationRejectsValidInvalidStandIn(t *t
 
 	partial := snapshot
 	partial.Error = errors.New("deployment: materialize commit: fetch failed")
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, partial,
-	); err == nil {
+	if err := validateTreeAuthorization(t, root, partial); err == nil {
 		t.Fatal("a valid candidate standing in for a materialized-invalid app = nil, " +
 			"want a fail-closed error after a failed materialization")
 	}
 
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, snapshot,
-	); err != nil {
+	if err := validateTreeAuthorization(t, root, snapshot); err != nil {
 		t.Fatalf("non-partial startup = %v, want ordinary invalid drift filtering "+
 			"preserved", err)
 	}
 }
 
 // TestValidateRecoveredDeploymentAuthorizationRequiresIdentityOnRecovery pins
-// the identity half of the failed-materialization recovery proof: an authorized
-// app whose recorded template identity is empty cannot be proven from its content
-// fingerprint alone (runtime-only template fields are excluded from it), so startup
-// fails closed while recovering a failed materialization. Ordinary startup keeps
-// the existing behavior for an unrecorded identity, and a matching recorded
-// identity satisfies the recovery proof.
+// the identity half of the authorization proof: an authorized app whose
+// recorded template identity is empty cannot be proven from its content
+// fingerprint alone (runtime-only template fields are excluded from it), so
+// startup fails closed — at ordinary startup AND while recovering a failed
+// materialization — and a matching recorded identity satisfies the proof in
+// both modes.
 func TestValidateRecoveredDeploymentAuthorizationRequiresIdentityOnRecovery(t *testing.T) {
 	root := t.TempDir()
 	fingerprint, identity := writeValidationApp(t, root, "authorized", validationTemplate)
@@ -108,26 +124,32 @@ func TestValidateRecoveredDeploymentAuthorizationRequiresIdentityOnRecovery(t *t
 	snapshot := emptyAuthorization()
 	snapshot.Fingerprints["authorized"] = fingerprint
 
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, snapshot,
-	); err != nil {
-		t.Fatalf("ordinary startup with an unrecorded identity = %v, want unchanged "+
-			"filtering behavior", err)
+	// Ordinary startup with an unrecorded identity now fails closed too: the
+	// exact carried identity is required for every authorized valid candidate.
+	err := validateTreeAuthorization(t, root, snapshot)
+	if err == nil {
+		t.Fatal("ordinary startup with no recorded template identity = nil, " +
+			"want a fail-closed error")
+	}
+	if want := "has no recorded template identity"; !strings.Contains(err.Error(), want) {
+		t.Fatalf("error = %q, want it to contain %q", err, want)
 	}
 
 	partial := snapshot
 	partial.Error = errors.New("deployment: materialize commit: fetch failed")
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, partial,
-	); err == nil {
+	if err := validateTreeAuthorization(t, root, partial); err == nil {
 		t.Fatal("failed materialization with no recorded template identity = nil, " +
 			"want a fail-closed error")
 	}
 
-	partial.TemplateIdentities = map[string]string{"authorized": identity}
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, partial,
-	); err != nil {
+	// A matching recorded identity satisfies the proof in both modes.
+	snapshot.TemplateIdentities = map[string]string{"authorized": identity}
+	if err := validateTreeAuthorization(t, root, snapshot); err != nil {
+		t.Fatalf("ordinary startup with a matching identity = %v, want nil", err)
+	}
+	partial = snapshot
+	partial.Error = errors.New("deployment: materialize commit: fetch failed")
+	if err := validateTreeAuthorization(t, root, partial); err != nil {
 		t.Fatalf("failed materialization with a matching identity = %v, want nil", err)
 	}
 }
@@ -157,18 +179,14 @@ func TestValidateRecoveredDeploymentAuthorizationRequiresInvalidIdentityOnRecove
 	snapshot.Invalid["gated"] = "template invalid"
 	snapshot.InvalidTemplates["gated"] = "recorded-invalid-identity"
 
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, snapshot,
-	); err != nil {
+	if err := validateTreeAuthorization(t, root, snapshot); err != nil {
 		t.Fatalf("ordinary startup with an unhashable desired-invalid app = %v, want "+
 			"the existing filtering behavior", err)
 	}
 
 	partial := snapshot
 	partial.Error = errors.New("deployment: materialize commit: fetch failed")
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, partial,
-	); err == nil {
+	if err := validateTreeAuthorization(t, root, partial); err == nil {
 		t.Fatal("failed materialization with an unprovable desired-invalid identity " +
 			"= nil, want a fail-closed error")
 	}
@@ -186,18 +204,17 @@ func TestValidateRecoveredDeploymentAuthorizationRequiresInvalidIdentityOnRecove
 	proven.Invalid["gated"] = "template invalid"
 	proven.InvalidTemplates["gated"] = source.Identity
 	proven.Error = errors.New("deployment: materialize commit: fetch failed")
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), matching, proven,
-	); err != nil {
+	if err := validateTreeAuthorization(t, matching, proven); err != nil {
 		t.Fatalf("failed materialization with a matching invalid identity = %v, want nil", err)
 	}
 }
 
 // TestValidateRecoveredDeploymentAuthorizationAuthorizedContent pins the base
 // startup check in both modes: every persisted valid fingerprint must have a
-// matching local candidate (and, only while recovering a failed materialization,
-// its recorded template identity), while extra local candidates only fail when
-// a failed materialization may have left a partially materialized target.
+// matching local candidate CARRIED WITH its recorded template identity — the
+// identity is required in every case, not only while recovering a failed
+// materialization — while extra local candidates only fail when a failed
+// materialization may have left a partially materialized target.
 func TestValidateRecoveredDeploymentAuthorizationAuthorizedContent(t *testing.T) {
 	root := t.TempDir()
 	fingerprint, identity := writeValidationApp(t, root, "authorized", validationTemplate)
@@ -206,9 +223,7 @@ func TestValidateRecoveredDeploymentAuthorizationAuthorizedContent(t *testing.T)
 	snapshot.Fingerprints["authorized"] = fingerprint
 	snapshot.TemplateIdentities["authorized"] = identity
 
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, snapshot,
-	); err != nil {
+	if err := validateTreeAuthorization(t, root, snapshot); err != nil {
 		t.Fatalf("matching authorized app = %v, want nil", err)
 	}
 
@@ -216,8 +231,8 @@ func TestValidateRecoveredDeploymentAuthorizationAuthorizedContent(t *testing.T)
 	// tree. The comment flows into the stripped-template digest byte-for-byte
 	// (the runtime-only strip preserves comments), so this edit CHANGES THE
 	// CONTENT FINGERPRINT and fails on the fingerprint gate — it is deliberately
-	// not the identity-only drift that ordinary startup must let through (see
-	// TestValidateRecoveredDeploymentAuthorizationRuntimeOnlyIdentityDrift).
+	// not the identity-only drift covered by
+	// TestValidateRecoveredDeploymentAuthorizationRuntimeOnlyIdentityDrift.
 	editedFingerprint, _ := writeValidationApp(t, root, "authorized",
 		validationTemplate+"# local edit\n")
 	if editedFingerprint == fingerprint {
@@ -225,9 +240,7 @@ func TestValidateRecoveredDeploymentAuthorizationAuthorizedContent(t *testing.T)
 			"fingerprint — otherwise this case would pin identity-only drift " +
 			"instead of a fingerprint change")
 	}
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, snapshot,
-	); err == nil {
+	if err := validateTreeAuthorization(t, root, snapshot); err == nil {
 		t.Fatal("fingerprint-changed authorized app = nil, want a fail-closed error")
 	}
 
@@ -236,18 +249,14 @@ func TestValidateRecoveredDeploymentAuthorizationAuthorizedContent(t *testing.T)
 	// the extra candidate as evidence of a partially materialized target.
 	writeValidationApp(t, root, "authorized", validationTemplate)
 	writeValidationApp(t, root, "local-only", validationTemplate)
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, snapshot,
-	); err != nil {
+	if err := validateTreeAuthorization(t, root, snapshot); err != nil {
 		t.Fatalf("local-only app at ordinary startup = %v, want it filtered without "+
 			"failing startup", err)
 	}
 
 	partial := snapshot
 	partial.Error = errors.New("deployment: materialize commit: fetch failed")
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, partial,
-	); err == nil {
+	if err := validateTreeAuthorization(t, root, partial); err == nil {
 		t.Fatal("local-only app after a failed materialization = nil, want a " +
 			"fail-closed error")
 	}
@@ -257,28 +266,46 @@ func TestValidateRecoveredDeploymentAuthorizationAuthorizedContent(t *testing.T)
 	missing := emptyAuthorization()
 	missing.Fingerprints["authorized"] = fingerprint
 	missing.TemplateIdentities["authorized"] = identity
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), restored, missing,
-	); err == nil {
+	if err := validateTreeAuthorization(t, restored, missing); err == nil {
 		t.Fatal("missing authorized app = nil, want a fail-closed error")
 	}
 }
 
 // TestValidateRecoveredDeploymentAuthorizationRuntimeOnlyIdentityDrift pins
-// the gating of raw template-identity strictness: a runtime-only template edit
+// the always-on raw-template-identity boundary: a runtime-only template edit
 // (here top-level resources) changes the RAW template identity but not the
 // content fingerprint, because runtime-only fields are stripped from the
-// digest. Ordinary startup must PROCEED for such an app — the existing startup
-// filter and the reconciler's drift/restore behavior own that drift — while the
-// same tree during a failed-materialization recovery fails closed, because
-// recovery must prove the exact recorded template bytes. Missing or
-// fingerprint-changed authorized apps still fail ordinary startup (pinned by
-// TestValidateRecoveredDeploymentAuthorizationAuthorizedContent).
+// digest. Startup now FAILS CLOSED for such an authorized app in every mode —
+// ordinary startup included, because the edit can arrive after successful
+// materialization but before this scan, and activating it would serve
+// unauthorized config before the asynchronous reconciler catches the drift —
+// while the same drift was previously left to the reconciler's restore. An
+// unedited tree still validates in both modes, so the rejection is
+// attributable to the carried identity alone. Missing or fingerprint-changed
+// authorized apps also fail ordinary startup (pinned by
+// TestValidateRecoveredDeploymentAuthorizationAuthorizedContent and
+// TestValidateRecoveredDeploymentAuthorizationRequiresIdentityOnRecovery).
 func TestValidateRecoveredDeploymentAuthorizationRuntimeOnlyIdentityDrift(t *testing.T) {
 	root := t.TempDir()
 	fingerprint, identity := writeValidationApp(t, root, "authorized",
 		validationTemplate)
 
+	snapshot := emptyAuthorization()
+	snapshot.Fingerprints["authorized"] = fingerprint
+	snapshot.TemplateIdentities["authorized"] = identity
+	partial := snapshot
+	partial.Error = errors.New("deployment: materialize commit: fetch failed")
+
+	// Positive control: the unedited tree validates in both modes.
+	if err := validateTreeAuthorization(t, root, snapshot); err != nil {
+		t.Fatalf("unedited tree at ordinary startup = %v, want nil", err)
+	}
+	if err := validateTreeAuthorization(t, root, partial); err != nil {
+		t.Fatalf("unedited tree during recovery = %v, want nil", err)
+	}
+
+	// A runtime-only template edit changes the raw identity but not the
+	// content fingerprint (runtime-only fields are stripped from the digest).
 	editedFingerprint, editedIdentity := writeValidationApp(t, root, "authorized",
 		validationTemplate+"resources:\n  memory: 1GiB\n")
 	if editedFingerprint != fingerprint {
@@ -290,25 +317,18 @@ func TestValidateRecoveredDeploymentAuthorizationRuntimeOnlyIdentityDrift(t *tes
 			"template identity (both %q)", identity)
 	}
 
-	snapshot := emptyAuthorization()
-	snapshot.Fingerprints["authorized"] = fingerprint
-	snapshot.TemplateIdentities["authorized"] = identity
-
-	// Ordinary startup: fingerprint-stable identity drift proceeds.
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, snapshot,
-	); err != nil {
-		t.Fatalf("ordinary startup with runtime-only template identity drift = "+
-			"%v, want it to proceed to the existing filter and reconciler restore",
-			err)
+	// Ordinary startup with identity-only drift now fails closed...
+	err := validateTreeAuthorization(t, root, snapshot)
+	if err == nil {
+		t.Fatal("ordinary startup with runtime-only template identity drift = nil, " +
+			"want a fail-closed error (the edit can land after materialization)")
+	}
+	if want := "template bytes no longer match the materialized revision"; !strings.Contains(err.Error(), want) {
+		t.Fatalf("error = %q, want it to contain %q", err, want)
 	}
 
-	// The same drift during a failed-materialization recovery fails closed.
-	partial := snapshot
-	partial.Error = errors.New("deployment: materialize commit: fetch failed")
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, partial,
-	); err == nil {
+	// ...and so does the same drift during a failed-materialization recovery.
+	if err := validateTreeAuthorization(t, root, partial); err == nil {
 		t.Fatal("runtime-only template identity drift after a failed " +
 			"materialization = nil, want a fail-closed error")
 	}
@@ -339,23 +359,17 @@ func TestValidateRecoveredDeploymentAuthorizationRejectsChangedDesiredInvalidIde
 
 	partial := snapshot
 	partial.Error = errors.New("deployment: materialize commit: fetch failed")
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, partial,
-	); err != nil {
+	if err := validateTreeAuthorization(t, root, partial); err != nil {
 		t.Fatalf("desired-invalid app with matching identity after a failed "+
 			"materialization = %v, want startup to proceed", err)
 	}
 
 	writeBrokenWorkerApp(t, root, "broken", broken+"# edited invalid\n")
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, partial,
-	); err == nil {
+	if err := validateTreeAuthorization(t, root, partial); err == nil {
 		t.Fatal("changed desired-invalid template bytes after a failed " +
 			"materialization = nil, want a fail-closed error")
 	}
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, snapshot,
-	); err != nil {
+	if err := validateTreeAuthorization(t, root, snapshot); err != nil {
 		t.Fatalf("ordinary startup with locally changed invalid bytes = %v, "+
 			"want the invalid-drift filtering preserved", err)
 	}
@@ -373,17 +387,13 @@ func TestValidateRecoveredDeploymentAuthorizationRequiresPriorAuthority(t *testi
 	root := t.TempDir()
 
 	idle := deployment.Snapshot{Generation: 0}
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, idle,
-	); err != nil {
+	if err := validateTreeAuthorization(t, root, idle); err != nil {
 		t.Fatalf("nothing ever published = %v, want startup to proceed", err)
 	}
 
 	orphan := idle
 	orphan.Error = errors.New("deployment: materialize commit: fetch failed")
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, orphan,
-	); err == nil {
+	if err := validateTreeAuthorization(t, root, orphan); err == nil {
 		t.Fatal("failed materialization without a prior authoritative " +
 			"generation = nil, want a fail-closed error")
 	}
@@ -401,16 +411,12 @@ func TestValidateRecoveredDeploymentAuthorizationLegitimatelyEmptyTree(t *testin
 
 	partial := empty
 	partial.Error = errors.New("deployment: materialize commit: fetch failed")
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, partial,
-	); err != nil {
+	if err := validateTreeAuthorization(t, root, partial); err != nil {
 		t.Fatalf("authoritatively empty tree = %v, want startup to proceed", err)
 	}
 
 	writeValidationApp(t, root, "half-synced", validationTemplate)
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, partial,
-	); err == nil {
+	if err := validateTreeAuthorization(t, root, partial); err == nil {
 		t.Fatal("extra candidate against an empty authorization after a failed " +
 			"materialization = nil, want a fail-closed error")
 	}
@@ -428,18 +434,14 @@ func TestValidateRecoveredDeploymentAuthorizationRemovedNameReappearing(t *testi
 	snapshot := emptyAuthorization()
 	snapshot.Removed = []string{"removed-app"}
 
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, snapshot,
-	); err != nil {
+	if err := validateTreeAuthorization(t, root, snapshot); err != nil {
 		t.Fatalf("reappeared removed app at ordinary startup = %v, want it "+
 			"filtered without failing startup", err)
 	}
 
 	partial := snapshot
 	partial.Error = errors.New("deployment: materialize commit: fetch failed")
-	if err := validateRecoveredDeploymentAuthorization(
-		context.Background(), discardLogger(), root, partial,
-	); err == nil {
+	if err := validateTreeAuthorization(t, root, partial); err == nil {
 		t.Fatal("reappeared removed app after a failed materialization = nil, " +
 			"want a fail-closed error")
 	}

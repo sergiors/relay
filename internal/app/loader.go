@@ -78,17 +78,26 @@ func HasTemplate(dir string) (bool, error) {
 		return false, err
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return true, fmt.Errorf("%w: %q is not a regular non-symlink template", ErrInvalidPath, filepath.Join(dir, TemplateFile))
+		return true, fmt.Errorf(
+			"%w: %q is not a regular non-symlink template",
+			ErrInvalidPath, filepath.Join(dir, TemplateFile),
+		)
 	}
 	return true, nil
 }
 
 // App is a loaded app: its name (from the directory name), directory
-// path (used later for image building), and parsed template.
+// path (used later for image building), parsed template, and the content
+// identity of the exact template.yaml bytes that produced Template.
 type App struct {
 	Name     string
 	Dir      string
 	Template *Template
+	// TemplateIdentity is the stable raw-template identity computed from the
+	// bytes parsed into Template. Callers that must prove the local tree still
+	// matches a materialized revision compare this carried value instead of
+	// re-reading template.yaml, which could observe different bytes.
+	TemplateIdentity string
 }
 
 // Loader discovers apps from a directory: each direct subdirectory is one
@@ -139,10 +148,10 @@ type LoadIssue struct {
 }
 
 // TemplateIdentity returns the stable content identity of raw template.yaml
-// bytes: the SHA-256 digest rendered as "sha256:<hex>". It is used only to
-// recognize that the exact same invalid input was already diagnosed; it is
-// deliberately NOT a fencing token and never participates in generation/claim
-// ordering.
+// bytes: the SHA-256 digest rendered as "sha256:<hex>". It recognizes an
+// unchanged invalid input and verifies loaded templates against materialized
+// deployment authorization. It is NOT a fencing token and never participates
+// in generation or claim ordering.
 func TemplateIdentity(data []byte) string {
 	sum := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(sum[:])
@@ -193,7 +202,12 @@ func (s TemplateSource) Parse() (App, error) {
 			Err:      fmt.Errorf("app %q: %w", s.Name, err),
 		}
 	}
-	return App{Name: s.Name, Dir: s.Dir, Template: tmpl}, nil
+	return App{
+		Name:             s.Name,
+		Dir:              s.Dir,
+		Template:         tmpl,
+		TemplateIdentity: s.Identity,
+	}, nil
 }
 
 // TemplateParseGate lets a caller consult persisted state around a loader scan.
@@ -230,7 +244,9 @@ func resolveAppDir(root, name string) (*os.Root, string, error) {
 	// non-app directory, so their candidacy is decided after the directory check.
 	if name == "" || name == "." || name == ".." || filepath.IsAbs(name) ||
 		strings.ContainsAny(name, "/\\") || name != filepath.Base(name) {
-		return nil, "", fmt.Errorf("%w: %q is not a single path element", ErrInvalidPath, name)
+		return nil, "", fmt.Errorf(
+			"%w: %q is not a single path element", ErrInvalidPath, name,
+		)
 	}
 	nameErr := ValidName(name)
 	appsRoot, err := os.OpenRoot(root)
@@ -266,7 +282,9 @@ func resolveAppDir(root, name string) (*os.Root, string, error) {
 		// now-missing, symlinked, or non-directory child without following it.
 		current, statErr := appsRoot.Lstat(name)
 		if statErr == nil && (current.Mode()&os.ModeSymlink != 0 || !current.IsDir()) {
-			return nil, "", fmt.Errorf("%w: %q changed to an unsupported app path", ErrInvalidPath, name)
+			return nil, "", fmt.Errorf(
+				"%w: %q changed to an unsupported app path", ErrInvalidPath, name,
+			)
 		}
 		if errors.Is(statErr, fs.ErrNotExist) && nameErr == nil {
 			return nil, "", fmt.Errorf("app %q: %w", name, fs.ErrNotExist)
@@ -356,13 +374,18 @@ func ReadTemplateSource(root, name string) (TemplateSource, error) {
 		return TemplateSource{}, fmt.Errorf("app %q: stat template: %w", name, err)
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return TemplateSource{}, fmt.Errorf("%w: app %q template is not a regular non-symlink file", ErrInvalidPath, name)
+		return TemplateSource{}, fmt.Errorf(
+			"%w: app %q template is not a regular non-symlink file", ErrInvalidPath, name,
+		)
 	}
 	f, err := appRoot.Open(TemplateFile)
 	if err != nil {
 		currentInfo, statErr := appRoot.Lstat(TemplateFile)
 		if statErr == nil && (currentInfo.Mode()&os.ModeSymlink != 0 || !currentInfo.Mode().IsRegular()) {
-			return TemplateSource{}, fmt.Errorf("%w: app %q template changed to a non-regular or symlinked file", ErrInvalidPath, name)
+			return TemplateSource{}, fmt.Errorf(
+				"%w: app %q template changed to a non-regular or symlinked file",
+				ErrInvalidPath, name,
+			)
 		}
 		if errors.Is(statErr, fs.ErrNotExist) {
 			return TemplateSource{}, ErrNotReady
@@ -373,7 +396,9 @@ func ReadTemplateSource(root, name string) (TemplateSource, error) {
 		if errors.Is(err, fs.ErrNotExist) {
 			// The entry is regular now, but the open raced with a replacement.
 			// Do not wrap ENOENT: this is retryable, not a removal or invalid input.
-			return TemplateSource{}, fmt.Errorf("app %q: template changed during open (open error: %v)", name, err)
+			return TemplateSource{}, fmt.Errorf(
+				"app %q: template changed during open (open error: %v)", name, err,
+			)
 		}
 		return TemplateSource{}, fmt.Errorf("app %q: read template: %w", name, err)
 	}
@@ -393,16 +418,24 @@ func ReadTemplateSource(root, name string) (TemplateSource, error) {
 		}
 		return TemplateSource{}, fmt.Errorf("app %q: recheck template: %w", name, err)
 	}
-	if currentInfo.Mode()&os.ModeSymlink != 0 || !currentInfo.Mode().IsRegular() || !openedInfo.Mode().IsRegular() {
-		return TemplateSource{}, fmt.Errorf("%w: app %q template changed during read", ErrInvalidPath, name)
+
+	if currentInfo.Mode()&os.ModeSymlink != 0 ||
+		!currentInfo.Mode().IsRegular() ||
+		!openedInfo.Mode().IsRegular() {
+		return TemplateSource{}, fmt.Errorf(
+			"%w: app %q template changed during read", ErrInvalidPath, name,
+		)
 	}
+
 	if !os.SameFile(info, openedInfo) || !os.SameFile(currentInfo, openedInfo) {
 		return TemplateSource{}, fmt.Errorf("app %q: template changed during read", name)
 	}
+
 	data, err := io.ReadAll(f)
 	if err != nil {
 		return TemplateSource{}, fmt.Errorf("app %q: read template: %w", name, err)
 	}
+
 	return TemplateSource{
 		Name:     name,
 		Dir:      dir,
@@ -520,7 +553,9 @@ func (l *Loader) load(gate TemplateParseGate) ([]App, []LoadIssue, error) {
 			// The entry was enumerated but its current type could not be checked.
 			// Keep the ambiguity visible rather than silently turning it into a
 			// missing desired app.
-			issues = append(issues, LoadIssue{Name: name, Err: fmt.Errorf("app %q: inspect directory: %w", name, dirErr)})
+			issues = append(issues, LoadIssue{
+				Name: name, Err: fmt.Errorf("app %q: inspect directory: %w", name, dirErr),
+			})
 			continue
 		}
 		if !realDir {
