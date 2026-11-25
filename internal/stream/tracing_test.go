@@ -89,6 +89,13 @@ func processMessageConsumer(store invocationStateStore) *Consumer {
 	}, store)
 }
 
+func processMessageContext(c *Consumer) context.Context {
+	return withDeliveryGroupGeneration(
+		withDeliveryGeneration(context.Background(), c.groupGeneration()),
+		"test-generation",
+	)
+}
+
 // TestProcessMessageEmitsStreamSpanWithContext proves the per-message span is
 // emitted with low-cardinality messaging attributes and that its context (and
 // the dispatch child span) reaches the handler, so the runner's function.invoke

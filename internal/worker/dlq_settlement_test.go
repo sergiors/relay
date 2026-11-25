@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"relay/internal/dlq"
+	"relay/internal/stream"
 	"relay/internal/testutil"
 )
 
@@ -99,20 +100,25 @@ func (s *stubSettlementStore) settledAt(deliveryID string) (time.Time, bool) {
 	return at, ok
 }
 
-// stubInspector doubles deliveryPendingInspector: one canned answer per source
-// message ID, with an error injected for a matching identity.
+// stubInspector doubles deliveryInspector: one canned broker disposition per
+// source message ID, with an error injected for a matching identity. A key that
+// is not configured reports DeliveryUnknown, the conservative "preserve"
+// disposition, so a test never settles a row by omission.
 type stubInspector struct {
-	pending map[string]bool // by "stream/group/id"
-	errBy   string
-	groups  chan struct{} // optional block seam (unused in these tests)
+	states map[string]stream.DeliveryState // by "stream/group/id"
+	errBy  string
 }
 
-func (s *stubInspector) Pending(_ context.Context, source, group, messageID string) (bool, error) {
+func (s *stubInspector) Inspect(_ context.Context, source, group, messageID string) (stream.DeliveryState, error) {
 	key := source + "/" + group + "/" + messageID
 	if key == s.errBy {
-		return false, errors.New("redis unavailable")
+		return stream.DeliveryUnknown, errors.New("redis unavailable")
 	}
-	return s.pending[key], nil
+	state, ok := s.states[key]
+	if !ok {
+		return stream.DeliveryUnknown, nil
+	}
+	return state, nil
 }
 
 func TestDLQSettlementTickSettlesOnlyConfirmedDeliveries(t *testing.T) {
@@ -122,13 +128,22 @@ func TestDLQSettlementTickSettlesOnlyConfirmedDeliveries(t *testing.T) {
 	stillPending := dlq.DeliveryRef{
 		DeliveryID: "d-pending", Source: "stream", SourceGroup: "group", SourceMessageID: "6-0",
 	}
-	store := &stubSettlementStore{refs: []dlq.DeliveryRef{confirmed, stillPending}}
-	// The broker reports the confirmed delivery is no longer in its group's PEL
-	// (the XACK must already have succeeded or its reply was lost); the pending
-	// delivery is still recoverable.
-	inspector := &stubInspector{pending: map[string]bool{
-		"stream/group/5-0": false,
-		"stream/group/6-0": true,
+	unread := dlq.DeliveryRef{
+		DeliveryID: "d-unread", Source: "stream", SourceGroup: "group", SourceMessageID: "7-0",
+	}
+	unknown := dlq.DeliveryRef{
+		DeliveryID: "d-unknown", Source: "stream", SourceGroup: "group", SourceMessageID: "8-0",
+	}
+	store := &stubSettlementStore{refs: []dlq.DeliveryRef{confirmed, stillPending, unread, unknown}}
+	// Only the confirmed delivery is provably settled (its XACK succeeded or the
+	// reply was lost after XACK). Pending stays recoverable, unread will be
+	// delivered again after a group recreation, and unknown is missing data —
+	// none of the three may be marked.
+	inspector := &stubInspector{states: map[string]stream.DeliveryState{
+		"stream/group/5-0": stream.DeliverySettled,
+		"stream/group/6-0": stream.DeliveryPending,
+		"stream/group/7-0": stream.DeliveryUnread,
+		"stream/group/8-0": stream.DeliveryUnknown,
 	}}
 	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
 
@@ -150,7 +165,7 @@ func TestDLQSettlementTickSettlesOnlyConfirmedDeliveries(t *testing.T) {
 
 func TestDLQSettlementTickPagesPastPermanentPendingRows(t *testing.T) {
 	refs := make([]dlq.DeliveryRef, 0, dlqSettlementBatch+1)
-	pending := make(map[string]bool, dlqSettlementBatch+1)
+	states := make(map[string]stream.DeliveryState, dlqSettlementBatch+1)
 	for i := 0; i < dlqSettlementBatch; i++ {
 		id := fmt.Sprintf("d-%03d", i)
 		ref := dlq.DeliveryRef{
@@ -162,16 +177,16 @@ func TestDLQSettlementTickPagesPastPermanentPendingRows(t *testing.T) {
 			ref.Source = ""
 		}
 		refs = append(refs, ref)
-		pending["stream/group/"+id] = true
+		states["stream/group/"+id] = stream.DeliveryPending
 	}
 	later := dlq.DeliveryRef{
 		DeliveryID: "d-999", Source: "stream", SourceGroup: "group", SourceMessageID: "999-0",
 	}
 	refs = append(refs, later)
-	pending["stream/group/999-0"] = false
+	states["stream/group/999-0"] = stream.DeliverySettled
 
 	store := &stubSettlementStore{refs: refs}
-	inspector := &stubInspector{pending: pending}
+	inspector := &stubInspector{states: states}
 	logger := testutil.DiscardLogger()
 
 	cursor := dlqSettlementTick(context.Background(), store, inspector, "", time.Now, logger)
@@ -220,7 +235,7 @@ func TestDLQSettlementTickPreservesRowsOnAmbiguity(t *testing.T) {
 	broken := dlq.DeliveryRef{DeliveryID: "d-broken", Source: "", SourceGroup: "group", SourceMessageID: "1-0"}
 	store = &stubSettlementStore{refs: []dlq.DeliveryRef{broken, d}}
 	dlqSettlementTick(context.Background(), store, &stubInspector{
-		pending: map[string]bool{"stream/group/1-0": false},
+		states: map[string]stream.DeliveryState{"stream/group/1-0": stream.DeliverySettled},
 	}, "", time.Now, testutil.DiscardLogger())
 	if got := store.markedIDs(); len(got) != 1 || got[0] != d.DeliveryID {
 		t.Fatalf("marked = %v, want only the complete identity", got)
@@ -235,7 +250,10 @@ func TestDLQSettlementTickPreservesRowsOnAmbiguity(t *testing.T) {
 		},
 	}
 	dlqSettlementTick(context.Background(), store, &stubInspector{
-		pending: map[string]bool{"stream/group/1-0": false, "stream/group/2-0": false},
+		states: map[string]stream.DeliveryState{
+			"stream/group/1-0": stream.DeliverySettled,
+			"stream/group/2-0": stream.DeliverySettled,
+		},
 	}, "", time.Now, testutil.DiscardLogger())
 	if got := store.markedIDs(); len(got) != 1 || got[0] != "d-2" {
 		t.Fatalf("after one failed mark, marked = %v, want the remaining delivery", got)
@@ -265,7 +283,9 @@ func TestDLQSettlementLoopStopsOnCancel(t *testing.T) {
 func TestDLQSettlementLoopPerformsInitialReconcile(t *testing.T) {
 	d := dlq.DeliveryRef{DeliveryID: "d-1", Source: "stream", SourceGroup: "group", SourceMessageID: "1-0"}
 	store := &stubSettlementStore{refs: []dlq.DeliveryRef{d}}
-	inspector := &stubInspector{pending: map[string]bool{"stream/group/1-0": false}}
+	inspector := &stubInspector{states: map[string]stream.DeliveryState{
+		"stream/group/1-0": stream.DeliverySettled,
+	}}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {

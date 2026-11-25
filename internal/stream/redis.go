@@ -3,10 +3,8 @@ package stream
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -160,6 +158,25 @@ type Consumer struct {
 	backoff         *backoff
 	invStateStore   invocationStateStore
 	healthy         atomic.Bool
+	// groupGen advances on each local consumer-group recreation after NOGROUP.
+	// A delivery captures it before running so a completion that crosses a
+	// recreation cannot acknowledge a replayed source entry.
+	groupGen atomic.Uint64
+	// recovering is true from a NOGROUP observation until normal consumer
+	// consumption (a successful XREADGROUP) resumes. Healthy consults it so
+	// readiness stays unhealthy through the repair: a successful reclaim or any
+	// other Redis command must not mask a still-missing group.
+	recovering atomic.Bool
+	// recoveryEpoch advances when a NOGROUP recovery begins. A read captures it
+	// before the command, so a success from a read issued before the loss cannot
+	// clear the recovering state.
+	recoveryEpoch atomic.Uint64
+	// recoveryMu serializes group recreation and guards recoveryBackoff and
+	// recoveryStreak. Concurrent NOGROUP observers coalesce on one attempt via
+	// groupGen.
+	recoveryMu      sync.Mutex
+	recoveryBackoff *backoff
+	recoveryStreak  int
 	// buffer is the bounded local-event semaphore: it caps the number of
 	// messages read from Redis and held locally before completion, so the
 	// consumption loop applies backpressure instead of unboundedly buffering.
@@ -187,7 +204,7 @@ type Consumer struct {
 }
 
 func NewConsumer(cfg ConsumerConfig) *Consumer {
-	return newConsumer(cfg, &invocationStore{client: cfg.Client})
+	return newConsumer(cfg, &invocationStore{client: cfg.Client, consumer: cfg.Consumer})
 }
 
 func newConsumer(cfg ConsumerConfig, store invocationStateStore) *Consumer {
@@ -256,6 +273,7 @@ func newConsumer(cfg ConsumerConfig, store invocationStateStore) *Consumer {
 		metrics:         cfg.Metrics,
 		metricsInterval: cfg.MetricsInterval,
 		backoff:         newBackoff(cfg.backoffTable, cfg.backoffJitter),
+		recoveryBackoff: newBackoff(cfg.backoffTable, cfg.backoffJitter),
 		capacity:        capacity,
 		buffer: newBufferSemaphore(capacity, func(occupancy int) {
 			cfg.Metrics.SetGauge(metrics.MetricBufferedEvents, float64(occupancy))
@@ -273,37 +291,36 @@ func newConsumer(cfg ConsumerConfig, store invocationStateStore) *Consumer {
 	return c
 }
 
-// groupCreator is the narrow Redis view the consumer-group bootstrap needs:
-// XGROUP CREATE with MKSTREAM. *redis.Client satisfies it; a test fake can
-// implement it too, so the BUSYGROUP/MKSTREAM-at-0 semantics are unit-testable
-// without a Redis server.
-type groupCreator interface {
-	XGroupCreateMkStream(ctx context.Context, stream, group, start string) *redis.StatusCmd
-}
+// GroupCreation reports what an ensure-group call observed. It lets the
+// consumer-group recovery metric distinguish a group this process actually
+// created from one another actor had already created (BUSYGROUP).
+type GroupCreation int
+
+const (
+	// GroupCreated means XGROUP CREATE succeeded: the group did not exist.
+	GroupCreated GroupCreation = iota
+	// GroupAlreadyExists means Redis answered BUSYGROUP: the group was already
+	// present, so nothing was created.
+	GroupAlreadyExists
+)
 
 // EnsureGroup creates the consumer group if it does not exist, tolerating a
-// group that already exists (BUSYGROUP). MKSTREAM creates the stream if needed;
-// the group starts at "0", so its consumers see every entry already in the
-// stream as well as new ones (not just new messages); a fresh group over an
-// existing stream therefore replays the backlog.
+// group that already exists (BUSYGROUP). MKSTREAM creates the stream if
+// needed; the group starts at "0", so its consumers see every entry already in
+// the stream as well as new ones (not just new messages); a fresh group over
+// an existing stream therefore replays the backlog. Group creation and its
+// opaque fencing-token update are atomic; BUSYGROUP preserves the current token.
 //
-// It is the single stream-level bootstrap both Consumer.EnsureGroup and the
-// worker's external-dependency preflight delegate to, so these semantics have
-// exactly one implementation. The worker invokes it as a startup prerequisite
-// before any app is loaded or fingerprinted and before the state DB and
-// runtime workload initialization (the Redis client and tracing already exist;
-// the Docker manager is opened afterwards, see internal/worker); an embedder
-// invokes it before Consume.
+// It delegates to ensureGroup, the single authoritative implementation, and
+// preserves the error-only bootstrap contract used by the worker's
+// external-dependency preflight and by embedders. The worker runs it as a
+// startup prerequisite before any app is loaded or fingerprinted and before
+// the state DB and runtime workload initialization (the Redis client and
+// tracing already exist; the Docker manager is opened afterwards, see
+// internal/worker); an embedder invokes it before Consume.
 func EnsureGroup(ctx context.Context, client groupCreator, stream, group string) error {
-	err := client.XGroupCreateMkStream(ctx, stream, group, "0").Err()
-	if err == nil {
-		return nil
-	}
-	// BUSYGROUP means the group already exists; that is not a failure.
-	if isBusyGroup(err) {
-		return nil
-	}
-	return fmt.Errorf("create consumer group %q on stream %q: %w", group, stream, err)
+	_, _, err := ensureGroup(ctx, client, stream, group)
+	return err
 }
 
 // EnsureGroup creates the consumer group required for consumption. It delegates
@@ -313,17 +330,40 @@ func (c *Consumer) EnsureGroup(ctx context.Context) error {
 	return EnsureGroup(ctx, c.client, c.stream, c.group)
 }
 
+// ensureGroup recreates this consumer's group during NOGROUP recovery and
+// reports whether Relay created it.
+func (c *Consumer) recoverGroup(ctx context.Context) (GroupCreation, error) {
+	outcome, _, err := ensureGroup(ctx, c.client, c.stream, c.group)
+	return outcome, err
+}
+
 // The production Redis client must satisfy the group-bootstrap seam.
 var _ groupCreator = (*redis.Client)(nil)
 
-// Healthy reports whether the consumer's last observed Redis operation
-// succeeded: true while Redis is reachable, false during an outage. It is an
-// in-process readiness accessor for embedders and orchestrators that run the
-// consumer themselves; the worker's own `relay health` probe consults it in
+// Healthy reports whether the consumer is ready to consume: its last observed
+// Redis operation succeeded and no consumer-group recovery is outstanding. It
+// is an in-process readiness accessor for embedders and orchestrators that run
+// the consumer themselves; the worker's own `relay health` probe consults it in
 // steady state. `relay health` itself never touches Redis: it asks the running
-// worker over its control socket.
+// worker over its control socket. Prefer ReadinessReason when a fixed,
+// low-cardinality reason is needed.
 func (c *Consumer) Healthy() bool {
-	return c.healthy.Load()
+	return c.healthy.Load() && !c.recovering.Load()
+}
+
+// ReadinessReason reports consumer readiness together with a fixed, bounded
+// reason suitable for a readiness response. A group recovery in progress is
+// reported distinctly from a generic Redis outage so an operator can tell that
+// the stream group is being repaired rather than that Redis is unreachable.
+// Like Healthy, it never blocks on Redis.
+func (c *Consumer) ReadinessReason() (bool, string) {
+	if c.recovering.Load() {
+		return false, "redis consumer group recovery pending"
+	}
+	if !c.healthy.Load() {
+		return false, "redis consumer unhealthy"
+	}
+	return true, ""
 }
 
 // noteOutcome feeds a single Redis operation result into the health state and
@@ -332,6 +372,12 @@ func (c *Consumer) Healthy() bool {
 // healthy (logging once on the unhealthy→healthy transition) and resets the
 // backoff. redis.Nil counts as success because connectivity is fine. delay is
 // the retry delay the caller is about to wait, used only in the failure log.
+//
+// It deliberately does NOT clear a pending group recovery: any Redis operation
+// can succeed while the consumer group is still missing (a reclaim tick, a
+// metrics sample, or a read issued before the loss was observed). Only a
+// successful normal XREADGROUP issued after the loss clears that state (see
+// noteConsumeSuccess), so a concurrent stale success cannot mask a NOGROUP.
 func (c *Consumer) noteOutcome(err error, delay time.Duration) {
 	if err != nil && !errors.Is(err, redis.Nil) {
 		if c.healthy.Swap(false) {
@@ -339,11 +385,49 @@ func (c *Consumer) noteOutcome(err error, delay time.Duration) {
 		}
 		return
 	}
-	// Success (or redis.Nil): mark healthy and reset backoff on the transition.
 	if !c.healthy.Swap(true) {
 		c.log.Info("Redis connection recovered")
 	}
 	c.backoff.reset()
+}
+
+// noteConsumeSuccess records one successful normal XREADGROUP (a read or its
+// blocking timeout). gen and epoch are the local group generation and recovery
+// epoch captured immediately before the command was issued.
+//
+// A success clears the recovering state only when the command was issued under
+// the CURRENT generation and epoch: a read that started before a NOGROUP was
+// observed (or before a recreation completed) is stale and cannot prove the
+// missing group is back. The check is repeated under recoveryMu, which also
+// serializes it against recoverConsumerGroup, so a recovery that advances the
+// generation while this call is waiting cannot be masked. Only this confirmed
+// normal-consumption success resets the recovery pacing: reclaim and metrics
+// successes never do.
+func (c *Consumer) noteConsumeSuccess(gen, epoch uint64) {
+	if !c.healthy.Swap(true) {
+		c.log.Info("Redis connection recovered")
+	}
+	c.backoff.reset()
+
+	if !c.recovering.Load() {
+		return
+	}
+	if gen != c.groupGeneration() || epoch != c.recoveryEpoch.Load() {
+		return
+	}
+	c.recoveryMu.Lock()
+	defer c.recoveryMu.Unlock()
+	if !c.recovering.Load() ||
+		gen != c.groupGeneration() ||
+		epoch != c.recoveryEpoch.Load() {
+		return
+	}
+	c.recovering.Store(false)
+	c.recoveryStreak = 0
+	c.recoveryBackoff.reset()
+	c.log.Info("Redis: consumer group recovery confirmed; consumption resumed",
+		"stream", c.stream,
+		"group", c.group)
 }
 
 // recordRedisReadError increments the Redis read-error counter for a genuine
@@ -587,6 +671,31 @@ Drain:
 			continue
 		}
 
+		// Capture the generation and recovery epoch BEFORE issuing the read: the
+		// result belongs to the group state that existed when the command was
+		// issued, so it can neither confirm a recovery nor ACK a delivery after a
+		// concurrent recreation.
+		gen := c.groupGeneration()
+		epoch := c.recoveryEpoch.Load()
+		groupToken, tokenErr := readGroupGeneration(ctx, c.client, c.stream, c.group)
+		if tokenErr != nil {
+			if errors.Is(tokenErr, context.Canceled) || errors.Is(tokenErr, context.DeadlineExceeded) {
+				break
+			}
+			if handled, wait := c.handleGroupLoss(ctx, metrics.RedisOpReadGroup, gen, tokenErr); handled {
+				if !waitContext(ctx, wait) {
+					break
+				}
+				continue
+			}
+			recordRedisReadError(c.metrics, metrics.RedisOpReadGroup, tokenErr)
+			delay := c.backoff.next()
+			c.noteOutcome(tokenErr, delay)
+			if !waitContext(ctx, delay) {
+				break
+			}
+			continue
+		}
 		streams, err := c.client.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    c.group,
 			Consumer: c.consumer,
@@ -598,10 +707,19 @@ Drain:
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				break
 			}
+			// Only NOGROUP triggers recreation; every other failure keeps the
+			// existing health/backoff behavior below.
+			if handled, wait := c.handleGroupLoss(ctx, metrics.RedisOpReadGroup, gen, err); handled {
+				if !waitContext(ctx, wait) {
+					break
+				}
+				continue
+			}
 			recordRedisReadError(c.metrics, metrics.RedisOpReadGroup, err)
 			if errors.Is(err, redis.Nil) {
-				// Block timed out with no messages; connectivity is fine.
-				c.noteOutcome(nil, 0)
+				// Block timed out with no messages; the command reached the server
+				// and the group exists, so normal consumption has resumed.
+				c.noteConsumeSuccess(gen, epoch)
 				continue
 			}
 			// A transient Redis failure (restart, flaky network) should not kill the
@@ -610,15 +728,17 @@ Drain:
 			// interrupts a pending retry promptly.
 			delay := c.backoff.next()
 			c.noteOutcome(err, delay)
-			select {
-			case <-ctx.Done():
+			if !waitContext(ctx, delay) {
 				break
-			case <-time.After(delay):
 			}
 			continue
 		}
 
-		c.noteOutcome(nil, 0)
+		c.noteConsumeSuccess(gen, epoch)
+		// Bind the generation captured before this read to every message in the
+		// batch, so a completion that crosses a later group recreation cannot
+		// ACK an entry the recreated group may not have delivered yet.
+		deliveryCtx := withDeliveryGroupGeneration(withDeliveryGeneration(ctx, gen), groupToken)
 		for _, stream := range streams {
 			for _, msg := range stream.Messages {
 				// Acquire a slot synchronously. The batch was sized to the free
@@ -647,7 +767,7 @@ Drain:
 					}()
 					defer c.buffer.release()
 					// A message read fresh from XREADGROUP is on its first delivery.
-					c.processMessage(ctx, m, 1, handler)
+					c.processMessage(deliveryCtx, m, 1, handler)
 				}(msg)
 			}
 		}
@@ -660,8 +780,4 @@ Drain:
 	// the existing stop-and-join-before-return shutdown contract.
 	inflight.Wait()
 	return nil
-}
-
-func isBusyGroup(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "BUSYGROUP")
 }

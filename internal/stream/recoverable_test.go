@@ -69,7 +69,7 @@ func TestProcessScheduleMessageMakeRecoverableFailureLeavesPending(t *testing.T)
 	// Direct call: the pending outcome and non-nil error are what stop the
 	// caller from ACKing or dead-lettering. rawValue is the transport value a
 	// live delivery passes; a direct caller may pass "".
-	outcome, err := c.processScheduleMessage(context.Background(), "9-0", 1, occ, "")
+	outcome, err := c.processScheduleMessage(context.Background(), "9-0", 1, c.groupGeneration(), occ, "")
 	if outcome != "pending" {
 		t.Fatalf("processScheduleMessage outcome = %q, want pending", outcome)
 	}

@@ -198,7 +198,7 @@ func (e *scheduleEnv) cleanup() {
 		}
 	}
 	cctx := context.Background()
-	_ = e.client.Del(cctx, e.stream).Err()
+	_ = e.client.Del(cctx, e.stream, "relay:stream-group-generation:"+e.stream+":"+e.group).Err()
 	// Best-effort removal of this env's invocation-state keys. The stream/group
 	// names contain no ':' or '%', so percent-encoding is identity for them and a
 	// direct prefix scan is safe and bounded to this env.

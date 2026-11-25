@@ -33,7 +33,7 @@ func routeToDLQForOne(t *testing.T, c *Consumer, msgID, app, handler string, att
 	c.routeToDLQ(context.Background(), redis.XMessage{ID: msgID, Values: map[string]any{"value": `{"a":1}`}},
 		&HandlerExhaustedError{Invocations: []ExhaustedInvocation{
 			{App: app, Handler: handler, Attempts: attempts, Err: ErrInvocationExhausted},
-		}}, 1, []byte(`{"a":1}`))
+		}}, 1, c.groupGeneration(), []byte(`{"a":1}`))
 }
 
 // TestIntegrationDLQRefusesStaleOrMissingClaimPinsNoRowNoACK pins the claim

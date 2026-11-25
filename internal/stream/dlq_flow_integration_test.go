@@ -316,8 +316,8 @@ func TestIntegrationDLQPlaceholderPersistedBeforeACK(t *testing.T) {
 
 	// Redelivery on a fresh consumer: the placeholder row already exists, so no
 	// second row is written and the message is ACKed (and the delivery settled).
-	// A malformed message is stateless (it never owned invocation state), so the
-	// ACK creates no hash: only the message leaving the PEL is observable.
+	// The tracked ACK retains terminal state and its receipt for settlement
+	// reconciliation, despite the malformed message having no invocation fields.
 	redeliverCli := auxRedisClient(t, inspect)
 	rc := NewConsumer(ConsumerConfig{
 		Client:   redeliverCli,
@@ -338,8 +338,11 @@ func TestIntegrationDLQPlaceholderPersistedBeforeACK(t *testing.T) {
 	if pendingForClient(t, inspect, e.stream, e.group, id) {
 		t.Fatalf("message %s should be acked on the idempotent redelivery", id)
 	}
-	if exists, err := inspect.Exists(context.Background(), key).Result(); err != nil || exists != 0 {
-		t.Fatalf("a stateless malformed message must not create invocation state (exists=%d err=%v)", exists, err)
+	if terminal, err := inspect.HGet(context.Background(), key, terminalField).Result(); err != nil || terminal != "1" {
+		t.Fatalf("placeholder terminal marker = (%q, %v), want \"1\"", terminal, err)
+	}
+	if receipt, err := inspect.HGet(context.Background(), key, ackReceiptField).Result(); err != nil || receipt != "1" {
+		t.Fatalf("placeholder ACK receipt = (%q, %v), want \"1\"", receipt, err)
 	}
 }
 

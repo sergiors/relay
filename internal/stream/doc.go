@@ -1,14 +1,31 @@
 // Package stream owns Redis Stream consumption and recovery.
 //
 // This package manages the consumer-group lifecycle and message delivery:
-//   - Group creation: XGROUP CREATE with MKSTREAM, tolerating BUSYGROUP, via the
-//     package-level EnsureGroup (Consumer.EnsureGroup delegates to it). The
+//   - Group creation: XGROUP CREATE with MKSTREAM and an opaque Redis
+//     stream/group generation token are updated atomically, tolerating
+//     BUSYGROUP without rotating the token, via the package-level EnsureGroup
+//     (Consumer.EnsureGroup delegates to it). The
 //     worker runs it as the FIRST step of its external-dependency preflight,
 //     before any app is loaded or fingerprinted and before the state DB and
 //     runtime workload initialization (the Redis client and tracing already
 //     exist; the Docker manager is opened afterwards, see internal/worker), so a
-//     Redis stream/group problem short-circuits startup; the group is not
-//     created lazily right before Consume. An embedder uses it before Consume.
+//     Redis stream/group problem short-circuits startup; the startup bootstrap
+//     is not deferred until just before Consume. An embedder uses it before
+//     Consume. A group lost later is repaired on demand (next bullet).
+//   - Group loss: a confirmed NOGROUP on XREADGROUP/XAUTOCLAIM/XPENDING or the
+//     ACK script triggers the same XGROUP CREATE ... 0 MKSTREAM recovery, with
+//     BUSYGROUP treated as success. Only NOGROUP does; generic outages keep the
+//     existing backoff and never recreate a group that was not lost. There is
+//     no distributed lock: each process repairs its own view. A recovery
+//     replays the stream backlog from ID 0, so deliveries read under the old
+//     group may run again (at least once). Each XREADGROUP/XAUTOCLAIM captures
+//     the shared token before issuing the command; the atomic ACK script checks
+//     it before terminal-state writes or XACK. This fences stale deliveries even
+//     when the same consumer name owns both the old and replayed PEL entry.
+//     The token is only a fencing generation, not a stream position,
+//     checkpoint, or lock. Missing token metadata is repaired only after
+//     confirming the existing group, never by resetting it. Readiness stays
+//     unhealthy until a normal XREADGROUP issued after the recovery succeeds.
 //   - Consumption: an XREADGROUP loop that hands each decoded event to a Handler
 //   - Envelope decoding: each entry carries its payload in `value`, with an
 //     optional `format=raw` marker; every other field is ignored. The
@@ -71,17 +88,27 @@
 //     untouched. The original is ACKed only after every required row is
 //     committed, so a PostgreSQL write failure leaves the message pending.
 //   - DLQ settlement: every row for one logical source delivery shares a
-//     delivery_id and starts UNSETTLED. Only after ackAndRetainTerminal succeeds
-//     does the stream mark that delivery settled. If the process crashes
-//     between the ACK and that update, a bounded worker reconciliation asks
-//     Redis whether the exact source stream/group/message is still pending and
-//     marks settled only once it is gone; Redis errors preserve the rows. Its
-//     bounded pages advance a delivery-ID cursor and wrap, so permanently
-//     pending rows cannot starve later deliveries. Admin removal and retention
-//     delete settled rows only. The payload is private JSONB;
-//     event/replay-payload/reason and broker diagnostic identity bytes are
-//     base64 inside it so arbitrary bytes (including NUL and invalid UTF-8)
-//     survive JSONB losslessly.
+//     delivery_id and starts UNSETTLED. Only after a settled ACK result does the
+//     stream mark that delivery settled. If the process crashes between the ACK
+//     and that update, a bounded worker reconciliation asks Redis for the exact
+//     source stream/group/message disposition in one atomic read: PENDING
+//     (still in the PEL), UNREAD (body exists and the group has not reached it),
+//     SETTLED (the group passed a body that still exists, or an ACK receipt
+//     proves a bodyless delivery was acknowledged), or UNKNOWN (body absent
+//     without an ACK receipt). Only SETTLED marks a row; PENDING, UNREAD,
+//     UNKNOWN, and every Redis error preserve it, so "not pending" is never
+//     mistaken for settlement. The receipt lives in the invocation-state hash
+//     for the configured retention window; if it expires before a bodyless
+//     delivery is reconciled, settlement remains unknown and the DLQ row stays
+//     unsettled rather than risking false cleanup. Its bounded pages advance
+//     a delivery-ID cursor and wrap, so permanently pending rows cannot starve
+//     later deliveries. Admin removal and retention delete settled rows only.
+//     Settlement is an advisory PostgreSQL mark, not an atomic cross-system
+//     claim: a group recreation immediately after a SETTLED observation can
+//     replay the source, which is at-least-once and re-inserts the same
+//     idempotent row. The payload is private JSONB; event/replay-payload/reason
+//     and broker diagnostic identity bytes are base64 inside it so arbitrary
+//     bytes (including NUL and invalid UTF-8) survive JSONB losslessly.
 //   - Invocation state: per-handler lifecycle is recorded in a Redis hash
 //     (relay:invocation:{stream}:{group}:{msgID}, field "<app>/<handler>" →
 //     "ok" when complete, "running:<deadline_ms>:<attempt>:<token>" while an
@@ -92,17 +119,19 @@
 //     already completed, are still
 //     within an active attempt deadline or retry backoff, or are exhausted; the
 //     message is acknowledged when all matching invocations are complete.
-//     While the message is recoverable the key is PERSISTENT (no TTL); only
-//     after a successful ACK (success, obsolete schedule, or DLQ) does the state
-//     switch to terminal retention (a reserved marker plus the configured
-//     invocation retention, REDIS_INVOCATION_RETENTION, default 48h) so a stale
-//     in-memory delivery can neither mutate
-//     nor resurrect it. The ACK and that retention switch are performed by ONE
-//     atomic Lua script (ackAndRetainTerminal), so a crash or error can never
-//     leave a hash whose message already left the PEL without a marker/TTL; a
-//     failed ACK stages only a persistent marker (no TTL), so a still-pending
-//     message's state never expires. A schedule occurrence additionally pins an
-//     immutable
+//     While the message is recoverable the key is PERSISTENT (no TTL). The ACK
+//     script (ackAndRetainTerminal) stages terminal state persistently before
+//     XACK, then applies the configured invocation retention
+//     (REDIS_INVOCATION_RETENTION, default 48h) after confirmed removal; this
+//     keeps a failed ACK from expiring state while pending. A replayed terminal
+//     hash is made persistent while its exact ID is in the PEL, then receives a
+//     fresh retention window after confirmed XACK. DLQ ACKs also retain a
+//     receipt in the same hash to prove settlement if the source body is later
+//     trimmed; ordinary stateless ACKs create no hash. An UNREAD entry after a
+//     group recreation, a PEL entry owned by another
+//     consumer, or an UNKNOWN bodyless entry without a receipt is never
+//     acknowledged: no terminal marker or TTL is written and the delivery stays
+//     replayable. A schedule occurrence additionally pins an immutable
 //     admission descriptor under the reserved "__schedule" field, atomically
 //     with its first successful claim (see ScheduleDescriptor and
 //     TryStartScheduled), so the handler/timeout/retries it was admitted under
@@ -207,6 +236,15 @@
 //   - A message is acknowledged only after the handler succeeds or every
 //     required DLQ row is committed to PostgreSQL (at-least-once, never
 //     exactly-once)
+//   - A lost consumer group (NOGROUP) is recreated at ID 0, so every entry
+//     still in the stream is replayed. This is a deliberate durability
+//     limitation: the PEL is lost with the group, handlers may run again, and
+//     an entry whose body was already trimmed cannot be recovered. Relay never
+//     recreates a group for a generic outage. Its shared generation-token fence
+//     prevents a completion that crosses a recreation from acknowledging a
+//     replayed PEL entry, even when the same consumer name owns both deliveries;
+//     per-invocation claim fencing separately prevents concurrent attempts for
+//     the same invocation.
 //   - A message whose invocation is protected (running on another replica or
 //     waiting out a retry backoff) is left pending, never acknowledged — this
 //     is what prevents the cross-replica ACK hazard where a reclaiming replica
@@ -228,6 +266,11 @@
 //   - A pending entry whose stream body no longer exists is data loss, not a
 //     success: it is counted as missing_payload_total, never run through a
 //     handler, and never turned into a fabricated payload or DLQ entry.
+//   - Source-stream retention is opt-in and only trims ACKED entries once the
+//     Relay consumer group and every other group have acknowledged them. Group
+//     existence and XTRIM ... ACKED are one atomic script; a missing Relay group
+//     skips the trim (it never trims without the group and never recreates it).
+//     When Redis does not support ACKED (pre-8.2), retention disables itself.
 //   - Transient Redis failures are logged and retried, never fatal
 //   - Redis outages are survived: the consume loop backs off with bounded,
 //     jittered exponential backoff (1s..30s cap) and the consumer exposes a
@@ -268,7 +311,8 @@
 // package-level EnsureGroup(ctx, client, stream, group) (the single
 // implementation Consumer.EnsureGroup delegates to); the worker runs the
 // package-level form as the first external-dependency preflight step before
-// Consume.
+// Consume. A later NOGROUP is repaired by the same implementation, without any
+// distributed coordination.
 //
 // The package knows nothing about matching or execution; it delegates each
 // decoded event to the caller's Handler. Schedule-occurrence messages are a

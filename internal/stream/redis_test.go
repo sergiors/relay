@@ -173,24 +173,9 @@ func TestPendingAgeInvalidInputs(t *testing.T) {
 	}
 }
 
-// TestIsBusyGroup pins the BUSYGROUP tolerance predicate used by EnsureGroup:
-// only an error whose text carries BUSYGROUP is tolerated; nil and unrelated
-// errors are not.
-func TestIsBusyGroup(t *testing.T) {
-	if isBusyGroup(nil) {
-		t.Error("isBusyGroup(nil) = true, want false")
-	}
-	if !isBusyGroup(errors.New("BUSYGROUP Consumer Group name already exists")) {
-		t.Error("isBusyGroup(BUSYGROUP error) = false, want true")
-	}
-	if isBusyGroup(errors.New("connection refused")) {
-		t.Error("isBusyGroup(unrelated error) = true, want false")
-	}
-}
-
-// fakeGroupCreator is the groupCreator seam: it records the exact arguments the
-// package-level EnsureGroup issues and returns a canned command result, so the
-// BUSYGROUP/MKSTREAM-at-0 semantics are unit-testable without Redis.
+// fakeGroupCreator records group bootstrap script inputs and returns a canned
+// outcome, so group creation and BUSYGROUP semantics are unit-testable without
+// Redis.
 type fakeGroupCreator struct {
 	stream, group, start string
 	calls                int
@@ -198,17 +183,24 @@ type fakeGroupCreator struct {
 	err error
 }
 
-func (f *fakeGroupCreator) XGroupCreateMkStream(_ context.Context, stream, group, start string) *redis.StatusCmd {
+func (f *fakeGroupCreator) Eval(_ context.Context, _ string, keys []string, args ...interface{}) *redis.Cmd {
 	f.calls++
-	f.stream, f.group, f.start = stream, group, start
-	return redis.NewStatusResult("OK", f.err)
+	f.stream = keys[0]
+	f.group, f.start = args[0].(string), "0"
+	if f.err != nil && strings.Contains(f.err.Error(), "BUSYGROUP") {
+		return redis.NewCmdResult("existing:preserved-token", nil)
+	}
+	if f.err != nil {
+		return redis.NewCmdResult("", f.err)
+	}
+	return redis.NewCmdResult("created:"+args[1].(string), nil)
 }
 
 // TestEnsureGroupBootstrapSemantics pins the single stream-level group bootstrap
 // that both Consumer.EnsureGroup and the worker's external-dependency preflight
-// delegate to: it issues XGROUP CREATE with MKSTREAM at position "0", tolerates
-// a BUSYGROUP (the group already exists) as success, and wraps any other error
-// with both the group and the stream named.
+// delegate to: it creates at position "0" with MKSTREAM and an atomic token,
+// preserves the token on BUSYGROUP, and wraps any other error with both the
+// group and the stream named.
 func TestEnsureGroupBootstrapSemantics(t *testing.T) {
 	t.Run("issues MKSTREAM at position 0", func(t *testing.T) {
 		f := &fakeGroupCreator{}
@@ -225,8 +217,12 @@ func TestEnsureGroupBootstrapSemantics(t *testing.T) {
 
 	t.Run("BUSYGROUP is tolerated", func(t *testing.T) {
 		f := &fakeGroupCreator{err: errors.New("BUSYGROUP Consumer Group name already exists")}
-		if err := EnsureGroup(context.Background(), f, "events", "workers"); err != nil {
+		outcome, token, err := ensureGroup(context.Background(), f, "events", "workers")
+		if err != nil {
 			t.Fatalf("EnsureGroup(BUSYGROUP) = %v, want nil", err)
+		}
+		if outcome != GroupAlreadyExists || token != "preserved-token" {
+			t.Fatalf("ensureGroup(BUSYGROUP) = (%v, %q), want existing and preserved token", outcome, token)
 		}
 	})
 
@@ -242,6 +238,32 @@ func TestEnsureGroupBootstrapSemantics(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestEnsureGroupRotatesTokenBeforeCreatingAbsentGroup(t *testing.T) {
+	checks := []struct {
+		name  string
+		token string
+	}{
+		{"stream type check", "local streamKind = redis.call('TYPE'"},
+		{"group lookup", "redis.pcall('XINFO', 'GROUPS'"},
+		{"existing-group branch", "if groupExists then"},
+		{"fresh token write", "redis.call('SET', KEYS[2], ARGV[2])"},
+		{"group creation", "redis.pcall('XGROUP', 'CREATE'"},
+	}
+	positions := make([]int, 0, len(checks))
+	for _, check := range checks {
+		position := strings.Index(ensureGroupScript, check.token)
+		if position < 0 {
+			t.Fatalf("ensureGroupScript is missing %s", check.name)
+		}
+		positions = append(positions, position)
+	}
+	for i := 1; i < len(positions); i++ {
+		if positions[i] <= positions[i-1] {
+			t.Fatalf("%s must follow %s in ensureGroupScript", checks[i].name, checks[i-1].name)
+		}
+	}
 }
 
 // TestBufferSemaphoreAcquireReleaseGauge pins the semaphore's capacity bound and

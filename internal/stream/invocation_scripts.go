@@ -499,20 +499,33 @@ redis.call('PERSIST', KEYS[1])
 return 1
 `)
 
-	// makeRecoverableScript clears any TTL from an existing invocation-state
-	// hash, making it persistent, but NEVER touches an already terminal-retained
-	// hash (its message left the PEL and its retention TTL must be preserved).
+	// makeRecoverableScript clears any TTL from an existing recoverable hash.
+	// For a terminal hash, it only clears the TTL when the exact message is
+	// currently in the PEL; a stale in-memory delivery cannot revive terminal
+	// retention after the PEL entry is gone.
 	// A missing key is a no-op. It is the legacy/pre-persistence migration hook:
 	// a hash written with the old fixed TTL becomes persistent as soon as its
 	// message is processed again.
 	//
-	// KEYS[1] = invocation-state hash;
-	// ARGV[1] = terminal marker field.
-	// Returns 1 when the key is now recoverable (persistent), 0 when it is
-	// terminal-retained or absent.
+	// KEYS[1] = invocation-state hash, KEYS[2] = stream;
+	// ARGV[1] = group, ARGV[2] = message ID, ARGV[3] = terminal marker field.
+	// Returns 1 when the key is now persistent, 0 when it is terminal-retained
+	// without a matching PEL entry or absent.
 	makeRecoverableScript = redis.NewScript(`
 if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
-if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then return 0 end
+if redis.call('HEXISTS', KEYS[1], ARGV[3]) == 1 then
+  local pending = redis.pcall('XPENDING', KEYS[2], ARGV[1], ARGV[2], ARGV[2], 1)
+  if type(pending) ~= 'table' then return redis.error_reply('makeRecoverable: pending lookup failed') end
+  if pending.err then
+    if string.find(pending.err, 'NOGROUP', 1, true) or string.find(pending.err, 'no such key', 1, true) then
+      return 0
+    end
+    return redis.error_reply('makeRecoverable: pending lookup failed')
+  end
+  if #pending == 0 or type(pending[1]) ~= 'table' or pending[1][1] ~= ARGV[2] then return 0 end
+  redis.call('PERSIST', KEYS[1])
+  return 1
+end
 redis.call('PERSIST', KEYS[1])
 return 1
 `)
@@ -560,53 +573,212 @@ return 1
 
 	// ackAndRetainTerminalScript atomically acknowledges a message AND switches
 	// its invocation-state hash to terminal retention in ONE script, so the
-	// post-XACK orphan window cannot exist: a crash or error can no
-	// longer leave a hash whose message already left the PEL without a terminal
-	// marker/TTL.
+	// post-XACK orphan window cannot exist: a crash or error can no longer leave
+	// a hash whose message already left the PEL without a terminal marker/TTL.
 	//
-	// Ordering is deliberate and PEL-safe:
+	// XACK=0 is NOT automatically success. A consumer group recreated at ID 0
+	// (after NOGROUP) loses its PEL, so a message read before the recreation is
+	// UNREAD in the new group: XACK returns 0 but the entry will be replayed.
+	// Treating that as acknowledged would retire a delivery that is still owed.
+	// The script therefore establishes the disposition atomically before it
+	// writes anything:
 	//
-	//   1. Validate everything that could fail AFTER the irreversible XACK:
-	//      parse the retention TTL and inspect the state key's type. A non-hash
-	//      state key is refused (an error reply) BEFORE any write or ACK, so a
-	//      wrong-type key leaves no partial effect and the caller leaves the
-	//      message pending.
-	//   2. When the hash exists and is not already terminal, stage the terminal
-	//      marker and PERSIST it (NO TTL) BEFORE the ACK. Staging before the ACK
-	//      is what makes a failed ACK safe: the marker is PERSISTENT, so a
-	//      still-pending message's state can never acquire (or keep) an expiring
-	//      TTL and expire out from under a redelivery; a redelivery merely
-	//      observes the terminal marker (its lifecycle transitions are inert) and
-	//      re-acks.
-	//   3. XACK. A returned count of 0 (the entry was already absent) is a
-	//      success, exactly like the former bare XAck whose .Err() ignored it.
-	//      XACK runs after the marker is staged, so even if XACK raises (e.g. a
-	//      wrong-type stream) the hash is left terminal-marked and persistent,
-	//      never an unmarked orphan and never expiring.
-	//   4. Apply the retention TTL ONLY now, after the ACK, and only when
-	//      retention is enabled (ttl > 0) and the hash HAS NO TTL already
-	//      (PTTL < 0). Never re-extend or shorten an existing retention TTL, so
-	//      repeated calls are monotonic; but a marker a previous failed ACK
-	//      staged without a TTL DOES get its window once the ACK finally
-	//      succeeds, so an interrupted terminal-ack cannot leave a permanent
-	//      leak either. The TTL can no longer land on a still-pending message,
-	//      and PTTL/PEXPIRE on the validated hash cannot error, so no command
-	//      after the ACK can fail and recreate an unmarked orphan.
+	//   1. Validate the retention TTL and the state key's type. A non-hash state
+	//      key is refused before any write or ACK.
+	//   2. Verify the stream key exists and is a stream, then locate the group
+	//      and its last-delivered ID. ONLY a confirmed missing stream/group is
+	//      returned as a NOGROUP error reply: a WRONGTYPE, ACL, protocol, or
+	//      other Redis failure remains a distinct generic error, so the Go
+	//      recovery path never recreates a group that was not lost.
+	//   3. Inspect the exact PEL entry (detail form gives its owner) and, when it
+	//      is not pending, whether the exact stream entry still exists and how the
+	//      group's last-delivered ID compares. IDs are compared component-wise by
+	//      digit length then lexicographically (canonical decimals), never as
+	//      whole strings or lossy numbers.
 	//
-	// KEYS[1] = invocation-state hash; KEYS[2] = stream.
+	// The disposition is one of:
+	//
+	//   settled — the entry is pending and owned by this consumer (a confirmed
+	//             XACK removes it), or the body exists and the group's
+	//             last-delivered ID proves it already passed, or an ACK receipt
+	//             proves a bodyless entry was acknowledged.
+	//   unread  — not pending, body exists, and last-delivered < msgID: the
+	//             recreated group has not delivered it yet. No write at all.
+	//   foreign — pending, but owned by another consumer: a reclaimed or other
+	//             node's live delivery. Never ACK someone else's pending entry.
+	//   unknown — not pending, the body is gone, and there is no ACK receipt:
+	//             the body may have been trimmed before delivery or its PEL may
+	//             have been purged by XAUTOCLAIM, so nothing is written.
+	//
+	// For a live PEL entry, stage existing terminal state persistently before
+	// XACK; a failed XACK must leave no expiring terminal state. Once XACK
+	// confirms removal, write a receipt when requested for DLQ settlement, or
+	// when replaying an already-terminal hash that lacks one. Ordinary stateless
+	// ACKs create no hash. A no-op settled call preserves a positive existing TTL.
+	//
+	// KEYS[1] = invocation-state hash; KEYS[2] = stream;
+	// KEYS[3] = stream/group generation token.
 	// ARGV[1] = group, ARGV[2] = message ID, ARGV[3] = terminal marker field,
-	// ARGV[4] = retention TTL ms (>0) or <=0 for disabled.
-	// Returns {removed, retained}: removed 1 when the message left the PEL (0
-	// when it was already absent), retained 1 when the hash existed and now
-	// carries the terminal marker.
+	// ARGV[4] = retention TTL ms (>0) or <=0 for disabled,
+	// ARGV[5] = this consumer's name ("" skips the PEL owner check),
+	// ARGV[6] = ACK receipt field, ARGV[7] = whether this ACK needs a receipt,
+	// ARGV[8] = generation token captured before the source read/claim.
+	// Returns {status, removed, retained}: status 0 settled, 1 unread, 2 foreign
+	// owner, 3 unknown, 4 stale generation; removed 1 when XACK removed a pending
+	// entry; retained 1 when the hash carries terminal state.
 	ackAndRetainTerminalScript = redis.NewScript(`
+local function parse_id(s)
+  if type(s) ~= 'string' then return nil end
+  local ms, seq = string.match(s, '^(%d+)%-(%d+)$')
+  if not ms then return nil end
+  return ms, seq
+end
+
+local function cmp_uint(a, b)
+  if #a ~= #b then
+    if #a < #b then return -1 end
+    return 1
+  end
+  if a == b then return 0 end
+  if a < b then return -1 end
+  return 1
+end
+
+-- Component-exact comparison of two canonical "<ms>-<seq>" stream IDs.
+local function cmp_id(a, b)
+  local am, as = parse_id(a)
+  local bm, bs = parse_id(b)
+  if not am or not bm then return nil end
+  local c = cmp_uint(am, bm)
+  if c ~= 0 then return c end
+  return cmp_uint(as, bs)
+end
+
+local function contains(s, needle)
+  if type(s) ~= 'string' then return false end
+  return string.find(s, needle, 1, true) ~= nil
+end
+
+-- A missing stream/group is the only condition that authorizes recovery. Other
+-- command errors (WRONGTYPE, ACL, protocol, transport-in-script) stay generic:
+-- treating them as NOGROUP would recreate a group that was never lost.
+local function missing_group(errstr)
+  return contains(errstr, 'NOGROUP') or contains(errstr, 'no such key')
+end
+
+local NOGROUP_ERR = 'NOGROUP no such stream or consumer group'
+local LOOKUP_ERR = 'ackAndRetainTerminal: group lookup failed'
+local MALFORMED_ERR = 'ackAndRetainTerminal: malformed group reply'
+local PENDING_ERR = 'ackAndRetainTerminal: pending lookup failed'
+local SOURCE_ERR = 'ackAndRetainTerminal: source lookup failed'
+local ID_ERR = 'ackAndRetainTerminal: unparseable stream id'
+
 local ttl = tonumber(ARGV[4])
 if ttl == nil then ttl = 0 end
+
+-- A same-name consumer can own both an old and replayed PEL entry after another
+-- process recreates the group, so check the shared generation before any write.
+local currentGeneration = redis.call('GET', KEYS[3])
+if not currentGeneration or currentGeneration ~= ARGV[8] then
+  return {4, 0, 0}
+end
 
 local kt = redis.call('TYPE', KEYS[1])
 local kind = kt['ok']
 if kind ~= 'none' and kind ~= 'hash' then
   return redis.error_reply('ackAndRetainTerminal: invocation-state key is not a hash')
+end
+
+local streamKind = redis.call('TYPE', KEYS[2])['ok']
+if streamKind == 'none' then
+  return redis.error_reply(NOGROUP_ERR)
+end
+if streamKind ~= 'stream' then
+  return redis.error_reply('ackAndRetainTerminal: stream key is not a stream')
+end
+
+local groups = redis.pcall('XINFO', 'GROUPS', KEYS[2])
+if type(groups) ~= 'table' then
+  return redis.error_reply(LOOKUP_ERR)
+end
+if groups.err then
+  if missing_group(groups.err) then return redis.error_reply(NOGROUP_ERR) end
+  return redis.error_reply(LOOKUP_ERR)
+end
+local lastDelivered = nil
+for _, g in ipairs(groups) do
+  if type(g) ~= 'table' then return redis.error_reply(MALFORMED_ERR) end
+  local name = nil
+  local ldid = nil
+  for i = 1, #g, 2 do
+    if g[i] == 'name' then name = g[i+1] end
+    if g[i] == 'last-delivered-id' then ldid = g[i+1] end
+  end
+  if name == ARGV[1] then
+    lastDelivered = ldid
+    break
+  end
+end
+if lastDelivered == nil then
+  return redis.error_reply(NOGROUP_ERR)
+end
+if type(lastDelivered) ~= 'string' then
+  return redis.error_reply(MALFORMED_ERR)
+end
+
+local pending = redis.pcall('XPENDING', KEYS[2], ARGV[1], ARGV[2], ARGV[2], 1)
+if type(pending) ~= 'table' then
+  return redis.error_reply(PENDING_ERR)
+end
+if pending.err then
+  if missing_group(pending.err) then return redis.error_reply(NOGROUP_ERR) end
+  return redis.error_reply(PENDING_ERR)
+end
+
+local status = 0
+local pendingOwner = nil
+if #pending > 0 then
+  local entry = pending[1]
+  if type(entry) ~= 'table' or type(entry[1]) ~= 'string' or type(entry[2]) ~= 'string' then
+    return redis.error_reply(PENDING_ERR)
+  end
+  if entry[1] ~= ARGV[2] then
+    return redis.error_reply(PENDING_ERR)
+  end
+  pendingOwner = entry[2]
+  if ARGV[5] ~= '' and pendingOwner ~= ARGV[5] then
+    status = 2
+  end
+else
+  local c = cmp_id(lastDelivered, ARGV[2])
+  if c == nil then
+    return redis.error_reply(ID_ERR)
+  end
+  local entries = redis.pcall('XRANGE', KEYS[2], ARGV[2], ARGV[2])
+  if type(entries) ~= 'table' then
+    return redis.error_reply(SOURCE_ERR)
+  end
+  if entries.err then
+    if missing_group(entries.err) then return redis.error_reply(NOGROUP_ERR) end
+    return redis.error_reply(SOURCE_ERR)
+  end
+  if #entries > 0 then
+    if c < 0 then
+      status = 1
+    end
+  else
+    local hasReceipt = false
+    if kind == 'hash' then
+      hasReceipt = redis.call('HGET', KEYS[1], ARGV[6]) == '1'
+    end
+    if not hasReceipt then
+      status = 3
+    end
+  end
+end
+
+if status ~= 0 then
+  return {status, 0, 0}
 end
 
 local hasHash = kind == 'hash'
@@ -615,17 +787,62 @@ if hasHash then
   alreadyTerminal = redis.call('HEXISTS', KEYS[1], ARGV[3]) == 1
 end
 
-if hasHash and not alreadyTerminal then
-  redis.call('HSET', KEYS[1], ARGV[3], '1')
-  redis.call('PERSIST', KEYS[1])
+local removed = 0
+local trackReceipt = ARGV[7] == '1'
+local hasReceipt = false
+if hasHash then
+  hasReceipt = redis.call('HGET', KEYS[1], ARGV[6]) == '1'
+end
+local writeReceipt = trackReceipt or (hasHash and alreadyTerminal and not hasReceipt)
+if pendingOwner ~= nil then
+  if hasHash then
+    if not alreadyTerminal then redis.call('HSET', KEYS[1], ARGV[3], '1') end
+    -- A terminal hash may arrive here with an old retention TTL from a prior
+    -- ACK. It is live in the PEL again, so make it persistent before XACK too.
+    redis.call('PERSIST', KEYS[1])
+  end
+  removed = redis.call('XACK', KEYS[2], ARGV[1], ARGV[2])
+
+  if removed == 1 then
+    if hasHash then
+      redis.call('HSET', KEYS[1], ARGV[3], '1')
+      if writeReceipt then redis.call('HSET', KEYS[1], ARGV[6], '1') end
+    elseif writeReceipt then
+      redis.call('HSET', KEYS[1], ARGV[3], '1', ARGV[6], '1')
+      hasHash = true
+    end
+    if hasHash then
+      if ttl > 0 then
+        redis.call('PEXPIRE', KEYS[1], ttl)
+      else
+        redis.call('PERSIST', KEYS[1])
+      end
+    end
+  end
+else
+  if not hasHash and writeReceipt then
+    redis.call('HSET', KEYS[1], ARGV[3], '1', ARGV[6], '1')
+    hasHash = true
+  elseif hasHash then
+    if not alreadyTerminal then
+      redis.call('HSET', KEYS[1], ARGV[3], '1')
+      redis.call('PERSIST', KEYS[1])
+    end
+    if writeReceipt and not hasReceipt then
+      redis.call('HSET', KEYS[1], ARGV[6], '1')
+    end
+  end
+  if hasHash then
+    if ttl > 0 then
+      if redis.call('PTTL', KEYS[1]) < 0 then
+        redis.call('PEXPIRE', KEYS[1], ttl)
+      end
+    else
+      redis.call('PERSIST', KEYS[1])
+    end
+  end
 end
 
-local removed = redis.call('XACK', KEYS[2], ARGV[1], ARGV[2])
-
-if hasHash and ttl > 0 and redis.call('PTTL', KEYS[1]) < 0 then
-  redis.call('PEXPIRE', KEYS[1], ttl)
-end
-
-return {removed, hasHash and 1 or 0}
+return {0, removed, hasHash and 1 or 0}
 `)
 )

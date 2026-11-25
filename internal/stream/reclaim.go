@@ -40,6 +40,7 @@ func (c *Consumer) reclaimLoop(ctx context.Context, handler Handler) {
 // concurrently and a backoff is honored. MinPendingIdle remains a message-level
 // recovery-pacing backstop; it never defines retry timing.
 func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
+	gen := c.groupGeneration()
 	pending, err := c.client.XPendingExt(ctx, &redis.XPendingExtArgs{
 		Stream: c.stream,
 		Group:  c.group,
@@ -49,6 +50,12 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 		Count:  c.count,
 	}).Result()
 	if err != nil {
+		if handled, wait := c.handleGroupLoss(ctx, metrics.RedisOpPending, gen, err); handled {
+			// The ticker paces the retry; waiting here only bounds a recovery
+			// attempt, so the reclaim goroutine is never blocked beyond it.
+			_ = waitContext(ctx, wait)
+			return
+		}
 		// The recovery loop is paced by its own ticker, so it only feeds the
 		// health state (transition-log + mark unhealthy) and does not run a
 		// second backoff mechanism.
@@ -78,6 +85,16 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 		if ctx.Err() != nil {
 			return
 		}
+		gen := c.groupGeneration()
+		groupToken, tokenErr := readGroupGeneration(ctx, c.client, c.stream, c.group)
+		if tokenErr != nil {
+			if handled, _ := c.handleGroupLoss(ctx, metrics.RedisOpAutoclaim, gen, tokenErr); handled {
+				return
+			}
+			recordRedisReadError(c.metrics, metrics.RedisOpAutoclaim, tokenErr)
+			c.noteOutcome(tokenErr, c.backoff.peek())
+			return
+		}
 		msgs, next, deletedIDs, err := c.client.XAutoClaimWithDeleted(ctx, &redis.XAutoClaimArgs{
 			Stream:   c.stream,
 			Group:    c.group,
@@ -87,15 +104,26 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 			Count:    c.count,
 		}).Result()
 		if err != nil {
+			if handled, _ := c.handleGroupLoss(ctx, metrics.RedisOpAutoclaim, gen, err); handled {
+				// The group was recreated; the XAUTOCLAIM cursor belongs to the
+				// vanished group, so stop this tick and start a fresh scan on the
+				// next one.
+				return
+			}
 			recordRedisReadError(c.metrics, metrics.RedisOpAutoclaim, err)
 			c.noteOutcome(err, c.backoff.peek())
 			return
 		}
+		// Bind the generation captured before XAUTOCLAIM to the claimed batch: a
+		// group recreation between the claim and completion must leave these
+		// deliveries pending rather than acknowledging entries the recreated
+		// group has not delivered.
+		deliveryCtx := withDeliveryGroupGeneration(withDeliveryGeneration(ctx, gen), groupToken)
 		// The server already purged these dangling PEL references as part of the
 		// scan; there is nothing to ack. Surface each as missing-payload data
 		// loss (no handler, no retry, no DLQ) exactly like the nil-values path.
 		for _, id := range deletedIDs {
-			c.clearMissingValueEntry(ctx, redis.XMessage{ID: id}, missingPayloadUnknownDeliveries, false)
+			c.clearMissingValueEntry(deliveryCtx, redis.XMessage{ID: id}, missingPayloadUnknownDeliveries, false)
 		}
 		for _, msg := range msgs {
 			// A pending entry whose stream body is already gone (trimmed or
@@ -110,7 +138,7 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 				if pe, ok := byID[msg.ID]; ok {
 					deliveries = pe.RetryCount
 				}
-				c.clearMissingValueEntry(ctx, msg, deliveries, true)
+				c.clearMissingValueEntry(deliveryCtx, msg, deliveries, true)
 				continue
 			}
 			pe, ok := byID[msg.ID]
@@ -122,9 +150,15 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 				// accounting is never fabricated. On failure, skip this tick
 				// (leave pending; retried next tick) rather than fabricating
 				// attempt 1.
+				gen := c.groupGeneration()
 				entries, err := c.client.XPendingExt(ctx, &redis.XPendingExtArgs{
 					Stream: c.stream, Group: c.group, Start: msg.ID, End: msg.ID, Count: 1,
 				}).Result()
+				if err != nil {
+					if handled, _ := c.handleGroupLoss(ctx, metrics.RedisOpPending, gen, err); handled {
+						return
+					}
+				}
 				if err != nil || len(entries) == 0 {
 					recordRedisReadError(c.metrics, metrics.RedisOpPending, err)
 					c.log.Debug("Message: beyond reclaim window and pending lookup failed; skipping this tick",
@@ -139,7 +173,7 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 				"idle", pe.Idle,
 				"delivery_attempt", pe.RetryCount,
 			)
-			c.deliverClaimed(ctx, msg, pe.RetryCount, handler)
+			c.deliverClaimed(deliveryCtx, msg, pe.RetryCount, handler)
 		}
 		if len(msgs) == 0 || next == "0-0" {
 			break
@@ -172,16 +206,21 @@ const missingPayloadUnknownDeliveries = int64(-1)
 // (missingPayloadUnknownDeliveries otherwise), reported for diagnosis only; it
 // is never converted into a handler attempt.
 //
-// Invocation state: once the dangling PEL reference is gone (ACKed here, or
-// already purged by the server during the scan) the message is no longer
-// recoverable, so its state hash is switched to terminal retention. Without
-// that, a persistent hash written for a body-less invocation would leak forever.
-// When ack is true the ACK and the retention happen in ONE atomic script
-// (ackAndRetainTerminal): a failed ACK leaves the marker PERSISTENT (no TTL), so
-// the entry stays pending/recoverable and nothing expires — a leak is safer than
-// dropping state a redelivery might still need. When ack is false there is no ACK
-// to run, so the server-purged reference is retained via the non-XACK
-// retainTerminal path.
+// Invocation state: once the dangling PEL reference is confirmed gone (ACKed
+// here as settled, or already purged by the server during the scan) the message
+// is no longer recoverable, so its state hash is switched to terminal
+// retention. Without that, a persistent hash written for a body-less invocation
+// would leak forever. When ack is true the ACK and the retention happen in ONE
+// atomic script (ackAndRetainTerminal): a failed ACK leaves the marker
+// PERSISTENT (no TTL), so the entry stays pending/recoverable and nothing
+// expires — a leak is safer than dropping state a redelivery might still need.
+// A non-settled ACK result (unread after a group recreation, a foreign PEL
+// owner, or unknown because the body is gone with no proof the group passed
+// the ID) writes no terminal state, so a still-replayable delivery cannot lose
+// its state to a TTL. The unknown case may therefore leave a persistent hash
+// that will never resolve; that leak is the accepted cost of never treating
+// missing data as success. When ack is false there is no ACK to run, so the
+// server-purged reference is retained via the non-XACK retainTerminal path.
 func (c *Consumer) clearMissingValueEntry(ctx context.Context, msg redis.XMessage, deliveries int64, ack bool) {
 	c.metrics.Inc(metrics.MetricMissingPayload)
 	attrs := []any{
@@ -194,14 +233,25 @@ func (c *Consumer) clearMissingValueEntry(ctx context.Context, msg redis.XMessag
 	c.log.Warn("Message: pending entry has no stream body (trimmed or deleted); not processed", attrs...)
 	if ack {
 		// Acknowledge the dangling PEL reference AND switch the invocation state
-		// to terminal retention in ONE atomic script: the ACK and the
-		// retention can no longer be split by a crash or error, and a failed ACK
-		// can never leave an expiring TTL on still-pending state (the script
-		// stages only a persistent marker before the XACK). On failure nothing is
-		// guaranteed, so the entry is left pending/recoverable for a later pass.
-		if _, err := c.invStateStore.ackAndRetainTerminal(ctx, c.stream, c.group, msg.ID, c.invocationRetention); err != nil {
-			c.log.Warn("Message: ack missing-value entry failed", "message_id", msg.ID, "error", err)
+		// to terminal retention in ONE atomic script. The ACK goes through the
+		// same generation fence and NOGROUP recovery as every other ACK path; a
+		// failed ACK leaves the entry pending/recoverable for a later pass.
+		deliveryGen, captured := deliveryGeneration(ctx)
+		if !captured {
+			deliveryGen = c.groupGeneration()
+		}
+		result, err := c.ackDelivery(ctx, msg.ID, deliveryGen, true)
+		if err != nil {
+			c.handleAckFailure(ctx, deliveryGen, msg.ID, err)
 			return
+		}
+		if !result.Settled {
+			// The reference is not ours to retire (unread after a recreation, or
+			// pending under another consumer). Preserve terminal state so a TTL
+			// cannot expire it before the delivery is actually resolved.
+			c.log.Debug("Message: missing-value delivery not settled; leaving state recoverable",
+				"message_id", msg.ID,
+				"disposition", result.Disposition)
 		}
 		return
 	}

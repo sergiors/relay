@@ -31,7 +31,7 @@ func TestIntegrationDeliveryInspectorPendingSemantics(t *testing.T) {
 	if err := EnsureGroup(ctx, cli, streamName, group); err != nil {
 		t.Fatalf("ensure group: %v", err)
 	}
-	t.Cleanup(func() { _ = cli.Del(ctx, streamName).Err() })
+	t.Cleanup(func() { cleanupEnvRedisKeys(ctx, cli, streamName, group) })
 
 	inspector := NewDeliveryInspector(cli)
 	add := func() string {

@@ -82,6 +82,11 @@ are intentionally skipped. Catch-up and publication retries use the same
 deduplication, so they do not create a second entry for an occurrence already
 published.
 
+Schedule execution shares the event consumer group. If that group or the
+stream is lost, Relay recreates it and replays occurrences still present, so an
+occurrence can execute again (at least once); an occurrence whose stream entry
+was already trimmed cannot be recovered.
+
 Schedule firing pauses if PostgreSQL is unavailable and resumes when it
 recovers. This does not stop event consumption or make the worker unready.
 PostgreSQL is required when the worker starts. See

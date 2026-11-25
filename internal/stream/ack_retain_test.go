@@ -28,7 +28,7 @@ func TestProductionAckUsesAtomicAckAndRetain(t *testing.T) {
 		store := newFakeInvocationStore(nil)
 		c := processMessageConsumer(store)
 		msg := redis.XMessage{ID: "1-0", Values: map[string]any{"value": `{"event_name":"X"}`}}
-		c.processMessage(context.Background(), msg, 1, func(context.Context, string, map[string]any) error {
+		c.processMessage(processMessageContext(c), msg, 1, func(context.Context, string, map[string]any) error {
 			return nil
 		})
 		assertAtomicAckOnly(t, store)
@@ -38,7 +38,7 @@ func TestProductionAckUsesAtomicAckAndRetain(t *testing.T) {
 		store := newFakeInvocationStore(nil)
 		c := processMessageConsumer(store)
 		msg := redis.XMessage{ID: "1-0", Values: map[string]any{"value": `{"event_name":"X"}`}}
-		c.processMessage(context.Background(), msg, 1, func(ctx context.Context, _ string, _ map[string]any) error {
+		c.processMessage(processMessageContext(c), msg, 1, func(ctx context.Context, _ string, _ map[string]any) error {
 			p, ok := InvocationStateFrom(ctx)
 			if !ok {
 				return errors.New("no invocation state in ctx")
@@ -74,7 +74,7 @@ func TestProductionAckUsesAtomicAckAndRetain(t *testing.T) {
 		store := newFakeInvocationStore(nil)
 		c := processMessageConsumer(store)
 		msg := redis.XMessage{ID: "1-0", Values: map[string]any{"not_event": "x"}}
-		c.processMessage(context.Background(), msg, 1, func(context.Context, string, map[string]any) error {
+		c.processMessage(processMessageContext(c), msg, 1, func(context.Context, string, map[string]any) error {
 			return nil
 		})
 		assertAtomicAckOnly(t, store)
@@ -84,7 +84,7 @@ func TestProductionAckUsesAtomicAckAndRetain(t *testing.T) {
 		store := newFakeInvocationStore(nil)
 		c := processMessageConsumer(store)
 		// A body-less message takes the missing-payload branch with ack=true.
-		c.processMessage(context.Background(), redis.XMessage{ID: "1-0"}, 1,
+		c.processMessage(processMessageContext(c), redis.XMessage{ID: "1-0"}, 1,
 			func(context.Context, string, map[string]any) error { return nil })
 		assertAtomicAckOnly(t, store)
 	})
@@ -97,7 +97,7 @@ func TestProductionAckUsesAtomicAckAndRetain(t *testing.T) {
 		msg := redis.XMessage{ID: "1-0", Values: map[string]any{
 			"value": "default",
 		}}
-		c.processMessage(context.Background(), msg, 1, func(context.Context, string, map[string]any) error {
+		c.processMessage(processMessageContext(c), msg, 1, func(context.Context, string, map[string]any) error {
 			return nil
 		})
 		assertAtomicAckOnly(t, store)
@@ -108,7 +108,7 @@ func TestProductionAckUsesAtomicAckAndRetain(t *testing.T) {
 		c := processMessageConsumer(store)
 		c.scheduleRunner = func(context.Context, string, schedule.Occurrence, []byte) error { return nil }
 		msg := scheduleMessage(t)
-		c.processMessage(context.Background(), msg, 1, func(context.Context, string, map[string]any) error {
+		c.processMessage(processMessageContext(c), msg, 1, func(context.Context, string, map[string]any) error {
 			return nil
 		})
 		assertAtomicAckOnly(t, store)
@@ -121,11 +121,25 @@ func TestProductionAckUsesAtomicAckAndRetain(t *testing.T) {
 			return fmt.Errorf("%w: schedule removed", ErrInvocationObsolete)
 		}
 		msg := scheduleMessage(t)
-		c.processMessage(context.Background(), msg, 1, func(context.Context, string, map[string]any) error {
+		c.processMessage(processMessageContext(c), msg, 1, func(context.Context, string, map[string]any) error {
 			return nil
 		})
 		assertAtomicAckOnly(t, store)
 	})
+}
+
+func TestDirectAckWithoutCapturedGenerationUsesStoreSeam(t *testing.T) {
+	store := newFakeInvocationStore(nil)
+	c := processMessageConsumer(store)
+	ctx := withDeliveryGeneration(context.Background(), c.groupGeneration())
+
+	result, err := c.ackDelivery(ctx, "1-0", c.groupGeneration(), false)
+	if err != nil {
+		t.Fatalf("ackDelivery without captured shared generation: %v", err)
+	}
+	if !result.Settled || store.ackRetainCalls != 1 {
+		t.Fatalf("ack result/store calls = (%+v, %d), want settled and one store call", result, store.ackRetainCalls)
+	}
 }
 
 // TestMissingPayloadPurgedReferenceUsesRetainOnly pins the one production path

@@ -155,6 +155,15 @@ crash, so handlers that cause side effects should be idempotent. Relay
 acknowledges a message only after every matched invocation is terminal: it
 succeeded or was dead-lettered after exhausting its retry budget.
 
+If the Redis consumer group is lost, Relay recreates it at ID 0 when it next
+observes the loss and replays the entries still present in the stream. The lost
+pending list cannot be recovered, so messages Relay had already read can run
+again, and an entry whose body was already trimmed cannot be recovered at all.
+Relay reports itself not ready while that recovery is outstanding and resumes
+only after normal consumption succeeds. See
+[Operations](operations.md#redis-recovery-and-reliability) for the operational
+details.
+
 `retries` is the number of additional attempts (default `4`, maximum `100`).
 Backoff is fixed at 1m, 2m, 5m, then 10m for later retries. Events remain
 pending while an app is unavailable, a handler is running or in backoff, or
@@ -175,8 +184,10 @@ body after Redis has delivered it; it does not limit Redis entry overhead. See
 
 Relay stores dead letters durably in PostgreSQL before acknowledging their
 source message. A row is written per exhausted invocation. Malformed and
-oversized messages cannot be replayed. Rows remain unsettled until the source
-ACK is confirmed, and only settled rows can be removed or expired.
+oversized messages cannot be replayed. Rows remain unsettled until Redis proves
+the source delivery is settled; a source that is still pending, unread after a
+group recreation, or unknown (its entry is gone with no proof it was delivered)
+keeps the row. Only settled rows can be removed or expired.
 
 Inspection preserves the original Redis `value`. Replay uses the logical handler
 input: normalized Debezium event, unchanged raw event, or schedule handler

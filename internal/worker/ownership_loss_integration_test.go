@@ -326,5 +326,10 @@ export async function slow(event, context) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("consumer B did not stop")
 	}
-	_ = env.client.Del(context.Background(), streamName, invKey).Err()
+	_ = env.client.Del(
+		context.Background(),
+		streamName,
+		"relay:stream-group-generation:"+streamName+":"+groupName,
+		invKey,
+	).Err()
 }

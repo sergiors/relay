@@ -26,6 +26,15 @@ type consumerHealth interface {
 	Healthy() bool
 }
 
+// consumerReadinessReason is the OPTIONAL live-consumer capability that reports
+// a fixed, low-cardinality reason for a not-ready consumer, so a readiness
+// response can distinguish a consumer-group recovery from a generic Redis
+// outage. It is optional so existing narrow test probes stay valid;
+// *stream.Consumer implements it.
+type consumerReadinessReason interface {
+	ReadinessReason() (bool, string)
+}
+
 // dockerReadinessProbe is the narrow runtime-manager view the readiness probe
 // needs: a bounded Docker daemon ping and verification that every configured
 // NETWORKS network still exists and remains workload-safe (not missing, not
@@ -49,8 +58,9 @@ type controlNetworkReadiness interface {
 
 // The production seams must satisfy the readiness probe's narrow views.
 var (
-	_ consumerHealth       = (*stream.Consumer)(nil)
-	_ dockerReadinessProbe = (*runtime.Manager)(nil)
+	_ consumerHealth          = (*stream.Consumer)(nil)
+	_ consumerReadinessReason = (*stream.Consumer)(nil)
+	_ dockerReadinessProbe    = (*runtime.Manager)(nil)
 )
 
 // readiness owns the worker's process-lifetime ready flag plus the live
@@ -226,7 +236,15 @@ func probeReadiness(
 		return false, "redis consumer unavailable"
 	}
 	if !consumer.Healthy() {
-		return false, "redis consumer unhealthy"
+		if reason, ok := consumer.(consumerReadinessReason); ok {
+			if healthy, why := reason.ReadinessReason(); !healthy {
+				return false, why
+			}
+			// The consumer recovered between the two in-process reads; continue
+			// with the remaining dependency checks.
+		} else {
+			return false, "redis consumer unhealthy"
+		}
 	}
 	if manager == nil {
 		return false, "docker manager unavailable"

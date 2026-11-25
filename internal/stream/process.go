@@ -60,6 +60,16 @@ func (c *Consumer) processMessage(
 	defer func() { finishMessageSpan(span, outcome, spanErr) }()
 	ctx = spanCtx
 
+	// The group generation this delivery belongs to is captured by the read or
+	// reclaim that produced the message, BEFORE concurrent group recreation. A
+	// direct caller (a test or an embedder invoking processMessage itself) has
+	// no generation in its context, so it uses the current one: there is no
+	// earlier read to fence against.
+	deliveryGen, captured := deliveryGeneration(ctx)
+	if !captured {
+		deliveryGen = c.groupGeneration()
+	}
+
 	// Register the panic boundary before any handler work so a panic in the
 	// handler handoff (or in extractAndDecodeEnvelope, which is pure JSON
 	// parsing and practically cannot panic) is caught. The delivery is treated
@@ -112,7 +122,7 @@ func (c *Consumer) processMessage(
 				"error", err,
 			)
 			outcome, spanErr = "dlq", err
-			c.routeToDLQ(ctx, msg, err, deliveryNum, nil)
+			c.routeToDLQ(ctx, msg, err, deliveryNum, deliveryGen, nil)
 			return
 		}
 		// A malformed message can never succeed, so it goes straight to the DLQ on
@@ -123,7 +133,7 @@ func (c *Consumer) processMessage(
 			"error", err,
 		)
 		outcome, spanErr = "dlq", err
-		c.routeToDLQ(ctx, msg, err, deliveryNum, nil)
+		c.routeToDLQ(ctx, msg, err, deliveryNum, deliveryGen, nil)
 		return
 	}
 
@@ -137,10 +147,18 @@ func (c *Consumer) processMessage(
 			"message_id", msg.ID,
 			"delivery_attempt", deliveryNum,
 		)
-		if err := c.acknowledgeMessage(ctx, msg.ID); err != nil {
-			c.log.Warn("Message: ack failed", "message_id", msg.ID, "error", err)
-			c.noteOutcome(err, 0)
-			outcome, spanErr = "pending", err
+		result, err := c.acknowledgeMessage(ctx, msg.ID, deliveryGen)
+		if err != nil {
+			c.handleAckFailure(ctx, deliveryGen, msg.ID, err)
+			if !errors.Is(err, errDeliverySuperseded) {
+				outcome, spanErr = "pending", err
+			}
+			return
+		}
+		if !result.Settled {
+			c.log.Debug("Message: tombstone delivery not settled; leaving pending",
+				"message_id", msg.ID,
+				"disposition", result.Disposition)
 			return
 		}
 		outcome = "acked"
@@ -158,7 +176,7 @@ func (c *Consumer) processMessage(
 			return
 		}
 		outcome, spanErr = c.processScheduleMessage(
-			ctx, msg.ID, deliveryNum, decoded.Occurrence, valueString(msg))
+			ctx, msg.ID, deliveryNum, deliveryGen, decoded.Occurrence, valueString(msg))
 		return
 	}
 	event := decoded.Event
@@ -238,7 +256,7 @@ func (c *Consumer) processMessage(
 				"reason", err,
 			)
 			outcome, spanErr = "dlq", err
-			c.routeToDLQ(ctx, msg, err, deliveryNum, decoded.Payload)
+			c.routeToDLQ(ctx, msg, err, deliveryNum, deliveryGen, decoded.Payload)
 			return
 		}
 		c.log.Warn("Message: retryable failure; leaving pending for a later reclaim",
@@ -252,15 +270,26 @@ func (c *Consumer) processMessage(
 	}
 
 	ackCtx, ackSpan := redisSpan(ctx, "redis.ack")
-	if _, err := c.invStateStore.ackAndRetainTerminal(ackCtx, c.stream, c.group, msg.ID, c.invocationRetention); err != nil {
-		ackSpan.RecordError(err)
-		ackSpan.SetStatus(codes.Error, err.Error())
+	result, err := c.ackDelivery(ackCtx, msg.ID, deliveryGen, false)
+	if err != nil {
+		if !errors.Is(err, errDeliverySuperseded) {
+			ackSpan.RecordError(err)
+			ackSpan.SetStatus(codes.Error, err.Error())
+		}
 		ackSpan.End()
-		c.log.Warn("Message: ack failed", "message_id", msg.ID, "error", err)
-		c.noteOutcome(err, 0)
+		c.handleAckFailure(ctx, deliveryGen, msg.ID, err)
 		return
 	}
 	ackSpan.End()
+	if !result.Settled {
+		// The delivery is not ours to retire: the group was recreated while the
+		// handler ran, a foreign consumer owns it, or the entry is unknown. Leave
+		// the state persistent; a later delivery resolves it.
+		c.log.Debug("Message: source delivery not settled; leaving pending",
+			"message_id", msg.ID,
+			"disposition", result.Disposition)
+		return
+	}
 	outcome = "acked"
 	// The message is fully processed and acknowledged, and its invocation state
 	// was switched to terminal retention in the SAME atomic script, so
@@ -273,17 +302,97 @@ func (c *Consumer) processMessage(
 
 // acknowledgeMessage performs the single atomic source ACK and terminal
 // invocation-state retention for a message that needs no handler dispatch, such
-// as a confirmed tombstone.
-func (c *Consumer) acknowledgeMessage(ctx context.Context, msgID string) error {
+// as a confirmed tombstone. It applies the same group-generation fence as every
+// other ACK path.
+func (c *Consumer) acknowledgeMessage(ctx context.Context, msgID string, deliveryGen uint64) (terminalAckResult, error) {
 	ackCtx, ackSpan := redisSpan(ctx, "redis.ack")
-	_, err := c.invStateStore.ackAndRetainTerminal(
-		ackCtx, c.stream, c.group, msgID, c.invocationRetention)
-	if err != nil {
+	result, err := c.ackDelivery(ackCtx, msgID, deliveryGen, false)
+	if err != nil && !errors.Is(err, errDeliverySuperseded) {
 		ackSpan.RecordError(err)
 		ackSpan.SetStatus(codes.Error, err.Error())
 	}
 	ackSpan.End()
-	return err
+	return result, err
+}
+
+// deliveryGenerationKey carries the consumer-group generation that produced a
+// delivery from the read/reclaim site into processMessage. It is bound per
+// batch (one shared value) rather than per message, and is never mutated.
+type deliveryGenerationKey struct{}
+type deliveryGroupGenerationKey struct{}
+
+// withDeliveryGeneration binds gen to ctx for the messages this read produced.
+func withDeliveryGeneration(ctx context.Context, gen uint64) context.Context {
+	return context.WithValue(ctx, deliveryGenerationKey{}, gen)
+}
+
+// deliveryGeneration returns the generation bound by the read or reclaim that
+// produced the delivery.
+func deliveryGeneration(ctx context.Context) (uint64, bool) {
+	gen, ok := ctx.Value(deliveryGenerationKey{}).(uint64)
+	return gen, ok
+}
+
+func withDeliveryGroupGeneration(ctx context.Context, generation string) context.Context {
+	return context.WithValue(ctx, deliveryGroupGenerationKey{}, generation)
+}
+
+func deliveryGroupGeneration(ctx context.Context) (string, bool) {
+	generation, ok := ctx.Value(deliveryGroupGenerationKey{}).(string)
+	return generation, ok && generation != ""
+}
+
+// errDeliverySuperseded reports that a delivery began under an older local
+// consumer-group generation. It is not a Redis failure: the completion is stale
+// because this process recreated the group while the handler ran, so the source
+// entry may be unread in the recreated group and must not be acknowledged.
+var errDeliverySuperseded = errors.New("stream: delivery superseded by consumer-group recreation")
+
+// ackDelivery acknowledges a source delivery only when it still belongs to the
+// local and shared group generations captured before the delivery started.
+//
+// The local fence handles recreations this process observes. The shared token
+// handles cross-process recreation: both an old and replayed delivery may have
+// the same PEL owner, so only the token checked atomically with terminal-state
+// writes and XACK can distinguish their group generations.
+// Consume and reclaim bind that token before reading. A direct contextless
+// caller is passed through to the store, which resolves the current token.
+func (c *Consumer) ackDelivery(
+	ctx context.Context,
+	msgID string,
+	deliveryGen uint64,
+	trackReceipt bool,
+) (terminalAckResult, error) {
+	if deliveryGen != c.groupGeneration() {
+		return terminalAckResult{}, errDeliverySuperseded
+	}
+	return c.invStateStore.ackAndRetainTerminal(
+		ctx, c.stream, c.group, msgID, c.invocationRetention, trackReceipt)
+}
+
+// handleAckFailure feeds an ACK-script failure into health and, for a NOGROUP
+// error, runs the shared group-recovery path so the group is repaired. The
+// message is left pending either way: an ambiguous or missing group is never
+// proof that the source delivery resolved. A local generation supersession is
+// not a Redis failure and is logged only at debug.
+func (c *Consumer) handleAckFailure(
+	ctx context.Context,
+	deliveryGen uint64,
+	msgID string,
+	err error,
+) {
+	if errors.Is(err, errDeliverySuperseded) {
+		c.log.Debug("Message: delivery superseded by consumer-group recreation; leaving pending",
+			"message_id", msgID)
+		return
+	}
+	c.log.Warn("Message: ack failed", "message_id", msgID, "error", err)
+	if isNoGroup(err) {
+		wait, _ := c.recoverConsumerGroup(ctx, deliveryGen)
+		c.noteOutcome(err, wait)
+		return
+	}
+	c.noteOutcome(err, 0)
 }
 
 // processScheduleMessage routes a schedule-occurrence message directly to the
@@ -308,7 +417,7 @@ func (c *Consumer) acknowledgeMessage(ctx context.Context, msgID string) error {
 // have no meaningful matched/unmatched class and would otherwise break the
 // partition invariant. Schedule activity is accounted by the schedule
 // publication counters and the per-app handler counters.
-func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, deliveryNum int64, occ schedule.Occurrence, rawValue string) (string, error) {
+func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, deliveryNum int64, deliveryGen uint64, occ schedule.Occurrence, rawValue string) (string, error) {
 	c.log.Debug("Schedule: executing occurrence",
 		"app", occ.App,
 		"schedule", occ.Schedule,
@@ -382,10 +491,19 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 			// one atomic script, exactly like the success tail. An ACK
 			// failure means the message stays pending (the script's staged marker is
 			// persistent, so a redelivery still resolves it and nothing expires).
-			if _, ackErr := c.invStateStore.ackAndRetainTerminal(ctx, c.stream, c.group, msgID, c.invocationRetention); ackErr != nil {
-				c.log.Warn("Schedule: message ack failed", "message_id", msgID, "error", ackErr)
-				c.noteOutcome(ackErr, 0)
+			result, ackErr := c.ackDelivery(ctx, msgID, deliveryGen, false)
+			if ackErr != nil {
+				c.handleAckFailure(ctx, deliveryGen, msgID, ackErr)
+				if errors.Is(ackErr, errDeliverySuperseded) {
+					return "pending", nil
+				}
 				return "pending", ackErr
+			}
+			if !result.Settled {
+				c.log.Debug("Schedule: delivery not settled; leaving pending",
+					"message_id", msgID,
+					"disposition", result.Disposition)
+				return "pending", nil
 			}
 			return "acked", nil
 		}
@@ -405,7 +523,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 			// A semantically invalid claim has no handler payload that ran, so
 			// the entry is non-replayable (nil replay payload).
 			c.routeToDLQ(ctx,
-				scheduleDLQMessage(msgID, occ, rawValue), err, deliveryNum, nil)
+				scheduleDLQMessage(msgID, occ, rawValue), err, deliveryNum, deliveryGen, nil)
 			return "dlq", err
 		}
 		// A terminal message: the schedule invocation is exhausted, so the message
@@ -419,7 +537,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 			// The handler payload the schedule path actually handed the runner
 			// is Occurrence.Payload(), never the coordination envelope.
 			c.routeToDLQ(ctx,
-				scheduleDLQMessage(msgID, occ, rawValue), err, deliveryNum, occ.Payload())
+				scheduleDLQMessage(msgID, occ, rawValue), err, deliveryNum, deliveryGen, occ.Payload())
 			return "dlq", err
 		}
 		// A retryable failure: leave pending for a later reclaim. The
@@ -433,10 +551,19 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 		return "pending", nil
 	}
 
-	if _, err := c.invStateStore.ackAndRetainTerminal(ctx, c.stream, c.group, msgID, c.invocationRetention); err != nil {
-		c.log.Warn("Schedule: message ack failed", "message_id", msgID, "error", err)
-		c.noteOutcome(err, 0)
+	result, err := c.ackDelivery(ctx, msgID, deliveryGen, false)
+	if err != nil {
+		c.handleAckFailure(ctx, deliveryGen, msgID, err)
+		if errors.Is(err, errDeliverySuperseded) {
+			return "pending", nil
+		}
 		return "pending", err
+	}
+	if !result.Settled {
+		c.log.Debug("Schedule: delivery not settled; leaving pending",
+			"message_id", msgID,
+			"disposition", result.Disposition)
+		return "pending", nil
 	}
 	// The ACK and the terminal-retention switch happened in the SAME atomic
 	// script, exactly like processMessage, so no post-ACK orphan window
@@ -530,6 +657,7 @@ func (c *Consumer) routeToDLQ(
 	msg redis.XMessage,
 	reason error,
 	deliveries int64,
+	deliveryGen uint64,
 	replayPayload []byte,
 ) {
 	event := valueString(msg)
@@ -644,11 +772,22 @@ func (c *Consumer) routeToDLQ(
 			"reason", spec.reason,
 		)
 	}
-	if _, err := c.invStateStore.ackAndRetainTerminal(ctx, c.stream, c.group, msg.ID, c.invocationRetention); err != nil {
-		dlqSpan.RecordError(err)
-		dlqSpan.SetStatus(codes.Error, err.Error())
-		c.log.Warn("Message: ack after DLQ failed", "message_id", msg.ID, "error", err)
-		c.noteOutcome(err, 0)
+	result, err := c.ackDelivery(ctx, msg.ID, deliveryGen, true)
+	if err != nil {
+		if !errors.Is(err, errDeliverySuperseded) {
+			dlqSpan.RecordError(err)
+			dlqSpan.SetStatus(codes.Error, err.Error())
+		}
+		c.handleAckFailure(ctx, deliveryGen, msg.ID, err)
+		return
+	}
+	if !result.Settled {
+		// The committed DLQ rows stay unsettled; reconciliation preserves them
+		// until the source delivery is genuinely resolved (the recreated group
+		// will replay it, and a duplicate DLQ insert is idempotent).
+		c.log.Debug("Message: DLQ source delivery not settled; leaving source pending",
+			"message_id", msg.ID,
+			"disposition", result.Disposition)
 		return
 	}
 	// Every required row was committed before this call, so a failed or lost ACK
@@ -661,8 +800,8 @@ func (c *Consumer) routeToDLQ(
 	//
 	// Settlement is recorded only AFTER the ACK resolves successfully. If this
 	// update is lost (crash between Redis and PostgreSQL), the bounded worker
-	// reconciliation observes the source delivery is no longer pending and marks
-	// it settled then.
+	// reconciliation asks Redis for the exact disposition and marks the delivery
+	// settled only when it proves the group already passed it.
 	if err := c.dlqStore.MarkDLQDeliverySettled(ctx, deliveryID, time.Now()); err != nil {
 		dlqSpan.RecordError(err)
 		dlqSpan.SetStatus(codes.Error, err.Error())

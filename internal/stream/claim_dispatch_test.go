@@ -168,7 +168,7 @@ func TestProcessMessageInvalidScheduleEnvelopeNeverDispatched(t *testing.T) {
 			}
 
 			msg := redis.XMessage{ID: "1-0", Values: map[string]any{"value": tt.body}}
-			c.processMessage(context.Background(), msg, 1, handler)
+			c.processMessage(processMessageContext(c), msg, 1, handler)
 
 			if handlerCalls != 0 {
 				t.Fatalf("ordinary event handler invoked %d times; an invalid schedule claim must never fall through to matching", handlerCalls)
@@ -207,7 +207,7 @@ func TestProcessMessageValidScheduleEnvelopeRoutesToRunner(t *testing.T) {
 
 	handlerCalls := 0
 	msg := redis.XMessage{ID: "1-0", Values: scheduleMessageValues(t, validScheduleOccurrence())}
-	c.processMessage(context.Background(), msg, 1, func(context.Context, string, map[string]any) error {
+	c.processMessage(processMessageContext(c), msg, 1, func(context.Context, string, map[string]any) error {
 		handlerCalls++
 		return nil
 	})
@@ -262,7 +262,7 @@ func TestProcessMessageScheduleClaimIgnoresStrayTransportFields(t *testing.T) {
 	values["unknown_field"] = "x"
 	handlerCalls := 0
 	msg := redis.XMessage{ID: "1-0", Values: values}
-	c.processMessage(context.Background(), msg, 1, func(context.Context, string, map[string]any) error {
+	c.processMessage(processMessageContext(c), msg, 1, func(context.Context, string, map[string]any) error {
 		handlerCalls++
 		return nil
 	})
@@ -303,7 +303,7 @@ func TestProcessMessageNonzeroSecondClaimRoutesToRunner(t *testing.T) {
 	occ.ScheduledAt = time.Date(1866, 6, 1, 11, 10, 4, 0, time.UTC)
 	handlerCalls := 0
 	msg := redis.XMessage{ID: "1-0", Values: scheduleMessageValues(t, occ)}
-	c.processMessage(context.Background(), msg, 1, func(context.Context, string, map[string]any) error {
+	c.processMessage(processMessageContext(c), msg, 1, func(context.Context, string, map[string]any) error {
 		handlerCalls++
 		return nil
 	})
@@ -331,7 +331,7 @@ func TestProcessMessageNormalEventUnchanged(t *testing.T) {
 	}
 	handlerCalls := 0
 	msg := redis.XMessage{ID: "1-0", Values: map[string]any{"value": `{"event_name":"INSERT"}`}}
-	c.processMessage(context.Background(), msg, 1, func(context.Context, string, map[string]any) error {
+	c.processMessage(processMessageContext(c), msg, 1, func(context.Context, string, map[string]any) error {
 		handlerCalls++
 		return nil
 	})
@@ -361,7 +361,7 @@ func TestProcessMessageTombstoneAckedWithoutMatching(t *testing.T) {
 	msg := redis.XMessage{ID: "1-0", Values: map[string]any{
 		"value": "default",
 	}}
-	c.processMessage(context.Background(), msg, 1, func(context.Context, string, map[string]any) error {
+	c.processMessage(processMessageContext(c), msg, 1, func(context.Context, string, map[string]any) error {
 		handlerCalls++
 		return nil
 	})
@@ -399,7 +399,7 @@ func TestProcessMessageRawSentinelNotTombstoneIsDeadLettered(t *testing.T) {
 				"format": tt.format,
 				"value":  "default",
 			}}
-			c.processMessage(context.Background(), msg, 1,
+			c.processMessage(processMessageContext(c), msg, 1,
 				func(context.Context, string, map[string]any) error {
 					handlerCalls++
 					return nil
@@ -508,7 +508,7 @@ func TestProcessScheduleMessageInvalidClaimRoutesToDLQ(t *testing.T) {
 	}
 
 	outcome, err := c.processScheduleMessage(
-		context.Background(), "9-0", 1, validScheduleOccurrence(), "")
+		context.Background(), "9-0", 1, c.groupGeneration(), validScheduleOccurrence(), "")
 	if outcome != "dlq" {
 		t.Fatalf("outcome = %q, want dlq", outcome)
 	}

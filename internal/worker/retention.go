@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	streampkg "relay/internal/stream"
 )
 
 // trimModeAcked is the XTRIM trim-reference mode Relay requires. Unlike the
@@ -19,6 +21,12 @@ import (
 // has not read them yet — are therefore never trimmed out from under a
 // consumer. This is what makes retention safe on a shared stream.
 const trimModeAcked = "ACKED"
+
+// errRetentionGroupAbsent marks a tick skipped because the Relay consumer group
+// (or the stream itself) is not present. Retention must not recreate it; the
+// loop logs the transition and keeps ticking so trimming resumes if the group
+// returns. It is distinct from a trim failure and never disables retention.
+var errRetentionGroupAbsent = errors.New("retention: relay consumer group is absent")
 
 // errTrimModeUnsupported marks a Redis server that rejects the ACKED mode token
 // (pre-8.2 servers, where the mode is parsed but unknown). Retention must be
@@ -30,8 +38,10 @@ var errTrimModeUnsupported = errors.New("redis XTRIM does not support the ACKED 
 
 // streamTrimmer is the narrow seam the retention loop needs from Redis: a
 // single approximate MINID trim carrying an explicit trim-reference mode.
-// *redis.Client satisfies it; a test stub can implement it with a canned
-// *redis.IntCmd, so unit tests never need a real Redis.
+// *redis.Client satisfies it, and stream.AckedTrimmer is the production
+// implementation that also verifies the Relay group in the same script; a test
+// stub can implement it with a canned *redis.IntCmd, so unit tests never need a
+// real Redis.
 type streamTrimmer interface {
 	XTrimMinIDApproxMode(ctx context.Context, key string, minID string, limit int64, mode string) *redis.IntCmd
 }
@@ -73,10 +83,13 @@ func retentionCutoffID(now time.Time) string {
 }
 
 // trimStream issues a single approximate MINID trim against the stream in ACKED
-// mode. It is a thin typed wrapper over the go-redis API
+// mode. It is a thin typed wrapper over the trimmer seam
 // (XTRIM <stream> MINID ~ <minID> ACKED, LIMIT omitted because limit==0) so the
-// retention loop never touches raw commands. It returns the number of entries
-// removed (approximate under the "~" rule).
+// retention loop never touches raw commands. The production trimmer is
+// stream.AckedTrimmer, which checks the Relay consumer group and trims in one
+// atomic script; a missing group yields stream.ErrRetentionGroupAbsent and no
+// trim. It returns the number of entries removed (approximate under the "~"
+// rule).
 //
 // Boundedness: the operation is bounded by the 30s per-call context the loop
 // supplies, not by an effort LIMIT. LIMIT is deliberately omitted: a finite
@@ -125,9 +138,12 @@ func isUnsupportedTrimMode(err error) bool {
 // and every ticker tick. now is injectable for deterministic tests.
 //
 // It returns errTrimModeUnsupported when the server rejects the ACKED mode; the
-// caller disables retention rather than trimming unsafely. Any other failure is
-// logged and swallowed — retention is best-effort and must never stop the
-// worker; the caller retries on the next tick.
+// caller disables retention rather than trimming unsafely. It returns
+// errRetentionGroupAbsent when the production trimmer skipped the tick because
+// the Relay consumer group is absent; the caller logs the transition and keeps
+// ticking without disabling retention. Any other failure is logged and
+// swallowed — retention is best-effort and must never stop the worker; the
+// caller retries on the next tick.
 func retentionTick(
 	ctx context.Context,
 	client streamTrimmer,
@@ -139,6 +155,9 @@ func retentionTick(
 	cutoffID := retentionCutoffID(now().Add(-retention))
 	n, err := trimStream(ctx, client, stream, cutoffID)
 	if err != nil {
+		if errors.Is(err, streampkg.ErrRetentionGroupAbsent) {
+			return errRetentionGroupAbsent
+		}
 		if isUnsupportedTrimMode(err) {
 			return fmt.Errorf("%w: %v", errTrimModeUnsupported, err)
 		}
@@ -184,6 +203,9 @@ func logRetentionUnsupported(logger *slog.Logger, stream string, err error) {
 //
 // If the server does not support ACKED (pre-8.2), the loop logs and returns
 // WITHOUT trimming: it never falls back to the unsafe KEEPREF/default behavior.
+// If the Relay consumer group is absent, the production trimmer skips the tick
+// atomically (it never trims a stream without its group); the loop logs the
+// transition and keeps ticking, because it must never recreate the group.
 func retentionLoop(
 	ctx context.Context,
 	client streamTrimmer,
@@ -193,6 +215,25 @@ func retentionLoop(
 ) {
 	interval := retentionTickInterval(retention)
 	logger.Info("Retention: starting", "stream", stream, "window", retention, "tick", interval, "mode", trimModeAcked)
+
+	// groupAbsent tracks the skip transition so a missing Relay group is logged
+	// once when it is first observed and once when trimming resumes, not on
+	// every tick. Retention never recreates the group.
+	groupAbsent := false
+	noteGroupPresence := func(err error) {
+		switch {
+		case errors.Is(err, errRetentionGroupAbsent):
+			if !groupAbsent {
+				logger.Warn("Retention: relay consumer group is absent; skipping trims until it returns",
+					"stream", stream)
+				groupAbsent = true
+			}
+		case err == nil && groupAbsent:
+			logger.Info("Retention: relay consumer group is present again; resuming trims",
+				"stream", stream)
+			groupAbsent = false
+		}
+	}
 
 	// Initial trim immediately (bounded) so an already-large stream is trimmed
 	// without waiting a full interval. It doubles as the capability check: a
@@ -206,6 +247,7 @@ func retentionLoop(
 		logRetentionUnsupported(logger, stream, initErr)
 		return
 	}
+	noteGroupPresence(initErr)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -223,6 +265,7 @@ func retentionLoop(
 				logRetentionUnsupported(logger, stream, trimErr)
 				return
 			}
+			noteGroupPresence(trimErr)
 		}
 	}
 }

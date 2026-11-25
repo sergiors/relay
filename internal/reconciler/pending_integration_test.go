@@ -115,7 +115,7 @@ func (e *discoveryLossEnv) cleanup() {
 		}
 	}
 	ctx := context.Background()
-	_ = e.cli.Del(ctx, e.stream).Err()
+	_ = e.cli.Del(ctx, e.stream, "relay:stream-group-generation:"+e.stream+":"+e.group).Err()
 	// Best-effort removal of this env's invocation-state keys. The stream/group
 	// names contain no ':' or '%', so a direct prefix scan is safe and bounded to
 	// this env.

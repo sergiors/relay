@@ -3,9 +3,9 @@
 // This file proves the worker's bounded ACK/settlement reconciler against real
 // PostgreSQL and real Redis: a delivery whose dead letters were committed but
 // whose source ACK reply was lost (the crash-before-settlement window, or any
-// lost settlement write) is settled by reconciliation once the broker reports
-// the delivery is no longer pending; a delivery still pending — or any broker
-// error, including a missing group — is preserved unsettled.
+// lost settlement write) is settled by reconciliation from its ACK receipt; a
+// delivery still pending — or any broker error, including a missing group — is
+// preserved unsettled.
 package worker
 
 import (
@@ -24,7 +24,7 @@ import (
 // settlementEnv is one real Redis stream/group carrying three DLQ deliveries
 // whose settlement was lost:
 //
-//   - confirmed: delivered, committed, and XACKed (no longer pending);
+//   - confirmed: committed, then acknowledged through Relay's atomic ACK path;
 //   - pending:   delivered, committed, and still pending in the PEL;
 //   - ambiguous: committed with a source group that no longer exists, so the
 //     broker question cannot be answered (NOGROUP).
@@ -52,6 +52,9 @@ func newSettlementEnv(t *testing.T) *settlementEnv {
 	if err := stream.EnsureGroup(ctx, cli, streamName, group); err != nil {
 		t.Fatalf("ensure group: %v", err)
 	}
+	t.Cleanup(func() {
+		cleanupDLQSettlementRedis(context.Background(), cli, streamName, group)
+	})
 
 	e := &settlementEnv{
 		cli: cli, st: st,
@@ -73,8 +76,8 @@ const (
 // seedsOneCrashedDelivery writes the durable state one delivery leaves behind
 // when a worker crashed AFTER committing its DLQ row but BEFORE recording the
 // settlement of its source ACK: one unsettled row referring to a real stream
-// group message. ack=true performs the source XACK (a confirmed delivery
-// whose settlement write was lost); ack=false leaves the message recoverable.
+// group message. ack=true processes the source through a Relay consumer after
+// saving the row; ack=false leaves the message recoverable.
 func (e *settlementEnv) seed(t *testing.T, cased string, ack bool) dlq.Entry {
 	t.Helper()
 	ctx := context.Background()
@@ -92,13 +95,13 @@ func (e *settlementEnv) seed(t *testing.T, cased string, ack bool) dlq.Entry {
 			t.Fatalf("xadd %s: %v", cased, err)
 		}
 		msgID = res
-		// Deliver the message into the group's PEL: a DLQ row always refers to a
-		// message that WAS delivered, so the fixture must be in the PEL before
-		// the (optional) XACK.
-		if _, err := e.cli.XReadGroup(ctx, &redis.XReadGroupArgs{
-			Group: group, Consumer: "settler-itest", Streams: []string{source, ">"}, Count: 1,
-		}).Result(); err != nil {
-			t.Fatalf("xreadgroup %s: %v", cased, err)
+		if !ack {
+			// A pending row must refer to a message already delivered into the PEL.
+			if _, err := e.cli.XReadGroup(ctx, &redis.XReadGroupArgs{
+				Group: group, Consumer: "settler-itest", Streams: []string{source, ">"}, Count: 1,
+			}).Result(); err != nil {
+				t.Fatalf("xreadgroup %s: %v", cased, err)
+			}
 		}
 	}
 	deliveryID := dlq.NewDeliveryID(source, group, msgID)
@@ -121,9 +124,7 @@ func (e *settlementEnv) seed(t *testing.T, cased string, ack bool) dlq.Entry {
 		t.Fatalf("seed DLQ entry %s = (%v,%v)", entry.ID, inserted, err)
 	}
 	if ack {
-		if err := e.cli.XAck(ctx, source, group, msgID).Err(); err != nil {
-			t.Fatalf("xack (the confirmed-but-unsettled ACK): %v", err)
-		}
+		ackWithRelayConsumer(t, e.cli, source, group, msgID)
 	}
 	return entry
 }

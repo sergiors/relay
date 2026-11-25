@@ -6,15 +6,19 @@
 // leave a hash whose message already left the PEL without a terminal marker/TTL
 // (the post-ACK orphan window). It covers the success+TTL path, the disabled
 // retention path, the absent-hash (stateless) ACK, idempotent/monotonic repeats,
-// and a deterministically failed XACK — proving a failed ACK never leaves an
-// expiring TTL on still-pending state. Excluded from the default suite by the
-// integration build tag; REQUIRES Redis at REDIS_TEST_ADDR (default
-// localhost:6379), failing rather than skipping when it is absent.
+// and the two refusal/failure legs — a transport failure where the whole EVAL
+// never ran, and an in-script disposition refusal (wrong-type stream) that
+// writes NOTHING — proving a failed or refused ACK never resolves the delivery
+// and never leaves an expiring TTL on still-pending state. Excluded from the
+// default suite by the integration build tag; REQUIRES Redis at
+// REDIS_TEST_ADDR (default localhost:6379), failing rather than skipping when
+// it is absent.
 package stream
 
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,7 +56,7 @@ func ackRetainEnv(t *testing.T, cli *redis.Client) (invocationStateStore, string
 	}
 	t.Cleanup(func() {
 		cctx := context.Background()
-		_ = cli.Del(cctx, stream, invocationStateKey(stream, group, id)).Err()
+		_ = cli.Del(cctx, stream, groupGenerationKey(stream, group), invocationStateKey(stream, group, id)).Err()
 	})
 	return &invocationStore{client: cli}, stream, group, id
 }
@@ -100,7 +104,7 @@ func TestAtomicTerminalAckPreventsOrphanedInvocation(t *testing.T) {
 	key := invocationStateKey(stream, group, msgID)
 	seedCompletedHash(t, cli, key)
 
-	res, err := store.ackAndRetainTerminal(ctx, stream, group, msgID, DefaultInvocationRetention)
+	res, err := store.ackAndRetainTerminal(ctx, stream, group, msgID, DefaultInvocationRetention, false)
 	if err != nil {
 		t.Fatalf("ackAndRetainTerminal: %v", err)
 	}
@@ -146,7 +150,7 @@ func TestAtomicTerminalAckIsMonotonic(t *testing.T) {
 	seedCompletedHash(t, cli, key)
 
 	const firstWindow = 5 * time.Second
-	if _, err := store.ackAndRetainTerminal(ctx, stream, group, msgID, firstWindow); err != nil {
+	if _, err := store.ackAndRetainTerminal(ctx, stream, group, msgID, firstWindow, false); err != nil {
 		t.Fatalf("first ackAndRetainTerminal: %v", err)
 	}
 	ttl1, err := cli.PTTL(ctx, key).Result()
@@ -156,7 +160,7 @@ func TestAtomicTerminalAckIsMonotonic(t *testing.T) {
 
 	// A second call with the much longer default window must be a no-op on the
 	// TTL (idempotent/monotonic), and the message is already acked (removed=false).
-	res, err := store.ackAndRetainTerminal(ctx, stream, group, msgID, DefaultInvocationRetention)
+	res, err := store.ackAndRetainTerminal(ctx, stream, group, msgID, DefaultInvocationRetention, false)
 	if err != nil {
 		t.Fatalf("second ackAndRetainTerminal: %v", err)
 	}
@@ -176,6 +180,68 @@ func TestAtomicTerminalAckIsMonotonic(t *testing.T) {
 	}
 }
 
+func TestAtomicTerminalAckRetainsExistingPersistentTerminalHash(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	store, stream, group, msgID := ackRetainEnv(t, cli)
+	ctx := context.Background()
+	key := invocationStateKey(stream, group, msgID)
+
+	if err := cli.HSet(ctx, key, terminalField, "1", "fn/h", "ok").Err(); err != nil {
+		t.Fatalf("seed terminal state: %v", err)
+	}
+	if err := cli.XAck(ctx, stream, group, msgID).Err(); err != nil {
+		t.Fatalf("xack: %v", err)
+	}
+	if streamPending(t, cli, stream, group, msgID) {
+		t.Fatalf("message %s is still pending after xack", msgID)
+	}
+	if ttl, err := cli.PTTL(ctx, key).Result(); err != nil || ttl != -1 {
+		t.Fatalf("seeded PTTL = %s (err %v), want persistent", ttl, err)
+	}
+
+	res, err := store.ackAndRetainTerminal(ctx, stream, group, msgID, DefaultInvocationRetention, false)
+	if err != nil {
+		t.Fatalf("ackAndRetainTerminal: %v", err)
+	}
+	if !res.Settled || res.Removed || !res.Retained {
+		t.Fatalf("result = %+v, want settled, not removed, and retained", res)
+	}
+	if receipt, err := cli.HGet(ctx, key, ackReceiptField).Result(); err != nil || receipt != "1" {
+		t.Fatalf("ACK receipt = (%q, %v), want \"1\"", receipt, err)
+	}
+	if ttl, err := cli.PTTL(ctx, key).Result(); err != nil || ttl <= 0 || ttl > DefaultInvocationRetention {
+		t.Fatalf("retention PTTL = %s (err %v), want (0, %s]", ttl, err, DefaultInvocationRetention)
+	}
+}
+
+func TestAtomicTerminalAckDisabledRetentionPersistsExistingTTL(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	store, stream, group, msgID := ackRetainEnv(t, cli)
+	ctx := context.Background()
+	key := invocationStateKey(stream, group, msgID)
+
+	if err := cli.HSet(ctx, key, terminalField, "1", "fn/h", "ok").Err(); err != nil {
+		t.Fatalf("seed terminal state: %v", err)
+	}
+	if err := cli.PExpire(ctx, key, time.Hour).Err(); err != nil {
+		t.Fatalf("seed terminal retention: %v", err)
+	}
+	if err := cli.XAck(ctx, stream, group, msgID).Err(); err != nil {
+		t.Fatalf("xack: %v", err)
+	}
+
+	res, err := store.ackAndRetainTerminal(ctx, stream, group, msgID, 0, false)
+	if err != nil {
+		t.Fatalf("ackAndRetainTerminal(disabled): %v", err)
+	}
+	if !res.Settled || res.Removed || !res.Retained {
+		t.Fatalf("result = %+v, want settled, not removed, and retained", res)
+	}
+	if ttl, err := cli.PTTL(ctx, key).Result(); err != nil || ttl != -1 {
+		t.Fatalf("PTTL with disabled retention = %s (err %v), want persistent", ttl, err)
+	}
+}
+
 // TestAtomicTerminalAckRetentionDisabled pins the explicit-disable contract
 // (REDIS_INVOCATION_RETENTION empty/0/negative): the terminal marker is still
 // written atomically (so stale-transition guards are unchanged) but NO TTL is
@@ -188,7 +254,7 @@ func TestAtomicTerminalAckRetentionDisabled(t *testing.T) {
 	key := invocationStateKey(stream, group, msgID)
 	seedCompletedHash(t, cli, key)
 
-	res, err := store.ackAndRetainTerminal(ctx, stream, group, msgID, 0)
+	res, err := store.ackAndRetainTerminal(ctx, stream, group, msgID, 0, false)
 	if err != nil {
 		t.Fatalf("ackAndRetainTerminal(disabled): %v", err)
 	}
@@ -205,7 +271,7 @@ func TestAtomicTerminalAckRetentionDisabled(t *testing.T) {
 		t.Fatalf("PTTL after disabled retention = %s (err %v), want -1 (persistent)", d, err)
 	}
 	// A repeated disabled call must not introduce a TTL either (monotonic).
-	if _, err := store.ackAndRetainTerminal(ctx, stream, group, msgID, 0); err != nil {
+	if _, err := store.ackAndRetainTerminal(ctx, stream, group, msgID, 0, false); err != nil {
 		t.Fatalf("second ackAndRetainTerminal(disabled): %v", err)
 	}
 	if d, err := cli.PTTL(ctx, key).Result(); err != nil || d != -1 {
@@ -213,17 +279,15 @@ func TestAtomicTerminalAckRetentionDisabled(t *testing.T) {
 	}
 }
 
-// TestAtomicTerminalAckAbsentHashStillAcks pins the stateless-message case: when
-// there is no invocation-state hash there is nothing to retain, but the ACK must
-// still happen and NO empty key may be created (the marker must never fabricate
-// state that did not exist).
+// TestAtomicTerminalAckAbsentHashStillAcks pins the ordinary stateless case:
+// an ACK that does not need DLQ settlement proof leaves no invocation hash.
 func TestAtomicTerminalAckAbsentHashStillAcks(t *testing.T) {
 	cli := testutil.RequireRedis(t)
 	store, stream, group, msgID := ackRetainEnv(t, cli)
 	ctx := context.Background()
 	key := invocationStateKey(stream, group, msgID)
 
-	res, err := store.ackAndRetainTerminal(ctx, stream, group, msgID, DefaultInvocationRetention)
+	res, err := store.ackAndRetainTerminal(ctx, stream, group, msgID, DefaultInvocationRetention, false)
 	if err != nil {
 		t.Fatalf("ackAndRetainTerminal(absent hash): %v", err)
 	}
@@ -231,28 +295,133 @@ func TestAtomicTerminalAckAbsentHashStillAcks(t *testing.T) {
 		t.Fatalf("result.Removed = false, want true (the message must still be acked)")
 	}
 	if res.Retained {
-		t.Fatalf("result.Retained = true, want false (there was no hash to retain)")
+		t.Fatalf("result.Retained = true, want false (ordinary stateless ACK creates no hash)")
 	}
 	if streamPending(t, cli, stream, group, msgID) {
 		t.Fatalf("message %s still pending after the ack", msgID)
 	}
-	if n, err := cli.Exists(ctx, key).Result(); err != nil || n != 0 {
-		t.Fatalf("an absent hash must not be created by the ACK (exists=%d err=%v)", n, err)
+	if exists, err := cli.Exists(ctx, key).Result(); err != nil || exists != 0 {
+		t.Fatalf("stateless ACK created invocation state: exists=%d err=%v", exists, err)
+	}
+}
+
+func TestAtomicTrackedStatelessAckRetainsReceipt(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	store, stream, group, msgID := ackRetainEnv(t, cli)
+	ctx := context.Background()
+	key := invocationStateKey(stream, group, msgID)
+
+	res, err := store.ackAndRetainTerminal(ctx, stream, group, msgID, DefaultInvocationRetention, true)
+	if err != nil {
+		t.Fatalf("tracked ackAndRetainTerminal: %v", err)
+	}
+	if !res.Removed || !res.Retained {
+		t.Fatalf("result = %+v, want removed+retained for DLQ tracking", res)
+	}
+	if receipt, err := cli.HGet(ctx, key, ackReceiptField).Result(); err != nil || receipt != "1" {
+		t.Fatalf("ACK receipt = (%q, %v), want \"1\"", receipt, err)
+	}
+	if ttl, err := cli.PTTL(ctx, key).Result(); err != nil || ttl <= 0 {
+		t.Fatalf("receipt retention PTTL = %s (err %v), want positive", ttl, err)
+	}
+}
+
+func TestAtomicTerminalReplayRearmsRetentionAfterConfirmedAck(t *testing.T) {
+	inspect := testutil.RequireRedis(t)
+	ctx := context.Background()
+	storeCli := auxRedisClient(t, inspect)
+	_, stream, group, id := ackRetainEnv(t, inspect)
+	key := invocationStateKey(stream, group, id)
+	if err := inspect.HSet(ctx, key, terminalField, "1", "fn/h", "ok").Err(); err != nil {
+		t.Fatalf("seed terminal state: %v", err)
+	}
+	if err := inspect.PExpire(ctx, key, time.Hour).Err(); err != nil {
+		t.Fatalf("seed old retention: %v", err)
+	}
+	before, err := inspect.PTTL(ctx, key).Result()
+	if err != nil {
+		t.Fatalf("initial pttl: %v", err)
+	}
+
+	// The terminal hash is being replayed from the live PEL. Recovery must
+	// remove its old expiry before any handler/ACK operation.
+	realStore := &invocationStore{client: inspect, consumer: "c"}
+	if err := realStore.makeRecoverable(ctx, stream, group, id); err != nil {
+		t.Fatalf("makeRecoverable: %v", err)
+	}
+	if ttl, err := inspect.PTTL(ctx, key).Result(); err != nil || ttl != -1 {
+		t.Fatalf("PTTL after replay recovery = %s (err %v), want persistent", ttl, err)
+	}
+
+	// A transport failure at the ACK boundary leaves the message pending and
+	// the terminal state persistent, never expiring during a replay.
+	if err := storeCli.Close(); err != nil {
+		t.Fatalf("close ACK client: %v", err)
+	}
+	failedStore := &invocationStore{client: storeCli, consumer: "c"}
+	if _, err := failedStore.ackAndRetainTerminal(ctx, stream, group, id, 2*time.Hour, false); err == nil {
+		t.Fatal("ackAndRetainTerminal with a closed client = nil error, want transport failure")
+	}
+	if !streamPending(t, inspect, stream, group, id) {
+		t.Fatal("message left the PEL after the failed ACK")
+	}
+	if ttl, err := inspect.PTTL(ctx, key).Result(); err != nil || ttl != -1 {
+		t.Fatalf("PTTL after failed replay ACK = %s (err %v), want persistent", ttl, err)
+	}
+
+	// Retrying the pending replay's ACK starts a fresh retention window even
+	// when the hash was already terminal and carried an old TTL.
+	res, err := realStore.ackAndRetainTerminal(ctx, stream, group, id, 2*time.Hour, false)
+	if err != nil {
+		t.Fatalf("replay ACK: %v", err)
+	}
+	if !res.Settled || !res.Removed {
+		t.Fatalf("replay ACK result = %+v, want settled+removed", res)
+	}
+	after, err := inspect.PTTL(ctx, key).Result()
+	if err != nil || after < time.Hour {
+		t.Fatalf("PTTL after replay ACK = %s (err %v), want fresh two-hour retention (old %s)", after, err, before)
+	}
+
+	// A stale in-memory delivery with no exact PEL entry must not revive the
+	// retained hash by making it persistent.
+	time.Sleep(40 * time.Millisecond)
+	if err := realStore.makeRecoverable(ctx, stream, group, id); err != nil {
+		t.Fatalf("makeRecoverable after ACK: %v", err)
+	}
+	staleTTL, err := inspect.PTTL(ctx, key).Result()
+	if err != nil || staleTTL <= 0 || staleTTL >= after {
+		t.Fatalf("PTTL after stale makeRecoverable = %s (err %v), want retained and decayed from %s", staleTTL, err, after)
+	}
+
+	// A non-pending idempotent ACK must not extend that fresh deadline either.
+	res, err = realStore.ackAndRetainTerminal(ctx, stream, group, id, 3*time.Hour, false)
+	if err != nil {
+		t.Fatalf("repeated no-op ACK: %v", err)
+	}
+	if res.Removed {
+		t.Fatalf("repeated no-op ACK removed a PEL entry: %+v", res)
+	}
+	repeated, err := inspect.PTTL(ctx, key).Result()
+	if err != nil || repeated >= after {
+		t.Fatalf("PTTL after no-op ACK = %s (err %v), want less than prior %s", repeated, err, after)
 	}
 }
 
 // TestAtomicTerminalAckXACKFailureLeavesPendingPersistentState pins the PEL
-// safety of the atomic script: a failed XACK must never leave an expiring TTL on
-// still-pending state, and must never recreate an unmarked orphan.
+// safety of the atomic script: a refused or failed ACK must never leave an
+// expiring TTL on still-pending state, and must never recreate an unmarked
+// orphan.
 //
 //   - "transport failure": the whole EVAL never runs (the client is closed), so
 //     nothing is staged; the message stays in the PEL and the recoverable hash
 //     stays persistent (PTTL -1, no terminal marker).
-//   - "in-script failure": the state hash is seeded with a LEGACY expiring TTL
-//     and the ACK is forced to fail inside the script by pointing the ACK at a
-//     wrong-type key. The script stages the terminal marker and PERSISTs BEFORE
-//     the ACK, so even though the ACK raises, the hash is left terminal-marked
-//     and PERSISTENT (no expiring TTL) — never an orphan that leaks or expires.
+//   - "in-script refusal": the stream key holds a WRONGTYPE value, so the
+//     script's disposition validation refuses BEFORE any write. The refusal is
+//     a complete no-op — no terminal marker, the recoverable value and its
+//     seeded legacy TTL are untouched — and it is a generic error, never
+//     NOGROUP (WRONGTYPE must not send the Go recovery path recreating a group
+//     that was not lost).
 func TestAtomicTerminalAckXACKFailureLeavesPendingPersistentState(t *testing.T) {
 	t.Run("transport failure leaves PEL and persistent state", func(t *testing.T) {
 		inspect := testutil.RequireRedis(t)
@@ -286,7 +455,7 @@ func TestAtomicTerminalAckXACKFailureLeavesPendingPersistentState(t *testing.T) 
 		if err := storeCli.Close(); err != nil {
 			t.Fatalf("close store client: %v", err)
 		}
-		if _, err := store.ackAndRetainTerminal(ctx, stream, group, id, DefaultInvocationRetention); err == nil {
+		if _, err := store.ackAndRetainTerminal(ctx, stream, group, id, DefaultInvocationRetention, false); err == nil {
 			t.Fatal("ackAndRetainTerminal with a closed client = nil error, want a transport error")
 		}
 
@@ -306,11 +475,12 @@ func TestAtomicTerminalAckXACKFailureLeavesPendingPersistentState(t *testing.T) 
 		}
 	})
 
-	t.Run("in-script XACK failure leaves persistent non-expiring state", func(t *testing.T) {
+	// A stream name holding a NON-stream key: the script's disposition
+	// validation refuses the ACK before any write.
+	t.Run("in-script stream-type refusal writes nothing", func(t *testing.T) {
 		cli := testutil.RequireRedis(t)
 		ctx := context.Background()
 		prefix := fmt.Sprintf("ackwrongtype-%d", time.Now().UnixNano())
-		// A stream name holding a NON-stream key: the script's XACK raises.
 		stream, group, msgID := prefix+"-notastream", "g", "1-0"
 		key := invocationStateKey(stream, group, msgID)
 		t.Cleanup(func() {
@@ -320,32 +490,45 @@ func TestAtomicTerminalAckXACKFailureLeavesPendingPersistentState(t *testing.T) 
 		if err := cli.Set(ctx, stream, "not-a-stream", 0).Err(); err != nil {
 			t.Fatalf("set wrong-type stream key: %v", err)
 		}
-		// Seed a recoverable hash that carries a LEGACY TTL, exactly the state a
-		// pre-persistence Relay could leave: the script must PERSIST it before the
-		// failed ACK, so the failed ACK can never leave it expiring.
+		// Seed a recoverable hash that carries a LEGACY TTL, exactly the
+		// state a pre-persistence Relay could leave: a refusal must not
+		// touch it at all — no marker staged, no TTL migration, no value
+		// change — so the state is byte-identical after the failed ACK.
 		if err := cli.HSet(ctx, key, "fn/h", "ok").Err(); err != nil {
 			t.Fatalf("seed state: %v", err)
 		}
 		if err := cli.PExpire(ctx, key, time.Hour).Err(); err != nil {
 			t.Fatalf("seed legacy ttl: %v", err)
 		}
-		if d, err := cli.PTTL(ctx, key).Result(); err != nil || d <= 0 {
-			t.Fatalf("seeded PTTL = %s (err %v), want a positive legacy TTL", d, err)
+		seededTTL, err := cli.PTTL(ctx, key).Result()
+		if err != nil || seededTTL <= 0 {
+			t.Fatalf("seeded PTTL = %s (err %v), want a positive legacy TTL", seededTTL, err)
 		}
 
 		store := &invocationStore{client: cli}
-		if _, err := store.ackAndRetainTerminal(ctx, stream, group, msgID, DefaultInvocationRetention); err == nil {
-			t.Fatal("ackAndRetainTerminal against a wrong-type stream = nil error, want the in-script XACK error")
+		res, err := store.ackAndRetainTerminal(ctx, stream, group, msgID, DefaultInvocationRetention, false)
+		if err == nil {
+			t.Fatal("ackAndRetainTerminal against a wrong-type stream = nil error, want the in-script refusal")
+		}
+		if strings.Contains(err.Error(), "NOGROUP") {
+			t.Fatalf("a WRONGTYPE stream must not masquerade as a lost group (it would trigger a bogus recovery): %v", err)
+		}
+		if res.Settled || res.Removed || res.Retained {
+			t.Fatalf("result = %+v, want the zero value (a refusal resolves nothing)", res)
 		}
 
-		// The marker was staged (persistent) BEFORE the failed ACK, so the state
-		// is terminal-marked and has NO expiring TTL — the still-pending message's
-		// state can never expire.
-		if v, err := cli.HGet(ctx, key, terminalField).Result(); err != nil || v != "1" {
-			t.Fatalf("terminal field = %q (err %v), want \"1\" (marker staged before the ACK)", v, err)
+		// The refusal wrote NOTHING: no terminal marker, the recoverable
+		// value is intact, and even the seeded legacy TTL is untouched (still
+		// expiring, never persisted away and never re-armed to the retention
+		// window; it may only have decayed by the sub-millisecond test runtime).
+		if exists, err := cli.HExists(ctx, key, terminalField).Result(); err != nil || exists {
+			t.Fatalf("terminal marker = (%v, %v), want absent (refusal must write nothing)", exists, err)
 		}
-		if d, err := cli.PTTL(ctx, key).Result(); err != nil || d != -1 {
-			t.Fatalf("state after a failed in-script ACK must be persistent; pttl=%s (err %v), want -1 (no expiring TTL)", d, err)
+		if v, err := cli.HGet(ctx, key, "fn/h").Result(); err != nil || v != "ok" {
+			t.Fatalf("marker = %q (err %v), want \"ok\" preserved", v, err)
+		}
+		if d, err := cli.PTTL(ctx, key).Result(); err != nil || d <= 0 || d > seededTTL {
+			t.Fatalf("PTTL = %s (err %v), want the seeded %s decayed but untouched", d, err, seededTTL)
 		}
 	})
 }

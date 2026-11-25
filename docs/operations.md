@@ -101,6 +101,9 @@ include:
 - `relay_pending_entries`, `relay_pending_oldest_age_seconds`,
   `relay_buffered_events`, and `relay_in_flight_invocations` for workload and
   backlog.
+- `relay_consumer_group_recoveries_total` for lost-group recovery attempts,
+  labeled `created`, `existing`, or `failed`. A `created`/`existing` result means
+  the stream backlog was replayed.
 - `relay_schedule_occurrences_published_total`,
   `relay_schedule_occurrences_duplicate_total`, and
   `relay_schedule_pending_expired_total` for schedule publication.
@@ -270,11 +273,38 @@ and are eligible for reclaim. Reclaim is a recovery mechanism, not the handler
 retry timer. Transport or state errors leave unresolved work pending rather than
 acknowledging it.
 
+If Relay observes that its consumer group or the stream is missing, it recreates
+the group at ID 0 and replays the entries still present in the stream. This is
+deliberate at-least-once recovery, not a silent reset: the previous pending list
+is gone, so already-read messages can run again, and entries whose bodies were
+already trimmed cannot be recovered. Relay logs the recovery, reports not ready
+while it is outstanding, and resumes normal readiness only after a successful
+read. A group that another node already recreated is reused (Redis reports it as
+existing); Relay never recreates a group for an ordinary Redis outage and does
+not take a cluster-wide lock.
+
 Relay writes required PostgreSQL DLQ rows before acknowledging a source message.
-It marks those rows settled only after ACK is confirmed (or recovery verifies
-the delivery is no longer pending). See [Events](events.md#execution-retries-and-delivery)
-and [Schedules](schedules.md#recovery-and-availability) for workload-specific
+It marks those rows settled only when Redis proves the exact source delivery is
+settled: the message left the group's pending list because the group had already
+passed it. Rows are preserved while the source is still pending, not yet read by
+a recreated group, or unknown. Redis and PostgreSQL cannot be updated atomically,
+so a group recreation immediately after a settled observation can replay the
+source; that replay is at least once and re-inserts the same idempotent row. See
+[Events](events.md#execution-retries-and-delivery) and
+[Schedules](schedules.md#recovery-and-availability) for workload-specific
 behavior.
+
+When a DLQ source body is gone, settlement requires an ACK receipt retained
+with invocation state for `REDIS_INVOCATION_RETENTION` (48h by default). If that
+receipt expires before reconciliation, the delivery remains unknown and its DLQ
+row stays unsettled indefinitely; `DLQ_RETENTION` cannot remove unsettled rows.
+Choose invocation retention long enough to cover expected reconciliation
+outages.
+
+Source-stream retention (`REDIS_STREAM_RETENTION`) trims only entries every
+consumer group has acknowledged. Relay checks that its own group still exists
+and issues the trim in one atomic step; while the group is absent it skips trims
+and keeps checking instead of trimming unprotected or recreating the group.
 
 ## DLQ controls
 
@@ -287,7 +317,13 @@ handlers should be idempotent. See [CLI](cli.md#relay-dlq).
 ## Reliability model and limitations
 
 - Event and schedule delivery is at least once, not exactly once. A handler can
-  run again after a crash or ambiguous completion.
+  run again after a crash, an ambiguous completion, or a lost consumer group.
+- A lost stream/group is recreated at ID 0 and replayed from the entries still
+  present. Pending state from the lost group is unrecoverable, and entries whose
+  bodies were trimmed cannot be replayed.
+- Source-stream retention requires Redis 8.2+ and the Relay consumer group to
+  exist; Relay skips trims while the group is absent rather than trimming
+  without protection.
 - Event retry count is configured per rule; backoff and reclaim timing are not
   configurable. See [Events](events.md#execution-retries-and-delivery).
 - Schedule publication is deduplicated cluster-wide. Handler execution remains

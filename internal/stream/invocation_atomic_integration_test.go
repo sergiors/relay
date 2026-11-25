@@ -955,7 +955,7 @@ func TestIntegrationAtomicStoreFailureKeepsMessagePendingAndSkipsHandler(t *test
 		t.Fatalf("ensure group: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = cli.Del(context.Background(), streamName).Err()
+		cleanupEnvRedisKeys(context.Background(), cli, streamName, groupName)
 	})
 
 	if _, err := cli.XAdd(ctx, &redis.XAddArgs{

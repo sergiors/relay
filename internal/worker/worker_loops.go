@@ -53,15 +53,22 @@ func startBackgroundLoops(
 	// resolved by config.Load): a single goroutine periodically trims the
 	// configured stream with XTRIM MINID ~ ... ACKED so entries older than the
 	// window are removed only once every consumer group has acknowledged them.
-	// Completely separate from ACK/retry/DLQ semantics. On a server that does not
-	// support ACKED (pre-8.2) the loop logs and disables itself rather than
-	// trimming unsafely.
+	// Completely separate from ACK/retry/DLQ semantics. The Relay group is bound
+	// into the trimmer: group existence and the trim are one atomic script, and
+	// a missing group skips the tick rather than letting retention recreate it.
+	// On a server that does not support ACKED (pre-8.2) the loop logs and
+	// disables itself rather than trimming unsafely.
 	if cfg.StreamRetention > 0 {
 		retentionDone := make(chan struct{})
 		loopDones = append(loopDones, retentionDone)
 		go func() {
 			defer close(retentionDone)
-			retentionLoop(ctx, client, cfg.RedisStream, cfg.StreamRetention, logger)
+			// Bind the Relay group here: the trimmer verifies its presence and
+			// trims in one atomic script, so retention never trims a stream whose
+			// group was removed between a check and the trim.
+			retentionLoop(ctx,
+				stream.NewAckedTrimmer(client, cfg.RedisGroup),
+				cfg.RedisStream, cfg.StreamRetention, logger)
 		}()
 	}
 

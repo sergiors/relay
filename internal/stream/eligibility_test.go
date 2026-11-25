@@ -471,14 +471,16 @@ func (f *fakeInvocationStore) retainTerminal(_ context.Context, _, _, _ string, 
 // PEL (not modelled in memory) and the message-level terminal marker is set
 // monotonically. An absent hash still acks but retains nothing (no empty key is
 // created), mirroring the script's EXISTS/type guard; the fake reports the ACK
-// as removed so callers can distinguish a stateless message.
-func (f *fakeInvocationStore) ackAndRetainTerminal(_ context.Context, _, _, _ string, _ time.Duration) (terminalAckResult, error) {
+// as settled+removed so callers can distinguish a stateless message. (The
+// unread/foreign dispositions only exist against a real broker's group/PEL
+// state, so the fake always models the settled disposition.)
+func (f *fakeInvocationStore) ackAndRetainTerminal(_ context.Context, _, _, _ string, _ time.Duration, _ bool) (terminalAckResult, error) {
 	f.ackRetainCalls++
 	if len(f.fields) == 0 && !f.retained {
-		return terminalAckResult{Removed: true, Retained: false}, nil
+		return terminalAckResult{Settled: true, Removed: true, Retained: false}, nil
 	}
 	f.retained = true
-	return terminalAckResult{Removed: true, Retained: true}, nil
+	return terminalAckResult{Settled: true, Removed: true, Retained: true}, nil
 }
 
 // makeRecoverable models makeRecoverableScript: it marks a pre-existing,

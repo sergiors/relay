@@ -153,12 +153,12 @@ enrich their output with per-invocation context.
 
 Retention settings are independent and do not change retry or ACK behavior:
 
-| Setting                      | Default         | What expires                                                                                           |
-| ---------------------------- | --------------- | ------------------------------------------------------------------------------------------------------ |
-| `REDIS_STREAM_RETENTION`     | `24h`           | Acknowledged entries in the source stream. Requires Redis 8.2 or newer; pending entries are protected. |
-| `DLQ_RETENTION`              | `168h` (7 days) | Settled PostgreSQL DLQ entries. Unsettled or actively replayed entries are retained.                   |
-| `REDIS_INVOCATION_RETENTION` | `48h`           | Terminal invocation state, only after the message leaves the pending list.                             |
-| `STATS_RETENTION`            | `168h` (7 days) | Statistics for retired nodes; a worker never deletes its own row.                                      |
+| Setting                      | Default         | What expires                                                                                                                                                         |
+| ---------------------------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `REDIS_STREAM_RETENTION`     | `24h`           | Acknowledged entries in the source stream. Requires Redis 8.2 or newer; pending entries are protected, and trims are skipped while Relay's consumer group is absent. |
+| `DLQ_RETENTION`              | `168h` (7 days) | Settled PostgreSQL DLQ entries. Unsettled or actively replayed entries are retained.                                                                                 |
+| `REDIS_INVOCATION_RETENTION` | `48h`           | Terminal invocation state and DLQ settlement receipts after ACK.                                                                                                     |
+| `STATS_RETENTION`            | `168h` (7 days) | Statistics for retired nodes; a worker never deletes its own row.                                                                                                    |
 
 Retention values use Go duration syntax (`168h`, not `7d`). Unset values use the
 defaults. An explicitly empty value disables retention; zero, negative, or

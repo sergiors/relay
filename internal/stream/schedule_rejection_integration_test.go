@@ -77,8 +77,7 @@ func rejectionEnv(t *testing.T, cli *redis.Client) (stream, group, msgID, event 
 	}
 	t.Cleanup(func() {
 		c := context.Background()
-		_ = cli.Del(c, stream).Err()
-		cleanupInvocationKeys(c, cli, prefix)
+		cleanupEnvRedisKeys(c, cli, stream, group)
 	})
 	return stream, group, id, event
 }
@@ -257,7 +256,13 @@ func TestIntegrationScheduleReservedInvalidDispositionIsIdempotent(t *testing.T)
 	}
 
 	c := NewConsumer(ConsumerConfig{
-		Client: cli, Stream: stream, Group: group, Consumer: "c",
+		Client: cli, Stream: stream, Group: group,
+		// The pending fixture entry is owned by the "probe" consumer that read
+		// it into the PEL; the retrying consumer must be that owner, because the
+		// atomic ACK now refuses to resolve a PEL entry owned by anyone else
+		// (the F-03 foreign-owner disposition). A real retry would arrive after
+		// an XAUTOCLAIM transfer, which is equivalent to being the owner here.
+		Consumer: "probe",
 		Log:      testutil.DiscardLogger(),
 		DLQStore: pg,
 	})
@@ -266,7 +271,7 @@ func TestIntegrationScheduleReservedInvalidDispositionIsIdempotent(t *testing.T)
 	// The "retry" completes the disposition: the DLQ row is committed to
 	// PostgreSQL and only then is the message terminal-ACKed. A reserved
 	// invalid-rejection disposition has no handler payload (nil replay payload).
-	c.routeToDLQ(ctx, msg, fmt.Errorf("%w: reserved", ErrScheduleInvalid), 1, nil)
+	c.routeToDLQ(ctx, msg, fmt.Errorf("%w: reserved", ErrScheduleInvalid), 1, c.groupGeneration(), nil)
 
 	key := invocationStateKey(stream, group, msgID)
 	entries := dlqEntriesFor(t, pg, msgID)
@@ -302,7 +307,7 @@ func TestIntegrationScheduleReservedInvalidDispositionIsIdempotent(t *testing.T)
 
 	// A duplicate disposition must not commit a second row (the stable identity
 	// is idempotent in PostgreSQL, with no Redis persistence marker at all).
-	c.routeToDLQ(ctx, msg, fmt.Errorf("%w: reserved", ErrScheduleInvalid), 2, nil)
+	c.routeToDLQ(ctx, msg, fmt.Errorf("%w: reserved", ErrScheduleInvalid), 2, c.groupGeneration(), nil)
 	if entries := dlqEntriesFor(t, pg, msgID); len(entries) != 1 {
 		t.Fatalf("DLQ rows after duplicate disposition = %d, want still 1", len(entries))
 	}
@@ -331,7 +336,7 @@ func TestIntegrationScheduleReservedObsoleteAckedOnRetry(t *testing.T) {
 	if !adm.Rejected || adm.Rejection != ScheduleRejectionObsolete {
 		t.Fatalf("admission = %+v, want rejected(obsolete)", adm)
 	}
-	if _, err := store.ackAndRetainTerminal(ctx, stream, group, msgID, DefaultInvocationRetention); err != nil {
+	if _, err := store.ackAndRetainTerminal(ctx, stream, group, msgID, DefaultInvocationRetention, false); err != nil {
 		t.Fatalf("ackAndRetainTerminal: %v", err)
 	}
 	key := invocationStateKey(stream, group, msgID)

@@ -231,6 +231,16 @@ const (
 	// recovered" log, not a metric.
 	MetricRedisReadErrors = metricNamespacePrefix + "redis_read_errors_total"
 
+	// MetricGroupRecoveries counts consumer-group recovery attempts after a
+	// NOGROUP error, labeled by the finite result set (created/existing/failed).
+	// It is separate from redis_read_errors_total: a NOGROUP is not a transport
+	// failure but a destructive group loss that Relay repairs by creating the
+	// group at ID 0. "created" means this process actually created the group;
+	// "existing" means another actor had already created it (BUSYGROUP), which
+	// still replayed the stream backlog. Cardinality is fixed at three series
+	// per worker.
+	MetricGroupRecoveries = metricNamespacePrefix + "consumer_group_recoveries_total"
+
 	// Service reconcile observability. MetricServiceReconciles counts every
 	// ServiceReconciler pass outcome (changed/unchanged/pending/error), including
 	// the periodic no-op verification passes; MetricServiceReconcileDuration
@@ -350,6 +360,7 @@ var metricHelp = map[string]string{
 
 	MetricAppStatus:                "Current public lifecycle status of the app as a one-hot gauge: exactly one status series is 1 and every other allowed status is 0.",
 	MetricRedisReadErrors:          "Failed Redis read commands by the finite operation that failed; one increment per failed command.",
+	MetricGroupRecoveries:          "Consumer-group recovery attempts after a NOGROUP error, by finite result: created when XGROUP CREATE succeeded, existing when the group was already present (BUSYGROUP), and failed when the attempt returned an error. Any created/existing result means Relay observed a lost group and consumption resumes from ID 0, replaying the stream backlog.",
 	MetricServiceReconciles:        "Service convergence passes by app and outcome; counted once per ServiceReconciler pass, including periodic no-op verification passes.",
 	MetricServiceReconcileDuration: "Service convergence pass duration in seconds by app, observed for every pass (changed, unchanged, or failed).",
 }
@@ -401,6 +412,17 @@ const (
 	RedisOpAutoclaim    = "autoclaim"
 	RedisOpPendingGauge = "pending_gauge"
 	RedisOpGroupLag     = "group_lag"
+)
+
+// Consumer-group recovery result label values for MetricGroupRecoveries. The
+// set is closed: created means this process created the group, existing means
+// it was already present (BUSYGROUP), and failed means the attempt returned an
+// error and will be retried with bounded backoff. Both created and existing
+// indicate a NOGROUP observation, so the consumer's group generation advances.
+const (
+	GroupRecoveryCreated  = "created"
+	GroupRecoveryExisting = "existing"
+	GroupRecoveryFailed   = "failed"
 )
 
 // Service reconcile outcome label values. A pass that changed container state
@@ -942,6 +964,25 @@ func New() *Registry {
 	r.counterVecs[MetricRedisReadErrors] = &labeledCounterVec{
 		order: []string{"operation"},
 		vec:   redisReadErrors,
+	}
+
+	// Consumer-group recreations after NOGROUP, labeled by the finite result.
+	groupRecoveries := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: MetricGroupRecoveries,
+		Help: metricHelp[MetricGroupRecoveries],
+	}, []string{"result"})
+	reg.MustRegister(groupRecoveries)
+	// Materialize the closed result set at zero so the family is present from
+	// startup (stable dashboards and predictable scrape output) even before a
+	// group is ever lost.
+	for _, result := range []string{
+		GroupRecoveryCreated, GroupRecoveryExisting, GroupRecoveryFailed,
+	} {
+		groupRecoveries.WithLabelValues(result)
+	}
+	r.counterVecs[MetricGroupRecoveries] = &labeledCounterVec{
+		order: []string{"result"},
+		vec:   groupRecoveries,
 	}
 
 	// Service convergence passes: outcome counter (changed/unchanged/error) and

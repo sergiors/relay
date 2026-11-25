@@ -172,13 +172,7 @@ func newEnv(t *testing.T, cfg ConsumerConfig) *testEnv {
 		// rows live in the per-test PostgreSQL schema, which testutil drops via
 		// its own cleanup.
 		cleanupCtx := context.Background()
-		_ = cleanupClient.Del(cleanupCtx, c.stream).Err()
-		// Also clear any invocation-state keys this env's stream/group created,
-		// otherwise a message claimed on a failure path can leak a
-		// `relay:invocation:<stream>:<group>:*` hash in Redis. The scan pattern
-		// is bounded to the unique stream/group names this test owns — never a
-		// global FLUSHDB/FLUSHALL.
-		cleanupInvocationKeys(cleanupCtx, cleanupClient, prefix)
+		cleanupEnvRedisKeys(cleanupCtx, cleanupClient, c.stream, c.group)
 		_ = cleanupClient.Close()
 	})
 	return env
@@ -305,11 +299,10 @@ func (e *testEnv) dlqFor(msgID string) []dlq.Entry {
 	return out
 }
 
-// cleanupInvocationKeys scans for and deletes any `relay:invocation:*` hash
-// keys that belong to this test's ownership prefix (a unixnano-unique
-// stream/group prefix). The scan MATCH pattern is bounded to keys whose
-// percent-encoded prefix matches the unique names this env created, so it never
-// touches other tests' or the dev relay's state — never a global FLUSHDB.
+// cleanupInvocationKeys removes invocation-state and generation keys owned by
+// this test's unixnano-unique stream/group prefix. The SCAN MATCH patterns are
+// bounded to keys whose percent-encoded prefix matches this env's names, so they
+// never touch other tests' or the dev relay's state.
 func cleanupInvocationKeys(ctx context.Context, cli *redis.Client, prefix string) {
 	match := "relay:invocation:*" + encodeComponent(prefix) + "*"
 	var cursor uint64
@@ -326,14 +319,29 @@ func cleanupInvocationKeys(ctx context.Context, cli *redis.Client, prefix string
 		}
 		cursor = next
 	}
+	match = "relay:stream-group-generation:*" + encodeComponent(prefix) + "*"
+	cursor = 0
+	for {
+		keys, next, err := cli.Scan(ctx, cursor, match, 0).Result()
+		if err != nil {
+			break
+		}
+		if len(keys) > 0 {
+			_ = cli.Del(ctx, keys...).Err()
+		}
+		if next == 0 {
+			break
+		}
+		cursor = next
+	}
 }
 
-// cleanupEnvRedisKeys removes only the stream and invocation-state keys owned
-// by this env's stream/group pair. It is used by the deferred cleanup path,
-// where caller-provided stream/group names need not contain the generated env
-// prefix.
+// cleanupEnvRedisKeys removes only the stream, generation, and invocation-state
+// keys owned by this env's stream/group pair. It is used by the deferred cleanup
+// path, where caller-provided stream/group names need not contain the generated
+// env prefix.
 func cleanupEnvRedisKeys(ctx context.Context, cli *redis.Client, stream, group string) {
-	_ = cli.Del(ctx, stream).Err()
+	_ = cli.Del(ctx, stream, groupGenerationKey(stream, group)).Err()
 	keyPrefix := "relay:invocation:" + encodeComponent(stream) + ":" + encodeComponent(group) + ":"
 	var cursor uint64
 	for {
@@ -907,9 +915,9 @@ type ackCountingStore struct {
 	retainCalls    atomic.Int64
 }
 
-func (s *ackCountingStore) ackAndRetainTerminal(ctx context.Context, stream, group, msgID string, retention time.Duration) (terminalAckResult, error) {
+func (s *ackCountingStore) ackAndRetainTerminal(ctx context.Context, stream, group, msgID string, retention time.Duration, trackReceipt bool) (terminalAckResult, error) {
 	s.ackRetainCalls.Add(1)
-	return s.invocationStateStore.ackAndRetainTerminal(ctx, stream, group, msgID, retention)
+	return s.invocationStateStore.ackAndRetainTerminal(ctx, stream, group, msgID, retention, trackReceipt)
 }
 
 func (s *ackCountingStore) retainTerminal(ctx context.Context, stream, group, msgID string, retention time.Duration) error {
@@ -1418,8 +1426,8 @@ func TestIntegrationPerInvocationDLQXACKFailureRetryIsIdempotent(t *testing.T) {
 // for the malformed-message path end to end: the placeholder row was already
 // committed by a prior delivery whose XACK was lost, so a redelivery must NOT
 // insert a second row — the placeholder's stable ID (delivery + empty
-// invocation) makes the write idempotent without any Redis persistence marker.
-// The message is ACKed and its state terminal-retained.
+// invocation) makes the write idempotent. The successful retry retains terminal
+// state and its ACK receipt for settlement reconciliation.
 func TestIntegrationPlaceholderDLQXACKFailureRetryIsIdempotent(t *testing.T) {
 	testutil.RequireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
@@ -1468,10 +1476,11 @@ func TestIntegrationPlaceholderDLQXACKFailureRetryIsIdempotent(t *testing.T) {
 	if _, ok := e.pending()[id]; ok {
 		t.Fatalf("message %s should be acked on the idempotent retry", id)
 	}
-	// A malformed message never owned invocation state, so the ACK creates no
-	// hash (nothing to retain).
-	if exists, err := e.client.Exists(context.Background(), key).Result(); err != nil || exists != 0 {
-		t.Fatalf("a stateless malformed message must not create invocation state (exists=%d err=%v)", exists, err)
+	if terminal, err := e.client.HGet(context.Background(), key, terminalField).Result(); err != nil || terminal != "1" {
+		t.Fatalf("placeholder terminal marker = (%q, %v), want \"1\"", terminal, err)
+	}
+	if receipt, err := e.client.HGet(context.Background(), key, ackReceiptField).Result(); err != nil || receipt != "1" {
+		t.Fatalf("placeholder ACK receipt = (%q, %v), want \"1\"", receipt, err)
 	}
 }
 
@@ -2031,19 +2040,28 @@ func TestIntegrationConcurrentReplicasNoDuplicate(t *testing.T) {
 		if !ok {
 			return fmt.Errorf("no invocation state in ctx")
 		}
-		if started, _, _, _ := p.TryStart("fn/h", 5*time.Second); !started {
+		started, claim, _, _ := p.TryStart("fn/h", 5*time.Second)
+		if !started {
 			return ErrInvocationNotEligible
 		}
 		aCalls.Add(1)
 		close(deliveredA)
 		// Block until the test releases us, keeping the invocation in flight.
 		<-releaseA
+		// Mirror the runner: a successful handler persists completion before
+		// returning nil. Once complete, A's own ACK may be refused as foreign
+		// (B now owns the reclaimed PEL entry — the F-03 disposition), so the
+		// final resolution legitimately happens on B's terminal-skip
+		// redelivery below.
+		p.MarkComplete("fn/h", claim)
 		return nil
 	})
 	<-deliveredA
 
 	// Consumer B: reclaims the idle message while A's handler is still blocked.
-	// Its redelivery must skip the invocation while protected.
+	// Its redelivery must skip the invocation while protected, and once A has
+	// persisted completion it must resolve the message WITHOUT executing
+	// (mirroring the runner's all-complete success path).
 	envB := newEnv(t, ConsumerConfig{
 		Stream: stream, Group: group, Consumer: "conc-B",
 		MinPendingIdle:  150 * time.Millisecond,
@@ -2058,6 +2076,9 @@ func TestIntegrationConcurrentReplicasNoDuplicate(t *testing.T) {
 		if !ok {
 			return fmt.Errorf("no invocation state in ctx")
 		}
+		if p.IsComplete("fn/h") {
+			return nil
+		}
 		if started, _, _, _ := p.TryStart("fn/h", 5*time.Second); !started {
 			return ErrInvocationNotEligible
 		}
@@ -2071,9 +2092,11 @@ func TestIntegrationConcurrentReplicasNoDuplicate(t *testing.T) {
 		return bCalls.Load() == 0
 	})
 
-	// Release A's handler; it acks and the message leaves the PEL.
+	// Release A's handler; it persists completion, and the message leaves the
+	// PEL once the owning consumer's terminal-skip redelivery resolves it (A's
+	// own ACK is refused when B already owns the reclaimed entry).
 	close(releaseA)
-	testutil.WaitFor(t, 8*time.Second, "message acked by A (gone from PEL)", func() bool {
+	testutil.WaitFor(t, 8*time.Second, "message acked (gone from PEL)", func() bool {
 		_, ok := envA.pending()[id]
 		return !ok
 	})

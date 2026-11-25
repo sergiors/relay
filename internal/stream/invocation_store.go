@@ -12,23 +12,20 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// claimTokenBytes is the size of the crypto-random per-claim nonce. 16 bytes
-// (128 bits) makes a token collision between two independent claims
-// computationally impossible, which is what lets the token — not the attempt
-// number — be the authoritative claim identity. The token is opaque: it is never
-// logged, metricked, or written to the DLQ.
-const claimTokenBytes = 16
+const opaqueTokenBytes = 16
 
-// newClaimToken returns a fresh crypto-random claim token (lowercase hex). A
-// failure is returned (never a panic) so the caller can fail the claim closed:
-// the runner must leave the message pending and must NOT execute the handler on
-// an unverifiable claim.
-func newClaimToken() (string, error) {
-	var b [claimTokenBytes]byte
+func newOpaqueToken(purpose string) (string, error) {
+	var b [opaqueTokenBytes]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return "", fmt.Errorf("generate invocation claim token: %w", err)
+		return "", fmt.Errorf("generate %s token: %w", purpose, err)
 	}
 	return hex.EncodeToString(b[:]), nil
+}
+
+// newClaimToken returns a fresh opaque claim token. A failure is returned (never
+// a panic) so the caller can fail the claim closed.
+func newClaimToken() (string, error) {
+	return newOpaqueToken("invocation claim")
 }
 
 // scheduleStartOutcome classifies one evaluation of the schedule admission
@@ -179,17 +176,20 @@ func ttlMillis(d time.Duration) int64 {
 	return int64(d / time.Millisecond)
 }
 
-// terminalField is the reserved invocation-state hash field that marks a hash as
-// no longer recoverable: the message it belongs to has left the PEL (a
-// successful XACK on the success/obsolete/DLQ path, or a purged missing-payload
-// PEL reference), so ackAndRetainTerminal (or, without an ACK, retainTerminal)
-// switched the hash to terminal retention. While the field is present every
-// lifecycle script is inert: a stale transition from an in-memory delivery can
-// neither mutate the retained state nor remove the retention TTL (which would
-// resurrect an unrecoverable hash). Like classificationField and traceFieldPrefix
-// it cannot collide with a real invocation ID (a leading "__" is not a legal
-// app name).
+// terminalField records that this message's invocation disposition is final.
+// The ACK script stages it persistently before XACK, so it can remain present
+// while a failed ACK leaves the source in the PEL; ackReceiptField, not this
+// marker, proves ACK settlement. While terminalField is present, lifecycle
+// scripts are inert and cannot reopen a completed/exhausted invocation. Like
+// classificationField and traceFieldPrefix it cannot collide with a real
+// invocation ID (a leading "__" is not a legal app name).
 const terminalField = "__terminal"
+
+// ackReceiptField proves source settlement for DLQ reconciliation. It is also
+// added when re-ACKing an already-terminal hash that lacks a receipt. It shares
+// the invocation hash and its retention, so a missing body without this receipt
+// remains unknown.
+const ackReceiptField = "__ack_confirmed"
 
 // retentionTTLMillis returns the terminal retention TTL in integer milliseconds
 // for the PEXPIRE argument passed to the retain script. Zero means terminal
@@ -277,18 +277,69 @@ const (
 	kindExhausted
 )
 
+// deliveryDisposition classifies a source delivery after the atomic ACK script
+// inspected the group, PEL, and source entry. Only dispositionSettled may be
+// treated as acknowledged.
+type deliveryDisposition uint8
+
+const (
+	// dispositionUnknown means the body is gone and no ACK receipt proves
+	// settlement. Missing data is not success, so the delivery stays unresolved.
+	// It is the zero value so an uninitialized result is conservative.
+	dispositionUnknown deliveryDisposition = iota
+	// dispositionSettled means the delivery is resolved: it was pending under
+	// this consumer and removed, an extant body is past last-delivered, or a
+	// receipt proves a bodyless delivery was acknowledged.
+	dispositionSettled
+	// dispositionUnread means the recreated group has not delivered the entry
+	// yet (the body exists); it will be replayed, so it must not be ACKed.
+	dispositionUnread
+	// dispositionForeignOwner means the entry is pending under another consumer
+	// (a reclaim or another node's live delivery); it must not be ACKed.
+	dispositionForeignOwner
+	// dispositionStaleGeneration means another process recreated the group after
+	// this delivery was read or claimed; it must not be ACKed.
+	dispositionStaleGeneration
+)
+
+func (d deliveryDisposition) String() string {
+	switch d {
+	case dispositionSettled:
+		return "settled"
+	case dispositionUnread:
+		return "unread"
+	case dispositionForeignOwner:
+		return "foreign_owner"
+	case dispositionStaleGeneration:
+		return "stale_generation"
+	default:
+		return "unknown"
+	}
+}
+
 // terminalAckResult is the unambiguous outcome of ackAndRetainTerminal,
 // reported from ONE atomic operation: whether the message left the group PEL
 // and whether its invocation-state hash was switched to terminal retention.
 type terminalAckResult struct {
+	// Settled reports that the source delivery is knowingly resolved in the
+	// consumer group: XACK removed it, an extant body is past last-delivered, or
+	// an ACK receipt proves a bodyless delivery was previously acknowledged.
+	// false means the entry may still be replayed — unread because the group was
+	// recreated after this delivery was read, stale because its captured group
+	// token no longer matches, pending under another consumer, or unknown because
+	// the body is absent with no ACK receipt.
+	// The caller MUST leave it pending. A false Settled is never an error.
+	Settled bool
+	// Disposition explains a non-settled result and is dispositionSettled
+	// whenever Settled is true. It is diagnostic only: callers must key the
+	// control decision on Settled.
+	Disposition deliveryDisposition
 	// Removed is true when the XACK removed the message from the group PEL.
-	// false means the message was already not pending (an idempotent no-op),
-	// which is still a terminal disposition.
+	// false means the message was not pending at ACK time (already gone, or
+	// never delivered to the current group).
 	Removed bool
-	// Retained is true when the invocation-state hash existed and now carries
-	// the terminal marker (plus, when retention is enabled, the retention TTL).
-	// false means there was no hash to retain (a stateless message): the ACK
-	// still happened and no empty key was created.
+	// Retained is true when the invocation-state hash carries terminal state;
+	// DLQ-tracked ACKs also retain their ACK receipt in that hash.
 	Retained bool
 }
 
@@ -307,17 +358,39 @@ type invocationStateStore interface {
 	// missing-payload paths all acknowledge through it, never a separate
 	// XAck + retainTerminal pair.
 	//
-	// The terminal marker is staged (PERSISTent, no TTL) BEFORE the XACK and the
-	// retention TTL is applied only AFTER it, so a failed ACK never leaves an
-	// expiring TTL on a still-pending message. An absent hash is still
-	// acknowledged (no empty key is created); an already-terminal hash is an
-	// idempotent no-op. retention is the resolved window: >0 applies that
-	// PEXPIRE TTL, <=0 writes the marker but leaves the hash PERSISTENT.
+	// Terminal state is PERSISTed before XACK whenever the delivery is in the
+	// PEL, including an already-terminal replay, so a failed ACK never leaves
+	// expiring state on a pending message. After confirmed XACK, the script
+	// writes an ACK receipt only when trackReceipt is true or a terminal hash
+	// lacks its receipt, then starts retention afresh. Ordinary stateless ACKs
+	// create no hash. An already-settled no-op preserves a positive TTL;
+	// retention <=0 PERSISTs the settled hash.
+	// trackReceipt is set for DLQ disposition ACKs, including placeholder and
+	// missing-payload cases that may have unsettled rows to reconcile.
+	// The delivery's shared consumer-group generation must be bound in ctx; the
+	// script compares it before any terminal-state write, receipt, or XACK.
+	// Missing or stale generation metadata resolves as unsettled, never success.
 	//
-	// A returned error means the ACK did not resolve (a wrong-type state key
-	// refused before any write, or a Redis/transport failure): the caller MUST
-	// leave the message pending.
-	ackAndRetainTerminal(ctx context.Context, stream, group, msgID string, retention time.Duration) (terminalAckResult, error)
+	// The result's Settled distinguishes a resolved delivery from one that is
+	// still replayable: an entry that is not pending because the group was
+	// recreated at ID 0 (unread), is pending under another consumer, or is
+	// absent with no ACK receipt (unknown) is NOT acknowledged and
+	// gets no terminal retention, so the caller MUST leave it pending even
+	// though no error was returned.
+	//
+	// A returned error means the caller did not confirm the ACK (a wrong-type
+	// state key refused before any write, or a Redis/transport failure); a
+	// transport error may have happened after the script ran, so reconciliation
+	// uses the receipt to determine the outcome. The caller MUST leave the DLQ
+	// row unsettled. Only a confirmed NOGROUP means the group
+	// disappeared mid-flight and the shared recovery path must recreate it; any
+	// other error (WRONGTYPE, ACL, protocol) remains a generic failure.
+	ackAndRetainTerminal(
+		ctx context.Context,
+		stream, group, msgID string,
+		retention time.Duration,
+		trackReceipt bool,
+	) (terminalAckResult, error)
 	completed(ctx context.Context, stream, group, msgID, invocation string) (bool, error)
 	// tryStart atomically claims the invocation for a new execution when
 	// eligible. On success it returns (started=true, claim) where claim carries
@@ -547,24 +620,31 @@ func traceField(invocation string) string {
 //
 // The hash also carries reserved sibling fields that are never invocation IDs:
 // classificationField (the once-per-event classification claim), terminalField
-// (the terminal-retention marker), and one traceFieldPrefix field per invocation
-// (the last attempt's compact lineage).
+// (the final invocation disposition), ackReceiptField (confirmed DLQ source
+// settlement), and one traceFieldPrefix field per invocation (the last attempt's
+// compact lineage).
 //
 // Lifetime: while the message is still recoverable (present in the PEL and
-// therefore redeliverable) the hash is PERSISTENT — no TTL. Only once the
-// message has left the PEL (a successful atomic ACK on the success/obsolete/DLQ
-// path, or a purged missing-payload PEL reference) does the hash switch to
-// terminal retention (the configured invocation window): every ACK path does it
-// in the SAME script as the XACK (ackAndRetainTerminal), so no post-ACK orphan
-// window exists; a purged reference with no ACK to run uses retainTerminal. A
-// hash that never gets retained is leaked, never prematurely expired: safe by
-// construction.
+// therefore redeliverable) the hash is PERSISTENT — no TTL. The ACK script may
+// stage terminalField before XACK, but a failed ACK leaves it persistent and
+// writes no receipt. A confirmed DLQ ACK writes ackReceiptField and starts
+// terminal retention in the same script; ordinary stateless ACKs create no key.
+// A terminal replay without a receipt gains one when its ACK is confirmed. The
+// non-XACK missing-payload path retains its state without an ACK receipt; a
+// bodyless delivery without receipt remains unknown to settlement
+// reconciliation. A disabled (0) retention leaves terminal state and receipts
+// PERSISTENT (no expiry), never weakening stale transition guards.
 //
 // It is the stream layer's domain (Redis), but the runner decides which
 // invocations match, so the store is exposed to the runner through the
 // InvocationState interface carried in the delivery context.
 type invocationStore struct {
 	client *redis.Client
+	// consumer is this process's consumer name. The ACK script refuses to
+	// acknowledge a PEL entry owned by another consumer (another node's live
+	// delivery, or one this process reclaimed). It is empty for a store built
+	// directly (tests), which skips the owner check.
+	consumer string
 }
 
 // completed reports whether the invocation has already completed for this
@@ -1113,33 +1193,73 @@ func (store *invocationStore) exhaustedClaim(
 // the former bare XAck followed by a separate retainTerminal call, whose gap
 // could leak a persistent invocation hash once the message had already left the
 // PEL. The store shells out to a single EVAL, so the ACK and the
-// retention always take effect together (or, on a transport failure, neither
-// does).
+// retention take effect together when Redis confirms the script result. A
+// transport error can make the result ambiguous; the in-hash ACK receipt lets
+// later DLQ reconciliation distinguish a completed script from a failed one.
 func (store *invocationStore) ackAndRetainTerminal(
 	ctx context.Context,
 	stream,
 	group,
 	msgID string,
 	retention time.Duration,
+	trackReceipt bool,
 ) (terminalAckResult, error) {
+	generation, ok := deliveryGroupGeneration(ctx)
+	if !ok {
+		var err error
+		generation, err = readGroupGeneration(ctx, store.client, stream, group)
+		if err != nil {
+			return terminalAckResult{}, err
+		}
+	}
+	trackReceiptArg := int64(0)
+	if trackReceipt {
+		trackReceiptArg = 1
+	}
 	res, err := ackAndRetainTerminalScript.Run(ctx, store.client,
-		[]string{invocationStateKey(stream, group, msgID), stream},
+		[]string{
+			invocationStateKey(stream, group, msgID),
+			stream,
+			groupGenerationKey(stream, group),
+		},
 		group,
 		msgID,
 		terminalField,
 		retentionTTLMillis(retention),
+		store.consumer,
+		ackReceiptField,
+		trackReceiptArg,
+		generation,
 	).Slice()
 	if err != nil {
 		return terminalAckResult{}, err
 	}
-	if len(res) < 2 {
-		// The script always returns two elements; a short reply is a protocol
+	if len(res) < 3 {
+		// The script always returns three elements; a short reply is a protocol
 		// violation, so treat the outcome as unconfirmed rather than guess.
 		return terminalAckResult{}, fmt.Errorf("ackAndRetainTerminal: unexpected script reply of length %d", len(res))
 	}
+	status := toInt64(res[0])
+	var disposition deliveryDisposition
+	switch status {
+	case 0:
+		disposition = dispositionSettled
+	case 1:
+		disposition = dispositionUnread
+	case 2:
+		disposition = dispositionForeignOwner
+	case 3:
+		disposition = dispositionUnknown
+	case 4:
+		disposition = dispositionStaleGeneration
+	default:
+		return terminalAckResult{}, fmt.Errorf("ackAndRetainTerminal: unexpected status %d", status)
+	}
 	return terminalAckResult{
-		Removed:  toInt64(res[0]) == 1,
-		Retained: toInt64(res[1]) == 1,
+		Settled:     disposition == dispositionSettled,
+		Disposition: disposition,
+		Removed:     toInt64(res[1]) == 1,
+		Retained:    toInt64(res[2]) == 1,
 	}, nil
 }
 
@@ -1172,7 +1292,9 @@ func (store *invocationStore) retainTerminal(ctx context.Context, stream, group,
 // hash written by a pre-persistence Relay (or any legacy fixed-TTL write): a
 // message that sat pending longer than the old TTL would otherwise lose its
 // attempt/reclaim accounting on redelivery. It is a no-op for a missing hash and
-// for an already terminal-retained hash (retention must never be removed).
+// for an already terminal-retained hash unless the exact message is currently
+// in the PEL; a replayed terminal hash must be persistent until its ACK resolves.
+// A stale in-memory delivery with no PEL entry never revives terminal retention.
 //
 // An error is returned to the caller as a Redis-state failure, never swallowed:
 // the hash may still carry its old TTL and could expire mid-delivery, so the
@@ -1180,7 +1302,9 @@ func (store *invocationStore) retainTerminal(ctx context.Context, stream, group,
 // leaves the message pending so a later reclaim retries it.
 func (store *invocationStore) makeRecoverable(ctx context.Context, stream, group, msgID string) error {
 	_, err := makeRecoverableScript.Run(ctx, store.client,
-		[]string{invocationStateKey(stream, group, msgID)},
+		[]string{invocationStateKey(stream, group, msgID), stream},
+		group,
+		msgID,
 		terminalField,
 	).Int64()
 	return err

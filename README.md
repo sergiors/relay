@@ -63,6 +63,9 @@ behavior.
   that cause side effects should be idempotent.
 - Relay keeps messages pending while matched work is unresolved. It acknowledges
   only after all matched invocations succeed or are durably dead-lettered.
+- If the Redis consumer group is lost, Relay recreates it and replays the
+  entries still in the stream; work may run again and already-trimmed entries
+  cannot be recovered.
 - Unavailable apps and temporary capacity limits do not cause matching work to
   be acknowledged or consume a retry.
 - Schedule publication is deduplicated cluster-wide; handler execution still

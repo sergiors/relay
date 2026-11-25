@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"relay/internal/dlq"
+	"relay/internal/stream"
 )
 
 // dlqSettlementInterval is the fixed cadence of the bounded ACK/settlement
@@ -26,18 +27,31 @@ type dlqSettlementStore interface {
 	MarkDLQDeliverySettled(ctx context.Context, deliveryID string, settledAt time.Time) error
 }
 
-// deliveryPendingInspector is the broker side of reconciliation. The stream
-// package's DeliveryInspector is the production implementation.
-type deliveryPendingInspector interface {
-	Pending(ctx context.Context, source, group, messageID string) (bool, error)
+// deliveryInspector is the broker side of reconciliation. The stream package's
+// DeliveryInspector is the production implementation.
+type deliveryInspector interface {
+	Inspect(ctx context.Context, source, group, messageID string) (stream.DeliveryState, error)
 }
 
 // dlqSettlementTick performs one bounded reconciliation page starting strictly
 // after afterDeliveryID, then returns the cursor for the next tick. It asks the
-// broker whether each unsettled source delivery is still in its group's PEL. A
-// pending delivery is preserved. A delivery that is no longer pending is marked
-// settled, which is safe because the source ACK must already have succeeded (or
-// its ambiguous reply was lost after XACK).
+// broker for each unsettled source delivery's exact disposition and marks a row
+// settled ONLY on stream.DeliverySettled (an extant body is past the group's
+// last-delivered ID, or an ACK receipt proves a bodyless delivery was acked).
+//
+// Pending, unread, and unknown dispositions preserve the row. "Not pending" is
+// deliberately insufficient: an unread entry will be delivered again after a
+// group recreation, and an unknown disposition (absent body with no ACK receipt)
+// is missing data, not settlement. If receipt retention expires before
+// reconciliation, the row stays unsettled rather than inferring an ACK.
+//
+// There is an unavoidable ordering assumption between Redis and PostgreSQL: the
+// observation and the settlement mark are not atomic across the two systems. A
+// group recreation immediately after a settled observation can make the source
+// entry unread again, so a row may have been settled just before a legitimate
+// replay. That replay is at-least-once and re-inserts the same idempotent DLQ
+// row; settlement only governs admin removal and retention, never matching or
+// delivery.
 //
 // The cursor advances past every returned row, including pending and malformed
 // ones, so 100 permanently pending deliveries cannot starve later rows. When the
@@ -49,7 +63,7 @@ type deliveryPendingInspector interface {
 func dlqSettlementTick(
 	ctx context.Context,
 	store dlqSettlementStore,
-	inspector deliveryPendingInspector,
+	inspector deliveryInspector,
 	afterDeliveryID string,
 	now func() time.Time,
 	logger *slog.Logger,
@@ -68,7 +82,7 @@ func dlqSettlementTick(
 				"delivery_id", ref.DeliveryID)
 			continue
 		}
-		pending, err := inspector.Pending(ctx, ref.Source, ref.SourceGroup, ref.SourceMessageID)
+		state, err := inspector.Inspect(ctx, ref.Source, ref.SourceGroup, ref.SourceMessageID)
 		if err != nil {
 			logger.Warn("DLQ settlement: source delivery check failed; preserving unsettled rows",
 				"delivery_id", ref.DeliveryID,
@@ -76,9 +90,11 @@ func dlqSettlementTick(
 			)
 			continue
 		}
-		if pending {
-			logger.Debug("DLQ settlement: source delivery still recoverable; preserving",
-				"delivery_id", ref.DeliveryID)
+		if state != stream.DeliverySettled {
+			logger.Debug("DLQ settlement: source delivery is not knowingly settled; preserving",
+				"delivery_id", ref.DeliveryID,
+				"state", deliveryStateName(state),
+			)
 			continue
 		}
 		if err := store.MarkDLQDeliverySettled(ctx, ref.DeliveryID, now()); err != nil {
@@ -96,6 +112,21 @@ func dlqSettlementTick(
 	return refs[len(refs)-1].DeliveryID
 }
 
+// deliveryStateName renders a broker disposition as a fixed, low-cardinality
+// label for logs.
+func deliveryStateName(state stream.DeliveryState) string {
+	switch state {
+	case stream.DeliveryPending:
+		return "pending"
+	case stream.DeliveryUnread:
+		return "unread"
+	case stream.DeliverySettled:
+		return "settled"
+	default:
+		return "unknown"
+	}
+}
+
 // dlqSettlementLoop runs the bounded reconciliation until ctx is cancelled. It
 // performs one initial pass so an already-crashed settlement is repaired
 // promptly, then one pass per fixed interval. It owns no Redis or PostgreSQL
@@ -103,7 +134,7 @@ func dlqSettlementTick(
 func dlqSettlementLoop(
 	ctx context.Context,
 	store dlqSettlementStore,
-	inspector deliveryPendingInspector,
+	inspector deliveryInspector,
 	logger *slog.Logger,
 ) {
 	logger.Info("DLQ settlement: starting", "interval", dlqSettlementInterval, "batch", dlqSettlementBatch)
