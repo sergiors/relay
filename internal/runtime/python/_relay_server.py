@@ -13,6 +13,7 @@ a private container network; this port is never published.
 """
 
 import asyncio
+import importlib
 import sys
 import time
 
@@ -224,11 +225,55 @@ async def _handle_connection(reader, writer, admission, shutdown, secret):
             pass
 
 
+async def _shutdown_optional_dependencies():
+    """Best-effort cleanup for the optional Python SDK's container resources.
+
+    The SDK is not a runtime dependency, so an import failure simply means the
+    app did not use it. Cleanup runs on the container-lifetime loop before
+    asyncio.run closes it; an individual provider failure is reported and never
+    prevents the remaining cleanup or the container exit.
+    """
+    # A handler that never imported the SDK cannot own container dependencies.
+    # Do not import it merely to discover that there is nothing to clean up.
+    if "relay_runtime" not in sys.modules:
+        return
+
+    try:
+        module = importlib.import_module("relay_runtime.dependencies")
+    except ImportError:
+        return
+    except Exception as exc:
+        print(
+            f"execution channel: dependency cleanup unavailable: {exc}",
+            file=sys.stderr,
+        )
+        return
+
+    shutdown_cleanup = getattr(module, "_shutdown_container_dependencies", None)
+    if shutdown_cleanup is None:
+        return
+
+    try:
+        errors = await shutdown_cleanup()
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:
+        errors = [exc]
+
+    for error in errors:
+        print(
+            f"execution channel: dependency cleanup failed: {error}",
+            file=sys.stderr,
+        )
+
+
 async def runtime_loop(config: ExecutionConfig):
     """Bind the execution listener and run until the authenticated channel ends.
 
     The listener starts before any handler module is imported, so Relay's
-    handshake is also the container's readiness signal.
+    handshake is also the container's readiness signal. Container-scoped SDK
+    dependencies are closed after the channel ends, while the container's event
+    loop that created them is still running.
     """
     admission = ConnectionAdmission()
     shutdown = asyncio.Event()
@@ -239,5 +284,8 @@ async def runtime_loop(config: ExecutionConfig):
     server = await asyncio.start_server(
         handle_connection, host="0.0.0.0", port=config.port
     )
-    async with server:
-        await shutdown.wait()
+    try:
+        async with server:
+            await shutdown.wait()
+    finally:
+        await _shutdown_optional_dependencies()
