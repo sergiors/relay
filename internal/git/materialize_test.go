@@ -11,24 +11,12 @@ import (
 	"relay/internal/source"
 )
 
-// mustSelect resolves a selection rooted at root for dir, failing the test on
-// error. Tests use it to drive materialize with the shared policy explicitly.
-func mustSelect(t *testing.T, root, dir string) *source.Selection {
-	t.Helper()
-	selection, err := source.New(root, dir)
-	if err != nil {
-		t.Fatalf("select %q under %q: %v", dir, root, err)
-	}
-	return selection
-}
-
-// TestSelectMissingSourceDir pins that a Selection cannot be built for a source
-// directory that is absent from the checkout; the error is the clear
-// missing-source message the sync surfaces (sync.go maps source.ErrNotExist to the
-// same wording).
+// TestSelectMissingSourceDir pins that an app selection cannot be built for a
+// source directory that is absent from the checkout; the error is the clear
+// missing-source message the sync surfaces.
 func TestSelectMissingSourceDir(t *testing.T) {
 	src := filepath.Join(t.TempDir(), "does-not-exist")
-	_, err := source.New(t.TempDir(), src)
+	_, err := source.ForDir(src)
 	if err == nil {
 		t.Fatal("select of missing source: nil error, want missing-source error")
 	}
@@ -37,28 +25,47 @@ func TestSelectMissingSourceDir(t *testing.T) {
 	}
 }
 
-// TestMaterializeMissingSourceRace pins the TOCTOU guard: if the source dir
-// vanishes between Selection construction and the materialize read, materialize
-// returns the clear missing-source error and leaves /apps untouched (even a
-// pre-existing dir is NOT removed, so a failed sync cannot erase valid apps).
-func TestMaterializeMissingSourceRace(t *testing.T) {
+// TestMaterializeMissingSourceLeavesLiveAppsUntouched pins fail-closed behavior:
+// when the source directory is absent, materialization errors without removing
+// an existing app from /apps.
+func TestMaterializeMissingSourceLeavesLiveAppsUntouched(t *testing.T) {
 	funcs := t.TempDir()
 	src := filepath.Join(t.TempDir(), "src")
 	if err := os.MkdirAll(src, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	selection := mustSelect(t, src, src)
 	if err := os.RemoveAll(src); err != nil {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(funcs, "keep", "template.yaml"), "runtime: node\n")
-	if _, _, err := materialize(selection, funcs); err == nil {
+	if _, _, err := materialize(src, funcs); err == nil {
 		t.Fatal("materialize of vanished source: nil error, want missing-source error")
 	} else if !strings.Contains(err.Error(), "does not exist in the checkout") {
 		t.Fatalf("err = %v, want clear missing-source message", err)
 	}
 	if _, serr := os.Stat(filepath.Join(funcs, "keep")); serr != nil {
 		t.Fatalf("missing-source materialize removed an existing function dir: %v", serr)
+	}
+}
+
+func TestMaterializeSelectionErrorHasGitContext(t *testing.T) {
+	src := t.TempDir()
+	appDir := filepath.Join(src, "broken")
+	writeFile(t, filepath.Join(appDir, "template.yaml"), "runtime: node\n")
+	if err := os.Mkdir(filepath.Join(appDir, ".gitignore"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := materialize(src, t.TempDir())
+	if err == nil {
+		t.Fatal("materialize with an unreadable app selection: nil error")
+	}
+	if !strings.Contains(err.Error(), `git: select app dir "broken": source: read`) {
+		t.Fatalf("err = %v, want git app-selection context", err)
+	}
+	var pathErr *os.PathError
+	if !errors.As(err, &pathErr) {
+		t.Fatalf("err = %v, want wrapped filesystem error", err)
 	}
 }
 
@@ -69,7 +76,7 @@ func TestMaterializeEmptySourceClearsStale(t *testing.T) {
 	}
 	funcs := t.TempDir()
 	writeFile(t, filepath.Join(funcs, "stale", "template.yaml"), "runtime: node\n")
-	mat, rem, err := materialize(mustSelect(t, src, src), funcs)
+	mat, rem, err := materialize(src, funcs)
 	if err != nil {
 		t.Fatalf("materialize empty source: %v", err)
 	}
@@ -89,7 +96,7 @@ func TestMaterializeDiscoveryIgnoresNonApps(t *testing.T) {
 	writeFile(t, filepath.Join(src, "valid", "template.yaml"), "runtime: node\n")
 	writeFile(t, filepath.Join(src, "notadir.txt"), "x\n")
 	writeFile(t, filepath.Join(src, "nofn", "readme.md"), "not a function\n")
-	names, err := discoverApps(mustSelect(t, src, src))
+	names, err := discoverApps(src)
 	if err != nil {
 		t.Fatalf("discoverApps: %v", err)
 	}
@@ -111,7 +118,7 @@ func TestDiscoverAppsRejectsSymlinkedTemplate(t *testing.T) {
 		t.Skipf("symlink unsupported: %v", err)
 	}
 
-	if names, err := discoverApps(mustSelect(t, src, src)); err == nil {
+	if names, err := discoverApps(src); err == nil {
 		t.Fatalf("discoverApps = %v, want an error for a symlinked template", names)
 	} else if !errors.Is(err, app.ErrInvalidPath) {
 		t.Fatalf("discoverApps error = %v, want ErrInvalidPath", err)
@@ -136,7 +143,7 @@ func TestDiscoverAppsSkipsSymlinkEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	names, err := discoverApps(mustSelect(t, src, src))
+	names, err := discoverApps(src)
 	if err != nil {
 		t.Fatalf("discoverApps: %v", err)
 	}
@@ -161,7 +168,7 @@ func TestMaterializeDoesNotRemoveStagingDir(t *testing.T) {
 	// A genuinely stale app directory.
 	writeFile(t, filepath.Join(funcs, "stale", "template.yaml"), "runtime: nodejs24.x\n")
 
-	mat, rem, err := materialize(mustSelect(t, src, src), funcs)
+	mat, rem, err := materialize(src, funcs)
 	if err != nil {
 		t.Fatalf("materialize: %v", err)
 	}
@@ -179,13 +186,12 @@ func TestMaterializeDoesNotRemoveStagingDir(t *testing.T) {
 	}
 }
 
-// TestMaterializeHonorsIgnoreRules proves the shared policy drives
-// materialization: an app directory excluded by the source root's
-// .gitignore is not copied, while an included sibling is; and a .gitignore
-// inside the app travels with it so the build context and fingerprint can
-// keep applying the same rules against /apps. Ignored files inside the
-// app are not copied either.
-func TestMaterializeHonorsIgnoreRules(t *testing.T) {
+// TestMaterializeHonorsAppIgnoreRules proves the app's own policy drives
+// materialization: its .gitignore travels with it so the build context and
+// fingerprint can keep applying the same rules against /apps, and files it
+// ignores are not copied. A sibling directory named by a CHECKOUT-ROOT rule is
+// still an app because ancestor rules never apply.
+func TestMaterializeHonorsAppIgnoreRules(t *testing.T) {
 	src := t.TempDir()
 	writeFile(t, filepath.Join(src, ".gitignore"), "ignored/\n")
 	writeFile(t, filepath.Join(src, "keep", "template.yaml"), "runtime: nodejs24.x\n")
@@ -195,18 +201,18 @@ func TestMaterializeHonorsIgnoreRules(t *testing.T) {
 	writeFile(t, filepath.Join(src, "ignored", "template.yaml"), "runtime: nodejs24.x\n")
 
 	funcs := t.TempDir()
-	mat, rem, err := materialize(mustSelect(t, src, src), funcs)
+	mat, rem, err := materialize(src, funcs)
 	if err != nil {
 		t.Fatalf("materialize: %v", err)
 	}
-	if len(mat) != 1 || mat[0] != "keep" {
-		t.Fatalf("materialized = %v, want [keep] (ignored/ is excluded)", mat)
+	if len(mat) != 2 || mat[0] != "ignored" || mat[1] != "keep" {
+		t.Fatalf("materialized = %v, want [ignored keep] (ancestor rule must not hide an app)", mat)
 	}
 	if len(rem) != 0 {
 		t.Fatalf("removed = %v, want none", rem)
 	}
-	if _, err := os.Stat(filepath.Join(funcs, "ignored")); !os.IsNotExist(err) {
-		t.Fatalf("ignored function dir was materialized; stat err = %v", err)
+	if _, err := os.Stat(filepath.Join(funcs, "ignored", "template.yaml")); err != nil {
+		t.Fatalf("app hidden by a checkout-root rule was not materialized: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(funcs, "keep", "template.yaml")); err != nil {
 		t.Fatalf("included function not materialized: %v", err)
@@ -214,8 +220,8 @@ func TestMaterializeHonorsIgnoreRules(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(funcs, "keep", "handler.js")); err != nil {
 		t.Fatalf("included source missing: %v", err)
 	}
-	// The app's own policy travels with it and its rules exclude the
-	// ignored file from the copy.
+	// The app's own policy travels with it and its rules exclude the ignored
+	// file from the copy.
 	if _, err := os.Stat(filepath.Join(funcs, "keep", ".gitignore")); err != nil {
 		t.Fatalf("applicable .gitignore not materialized with the function: %v", err)
 	}
@@ -224,34 +230,39 @@ func TestMaterializeHonorsIgnoreRules(t *testing.T) {
 	}
 }
 
-// TestMaterializeAnchorsRootIgnoreRules proves a root-level .gitignore governs a
-// monorepo subtree selection: a rule anchored at the checkout root excludes a
-// path beneath the selected subtree, exactly as git would apply it.
-func TestMaterializeAnchorsRootIgnoreRules(t *testing.T) {
+// TestMaterializeIgnoresAncestorIgnoreRules proves a checkout-root or monorepo
+// ancestor .gitignore never shapes an app's copied source: even rules matching
+// the app directory, its files, and its template do not exclude them, and no
+// ancestor file is copied or merged into the app.
+func TestMaterializeIgnoresAncestorIgnoreRules(t *testing.T) {
 	root := t.TempDir()
-	writeFile(t, filepath.Join(root, ".gitignore"), "*.generated\n")
+	writeFile(t, filepath.Join(root, ".gitignore"), "*.generated\nservices/\n")
 	sub := filepath.Join(root, "services")
 	writeFile(t, filepath.Join(sub, "funa", "template.yaml"), "runtime: nodejs24.x\n")
 	writeFile(t, filepath.Join(sub, "funa", "handler.generated"), "generated\n")
 	writeFile(t, filepath.Join(sub, "funa", "handler.js"), "export const x=1;\n")
 
 	funcs := t.TempDir()
-	mat, _, err := materialize(mustSelect(t, root, sub), funcs)
+	mat, _, err := materialize(sub, funcs)
 	if err != nil {
 		t.Fatalf("materialize: %v", err)
 	}
 	if len(mat) != 1 || mat[0] != "funa" {
 		t.Fatalf("materialized = %v, want [funa]", mat)
 	}
-	if _, err := os.Stat(filepath.Join(funcs, "funa", "handler.generated")); !os.IsNotExist(err) {
-		t.Fatalf("root-anchored ignore rule did not exclude the file; stat err = %v", err)
+	if _, err := os.Stat(filepath.Join(funcs, "funa", "handler.generated")); err != nil {
+		t.Fatalf("ancestor ignore rule excluded an app file: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(funcs, "funa", "template.yaml")); err != nil {
+		t.Fatalf("ancestor ignore rule excluded the app template: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(funcs, "funa", "handler.js")); err != nil {
 		t.Fatalf("included source missing: %v", err)
 	}
-	// The root policy is carried into the app so a later fingerprint and
-	// build context retain the same applicable policy after sync.
-	if _, err := os.Stat(filepath.Join(funcs, "funa", ".gitignore")); err != nil {
-		t.Fatalf("ancestor .gitignore was not preserved: %v", err)
+	if _, err := os.Stat(filepath.Join(funcs, "funa", ".gitignore")); !os.IsNotExist(err) {
+		t.Fatalf("ancestor policy was copied into the app; stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(funcs, ".gitignore")); !os.IsNotExist(err) {
+		t.Fatalf("ancestor policy leaked into the apps root; stat err = %v", err)
 	}
 }

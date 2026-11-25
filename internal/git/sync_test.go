@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 
 	"relay/internal/app"
+	"relay/internal/source"
 )
 
 // mustSync runs a sync against the test env's bare remote and fails the test on
@@ -328,13 +330,13 @@ func TestMonorepoSync(t *testing.T) {
 	}
 }
 
-// TestSyncHonorsGitignore pins end-to-end ignore handling: an app source
-// file excluded by .gitignore is NOT materialized, while the app's own
-// .gitignore is. The excluded file IS committed (go-git does not filter ignored
-// files from the index — verified by the fixture's explicit Add), so it truly
-// exists in the checkout: the exclusion is the shared source-selection policy,
+// TestSyncHonorsAppGitignoreOnly pins end-to-end ignore handling: an app source
+// file excluded by the app's own .gitignore is NOT materialized, while that
+// .gitignore is, and a checkout-root .gitignore does not affect the app at all.
+// The files are committed (go-git's explicit Add includes them), so they truly
+// exist in the checkout: the outcome is the app-local source-selection policy,
 // not the file's absence from git.
-func TestSyncHonorsGitignore(t *testing.T) {
+func TestSyncHonorsAppGitignoreOnly(t *testing.T) {
 	e := fixture(t, false)
 
 	r, err := git.PlainOpen(e.work)
@@ -368,9 +370,10 @@ func TestSyncHonorsGitignore(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(e.apps, "fn", "handler.js")); err != nil {
 		t.Fatalf("included source not materialized: %v", err)
 	}
-	// The root rule excludes debug.log; the app rule excludes scratch.tmp.
-	if _, err := os.Stat(filepath.Join(e.apps, "fn", "debug.log")); !os.IsNotExist(err) {
-		t.Fatalf("root .gitignore rule not applied during materialization; stat err = %v", err)
+	// The app rule excludes scratch.tmp; the checkout-root rule must not exclude
+	// debug.log because ancestor rules never apply to an app's source.
+	if _, err := os.Stat(filepath.Join(e.apps, "fn", "debug.log")); err != nil {
+		t.Fatalf("ancestor .gitignore rule incorrectly excluded an app file: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(e.apps, "fn", "scratch.tmp")); !os.IsNotExist(err) {
 		t.Fatalf("function .gitignore rule not applied during materialization; stat err = %v", err)
@@ -380,10 +383,135 @@ func TestSyncHonorsGitignore(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(e.apps, "fn", ".gitignore")); err != nil {
 		t.Fatalf("function .gitignore not materialized with the function: %v", err)
 	}
-	// The root .gitignore lives outside the app dir and is not copied.
+	// The root .gitignore lives outside the app dir and is never merged in.
 	if _, err := os.Stat(filepath.Join(e.apps, ".gitignore")); err == nil {
 		t.Fatal("root .gitignore must not be copied into the materialized function")
 	}
+}
+
+// TestMaterializedAppMatchesLocalEquivalent pins that a Git-materialized app
+// source is indistinguishable from the equivalent locally managed app: the same
+// selected file set, the same bytes, the same policy, and therefore the same
+// fingerprint. The checkout carries the app's FULL tree — including files the
+// policy excludes — plus a hostile checkout-root .gitignore naming the app, its
+// handler, and a generated file; the local equivalent carries that same full
+// tree under its own hostile ancestor .gitignore. Neither ancestor may fold
+// into identity: ancestor rules never apply, and the app's own rules (negation,
+// anchored, directory exclusion) decide the selected set on both sides.
+func TestMaterializedAppMatchesLocalEquivalent(t *testing.T) {
+	e := fixture(t, false)
+
+	r, err := git.PlainOpen(e.work)
+	if err != nil {
+		t.Fatalf("open work: %v", err)
+	}
+	wt, err := r.Worktree()
+	if err != nil {
+		t.Fatalf("worktree: %v", err)
+	}
+
+	appFiles := []struct{ rel, content string }{
+		{".gitignore", "*.tmp\n!keep.tmp\n/root-only.txt\nbuild/\n"},
+		{"template.yaml", fixtureTemplate},
+		{"handler.js", "export function h(event, context){}\n"},
+		{"handler.generated", "generated\n"},
+		{"debug.log", "noise\n"},
+		{"keep.tmp", "keep\n"},
+		{"scratch.tmp", "noise\n"},
+		{"root-only.txt", "root\n"},
+		{"nested/root-only.txt", "nested\n"},
+		{"build/out.js", "export const out = 1;\n"},
+	}
+	// Hostile checkout-root policy naming the app itself and files it selects.
+	writeFile(t, filepath.Join(e.work, ".gitignore"), "*.log\n*.generated\nfn/\n")
+	staged := []string{".gitignore"}
+	for _, f := range appFiles {
+		writeFile(t, filepath.Join(e.work, "fn", filepath.FromSlash(f.rel)), f.content)
+		staged = append(staged, filepath.Join("fn", filepath.FromSlash(f.rel)))
+	}
+	for _, p := range staged {
+		if _, err := wt.Add(p); err != nil {
+			t.Fatalf("add %s: %v", p, err)
+		}
+	}
+	commit(t, wt, "app policy and full tree")
+	h, _ := r.Head()
+	mustSetRef(t, r, "refs/heads/main", h.Hash())
+	seedBare(t, e)
+
+	mustSync(t, e, Config{Repository: "git@github.com:acme/r.git", Ref: "main"})
+
+	materialized := filepath.Join(e.apps, "fn")
+	// The app's own policy decided the materialized set: excluded files are
+	// absent, everything the policy selects (including files only an ANCESTOR
+	// rule would exclude, and the negation re-inclusion) is present.
+	for _, absent := range []string{"scratch.tmp", "root-only.txt", "build"} {
+		if _, err := os.Stat(filepath.Join(materialized, filepath.FromSlash(absent))); !os.IsNotExist(err) {
+			t.Fatalf("%q must be excluded by the app policy; stat err = %v", absent, err)
+		}
+	}
+	for _, present := range []string{
+		".gitignore", "template.yaml", "handler.js", "handler.generated",
+		"debug.log", "keep.tmp", "nested/root-only.txt",
+	} {
+		if _, err := os.Stat(filepath.Join(materialized, filepath.FromSlash(present))); err != nil {
+			t.Fatalf("%q must be materialized source: %v", present, err)
+		}
+	}
+
+	// The equivalent locally managed source: the checkout's full app tree under
+	// a DIFFERENT (also hostile) ancestor policy.
+	localRoot := t.TempDir()
+	writeFile(t, filepath.Join(localRoot, ".gitignore"), "*.js\ntemplate.yaml\nfn/\n")
+	for _, f := range appFiles {
+		writeFile(t, filepath.Join(localRoot, "fn", filepath.FromSlash(f.rel)), f.content)
+	}
+	matFP, err := app.Fingerprint(materialized)
+	if err != nil {
+		t.Fatalf("fingerprint materialized: %v", err)
+	}
+	localFP, err := app.Fingerprint(filepath.Join(localRoot, "fn"))
+	if err != nil {
+		t.Fatalf("fingerprint local: %v", err)
+	}
+	if matFP != localFP {
+		t.Fatalf("materialized fingerprint = %q, local equivalent = %q: "+
+			"the same app source under different ancestors must fingerprint identically\n"+
+			"materialized selected = %v\nlocal selected = %v",
+			matFP, localFP,
+			selectedContents(t, materialized), selectedContents(t, filepath.Join(localRoot, "fn")))
+	}
+}
+
+// selectedContents resolves dir's selection and returns every selected
+// regular file's slash path -> content, for diagnosing selection drift
+// between two trees.
+func selectedContents(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	selection, err := source.ForDir(dir)
+	if err != nil {
+		t.Fatalf("select %q: %v", dir, err)
+	}
+	out := map[string]string{}
+	err = selection.WalkDir(func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		b, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return rerr
+		}
+		rel, rerr := selection.Rel(path)
+		if rerr != nil {
+			return rerr
+		}
+		out[rel] = string(b)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %q: %v", dir, err)
+	}
+	return out
 }
 
 // TestSyncLoadsAppLoader verifies the materialized output loads cleanly

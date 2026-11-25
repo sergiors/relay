@@ -164,10 +164,10 @@ func FingerprintSelection(selection *source.Selection) (string, error) {
 }
 
 // snapshotEntry is one entry collected from a selection: its canonical
-// root-relative path and filesystem path, its selected-directory-relative stage
-// path, its mode, and whether it is a directory. It is the intermediate the
-// streaming fingerprinter and the capturing snapshot share, so both see exactly
-// the same selection and ordering.
+// selected-directory-relative path and filesystem path, its stage path, its mode,
+// and whether it is a directory. It is the intermediate the streaming
+// fingerprinter and the capturing snapshot share, so both see exactly the same
+// selection and ordering.
 type snapshotEntry struct {
 	rel      string
 	path     string
@@ -177,11 +177,11 @@ type snapshotEntry struct {
 }
 
 // collectSelectionEntries walks the resolved selection once and returns every
-// selected entry in canonical root-relative order. It is the single definition of
-// "which files are source and in what order" shared by FingerprintSelection and
-// CaptureSourceSnapshot, so the digest and the staged context can never select
-// differently. Applicable ignore files ABOVE the selected directory are included
-// (they affect selection) with an empty stageRel.
+// selected entry in canonical directory-relative order. It is the single
+// definition of "which files are source and in what order" shared by
+// FingerprintSelection and CaptureSourceSnapshot, so the digest and the staged
+// context can never select differently. The app's own and nested applicable
+// .gitignore files are included as ordinary source by the walk.
 func collectSelectionEntries(selection *source.Selection) ([]snapshotEntry, error) {
 	if selection == nil {
 		return nil, fmt.Errorf("collect source entries: nil selection")
@@ -216,26 +216,12 @@ func collectSelectionEntries(selection *source.Selection) ([]snapshotEntry, erro
 		return nil, fmt.Errorf("walk %q: %w", dir, err)
 	}
 
-	// A subtree walk cannot visit policy files ABOVE the selected directory, but
-	// those files still affect the selected source and must be versioned. They are
-	// fingerprinted but never staged: they live outside the image.
-	for _, path := range selection.ApplicableIgnoreFiles() {
-		rel, rerr := selection.Rel(path)
-		if rerr != nil || rel == "." || seen[rel] {
-			continue
-		}
-		seen[rel] = true
-		entries = append(entries, snapshotEntry{
-			rel: rel, path: path, mode: 0o644,
-		})
-	}
-
 	sort.Slice(entries, func(i, j int) bool { return entries[i].rel < entries[j].rel })
 	return entries, nil
 }
 
-// templateRelFor returns the root-relative path of the selected directory's own
-// template.yaml, or "" when the selection has none. Only that file has its
+// templateRelFor returns the directory-relative path of the selected directory's
+// own template.yaml, or "" when the selection has none. Only that file has its
 // top-level `resources` mapping stripped before hashing; a nested template.yaml
 // is ordinary source.
 func templateRelFor(selection *source.Selection) string {
@@ -292,14 +278,12 @@ const snapshotRootPattern = "relay-build-*"
 // SourceSnapshot's private root (see Root), so a whole selected tree is never
 // held in memory.
 type SnapshotEntry struct {
-	// Rel is the entry's ROOT-relative slash path: the canonical path the
-	// fingerprint frames entries with (so the serialization is independent of how
-	// the walk produced absolute paths and independent of the selected subtree).
+	// Rel is the entry's SELECTED-DIRECTORY-relative slash path: the canonical
+	// path the fingerprint frames entries with (so the serialization is
+	// independent of how the walk produced absolute paths).
 	Rel string
-	// StageRel is the entry's SELECTED-DIRECTORY-relative slash path: the path
-	// the build context stages it at. It is empty when the entry is a policy file
-	// above the selected directory (an ancestor .gitignore), which participates in
-	// the fingerprint but is not part of the image.
+	// StageRel is the path the build context stages the entry at, also relative
+	// to the selected directory. Every captured entry lies inside that directory.
 	StageRel string
 	// Mode is the entry's file mode at capture time.
 	Mode fs.FileMode
@@ -345,10 +329,10 @@ type SourceSnapshot struct {
 // never disagree.
 //
 // Selection policy is preserved exactly: ignored files and .git are never
-// captured; an applicable ancestor .gitignore is fingerprinted but not staged;
-// template.yaml is fingerprinted but excluded from the build context by base name
-// anywhere in the tree (with its subtree when it is a directory); a non-regular
-// entry is fingerprinted but never staged.
+// captured; the app's own and nested applicable .gitignore files are captured
+// like other source; template.yaml is fingerprinted but excluded from the build
+// context by base name anywhere in the tree (with its subtree when it is a
+// directory); a non-regular entry is fingerprinted but never staged.
 //
 // Any read error is surfaced and the private root is removed: a caller must never
 // build an image from a tree it could not fully capture, because that would bake
@@ -498,11 +482,10 @@ func (s *SourceSnapshot) Fingerprint() string {
 	return s.fingerprint
 }
 
-// Entries returns the captured entry metadata in canonical root-relative order.
-// The returned slice must not be mutated; entries with an empty StageRel are
-// policy files outside the selected tree and are not part of the build context.
-// A directory literally named template.yaml is present as metadata but its
-// subtree is not staged.
+// Entries returns the captured entry metadata in canonical
+// selected-directory-relative order. The returned slice must not be mutated;
+// StageRel is relative to the selected directory. A directory literally named
+// template.yaml is present as metadata but its subtree is not staged.
 func (s *SourceSnapshot) Entries() []SnapshotEntry {
 	if s == nil {
 		return nil
@@ -550,7 +533,7 @@ func underStageDir(rel string, prefixes []string) bool {
 }
 
 // stagedRel returns path's path relative to the selected directory dir as a slash
-// path, or "" when it lies outside dir (an ancestor policy file).
+// path, or "" when it lies outside dir.
 func stagedRel(dir, path string) string {
 	rel, err := filepath.Rel(dir, path)
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {

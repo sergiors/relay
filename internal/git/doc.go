@@ -20,10 +20,12 @@
 // source is configured and a sync has run, /apps is treated as fully managed by
 // git: a sync rewrites it to reflect exactly the configured repository/path,
 // removing any directory it does not contain (the "deterministic replace"
-// rule). Source selection honors .gitignore rules via the shared internal/source
-// policy: an ignored app directory is not materialized and an ignored file
-// inside an app is not copied, while the applicable .gitignore files themselves
-// are copied (they are the policy). See Sync's documentation and
+// rule). Source selection honors each app's OWN .gitignore rules via the shared
+// internal/source policy: an ignored file inside an app is not copied, while the
+// app's own and nested applicable .gitignore files are copied (they are the
+// policy). Ignore files above the app directory never apply: a repository-root,
+// monorepo, or checkout-level rule cannot hide an app or alter its copied source,
+// and is never copied or merged into it. See Sync's documentation and
 // docs/operations.md "Git" for the precise contract.
 //
 // Materialization is staged before it is committed. Every desired app tree is

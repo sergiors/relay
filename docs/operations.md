@@ -197,7 +197,10 @@ Add the public key from `git keygen` to the repository as a read-only deploy key
 `git set` saves the SSH repository and optional ref, app path, and webhook secret;
 it does not deploy apps. Run `git sync` to deploy the latest revision from the
 configured ref to `/apps`. It removes apps no longer present in the selected
-source, so review the repository and path before syncing.
+source, so review the repository and path before syncing. Each app's source is
+scoped to its own directory: a `.gitignore` above the app (for example at the
+repository root) does not exclude the app or any of its files. See
+[Apps](apps.md) for source-selection details.
 Changing or removing the Git source on a running worker requires restarting it.
 
 Relay verifies SSH host keys using its managed `known_hosts` file and does not

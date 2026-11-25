@@ -304,28 +304,27 @@ func TestFingerprintTracksIgnoreRuleContent(t *testing.T) {
 	}
 }
 
-func TestFingerprintTracksAncestorIgnoreAfterSubselection(t *testing.T) {
+// TestFingerprintIgnoresAncestorIgnoreRules pins that an app fingerprint is
+// self-contained: a checkout-root or monorepo-parent .gitignore neither hides an
+// app file nor contributes policy bytes. Editing it cannot change the digest,
+// and a file its pattern matches remains source.
+func TestFingerprintIgnoresAncestorIgnoreRules(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "services", "fn")
-	writeFile(t, filepath.Join(root, ".gitignore"), "*.generated\n")
+	writeFile(t, filepath.Join(root, ".gitignore"), "*.generated\nservices/\n")
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\n")
 	writeFile(t, filepath.Join(dir, "handler.js"), "export const x = 1\n")
+	writeFile(t, filepath.Join(dir, "handler.generated"), "generated v1\n")
+	base := fp(t, dir)
 
-	selection, err := source.New(root, dir)
-	if err != nil {
-		t.Fatalf("select: %v", err)
+	writeFile(t, filepath.Join(root, ".gitignore"), "*.generated\nservices/\nchanged-policy\n")
+	if got := fp(t, dir); got != base {
+		t.Fatal("ancestor ignore content must not affect an app fingerprint")
 	}
-	before, err := FingerprintSelection(selection)
-	if err != nil {
-		t.Fatalf("before: %v", err)
-	}
-	writeFile(t, filepath.Join(root, ".gitignore"), "*.generated\nchanged-policy\n")
-	after, err := FingerprintSelection(selection)
-	if err != nil {
-		t.Fatalf("after: %v", err)
-	}
-	if before == after {
-		t.Fatal("ancestor ignore content must affect a subtree fingerprint")
+
+	writeFile(t, filepath.Join(dir, "handler.generated"), "generated v2\n")
+	if got := fp(t, dir); got == base {
+		t.Fatal("a file matched only by an ancestor rule must remain source")
 	}
 }
 
@@ -555,9 +554,9 @@ func oldFingerprintSelection(t *testing.T, selection *source.Selection) string {
 
 // TestFingerprintSelectionMatchesOldReadFileAlgorithm pins byte-for-byte
 // compatibility with the previous os.ReadFile implementation across a multi-file
-// tree that exercises directories, an applicable ANCESTOR .gitignore (policy
-// above the selected directory), a nested .gitignore, ignored files, and the
-// top-level resources strip. A different digest would be a silent identity break.
+// tree that exercises directories, an app-local .gitignore, a nested .gitignore,
+// ignored files, an ANCESTOR .gitignore that must not apply, and the top-level
+// resources strip. A different digest would be a silent identity break.
 func TestFingerprintSelectionMatchesOldReadFileAlgorithm(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "services", "fn")
@@ -567,10 +566,10 @@ func TestFingerprintSelectionMatchesOldReadFileAlgorithm(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e, context): return 1\n")
 	writeFile(t, filepath.Join(dir, "pkg", "mod.py"), "x = 1\n")
 	writeFile(t, filepath.Join(dir, "pkg", "sub", "deep.py"), "y = 2\n")
-	writeFile(t, filepath.Join(dir, "scratch.tmp"), "ignored by nested rule\n")
-	writeFile(t, filepath.Join(dir, "noise.generated"), "ignored by ancestor rule\n")
+	writeFile(t, filepath.Join(dir, "scratch.tmp"), "ignored by app-local rule\n")
+	writeFile(t, filepath.Join(dir, "noise.generated"), "must remain source despite ancestor rule\n")
 
-	selection, err := source.New(root, dir)
+	selection, err := source.ForDir(dir)
 	if err != nil {
 		t.Fatalf("select: %v", err)
 	}

@@ -67,15 +67,16 @@ func TestSnapshotIsImmutableAcrossMutation(t *testing.T) {
 // stager relies on: every entry below the selected directory carries a non-empty
 // selected-directory-relative StageRel, a regular file is staged at its StageRel
 // under the snapshot's private root, a directory entry is flagged, and an
-// ancestor policy file is fingerprinted with an EMPTY StageRel (never staged).
+// ANCESTOR policy file is neither fingerprinted nor staged.
 func TestSnapshotEntriesCarryStageRelAndContent(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "fn")
 	writeFile(t, filepath.Join(root, ".gitignore"), "*.generated\n")
+	writeFile(t, filepath.Join(dir, ".gitignore"), "*.log\n")
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\n")
 	writeFile(t, filepath.Join(dir, "sub", "helper.js"), "export const x = 1\n")
 
-	selection, err := source.New(root, dir)
+	selection, err := source.ForDir(dir)
 	if err != nil {
 		t.Fatalf("select: %v", err)
 	}
@@ -89,7 +90,7 @@ func TestSnapshotEntriesCarryStageRelAndContent(t *testing.T) {
 	for _, e := range snapshot.Entries() {
 		byRel[e.Rel] = e
 	}
-	helper, ok := byRel["fn/sub/helper.js"]
+	helper, ok := byRel["sub/helper.js"]
 	if !ok {
 		t.Fatalf("missing helper entry; entries = %v", byRel)
 	}
@@ -103,18 +104,18 @@ func TestSnapshotEntriesCarryStageRelAndContent(t *testing.T) {
 	if string(staged) != "export const x = 1\n" {
 		t.Fatalf("staged helper content = %q", staged)
 	}
-	if !byRel["fn/sub"].IsDir {
-		t.Fatalf("sub must be captured as a directory: %+v", byRel["fn/sub"])
+	if !byRel["sub"].IsDir {
+		t.Fatalf("sub must be captured as a directory: %+v", byRel["sub"])
 	}
-	ancestor, ok := byRel[".gitignore"]
+	local, ok := byRel[".gitignore"]
 	if !ok {
-		t.Fatalf("ancestor .gitignore must be fingerprinted; entries = %v", byRel)
+		t.Fatalf("the app's own .gitignore must be captured; entries = %v", byRel)
 	}
-	if ancestor.StageRel != "" {
-		t.Fatalf("ancestor policy file StageRel = %q, want empty (never staged)", ancestor.StageRel)
+	if local.StageRel != ".gitignore" {
+		t.Fatalf("app .gitignore StageRel = %q, want .gitignore", local.StageRel)
 	}
-	if _, err := os.Stat(filepath.Join(snapshot.Root(), ".gitignore")); !os.IsNotExist(err) {
-		t.Fatalf("ancestor policy file must never be staged, stat err = %v", err)
+	if _, ok := byRel["../.gitignore"]; ok {
+		t.Fatalf("ancestor policy file must not be captured; entries = %v", byRel)
 	}
 }
 
@@ -351,6 +352,94 @@ func mustSnapshotSelection(t *testing.T, dir string) *source.Selection {
 		t.Fatalf("select %q: %v", dir, err)
 	}
 	return selection
+}
+
+// buildContextCapture is one snapshot capture reduced to what a build would
+// consume: the identity digest and the staged regular files under the private
+// root (StageRel -> bytes).
+type buildContextCapture struct {
+	fingerprint string
+	staged      map[string]string
+}
+
+func captureBuildContext(t *testing.T, dir string) buildContextCapture {
+	t.Helper()
+	snapshot, err := CaptureSourceSnapshot(mustSnapshotSelection(t, dir))
+	if err != nil {
+		t.Fatalf("capture %q: %v", dir, err)
+	}
+	defer snapshot.Discard()
+	staged := map[string]string{}
+	for _, e := range snapshot.Entries() {
+		if e.IsDir || !e.Regular || e.StageRel == "" {
+			continue
+		}
+		if filepath.Base(e.StageRel) == source.AppTemplateFile {
+			continue // template.yaml is fingerprinted but never staged
+		}
+		b, err := os.ReadFile(filepath.Join(snapshot.Root(), filepath.FromSlash(e.StageRel)))
+		if err != nil {
+			t.Fatalf("read staged %q: %v", e.StageRel, err)
+		}
+		staged[e.StageRel] = string(b)
+	}
+	return buildContextCapture{fingerprint: snapshot.Fingerprint(), staged: staged}
+}
+
+// TestSnapshotUnchangedByAncestorIgnoreEdit pins that an ancestor-only policy
+// edit changes neither the snapshot identity nor the app build context: both
+// derive from the app-root selection, so a repository-root .gitignore edit
+// leaves exactly what a build would see untouched — while an ancestor-matched
+// file the app selects stays captured, the app's own rules still exclude, and
+// an app-local edit is still detected.
+func TestSnapshotUnchangedByAncestorIgnoreEdit(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "services", "fn")
+	ancestorIgnore := filepath.Join(root, ".gitignore")
+	writeFile(t, ancestorIgnore, "*.generated\n")
+	writeFile(t, filepath.Join(dir, ".gitignore"), "*.log\n")
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: nodejs24.x\nresources:\n  memory: 128MiB\n")
+	writeFile(t, filepath.Join(dir, "index.js"), "export function h(event, context){}\n")
+	writeFile(t, filepath.Join(dir, "helper.generated"), "generated\n")
+	writeFile(t, filepath.Join(dir, "debug.log"), "noise\n")
+
+	before := captureBuildContext(t, dir)
+
+	// Ancestor-only edit: hostile rules naming the app, its template, and a file
+	// the app itself selects.
+	writeFile(t, ancestorIgnore, "*.generated\nservices/\nfn\ntemplate.yaml\n!index.js\n")
+	after := captureBuildContext(t, dir)
+
+	if after.fingerprint != before.fingerprint {
+		t.Fatalf("ancestor-only edit changed the snapshot fingerprint: %q != %q",
+			after.fingerprint, before.fingerprint)
+	}
+	if len(after.staged) != len(before.staged) {
+		t.Fatalf("ancestor-only edit changed the staged build context: %v != %v",
+			before.staged, after.staged)
+	}
+	for rel, want := range before.staged {
+		if got, ok := after.staged[rel]; !ok || got != want {
+			t.Fatalf("staged %q after ancestor-only edit = %q (present=%v), want %q",
+				rel, got, ok, want)
+		}
+	}
+	if _, ok := after.staged["helper.generated"]; !ok {
+		t.Fatal("a file matched only by an ancestor rule must stay in the build context")
+	}
+	if _, ok := after.staged["debug.log"]; ok {
+		t.Fatal("the app's own rule must keep excluding debug.log from the build context")
+	}
+
+	// Control: an app-local edit still changes both the digest and the context.
+	writeFile(t, filepath.Join(dir, "index.js"), "export function h(event, context){ return 2; }\n")
+	local := captureBuildContext(t, dir)
+	if local.fingerprint == before.fingerprint {
+		t.Fatal("an app-local edit must change the snapshot fingerprint")
+	}
+	if local.staged["index.js"] == before.staged["index.js"] {
+		t.Fatal("an app-local edit must change the staged build context")
+	}
 }
 
 func snapshotDigest(t *testing.T, dir string) string {

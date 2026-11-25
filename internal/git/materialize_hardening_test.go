@@ -154,7 +154,7 @@ func TestMaterializeUpdateNeverExposesAbsence(t *testing.T) {
 		return nil
 	})
 
-	mat, rem, err := materialize(mustSelect(t, src, src), apps)
+	mat, rem, err := materialize(src, apps)
 	if err != nil {
 		t.Fatalf("materialize update: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestMaterializeAddsNewAppAndRemovesAbsentSourceApp(t *testing.T) {
 		"runtime: nodejs24.x\n# stale\n")
 	writeFile(t, filepath.Join(apps, "stale", "old.txt"), "old\n")
 
-	mat, rem, err := materialize(mustSelect(t, src, src), apps)
+	mat, rem, err := materialize(src, apps)
 	if err != nil {
 		t.Fatalf("materialize add/remove: %v", err)
 	}
@@ -224,9 +224,8 @@ func TestMaterializeAddsNewAppAndRemovesAbsentSourceApp(t *testing.T) {
 // existing app bytes and its stale directory; no exchange is even probed.
 //
 // The injected failure is a directory named .gitignore created in the second
-// source app AFTER the selection policy is resolved. Copying it succeeds, but
-// preserving the local ignore policy then tries to read a directory, which
-// fails deterministically even when tests run as root.
+// source app. Building its app-local selection tries to read that directory as
+// an ignore file, which fails deterministically even when tests run as root.
 func TestMaterializeStagingFailureLeavesLiveAppsUntouched(t *testing.T) {
 	src := t.TempDir()
 	writeFile(t, filepath.Join(src, ".gitignore"), "*.ignored\n")
@@ -234,7 +233,6 @@ func TestMaterializeStagingFailureLeavesLiveAppsUntouched(t *testing.T) {
 		"runtime: nodejs24.x\n# new-alpha\n")
 	writeFile(t, filepath.Join(src, "zeta", "template.yaml"),
 		"runtime: nodejs24.x\n# zeta\n")
-	selection := mustSelect(t, src, src)
 	if err := os.MkdirAll(filepath.Join(src, "zeta", ".gitignore"), 0o755); err != nil {
 		t.Fatalf("seed non-file .gitignore: %v", err)
 	}
@@ -252,8 +250,8 @@ func TestMaterializeStagingFailureLeavesLiveAppsUntouched(t *testing.T) {
 		return platformExchange(a, b)
 	})
 
-	_, _, err := materialize(selection, apps)
-	if err == nil || !strings.Contains(err.Error(), "read local ignore file") {
+	_, _, err := materialize(src, apps)
+	if err == nil || !strings.Contains(err.Error(), filepath.Join("zeta", ".gitignore")) {
 		t.Fatalf("materialize err = %v, want injected staging failure", err)
 	}
 	if exchanges != 0 {
@@ -305,10 +303,6 @@ func TestMaterializeUnreadableSourceDirFailsClosed(t *testing.T) {
 	writeFile(t, filepath.Join(src, "alpha", "template.yaml"),
 		"runtime: nodejs24.x\n# new-alpha\n")
 	writeFile(t, filepath.Join(src, "locked", "template.yaml"), "runtime: nodejs24.x\n")
-	// Resolve the selection BEFORE the failure injection (as a real sync does:
-	// the checkout policy is read first), so the failure below lands on
-	// materialize's own discovery, not on the selection construction.
-	selection := mustSelect(t, src, src)
 	locked := filepath.Join(src, "locked")
 	if err := os.Chmod(locked, 0o000); err != nil {
 		t.Fatalf("chmod locked: %v", err)
@@ -322,7 +316,7 @@ func TestMaterializeUnreadableSourceDirFailsClosed(t *testing.T) {
 	writeFile(t, filepath.Join(apps, "stale", "template.yaml"),
 		"runtime: nodejs24.x\n# stale\n")
 
-	mat, rem, err := materialize(selection, apps)
+	mat, rem, err := materialize(src, apps)
 	if err == nil {
 		t.Fatal("unreadable source app dir: nil error, want the sync to fail closed")
 	}
@@ -371,7 +365,7 @@ func TestMaterializeUnsupportedExchangeFailsBeforeMutation(t *testing.T) {
 		return unsupported
 	})
 
-	mat, rem, err := materialize(mustSelect(t, src, src), apps)
+	mat, rem, err := materialize(src, apps)
 	if !errors.Is(err, unsupported) {
 		t.Fatalf("materialize err = %v, want injected unsupported exchange", err)
 	}
@@ -437,7 +431,7 @@ func TestMaterializeCommitFailureRollsBackPreviousSwap(t *testing.T) {
 		return platformExchange(a, b)
 	})
 
-	mat, rem, err := materialize(mustSelect(t, src, src), apps)
+	mat, rem, err := materialize(src, apps)
 	if !errors.Is(err, commitFailure) {
 		t.Fatalf("materialize err = %v, want injected commit failure", err)
 	}
@@ -509,7 +503,7 @@ func TestMaterializeCommitFailureRollsBackNewApp(t *testing.T) {
 		return platformExchange(a, b)
 	})
 
-	_, _, err := materialize(mustSelect(t, src, src), apps)
+	_, _, err := materialize(src, apps)
 	if !errors.Is(err, commitFailure) {
 		t.Fatalf("materialize err = %v, want injected gamma commit failure", err)
 	}
@@ -588,7 +582,7 @@ func TestMaterializeRollbackFailurePreservesOldTreeBackup(t *testing.T) {
 		}
 	})
 
-	_, _, err := materialize(mustSelect(t, src, src), apps)
+	_, _, err := materialize(src, apps)
 	if !errors.Is(err, commitFailure) {
 		t.Fatalf("materialize err = %v, want beta commit failure", err)
 	}

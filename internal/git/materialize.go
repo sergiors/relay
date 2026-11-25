@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 
 	"relay/internal/app"
 	"relay/internal/source"
@@ -21,18 +20,20 @@ import (
 // exchange_<platform>.go files).
 var exchangeDirs = platformExchange
 
-// discoverApps returns the sorted set of app directories under the selected
-// source: each real direct subdirectory with an app.ValidName name, an included
-// template.yaml path, and a regular non-symlink template. It selects by
-// presence, not template contents; parsing and schema validation belong to the
-// reconciler. Subdirectories without a template.yaml, files, symlinked dirs,
-// and directories failing app.ValidName are ignored. An invalid template entry
-// or operational filesystem error aborts discovery rather than being mistaken
-// for absence and removing a live app. An ignored directory is skipped just as
-// the loader would (git never descends into it), so an app directory excluded
-// by .gitignore is not materialized.
-func discoverApps(selection *source.Selection) ([]string, error) {
-	entries, err := os.ReadDir(selection.Dir())
+// discoverApps returns the sorted set of app directories under srcDir: each real
+// direct subdirectory with an app.ValidName name and a regular non-symlink
+// template. It selects by presence, not template contents, exactly like the app
+// loader; parsing and schema validation belong to the reconciler. Subdirectories
+// without a template.yaml, files, symlinked dirs, and directories failing
+// app.ValidName are ignored. An invalid template entry or operational
+// filesystem error aborts discovery rather than being mistaken for absence and
+// removing a live app.
+//
+// Discovery deliberately does not consult .gitignore: selection is scoped to an
+// app's own directory, so an ignore rule in the checkout root or a monorepo
+// parent can never hide an app candidate.
+func discoverApps(srcDir string) ([]string, error) {
+	entries, err := os.ReadDir(srcDir)
 	if err != nil {
 		// A missing source dir means the validated monorepo path (or the whole
 		// checkout) is absent from the checked-out ref. That is a hard sync
@@ -40,9 +41,9 @@ func discoverApps(selection *source.Selection) ([]string, error) {
 		// successful "there are no apps yet" sync and could erase valid
 		// materialized apps through the deterministic-removal rule.
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("git: source dir %q does not exist in the checkout", selection.Dir())
+			return nil, fmt.Errorf("git: source dir %q does not exist in the checkout", srcDir)
 		}
-		return nil, fmt.Errorf("git: read source dir %q: %w", selection.Dir(), err)
+		return nil, fmt.Errorf("git: read source dir %q: %w", srcDir, err)
 	}
 	// A successfully read but empty directory is a valid, deliberate "no
 	// apps here" source, NOT an error: materialize still runs the
@@ -55,16 +56,13 @@ func discoverApps(selection *source.Selection) ([]string, error) {
 		if app.ValidName(name) != nil {
 			continue
 		}
-		dir := filepath.Join(selection.Dir(), name)
+		dir := filepath.Join(srcDir, name)
 		realDir, err := app.IsRealAppDir(dir)
 		if err != nil {
 			return nil, fmt.Errorf("git: inspect app dir %q: %w", name, err)
 		}
 		if !realDir {
 			continue
-		}
-		if !selection.IncludesPath(filepath.Join(selection.Dir(), name, "template.yaml"), false) {
-			continue // excluded by the source-selection policy
 		}
 		present, err := app.HasTemplate(dir)
 		if err != nil {
@@ -85,8 +83,8 @@ func discoverApps(selection *source.Selection) ([]string, error) {
 // materialize is the package-internal compatibility entry point for
 // materializeApps that returns only the added/updated and removed app names.
 // The returned slices are sorted and nil on failure.
-func materialize(selection *source.Selection, dstDir string) (materialized, removed []string, err error) {
-	result, err := materializeApps(selection, dstDir)
+func materialize(srcDir, dstDir string) (materialized, removed []string, err error) {
+	result, err := materializeApps(srcDir, dstDir)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -109,7 +107,7 @@ type materializeResult struct {
 }
 
 // materializeApps rewrites dstDir (the /apps root) so that it contains exactly
-// the app directories discovered under selection, recursively and
+// the app directories discovered under srcDir, recursively and
 // deterministically:
 //
 //   - Every desired app is first copied into a Relay-owned staging directory
@@ -140,11 +138,12 @@ type materializeResult struct {
 //     directory; a reader whose walk spans a swap can still see files from both
 //     generations, which the next reconcile's fingerprint handles. Per-app
 //     atomicity is not whole-revision atomicity.
-//   - Files excluded by the source-selection policy (the .gitignore rules
-//     anchored at the checkout root) are NOT copied. The applicable .gitignore
-//     files themselves ARE copied: they are the selection policy, so they must
-//     travel with the app for the build context and fingerprint to keep
-//     applying the same rules against /apps.
+//   - Files excluded by the app's own source-selection policy (its .gitignore
+//     rules) are NOT copied. The applicable .gitignore files themselves ARE
+//     copied: they are the selection policy, so they must travel with the app
+//     for the build context and fingerprint to keep applying the same rules
+//     against /apps. Ignore files above the app directory never apply and are
+//     never copied or merged into it.
 //   - Any pre-existing DIRECTORY in dstDir whose name is not in the new set is
 //     removed, so /apps reflects exactly the configured source (the
 //     deterministic-replace rule). Removal first renames the directory into the
@@ -174,13 +173,13 @@ type materializeResult struct {
 // managed by git. Operator-placed app directories are subject to the same
 // deterministic rule: a sync removes any directory not in the source. This is
 // documented in docs/operations.md "Git" and in Sync's doc comment.
-func materializeApps(selection *source.Selection, dstDir string) (materializeResult, error) {
+func materializeApps(srcDir, dstDir string) (materializeResult, error) {
 	var result materializeResult
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return materializeResult{}, fmt.Errorf("git: create apps dir %q: %w", dstDir, err)
 	}
 
-	newSet, err := discoverApps(selection)
+	newSet, err := discoverApps(srcDir)
 	if err != nil {
 		return materializeResult{}, err
 	}
@@ -202,11 +201,13 @@ func materializeApps(selection *source.Selection, dstDir string) (materializeRes
 		}
 	}()
 	for _, name := range newSet {
-		fnSelection, err := selection.Sub(filepath.Join(selection.Dir(), name))
+		// Each app is selected from its own directory: only that app's
+		// .gitignore and its nested non-ignored rules shape its source.
+		appSelection, err := source.ForDir(filepath.Join(srcDir, name))
 		if err != nil {
-			return materializeResult{}, err
+			return materializeResult{}, fmt.Errorf("git: select app dir %q: %w", name, err)
 		}
-		stagePath, err := stageAppDir(fnSelection, dstDir, name)
+		stagePath, err := stageAppDir(appSelection, dstDir, name)
 		if err != nil {
 			return materializeResult{}, err
 		}
@@ -332,8 +333,8 @@ type stagedRemoval struct {
 
 // stageAppDir copies the whole tree at selection into a new reserved staging
 // directory directly under dst, validates that the staged candidate is
-// complete, and returns its path. Nothing live is touched. Files the
-// source-selection policy excludes are not copied; the applicable .gitignore
+// complete, and returns its path. Nothing live is touched. Files the app's own
+// source-selection policy excludes are not copied; its applicable .gitignore
 // files are (they are the policy and must travel with the app). File modes are
 // preserved.
 func stageAppDir(selection *source.Selection, dst, name string) (string, error) {
@@ -349,9 +350,6 @@ func stageAppDir(selection *source.Selection, dst, name string) (string, error) 
 	}()
 
 	if err := copyTree(selection, tmp); err != nil {
-		return "", err
-	}
-	if err := preserveAncestorIgnoreFiles(selection, tmp); err != nil {
 		return "", err
 	}
 	// A staged app must be a complete candidate: the same template.yaml
@@ -690,43 +688,12 @@ func clearStaleStages(dstDir string) error {
 	return nil
 }
 
-// preserveAncestorIgnoreFiles carries checkout-level policy into the
-// materialized app. Without this, a subsequent runtime fingerprint would
-// forget an ancestor .gitignore when the ancestor rule happened not to change
-// the selected files.
-func preserveAncestorIgnoreFiles(selection *source.Selection, dst string) error {
-	local := filepath.Join(selection.Dir(), source.IgnoreFile)
-	var contents []byte
-	for _, path := range selection.ApplicableIgnoreFiles() {
-		if path == local || strings.HasPrefix(path, selection.Dir()+string(filepath.Separator)) {
-			continue
-		}
-		b, err := os.ReadFile(path)
-		if err != nil {
-			return fmt.Errorf("git: read ancestor ignore file %q: %w", path, err)
-		}
-		contents = append(contents, b...)
-		if len(b) > 0 && b[len(b)-1] != '\n' {
-			contents = append(contents, '\n')
-		}
-	}
-	if len(contents) == 0 {
-		return nil
-	}
-	localBytes, err := os.ReadFile(local)
-	if err == nil {
-		contents = append(contents, localBytes...)
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("git: read local ignore file %q: %w", local, err)
-	}
-	return os.WriteFile(filepath.Join(dst, source.IgnoreFile), contents, 0o644)
-}
-
 // copyTree recursively copies the selected source tree at selection into dst
-// (which must already exist), preserving file permissions. Excluded files (the
-// .gitignore rules) and ".git" are skipped by the selection itself. Symlinks and
-// other non-regular entries are skipped: WalkDir does not follow links, so the
-// staged representation contains only directories and regular files.
+// (which must already exist), preserving file permissions. Files excluded by the
+// app's own .gitignore rules and ".git" are skipped by the selection itself.
+// Symlinks and other non-regular entries are skipped: WalkDir does not follow
+// links, so the staged representation contains only directories and regular
+// files.
 func copyTree(selection *source.Selection, dst string) error {
 	return selection.WalkDir(func(path string, d fs.DirEntry, err error) error {
 		if err != nil {

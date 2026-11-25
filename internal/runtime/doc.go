@@ -135,8 +135,9 @@
 // may not exist in the image.
 //
 // The build context stages exactly the app's selected source via the shared
-// internal/source policy (the app's .gitignore rules), the same selection
-// the fingerprint uses: an ignored file is neither hashed nor baked into a layer.
+// internal/source policy (the app's own and nested .gitignore rules; ignore
+// files above the app directory never apply), the same selection the fingerprint
+// uses: an ignored file is neither hashed nor baked into a layer.
 //
 // Build resource use does not scale with the source tree's total size, but it is
 // not a host-wide memory bound. The selected source is captured to a private

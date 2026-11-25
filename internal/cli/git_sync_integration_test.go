@@ -19,6 +19,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport/client"
 	"github.com/go-git/go-git/v5/plumbing/transport/server"
 
+	"relay/internal/app"
 	"relay/internal/git"
 	"relay/internal/state"
 	"relay/internal/testutil"
@@ -559,6 +560,104 @@ func TestGitSyncConcurrentPinRefusesWithoutMaterializing(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(deps.GitAppsDir, "fn")); !os.IsNotExist(err) {
 		t.Fatalf("apps dir stat = %v, want no local materialization", err)
+	}
+}
+
+// TestGitSyncAncestorIgnoreChangeDoesNotTouchApp pins app-local source scoping
+// through the whole CLI path: a revision whose ONLY change is the
+// repository-root .gitignore still advances the shared desired generation (it is
+// a new commit), but leaves the materialized app tree, inode, and fingerprint
+// untouched and never copies the ancestor policy into the app.
+func TestGitSyncAncestorIgnoreChangeDoesNotTouchApp(t *testing.T) {
+	deps, dsn := stateBackedDeps(t)
+	repo := testutil.New(t, testutil.Options{})
+	deps.GitCloneURL = repo.Bare
+	if err := git.SetSource(deps.GitConfigPath, "git@github.com:acme/r.git", "main", "", ""); err != nil {
+		t.Fatalf("set source: %v", err)
+	}
+	st := testutil.OpenState(t, dsn)
+
+	if out, _, err := runCLIWithDeps(t, deps, "", "git", "sync"); err != nil {
+		t.Fatalf("initial git sync: %v (out=%s)", err, out)
+	}
+
+	appDir := filepath.Join(deps.GitAppsDir, "fn")
+	beforeInfo, err := os.Stat(appDir)
+	if err != nil {
+		t.Fatalf("stat materialized app: %v", err)
+	}
+	beforeFingerprint, err := app.Fingerprint(appDir)
+	if err != nil {
+		t.Fatalf("fingerprint materialized app: %v", err)
+	}
+	beforeTemplate, err := os.ReadFile(filepath.Join(appDir, "template.yaml"))
+	if err != nil {
+		t.Fatalf("read materialized template: %v", err)
+	}
+
+	// Commit only the repository-root .gitignore, an ancestor of the app.
+	work, err := gogit.PlainOpen(repo.Work)
+	if err != nil {
+		t.Fatalf("open work repo: %v", err)
+	}
+	wt, err := work.Worktree()
+	if err != nil {
+		t.Fatalf("worktree: %v", err)
+	}
+	testutil.WriteFile(t, filepath.Join(repo.Work, ".gitignore"), "*.log\nfn/\n")
+	if _, err := wt.Add(".gitignore"); err != nil {
+		t.Fatalf("add root .gitignore: %v", err)
+	}
+	commitHash := testutil.Commit(t, wt, "ignore app files at the root")
+	testutil.SetRef(t, work, "refs/heads/main", commitHash)
+	testutil.SeedBare(t, repo.Bare, repo.Work)
+
+	out, _, err := runCLIWithDeps(t, deps, "", "git", "sync")
+	if err != nil {
+		t.Fatalf("ancestor-ignore git sync: %v (out=%s)", err, out)
+	}
+	for _, want := range []string{
+		"Updating apps on this node...",
+		"No app changes: 1 app(s) already up to date",
+		"This node's apps are up to date",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("sync output missing %q:\n%s", want, out)
+		}
+	}
+
+	desired, found, err := st.ReadDeploymentDesired(context.Background())
+	if err != nil || !found {
+		t.Fatalf("ReadDeploymentDesired = (%+v, %v, %v)", desired, found, err)
+	}
+	if desired.Generation != 2 || desired.Commit != commitHash.String() {
+		t.Fatalf("desired = generation %d commit %s, want generation 2 commit %s",
+			desired.Generation, desired.Commit, commitHash.String())
+	}
+
+	afterInfo, err := os.Stat(appDir)
+	if err != nil {
+		t.Fatalf("stat materialized app after ancestor-only revision: %v", err)
+	}
+	if !os.SameFile(beforeInfo, afterInfo) {
+		t.Fatal("the app directory was replaced by an ancestor-only ignore change")
+	}
+	afterFingerprint, err := app.Fingerprint(appDir)
+	if err != nil {
+		t.Fatalf("fingerprint app after ancestor-only revision: %v", err)
+	}
+	if afterFingerprint != beforeFingerprint {
+		t.Fatalf("app fingerprint changed from %s to %s", beforeFingerprint, afterFingerprint)
+	}
+	afterTemplate, err := os.ReadFile(filepath.Join(appDir, "template.yaml"))
+	if err != nil {
+		t.Fatalf("read template after ancestor-only revision: %v", err)
+	}
+	if !bytes.Equal(afterTemplate, beforeTemplate) {
+		t.Fatalf("app template changed from %q to %q", beforeTemplate, afterTemplate)
+	}
+	if _, err := os.Stat(filepath.Join(appDir, ".gitignore")); !os.IsNotExist(err) {
+		t.Fatalf("ancestor .gitignore was copied into the app; stat err = %v", err)
 	}
 }
 

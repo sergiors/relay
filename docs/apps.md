@@ -26,6 +26,13 @@ not an app: discovery ignores it (it may hold unrelated files), and if a known
 app loses its template it is removed like any other removed app. An invalid name
 or invalid template is logged and skipped without stopping the worker.
 
+An app's source is scoped to its own directory. Only the app's `.gitignore` and
+`.gitignore` files in its non-ignored subdirectories decide which files are
+copied, fingerprinted, and built. Ignore files above the app directory — at the
+repository root or a monorepo parent — never affect the app, so they cannot hide
+an app or exclude files from it. `template.yaml` is always part of the app's
+source, even if a pattern matches it.
+
 ## Template schema
 
 The event rule below shows MongoDB CDC's `collectionName`; for PostgreSQL CDC,

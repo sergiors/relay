@@ -174,7 +174,7 @@ func TestReconcilerMaterializeUpdateDoesNotRemove(t *testing.T) {
 	registry, cancel, done := startMaterializeReconciler(t, apps, oldApp,
 		builder, func(string) { removals.Add(1) })
 
-	mat, rem, err := materialize(mustSelect(t, src, src), apps)
+	mat, rem, err := materialize(src, apps)
 	if err != nil {
 		t.Fatalf("materialize update: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestReconcilerMaterializeSourceRemovalCallsRemoveApp(t *testing.T) {
 	registry, cancel, done := startMaterializeReconciler(t, apps, oldApp,
 		builder, func(name string) { removals <- name })
 
-	mat, rem, err := materialize(mustSelect(t, src, src), apps)
+	mat, rem, err := materialize(src, apps)
 	if err != nil {
 		t.Fatalf("materialize source removal: %v", err)
 	}
@@ -311,7 +311,7 @@ func TestReconcilerMaterializeAtomicExchangeWatchesNestedNewTree(t *testing.T) {
 	registry, cancel, done := startMaterializeReconcilerWithDebounce(t, apps,
 		oldApp, builder, func(string) {}, 50*time.Millisecond)
 
-	result, err := materializeApps(mustSelect(t, src, src), apps)
+	result, err := materializeApps(src, apps)
 	if err != nil {
 		t.Fatalf("materialize revision B: %v", err)
 	}

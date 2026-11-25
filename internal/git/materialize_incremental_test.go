@@ -36,8 +36,7 @@ func TestMaterializeOnlyChangedAppIsExchanged(t *testing.T) {
 		"export function beta(event, context){}\n")
 
 	apps := t.TempDir()
-	selection := mustSelect(t, src, src)
-	first, err := materializeApps(selection, apps)
+	first, err := materializeApps(src, apps)
 	if err != nil {
 		t.Fatalf("initial materialize: %v", err)
 	}
@@ -64,7 +63,6 @@ func TestMaterializeOnlyChangedAppIsExchanged(t *testing.T) {
 	if err := os.Remove(filepath.Join(src, "alpha", "old-only.txt")); err != nil {
 		t.Fatalf("remove alpha old-only: %v", err)
 	}
-	selection = mustSelect(t, src, src)
 
 	var liveTargets []string
 	swapExchange(t, func(a, b string) error {
@@ -75,7 +73,7 @@ func TestMaterializeOnlyChangedAppIsExchanged(t *testing.T) {
 		return platformExchange(a, b)
 	})
 
-	second, err := materializeApps(selection, apps)
+	second, err := materializeApps(src, apps)
 	if err != nil {
 		t.Fatalf("incremental materialize: %v", err)
 	}
@@ -126,7 +124,7 @@ func TestMaterializeOnlyChangedAppIsExchanged(t *testing.T) {
 		t.Fatalf("exchange called for an unchanged app: %q -> %q", a, b)
 		return errors.New("unreachable")
 	})
-	third, err := materializeApps(selection, apps)
+	third, err := materializeApps(src, apps)
 	if err != nil {
 		t.Fatalf("identical materialize: %v", err)
 	}
@@ -177,7 +175,7 @@ events:
 	writeFile(t, filepath.Join(src, "res", "index.js"), "export function hi(e, context){}\n")
 
 	apps := t.TempDir()
-	if _, err := materializeApps(mustSelect(t, src, src), apps); err != nil {
+	if _, err := materializeApps(src, apps); err != nil {
 		t.Fatalf("initial materialize: %v", err)
 	}
 	before, err := app.LoadSingle(apps, "res")
@@ -191,7 +189,7 @@ events:
 
 	writeFile(t, filepath.Join(src, "res", "template.yaml"),
 		strings.Replace(resourceTemplate, "128MiB", "1GiB", 1))
-	second, err := materializeApps(mustSelect(t, src, src), apps)
+	second, err := materializeApps(src, apps)
 	if err != nil {
 		t.Fatalf("resource-only materialize: %v", err)
 	}

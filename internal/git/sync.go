@@ -2,7 +2,6 @@ package git
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,7 +12,6 @@ import (
 	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 
 	"relay/internal/processlock"
-	"relay/internal/source"
 )
 
 // gitOps is the seam isolating the transport operations sync drives (clone,
@@ -62,16 +60,16 @@ type gitRepo interface {
 //     fetches origin with Force+Prune+AllTags so removed branches/tags drop.
 //  4. Resolves the configured ref to a commit and hard-checks-out it (detached
 //     HEAD, Force). NEVER pulls — a pull could produce merge state.
-//  5. Locates the apps source (repo root or validated monorepo Path) and
-//     resolves the shared source-selection policy (.gitignore rules anchored at
-//     the checkout root; see internal/source).
-//  6. Stages every desired app (skipping files excluded by the selection
-//     policy) before touching /apps, compares each staged candidate with its
-//     live tree, and atomically exchanges ONLY per-app trees that were added or
-//     actually changed. Unchanged apps keep their existing live directory (and
-//     inode) untouched, so their watcher handles stay valid. Any directory not
-//     in the source is removed (see materializeApps). /apps itself is a fixed
-//     bind mount and is never replaced as a root.
+//  5. Locates the apps source (repo root or validated monorepo Path). Each app
+//     directory is its own source-selection root (its own and nested .gitignore
+//     rules; see internal/source); ignore files above it never apply.
+//  6. Stages every desired app (skipping files excluded by the app-local
+//     selection policy) before touching /apps, compares each staged candidate
+//     with its live tree, and atomically exchanges ONLY per-app trees that were
+//     added or actually changed. Unchanged apps keep their existing live
+//     directory (and inode) untouched, so their watcher handles stay valid.
+//     Any directory absent from the source is removed (see materializeApps).
+//     /apps itself is a fixed bind mount and is never replaced as a root.
 //  7. Records LastSyncedCommit/LastSyncedAt/Synced in the persisted config,
 //     atomically, after materialization succeeds. No content comparison
 //     fingerprint is persisted; each sync compares its actual staged output.
@@ -429,18 +427,11 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 		return err
 	}
 
-	// Resolve the source-selection policy once and share it with
-	// materialization: the checkout root anchors ancestor .gitignore rules (so a
-	// root-level rule governs a monorepo subtree exactly as git would), and the
-	// selected dir scopes the walk. A missing source dir is the hard missing-source
-	// failure materialize reports; a missing .gitignore is not an error.
-	selection, err := source.New(opts.CheckoutDir, srcDir)
-	if err != nil {
-		if errors.Is(err, source.ErrNotExist) {
-			return fmt.Errorf("git: source dir %q does not exist in the checkout", srcDir)
-		}
-		return err
-	}
+	// Source selection is scoped to each app directory during materialization:
+	// only the app's own .gitignore and nested non-ignored rules apply. A
+	// repository-root or monorepo ancestor rule never affects an app's source.
+	// A missing source dir is the hard missing-source failure discovery reports;
+	// a missing .gitignore is not an error.
 
 	// We hold the writer lock, so every reserved staging entry under /apps is a
 	// leftover from an interrupted earlier sync (never an active stage of a
@@ -452,7 +443,7 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 
 	// Materialize /apps deterministically. Only added/changed apps are reported
 	// as materialized; an identical revision performs no live replacement.
-	result, err := materializeApps(selection, opts.AppsDir)
+	result, err := materializeApps(srcDir, opts.AppsDir)
 	if err != nil {
 		return err
 	}

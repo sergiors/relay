@@ -21,66 +21,50 @@ import (
 // selection is self-contained and reproducible from the tree alone.
 const IgnoreFile = ".gitignore"
 
+// AppTemplateFile is the mandatory app definition file at a selection root. It
+// mirrors app.TemplateFile and must stay equal to it; source cannot import app
+// because app imports source. App discovery and the loader read it regardless of
+// ignore rules, so it is always part of the selected source.
+const AppTemplateFile = "template.yaml"
+
 // ErrNotExist reports that the selected source directory does not exist. Callers
 // that must distinguish "the configured source is absent" (a hard sync failure)
 // from other selection errors can test it with errors.Is.
 var ErrNotExist = errors.New("source: directory does not exist")
 
-// Selection is a resolved source-selection policy: the directory being selected
-// (dir), the scope its ignore rules are anchored to (root), and the compiled
-// rules that decide which paths under dir are part of the source.
+// Selection is a resolved source-selection policy for one app directory: the
+// directory being selected (dir) and the compiled rules that decide which paths
+// under dir are part of the source.
+//
+// The app directory is the selection root. Ignore files above it are never read:
+// only the app's own .gitignore and those in its non-ignored descendants apply.
 //
 // A Selection is read-only after construction. It never writes to the
 // filesystem, so the git materializer, the build-context stager, and the
 // fingerprint can share one policy.
 type Selection struct {
-	// root is the directory ignore patterns are anchored to. Rules are read from
-	// root down to dir (inclusive) plus every non-ignored descendant of dir, so a
-	// monorepo's root-level .gitignore applies to a selected subtree exactly as it
-	// would to git. For a self-contained directory (ForDir) root == dir.
-	root string
-	// dir is the selected source directory: the tree walked by WalkDir.
+	// dir is the selected source directory: the tree walked by WalkDir and the
+	// anchor for every ignore rule.
 	dir string
-	// selRel is dir relative to root, as a slash path ("" at the root). It is the
-	// path that is always included: the selected directory is explicitly chosen,
-	// so an ancestor rule matching it does not suppress the selection itself.
-	selRel string
-	// matcher decides whether a root-relative path is ignored. A Selection with no
-	// rules still has a matcher (an empty one).
+	// matcher decides whether a directory-relative path is ignored. A Selection
+	// with no rules still has a matcher (an empty one).
 	matcher gitignore.Matcher
-	// ignoreFiles is the set of applicable .gitignore files, keyed by root-relative
-	// slash path. These are always reported by IgnoreFiles and always included by
-	// Includes/WalkDir even when a pattern would otherwise ignore them: the
-	// selection policy itself must never be silently dropped from a copy or a
-	// fingerprint, or editing it would not be observable.
+	// ignoreFiles is the set of applicable .gitignore files, keyed by
+	// directory-relative slash path. These are always reported by IgnoreFiles
+	// and always included by Includes/WalkDir even when a pattern would otherwise
+	// ignore them: the selection policy itself must never be silently dropped
+	// from a copy or a fingerprint, or editing it would not be observable.
 	ignoreFiles map[string]bool
-	// descendantOnly contains root-relative directories matched by `dir/**`.
+	// descendantOnly contains directory-relative directories matched by `dir/**`.
 	// Git keeps such a directory traversable while ignoring its contents.
 	descendantOnly map[string]bool
 }
 
-// ForDir builds a Selection for a self-contained source directory: the ignore
-// rules anchored at dir apply to dir and its descendants. It is the
-// fingerprint/build-context constructor, where the tree is the source root and no
-// checkout above it is known.
-func ForDir(dir string) (*Selection, error) {
-	return New(dir, dir)
-}
-
-// New builds a Selection for dir, reading .gitignore rules from root down to dir
-// (inclusive) and then through dir's non-ignored descendants. An empty root means
-// dir is its own root. dir must reside inside root.
-//
-// The selected directory is treated as explicitly chosen, so an ancestor ignore
-// rule matching dir itself does not suppress it (the operator configured this
-// path on purpose); rules still govern everything beneath it.
-//
+// ForDir builds a Selection rooted at dir: dir's own .gitignore and every
+// .gitignore in its non-ignored descendants apply. Ignore files above dir are
+// deliberately ignored, so an app directory's source policy is self-contained.
 // A missing dir returns an error wrapping ErrNotExist.
-func New(root, dir string) (*Selection, error) {
-	if root == "" {
-		root = dir
-	}
-	root = filepath.Clean(root)
+func ForDir(dir string) (*Selection, error) {
 	dir = filepath.Clean(dir)
 
 	info, err := os.Stat(dir)
@@ -94,17 +78,10 @@ func New(root, dir string) (*Selection, error) {
 		return nil, fmt.Errorf("source: %q is not a directory", dir)
 	}
 
-	rel, err := filepath.Rel(root, dir)
-	if err != nil {
-		return nil, fmt.Errorf("source: relate %q to %q: %w", dir, root, err)
-	}
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return nil, fmt.Errorf("source: dir %q is outside root %q", dir, root)
-	}
-
-	selection := &Selection{root: root, dir: dir, ignoreFiles: map[string]bool{}, descendantOnly: map[string]bool{}}
-	if rel != "." {
-		selection.selRel = filepath.ToSlash(rel)
+	selection := &Selection{
+		dir:            dir,
+		ignoreFiles:    map[string]bool{},
+		descendantOnly: map[string]bool{},
 	}
 	patterns, err := selection.gather()
 	if err != nil {
@@ -114,49 +91,28 @@ func New(root, dir string) (*Selection, error) {
 	return selection, nil
 }
 
-// Root returns the anchor directory the selection's ignore rules are relative to.
-func (s *Selection) Root() string { return s.root }
-
 // Dir returns the selected source directory.
 func (s *Selection) Dir() string { return s.dir }
 
-// Sub returns a Selection over a subdirectory of the selected tree. It shares the
-// parent's root and compiled rules, so root-relative matching (and therefore
-// ancestor rules) still applies; only the walked subtree changes. It is how the
-// materializer selects one app directory without re-reading rules.
-func (s *Selection) Sub(dir string) (*Selection, error) {
-	dir = filepath.Clean(dir)
-	rel, err := filepath.Rel(s.dir, dir)
+// Rel returns path as a slash path relative to the selected directory. It is the
+// argument form Includes expects.
+func (s *Selection) Rel(path string) (string, error) {
+	rel, err := filepath.Rel(s.dir, path)
 	if err != nil {
-		return nil, fmt.Errorf("source: relate %q to %q: %w", dir, s.dir, err)
+		return "", fmt.Errorf("source: relate %q to %q: %w", path, s.dir, err)
 	}
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return nil, fmt.Errorf("source: dir %q is outside %q", dir, s.dir)
-	}
-	sub := &Selection{root: s.root, dir: dir, matcher: s.matcher, ignoreFiles: s.ignoreFiles, descendantOnly: s.descendantOnly}
-	if rootRel, rerr := filepath.Rel(s.root, dir); rerr == nil && rootRel != "." {
-		sub.selRel = filepath.ToSlash(rootRel)
-	}
-	return sub, nil
-}
-
-// Rel returns path as a root-relative slash path. It is the argument form
-// Includes expects.
-func (s *Selection) Rel(path string) (string, error) {
-	rel, err := filepath.Rel(s.root, path)
-	if err != nil {
-		return "", fmt.Errorf("source: relate %q to %q: %w", path, s.root, err)
+		return "", fmt.Errorf("source: path %q is outside selected directory %q", path, s.dir)
 	}
 	return filepath.ToSlash(rel), nil
 }
 
-// Includes reports whether the root-relative slash path rel is part of the
-// source. The selected directory itself is always included. Applicable
-// .gitignore files and ".git" are special-cased: ignore files are always source,
-// ".git" never is.
+// Includes reports whether the directory-relative slash path rel is part of the
+// source. The selected directory itself is always included, as is its mandatory
+// template and every applicable .gitignore file. ".git" is never source.
 func (s *Selection) Includes(rel string, isDir bool) bool {
 	rel = strings.TrimSuffix(filepath.ToSlash(rel), "/")
-	if rel == "." || rel == "" || rel == s.selRel {
+	if rel == "." || rel == "" || rel == AppTemplateFile {
 		return true
 	}
 	if s.ignoreFiles[rel] {
@@ -175,8 +131,8 @@ func (s *Selection) Includes(rel string, isDir bool) bool {
 	return !s.matcher.Match(parts, isDir)
 }
 
-// IncludesPath is Includes for a filesystem path. A path outside the root is not
-// included.
+// IncludesPath is Includes for a filesystem path. A path outside the selected
+// directory is not included.
 func (s *Selection) IncludesPath(path string, isDir bool) bool {
 	rel, err := s.Rel(path)
 	if err != nil {
@@ -185,35 +141,14 @@ func (s *Selection) IncludesPath(path string, isDir bool) bool {
 	return s.Includes(rel, isDir)
 }
 
-// IgnoreFiles returns the absolute paths of the applicable .gitignore files, in
-// sorted order. They are the files whose content is part of the selection policy;
-// callers fold them into a fingerprint or preserve them in a copy. For a Sub
-// selection it returns the files gathered for the whole parent source, so callers
-// that want a subtree's rules should walk (WalkDir visits exactly the subtree's
-// applicable ignore files).
+// IgnoreFiles returns the absolute paths of the selected directory's applicable
+// .gitignore files, in sorted order. They are the files whose content is part of
+// the selection policy; callers fold them into a fingerprint or preserve them in
+// a copy.
 func (s *Selection) IgnoreFiles() []string {
 	out := make([]string, 0, len(s.ignoreFiles))
 	for rel := range s.ignoreFiles {
-		out = append(out, filepath.Join(s.root, filepath.FromSlash(rel)))
-	}
-	sort.Strings(out)
-	return out
-}
-
-// ApplicableIgnoreFiles returns the ignore files that can affect this selected
-// directory: files on its ancestor chain and files below it. This is narrower
-// than IgnoreFiles for a Sub selection, whose parent selection may also know
-// about sibling policies.
-func (s *Selection) ApplicableIgnoreFiles() []string {
-	var out []string
-	for rel := range s.ignoreFiles {
-		path := filepath.Join(s.root, filepath.FromSlash(rel))
-		dir := filepath.Dir(path)
-		if path == filepath.Join(s.dir, IgnoreFile) ||
-			strings.HasPrefix(s.dir+string(filepath.Separator), dir+string(filepath.Separator)) ||
-			strings.HasPrefix(path, s.dir+string(filepath.Separator)) {
-			out = append(out, path)
-		}
+		out = append(out, filepath.Join(s.dir, filepath.FromSlash(rel)))
 	}
 	sort.Strings(out)
 	return out
@@ -251,33 +186,15 @@ func (s *Selection) WalkDir(fn fs.WalkDirFunc) error {
 	})
 }
 
-// gather reads the applicable .gitignore files and compiles their patterns in
-// increasing priority order (root first, deeper last), matching git: the deepest
-// matching rule wins because the matcher evaluates patterns from last to first.
+// gather reads the .gitignore files at dir and in its non-ignored descendants,
+// compiling their patterns in increasing priority order (shallower first, deeper
+// last), matching git: the deepest matching rule wins because the matcher
+// evaluates patterns from last to first.
 func (s *Selection) gather() ([]gitignore.Pattern, error) {
-	var ps []gitignore.Pattern
-
-	// Ancestors from root down to dir, inclusive. dir is the explicitly selected
-	// root, so an ignore rule matching it does not stop these reads.
-	acc := s.root
-	ps, err := s.readIgnore(acc, ps)
+	ps, err := s.readIgnore(s.dir, nil)
 	if err != nil {
 		return nil, err
 	}
-	rel, err := filepath.Rel(s.root, s.dir)
-	if err != nil {
-		return nil, fmt.Errorf("source: relate %q to %q: %w", s.dir, s.root, err)
-	}
-	if rel != "." {
-		for part := range strings.SplitSeq(filepath.ToSlash(rel), "/") {
-			acc = filepath.Join(acc, part)
-			ps, err = s.readIgnore(acc, ps)
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-
 	return s.gatherChildren(s.dir, ps)
 }
 
@@ -297,11 +214,11 @@ func (s *Selection) gatherChildren(dir string, ps []gitignore.Pattern) ([]gitign
 			continue
 		}
 		child := filepath.Join(dir, e.Name())
-		childRel, rerr := filepath.Rel(s.root, child)
+		childRel, rerr := s.Rel(child)
 		if rerr != nil {
-			return nil, fmt.Errorf("source: relate %q to %q: %w", child, s.root, rerr)
+			return nil, rerr
 		}
-		if matcher.Match(strings.Split(filepath.ToSlash(childRel), "/"), true) {
+		if matcher.Match(strings.Split(childRel, "/"), true) {
 			continue
 		}
 		ps, err = s.readIgnore(child, ps)
@@ -331,13 +248,13 @@ func (s *Selection) readIgnore(dir string, ps []gitignore.Pattern) ([]gitignore.
 	}
 	defer file.Close()
 
-	rel, err := filepath.Rel(s.root, ignorePath)
+	rel, err := s.Rel(ignorePath)
 	if err != nil {
-		return nil, fmt.Errorf("source: relate %q to %q: %w", ignorePath, s.root, err)
+		return nil, err
 	}
-	s.ignoreFiles[filepath.ToSlash(rel)] = true
+	s.ignoreFiles[rel] = true
 
-	domain := domainOf(s.root, dir)
+	domain := domainOf(s.dir, dir)
 	sc := bufio.NewScanner(file)
 	for sc.Scan() {
 		line := sc.Text()
