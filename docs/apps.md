@@ -173,6 +173,13 @@ async def handler(event: dict, context: HandlerContext) -> None:
     )
 ```
 
+Python handlers may optionally use `Depends` and `@bind` from the same library
+to inject sync or async providers, with per-invocation or per-container
+lifetimes and generator cleanup. This is opt-in; handlers that do not import it
+keep the plain function form. See the
+[Python library documentation](../packages/python/README.md#dependency-injection)
+for the rules, scopes, and limitations.
+
 OpenTelemetry trace propagation remains available ambiently during the handler
 call in both runtimes.
 
