@@ -21,8 +21,11 @@ import (
 // architecture is unchanged), a configured git source WITH a monorepo path —
 // the only source of repository/ref/path — and a local two-commit bare
 // repository as the transport seam for rollback's commit verification.
-// It returns the dependencies, a direct state handle, and the two commit SHAs.
-func rollbackDeps(t *testing.T) (Dependencies, *state.State, string, string) {
+// It returns the dependencies, a direct NODE-OWNED state handle (the fixture
+// acquires deployment node progress, which requires one), the two commit SHAs,
+// and the fixture's node identity — unique per test, because the node session
+// advisory lock is cluster-global across parallel package suites.
+func rollbackDeps(t *testing.T) (Dependencies, *state.State, string, string, string) {
 	t.Helper()
 	deps, dsn := stateBackedDeps(t)
 	first, second := bareRepoWithTwoCommits(t, &deps)
@@ -30,8 +33,9 @@ func rollbackDeps(t *testing.T) (Dependencies, *state.State, string, string) {
 		deps.GitConfigPath, "git@github.com:acme/r.git", "main", "services", ""); err != nil {
 		t.Fatalf("set source: %v", err)
 	}
-	st := testutil.OpenState(t, dsn)
-	return deps, st, first, second
+	nodeID := testutil.UniqueName(t, "node-1")
+	st := testutil.OpenState(t, dsn, state.Options{NodeID: nodeID, Instance: "inst-1"})
+	return deps, st, first, second, nodeID
 }
 
 // bareRepoWithTwoCommits builds a work+bare fixture whose main branch has two
@@ -71,7 +75,7 @@ func bareRepoWithTwoCommits(t *testing.T, deps *Dependencies) (first, second str
 // repository/ref/path come exclusively from `relay git set` — and no
 // materialization of /apps.
 func TestDeployRollbackPublishesPinnedGenerationFromConfiguredSource(t *testing.T) {
-	deps, st, first, _ := rollbackDeps(t)
+	deps, st, first, _, _ := rollbackDeps(t)
 
 	out, _, err := runCLIWithDeps(t, deps, "", "deploy", "status")
 	if err != nil {
@@ -128,7 +132,7 @@ func TestDeployRollbackPublishesPinnedGenerationFromConfiguredSource(t *testing.
 // in use without advancing the generation, while a different commit writes a
 // NEW pinned generation carrying the exact verified commit.
 func TestDeployRollbackWhileAlreadyPinnedPublishesNewGeneration(t *testing.T) {
-	deps, st, first, second := rollbackDeps(t)
+	deps, st, first, second, _ := rollbackDeps(t)
 
 	out, _, err := runCLIWithDeps(t, deps, "", "deploy", "rollback", first)
 	if err != nil {
@@ -170,7 +174,7 @@ func TestDeployRollbackWhileAlreadyPinnedPublishesNewGeneration(t *testing.T) {
 // absent from the configured repository fails closed BEFORE publication: no
 // generation is written and nothing is materialized.
 func TestDeployRollbackRejectsMissingCommitWithoutPublishing(t *testing.T) {
-	deps, st, _, _ := rollbackDeps(t)
+	deps, st, _, _, _ := rollbackDeps(t)
 	missing := "0123456789abcdef0123456789abcdef01234567"
 
 	_, _, err := runCLIWithDeps(t, deps, "", "deploy", "rollback", missing)
@@ -192,7 +196,7 @@ func TestDeployRollbackRejectsMissingCommitWithoutPublishing(t *testing.T) {
 // only flip the policy: commit and generation are byte-identical before and
 // after, and neither command fetches, syncs, or materializes anything.
 func TestDeployPinUnpinPreserveRevisionWithoutMaterializing(t *testing.T) {
-	deps, st, first, _ := rollbackDeps(t)
+	deps, st, first, _, _ := rollbackDeps(t)
 
 	out, _, err := runCLIWithDeps(t, deps, "", "deploy", "rollback", first)
 	if err != nil {
@@ -254,7 +258,7 @@ func TestDeployPinUnpinPreserveRevisionWithoutMaterializing(t *testing.T) {
 // and the per-app activation progress for the applied generation renders
 // beneath the desired revision block.
 func TestDeployStatusShowsNodeProgressWhileBehind(t *testing.T) {
-	deps, st, first, second := rollbackDeps(t)
+	deps, st, first, second, nodeID := rollbackDeps(t)
 	ctx := context.Background()
 
 	if out, _, err := runCLIWithDeps(t, deps, "", "deploy", "rollback", first); err != nil {
@@ -266,26 +270,26 @@ func TestDeployStatusShowsNodeProgressWhileBehind(t *testing.T) {
 
 	// A node that observed generation 2 but still applies generation 1, whose
 	// latest materialization attempt failed.
-	acquired, err := st.AcquireDeploymentNode(ctx, "node-1", "inst-1", 2,
+	acquired, err := st.AcquireDeploymentNode(ctx, nodeID, "inst-1", 2,
 		state.DeploymentNodeProgress{
-			NodeID: "node-1", Generation: 2,
+			NodeID: nodeID, Generation: 2,
 			Phase: state.DeploymentNodeMaterializing, Commit: second,
 		})
 	if err != nil {
 		t.Fatalf("acquire node: %v", err)
 	}
-	if landed, err := st.RecordDeploymentNodeProgress(ctx, "node-1", 2,
+	if landed, err := st.RecordDeploymentNodeProgress(ctx, nodeID, 2,
 		acquired.Incarnation, state.DeploymentNodeProgress{
-			NodeID: "node-1", Generation: 2,
+			NodeID: nodeID, Generation: 2,
 			AppliedGeneration: 1, AppliedIncarnation: acquired.Incarnation,
 			Phase: state.DeploymentNodeFailed, Commit: second,
 			AppliedCommit: first, Error: "fetch failed",
 		}); err != nil || !landed {
 		t.Fatalf("record node progress = (%v, %v)", landed, err)
 	}
-	if landed, err := st.RecordDeploymentAppProgress(ctx, "node-1", "gated", 1,
+	if landed, err := st.RecordDeploymentAppProgress(ctx, nodeID, "gated", 1,
 		acquired.Incarnation, state.DeploymentAppProgress{
-			NodeID: "node-1", App: "gated", Generation: 1, Instance: "inst-1",
+			NodeID: nodeID, App: "gated", Generation: 1, Instance: "inst-1",
 			Phase: state.DeploymentAppActive, Fingerprint: "fp-gated",
 			TemplateIdentity: "tid-gated", Commit: first,
 		}); err != nil || !landed {
@@ -297,7 +301,7 @@ func TestDeployStatusShowsNodeProgressWhileBehind(t *testing.T) {
 		t.Fatalf("deploy status: %v (out=%s)", err, out)
 	}
 	for _, want := range []string{
-		"Apps on node-1 (active generation 1)",
+		"Apps on " + nodeID + " (active generation 1)",
 		"fetch failed",
 	} {
 		if !strings.Contains(out, want) {
@@ -336,7 +340,7 @@ func TestDeployStatusShowsNodeProgressWhileBehind(t *testing.T) {
 	}
 	// The node row pairs observed=2, applied=1 with the failed phase and the
 	// applied commit (abbreviated to 12 chars) while the node is behind.
-	nodeRow := regexp.MustCompile(`node-1\s+2\s+1\s+` +
+	nodeRow := regexp.MustCompile(regexp.QuoteMeta(nodeID) + `\s+2\s+1\s+` +
 		regexp.QuoteMeta(state.DeploymentNodeFailed) + `\s+` +
 		regexp.QuoteMeta(first[:12]) + `(?:\s|$)`)
 	if !nodeRow.MatchString(out) {

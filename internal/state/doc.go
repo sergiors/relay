@@ -233,6 +233,18 @@
 // node's observed/applied generation matches and the caller presents the current
 // incarnation.
 //
+// Acquiring a node's progress allocates a fresh incarnation, so it is the root
+// of that fence: it requires a node-owned handle and runs one atomic autocommit
+// statement on the handle's PINNED ownership backend. The statement proves the
+// node's session advisory lock before its upsert. A process whose lock was lost
+// while its pool stayed usable therefore cannot allocate a successor incarnation,
+// and a restart cannot consume as an identity it no longer owns (see
+// AcquireDeploymentNode). The query has a bounded client context and a
+// transaction-local row-lock timeout; a slow or ambiguous result fails closed.
+// A lost/unresponsive network or uninterruptible storage I/O can still delay the
+// pinned backend's response, and synchronous_commit=off can acknowledge before
+// WAL is durable.
+//
 // A materialization is committed atomically. CommitDeploymentMaterialization
 // locks the node row FOR UPDATE, verifies the incarnation/generation/instance
 // fence, upserts the COMPLETE authorization set (writing only changed rows, like
@@ -475,11 +487,15 @@
 //     the worker can cancel its lifecycle and skip identity-scoped cleanup
 //     before a replacement owner is disturbed. Detection is interval-bounded,
 //     not instantaneous (see OwnerLockCheckInterval). Every access to that one
-//     pinned connection — each check and Close — is serialized by ownerMu,
-//     because database/sql does not make a whole check atomic on one connection
-//     and pgx fails the overlapping calls with "conn busy"; the monitor and the
-//     startup/shutdown ownership proofs all share it. The lock is narrow
-//     (ownerConn only), so unrelated state work remains fully concurrent.
+//     pinned connection — each check, Close, and the deployment
+//     node-acquisition autocommit statement that re-proves the lock before
+//     allocating an incarnation — is serialized by ownerMu, because
+//     database/sql does not make a whole check atomic on one connection and pgx
+//     fails overlapping calls with "conn busy"; the monitor and the
+//     startup/shutdown ownership proofs all share it. Acquisition bounds the
+//     complete autocommit query, and a queued check waits only within its own
+//     context and then fails closed. The lock is narrow (ownerConn only), so
+//     unrelated state work remains fully concurrent.
 //   - Dependency-image coordination rides the same pinned connection
 //     (AcquireDependencyImageUse/TryAcquireDependencyImageGC, see
 //     dep_image_lease.go): dependency layers live on a Docker daemon that

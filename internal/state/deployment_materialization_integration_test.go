@@ -165,7 +165,7 @@ func acquireDeployNodeObserving(
 // for the identical re-commit; the validated node-row fence, not an upsert row
 // count, is the transaction's authority.
 func TestCommitDeploymentMaterializationIdempotentRecommit(t *testing.T) {
-	st := openTestState(t)
+	st := openDeployNodeOwner(t, newTestDSN(t), deployProgressNode, deployInstFirst)
 	installDeploymentAppWriteCounters(t, st)
 	ctx := context.Background()
 	start := deployProgressBase
@@ -308,7 +308,7 @@ func TestCommitDeploymentMaterializationIdempotentRecommit(t *testing.T) {
 // match the locked node row writes nothing, leaving the previous applied
 // generation and the per-app rows untouched.
 func TestCommitDeploymentMaterializationInstanceFence(t *testing.T) {
-	st := openTestState(t)
+	st := openDeployNodeOwner(t, newTestDSN(t), deployProgressNode, deployInstFirst)
 	ctx := context.Background()
 	pinDeploymentClock(t, st, deployProgressBase)
 	node := acquireDeployNode(t, st, deployInstFirst, 1, deployCommitA)
@@ -357,12 +357,16 @@ func TestCommitDeploymentMaterializationInstanceFence(t *testing.T) {
 // node still at its acquired state — while a control commit from the current
 // incarnation still lands, proving the refusal came from the fence.
 func TestCommitDeploymentMaterializationStaleIncarnationWritesNothing(t *testing.T) {
-	st := openTestState(t)
+	dsn := newTestDSN(t)
+	st := openDeployNodeOwner(t, dsn, deployProgressNode, deployInstFirst)
 	installDeploymentAppWriteCounters(t, st)
 	ctx := context.Background()
 	pinDeploymentClock(t, st, deployProgressBase)
 
 	stale := acquireDeployNode(t, st, deployInstFirst, 1, deployCommitA)
+	// Restart: the successor instance's handle opens only after the
+	// predecessor's closed (the node lock is exclusive).
+	st = reopenDeployNodeOwner(t, dsn, st, deployInstSecond)
 	current := acquireDeployNode(t, st, deployInstSecond, 1, deployCommitA)
 	if current.Incarnation <= stale.Incarnation {
 		t.Fatalf("re-acquired incarnation %d, want a fresh one after %d",
@@ -436,7 +440,7 @@ func TestCommitDeploymentMaterializationStaleIncarnationWritesNothing(t *testing
 // come from schema-local triggers. Every test runs on its own isolated schema
 // (openTestState) and fails rather than skips without PostgreSQL.
 func TestCommitDeploymentMaterializationOrderedAgainstSupersedingAcquire(t *testing.T) {
-	st := openTestState(t)
+	st := openDeployNodeOwner(t, newTestDSN(t), deployProgressNode, deployInstFirst)
 	installDeploymentAppWriteCounters(t, st)
 	ctx := context.Background()
 	pinDeploymentClock(t, st, deployProgressBase)
@@ -605,7 +609,7 @@ func TestCommitDeploymentMaterializationOrderedAgainstSupersedingAcquire(t *test
 // interleaving is proven through pg_stat_activity/pg_blocking_pids polling, so
 // the cancellation never races an arbitrary sleep.
 func TestCommitDeploymentMaterializationCancelledDuringLockWaitWritesNothing(t *testing.T) {
-	st := openTestState(t)
+	st := openDeployNodeOwner(t, newTestDSN(t), deployProgressNode, deployInstFirst)
 	installDeploymentAppWriteCounters(t, st)
 	ctx := context.Background()
 	pinDeploymentClock(t, st, deployProgressBase)
@@ -730,7 +734,7 @@ func TestCommitDeploymentMaterializationCancelledDuringLockWaitWritesNothing(t *
 // set removes previously committed rows — the complete-set contract at its
 // extreme — while the node keeps the applied generation.
 func TestCommitDeploymentMaterializationEmptyDeploymentIsCompleteSet(t *testing.T) {
-	st := openTestState(t)
+	st := openDeployNodeOwner(t, newTestDSN(t), deployProgressNode, deployInstFirst)
 	installDeploymentAppWriteCounters(t, st)
 	ctx := context.Background()
 	start := deployProgressBase
@@ -821,7 +825,7 @@ func TestCommitDeploymentMaterializationEmptyDeploymentIsCompleteSet(t *testing.
 // inserts disappearing. Removing the fault and retrying the identical commit
 // lands the full valid/invalid/removed set and advances the node atomically.
 func TestCommitDeploymentMaterializationRollsBackAtomicSetAfterPartialInsert(t *testing.T) {
-	st := openTestState(t)
+	st := openDeployNodeOwner(t, newTestDSN(t), deployProgressNode, deployInstFirst)
 	installDeploymentAppWriteCounters(t, st)
 	ctx := context.Background()
 	pinDeploymentClock(t, st, deployProgressBase)
@@ -950,7 +954,7 @@ func TestCommitDeploymentMaterializationRollsBackAtomicSetAfterPartialInsert(t *
 // inserts rolled back with them — while the prior generation keeps serving.
 // Removing the fault and retrying the identical commit lands both halves.
 func TestCommitDeploymentMaterializationRollsBackAppsWithNodeProgressFailure(t *testing.T) {
-	st := openTestState(t)
+	st := openDeployNodeOwner(t, newTestDSN(t), deployProgressNode, deployInstFirst)
 	installDeploymentAppWriteCounters(t, st)
 	ctx := context.Background()
 	pinDeploymentClock(t, st, deployProgressBase)

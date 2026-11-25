@@ -110,12 +110,18 @@ func TestDeploymentListenerCatchUpHintWakeAndReconnect(t *testing.T) {
 	// LISTEN sessions can never be terminated by mistake.
 	appName := testutil.Unique("relay-lstn", t.Name())
 	dsn += "&application_name=" + appName
-	st := testutil.OpenState(t, dsn)
+	// The coordinator claims deployment node progress, which requires a
+	// NODE-OWNED state handle; the node identity's session advisory lock is
+	// cluster-global, so it is unique to this test as well.
+	nodeID := testutil.UniqueName(t, "node-listen")
+	st := testutil.OpenState(t, dsn, state.Options{
+		NodeID: nodeID, Instance: "inst-listen",
+	})
 	logger, logs := captureStartupLog()
 
 	cfg := deployment.Config{
 		State:      st,
-		NodeID:     "node-listen",
+		NodeID:     nodeID,
 		InstanceID: "inst-listen",
 		// No local source file: each materialization attempt fails fast AFTER
 		// the node-progress claim, so attempts stay observable.
@@ -130,7 +136,7 @@ func TestDeploymentListenerCatchUpHintWakeAndReconnect(t *testing.T) {
 	t.Cleanup(cancel)
 
 	nodeProgress := func() (state.DeploymentNodeProgress, bool) {
-		node, found, err := st.ReadDeploymentNode(ctx, "node-listen")
+		node, found, err := st.ReadDeploymentNode(ctx, nodeID)
 		if err != nil || !found {
 			return state.DeploymentNodeProgress{}, false
 		}

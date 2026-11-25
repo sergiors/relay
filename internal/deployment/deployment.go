@@ -38,6 +38,14 @@
 // previous authorized generation. Without such proof the node fails closed
 // instead of ACKing previously matched deliveries unmatched.
 //
+// Every incarnation this coordinator uses is allocated by
+// state.AcquireDeploymentNode, which accepts it only from the process that still
+// owns the node identity's exclusive session lock: the allocation statement runs
+// on that same pinned backend and includes its ownership proof.
+// A process that lost ownership therefore cannot allocate a successor incarnation
+// from a still-open pool, and a failed startup allocation fails startup instead of
+// consuming as the identity.
+//
 // Rollback is a NEW generation carrying an older commit. A manual publication may
 // pin that revision; while pinned, automatic webhook pushes are ignored so a
 // later or out-of-order branch delivery cannot silently undo the rollback.
@@ -155,7 +163,10 @@ type Snapshot struct {
 // and records per-node materialization plus per-app activation progress. All
 // progress writes are fenced by the PostgreSQL-allocated incarnation and the
 // deployment generation, so a stale process or stale generation cannot overwrite
-// newer progress.
+// newer progress. The incarnation itself is only allocatable by the process
+// that still owns the node identity's session lock (see state's
+// AcquireDeploymentNode), which anchors that fence in provable ownership rather
+// than in a process-local belief.
 type Coordinator struct {
 	cfg   Config
 	poll  time.Duration
@@ -260,6 +271,13 @@ func (c *Coordinator) SetVerificationLedger(verified func(since time.Time) map[s
 // authorization can still be proven intact locally before consumption is
 // allowed.
 //
+// Claiming this process's incarnation for the node's stored progress is
+// different: it runs BEFORE any materialization and a failure is returned, not
+// reported as a retryable snapshot error. The incarnation is the root of every
+// later progress fence, so a process that cannot prove ownership of its node
+// identity (or otherwise cannot persist the claim) must fail startup instead of
+// consuming as that identity.
+//
 // A state read failure is returned: a coordinator-active node cannot converge
 // without the shared row, and silently treating it as "nothing published" would
 // be unsafe.
@@ -278,13 +296,24 @@ func (c *Coordinator) ObserveStartup(ctx context.Context) (Snapshot, error) {
 	// The per-app progress rows for the previous applied generation become the
 	// authorization fallback if this startup's fetch fails.
 	if c.cfg.NodeID != "" {
-		if node, found, err := c.cfg.State.ReadDeploymentNode(ctx, c.cfg.NodeID); err == nil && found {
+		node, found, err := c.cfg.State.ReadDeploymentNode(ctx, c.cfg.NodeID)
+		if err != nil {
+			return Snapshot{}, fmt.Errorf("deployment: read node progress: %w", err)
+		}
+		if found {
 			c.setAppliedIncarnation(node.AppliedIncarnation)
 			if node.Generation > 0 {
 				// Take ownership of this node's progress with a fresh incarnation
 				// even before observing a desired revision. Without this, a restart
 				// with no published revision could not report activation progress for
 				// the generation it keeps serving.
+				//
+				// A failed acquisition is FATAL to startup. The incarnation it
+				// allocates is the root of every later progress fence, so a failure
+				// to establish it — in particular an ownership proof that this
+				// process no longer holds the NODE_ID lock — must not let the worker
+				// consume as this identity or silently continue as if it owned the
+				// generation.
 				acquired, aerr := c.cfg.State.AcquireDeploymentNode(
 					ctx, c.cfg.NodeID, c.cfg.InstanceID, node.Generation,
 					state.DeploymentNodeProgress{
@@ -296,10 +325,15 @@ func (c *Coordinator) ObserveStartup(ctx context.Context) (Snapshot, error) {
 						Commit:            node.Commit,
 						AppliedCommit:     node.AppliedCommit,
 					})
-				if aerr == nil {
-					c.incarnation = acquired.Incarnation
-					c.setAppliedIncarnation(acquired.Incarnation)
+				if aerr != nil {
+					return Snapshot{}, fmt.Errorf(
+						"deployment: acquire node progress: %w", aerr,
+					)
 				}
+				c.mu.Lock()
+				c.incarnation = acquired.Incarnation
+				c.mu.Unlock()
+				c.setAppliedIncarnation(acquired.Incarnation)
 			}
 		}
 	}
@@ -317,6 +351,10 @@ func (c *Coordinator) ObserveStartup(ctx context.Context) (Snapshot, error) {
 	}
 	snapshot, err := c.materialize(ctx, previous, desired)
 	if err != nil {
+		if errors.Is(err, state.ErrOwnerLockLost) ||
+			errors.Is(err, state.ErrDeploymentNodeOutcomeUnknown) {
+			return Snapshot{}, err
+		}
 		c.mu.Lock()
 		c.retryGeneration = desired.Generation
 		c.retryCommit = desired.Commit

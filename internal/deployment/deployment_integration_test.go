@@ -43,13 +43,18 @@ func newCoordinatorEnv(t *testing.T) *coordinatorEnv {
 	gitDir := t.TempDir()
 	logBuf := &bytes.Buffer{}
 	dsn := testutil.NewStateDSN(t)
-	st := testutil.OpenState(t, dsn)
+	// The node identity's session advisory lock is cluster-global (schemas
+	// only isolate rows), so the fixture's identity is unique to this test:
+	// parallel package suites can never collide on it. The instance is a
+	// per-process token, not a lock, so it stays fixed.
+	nodeID := testutil.UniqueName(t, "node-1")
+	st := testutil.OpenState(t, dsn, state.Options{NodeID: nodeID, Instance: "inst-1"})
 	return &coordinatorEnv{
 		st:  st,
 		dsn: dsn,
 		cfg: Config{
 			State:          st,
-			NodeID:         "node-1",
+			NodeID:         nodeID,
 			InstanceID:     "inst-1",
 			GitConfigPath:  filepath.Join(gitDir, "source.json"),
 			GitCheckoutDir: filepath.Join(gitDir, "checkout"),
@@ -211,6 +216,11 @@ func TestObserveStartupMissingGitSourceReportsAndFailsClosed(t *testing.T) {
 	}
 	if snapshot.Authoritative {
 		t.Fatal("a failed startup must not authorize cluster reconciliation")
+	}
+	// An ordinary materialization failure stays retryable: it arms the short
+	// retry cadence instead of ending convergence for this generation.
+	if !c.retryPending() {
+		t.Fatal("an ordinary materialization failure must arm the retry cadence")
 	}
 
 	node, found, err := env.st.ReadDeploymentNode(context.Background(), env.cfg.NodeID)

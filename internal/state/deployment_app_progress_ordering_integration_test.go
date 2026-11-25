@@ -42,11 +42,36 @@ func awaitFenceOrdering(
 	supersessionPID int,
 	writes <-chan appProgressWriteResult,
 ) *appProgressWriteResult {
+	return awaitFenceOrderingInterval(t, monitor, supersessionPID, writes,
+		10*time.Millisecond)
+}
+
+// awaitFenceOrderingFast is the same server-observed proof at a 2ms cadence,
+// for acquisitions whose row-lock wait is bounded server-side by
+// deploymentNodeLockTimeout (50ms): a 10ms ticker leaves only a handful of
+// samples inside that window, so CI scheduling jitter could let a lock-timeout
+// COMPLETION arrive on the result channel before the wait was ever observed.
+// 2ms keeps roughly 25 pg_stat_activity/pg_blocking_pids samples inside the
+// window — still lock-manager observation, still no blind sleeps.
+func awaitFenceOrderingFast(
+	t *testing.T,
+	monitor *sql.DB,
+	backendPID int,
+	writes <-chan appProgressWriteResult,
+) *appProgressWriteResult {
+	return awaitFenceOrderingInterval(t, monitor, backendPID, writes,
+		2*time.Millisecond)
+}
+
+func awaitFenceOrderingInterval(
+	t *testing.T,
+	monitor *sql.DB,
+	supersessionPID int,
+	writes <-chan appProgressWriteResult,
+	pollInterval time.Duration,
+) *appProgressWriteResult {
 	t.Helper()
-	const (
-		pollInterval = 10 * time.Millisecond
-		pollDeadline = 10 * time.Second
-	)
+	const pollDeadline = 10 * time.Second
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	timeout := time.NewTimer(pollDeadline)
@@ -95,7 +120,7 @@ func awaitFenceOrdering(
 // isolated schema (openTestState) and fails rather than skips without
 // PostgreSQL.
 func TestRecordDeploymentAppProgressOrderedAgainstSupersedingAcquire(t *testing.T) {
-	st := openTestState(t)
+	st := openDeployNodeOwner(t, newTestDSN(t), deployProgressNode, deployInstFirst)
 	installDeploymentAppWriteCounters(t, st)
 	ctx := context.Background()
 

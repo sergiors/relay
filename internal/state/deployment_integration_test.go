@@ -934,18 +934,26 @@ func TestWithDeploymentDesiredLock(t *testing.T) {
 	}
 }
 
-// TestDeploymentNodeProgressFencing pins the two process fences: a fresh
-// incarnation is allocated on every acquisition (a restart takes ownership),
-// the applied generation survives re-acquisition (a failed newer target never
-// erases the authorized one), stale-incarnation/generation writes are normal
-// no-ops, an older observed generation is superseded, and independent nodes
-// never observe each other's progress.
+// TestDeploymentNodeProgressFencing pins the process fences around node
+// progress: a fresh incarnation is allocated on every acquisition (a restart
+// takes ownership through a successor handle), the applied generation survives
+// re-acquisition (a failed newer target never erases the authorized one),
+// stale-incarnation/generation writes are normal no-ops, an older observed
+// generation is superseded, identity the handle does not own is rejected, and
+// independent nodes never observe each other's progress.
 func TestDeploymentNodeProgressFencing(t *testing.T) {
-	st := openTestState(t)
+	dsn := newTestDSN(t)
 	ctx := context.Background()
+	// Advisory locks are cluster-global, so the owner identities are unique to
+	// this test even though their rows live in an isolated schema.
+	nodeAID := uniqueNodeID(t, "node-a")
+	nodeBID := uniqueNodeID(t, "node-b")
 
-	first, err := st.AcquireDeploymentNode(ctx, "node-a", "inst-1", 1, DeploymentNodeProgress{
-		NodeID: "node-a", Generation: 1, Phase: DeploymentNodeMaterializing,
+	// Given: the node's first process acquires generation 1 through its
+	// node-owned handle.
+	a1 := openDeployNodeOwner(t, dsn, nodeAID, "inst-1")
+	first, err := a1.AcquireDeploymentNode(ctx, nodeAID, "inst-1", 1, DeploymentNodeProgress{
+		NodeID: nodeAID, Generation: 1, Phase: DeploymentNodeMaterializing,
 		Commit: deployCommitA,
 	})
 	if err != nil {
@@ -958,9 +966,9 @@ func TestDeploymentNodeProgressFencing(t *testing.T) {
 		t.Fatalf("first acquire = %+v, want the supplied phase/commit", first)
 	}
 
-	landed, err := st.RecordDeploymentNodeProgress(ctx, "node-a", 1, first.Incarnation,
+	landed, err := a1.RecordDeploymentNodeProgress(ctx, nodeAID, 1, first.Incarnation,
 		DeploymentNodeProgress{
-			NodeID: "node-a", Generation: 1,
+			NodeID: nodeAID, Generation: 1,
 			AppliedGeneration: 1, AppliedIncarnation: first.Incarnation,
 			Phase: DeploymentNodeMaterialized, Commit: deployCommitA,
 			AppliedCommit: deployCommitA,
@@ -969,10 +977,13 @@ func TestDeploymentNodeProgressFencing(t *testing.T) {
 		t.Fatalf("record progress = (%v, %v), want landed", landed, err)
 	}
 
-	// A restart re-acquires the SAME observed generation with a fresh
-	// incarnation; the applied authorization is preserved.
-	reacquired, err := st.AcquireDeploymentNode(ctx, "node-a", "inst-2", 1, DeploymentNodeProgress{
-		NodeID: "node-a", Generation: 1, Phase: DeploymentNodeMaterialized,
+	// When: the node restarts under a new process instance. The successor
+	// handle opens only after the predecessor closed (the node lock is
+	// exclusive), and the re-acquisition of the SAME observed generation takes
+	// a fresh incarnation while the applied authorization is preserved.
+	a2 := reopenDeployNodeOwner(t, dsn, a1, "inst-2")
+	reacquired, err := a2.AcquireDeploymentNode(ctx, nodeAID, "inst-2", 1, DeploymentNodeProgress{
+		NodeID: nodeAID, Generation: 1, Phase: DeploymentNodeMaterialized,
 		Commit: deployCommitA, AppliedCommit: deployCommitA,
 	})
 	if err != nil {
@@ -986,10 +997,10 @@ func TestDeploymentNodeProgressFencing(t *testing.T) {
 		t.Fatalf("re-acquire = %+v, want applied generation 1 preserved", reacquired)
 	}
 
-	// The superseded incarnation can no longer write.
-	landed, err = st.RecordDeploymentNodeProgress(ctx, "node-a", 1, first.Incarnation,
+	// Then: the superseded incarnation can no longer write.
+	landed, err = a2.RecordDeploymentNodeProgress(ctx, nodeAID, 1, first.Incarnation,
 		DeploymentNodeProgress{
-			NodeID: "node-a", Generation: 1,
+			NodeID: nodeAID, Generation: 1,
 			AppliedGeneration: 99, AppliedIncarnation: first.Incarnation,
 			Phase: DeploymentNodeFailed, Commit: deployCommitA,
 		})
@@ -997,9 +1008,9 @@ func TestDeploymentNodeProgressFencing(t *testing.T) {
 		t.Fatalf("stale-incarnation write = (%v, %v), want a no-op", landed, err)
 	}
 	// A mismatched generation with the CURRENT incarnation is also a no-op.
-	landed, err = st.RecordDeploymentNodeProgress(ctx, "node-a", 7, reacquired.Incarnation,
+	landed, err = a2.RecordDeploymentNodeProgress(ctx, nodeAID, 7, reacquired.Incarnation,
 		DeploymentNodeProgress{
-			NodeID: "node-a", Generation: 7,
+			NodeID: nodeAID, Generation: 7,
 			AppliedGeneration: 7, AppliedIncarnation: reacquired.Incarnation,
 			Phase: DeploymentNodeMaterialized,
 		})
@@ -1007,9 +1018,9 @@ func TestDeploymentNodeProgressFencing(t *testing.T) {
 		t.Fatalf("mismatched-generation write = (%v, %v), want a no-op", landed, err)
 	}
 	// The current incarnation still writes.
-	landed, err = st.RecordDeploymentNodeProgress(ctx, "node-a", 1, reacquired.Incarnation,
+	landed, err = a2.RecordDeploymentNodeProgress(ctx, nodeAID, 1, reacquired.Incarnation,
 		DeploymentNodeProgress{
-			NodeID: "node-a", Generation: 1,
+			NodeID: nodeAID, Generation: 1,
 			AppliedGeneration: 1, AppliedIncarnation: reacquired.Incarnation,
 			Phase: DeploymentNodeMaterialized, Commit: deployCommitA,
 			AppliedCommit: deployCommitA,
@@ -1018,43 +1029,52 @@ func TestDeploymentNodeProgressFencing(t *testing.T) {
 		t.Fatalf("current-incarnation write = (%v, %v), want landed", landed, err)
 	}
 
-	// Invalid acquisitions are rejected before touching the row.
-	if _, err := st.AcquireDeploymentNode(ctx, "node-a", "inst-3", 0,
-		DeploymentNodeProgress{NodeID: "node-a"}); err == nil {
+	// Invalid acquisitions are rejected before touching the row: a
+	// non-positive generation on a matching identity, and identities the
+	// handle does not own.
+	if _, err := a2.AcquireDeploymentNode(ctx, nodeAID, "inst-2", 0,
+		DeploymentNodeProgress{NodeID: nodeAID}); err == nil {
 		t.Fatal("acquire generation 0 = nil, want an error")
 	}
-	if _, err := st.AcquireDeploymentNode(ctx, "", "inst-3", 1,
+	if _, err := a2.AcquireDeploymentNode(ctx, "", "inst-2", 1,
 		DeploymentNodeProgress{}); err == nil {
 		t.Fatal("acquire with an empty node ID = nil, want an error")
 	}
+	if _, err := a2.AcquireDeploymentNode(ctx, nodeAID, "inst-9", 1,
+		DeploymentNodeProgress{NodeID: nodeAID}); err == nil {
+		t.Fatal("acquire with a foreign instance = nil, want an error")
+	}
 
-	// node-a observes a newer generation (a fresh incarnation again), then an
-	// older observed generation is superseded outright.
-	nodeALatest, err := st.AcquireDeploymentNode(ctx, "node-a", "inst-3", 3,
+	// When: node-a observes a newer generation (a fresh incarnation again
+	// under its next restart), then an older observed generation is superseded
+	// outright.
+	a3 := reopenDeployNodeOwner(t, dsn, a2, "inst-3")
+	nodeALatest, err := a3.AcquireDeploymentNode(ctx, nodeAID, "inst-3", 3,
 		DeploymentNodeProgress{
-			NodeID: "node-a", Generation: 3,
+			NodeID: nodeAID, Generation: 3,
 			Phase: DeploymentNodeMaterializing, Commit: deployCommitC,
 		})
 	if err != nil {
 		t.Fatalf("acquire node-a generation 3: %v", err)
 	}
-	if _, err := st.AcquireDeploymentNode(ctx, "node-a", "inst-4", 2,
-		DeploymentNodeProgress{NodeID: "node-a", Generation: 2,
+	if _, err := a3.AcquireDeploymentNode(ctx, nodeAID, "inst-3", 2,
+		DeploymentNodeProgress{NodeID: nodeAID, Generation: 2,
 			Phase: DeploymentNodeMaterializing}); !errors.Is(err, ErrDeploymentNodeSuperseded) {
 		t.Fatalf("acquire an older generation = %v, want ErrDeploymentNodeSuperseded", err)
 	}
 
 	// Independent node progress: node-b acquires its own generation without
 	// observing node-a, and neither row changes the other.
-	nodeB, err := st.AcquireDeploymentNode(ctx, "node-b", "inst-1", 4, DeploymentNodeProgress{
-		NodeID: "node-b", Generation: 4, Phase: DeploymentNodeMaterializing,
+	b := openDeployNodeOwner(t, dsn, nodeBID, "inst-1")
+	nodeB, err := b.AcquireDeploymentNode(ctx, nodeBID, "inst-1", 4, DeploymentNodeProgress{
+		NodeID: nodeBID, Generation: 4, Phase: DeploymentNodeMaterializing,
 		Commit: deployCommitB,
 	})
 	if err != nil {
 		t.Fatalf("acquire node-b: %v", err)
 	}
 
-	nodeA, found, err := st.ReadDeploymentNode(ctx, "node-a")
+	nodeA, found, err := a3.ReadDeploymentNode(ctx, nodeAID)
 	if err != nil || !found {
 		t.Fatalf("ReadDeploymentNode(node-a) = (%+v, %v, %v)", nodeA, found, err)
 	}
@@ -1062,19 +1082,20 @@ func TestDeploymentNodeProgressFencing(t *testing.T) {
 		nodeA.Incarnation != nodeALatest.Incarnation {
 		t.Fatalf("node-a = %+v, want generation 3, applied 1, and its latest incarnation", nodeA)
 	}
-	nodeBB, found, err := st.ReadDeploymentNode(ctx, "node-b")
+	nodeBB, found, err := b.ReadDeploymentNode(ctx, nodeBID)
 	if err != nil || !found {
 		t.Fatalf("ReadDeploymentNode(node-b) = (%+v, %v, %v)", nodeBB, found, err)
 	}
 	if nodeBB.Generation != 4 || nodeBB.Incarnation != nodeB.Incarnation {
 		t.Fatalf("node-b = %+v, want generation 4 with its own incarnation", nodeBB)
 	}
-	nodes, err := st.ReadDeploymentNodes(ctx)
+	nodes, err := a3.ReadDeploymentNodes(ctx)
 	if err != nil || len(nodes) != 2 {
 		t.Fatalf("ReadDeploymentNodes = (%d rows, %v), want 2 nodes", len(nodes), err)
 	}
-	if nodes[0].NodeID != "node-a" || nodes[1].NodeID != "node-b" {
-		t.Fatalf("node order = [%s %s], want [node-a node-b]", nodes[0].NodeID, nodes[1].NodeID)
+	if nodes[0].NodeID != nodeAID || nodes[1].NodeID != nodeBID {
+		t.Fatalf("node order = [%s %s], want [%s %s]",
+			nodes[0].NodeID, nodes[1].NodeID, nodeAID, nodeBID)
 	}
 }
 
@@ -1084,19 +1105,26 @@ func TestDeploymentNodeProgressFencing(t *testing.T) {
 // foreign generation is a no-op, and pruning removes only rows below the new
 // applied generation.
 func TestDeploymentAppProgressFencing(t *testing.T) {
-	st := openTestState(t)
+	dsn := newTestDSN(t)
 	ctx := context.Background()
+	// Advisory locks are cluster-global, so this fixture's node identity is
+	// unique to the test even though its rows live in an isolated schema.
+	nodeID := uniqueNodeID(t, "node-app")
 
-	firstIncarnation, err := st.AcquireDeploymentNode(ctx, "node-a", "inst-1", 2,
+	st := openDeployNodeOwner(t, dsn, nodeID, "inst-1")
+	firstIncarnation, err := st.AcquireDeploymentNode(ctx, nodeID, "inst-1", 2,
 		DeploymentNodeProgress{
-			NodeID: "node-a", Generation: 2, Phase: DeploymentNodeMaterializing,
+			NodeID: nodeID, Generation: 2, Phase: DeploymentNodeMaterializing,
 			Commit: deployCommitB,
 		})
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
-	node, err := st.AcquireDeploymentNode(ctx, "node-a", "inst-2", 2, DeploymentNodeProgress{
-		NodeID: "node-a", Generation: 2, Phase: DeploymentNodeMaterializing,
+	// Restart under the successor process instance: the successor handle opens
+	// only after the predecessor's closed (the node lock is exclusive).
+	st = reopenDeployNodeOwner(t, dsn, st, "inst-2")
+	node, err := st.AcquireDeploymentNode(ctx, nodeID, "inst-2", 2, DeploymentNodeProgress{
+		NodeID: nodeID, Generation: 2, Phase: DeploymentNodeMaterializing,
 		Commit: deployCommitB,
 	})
 	if err != nil {
@@ -1107,9 +1135,9 @@ func TestDeploymentAppProgressFencing(t *testing.T) {
 			node.Incarnation, firstIncarnation.Incarnation)
 	}
 	// Applied generation 1 (previous tree) while observed generation is 2.
-	if landed, err := st.RecordDeploymentNodeProgress(ctx, "node-a", 2, node.Incarnation,
+	if landed, err := st.RecordDeploymentNodeProgress(ctx, nodeID, 2, node.Incarnation,
 		DeploymentNodeProgress{
-			NodeID: "node-a", Generation: 2,
+			NodeID: nodeID, Generation: 2,
 			AppliedGeneration: 1, AppliedIncarnation: node.Incarnation,
 			Phase: DeploymentNodeMaterializing, Commit: deployCommitB,
 			AppliedCommit: deployCommitA,
@@ -1119,7 +1147,7 @@ func TestDeploymentAppProgressFencing(t *testing.T) {
 
 	appReq := func(generation int64, phase string) DeploymentAppProgress {
 		return DeploymentAppProgress{
-			NodeID: "node-a", App: "fn", Generation: generation,
+			NodeID: nodeID, App: "fn", Generation: generation,
 			Instance: "inst-2", Phase: phase,
 			Fingerprint: "fp-" + phase, TemplateIdentity: "tid", Commit: deployCommitB,
 		}
@@ -1129,7 +1157,7 @@ func TestDeploymentAppProgressFencing(t *testing.T) {
 	// from the current incarnation.
 	for _, generation := range []int64{2, 1} {
 		if landed, err := st.RecordDeploymentAppProgress(
-			ctx, "node-a", "fn", generation, node.Incarnation,
+			ctx, nodeID, "fn", generation, node.Incarnation,
 			appReq(generation, DeploymentAppPending)); err != nil || !landed {
 			t.Fatalf("app progress for generation %d = (%v, %v), want landed",
 				generation, landed, err)
@@ -1137,27 +1165,27 @@ func TestDeploymentAppProgressFencing(t *testing.T) {
 	}
 	// A generation the node has neither observed nor applied is rejected.
 	if landed, err := st.RecordDeploymentAppProgress(
-		ctx, "node-a", "fn", 7, node.Incarnation,
+		ctx, nodeID, "fn", 7, node.Incarnation,
 		appReq(7, DeploymentAppActive)); err != nil || landed {
 		t.Fatalf("app progress for a foreign generation = (%v, %v), want a no-op", landed, err)
 	}
 	// The superseded incarnation is rejected even for a matching generation.
 	if landed, err := st.RecordDeploymentAppProgress(
-		ctx, "node-a", "fn", 2, firstIncarnation.Incarnation,
+		ctx, nodeID, "fn", 2, firstIncarnation.Incarnation,
 		appReq(2, DeploymentAppFailed)); err != nil || landed {
 		t.Fatalf("app progress with a stale incarnation = (%v, %v), want a no-op", landed, err)
 	}
 	// Validation: missing identifiers are errors, not silent writes.
 	if _, err := st.RecordDeploymentAppProgress(
-		ctx, "node-a", "", 2, node.Incarnation, appReq(2, DeploymentAppActive)); err == nil {
+		ctx, nodeID, "", 2, node.Incarnation, appReq(2, DeploymentAppActive)); err == nil {
 		t.Fatal("app progress without an app name = nil, want an error")
 	}
 
-	rows, err := st.ReadDeploymentAppProgress(ctx, "node-a", 0)
+	rows, err := st.ReadDeploymentAppProgress(ctx, nodeID, 0)
 	if err != nil || len(rows) != 2 {
 		t.Fatalf("ReadDeploymentAppProgress(all) = (%d rows, %v), want 2 rows", len(rows), err)
 	}
-	rows, err = st.ReadDeploymentAppProgress(ctx, "node-a", 2)
+	rows, err = st.ReadDeploymentAppProgress(ctx, nodeID, 2)
 	if err != nil || len(rows) != 1 || rows[0].Phase != DeploymentAppPending {
 		t.Fatalf("ReadDeploymentAppProgress(2) = (%+v, %v), want the generation-2 row", rows, err)
 	}
@@ -1166,14 +1194,14 @@ func TestDeploymentAppProgressFencing(t *testing.T) {
 	}
 
 	// Pruning below the new applied generation removes only older rows.
-	if err := st.PruneDeploymentAppProgress(ctx, "node-a", 2); err != nil {
+	if err := st.PruneDeploymentAppProgress(ctx, nodeID, 2); err != nil {
 		t.Fatalf("PruneDeploymentAppProgress: %v", err)
 	}
-	rows, err = st.ReadDeploymentAppProgress(ctx, "node-a", 0)
+	rows, err = st.ReadDeploymentAppProgress(ctx, nodeID, 0)
 	if err != nil || len(rows) != 1 || rows[0].Generation != 2 {
 		t.Fatalf("rows after prune = (%+v, %v), want only the generation-2 row", rows, err)
 	}
-	if err := st.PruneDeploymentAppProgress(ctx, "node-a", 0); err != nil {
+	if err := st.PruneDeploymentAppProgress(ctx, nodeID, 0); err != nil {
 		t.Fatalf("PruneDeploymentAppProgress(0): %v", err)
 	}
 }

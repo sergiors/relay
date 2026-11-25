@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -83,6 +85,35 @@ func acquireDeployNode(
 			deployProgressNode, generation, err)
 	}
 	return node
+}
+
+// openDeployNodeOwner opens an ownerful state handle for one node identity on
+// dsn. AcquireDeploymentNode accepts only a node-owned handle whose node ID and
+// instance equal the acquisition's arguments, so every fixture that acquires
+// must open through this helper (or its restart successor below).
+func openDeployNodeOwner(t *testing.T, dsn, nodeID, instance string) *State {
+	t.Helper()
+	st := openWithIdentity(t, dsn, nodeID, instance)
+	st.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	return st
+}
+
+// reopenDeployNodeOwner succeeds prev as the same node's NEXT process
+// instance: the per-node session advisory lock is exclusive, so the successor
+// opens only after the predecessor closes — the restart order production uses.
+// The predecessor's pinned clock (nowFn) carries over, so a fixture that pins a
+// deterministic instant keeps stamping it after the restart.
+func reopenDeployNodeOwner(
+	t *testing.T, dsn string, prev *State, instance string,
+) *State {
+	t.Helper()
+	nodeID, nowFn := prev.nodeID, prev.nowFn
+	if err := prev.Close(); err != nil {
+		t.Fatalf("close predecessor owner handle: %v", err)
+	}
+	next := openDeployNodeOwner(t, dsn, nodeID, instance)
+	next.nowFn = nowFn
+	return next
 }
 
 // writeDeployApp performs one app-progress write and fails the test on an
@@ -273,7 +304,7 @@ func requireDeployAppRow(
 // shows up through the read API with the stamped instance, payload, and clock
 // instant.
 func TestRecordDeploymentAppProgressFirstWriteInsertsRow(t *testing.T) {
-	st := openTestState(t)
+	st := openDeployNodeOwner(t, newTestDSN(t), deployProgressNode, deployInstFirst)
 	installDeploymentAppWriteCounters(t, st)
 	pinDeploymentClock(t, st, deployProgressBase)
 
@@ -312,7 +343,7 @@ func TestRecordDeploymentAppProgressFirstWriteInsertsRow(t *testing.T) {
 // same incarnation reports true, so the false results came from the identical
 // payload, not from a stale fence.
 func TestRecordDeploymentAppProgressIdenticalRewriteIsNoOp(t *testing.T) {
-	st := openTestState(t)
+	st := openDeployNodeOwner(t, newTestDSN(t), deployProgressNode, deployInstFirst)
 	installDeploymentAppWriteCounters(t, st)
 	pinDeploymentClock(t, st, deployProgressBase)
 
@@ -361,7 +392,7 @@ func TestRecordDeploymentAppProgressIdenticalRewriteIsNoOp(t *testing.T) {
 // reports false for the canonical payload, keeps its original updated_at, and
 // performs zero physical UPDATEs.
 func TestRecordDeploymentAppProgressSemanticallyIdenticalJSONBIsNoOp(t *testing.T) {
-	st := openTestState(t)
+	st := openDeployNodeOwner(t, newTestDSN(t), deployProgressNode, deployInstFirst)
 	installDeploymentAppWriteCounters(t, st)
 	pinDeploymentClock(t, st, deployProgressBase)
 	ctx := context.Background()
@@ -475,7 +506,7 @@ func TestRecordDeploymentAppProgressMeaningfulChangesUpdateRow(t *testing.T) {
 
 	for _, tc := range mutations {
 		t.Run(tc.name, func(t *testing.T) {
-			st := openTestState(t)
+			st := openDeployNodeOwner(t, newTestDSN(t), deployProgressNode, deployInstFirst)
 			installDeploymentAppWriteCounters(t, st)
 			pinDeploymentClock(t, st, deployProgressBase)
 
@@ -504,7 +535,7 @@ func TestRecordDeploymentAppProgressMeaningfulChangesUpdateRow(t *testing.T) {
 // byte intact (it still serves as the previous tree's authorization until
 // pruning).
 func TestRecordDeploymentAppProgressNewGenerationAddsRow(t *testing.T) {
-	st := openTestState(t)
+	st := openDeployNodeOwner(t, newTestDSN(t), deployProgressNode, deployInstFirst)
 	installDeploymentAppWriteCounters(t, st)
 	pinDeploymentClock(t, st, deployProgressBase)
 	ctx := context.Background()
@@ -557,7 +588,8 @@ func TestRecordDeploymentAppProgressNewGenerationAddsRow(t *testing.T) {
 // applied, all report false, insert no row, update no row, and leave both
 // stored rows byte-for-byte untouched.
 func TestRecordDeploymentAppProgressStaleFenceMutatesNothing(t *testing.T) {
-	st := openTestState(t)
+	dsn := newTestDSN(t)
+	st := openDeployNodeOwner(t, dsn, deployProgressNode, deployInstFirst)
 	installDeploymentAppWriteCounters(t, st)
 	pinDeploymentClock(t, st, deployProgressBase)
 	ctx := context.Background()
@@ -574,6 +606,9 @@ func TestRecordDeploymentAppProgressStaleFenceMutatesNothing(t *testing.T) {
 		}); err != nil || !landed {
 		t.Fatalf("record applied generation = (%v, %v), want landed", landed, err)
 	}
+	// Restart: the successor process instance opens only after the
+	// predecessor's handle closed (the node lock is exclusive).
+	st = reopenDeployNodeOwner(t, dsn, st, deployInstSecond)
 	current := acquireDeployNode(t, st, deployInstSecond, 2, deployCommitB)
 	if current.Incarnation <= stale.Incarnation {
 		t.Fatalf("re-acquired incarnation %d, want a fresh one after %d",
@@ -676,7 +711,7 @@ func TestRecordDeploymentAppProgressConcurrentWriters(t *testing.T) {
 	}
 
 	t.Run("identical writers collapse to one insert", func(t *testing.T) {
-		st := openTestState(t)
+		st := openDeployNodeOwner(t, newTestDSN(t), deployProgressNode, deployInstFirst)
 		installDeploymentAppWriteCounters(t, st)
 		pinDeploymentClock(t, st, deployProgressBase)
 		node := acquireDeployNode(t, st, deployInstFirst, 1, deployCommitA)
@@ -705,7 +740,7 @@ func TestRecordDeploymentAppProgressConcurrentWriters(t *testing.T) {
 
 	t.Run("identical writers against an existing row all report false",
 		func(t *testing.T) {
-			st := openTestState(t)
+			st := openDeployNodeOwner(t, newTestDSN(t), deployProgressNode, deployInstFirst)
 			installDeploymentAppWriteCounters(t, st)
 			pinDeploymentClock(t, st, deployProgressBase)
 			node := acquireDeployNode(t, st, deployInstFirst, 1, deployCommitA)
@@ -736,7 +771,7 @@ func TestRecordDeploymentAppProgressConcurrentWriters(t *testing.T) {
 
 	t.Run("conflicting writers each land their own payload",
 		func(t *testing.T) {
-			st := openTestState(t)
+			st := openDeployNodeOwner(t, newTestDSN(t), deployProgressNode, deployInstFirst)
 			installDeploymentAppWriteCounters(t, st)
 			pinDeploymentClock(t, st, deployProgressBase)
 			node := acquireDeployNode(t, st, deployInstFirst, 1, deployCommitA)
@@ -805,7 +840,8 @@ func TestRecordDeploymentAppProgressConcurrentWriters(t *testing.T) {
 // incarnation takes the row over with an instance-only transition (true), and
 // repeating its own identical write becomes an accepted no-op again.
 func TestRecordDeploymentAppProgressRecoversInstanceAfterRestart(t *testing.T) {
-	st := openTestState(t)
+	dsn := newTestDSN(t)
+	st := openDeployNodeOwner(t, dsn, deployProgressNode, deployInstFirst)
 	installDeploymentAppWriteCounters(t, st)
 	pinDeploymentClock(t, st, deployProgressBase)
 
@@ -818,7 +854,9 @@ func TestRecordDeploymentAppProgressRecoversInstanceAfterRestart(t *testing.T) {
 	requireDeployAppWrites(t, st, 1, 0)
 
 	// Restart: the same node re-acquires the same generation with a fresh
-	// incarnation and its own instance identity.
+	// incarnation and its own instance identity — the successor handle opens
+	// only after the predecessor's closed.
+	st = reopenDeployNodeOwner(t, dsn, st, deployInstSecond)
 	restarted := acquireDeployNode(t, st, deployInstSecond, 1, deployCommitA)
 	if restarted.Incarnation <= first.Incarnation {
 		t.Fatalf("restarted incarnation %d, want a fresh one after %d",

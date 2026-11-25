@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -149,18 +150,20 @@ func backendPID(ctx context.Context, conn *sql.Conn) (int, error) {
 // two checks overlap and the connection is never closed mid-check. The mutex
 // guards only ownerConn; unrelated State operations are untouched.
 //
-// The check is bounded and FAILS CLOSED. A caller that is queued behind an
-// in-flight check waits for the mutex (the mutex itself is not context-aware);
-// the in-flight check is bounded by the context ITS OWN caller supplied, so the
-// queue waits at most that timeout. Once it acquires the mutex, the query runs
-// under the caller's context: if that context has already expired (queued until
-// the timeout) the query fails immediately and the check fails closed with
-// ErrOwnerLockLost. A caller should therefore pass a bounded context (see
+// The check is bounded and FAILS CLOSED. It waits for ownerMu only while the
+// caller's context remains live, so time queued behind another check or the
+// bounded deployment-acquisition statement is charged to this check's own
+// budget. The statement includes its implicit commit and uses a bounded query
+// context; a queued check nevertheless returns at its own deadline instead of
+// blocking indefinitely. Once it acquires the mutex, the query also runs under
+// that context. A caller should therefore pass a bounded context (see
 // OwnerLockCheckTimeout).
 //
 // It returns nil for an ownerless CLI/admin handle, which never takes the lock
 // and is therefore never monitored. This method performs a single query and does
-// not itself retry or sleep.
+// not itself retry or sleep. AcquireDeploymentNode performs an equivalent
+// pg_locks proof in the same autocommit statement as its write on the pinned
+// backend.
 //
 // Every failure wraps ErrOwnerLockLost so existing errors.Is callers keep
 // failing closed. Callers that need to distinguish a CONFIRMED loss from an
@@ -176,7 +179,9 @@ func (st *State) VerifyOwnerLock(ctx context.Context) error {
 	// Serialize ALL access to the pinned lock connection: concurrent checks must
 	// never query the same *sql.Conn at once, and the read of ownerConn must not
 	// race Close clearing it. The mutex is released only after the query returns.
-	st.ownerMu.Lock()
+	if err := lockOwnerConnection(ctx, &st.ownerMu); err != nil {
+		return fmt.Errorf("%w: verify on lock connection: %w", ErrOwnerLockLost, err)
+	}
 	defer st.ownerMu.Unlock()
 	conn := st.ownerConn
 	if conn == nil {
@@ -189,7 +194,9 @@ func (st *State) VerifyOwnerLock(ctx context.Context) error {
 		pid  int
 		held bool
 	)
-	if err := conn.QueryRowContext(ctx, verifyOwnerLockQuery, nodeLockKey(st.nodeID)).Scan(&pid, &held); err != nil {
+	if err := conn.QueryRowContext(
+		ctx, verifyOwnerLockQuery, nodeLockKey(st.nodeID),
+	).Scan(&pid, &held); err != nil {
 		// A query failure is never a confirmed lock loss: classify a known
 		// PostgreSQL/network failure as a connection error and leave every other
 		// query error as an unverified failure. The cause stays wrapped so a
@@ -213,6 +220,30 @@ func (st *State) VerifyOwnerLock(ctx context.Context) error {
 			ErrOwnerLockLost, ErrOwnerLockNotHeld, st.nodeID)
 	}
 	return nil
+}
+
+func lockOwnerConnection(ctx context.Context, mu *sync.Mutex) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if mu.TryLock() {
+		return nil
+	}
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if mu.TryLock() {
+				return nil
+			}
+		}
+	}
 }
 
 // OwnerBackendPID returns the PostgreSQL backend PID (pg_backend_pid) of the

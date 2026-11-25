@@ -359,14 +359,18 @@ type State struct {
 	// later acquisition and verification fails closed.
 	depClosed bool
 	// ownerMu serializes EVERY access to the pinned lock connection (ownerConn):
-	// VerifyOwnerLock reads and queries it, and Close closes and clears it.
+	// VerifyOwnerLock reads and queries it, Close closes and clears it, and
+	// AcquireDeploymentNode runs its ownership-proof/upsert autocommit statement
+	// on it.
 	// database/sql serializes individual driver calls on a *sql.Conn but NOT a
 	// whole check, so two concurrent checks would interleave their calls and pgx
 	// would fail the overlap with "conn busy" — a spurious ownership loss; the
 	// mutex also stops VerifyOwnerLock reading the field while Close nils it. It
 	// is deliberately NARROW: it guards ONLY ownerConn, so every other State
 	// operation (the pool, reconcile/stats/outbox writes, CLI reads) stays fully
-	// concurrent.
+	// concurrent. Deployment acquisition bounds the complete query, including
+	// implicit commit, and VerifyOwnerLock waits only within its own context and
+	// fails closed if the statement is still in flight.
 	ownerMu sync.Mutex
 	// nowFn is an injectable clock used to stamp updated_at/reconcile
 	// timestamps and the schedule_pending retention deadline. Production leaves

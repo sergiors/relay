@@ -27,6 +27,14 @@ import (
 // process incarnation or a stale generation therefore cannot overwrite shared
 // desired state or another incarnation's progress.
 //
+// The incarnation fence is only as strong as its allocation. Acquiring a node's
+// progress (AcquireDeploymentNode) is therefore accepted only on a node-owned
+// State handle, and its atomic statement runs on the SAME pinned backend that
+// holds the node's exclusive session advisory lock, proving that lock in the
+// statement before its upsert. An ownership loss aborts the statement, a
+// successor cannot claim the identity while the backend is executing it, and a
+// handle whose pool outlived its ownership cannot allocate a fresh incarnation.
+//
 // A materialization commit is atomic: CommitDeploymentMaterialization writes the
 // node's applied generation, the COMPLETE per-app authorization, and the
 // materialized phase in one short transaction under a FOR UPDATE node-row fence.
@@ -81,6 +89,13 @@ var ErrDeploymentConflict = errors.New("deployment generation conflict")
 // older desired generation than the node already observed. It is a normal,
 // recoverable rejection (the node already moved on), not a database failure.
 var ErrDeploymentNodeSuperseded = errors.New("deployment node generation superseded")
+
+// ErrDeploymentNodeOutcomeUnknown reports that the autocommit acquisition may
+// have committed, but the client did not receive confirmation. Callers must not
+// use the unconfirmed incarnation for new progress or materialization; a
+// previously committed applied authorization may remain in service while a retry
+// performs a fresh ownership check and acquisition.
+var ErrDeploymentNodeOutcomeUnknown = errors.New("deployment node acquisition outcome unknown")
 
 var deploymentCommitRe = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
 
@@ -744,12 +759,97 @@ type deploymentAppPayload struct {
 	Error            string `json:"error,omitempty"`
 }
 
+// Bounds for AcquireDeploymentNode's owner-pinned autocommit statement. The
+// pinned connection is shared with the periodic ownership monitor, so ordinary
+// row-lock contention fails before the client-side acquisition budget.
+const (
+	// deploymentNodeAcquireTimeout bounds the complete QueryRowContext call,
+	// including implicit commit. The 750 ms budget covers ordinary slow
+	// acquisitions while leaving 250 ms of the verifier's 1 s budget to run
+	// after waiting for ownerMu.
+	deploymentNodeAcquireTimeout = OwnerLockCheckTimeout * 3 / 4
+	// deploymentNodeLockTimeout bounds waiting on a contended deployment row.
+	deploymentNodeLockTimeout = OwnerLockCheckTimeout / 20
+)
+
+// acquireDeploymentNodeQuery keeps its pg_locks predicate equivalent to
+// verifyOwnerLockQuery. The materialized ownership CTE gates the INSERT in this
+// same autocommit statement, so neither the proof nor the write can move to a
+// different backend.
+const acquireDeploymentNodeQuery = `
+	WITH lock_settings AS MATERIALIZED (
+		SELECT set_config('lock_timeout', $1, true) AS configured
+	),
+	ownership AS MATERIALIZED (
+		SELECT pg_backend_pid() AS pid,
+		       EXISTS (
+		         SELECT 1 FROM pg_locks
+		          WHERE locktype = 'advisory'
+		            AND pid = pg_backend_pid()
+		            AND objsubid = 1
+		            AND ((classid::bigint << 32) | objid::bigint) = $8
+		       ) AS held
+		  FROM lock_settings
+		 WHERE configured = $1
+	),
+	acquired AS (
+		INSERT INTO deployment_nodes
+			(node_id, generation, applied_generation, instance, incarnation,
+			 applied_incarnation, updated_at, data)
+		SELECT $3, $4, 0, $5, nextval('deployment_incarnation_seq'), 0, $6, $7
+		  FROM ownership
+		 WHERE ownership.pid = $2 AND ownership.held
+		ON CONFLICT (node_id) DO UPDATE SET
+			generation = excluded.generation,
+			instance = excluded.instance,
+			incarnation = nextval('deployment_incarnation_seq'),
+			updated_at = excluded.updated_at,
+			data = excluded.data
+		 WHERE excluded.generation >= deployment_nodes.generation
+		RETURNING incarnation, applied_generation, applied_incarnation, data::text
+	)
+	SELECT ownership.pid, ownership.held,
+	       acquired.incarnation, acquired.applied_generation,
+	       acquired.applied_incarnation, acquired.data
+	  FROM ownership
+	  LEFT JOIN acquired ON TRUE`
+
 // AcquireDeploymentNode claims this node's observation of generation with this
 // process instance and a fresh incarnation. It refuses an older generation with
 // ErrDeploymentNodeSuperseded. Applied progress is preserved until the caller
 // records a successful materialization (or adopts the previous applied
 // generation on a failed attempt), so a failed newer target never destroys the
 // previous generation's authorization.
+//
+// It is the ROOT of the deployment fence: every later progress write is
+// conditioned on the incarnation allocated here, and the incarnation is handed
+// out only to a process that can prove it owns the node identity. It therefore
+// accepts only a node-owned State handle whose node ID and instance equal the
+// arguments, and runs the ownership proof and allocation as ONE autocommit
+// statement on that handle's pinned lock connection (ownerConn), holding
+// ownerMu throughout:
+//
+//   - A materialized pg_locks proof is an input to the INSERT, and both execute
+//     on the exact backend that holds the session advisory lock. The implicit
+//     transaction commits before QueryRowContext returns; the session lock
+//     cannot transfer to a successor while the statement is in flight.
+//   - A transaction-local 50 ms lock_timeout rejects ordinary row contention
+//     without client cancellation. The 750 ms QueryRowContext budget includes
+//     the implicit commit.
+//   - Close and VerifyOwnerLock serialize with the statement through ownerMu.
+//
+// Caller cancellation is honored while waiting for ownerMu and before the
+// statement starts. Once it starts, a detached 750 ms bound governs the query so
+// caller cancellation cannot interrupt the pinned ownership session; a timeout
+// makes the autocommit outcome unknown and fails closed.
+// If the client deadline races the implicit commit, the result is unknown and
+// fails closed. pgx may discard ownerConn after cancellation; no replacement
+// connection is used as ownership evidence. The backend retains its session lock
+// until the statement ends or the backend exits, so a successor cannot write
+// concurrently with the canceled statement. An uninterruptible storage wait can
+// delay PostgreSQL processing cancellation, and synchronous_commit=off can
+// acknowledge before WAL is durable; this query does not strengthen that
+// database durability setting.
 func (st *State) AcquireDeploymentNode(
 	ctx context.Context,
 	nodeID,
@@ -757,8 +857,15 @@ func (st *State) AcquireDeploymentNode(
 	generation int64,
 	progress DeploymentNodeProgress,
 ) (DeploymentNodeProgress, error) {
-	if strings.TrimSpace(nodeID) == "" {
-		return DeploymentNodeProgress{}, fmt.Errorf("deployment node: node ID is empty")
+	if st == nil || st.nodeID == "" || st.instance == "" || st.ownerPID <= 0 {
+		return DeploymentNodeProgress{}, fmt.Errorf(
+			"acquire deployment node: node %q generation %d requires a node-owned state handle",
+			nodeID, generation)
+	}
+	if nodeID != st.nodeID || instance != st.instance {
+		return DeploymentNodeProgress{}, fmt.Errorf(
+			"acquire deployment node: state handle owns node %q instance %q, not node %q instance %q",
+			st.nodeID, st.instance, nodeID, instance)
 	}
 	if generation <= 0 {
 		return DeploymentNodeProgress{}, fmt.Errorf("deployment node %q: generation must be positive", nodeID)
@@ -775,50 +882,108 @@ func (st *State) AcquireDeploymentNode(
 		return DeploymentNodeProgress{}, fmt.Errorf("encode deployment node %q: %w", nodeID, err)
 	}
 	var (
-		incarnation int64
-		appliedGen  int64
-		appliedInc  int64
-		storedData  string
+		backendPID  int
+		lockHeld    bool
+		incarnation sql.NullInt64
+		appliedGen  sql.NullInt64
+		appliedInc  sql.NullInt64
+		storedData  sql.NullString
 	)
-	err = st.db.QueryRowContext(ctx,
-		`INSERT INTO deployment_nodes
-			(node_id, generation, applied_generation, instance, incarnation,
-			 applied_incarnation, updated_at, data)
-		 VALUES ($1, $2, 0, $3, nextval('deployment_incarnation_seq'), 0, $4, $5)
-		 ON CONFLICT (node_id) DO UPDATE SET
-			generation = excluded.generation,
-			instance = excluded.instance,
-			incarnation = nextval('deployment_incarnation_seq'),
-			updated_at = excluded.updated_at,
-			data = excluded.data
-		 WHERE excluded.generation >= deployment_nodes.generation
-		 RETURNING incarnation, applied_generation, applied_incarnation, data::text`,
-		nodeID, generation, instance, now, string(data),
-	).Scan(&incarnation, &appliedGen, &appliedInc, &storedData)
-	if errors.Is(err, sql.ErrNoRows) {
-		return DeploymentNodeProgress{}, fmt.Errorf(
-			"deployment node %q generation %d: %w", nodeID, generation, ErrDeploymentNodeSuperseded)
+	if err := lockOwnerConnection(ctx, &st.ownerMu); err != nil {
+		return DeploymentNodeProgress{}, fmt.Errorf("acquire deployment node: %w", err)
 	}
+	defer st.ownerMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return DeploymentNodeProgress{}, fmt.Errorf("acquire deployment node: %w", err)
+	}
+	conn := st.ownerConn
+	if conn == nil {
+		return DeploymentNodeProgress{}, fmt.Errorf(
+			"%w: %w: lock connection already released",
+			ErrOwnerLockLost, ErrOwnerLockConnection,
+		)
+	}
+	workCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx), deploymentNodeAcquireTimeout)
+	defer cancel()
+	err = conn.QueryRowContext(workCtx, acquireDeploymentNodeQuery,
+		fmt.Sprintf("%dms", deploymentNodeLockTimeout.Milliseconds()),
+		st.ownerPID,
+		nodeID,
+		generation,
+		instance,
+		now,
+		string(data),
+		nodeLockKey(nodeID),
+	).Scan(&backendPID, &lockHeld, &incarnation, &appliedGen, &appliedInc, &storedData)
 	if err != nil {
+		if deploymentCommitOutcomeUnknown(err) {
+			if isOwnerLockConnectionError(err) {
+				err = fmt.Errorf("%w: %w: %w: deployment node acquisition statement: %w",
+					ErrOwnerLockLost, ErrOwnerLockConnection,
+					ErrDeploymentNodeOutcomeUnknown, err)
+			} else {
+				err = fmt.Errorf("%w: deployment node acquisition statement: %w",
+					ErrDeploymentNodeOutcomeUnknown, err)
+			}
+		}
 		return DeploymentNodeProgress{}, fmt.Errorf("acquire deployment node %q: %w", nodeID, err)
 	}
+	if backendPID != st.ownerPID {
+		return DeploymentNodeProgress{}, fmt.Errorf(
+			"%w: %w: lock-connection backend pid changed from %d to %d",
+			ErrOwnerLockLost, ErrOwnerBackendPIDChanged, st.ownerPID, backendPID,
+		)
+	}
+	if !lockHeld {
+		return DeploymentNodeProgress{}, fmt.Errorf(
+			"%w: %w: session advisory lock for node %q is no longer held",
+			ErrOwnerLockLost, ErrOwnerLockNotHeld, nodeID,
+		)
+	}
+	if !incarnation.Valid {
+		return DeploymentNodeProgress{}, fmt.Errorf(
+			"deployment node %q generation %d: %w", nodeID, generation,
+			ErrDeploymentNodeSuperseded,
+		)
+	}
 	var stored deploymentNodePayload
-	if err := json.Unmarshal([]byte(storedData), &stored); err != nil {
+	if err := json.Unmarshal([]byte(storedData.String), &stored); err != nil {
 		return DeploymentNodeProgress{}, fmt.Errorf("decode deployment node %q: %w", nodeID, err)
 	}
 	return DeploymentNodeProgress{
 		NodeID:             nodeID,
 		Generation:         generation,
-		AppliedGeneration:  appliedGen,
+		AppliedGeneration:  appliedGen.Int64,
 		Instance:           instance,
-		Incarnation:        incarnation,
-		AppliedIncarnation: appliedInc,
+		Incarnation:        incarnation.Int64,
+		AppliedIncarnation: appliedInc.Int64,
 		Phase:              stored.Phase,
 		Commit:             stored.Commit,
 		AppliedCommit:      stored.AppliedCommit,
 		Error:              stored.Error,
 		UpdatedAt:          timestampString(now),
 	}, nil
+}
+
+func deploymentCommitOutcomeUnknown(err error) bool {
+	if isOwnerLockConnectionError(err) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var sqlState interface{ SQLState() string }
+	if !errors.As(err, &sqlState) {
+		return true
+	}
+	switch sqlState.SQLState() {
+	case "40003", "57014":
+		// Treat these as unknown for the full autocommit statement: the client
+		// cannot prove whether cancellation raced the implicit commit.
+		return true
+	default:
+		return false
+	}
 }
 
 // RecordDeploymentNodeProgress updates this node's progress only while the
@@ -833,7 +998,9 @@ func (st *State) RecordDeploymentNodeProgress(
 	progress DeploymentNodeProgress,
 ) (bool, error) {
 	if nodeID == "" || generation <= 0 || incarnation <= 0 {
-		return false, fmt.Errorf("deployment node progress: node ID, generation, and incarnation are required")
+		return false, fmt.Errorf(
+			"deployment node progress: node ID, generation, and incarnation are required",
+		)
 	}
 	now := st.nowTime().UTC()
 	payload, err := json.Marshal(deploymentNodePayload{
