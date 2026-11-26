@@ -23,12 +23,19 @@ Process-model notes (intended semantics, not a bug):
     and dependency cleanup), so import-time instrumentation joins Relay's
     invocation trace and one invocation's context never leaks into the next
     despite the warm interpreter.
+  - The shared logging context is bound before the trace context and before the
+    handler module is imported, then expired and restored in the outer finally.
+    Import-time, call-time, and dependency-cleanup log records therefore carry
+    this invocation's identity, and a warm container never attributes a later
+    record to an earlier invocation. A child task that inherited the context
+    after the invocation ended sees it expired instead of stale.
 """
 
 import asyncio
 import inspect
 
 import _relay_handlers as handlers
+import _relay_logging_context as logging_context
 import _relay_tracing as tracing
 from _relay_context import build_handler_context
 
@@ -40,38 +47,42 @@ async def invoke(handler, event, context_frame, trace=None):
     caller reports them as an ok:false result and keeps the container reusable.
     Return None on success.
     """
-    token = tracing.attach_invocation_context(trace)
+    log_token = logging_context.begin(context_frame)
     try:
+        trace_token = tracing.attach_invocation_context(trace)
         try:
-            func = handlers.load(handler)
-        except handlers.HandlerLoadError as exc:
-            return str(exc)
+            try:
+                func = handlers.load(handler)
+            except handlers.HandlerLoadError as exc:
+                return str(exc)
 
-        try:
-            context = build_handler_context(context_frame)
-        except (TypeError, ValueError) as exc:
-            return f"invalid handler context: {exc}"
+            try:
+                context = build_handler_context(context_frame)
+            except (TypeError, ValueError) as exc:
+                return f"invalid handler context: {exc}"
 
-        try:
-            result = func(event, context)
-            if inspect.isawaitable(result):
-                await result  # on the process-lifetime loop, never a fresh one
-        except SystemExit as exc:
-            code = exc.code
-            if code is None or code is True:
-                return f"handler {handler!r} exited"
-            return f"handler {handler!r} exited with code {code}"
-        except asyncio.CancelledError:
-            # Task cancellation is control flow, not a handler failure: re-raise
-            # so asyncio.run can shut the connection loop down and join its
-            # tasks.
-            raise
-        except BaseException as exc:
-            # BaseException: SystemExit is handled above, KeyboardInterrupt and
-            # anything the handler raises is a failed INVOCATION, not a
-            # fatality.
-            return f"handler {handler!r} failed: {exc}"
+            try:
+                result = func(event, context)
+                if inspect.isawaitable(result):
+                    await result  # on the process-lifetime loop, never a fresh one
+            except SystemExit as exc:
+                code = exc.code
+                if code is None or code is True:
+                    return f"handler {handler!r} exited"
+                return f"handler {handler!r} exited with code {code}"
+            except asyncio.CancelledError:
+                # Task cancellation is control flow, not a handler failure:
+                # re-raise so asyncio.run can shut the connection loop down and
+                # join its tasks.
+                raise
+            except BaseException as exc:
+                # BaseException: SystemExit is handled above, KeyboardInterrupt
+                # and anything the handler raises is a failed INVOCATION, not a
+                # fatality.
+                return f"handler {handler!r} failed: {exc}"
 
-        return None
+            return None
+        finally:
+            tracing.detach_invocation_context(trace_token)
     finally:
-        tracing.detach_invocation_context(token)
+        logging_context.end(log_token)

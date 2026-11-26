@@ -61,6 +61,283 @@ per-invocation object.
 `max_attempts` is the configured budget, not an upper bound on `attempt`: a
 configuration change can leave a claimed attempt above the current budget.
 
+## Structured logging
+
+`relay_runtime.logging` provides an optional structured logger. Import `Logger`
+and the public `JsonFormatter` from this module; neither is re-exported from
+`relay_runtime`:
+
+```python
+from relay_runtime.logging import Logger
+
+log = Logger(service="users")
+
+
+async def handler(event: dict[str, object], context) -> None:
+    log.info("User created", extra={"user_id": event["user_id"]})
+```
+
+The default handler writes compact JSON lines to stderr. The logger does not
+propagate to the root logger, so it does not duplicate output through the
+bootstrap's existing `logging.basicConfig`. Relay's lifecycle lines remain on
+stdout. `Logger()` works outside Relay with the standalone service identity.
+New SDK loggers default to `INFO`, so informational calls are emitted without
+changing the root logger. An existing named logger's non-`NOTSET` level is
+preserved unless `level=` is explicitly supplied.
+
+### Identity and configuration
+
+The public constructor is:
+
+```python
+Logger(
+    service: str | None = None,
+    level: str | int | None = None,
+    *,
+    logger_handler: logging.Handler | None = None,
+    logger_formatter: logging.Formatter | None = None,
+)
+```
+
+When `service` is omitted, identity is resolved once, in this order: a non-empty
+`OTEL_SERVICE_NAME`, the active Relay app identity (when constructed during an
+invocation), then `"standalone"`. An explicit non-empty `service` takes
+precedence. The stdlib logger name is `relay_runtime.<service>`; separate
+services therefore have separate names, handlers, and levels.
+
+Repeated construction for the same service reuses its stdlib logger and never
+adds a duplicate SDK handler. A supplied `logger_handler` replaces the SDK
+handler for that service. Its existing formatter is retained unless
+`logger_formatter` is also supplied, in which case that formatter is set on the
+supplied handler. The SDK does not close application handlers. A custom handler
+can replace an SDK handler installed by an earlier construction. Once a custom
+handler is selected, later constructions without `logger_handler` keep using
+it. A later explicit `logger_handler` replaces the previously selected handler
+for that service; the old handler is detached, not closed. An explicit
+`logger_formatter` updates the selected handler; omitting it preserves the
+handler's formatter. Supplying `level` sets the shared stdlib logger's level;
+omitting it preserves a preconfigured level or defaults a new `NOTSET` logger
+to `INFO`.
+
+`logger.name` and `logger.service` expose the resolved values. `addHandler` and
+`removeHandler` use standard logging behavior; removing a handler only detaches
+it and never closes it. The SDK isolates ordinary `Exception`s raised by a
+handler, continues dispatching to healthy handlers, and does not emit recursive
+diagnostic logs. `KeyboardInterrupt`, `SystemExit`, and cancellation are not
+swallowed. This per-logger dispatch behavior applies to handlers attached via
+`addHandler` as well as the configured destination.
+
+`addHandler` adds a destination alongside the default JSON stderr handler:
+
+```python
+import logging
+import sys
+
+from relay_runtime.logging import Logger
+
+log = Logger(service="users")
+console = logging.StreamHandler(sys.stdout)
+console.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+log.addHandler(console)
+log.info("User created", extra={"user_id": "u-42"})
+```
+
+The record goes to both stderr and stdout. Use `logger_handler=` at
+construction when the custom handler should replace the SDK destination.
+
+### Calls and context fields
+
+`debug`, `info`, `warning`, `error`, `exception`, `critical`, and `log` accept
+standard logging arguments: `%` formatting arguments, `extra` mapping,
+`exc_info`, `stack_info`, and `stacklevel`. Keyword arguments are not treated as
+application fields; put those fields in `extra`:
+
+```python
+log.info("request %s completed", request_id, extra={"duration_ms": 28})
+
+try:
+    process()
+except ValueError:
+    log.exception("processing failed", extra={"phase": "validate"})
+```
+
+Fields added with `extra` are shallow-copied into a new mapping at record
+creation. They appear on the public `LogRecord.attributes` mapping and are
+available individually on the record to custom formatters. Nested mutable values
+remain references; changing a nested list or dictionary before a queued listener
+formats the record may change its later representation. Standard `LogRecord`
+field collisions raise `KeyError` as in Python logging. Relay-owned fields such as `service`,
+`request_id`, `trace_id`, `location`, and `attributes` are reserved, as are the
+logging option names `extra`, `exc_info`, `stack_info`, and `stacklevel`;
+attempting to replace them raises `ValueError`. Framework metadata always wins.
+`message_id` and `max_attempts` are not automatically populated and may be used
+as application attributes.
+
+Appended fields can be set and removed with `append_keys(**fields)` and
+`remove_keys(names)`. `remove_keys` accepts an iterable such as a list; separate
+string arguments are also supported. These fields are scoped to the named
+stdlib logger identity: Logger instances for the same service share them, while
+different services remain isolated. `append_context_keys(**fields)` adds a
+temporary layer scoped to the same logger identity and current context. It
+returns a token-restoring scope that can be used with `with` when the fields
+should apply only inside a block:
+
+```python
+log.append_keys(component="payments")
+
+with log.append_context_keys(operation="authorize"):
+    log.info("starting")
+```
+
+Each operation is copy-on-write and context-local, so concurrent tasks do not
+mutate shared mappings. If the same name is present at multiple levels,
+precedence is `extra` then temporary `append_context_keys` values, then appended
+values. For example, `log.remove_keys(["user_id", "organization_id"])` removes
+both appended values. Leaving the `with` block restores the previous temporary
+layer. Invocation-scoped fields reset when an invocation ends; appending keys
+outside Relay remains local to the current context until changed. Context
+inherited by a child task expires when its invocation ends.
+
+### JSON record
+
+The default `JsonFormatter` emits one JSON object per line. It always includes
+`timestamp`, `level`, `service`, `message`, `logger`, and `location`. Timestamp
+uses UTC RFC 3339 with millisecond precision and is derived from
+`LogRecord.created`. `location` is `module.function:line`, resolved using normal
+`stacklevel` rules. Invocation metadata (`app`, `handler`, `request_id`,
+`attempt`, and `cold_start`) appears when present.
+
+Valid active OpenTelemetry spans add `trace_id` and `span_id`. Application
+fields are nested in `attributes`; the empty object is omitted. An
+exception is emitted as
+`exception: {"type": ..., "message": ..., "stacktrace": ...}`.
+`stack_info=True` adds `stack_info`.
+
+The following record is formatted across multiple lines for readability:
+
+```json
+{
+  "timestamp": "2026-04-02T12:30:15.123Z",
+  "level": "INFO",
+  "service": "checkout",
+  "message": "order accepted",
+  "logger": "relay_runtime.checkout",
+  "location": "handler.process:18",
+  "attributes": {
+    "order_id": "o-42"
+  }
+}
+```
+
+The SDK captures framework metadata and a shallow copy of application field
+mappings when the record is created. Nested mutable values are not deep-copied,
+so mutations before a `QueueHandler` listener formats the record can affect
+their representation. Supported JSON values include primitives, finite
+numbers, lists, tuples, string-keyed mappings, dates/datetimes, UUIDs, and
+Decimals. Unsupported, circular, overly deep, or non-finite values become
+explicit marker objects. If serialization itself fails, a safe one-line
+fallback is emitted and the application call continues.
+
+On CPython, the standard `QueueHandler.prepare` formats and copies a record,
+then clears `exc_info` and `exc_text`; traceback text is rendered into the
+message before enqueueing. A listener using `JsonFormatter` may therefore lack
+the structured `exception` object for queued records. The captured context and
+`attributes` mapping still travel with the record. Preserve exception details
+with a custom `QueueHandler.prepare` implementation if the listener needs the
+structured exception schema.
+
+Logging handlers run synchronously by default. A slow or blocking handler can
+block its caller or an asyncio event loop and cause an invocation to exceed its
+configured timeout; logging does not extend the timeout. For slow destinations,
+the standard library `QueueHandler` and `QueueListener` can move sink work to a
+listener thread:
+
+```python
+import logging
+from logging.handlers import QueueHandler, QueueListener
+from queue import Queue
+
+from relay_runtime.logging import Logger
+
+queue: Queue[logging.LogRecord] = Queue(maxsize=1000)
+listener = QueueListener(queue, logging.StreamHandler())
+listener.start()
+log = Logger(service="users", logger_handler=QueueHandler(queue))
+
+try:
+    log.info("User created", extra={"user_id": "u-42"})
+finally:
+    listener.stop()
+```
+
+Choose a bounded queue size and an explicit overflow policy. Standard
+`QueueHandler` enqueue is non-blocking; when a bounded queue is full, its error
+handling may report or drop the record. A custom blocking/retrying policy can
+stall the invocation. The application owns the listener lifecycle: stop it
+during graceful shutdown after producers finish, and ensure the queue can accept
+the stop signal; `stop()` waits for the listener and may itself block on a stuck
+sink. A timeout, container kill, or process crash may terminate the listener
+before queued records are written. Logging is not guaranteed delivery.
+
+Messages, exception tracebacks, and application attributes may contain secrets.
+Relay cannot reliably sanitize or redact them; avoid logging credentials, tokens,
+or other sensitive values.
+
+`JsonFormatter` can be used directly or supplied as `logger_formatter`. A custom
+formatter receives an ordinary `LogRecord` with the standard members, framework
+metadata, and `record.attributes`:
+
+```python
+import logging
+
+from relay_runtime.logging import JsonFormatter, Logger
+
+log = Logger(
+    "checkout",
+    level=logging.INFO,
+    logger_formatter=JsonFormatter(),
+)
+
+log.info("captured", extra={"order_id": "o-42"})
+```
+
+### Relay invocation and OpenTelemetry context
+
+Relay binds invocation logging context before importing the handler module and
+expires it after handler execution and dependency cleanup, including failure
+and cancellation paths. `cold_start` is true on the first accepted invocation,
+even if importing or running that handler fails. A child task may finish after
+its parent invocation, but its inherited invocation and temporary context are
+expired and cannot leak into later invocations. Records created during an
+invocation keep their captured metadata when formatted later. An expired child
+context also suppresses span lookup and trace correlation even when it still
+inherits the invocation's OpenTelemetry context.
+
+When the optional OpenTelemetry API is available, a valid active span is read at
+record creation in non-expired contexts both inside and outside Relay. The logger
+only reads the API: it does not install a provider, create spans, or export logs.
+The invocation trace ID is used only when there is no active valid span, so
+unrelated span and invocation IDs are never paired. Span discovery and
+application-field serialization are skipped when the log level is disabled.
+Relay collects application stderr as the container's native log; the SDK does
+not implement a Tracer, dependency integration, or log transport.
+
+Applications can create spans with the native OpenTelemetry API; log records
+inside a valid active span automatically include its trace and span IDs:
+
+```python
+from opentelemetry import trace
+
+tracer = trace.get_tracer(__name__)
+
+with tracer.start_as_current_span("create-user"):
+    log.info("User created", extra={"user_id": "u-42"})
+```
+
+OpenTelemetry remains optional and is not added as a `relay-runtime`
+dependency. The SDK reads active span context but does not expose or initialize
+a `Tracer` API.
+
 ## Dependency injection
 
 Dependency injection is optional. A handler that does not use it keeps the
@@ -120,6 +397,7 @@ forwards the call:
 
 ```python
 import functools
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -127,33 +405,36 @@ from relay_runtime import Depends, bind
 from relay_runtime.typing import HandlerContext
 
 
-def track_activity(
+def measure_duration(
     func: Callable[..., Awaitable[Any]],
 ) -> Callable[..., Awaitable[Any]]:
     @functools.wraps(func)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
-        # tracing/metrics here
-        return await func(*args, **kwargs)
+        start = time.perf_counter()
+        try:
+            return await func(*args, **kwargs)
+        finally:
+            print(f"{func.__name__}: {time.perf_counter() - start:.3f}s")
 
     return wrapper
 
 
-async def get_activity_log() -> object:
-    return object()
+def get_currency() -> str:
+    return "USD"
 
 
 @bind
-@track_activity
+@measure_duration
 async def handler(
     event: dict[str, object],
     context: HandlerContext,
-    activity_log: object = Depends(get_activity_log),
+    currency: str = Depends(get_currency),
 ) -> None:
-    ...
+    print(f"Order {event['order_id']} uses {currency}")
 ```
 
 In this order `@bind` sees the signature preserved by `functools.wraps` and
-resolves `activity_log` before calling `track_activity`. A `functools.wraps`
+resolves `currency` before calling `measure_duration`. A `functools.wraps`
 decorator may also be placed outside `@bind`; it then wraps the already-bound
 `(event, context)` callable. Both orders work when the ordinary decorator
 forwards arguments and preserves the signature. Relay resolves dependencies
@@ -290,8 +571,8 @@ Keys are matched by provider identity, not equality. The mapping is snapshotted
 and validated when the context is entered; later changes to the mapping object
 do not affect an active context. Mapping a provider to itself is a no-op.
 For parametrized provider factories, use the same cached provider object in the
-handler declaration and override mapping; for example, cache `get_table("users")`
-with `functools.cache` if it is constructed at both sites.
+handler declaration and override mapping; for example, cache
+`get_table("users")` with `functools.cache` if it is constructed at both sites.
 Nested contexts compose: an inner context inherits the outer overrides and its
 entries take precedence. Leaving the inner context restores the outer mapping.
 
@@ -400,71 +681,76 @@ injection. Relay's at-least-once delivery contract is unchanged.
 
 The following app uses `pymongo` and `httpx` as application dependencies; they
 are not dependencies of `relay-runtime`. The Mongo client is container-scoped,
-while the HTTP client and course catalog are invocation-scoped:
+while the HTTP client is invocation-scoped.
+
+The handler processes user registration events and sends a welcome email
+through an external notification service:
 
 ```python
+import os
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
 from pymongo import AsyncMongoClient
+from pymongo.asynchronous.collection import AsyncCollection
 
 from relay_runtime import Depends, bind
 from relay_runtime.typing import HandlerContext
 
 
-class CourseCatalog:
-    def __init__(
-        self, mongo: AsyncMongoClient, http: httpx.AsyncClient
-    ) -> None:
-        self._courses = mongo.get_database("school").courses
-        self._http = http
-
-    async def notify(
-        self, course_id: str, event: dict[str, Any], request_id: str
-    ) -> None:
-        course = await self._courses.find_one({"_id": course_id})
-        if course is None:
-            return
-        await self._http.post(
-            "/course-events",
-            json={
-                "course": str(course["_id"]),
-                "event": event,
-                "requestId": request_id,
-            },
-        )
-
-
 async def get_mongo() -> AsyncIterator[AsyncMongoClient]:
-    client = AsyncMongoClient("mongodb://localhost:27017")
-    try:
+    async with AsyncMongoClient(os.environ["MONGO_DSN"]) as client:
         yield client
-    finally:
-        await client.close()
 
 
-async def get_courses(
-    mongo: AsyncMongoClient = Depends(get_mongo, scope="container"),
-) -> AsyncIterator[CourseCatalog]:
-    async with httpx.AsyncClient(base_url="https://courses.internal") as http:
-        yield CourseCatalog(mongo, http)
+def get_users(
+    mongo: Annotated[AsyncMongoClient, Depends(get_mongo, scope="container")],
+) -> AsyncCollection:
+    return mongo.get_database("app").get_collection("users")
+
+
+async def get_http_client() -> AsyncIterator[httpx.AsyncClient]:
+    async with httpx.AsyncClient(
+        base_url=os.environ["NOTIFICATIONS_API_URL"],
+        timeout=10.0,
+    ) as client:
+        yield client
 
 
 @bind
 async def handler(
     event: dict[str, Any],
     context: HandlerContext,
-    courses: CourseCatalog = Depends(get_courses),
+    users: Annotated[AsyncCollection, Depends(get_users)],
+    http: Annotated[httpx.AsyncClient, Depends(get_http_client)],
 ) -> None:
-    await courses.notify(event["course_id"], event, context.request_id)
+    user = await users.find_one({"_id": event["user_id"]})
+    if user is None:
+        return
+
+    response = await http.post(
+        "/notifications/email",
+        json={
+            "recipient": user["email"],
+            "template": "welcome",
+            "data": {"name": user["name"]},
+        },
+        headers={"Idempotency-Key": context.request_id},
+    )
+    response.raise_for_status()
 ```
 
-`get_mongo` opens once per warm container. `get_courses` and its HTTP client are
-created for each invocation; their cleanup runs after the handler, and the Mongo
-client closes when the container shuts down. The handler completes its response
-through the injected HTTP client; Relay uses handler completion for success or
-failure, not the Python return value.
+`get_mongo` creates a client once per warm container. `get_users` resolves
+the collection using the shared Mongo client. The HTTP client is created
+for each invocation and closed after the handler finishes. The Mongo client
+closes when the container shuts down.
+
+The notification API is assumed to honor the idempotency key, allowing
+retries of the same logical invocation without sending duplicate emails.
+
+Relay uses handler completion for success or failure, not the Python return
+value.
 
 ### Errors and plain handlers
 

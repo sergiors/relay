@@ -11,6 +11,7 @@ source mount), so application files cannot shadow them:
   _relay_protocol     framing, JSON, authentication handshake, result envelopes
   _relay_context      the per-invocation HandlerContext Relay passes to handlers
   _relay_environment  exact per-invocation environment application
+  _relay_logging_context  per-invocation logging metadata shared by the SDK
   _relay_tracing      per-invocation OpenTelemetry context attach/detach
   _relay_telemetry    process-lifetime managed OpenTelemetry tracer provider
   _relay_handlers     "module.function" handler resolution
@@ -36,6 +37,12 @@ import logging
 import sys
 
 import _relay_lifecycle as lifecycle
+
+# Import the shared logging bridge before /app joins sys.path. The optional
+# relay_runtime.logging SDK imports this same top-level module name, so both
+# resolve one module object and the invocation runner can enrich application
+# logs even when no handler imports the SDK.
+import _relay_logging_context  # noqa: F401
 import _relay_memory as memory
 from _relay_config import load_execution_config
 from _relay_server import runtime_loop
