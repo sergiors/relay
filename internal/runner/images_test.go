@@ -317,15 +317,26 @@ func TestDependencyGCFailureDoesNotAffectRemoval(t *testing.T) {
 	exec := &blockingExecutor{gcErr: true}
 	logger, buf := debugBufferLogger()
 	r := newRetirementRunner(t, exec, logger)
+	w := newAttemptWatcher(r, 1)
 
 	r.RetireImage(retiredImage)
-	waitFor(t, func() bool { return len(exec.removedImages()) == 1 })
+
+	// Polling gcCallCount is not enough: the count is incremented (under the
+	// executor's mutex) while CleanupUnusedDependencies is still running, so it
+	// becomes observable before imageCleanupOnce emits its Warn. The
+	// attempt-completion seam fires only after the attempt is classified, i.e.
+	// after the GC call and its log line, so the assertions below are ordered
+	// against the log write instead of racing it.
+	w.wait(t, 1)
 
 	// GC was attempted and failed: the failure is logged as a Warn ("Dependency
 	// image cleanup failed"), and the removal outcome is unchanged (the image was
 	// removed).
-	waitFor(t, func() bool { return exec.gcCallCount() == 1 })
-	if !strings.Contains(buf.String(), "Dependency image cleanup failed") {
+	if n := exec.gcCallCount(); n != 1 {
+		t.Fatalf("dependency GC ran %d times, want exactly 1", n)
+	}
+	wantWarn := `level=WARN msg="Dependency image cleanup failed"`
+	if !strings.Contains(buf.String(), wantWarn) {
 		t.Fatalf("expected a Warn logging the dependency-GC failure, got:\n%s", buf.String())
 	}
 	if got := exec.removedImages(); len(got) != 1 || got[0] != retiredImage {
