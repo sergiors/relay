@@ -444,23 +444,33 @@ type invokeResult struct {
 
 // writeOtelStub writes a minimal stand-in for the OpenTelemetry API the runtime
 // image installs, into dir (the test PYTHONPATH). The real embedded bootstrap
-// imports `opentelemetry.context` and `opentelemetry.propagate`; this stub
-// provides just those with the same attach/detach/extract contract backed by
-// contextvars, so the process-behavior tests can observe the managed invocation
-// context without a network OTel install. Mirrors the Node bootstrap test's stub.
+// imports `opentelemetry.context` plus the explicit W3C classes
+// `opentelemetry.trace.propagation.tracecontext.TraceContextTextMapPropagator`
+// and `opentelemetry.baggage.propagation.W3CBaggagePropagator`; this stub
+// provides those modules with the same attach/detach/extract contract backed by
+// contextvars (the trace propagator returns the traceparent string itself, so
+// tests can assert on it directly), so the process-behavior tests can observe
+// the managed invocation context without a network OTel install. The empty
+// `opentelemetry.trace` package keeps the telemetry module's guarded API import
+// resolvable while exposing no provider constructors, so a stubbed process
+// never constructs a provider. Mirrors the Node bootstrap test's stub.
 func writeOtelStub(t *testing.T, dir string) {
 	t.Helper()
 	pkg := filepath.Join(dir, "opentelemetry")
 	if err := os.MkdirAll(pkg, 0o755); err != nil {
 		t.Fatalf("mkdir opentelemetry stub: %v", err)
 	}
-	write := func(name, contents string) {
-		if err := os.WriteFile(filepath.Join(pkg, name), []byte(contents), 0o644); err != nil {
-			t.Fatalf("write opentelemetry stub: %v", err)
+	writeFile := func(name, contents string) {
+		path := filepath.Join(pkg, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", name, err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatalf("write opentelemetry stub %s: %v", name, err)
 		}
 	}
-	write("__init__.py", "")
-	write("context.py", `
+	writeFile("__init__.py", "")
+	writeFile("context.py", `
 import contextvars
 
 _ROOT = "root"
@@ -478,11 +488,33 @@ def detach(token):
 def get_current():
     return _current.get()
 `)
-	write("propagate.py", `
+	writeFile("propagate.py", `
 def extract(carrier, context="root", getter=None):
     if not carrier:
         return context
     return carrier.get("traceparent") or context
+`)
+	writeFile("baggage/__init__.py", "")
+	writeFile("baggage/propagation/__init__.py", `
+class W3CBaggagePropagator:
+    def extract(self, carrier, context=None):
+        return context
+
+    def inject(self, context, carrier):
+        pass
+`)
+	writeFile("trace/__init__.py", "")
+	writeFile("trace/propagation/__init__.py", "")
+	writeFile("trace/propagation/tracecontext.py", `
+class TraceContextTextMapPropagator:
+    def extract(self, carrier, context=None):
+        if not carrier:
+            return "root"
+        return carrier.get("traceparent") or "root"
+
+    def inject(self, context, carrier):
+        if context and context != "root":
+            carrier["traceparent"] = context
 `)
 }
 

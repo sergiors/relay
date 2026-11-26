@@ -135,6 +135,12 @@ type executionContainer struct {
 	// joins it after closing the connection, so a container teardown leaves no
 	// live protocol reader behind.
 	readerDone chan struct{}
+	// monitorDone and watchDone are closed when the monitor and exit-watcher
+	// goroutines exit. A shutdown teardown joins them (see teardown) so the
+	// Manager's final cache teardown leaves no container goroutine behind. They
+	// are nil on a directly constructed container that never started them.
+	monitorDone chan struct{}
+	watchDone   chan struct{}
 
 	// dying is the discard CAS: only the first discarder closes/tears down.
 	dying atomic.Bool
@@ -368,20 +374,22 @@ func connectExecutionContainer(
 		)
 	}
 	c := &executionContainer{
-		cli:        cli,
-		log:        log,
-		fn:         fn,
-		image:      image,
-		ops:        ops,
-		meta:       meta,
-		id:         id,
-		conn:       conn,
-		fail:       make(chan failEvent, 4),
-		exitInfo:   make(chan exitInfo, 1),
-		connErr:    make(chan error, 1),
-		protoErr:   make(chan error, 1),
-		closed:     make(chan struct{}),
-		readerDone: make(chan struct{}),
+		cli:         cli,
+		log:         log,
+		fn:          fn,
+		image:       image,
+		ops:         ops,
+		meta:        meta,
+		id:          id,
+		conn:        conn,
+		fail:        make(chan failEvent, 4),
+		exitInfo:    make(chan exitInfo, 1),
+		connErr:     make(chan error, 1),
+		protoErr:    make(chan error, 1),
+		closed:      make(chan struct{}),
+		readerDone:  make(chan struct{}),
+		monitorDone: make(chan struct{}),
+		watchDone:   make(chan struct{}),
 	}
 	go c.readResponses()
 	// Exit watcher: the container is expected to keep running between
@@ -393,6 +401,16 @@ func connectExecutionContainer(
 	// pending is delivered to that Invoke and discarded there (single owner).
 	go c.monitor()
 	return c, nil
+}
+
+// closeIfSet closes ch when non-nil. Container goroutine completion channels are
+// created by the production connect path but absent on a directly constructed
+// test container that never started that goroutine, so the join helpers must be
+// nil-safe.
+func closeIfSet(ch chan struct{}) {
+	if ch != nil {
+		close(ch)
+	}
 }
 
 func signalExit(ch chan exitInfo, info exitInfo) {
@@ -527,6 +545,7 @@ func (c *executionContainer) deliverResponse(resp invokeResponse) error {
 // monitor routes it. A bounded give-up guards against a broken daemon that never
 // delivers.
 func (c *executionContainer) watchExit() {
+	defer closeIfSet(c.watchDone)
 	waitCtx, release, ok := c.ops.admitNormal(c.ops.opCtx())
 	if !ok {
 		// Normal admission closed: never admit a watcher late after close. The
@@ -539,18 +558,9 @@ func (c *executionContainer) watchExit() {
 	wait := c.cli.ContainerWait(waitCtx, c.id, client.ContainerWaitOptions{
 		Condition: container.WaitConditionNotRunning,
 	})
-	// drainWait releases the wait request's reader goroutine: the SDK delivers
-	// at most one result/error, and a cancelled request reports through the
-	// buffered Error channel, so a bounded drain lets the goroutine exit without
-	// blocking on an unread Result. It runs before the operation release, so the
-	// drain barrier covers the SDK reader too.
-	drainWait := func() {
-		select {
-		case <-wait.Result:
-		case <-wait.Error:
-		case <-time.After(5 * time.Second):
-		}
-	}
+	// drainWait releases the wait request's reader goroutine. It runs before the
+	// operation release, so the drain barrier covers the SDK reader too.
+	drainWait := func() { drainContainerWait(wait) }
 	timer := time.NewTimer(24 * time.Hour)
 	defer timer.Stop()
 	select {
@@ -590,6 +600,7 @@ func (c *executionContainer) watchExit() {
 // failure. A pending invocation is notified via fail (and performs the discard
 // itself); an idle container's death discards directly.
 func (c *executionContainer) monitor() {
+	defer closeIfSet(c.monitorDone)
 	for {
 		select {
 		case <-c.closed:
@@ -940,11 +951,27 @@ func (c *executionContainer) claimDiscard(reason string) bool {
 	return true
 }
 
-// teardown performs an already-claimed teardown: kill, remove, close the
-// execution channel, publish the discard, and join the protocol reader. Only a
-// claimDiscard winner may call it.
+// executionShutdownFlushGrace bounds how long a shutdown discard lets an idle
+// managed bootstrap clean up after its authenticated channel closes. The
+// bootstrap runs its container-scoped cleanup (including a Python OpenTelemetry
+// provider flush) only after channel EOF, so killing first would skip it. The
+// value leaves headroom above the bootstrap's own bounded provider shutdown
+// (the bootstrap also runs container-scoped dependency cleanup first). The
+// grace is additionally capped by the shutdown context's remaining budget, and
+// a container that has not exited by then is force-killed exactly as before.
+const executionShutdownFlushGrace = 10 * time.Second
+
+// teardown performs an already-claimed teardown. A shutdown discard of an IDLE
+// container first closes the authenticated execution channel and waits
+// (bounded) for the bootstrap to exit, so a process-lifetime provider can flush;
+// every other reason, and a busy shutdown container, keeps the historical
+// kill-then-remove order. Removing, publishing the discard, and joining the
+// reader follow on both paths. Only a claimDiscard winner may call it.
 func (c *executionContainer) teardown(ctx context.Context, reason string) bool {
-	killContainerContext(ctx, c.cli, c.id)
+	graceful := reason == reasonShutdown && c.drainShutdownChannel(ctx)
+	if !graceful {
+		killContainerContext(ctx, c.cli, c.id)
+	}
 	if err := removeContainerContext(ctx, c.cli, c.id); err != nil {
 		// A genuine removal failure: the container may survive as an orphan.
 		// `removed` stays false so its warm-budget slot is never returned for the
@@ -961,9 +988,105 @@ func (c *executionContainer) teardown(ctx context.Context, reason string) bool {
 	if c.readerDone != nil {
 		<-c.readerDone
 	}
+	if reason == reasonShutdown {
+		// A shutdown teardown runs from the cache/creation path, never from the
+		// container's own monitor, so joining both remaining goroutines is safe.
+		// Closing c.closed above releases the monitor; the watcher was cancelled
+		// when normal admission closed (or exits on c.closed) and drains itself.
+		joinIfSet(c.monitorDone)
+		joinIfSet(c.watchDone)
+	}
 	c.log.Debug("Runtime container: discarded",
 		"app", c.fn, "image", c.image, "container", c.id, "reason", reason)
 	return true
+}
+
+// drainShutdownChannel performs the graceful half of a shutdown teardown and
+// reports whether the process confirmed exit (so no kill is needed). It only
+// applies to a Manager-owned, physically known container whose invocation slot
+// is free: a busy container keeps the historical immediate-interrupt teardown,
+// so shutdown never waits out an in-flight handler. Closing the channel happens
+// under ioMu's try-lock, so no new exchange can start on it afterwards.
+func (c *executionContainer) drainShutdownChannel(ctx context.Context) bool {
+	if c.cli == nil || c.id == "" || c.ops.gate == nil {
+		return false
+	}
+	// Only the Manager's final cache teardown drains: a create-race shutdown
+	// cleanup before the teardown phase keeps its historical immediate teardown.
+	if !c.ops.gate.teardownPhaseOpen() {
+		return false
+	}
+	if !c.ioMu.TryLock() {
+		return false
+	}
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
+	c.ioMu.Unlock()
+	return c.waitProcessExit(ctx, shutdownFlushGrace(ctx))
+}
+
+// shutdownFlushGrace returns the grace for one shutdown drain: the fixed grace,
+// capped to half the shutdown context's remaining budget so the subsequent
+// kill/remove still have time to run within the same bound. An already-expired
+// context yields zero (force-kill immediately).
+func shutdownFlushGrace(ctx context.Context) time.Duration {
+	grace := executionShutdownFlushGrace
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 0
+		}
+		if half := remaining / 2; half < grace {
+			grace = half
+		}
+	}
+	return grace
+}
+
+// waitProcessExit issues one context-aware exit wait and reports whether the
+// container reached the not-running state within grace. It is used only by the
+// shutdown drain: the container's long-lived watcher has already been cancelled
+// with normal admission, so this is a fresh, bounded request. A wait error or
+// grace expiry reports false, and the caller force-kills.
+func (c *executionContainer) waitProcessExit(ctx context.Context, grace time.Duration) bool {
+	if grace <= 0 {
+		return false
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, grace)
+	defer cancel()
+	wait := c.cli.ContainerWait(waitCtx, c.id, client.ContainerWaitOptions{
+		Condition: container.WaitConditionNotRunning,
+	})
+	select {
+	case <-wait.Result:
+		return true
+	case <-wait.Error:
+		return false
+	case <-waitCtx.Done():
+		drainContainerWait(wait)
+		return false
+	}
+}
+
+// drainContainerWait releases a cancelled wait request's SDK reader goroutine.
+// The SDK delivers at most one result/error, and a cancelled request reports
+// through the buffered error channel, so a bounded drain lets the goroutine exit
+// without blocking on an unread result.
+func drainContainerWait(wait client.ContainerWaitResult) {
+	select {
+	case <-wait.Result:
+	case <-wait.Error:
+	case <-time.After(containerOpTimeout):
+	}
+}
+
+// joinIfSet waits on ch when it is non-nil. Goroutine-completion channels are
+// absent on a directly constructed container that never started that goroutine.
+func joinIfSet(ch chan struct{}) {
+	if ch != nil {
+		<-ch
+	}
 }
 
 // dead reports whether the container has been discarded or poisoned by a

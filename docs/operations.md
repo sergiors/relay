@@ -121,6 +121,65 @@ TraceContext and Baggage through stream messages and handler invocations. A
 tracing setup error is non-fatal; Relay continues without tracing. See
 [Configuration](configuration.md#environment-owned-by-other-libraries).
 
+Managed Python invocation images also install the OpenTelemetry SDK and OTLP
+exporters and run a provider for each warm container. Python service images
+install only the OpenTelemetry API (for existing trace-context propagation) and
+do not initialize a managed provider. Relay inherits only the
+standard, non-secret worker variables: SDK disable, generic and trace-specific
+OTLP endpoint, protocol, timeout, compression, and insecure flags, the trace
+sampler and its argument, and batch span processor settings. An inherited
+endpoint that carries user information, a query string, or a fragment is
+omitted entirely rather than rewritten (configure an endpoint without embedded
+credentials). For gRPC, the endpoint scheme selects the default transport
+security (`http://` is plaintext, `https://` is TLS), so a plaintext collector
+with an `http://` endpoint needs no extra setting. A bare authority-form endpoint
+such as `collector:4317` needs `OTEL_EXPORTER_OTLP_INSECURE=true` (or the
+trace-specific form) for plaintext.
+Relay's own service name and resource attributes are never inherited. The
+managed service name defaults to the app name; an app's explicit
+`OTEL_SERVICE_NAME` (or a non-empty `service.name` in its
+`OTEL_RESOURCE_ATTRIBUTES`) takes precedence, and an empty app
+`OTEL_SERVICE_NAME` falls back to the app name when no resource attribute names
+the service.
+
+The app's own `OTEL_*` template environment and secrets follow the normal
+application environment path. Relay never writes exporter headers,
+certificates, client keys, or other authentication values into Docker
+`Config.Env` or any container-creation configuration. An application that
+supplies them through its own environment or secrets still exposes them to its
+invocation process on the per-invocation environment frame; Relay does not log
+or persist those values, and only hashes them privately to decide when a
+process must be replaced. This includes app-only provider inputs
+such as `OTEL_PYTHON_TRACER_PROVIDER` and `OTEL_CONFIG_FILE`: Relay neither
+interprets nor injects them, but a changed value replaces the warm process. An
+application can also set `RELAY_OTEL_PROVIDER=application` in its own
+environment to keep provider creation and shutdown entirely under application
+control (for example, for a custom SDK provider). Unset, empty, or `managed`
+selects Relay-managed behavior as described above. Any other non-empty value is
+invalid: Relay emits a fixed diagnostic (without echoing the value) and skips
+provider creation entirely rather than silently falling back to Relay-managed
+or overwriting an application provider. The provider is
+process-lifetime: Relay can only detect provider inputs supplied through the
+application environment. A provider registered directly in
+application code, or configuration changed through a source Relay cannot observe,
+takes effect only in a new container and is not detected by Relay. At
+shutdown Relay closes an idle container's execution channel first, giving the
+bootstrap a bounded grace to clean up and flush before the container is killed.
+The grace is capped to half of the remaining manager shutdown budget, so a short
+shutdown budget shrinks the flush opportunity and may abandon an unfinished
+provider flush; outside that cap, the bootstrap bounds its own provider shutdown
+below the grace to leave headroom for container-scoped cleanup. A busy container
+(an invocation still in flight) keeps the immediate teardown, so it is not
+flushed. Node handlers do not initialize a managed provider.
+
+Execution containers join Relay's internal control network plus any configured
+`NETWORKS`; the bundled Compose collector network is not attached automatically.
+To export app traces, give Relay and the execution containers a least-privilege
+network that can reach the collector (for example a dedicated telemetry network
+added through `NETWORKS`) and set the OTLP endpoint to an address reachable from
+inside an execution container. A loopback endpoint such as `127.0.0.1` is not
+reachable from a separate container.
+
 ### Logging
 
 `LOG_LEVEL` controls Relay worker logs, not handler logs or output. Handler

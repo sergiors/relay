@@ -22,6 +22,7 @@ import _relay_lifecycle as lifecycle
 import _relay_memory as memory
 import _relay_protocol as protocol
 import _relay_report as report
+import _relay_telemetry as telemetry
 from _relay_config import ExecutionConfig
 from _relay_context import REQUIRED_CONTEXT_FIELDS
 from _relay_invocation import invoke
@@ -145,6 +146,11 @@ async def serve_invocations(reader, writer):
         lifecycle.start_invocation(request_id)
         started_at = time.perf_counter()
         environment.apply_invocation_env(env, handler)
+        # The effective application environment is in place, so this is the
+        # earliest point a managed provider sees the process's real OTel
+        # configuration. It runs before the handler module is imported, so
+        # import-time instrumentation exports under this invocation's trace.
+        telemetry.ensure_started()
         error = await invoke(
             handler,
             request.get("event"),
@@ -273,7 +279,10 @@ async def runtime_loop(config: ExecutionConfig):
     The listener starts before any handler module is imported, so Relay's
     handshake is also the container's readiness signal. Container-scoped SDK
     dependencies are closed after the channel ends, while the container's event
-    loop that created them is still running.
+    loop that created them is still running; the managed OpenTelemetry provider
+    stays active through that cleanup and is flushed afterwards, before the loop
+    exits. Cleanup is best-effort but ordered: a cancelled cleanup still leaves
+    the provider one bounded shutdown attempt.
     """
     admission = ConnectionAdmission()
     shutdown = asyncio.Event()
@@ -288,4 +297,7 @@ async def runtime_loop(config: ExecutionConfig):
         async with server:
             await shutdown.wait()
     finally:
-        await _shutdown_optional_dependencies()
+        try:
+            await _shutdown_optional_dependencies()
+        finally:
+            telemetry.shutdown()

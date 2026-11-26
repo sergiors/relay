@@ -18,9 +18,11 @@ Process-model notes (intended semantics, not a bug):
     connection loop can shut down and join its tasks.
   - A fresh HandlerContext is built from the frame for this call and passed as
     the handler's second argument, so the signature is ``func(event, context)``.
-    The trace context is attached for the single handler call and detached in a
-    finally, so one invocation's context never leaks into the next despite the
-    warm interpreter.
+    The trace context is attached before the handler module is imported and
+    detached only after the whole attempt (module import, context build, call,
+    and dependency cleanup), so import-time instrumentation joins Relay's
+    invocation trace and one invocation's context never leaks into the next
+    despite the warm interpreter.
 """
 
 import asyncio
@@ -38,35 +40,38 @@ async def invoke(handler, event, context_frame, trace=None):
     caller reports them as an ok:false result and keeps the container reusable.
     Return None on success.
     """
-    try:
-        func = handlers.load(handler)
-    except handlers.HandlerLoadError as exc:
-        return str(exc)
-
-    try:
-        context = build_handler_context(context_frame)
-    except (TypeError, ValueError) as exc:
-        return f"invalid handler context: {exc}"
-
     token = tracing.attach_invocation_context(trace)
     try:
-        result = func(event, context)
-        if inspect.isawaitable(result):
-            await result  # on the process-lifetime loop, never a fresh one
-    except SystemExit as exc:
-        code = exc.code
-        if code is None or code is True:
-            return f"handler {handler!r} exited"
-        return f"handler {handler!r} exited with code {code}"
-    except asyncio.CancelledError:
-        # Task cancellation is control flow, not a handler failure: re-raise so
-        # asyncio.run can shut the connection loop down and join its tasks.
-        raise
-    except BaseException as exc:
-        # BaseException: SystemExit is handled above, KeyboardInterrupt and
-        # anything the handler raises is a failed INVOCATION, not a fatality.
-        return f"handler {handler!r} failed: {exc}"
+        try:
+            func = handlers.load(handler)
+        except handlers.HandlerLoadError as exc:
+            return str(exc)
+
+        try:
+            context = build_handler_context(context_frame)
+        except (TypeError, ValueError) as exc:
+            return f"invalid handler context: {exc}"
+
+        try:
+            result = func(event, context)
+            if inspect.isawaitable(result):
+                await result  # on the process-lifetime loop, never a fresh one
+        except SystemExit as exc:
+            code = exc.code
+            if code is None or code is True:
+                return f"handler {handler!r} exited"
+            return f"handler {handler!r} exited with code {code}"
+        except asyncio.CancelledError:
+            # Task cancellation is control flow, not a handler failure: re-raise
+            # so asyncio.run can shut the connection loop down and join its
+            # tasks.
+            raise
+        except BaseException as exc:
+            # BaseException: SystemExit is handled above, KeyboardInterrupt and
+            # anything the handler raises is a failed INVOCATION, not a
+            # fatality.
+            return f"handler {handler!r} failed: {exc}"
+
+        return None
     finally:
         tracing.detach_invocation_context(token)
-
-    return None

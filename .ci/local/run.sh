@@ -20,10 +20,15 @@ done
 
 ensure_go_cache_ownership() {
     ci_uid=$(id -u ci)
-    mkdir -p /home/ci/.cache/go-build /go/pkg/mod
+    # The uv cache volume must be writable by the test user too: the root-run
+    # python target (uv sync) can leave root-owned entries in it, and a
+    # managed-install fallback running as ci then fails to initialize the
+    # cache. Repair it exactly like the Go caches.
+    mkdir -p /home/ci/.cache/go-build /go/pkg/mod /home/ci/.cache/uv
     if [ "$(stat -c %u /home/ci/.cache/go-build)" != "$ci_uid" ] ||
-        [ "$(stat -c %u /go/pkg/mod)" != "$ci_uid" ]; then
-        chown -R ci:docker /home/ci/.cache/go-build /go/pkg/mod
+        [ "$(stat -c %u /go/pkg/mod)" != "$ci_uid" ] ||
+        [ "$(stat -c %u /home/ci/.cache/uv)" != "$ci_uid" ]; then
+        chown -R ci:docker /home/ci/.cache/go-build /go/pkg/mod /home/ci/.cache/uv
     fi
 }
 

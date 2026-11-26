@@ -38,6 +38,12 @@
 // ships the W3C TraceContext and Baggage propagators, so Relay always installs
 // exactly those two rather than hand-rolling the other (b3/jaeger/xray) values.
 //
+// The package also owns the process-configuration contract for managed app
+// runtimes (see ResolveManagedAppConfig): the allowlisted worker inheritance,
+// the app-tier precedence, and the private in-memory identity used to replace a
+// warm process when its provider configuration changes. It never lets a managed
+// app inherit Relay's service identity or exporter authentication.
+//
 // Every instrumentation site calls the package-level Start helper. It resolves
 // the global tracer every call, so it is a no-op before Setup and after a
 // disabled Setup, and it transparently follows the provider installed by Setup.

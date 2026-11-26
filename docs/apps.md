@@ -188,7 +188,10 @@ keep the plain function form. See the
 for the rules, scopes, and limitations.
 
 OpenTelemetry trace propagation remains available ambiently during the handler
-call in both runtimes.
+call in both runtimes. Python invocation images additionally ship the
+OpenTelemetry SDK and OTLP exporters and run a managed provider configured from
+the app's standard `OTEL_*` environment and the worker's allowlisted tracing
+configuration; see [Operations](operations.md#tracing).
 
 Event handler names must be unique across an app's event rules. Every schedule
 and service also needs a unique, stable name within its app; names follow the

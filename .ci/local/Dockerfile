@@ -18,6 +18,13 @@ RUN apk add --no-cache \
 COPY --from=golang /usr/local/go /usr/local/go
 COPY --from=uv /uv /uvx /usr/local/bin/
 
+RUN SITE=$(python3 -c "import site;print(site.getsitepackages()[0])") && \
+    uv pip install --python /usr/bin/python3 --target "$SITE" --no-cache \
+    'opentelemetry-api>=1.16,<2' \
+    'opentelemetry-sdk>=1.16,<2' \
+    'opentelemetry-exporter-otlp-proto-grpc>=1.16,<2' \
+    'opentelemetry-exporter-otlp-proto-http>=1.16,<2'
+
 ENV PATH="/usr/local/go/bin:${PATH}"
 ENV GOPATH="/go"
 

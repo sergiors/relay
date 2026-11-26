@@ -158,8 +158,10 @@ func TestPlanZuvloopAppliesUnderSourceMountedImages(t *testing.T) {
 		mounted, baked := sameModePlans(t, zuvloopSpec(true), nil)
 
 		assertBootstrapFile(t, mounted, Bootstrap)
-		if len(mounted.Install) != 1 || mounted.Install[0] != otelInstall {
-			t.Errorf("mounted service-only Install = %v, want only the managed OTel install", mounted.Install)
+		// A service-only image never runs the invocation provider, so it keeps
+		// the API-only managed install (no SDK/exporters).
+		if len(mounted.Install) != 1 || mounted.Install[0] != otelAPIInstall {
+			t.Errorf("mounted service-only Install = %v, want only the API-only managed OTel install", mounted.Install)
 		}
 		if got, want := findBootstrapFile(mounted).Content, findBootstrapFile(baked).Content; !bytes.Equal(got, want) {
 			t.Error("mounted service-only bootstrap differs from the baked service-only bootstrap")
@@ -231,8 +233,10 @@ func TestPlanZuvloopEnabledServiceOnlyKeepsStandardBootstrap(t *testing.T) {
 				t.Fatalf("plan: %v", err)
 			}
 			assertBootstrapFile(t, enabled, Bootstrap)
-			if len(enabled.Install) != 1 || enabled.Install[0] != otelInstall {
-				t.Errorf("service-only Install = %v, want only the managed OTel install", enabled.Install)
+			// A service-only image never runs the invocation provider, so it
+			// keeps the API-only managed install under either mode.
+			if len(enabled.Install) != 1 || enabled.Install[0] != otelAPIInstall {
+				t.Errorf("service-only Install = %v, want only the API-only managed OTel install", enabled.Install)
 			}
 			if got, want := enabled.Install, disabled.Install; strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 				t.Errorf("service-only Install = %v, want the disabled plan's %v", got, want)

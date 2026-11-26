@@ -141,17 +141,25 @@ const (
 	exportedRequirements = "/tmp/uv-requirements.txt"
 )
 
-// otelAPIFloor is the managed OpenTelemetry API installed into every Python
-// runtime image (see otelInstall). It is a floor RANGE rather than an exact pin
-// on purpose: unlike Node's standalone @opentelemetry/api, the Python API
-// version is coupled to the user's opentelemetry-sdk version, so an exact pin
-// would silently replace a matching API and leave the SDK paired with a
-// mismatched one. The floor is the first release that imports without
-// `pkg_resources` (gone from python:3.14-slim and python:3.15-slim), which the
-// bootstrap's context/propagate imports need; the <2 cap refuses a future major
-// Relay has not validated. When a user SDK already installed a satisfying API,
-// uv keeps it and Relay never downgrades it.
-const otelAPIFloor = "opentelemetry-api>=1.16,<2"
+// Managed OpenTelemetry packages installed into every Python runtime image (see
+// otelInstall). The API is always present for per-invocation trace-context
+// propagation; the SDK and both OTLP exporters let the managed invocation
+// bootstrap own a process-lifetime provider for app tracing.
+//
+// They are floor RANGES rather than exact pins on purpose: the Python packages
+// are version-coupled (the SDK requires a matching API, and each exporter a
+// matching SDK), so an exact pin could silently replace a user's compatible
+// versions and leave the set mismatched. uv resolves the four together and keeps
+// an already-satisfying user install. The floor is the first release that
+// imports without `pkg_resources` (gone from python:3.14-slim and python:3.15-slim),
+// which the bootstrap needs; the <2 cap refuses a future major Relay has not
+// validated. The official wheels cover the managed Linux amd64/arm64 runtimes.
+const (
+	otelAPIFloor          = "opentelemetry-api>=1.16,<2"
+	otelSDKFloor          = "opentelemetry-sdk>=1.16,<2"
+	otelGRPCExporterFloor = "opentelemetry-exporter-otlp-proto-grpc>=1.16,<2"
+	otelHTTPExporterFloor = "opentelemetry-exporter-otlp-proto-http>=1.16,<2"
+)
 
 // zuvloopVersion is the exact pinned release installed when PYTHON_ZUVLOOP
 // applies to a Python app image. zuvloop requires Python 3.14+, which both
@@ -171,15 +179,25 @@ const (
 	// interface. --no-cache keeps the layer small.
 	requirementsInstall = "uv pip install --system --no-cache -r " + requirementsFile
 
-	// otelInstall installs the managed OpenTelemetry API into the app
-	// image's system site-packages (the same environment the bootstrap and any
-	// user-installed SDK resolve from). The spec is single-quoted because the
-	// version range's < and > are shell redirection operators. It runs in the
-	// app image (not the shared dependency layer) so it never enters the
-	// content-addressed dependency fingerprint; being a build Install command,
-	// it is covered by the relay.bootstrap label, so images pick it up on the
-	// next reconcile.
-	otelInstall = "uv pip install --system --no-cache '" + otelAPIFloor + "'"
+	// otelAPIInstall installs only the OpenTelemetry API. It runs in EVERY
+	// Python app image, preserving the long-standing per-invocation trace-context
+	// propagation floor for both invocation and service images.
+	otelAPIInstall = "uv pip install --system --no-cache '" + otelAPIFloor + "'"
+
+	// otelInstall installs the full managed OpenTelemetry set (API, SDK, and
+	// both OTLP exporters) for an image that actually serves event/schedule
+	// invocations via the _relay_server bootstrap. The specs are single-quoted
+	// because the version ranges' < and > are shell redirection operators.
+	// Installing them together lets uv resolve one compatible set and preserve a
+	// user-installed version that already satisfies the ranges. A service-only
+	// image keeps only otelAPIInstall: it never runs the invocation provider, so
+	// it pays no SDK/exporter image size and implies no service tracing support.
+	// Both commands run in the app image (not the shared dependency layer) so
+	// they never enter the content-addressed dependency fingerprint; being build
+	// Install commands, they are covered by the relay.bootstrap label, so images
+	// pick them up on the next reconcile.
+	otelInstall = "uv pip install --system --no-cache '" + otelAPIFloor + "' '" +
+		otelSDKFloor + "' '" + otelGRPCExporterFloor + "' '" + otelHTTPExporterFloor + "'"
 
 	// zuvloopPackage is the exact package spec installed for PYTHON_ZUVLOOP,
 	// and zuvloopInstall is its managed uv install. Like otelInstall it runs in
@@ -270,14 +288,20 @@ func (Engine) Plan(spec plan.Spec, fnDir string, handlers []string) (plan.BuildP
 	}
 
 	// The managed OpenTelemetry API is installed in the APP image (not the
-	// shared dependency layer): it must be present in every runtime even when
-	// the app declares no dependencies, and keeping it out of Deps leaves
-	// the content-addressed dependency fingerprint untouched. It runs after the
-	// dependency image's FROM has already provided the user's packages, so a
-	// user SDK that pinned its own matching API is not disturbed (see
-	// otelAPIFloor). uv is available: the no-deps app image copies it as a
-	// tool, and a deps app image inherits it from the dependency base.
-	install := []string{otelInstall}
+	// shared dependency layer): it must be present in every Python runtime even
+	// when the app declares no dependencies, and keeping it out of Deps leaves
+	// the content-addressed dependency fingerprint untouched. Only an image that
+	// serves event/schedule invocations gets the SDK and OTLP exporters, so a
+	// persistent service image does not pay for or imply function-invocation
+	// tracing support. Both commands run after the dependency image's FROM has
+	// already provided the user's packages, so a user SDK that pinned its own
+	// matching versions is not disturbed (see otelAPIFloor). uv is available:
+	// the no-deps app image copies it as a tool, and a deps app image inherits it
+	// from the dependency base.
+	install := []string{otelAPIInstall}
+	if len(handlers) > 0 {
+		install[0] = otelInstall
+	}
 	if zuvloop {
 		// The pinned zuvloop package joins the same app-image managed-install
 		// path. Keeping it out of Deps leaves the dependency fingerprint and

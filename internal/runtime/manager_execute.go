@@ -10,6 +10,7 @@ import (
 	"github.com/moby/moby/client"
 
 	"relay/internal/app"
+	"relay/internal/observability/tracing"
 )
 
 // startContainer builds one fresh execution container for an app version.
@@ -248,12 +249,29 @@ func (m *Manager) Execute(
 	idMeta.EventName = ""
 	// Resolve the app's effective per-container resource limits ONCE for
 	// this execution, from the cache's last published configuration, and derive
-	// the config fingerprint from exactly those limits. Passing the same pair to
-	// the create and to the pool means the HostConfig a container is created
-	// with and the generation it is pooled under always agree, so a resource-only
-	// hot change rotates containers without a rebuild.
+	// the config fingerprint from exactly those limits plus the managed process
+	// configuration. Passing the same values to the create and to the pool means
+	// the HostConfig a container is created with and the generation it is pooled
+	// under always agree, so a resource-only hot change rotates containers
+	// without a rebuild.
 	limits := m.containers.appResources(prepared.Name)
-	config := limits.Fingerprint()
+	// The generation's config half also carries the managed process-config
+	// identity (the Python OTel configuration). An effective change therefore
+	// supersedes the warm generation before the next invocation rather than
+	// mutating a running provider; an app with no managed provider keeps the
+	// historical resources-only identity. The per-invocation OTEL values
+	// (including exporter auth secrets, which are never written to Config.Env)
+	// join only this private fingerprint, so rotating one rotates the process.
+	// The EXECUTING Prepared's immutable identity is authoritative. It is
+	// paired with that same Prepared's execEnv; reading the cache's last
+	// activation here could pair an old generation's environment with a newer
+	// fingerprint while a replacement is being published.
+	managedConfig := prepared.otelConfig
+	if managedConfig != "" {
+		managedConfig = tracing.ManagedAppInvocationFingerprint(managedConfig, extraEnv)
+	}
+	config := runtimeVersionConfig(limits.Fingerprint(), managedConfig)
+	frameEnv := envMap(extraEnv)
 	// Resolve the managed image's IMMUTABLE content identity ONCE for this
 	// execution, after the image lease above and BEFORE the pool lease and the
 	// container create. The lease pins the reference for the whole inspection, so
@@ -266,6 +284,32 @@ func (m *Manager) Execute(
 	// prepared.Image for labels, spans, and image retirement. Resolution failure
 	// degrades to the reference identity, never failing the invocation.
 	img := m.resolveImageIdentity(ctx, prepared.Image, prepared.Fingerprint)
+	// Execution containers use the plan env plus Relay's worker-inherited
+	// tracing defaults; services stay on the plan-only Env. Application-specific
+	// OTEL values stay on the invocation frame. Standard precedence needs two
+	// frame overlays (an empty trace-specific value when the app sets a generic
+	// one, and the service-name rules), but no application value is promoted
+	// into Docker Config.Env.
+	containerEnv := prepared.Env
+	if len(prepared.execEnv) > 0 {
+		containerEnv = prepared.execEnv
+	}
+	if prepared.otelConfig != "" {
+		// Only a managed-provider execution has the injected service-name
+		// default and inherited trace-specific values these overlays resolve.
+		// Node and hand-built non-managed Prepared executions must keep their
+		// request frame byte-for-byte unchanged.
+		if overrides := tracing.ManagedAppInvocationEnvOverrides(
+			prepared.Name, prepared.otelInheritedTraceSpecific, extraEnv,
+		); len(overrides) > 0 {
+			if frameEnv == nil {
+				frameEnv = make(map[string]string, len(overrides))
+			}
+			for name, value := range overrides {
+				frameEnv[name] = value
+			}
+		}
+	}
 	start := func() (reusableContainer, error) {
 		// Every execution container joins the managed control network plus the
 		// optional worker-global NETWORKS set (WithNetworks), which the worker
@@ -273,7 +317,7 @@ func (m *Manager) Execute(
 		// disappears between verification and create surfaces as a create error
 		// here; Relay never creates operator networks (its own control network is
 		// provisioned during startup preflight).
-		return m.startContainer(ctx, prepared.Name, img, prepared.Env, limits, idMeta)
+		return m.startContainer(ctx, prepared.Name, img, containerEnv, limits, idMeta)
 	}
 	// Prepared.Concurrency is populated by Prepare as the effective bound
 	// (template concurrency clipped to MAX_CONCURRENT_INVOCATIONS). A hand-built Prepared
@@ -284,7 +328,8 @@ func (m *Manager) Execute(
 	// a stricter limiter than the runner's per-app semaphore.
 	max := m.clipConcurrency(prepared.Concurrency)
 	return m.containers.executeVersion(
-		ctx, prepared.Name, img.identity(), config, max, start, handler, eventJSON, envMap(extraEnv),
+		ctx, prepared.Name, img.identity(), config, max, start, handler,
+		eventJSON, frameEnv,
 	)
 }
 

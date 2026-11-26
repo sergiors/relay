@@ -350,6 +350,18 @@ func (o *managerOps) beginTeardown(ctx context.Context) (context.Context, func()
 	return opCtx, release, nil
 }
 
+// teardownPhaseOpen reports whether the Manager is in its final cache-teardown
+// phase. A shutdown discard uses it to distinguish the Manager-owned cache
+// teardown (which may drain an idle bootstrap before killing it) from an
+// ordinary create-race cleanup that happens while the normal phase is closing
+// (which keeps the historical immediate teardown).
+func (o *managerOps) teardownPhaseOpen() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.lazyInitLocked()
+	return o.teardownOpen && !o.teardownClosed
+}
+
 // closeTeardown closes teardown admission atomically. After it returns, no
 // teardown operation may be admitted.
 func (o *managerOps) closeTeardown() {

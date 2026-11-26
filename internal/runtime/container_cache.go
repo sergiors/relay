@@ -246,7 +246,14 @@ type containerCache struct {
 	// container create without a Prepared rebuild. It is deleted with the
 	// app on removal. Guarded by mu.
 	resources map[string]app.ResourceLimits
-	closed    bool
+	// managedConfigs records the last activated managed process-config
+	// fingerprint (the Python OTel configuration) per app. It is combined with
+	// the resource fingerprint to form the pool's generation config, so a
+	// resource-only reconcile can supersede and later re-warm the correct
+	// combined version. It is in-memory only and deleted with the app on
+	// removal. Guarded by mu.
+	managedConfigs map[string]string
+	closed         bool
 
 	// maxWarm is the global hard bound on this cache's warm EXECUTION
 	// containers across every app (MAX_WARM_CONTAINERS; <=0 means unbounded,
@@ -518,12 +525,13 @@ func (pc *pooledContainer) matchesVersion(image, config string) bool {
 // the global warm bound existed.
 func newContainerCache() *containerCache {
 	return &containerCache{
-		pools:         map[string]*appPool{},
-		retiredImages: map[string]bool{},
-		removedApps:   map[string]bool{},
-		capacity:      map[string]int{},
-		resources:     map[string]app.ResourceLimits{},
-		warmNotify:    make(chan struct{}),
+		pools:          map[string]*appPool{},
+		retiredImages:  map[string]bool{},
+		removedApps:    map[string]bool{},
+		capacity:       map[string]int{},
+		resources:      map[string]app.ResourceLimits{},
+		managedConfigs: map[string]string{},
+		warmNotify:     make(chan struct{}),
 	}
 }
 
@@ -569,6 +577,9 @@ func (cc *containerCache) lazyInit() {
 	}
 	if cc.resources == nil {
 		cc.resources = map[string]app.ResourceLimits{}
+	}
+	if cc.managedConfigs == nil {
+		cc.managedConfigs = map[string]string{}
 	}
 }
 
@@ -643,16 +654,19 @@ func (cc *containerCache) setAppResources(fnName string, limits app.ResourceLimi
 	cc.lazyInit()
 	previous, had := cc.resources[fnName]
 	cc.resources[fnName] = limits
+	// Capture the managed half under the same lock so the config passed to
+	// replaceConfig is exactly the combined identity Execute will resolve.
+	newConfig := runtimeVersionConfig(limits.Fingerprint(), cc.managedConfigs[fnName])
 	p := cc.pools[fnName]
 	cc.mu.Unlock()
 	if p == nil || (had && previous == limits) {
 		return
 	}
-	// The pool's generation identity changes with the resource fingerprint, so
-	// retire the current active generation now rather than waiting for a lazy
-	// acquire: idle old-config containers must not be served, and the drain
-	// begins immediately.
-	discard, op := p.replaceConfig(limits.Fingerprint())
+	// The pool's generation identity changes with the combined config, so retire
+	// the current active generation now rather than waiting for a lazy acquire:
+	// idle old-config containers must not be served, and the drain begins
+	// immediately.
+	discard, op := p.replaceConfig(newConfig)
 	p.discardReservedBatch(op, discard, func(*pooledContainer) string { return reasonResourcesChanged })
 }
 
@@ -732,6 +746,42 @@ func (cc *containerCache) appResources(fnName string) app.ResourceLimits {
 // effective limits: the config half of the cache's generation identity.
 func (cc *containerCache) appConfig(fnName string) string {
 	return cc.appResources(fnName).Fingerprint()
+}
+
+// setAppManagedConfig publishes fnName's activated managed process-config
+// fingerprint (the Python OTel configuration). It participates in the same
+// generation config as the resource fingerprint, so a resource-only reconcile
+// uses the current managed identity instead of reverting to a resources-only
+// key. An empty value clears it. A change supersedes the active generation
+// immediately (idle containers are discarded, busy ones drain) and un-retires a
+// reverted combined config, so a generation can never be permanently served as
+// a throwaway after reverting.
+func (cc *containerCache) setAppManagedConfig(fnName, config string) {
+	cc.mu.Lock()
+	cc.lazyInit()
+	previous, had := cc.managedConfigs[fnName]
+	if config == "" {
+		delete(cc.managedConfigs, fnName)
+	} else {
+		cc.managedConfigs[fnName] = config
+	}
+	limits := app.DefaultResourceLimits()
+	if current, ok := cc.resources[fnName]; ok {
+		limits = current.OrDefault()
+	}
+	newConfig := runtimeVersionConfig(limits.Fingerprint(), config)
+	p := cc.pools[fnName]
+	changed := (!had && config != "") || (had && previous != config)
+	cc.mu.Unlock()
+	if p == nil || !changed {
+		return
+	}
+	// Supersede the current combined generation now: idle old-config containers
+	// are discarded and busy ones drain. replaceConfig also un-retires a reverted
+	// config, so going A -> B -> A warms normally instead of being served on a
+	// permanent throwaway.
+	discard, op := p.replaceConfig(newConfig)
+	p.discardReservedBatch(op, discard, func(*pooledContainer) string { return reasonResourcesChanged })
 }
 
 // setAppConcurrency updates fnName's live warm pool bound to max. It is how
@@ -1463,6 +1513,7 @@ func (cc *containerCache) removeApp(fnName string) {
 	cc.lazyInit()
 	cc.removedApps[fnName] = true
 	delete(cc.capacity, fnName)
+	delete(cc.managedConfigs, fnName)
 	p := cc.pools[fnName]
 	var discard []*pooledContainer
 	var op *discardOp

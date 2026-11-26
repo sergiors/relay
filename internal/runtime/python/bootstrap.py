@@ -12,6 +12,7 @@ source mount), so application files cannot shadow them:
   _relay_context      the per-invocation HandlerContext Relay passes to handlers
   _relay_environment  exact per-invocation environment application
   _relay_tracing      per-invocation OpenTelemetry context attach/detach
+  _relay_telemetry    process-lifetime managed OpenTelemetry tracer provider
   _relay_handlers     "module.function" handler resolution
   _relay_invocation   one handler call on the process-lifetime loop
   _relay_lifecycle    INIT_START/START/END lines on the native stdout

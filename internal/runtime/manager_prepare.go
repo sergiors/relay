@@ -15,6 +15,7 @@ import (
 
 	"relay/internal/app"
 	"relay/internal/observability/metrics"
+	"relay/internal/observability/tracing"
 	"relay/internal/runtime/node"
 	"relay/internal/runtime/plan"
 	"relay/internal/runtime/python"
@@ -155,8 +156,17 @@ type Prepared struct {
 	ImageSelection string
 	// Env are the runtime environment variables the app's engine requires
 	// (e.g. PYTHONDONTWRITEBYTECODE for Python). They are applied to every
-	// execution container for this app, after the base RELAY_HANDLER var.
+	// execution container and managed service container for this app, after the
+	// base RELAY_HANDLER var. Managed tracing configuration is deliberately NOT
+	// part of this value: it belongs only to the invocation bootstrap (see
+	// execEnv).
 	Env []string
+	// execEnv is the environment for EXECUTION containers only: Env plus the
+	// allowlisted non-secret OpenTelemetry process configuration for a managed
+	// Python invocation image. It is nil when no managed configuration applies,
+	// in which case Execute uses Env. Keeping it separate is what stops Relay's
+	// tracing configuration from being inherited by service processes or Node.
+	execEnv []string
 	// Concurrency is the app's EFFECTIVE per-app concurrency: the
 	// template's resolved `concurrency` clipped to the worker-global
 	// MAX_CONCURRENT_INVOCATIONS (see Manager.effectiveConcurrency). It is the bound on the
@@ -190,6 +200,19 @@ type Prepared struct {
 	// from the same preparation that staged the build, so activation never
 	// re-resolves daemon paths or the source policy.
 	sourceMount *SourceMount
+	// otelConfig is the in-memory identity of the managed app's effective
+	// OpenTelemetry process configuration, or "" when the runtime has no
+	// managed provider. It participates in the warm-pool generation key (with
+	// the resource fingerprint) so a changed process-lifetime trace config
+	// rotates containers before the next invocation instead of mutating a
+	// running provider. It is never persisted or exposed on a container.
+	otelConfig string
+	// otelInheritedTraceSpecific is the preparation-time provenance of
+	// trace-specific OTel values inherited from the worker. It lets Execute add
+	// an explicit empty override when an app-tier generic value (for example a
+	// secret endpoint) is visible only per invocation. It contains names only,
+	// never values.
+	otelInheritedTraceSpecific []string
 }
 
 // Lease returns the admitted image lease Prepare acquired for this handle, or
@@ -503,6 +526,19 @@ func (m *Manager) prepare(
 	}
 
 	handlers := templateHandlers(fn)
+	// Managed Python function execution gets Relay's worker-inherited
+	// OpenTelemetry defaults plus the app-name service default. The app's own
+	// OTEL values stay on the normal per-invocation frame; only a private
+	// identity merges them, so a template change still rotates warm processes.
+	// Services and Node never receive execEnv and get no managed provider.
+	managedOtel := tracing.ManagedAppConfig{}
+	if spec.Engine == plan.EnginePython && len(handlers) > 0 {
+		var appEnv map[string]string
+		if fn.Template != nil {
+			appEnv = fn.Template.Env
+		}
+		managedOtel = tracing.ResolveManagedAppConfig(fn.Name, appEnv)
+	}
 	planResult, err := eng.Plan(buildSpec, fn.Dir, handlers)
 	if err != nil {
 		return nil, fmt.Errorf("app %q: plan: %w", fn.Name, err)
@@ -615,14 +651,26 @@ func (m *Manager) prepare(
 	}
 	image := ImageRef(fn.Name, imageFingerprint)
 
+	// Worker-inherited OTel values are applied only to execution containers
+	// (never baked, never in labels, never to services), after the plan's own
+	// runtime environment. They are non-secret by construction: the application's
+	// own values and exporter authentication stay on the per-invocation frame.
+	var execEnv []string
+	if len(managedOtel.Env) > 0 {
+		execEnv = append(append([]string(nil), planResult.Env...), managedOtel.Env...)
+	}
+
 	prepared := &Prepared{
-		Name:           fn.Name,
-		Image:          image,
-		Fingerprint:    fp,
-		Runtime:        spec.Name,
-		ImageSelection: runtimeSelection.identity(),
-		Env:            planResult.Env,
-		Concurrency:    m.effectiveConcurrency(fn),
+		Name:                       fn.Name,
+		Image:                      image,
+		Fingerprint:                fp,
+		Runtime:                    spec.Name,
+		ImageSelection:             runtimeSelection.identity(),
+		Env:                        planResult.Env,
+		execEnv:                    execEnv,
+		otelConfig:                 managedOtel.Fingerprint,
+		otelInheritedTraceSpecific: managedOtel.InheritedTraceSpecific,
+		Concurrency:                m.effectiveConcurrency(fn),
 		// The dependency image the app image is built FROM (both paths); it is
 		// the input to dependency garbage collection.
 		Dependency:  depRef,
@@ -836,12 +884,14 @@ func (m *Manager) prepare(
 	if err := verifyDependencyImageUse(ctx, depProtection, depRef); err != nil {
 		return nil, fmt.Errorf("app %q: %w", fn.Name, err)
 	}
-	buildElapsed, buildErr := m.runImageBuild(ctx, fn.Name, image, func(buildCtx context.Context, sessionID string) error {
-		return buildImage(
-			buildCtx, m.cli, fn.Name, planResult, image, appLabels,
-			sourceSnapshot, m.metrics, !mountSource, sessionID,
-		)
-	}, fp)
+	buildElapsed, buildErr := m.runImageBuild(
+		ctx, fn.Name, image, func(buildCtx context.Context, sessionID string,
+		) error {
+			return buildImage(
+				buildCtx, m.cli, fn.Name, planResult, image, appLabels,
+				sourceSnapshot, m.metrics, !mountSource, sessionID,
+			)
+		}, fp)
 	if buildErr != nil {
 		elapsed := buildElapsed
 		m.metrics.ObserveDurationLabels(metrics.MetricAppBuild, []metrics.Label{
@@ -876,7 +926,8 @@ func (m *Manager) prepare(
 		releaseDep()
 		if depRef != "" {
 			if _, cerr := m.CleanupUnusedDependencies(ctx); cerr != nil {
-				m.log.Debug("App: dependency image cleanup after failed build left layers for a later pass",
+				m.log.Debug(
+					"App: dependency image cleanup after failed build left layers for a later pass",
 					"app", fn.Name,
 					"dep_image", depRef,
 					"error", cerr,
@@ -923,6 +974,7 @@ func (m *Manager) activatePrepared(prepared *Prepared) {
 	if m == nil || prepared == nil {
 		return
 	}
+	m.containers.setAppManagedConfig(prepared.Name, prepared.otelConfig)
 	m.containers.activateApp(prepared.Name, prepared.Image)
 	m.containers.setAppConcurrency(prepared.Name, prepared.Concurrency)
 	m.containers.setAppResources(prepared.Name, prepared.resources)
@@ -1048,7 +1100,10 @@ func (m *Manager) clipConcurrency(n int) int {
 // captured for this preparation; the production path hashes it into the digest,
 // and the test seam's result is folded with the same identity so a pinned
 // dependency layer still gets a distinct content address.
-func (m *Manager) dependencyFingerprint(arch, platform string, spec plan.Spec, deps plan.Deps, snap dependencySnapshot, selection imageSelection) (string, error) {
+func (m *Manager) dependencyFingerprint(
+	arch, platform string, spec plan.Spec, deps plan.Deps, snap dependencySnapshot,
+	selection imageSelection,
+) (string, error) {
 	if m.depFingerprint != nil {
 		fingerprint, err := m.depFingerprint(arch, platform, spec, deps, snap)
 		if err != nil {
@@ -1130,7 +1185,9 @@ func (m *Manager) ensureDependencyImage(
 			"inspect_duration", time.Since(reprobeStart),
 		)
 
-		elapsed, buildErr := m.runImageBuild(ctx, fn.Name, depRef, func(buildCtx context.Context, sessionID string) error {
+		elapsed, buildErr := m.runImageBuild(ctx, fn.Name, depRef, func(
+			buildCtx context.Context, sessionID string,
+		) error {
 			// As in Prepare's app-image build, the dependency build uses an
 			// independent lifecycle-rooted buildTimeout context rather than the
 			// caller's ctx, so a slow install step is never cut off by a short
@@ -1185,7 +1242,9 @@ type dependencyBuild struct {
 // cancellation. A genuine build failure — including an actual build cut off by
 // the manager lifecycle or the build timeout — is returned to every waiter and
 // is never retried here.
-func (m *Manager) buildDependencyOnce(ctx context.Context, depRef string, build func() error) error {
+func (m *Manager) buildDependencyOnce(
+	ctx context.Context, depRef string, build func() error,
+) error {
 	for {
 		m.depBuildMu.Lock()
 		if m.depBuilds == nil {
@@ -1465,7 +1524,9 @@ func (m *Manager) runImageBuild(
 // its ID to build. A directly constructed Manager (in-package tests) has no
 // session hook and builds without one, because its scripted daemon cannot
 // perform the /session hijack; NewManager always sets connectBuildSession.
-func (m *Manager) buildWithSession(ctx context.Context, appName string, build func(context.Context, string) error) error {
+func (m *Manager) buildWithSession(
+	ctx context.Context, appName string, build func(context.Context, string) error,
+) error {
 	if m.startBuildSessionFn == nil {
 		return build(ctx, "")
 	}

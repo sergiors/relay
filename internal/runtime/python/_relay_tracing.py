@@ -3,13 +3,19 @@
 Embedded beside the bootstrap and written to ``/relay/_relay_tracing.py`` in
 the runtime image.
 
-The runtime image installs the OpenTelemetry API (see the Python engine's
-managed install). Relay's incoming W3C trace context is extracted with the
-global propagator and attached for the handler call only, so a user-installed
-OTel SDK resolves the SAME global context and creates child spans under Relay's
-invocation span. The trace context stays ambient; the invocation metadata does
-not (see ``_relay_invocation``), so every handler has the signature
-``func(event, context)``.
+Relay's carrier is parsed with Relay's own W3C TraceContext and Baggage
+propagators, not with the process's global propagator. An application that
+installed a different global propagator (or none at all) therefore still gets
+Relay's incoming trace context, and Relay never installs or changes the
+application's propagator. The managed tracer provider itself is configured in
+``_relay_telemetry`` and registered globally before the handler module is
+imported, so spans created while importing the module already export.
+
+The invocation context stays ambient for the whole handler attempt — module
+loading, the call, and dependency cleanup — and is detached in a finally, so a
+warm container's context never leaks into the next invocation. The invocation
+metadata does not live in the context (see ``_relay_invocation``), so every
+handler has the signature ``func(event, context)``.
 
 The import is guarded so a bare interpreter without the API degrades to no
 propagation instead of failing.
@@ -17,10 +23,17 @@ propagation instead of failing.
 
 try:
     from opentelemetry import context as otel_context
-    from opentelemetry import propagate as otel_propagate
-except ImportError:  # pragma: no cover - the runtime image always ships the API
+    from opentelemetry.baggage.propagation import W3CBaggagePropagator
+    from opentelemetry.trace.propagation.tracecontext import (
+        TraceContextTextMapPropagator,
+    )
+except ImportError:  # pragma: no cover - the runtime image always ships these
     otel_context = None
-    otel_propagate = None
+    _TRACE_CONTEXT = None
+    _BAGGAGE = None
+else:
+    _TRACE_CONTEXT = TraceContextTextMapPropagator()
+    _BAGGAGE = W3CBaggagePropagator()
 
 
 def attach_invocation_context(trace):
@@ -29,18 +42,28 @@ def attach_invocation_context(trace):
 
     The caller MUST detach in a finally: this is the per-invocation boundary
     that keeps a warm container's ambient context from leaking across
-    invocations, on success and on failure alike.
+    invocations, on success and on failure alike. Extraction is best-effort:
+    an unparseable trace carrier degrades to no propagation, and malformed
+    baggage cannot discard an otherwise valid trace identity.
     """
     if (
         otel_context is None
-        or otel_propagate is None
+        or _TRACE_CONTEXT is None
+        or _BAGGAGE is None
         or not isinstance(trace, dict)
         or not trace
     ):
         return None
     # A dict carrier is exactly what the JSON "trace" object decodes to, so the
-    # global W3C propagator (TraceContext + Baggage) reads it directly.
-    parent = otel_propagate.extract(trace)
+    # explicit W3C propagators read it directly.
+    try:
+        parent = _TRACE_CONTEXT.extract(trace)
+    except Exception:
+        return None
+    try:
+        parent = _BAGGAGE.extract(trace, parent)
+    except Exception:
+        pass
     return otel_context.attach(parent)
 
 
