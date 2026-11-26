@@ -31,6 +31,7 @@ import (
 	"time"
 
 	collectortrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 )
@@ -175,15 +176,25 @@ func otelPythonEnv(otelDir string, dirs ...string) string {
 	return "PYTHONPATH=" + strings.Join(parts, string(os.PathListSeparator))
 }
 
+// otlpEvent is one exported span event plus its attributes (the native
+// exception event's name and payload, for example).
+type otlpEvent struct {
+	Name       string
+	Attributes map[string]string
+}
+
 // otlpSpan is one exported span plus its resource attributes.
 type otlpSpan struct {
-	Name         string
-	TraceID      string
-	SpanID       string
-	ParentSpanID string
-	ServiceName  string
-	Attributes   map[string]string
-	Resource     map[string]string
+	Name          string
+	TraceID       string
+	SpanID        string
+	ParentSpanID  string
+	ServiceName   string
+	Attributes    map[string]string
+	Resource      map[string]string
+	StatusCode    tracev1.Status_StatusCode
+	StatusMessage string
+	Events        []otlpEvent
 }
 
 // otlpReceiver is a controlled local OTLP collector in the test process. It
@@ -215,14 +226,29 @@ func (r *otlpReceiver) record(req *collectortrace.ExportTraceServiceRequest) {
 				for _, a := range sp.GetAttributes() {
 					attrs[a.GetKey()] = a.GetValue().GetStringValue()
 				}
+				events := make([]otlpEvent, 0, len(sp.GetEvents()))
+				for _, ev := range sp.GetEvents() {
+					eventAttrs := make(map[string]string, len(ev.GetAttributes()))
+					for _, a := range ev.GetAttributes() {
+						eventAttrs[a.GetKey()] = a.GetValue().GetStringValue()
+					}
+					events = append(events, otlpEvent{
+						Name:       ev.GetName(),
+						Attributes: eventAttrs,
+					})
+				}
+				status := sp.GetStatus()
 				r.spans = append(r.spans, otlpSpan{
-					Name:         sp.GetName(),
-					TraceID:      hex.EncodeToString(sp.GetTraceId()),
-					SpanID:       hex.EncodeToString(sp.GetSpanId()),
-					ParentSpanID: hex.EncodeToString(sp.GetParentSpanId()),
-					ServiceName:  service,
-					Attributes:   attrs,
-					Resource:     resource,
+					Name:          sp.GetName(),
+					TraceID:       hex.EncodeToString(sp.GetTraceId()),
+					SpanID:        hex.EncodeToString(sp.GetSpanId()),
+					ParentSpanID:  hex.EncodeToString(sp.GetParentSpanId()),
+					ServiceName:   service,
+					Attributes:    attrs,
+					Resource:      resource,
+					StatusCode:    status.GetCode(),
+					StatusMessage: status.GetMessage(),
+					Events:        events,
 				})
 			}
 		}

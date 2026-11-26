@@ -29,11 +29,11 @@ jobs:
 
       - name: Sync
         working-directory: packages/python
-        run: uv sync --locked
+        run: uv sync --locked --extra tracing
 
       - name: Type check
         working-directory: packages/python
-        run: uv run mypy
+        run: uv run --extra tracing mypy
 
       - name: Build
         working-directory: packages/python
@@ -41,7 +41,7 @@ jobs:
 
       - name: Test
         working-directory: packages/python
-        run: uv run pytest
+        run: uv run --extra tracing pytest
 
   node-public-types:
     name: Node.js package checks

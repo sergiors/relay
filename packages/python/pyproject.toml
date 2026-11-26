@@ -11,12 +11,15 @@ keywords = ["relay", "application-development", "handlers"]
 classifiers = ["Programming Language :: Python :: 3", "Typing :: Typed"]
 dependencies = []
 
+[project.optional-dependencies]
+tracing = ["opentelemetry-api>=1.16,<2"]
+
 [build-system]
 requires = ["uv_build>=0.9.26,<0.10.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
-dev = ["mypy>=1.11", "pytest>=8.3"]
+dev = ["mypy>=1.11", "opentelemetry-sdk>=1.16,<2", "pytest>=8.3"]
 
 [tool.mypy]
 python_version = "3.14"

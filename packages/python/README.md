@@ -22,6 +22,23 @@ pip install relay-runtime
 
 The library supports Python 3.14 and newer.
 
+Tracing helpers are optional:
+
+```sh
+uv add "relay-runtime[tracing]"
+```
+
+Or with pip:
+
+```sh
+pip install "relay-runtime[tracing]"
+```
+
+Relay's managed Python runtime already installs the OpenTelemetry API; event
+and schedule app images also include the SDK and OTLP exporters. The `tracing`
+extra is for standalone use, local development, or an application that owns its
+own OpenTelemetry setup.
+
 ## Handler example
 
 Relay calls a handler with the event as its first argument and the context as
@@ -319,24 +336,190 @@ only reads the API: it does not install a provider, create spans, or export logs
 The invocation trace ID is used only when there is no active valid span, so
 unrelated span and invocation IDs are never paired. Span discovery and
 application-field serialization are skipped when the log level is disabled.
-Relay collects application stderr as the container's native log; the SDK does
-not implement a Tracer, dependency integration, or log transport.
+Relay collects application stderr as the container's native log. This logging
+API does not create spans, install a tracing provider, export logs, or integrate
+with dependency injection.
 
-Applications can create spans with the native OpenTelemetry API; log records
-inside a valid active span automatically include its trace and span IDs:
+Applications can use the native OpenTelemetry API or `relay_runtime.tracing`
+(see [Tracing](#tracing)); log records inside a valid active span automatically
+include its trace and span IDs.
+
+## Tracing
+
+`relay_runtime.tracing` provides a small `Tracer` facade over the official
+OpenTelemetry API. Import it from the submodule; it is not re-exported from
+`relay_runtime`:
 
 ```python
-from opentelemetry import trace
-
-tracer = trace.get_tracer(__name__)
-
-with tracer.start_as_current_span("create-user"):
-    log.info("User created", extra={"user_id": "u-42"})
+from relay_runtime.tracing import Tracer
 ```
 
-OpenTelemetry remains optional and is not added as a `relay-runtime`
-dependency. The SDK reads active span context but does not expose or initialize
-a `Tracer` API.
+The OpenTelemetry API is required only when this module is imported. Without it,
+importing `relay_runtime.tracing` raises:
+
+```text
+Install relay-runtime[tracing] to use relay_runtime.tracing.
+```
+
+The base package stays dependency-free, so `relay_runtime`,
+`relay_runtime.logging`, `relay_runtime.dependencies`, and
+`relay_runtime.typing` remain importable without OpenTelemetry. The `tracing`
+extra installs only the API; it does not install an SDK, exporter, or provider,
+so spans remain no-ops until the process registers a provider.
+
+### Tracer and method spans
+
+`Tracer(name)` stores one native tracer created with
+`opentelemetry.trace.get_tracer(name)`. `name` is the instrumentation scope
+reported to the provider, not the service name. Relay's managed provider uses
+the standard `OTEL_SERVICE_NAME` and resource configuration for service
+identity. The Tracer does not install, replace, configure, or shut down a
+provider or exporter.
+
+```python
+from relay_runtime.tracing import Tracer
+
+tracer = Tracer(__name__)
+
+
+@tracer.capture_method
+def find_user(user_id: str) -> dict[str, object]:
+    ...
+
+
+@tracer.capture_method()
+async def load_user(user_id: str) -> dict[str, object]:
+    ...
+```
+
+The default span name is the decorated callable's `__qualname__`. Use `name=`
+to choose a stable operation name. `record_exception=True` records the native
+exception event for an ordinary `Exception`; it is off by default.
+
+```python
+@tracer.capture_method(name="users.find", record_exception=True)
+async def find_user(user_id: str) -> dict[str, object]:
+    ...
+```
+
+`capture_method` creates the span when the callable executes, not at
+decoration. Synchronous callables stay synchronous and `async def` functions
+stay async. Wrappers preserve metadata and signature through `functools.wraps`,
+so they compose with `@bind` and ordinary decorators. Dependency resolution
+still happens only at the `@bind` layer, and this decorator does not change
+dependency injection.
+
+A callable instance is treated as a synchronous callable. Python does not
+identify an `__call__` coroutine function as async on the instance, so wrapping
+one returns its coroutine and the span ends before the coroutine is awaited.
+Likewise, a synchronous function that returns an awaitable is traced only until
+it returns. To trace the awaited work, put `with tracer.span(...)` inside the
+coroutine, or decorate the `async def` function itself. Classes are rejected
+because wrapping one would replace a type with a function.
+
+Generator and async-generator functions are rejected when decorated: their
+span would end before iteration began. Wrap the iteration with
+`tracer.span(...)` instead.
+
+### Manual spans
+
+`span(...)` returns a context manager for use in an ordinary `with` block. The
+block starts the native span and binds the `as` target to the
+`opentelemetry.trace.Span`. It works in both synchronous and asynchronous code:
+
+```python
+from opentelemetry.trace import SpanKind
+
+with tracer.span(
+    "users.export",
+    attributes={"user.count": 42},
+    kind=SpanKind.INTERNAL,
+) as span:
+    ...
+    span.set_attribute("export.format", "csv")
+```
+
+The supported options are `attributes`, `kind`, and `record_exception`.
+Attributes are passed to OpenTelemetry unchanged. The Tracer does not capture
+arguments, return values, local variables, events, or secrets automatically.
+Native instrumentation inside the block still applies, including nested spans,
+parent-child relationships, and the active context.
+
+### Exceptions and privacy
+
+By default, an ordinary `Exception` marks the span with the generic OpenTelemetry
+`ERROR` status and no description, then is re-raised unchanged. The SDK disables
+OpenTelemetry's automatic exception recording and automatic status description,
+so an exception message or traceback is not attached to the span unless
+`record_exception=True` is set explicitly. An explicitly recorded exception uses
+the native event format, which includes the exception type, message, and
+traceback. Application exceptions and their messages may contain secrets;
+enable recording only when that output is acceptable.
+
+`KeyboardInterrupt`, `SystemExit`, `asyncio.CancelledError`, and other
+`BaseException`-only control-flow signals propagate without an exception event
+or a status change.
+
+### Provider ownership and no-op behavior
+
+The Tracer delegates lookup to the native `trace.get_tracer()` API; the facade
+does not parse or override OpenTelemetry environment configuration or own
+provider lifecycle. Native API behavior, including lazily resolving a provider
+from environment configuration, remains in effect. This remains true inside
+Relay: Relay's managed provider is configured by the runtime and the Tracer
+attaches to it like any other instrumentation.
+
+If no provider is registered, OpenTelemetry's API is a no-op. Creating a Tracer
+still works, spans are non-recording, and the native API remains valid. A
+`Tracer` created before a provider is registered resolves through
+OpenTelemetry's proxy tracer when that provider is registered later. An
+application that owns its provider registers it before creating spans or
+according to the provider's documented lifecycle; Relay neither installs nor
+shuts down an application-owned provider.
+
+### Async background tasks and logging
+
+Native OpenTelemetry context is inherited by child asyncio tasks. A task that
+outlives its invocation can therefore create spans whose parent is the finished
+invocation span, even though the logging context is expired and no longer
+supplies stale log correlation. Relay does not cancel such tasks. Create
+long-lived tasks outside an invocation, or detach them from the inherited
+context, when that parent relationship is undesirable.
+
+Spans created through `relay_runtime.tracing` are ordinary active native spans,
+so `relay_runtime.logging` records include their `trace_id` and `span_id` when
+the logging context is still active. Logging's expired-context lease only
+suppresses log correlation; it does not disable native tracing.
+
+### Composition with dependency injection
+
+`capture_method` uses `functools.wraps`, so either order works with a
+signature-preserving decorator:
+
+```python
+from relay_runtime import Depends, bind
+from relay_runtime.tracing import Tracer
+
+tracer = Tracer(__name__)
+
+
+@bind
+@tracer.capture_method
+async def handler(
+    event: dict[str, object],
+    context,
+    limit: int = Depends(get_limit),
+) -> None:
+    ...
+```
+
+With `@bind` outside, dependencies are resolved before the span starts and the
+span covers the handler body; invocation-scoped cleanup runs after the span
+ends. With `@tracer.capture_method` outside `@bind`, the span also covers
+dependency resolution and invocation-scoped cleanup. Relay resolves
+dependencies only at the `@bind` layer; it does not inject into a third-party
+decorator. A decorator that changes the callable's signature or does not
+forward arguments remains unsupported for dependency injection.
 
 ## Dependency injection
 
@@ -793,15 +976,17 @@ layout with the `uv_build` backend.
 ```sh
 cd packages/python
 uv lock
-uv sync --locked
-uv run mypy
+uv sync --locked --extra tracing
+uv run --extra tracing mypy
 uv build
-uv run pytest
+uv run --extra tracing pytest
 ```
 
 `uv.lock` is committed so installs and checks resolve the same versions. The
-`dev` dependency group contains mypy and pytest only; neither is required by
-handlers or by the package at runtime.
+`dev` dependency group contains mypy, pytest, and the OpenTelemetry SDK for
+in-memory exporter tests; none of them is required by handlers at runtime. The
+public `tracing` extra contains only the OpenTelemetry API, and the base package
+has no dependencies.
 
 ## License
 

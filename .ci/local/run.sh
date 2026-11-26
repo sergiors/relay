@@ -50,10 +50,10 @@ run_integration() {
 run_python() {
     (
         cd packages/python
-        uv sync --locked
-        uv run mypy
+        uv sync --locked --extra tracing
+        uv run --extra tracing mypy
         uv build
-        uv run pytest
+        uv run --extra tracing pytest
     )
 }
 
