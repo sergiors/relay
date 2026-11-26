@@ -31,15 +31,21 @@ generator. Generator providers yield exactly one value; the remainder of the
 generator is the cleanup path and runs when the scope ends. Cleanups run in
 reverse creation order and are attempted even when the handler fails or is
 cancelled.
+
+:func:`override_dependencies` temporarily replaces providers for the current
+context. Each active context owns an isolated container cache and resource
+lifecycle; overrides never mutate the compiled handler graph or the global
+container state.
 """
 
 from __future__ import annotations
 
 from ._handler import bind
 from ._model import Depends
+from ._override import override_dependencies
 from ._state import CONTAINER_STATE
 
-__all__ = ["Depends", "bind"]
+__all__ = ["Depends", "bind", "override_dependencies"]
 
 
 async def _shutdown_container_dependencies() -> list[BaseException]:

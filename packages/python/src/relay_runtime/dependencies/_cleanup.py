@@ -167,15 +167,12 @@ def _cleanup_failure(name: str, exc: BaseException) -> BaseException:
 
 
 def _yielded_after_failure(name: str) -> BaseException:
-    return _DependencyError(
-        f"dependency {name!r} yielded after an invocation failure"
-    )
+    return _DependencyError(f"dependency {name!r} yielded after an invocation failure")
 
 
 def _exactly_one_yield_failure(name: str) -> BaseException:
     return _DependencyError(
-        f"dependency {name!r} must yield exactly once; "
-        "it yielded again during cleanup"
+        f"dependency {name!r} must yield exactly once; it yielded again during cleanup"
     )
 
 
@@ -203,7 +200,7 @@ async def _finalize_successfully(
     # yield, not GeneratorExit from close(). Resume it and require termination.
     try:
         result = finalizer.resume()
-    except (StopIteration, StopAsyncIteration):
+    except StopIteration, StopAsyncIteration:
         return [], False
     except BaseException as exc:
         return [_cleanup_failure(finalizer.name, exc)], False
@@ -233,7 +230,7 @@ async def _throw_finalizer(
 ) -> tuple[list[BaseException], bool]:
     try:
         result = finalizer.throw(active)
-    except (StopIteration, StopAsyncIteration):
+    except StopIteration, StopAsyncIteration:
         return [], False
     except BaseException as exc:
         if exc is active:
@@ -288,6 +285,81 @@ async def _run_cleanups(
         cancelled = cancelled or inner_cancelled
 
     return errors, cancelled
+
+
+def _force_close_sync(
+    finalizer: _SyncGeneratorFinalizer,
+) -> list[BaseException]:
+    try:
+        finalizer.close()
+    except BaseException as exc:
+        return [_cleanup_failure(finalizer.name, exc)]
+    return []
+
+
+def _finalize_successfully_sync(
+    finalizer: _SyncGeneratorFinalizer,
+) -> list[BaseException]:
+    try:
+        finalizer.resume()
+    except StopIteration, StopAsyncIteration:
+        return []
+    except BaseException as exc:
+        return [_cleanup_failure(finalizer.name, exc)]
+
+    close_errors = _force_close_sync(finalizer)
+    return [_exactly_one_yield_failure(finalizer.name), *close_errors]
+
+
+def _throw_finalizer_sync(
+    finalizer: _SyncGeneratorFinalizer, active: BaseException
+) -> list[BaseException]:
+    try:
+        finalizer.throw(active)
+    except StopIteration, StopAsyncIteration:
+        return []
+    except BaseException as exc:
+        if exc is active:
+            return []
+        return [_cleanup_failure(finalizer.name, exc)]
+
+    close_errors = _force_close_sync(finalizer)
+    return [_yielded_after_failure(finalizer.name), *close_errors]
+
+
+def _run_sync_cleanups(
+    finalizers: list[_Finalizer],
+    active_exception: BaseException | None = None,
+) -> list[BaseException]:
+    """Close finalizers without creating or requiring an event loop.
+
+    Only synchronous generator providers can be finalized this way. An
+    asynchronous generator is reported instead of being closed on a hidden
+    loop.
+    """
+
+    errors: list[BaseException] = []
+    for finalizer in reversed(finalizers):
+        if not isinstance(finalizer, _SyncGeneratorFinalizer):
+            errors.append(
+                _DependencyError(
+                    f"dependency {finalizer.name!r} requires asynchronous "
+                    "cleanup; use 'async with override_dependencies(...)'"
+                )
+            )
+            continue
+
+        try:
+            if active_exception is None:
+                found = _finalize_successfully_sync(finalizer)
+            else:
+                found = _throw_finalizer_sync(finalizer, active_exception)
+        except BaseException as exc:
+            found = [_cleanup_failure(finalizer.name, exc)]
+
+        errors.extend(found)
+
+    return errors
 
 
 class _FinalizerStack:

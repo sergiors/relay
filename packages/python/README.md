@@ -232,6 +232,170 @@ resource is attempted. Container-scoped dependencies use the same normal
 teardown and close when Relay's long-lived event loop exits, without replaying
 an older invocation's error.
 
+### Overriding dependencies
+
+`relay_runtime.dependencies.override_dependencies` temporarily replaces
+providers for the current context. It is available only from the
+`relay_runtime.dependencies` module; the top-level `relay_runtime` package does
+not export it.
+
+A test can replace the production email provider with a fake and call the bound
+handler inside the context:
+
+```python
+import asyncio
+from typing import Protocol
+
+from relay_runtime import Depends, bind
+from relay_runtime.dependencies import override_dependencies
+from relay_runtime.typing import HandlerContext
+
+
+class EmailSender(Protocol):
+    def send(self, address: str, subject: str) -> None: ...
+
+
+def get_email_sender() -> EmailSender:
+    ...  # return the production SES-backed sender
+
+
+@bind
+async def handler(
+    event: dict[str, object],
+    context: HandlerContext,
+    email: EmailSender = Depends(get_email_sender),
+) -> None:
+    email.send(str(event["address"]), "Welcome")
+
+
+class FakeEmailSender:
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, str]] = []
+
+    def send(self, address: str, subject: str) -> None:
+        self.sent.append((address, subject))
+
+
+def test_handler_sends_welcome_email(context: HandlerContext) -> None:
+    fake = FakeEmailSender()
+    with override_dependencies({get_email_sender: lambda: fake}):
+        asyncio.run(handler({"address": "user@example.com"}, context))
+    assert fake.sent == [("user@example.com", "Welcome")]
+```
+
+`context` is the invocation context Relay supplies; a unit test can pass a stub
+that implements `HandlerContext`.
+
+Keys are matched by provider identity, not equality. The mapping is snapshotted
+and validated when the context is entered; later changes to the mapping object
+do not affect an active context. Mapping a provider to itself is a no-op.
+For parametrized provider factories, use the same cached provider object in the
+handler declaration and override mapping; for example, cache `get_table("users")`
+with `functools.cache` if it is constructed at both sites.
+Nested contexts compose: an inner context inherits the outer overrides and its
+entries take precedence. Leaving the inner context restores the outer mapping.
+
+Overrides apply only where a `Depends(...)` declaration references the original
+provider. The replacement inherits that declaration's `scope` and `use_cache`.
+The replacement's own dependencies are resolved with the same overrides, but
+the replacement root is not replaced again. An override chain is therefore not
+followed recursively, and a replacement that depends on the provider it replaces
+is reported as a dependency cycle. Container and invocation caches are keyed by
+the original declaration, so two different originals mapped to one replacement
+remain separate cache entries and own separate resource instances. The effective
+graph is compiled lazily the first time a bound handler runs under the context;
+replacement signatures, cycles, and scope rules are validated then.
+
+Each active context owns an isolated container cache. Container-scoped values
+created inside the context are not shared with the global warm container or with
+another context, and their managed resources are closed when that context exits.
+Nested contexts each own their own cache; an inner context does not see the
+outer context's container values, and leaving the inner context closes only the
+resources it created.
+
+Use `with` for synchronous code and `async with` when container-scoped async
+generator providers may be involved:
+
+- `with` closes synchronous generator container resources without starting an
+  event loop. A container-scoped async generator is rejected before it is
+  started, including when another callable returns it indirectly; the error
+  asks for `async with`.
+- `async with` closes both synchronous and asynchronous container resources.
+- Invocation-scoped resources are always cleaned up inside the handler call, so
+  either form works for them.
+
+Container-scoped async generator replacements require `async with` so their
+cleanup path can run:
+
+```python
+from collections.abc import AsyncIterator
+
+from relay_runtime import Depends, bind
+from relay_runtime.dependencies import override_dependencies
+from relay_runtime.typing import HandlerContext
+
+
+class Bucket:
+    async def put(self, key: str, body: bytes) -> None: ...
+    async def close(self) -> None: ...
+
+
+async def get_bucket() -> AsyncIterator[Bucket]:
+    bucket = Bucket()
+    try:
+        yield bucket
+    finally:
+        await bucket.close()
+
+
+@bind
+async def upload(
+    event: dict[str, object],
+    context: HandlerContext,
+    bucket: Bucket = Depends(get_bucket, scope="container"),
+) -> None:
+    await bucket.put(str(event["key"]), b"...")
+
+
+async def get_fake_bucket() -> AsyncIterator[Bucket]:
+    bucket = Bucket()
+    try:
+        yield bucket
+    finally:
+        await bucket.close()
+
+
+async def test_upload_uses_fake_bucket(context: HandlerContext) -> None:
+    async with override_dependencies({get_bucket: get_fake_bucket}):
+        await upload({"key": "report.csv"}, context)
+```
+
+`get_fake_bucket` is a container-scoped async generator, so its resource is
+started and closed by `async with`. A synchronous `with` rejects that
+replacement before the generator starts and reports that `async with` is
+required.
+
+If cleanup fails on exit, the error is raised when no other exception is active;
+the context variable is restored first. If an exception is already propagating,
+cleanup failures are logged and the original exception is preserved.
+Invocation-scoped resources are cleaned up inside the handler on success,
+failure, and cancellation; container-scoped resources are cleaned up when their
+owning override context exits.
+
+The active context is stored in a `contextvars.ContextVar`. It is visible in the
+task that entered the context and in child tasks created while it is active.
+Contexts are independent across tasks. A child task that outlives the context
+and tries to resolve a dependency after the owner exits fails instead of using
+the closed container. That inherited task context also cannot enter a new
+override context after its parent has exited; create longer-lived tasks outside
+the override context. Enter and exit the context in the same task; do not move a
+context manager object to another task or thread.
+
+Overrides affect only dependency resolution performed by `@bind` and
+`Depends(...)`. They do not monkeypatch providers, change direct calls to a
+provider, or alter container values that were resolved outside dependency
+injection. Relay's at-least-once delivery contract is unchanged.
+
 ### Integration example
 
 The following app uses `pymongo` and `httpx` as application dependencies; they

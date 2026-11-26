@@ -65,7 +65,12 @@ async def call(plan: _CallablePlan, state: _Resolver) -> _CallOutcome:
     return _CallOutcome(result, False)
 
 
-async def produce(node: _CompiledNode, state: _Resolver) -> _Produced:
+async def produce(
+    node: _CompiledNode,
+    state: _Resolver,
+    *,
+    reject_async_generator: bool = False,
+) -> _Produced:
     try:
         outcome = await call(node.plan, state)
     except BaseException as exc:
@@ -75,6 +80,14 @@ async def produce(node: _CompiledNode, state: _Resolver) -> _Produced:
     result = outcome.value
     try:
         if inspect.isasyncgen(result):
+            if reject_async_generator:
+                await result.aclose()
+                raise _DependencyError(
+                    f"dependency {node.plan.name!r} produced an async "
+                    "generator; a synchronous override_dependencies context "
+                    "cannot start or clean it up. Use 'async with "
+                    "override_dependencies(...)'."
+                )
             value, finalizer = await start_async_generator(node.name, result)
             return _Produced(value, finalizer, True)
         if inspect.isgenerator(result):

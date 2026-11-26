@@ -14,6 +14,7 @@ from relay_runtime.typing import HandlerContext
 from ._execution import call
 from ._graph import _CallablePlan, _GraphCompiler
 from ._model import _DependencyError, _ProviderCallable
+from ._override import _current_override
 from ._state import CONTAINER_STATE, InvocationState
 
 _R = TypeVar("_R")
@@ -105,9 +106,21 @@ class _HandlerGraph:
         self._plan: _CallablePlan = _GraphCompiler().compile_handler(handler)
 
     async def invoke(self, event: Any, context: HandlerContext) -> Any:
-        state = InvocationState(event, context, CONTAINER_STATE)
+        scope = _current_override()
+        if scope is None:
+            plan = self._plan
+            state = InvocationState(event, context, CONTAINER_STATE)
+        else:
+            plan = scope.plan_for(self._plan)
+            state = InvocationState(
+                event,
+                context,
+                scope.container,
+                is_closed=lambda: scope.closed,
+            )
+
         try:
-            outcome = await call(self._plan, state)
+            outcome = await call(plan, state)
         except BaseException as exc:
             errors, cancelled = await state.close(exc)
             for error in errors:

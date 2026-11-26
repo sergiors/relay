@@ -2,19 +2,78 @@
 
 from __future__ import annotations
 
+import enum
 import inspect
 from dataclasses import dataclass, field
-from typing import Any, ForwardRef, get_type_hints
+from typing import Any, ForwardRef, Protocol, get_type_hints
 
 from ._model import (
     _RESERVED_PARAMETERS,
+    _callable_name,
     _DependencyError,
     _Depends,
     _Injection,
     _ProviderCallable,
     _Scope,
-    _callable_name,
 )
+
+
+class _CleanupKind(enum.Enum):
+    """How a provider's value must be torn down."""
+
+    NONE = "none"
+    SYNC = "sync"
+    ASYNC = "async"
+
+
+def _cleanup_kind(func: _ProviderCallable) -> _CleanupKind:
+    targets: list[Any] = [func]
+    partial_target = getattr(func, "func", None)
+    if callable(partial_target):
+        targets.append(partial_target)
+
+    call = getattr(func, "__call__", None)
+    if call is not None:
+        targets.append(call)
+
+    for candidate in targets:
+        try:
+            target = inspect.unwrap(candidate)
+        except ValueError:
+            target = candidate
+
+        if inspect.isasyncgenfunction(target):
+            return _CleanupKind.ASYNC
+        if inspect.isgeneratorfunction(target):
+            return _CleanupKind.SYNC
+    return _CleanupKind.NONE
+
+
+class _OverrideLookup(Protocol):
+    """Resolve an effective provider for one original declaration."""
+
+    def replacement_for(
+        self, provider: _ProviderCallable
+    ) -> _ProviderCallable | None: ...
+
+
+class _ReplacementFailure(_DependencyError):
+    """A provider could not be compiled after an override substitution."""
+
+
+def _replacement_failure(
+    original: _ProviderCallable,
+    replacement: _ProviderCallable,
+    path: str,
+    cause: _DependencyError,
+) -> _ReplacementFailure:
+    """Add override context to a replacement compilation failure."""
+
+    return _ReplacementFailure(
+        f"dependency {_callable_name(original)!r} is overridden by "
+        f"{_callable_name(replacement)!r}; compiling the replacement "
+        f"failed: {cause} (effective dependency path: {path})"
+    )
 
 
 @dataclass(frozen=True)
@@ -50,6 +109,7 @@ class _CompiledNode:
     scope: _Scope
     use_cache: bool
     plan: _CallablePlan = field(repr=False)
+    cleanup: _CleanupKind = _CleanupKind.NONE
 
 
 def _annotation_depends(
@@ -118,9 +178,16 @@ def _resolved_annotations(
 
 
 class _GraphCompiler:
-    """Compile one handler's graph, reusing each provider by declaration."""
+    """Compile one handler's graph, reusing each provider by declaration.
 
-    def __init__(self) -> None:
+    An optional override lookup substitutes a provider at each original
+    ``Depends(...)`` reference. The original callable remains the node's
+    identity and cache key; the replacement only supplies the plan and the
+    cleanup kind.
+    """
+
+    def __init__(self, overrides: _OverrideLookup | None = None) -> None:
+        self._overrides = overrides
         self._completed: dict[tuple[int, _Scope, bool], _CompiledNode] = {}
         self._active: list[tuple[tuple[int, _Scope, bool], str]] = []
 
@@ -142,19 +209,38 @@ class _GraphCompiler:
             return existing
 
         name = _callable_name(dependency)
+        replacement: _ProviderCallable | None = None
+        if self._overrides is not None:
+            replacement = self._overrides.replacement_for(dependency)
+        if replacement is dependency:
+            replacement = None
+        provider = dependency if replacement is None else replacement
+        provider_name = _callable_name(provider)
+        active_name = (
+            name if replacement is None else f"{name} (overridden by {provider_name})"
+        )
+
         if any(active_key == key for active_key, _ in self._active):
-            path = " -> ".join([active_name for _, active_name in self._active] + [name])
+            path = " -> ".join(
+                [active_name for _, active_name in self._active] + [name]
+            )
             raise _DependencyError(f"dependency cycle detected: {path}")
 
-        self._active.append((key, name))
+        self._active.append((key, active_name))
         try:
-            plan = self._plan_callable(
-                dependency,
-                name,
-                scope,
-                reserved_allowed=scope is _Scope.INVOCATION,
-                is_handler=False,
-            )
+            try:
+                plan = self._plan_callable(
+                    provider,
+                    provider_name,
+                    scope,
+                    reserved_allowed=scope is _Scope.INVOCATION,
+                    is_handler=False,
+                )
+            except _DependencyError as exc:
+                if replacement is None or isinstance(exc, _ReplacementFailure):
+                    raise
+                path = " -> ".join(active for _, active in self._active)
+                raise _replacement_failure(dependency, replacement, path, exc) from exc
         finally:
             self._active.pop()
 
@@ -164,6 +250,7 @@ class _GraphCompiler:
             scope=scope,
             use_cache=use_cache,
             plan=plan,
+            cleanup=_cleanup_kind(provider),
         )
         self._completed[key] = node
         return node
