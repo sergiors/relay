@@ -53,14 +53,18 @@ var (
 	otelAppDepsErr  error
 )
 
-// TestMain removes the shared materialized OpenTelemetry installs after the
-// package's tests have run.
+// TestMain removes the shared materialized OpenTelemetry installs and the
+// isolated Node SDK build (when one was needed) after the package's tests
+// have run.
 func TestMain(m *testing.M) {
 	code := m.Run()
 	for _, dir := range []string{otelNodeDir, otelNodeV19Dir, otelAppDepsDir} {
 		if dir != "" {
 			_ = os.RemoveAll(dir)
 		}
+	}
+	if nodeSDKIsTemp && nodeSDKDir != "" {
+		_ = os.RemoveAll(nodeSDKDir)
 	}
 	os.Exit(code)
 }

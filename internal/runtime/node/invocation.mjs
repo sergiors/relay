@@ -1,4 +1,5 @@
 import * as telemetry from "./telemetry.mjs";
+import * as loggingContext from "./logging-context.mjs";
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const MAX_ERROR_BYTES = 64 * 1024;
@@ -144,37 +145,39 @@ async function invoke(req, loadHandler) {
   process.env.RELAY_HANDLER = handler;
   telemetry.ensureStarted();
 
-  let error = null;
-  try {
-    if (
-      req.context === null ||
-      typeof req.context !== "object" ||
-      Array.isArray(req.context)
-    ) {
-      throw new Error("invalid request context: expected an object");
+  return loggingContext.runInvocation(req.context, async () => {
+    let error = null;
+    try {
+      if (
+        req.context === null ||
+        typeof req.context !== "object" ||
+        Array.isArray(req.context)
+      ) {
+        throw new Error("invalid request context: expected an object");
+      }
+
+      const handlerContext = new HandlerContext(req.context);
+      await telemetry.withParent(req.trace ?? {}, async () => {
+        const fn = await loadHandler(handler);
+        return fn(req.event ?? null, handlerContext);
+      });
+    } catch (e) {
+      // Module resolution, import errors, and handler errors are all
+      // invocation failures (ok:false): the container stays healthy.
+      const stack =
+        e && e.stack ? e.stack : e && e.message ? e.message : String(e);
+      error = "handler " + JSON.stringify(handler) + " failed: " + stack;
+      // Mirror the operator-visible stderr output of the one-shot bootstrap.
+      console.error(
+        "handler " +
+          JSON.stringify(handler) +
+          " failed: " +
+          (e && e.stack ? e.stack : e),
+      );
     }
 
-    const handlerContext = new HandlerContext(req.context);
-    await telemetry.withParent(req.trace ?? {}, async () => {
-      const fn = await loadHandler(handler);
-      return fn(req.event ?? null, handlerContext);
-    });
-  } catch (e) {
-    // Module resolution, import errors, and handler errors are all
-    // invocation failures (ok:false): the container stays healthy.
-    const stack =
-      e && e.stack ? e.stack : e && e.message ? e.message : String(e);
-    error = "handler " + JSON.stringify(handler) + " failed: " + stack;
-    // Mirror the operator-visible stderr output of the one-shot bootstrap.
-    console.error(
-      "handler " +
-        JSON.stringify(handler) +
-        " failed: " +
-        (e && e.stack ? e.stack : e),
-    );
-  }
-
-  return makeResult(id, error === null, error ?? undefined);
+    return makeResult(id, error === null, error ?? undefined);
+  });
 }
 
 export function createInvoker(loadHandler) {

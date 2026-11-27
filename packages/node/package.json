@@ -1,8 +1,13 @@
 {
   "name": "@sergiors/relay-runtime",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Official Node.js library and public handler interfaces for Relay applications",
-  "keywords": ["relay", "nodejs", "application-development", "handlers"],
+  "keywords": [
+    "relay",
+    "nodejs",
+    "application-development",
+    "handlers"
+  ],
   "license": "GPL-3.0-or-later",
   "engines": {
     "node": ">=24"
@@ -17,6 +22,10 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts"
+    },
+    "./logging": {
+      "types": "./dist/logging.d.ts",
+      "import": "./dist/logging.js"
     }
   },
   "files": [
@@ -33,6 +42,8 @@
     "prepack": "pnpm run build"
   },
   "devDependencies": {
+    "@opentelemetry/api": "1.10.0",
+    "@types/node": "24.10.1",
     "typescript": "5.9.3"
   },
   "packageManager": "pnpm@12.15.0",
