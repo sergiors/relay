@@ -6,10 +6,11 @@ package runtime
 // engine: ONE nodejs26.x invocation image driven by the production Manager →
 // Prepare → Execute path — production frame encoding of a REAL Go-managed
 // invocation trace, production execEnv, production /relay/otel install — with
-// the PACKAGED structured Logger (@sergiors/relay-runtime) vendored into the
-// app source exactly as an application dependency would ship it. The handler
-// opens a NESTED active span under the injected trace context and logs once
-// inside it; the test asserts the stderr JSON record's trace_id/span_id
+// the PACKAGED public SDK (@sergiors/relay-runtime) vendored into the app
+// source exactly as an application dependency would ship it. The handler
+// opens a NESTED active span through the SDK Tracer (never the raw OTel API)
+// under the injected trace context and logs once inside it through the SDK
+// Logger; the test asserts the stderr JSON record's trace_id/span_id
 // against BOTH exports: the Go in-process export of the worker-created
 // invocation span, and the container's OTLP export of the nested span as
 // received by a controlled local collector.
@@ -52,22 +53,21 @@ import (
 )
 
 // nodeLoggerCorrelationHandler is the application under test: it imports the
-// packaged structured logger from its own vendored copy, opens one nested
-// active span under the frame's extracted trace context, logs once inside it,
-// and reports the span identity it observed on stdout.
+// packaged structured logger and Tracer from its own vendored copy, opens one
+// nested active span under the frame's extracted trace context, logs once
+// inside it, and reports the span identity it observed on stdout.
 const nodeLoggerCorrelationHandler = `
-import { trace } from "@opentelemetry/api";
 import { Logger } from "./vendor/relay-runtime/logging.js";
+import { Tracer } from "./vendor/relay-runtime/tracing.js";
 
 const log = new Logger({ service: "otel-correlation", level: "INFO" });
+const tracer = new Tracer("otel-correlation");
 
 export async function check(event, context) {
-  const tracer = trace.getTracer("relay.test");
-  await tracer.startActiveSpan("app.work", async (span) => {
+  await tracer.span("app.work", async (span) => {
     log.info("correlated-log", { step: event.step });
     const active = span.spanContext();
     console.log("nested-active=" + active.traceId + "/" + active.spanId);
-    span.end();
   });
 }
 `
@@ -78,12 +78,25 @@ var nodeRuntimeSDKFiles = []string{
 	"logging.js",
 	"logging-context.js",
 	"logging-format.js",
+	"tracing.js",
+}
+
+// missingNodeRuntimeSDKFiles lists the packaged SDK modules absent from a dist
+// directory, so an incomplete build is never vendored.
+func missingNodeRuntimeSDKFiles(distDir string) []string {
+	var missing []string
+	for _, name := range nodeRuntimeSDKFiles {
+		if _, err := os.Stat(filepath.Join(distDir, name)); err != nil {
+			missing = append(missing, name)
+		}
+	}
+	return missing
 }
 
 // requireNodeRuntimeDist returns the packaged SDK's dist directory:
-// packages/node/dist when already built, otherwise an isolated temporary
-// npm+tsc build (never touching the working tree). The second result reports
-// whether the caller owns the temporary build's removal.
+// packages/node/dist when it already carries every vendored module, otherwise
+// an isolated temporary npm+tsc build (never touching the working tree). The
+// second result reports whether the caller owns the temporary build's removal.
 func requireNodeRuntimeDist(t *testing.T) (distDir string, temporary bool) {
 	t.Helper()
 	// the package's tests run in internal/runtime — two levels below the root
@@ -92,8 +105,9 @@ func requireNodeRuntimeDist(t *testing.T) (distDir string, temporary bool) {
 		t.Fatalf("resolve the repository root: %v", err)
 	}
 	sourcePkg := filepath.Join(root, "packages", "node")
-	if _, err := os.Stat(filepath.Join(sourcePkg, "dist", "logging.js")); err == nil {
-		return filepath.Join(sourcePkg, "dist"), false
+	builtDist := filepath.Join(sourcePkg, "dist")
+	if len(missingNodeRuntimeSDKFiles(builtDist)) == 0 {
+		return builtDist, false
 	}
 
 	npmPath, err := exec.LookPath("npm")
@@ -128,9 +142,9 @@ func requireNodeRuntimeDist(t *testing.T) (distDir string, temporary bool) {
 		_ = os.RemoveAll(dir)
 		t.Fatalf("environmental blocker: isolated packaged-SDK compile failed: %v\n%s", err, out)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "dist", "logging.js")); err != nil {
+	if missing := missingNodeRuntimeSDKFiles(filepath.Join(dir, "dist")); len(missing) > 0 {
 		_ = os.RemoveAll(dir)
-		t.Fatalf("environmental blocker: the isolated packaged-SDK build has no dist/logging.js: %v", err)
+		t.Fatalf("environmental blocker: the isolated packaged-SDK build is missing %v", missing)
 	}
 	return filepath.Join(dir, "dist"), true
 }
@@ -341,10 +355,11 @@ func jsonLogRecordsWithMessage(out, message string) []map[string]any {
 // TestIntegrationNode26LoggerTraceCorrelatesWithExportedSpanOverManagerExecute
 // proves the full correlation chain through the REAL manager execution path:
 // a Go-managed invocation span (exported in-process) → production frame
-// encoding of its W3C context → the container's nested active span (exported
-// over real OTLP to a controlled collector) → the packaged Logger's JSON
-// record on the container's stderr, whose trace_id/span_id must match the
-// exported spans on both sides while carrying the invocation identity.
+// encoding of its W3C context → the container's nested active span created
+// through the packaged SDK Tracer (exported over real OTLP to a controlled
+// collector) → the packaged Logger's JSON record on the container's stderr,
+// whose trace_id/span_id must match the exported spans on both sides while
+// carrying the invocation identity.
 func TestIntegrationNode26LoggerTraceCorrelatesWithExportedSpanOverManagerExecute(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)

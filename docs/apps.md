@@ -191,47 +191,58 @@ OpenTelemetry trace propagation remains available ambiently during the handler
 call in both runtimes. Python and Node.js invocation images can also run a
 Relay-managed trace provider configured from the app's standard `OTEL_*`
 environment and the worker's allowlisted tracing configuration. Node.js
-`nodejs24.x` and `nodejs26.x` invocation images include the OpenTelemetry SDK
-and OTLP trace exporters. Node.js service-only images include the API but not
-the managed SDK or provider; a service process does not initialize Relay's
-managed provider. See
+`nodejs24.x` and `nodejs26.x` invocation images supply OpenTelemetry API 1.10.0,
+the SDK, and OTLP trace exporters. Node.js service-only images supply API
+1.10.0 but not the managed SDK or provider; a service process does not initialize
+Relay's managed provider. Standalone Node.js applications must install API
+1.10.0 and configure their own SDK/provider. See
 [Operations](operations.md#tracing).
 
 #### Node.js spans
 
-Node.js handlers can create spans with the native OpenTelemetry API. Add
-`@opentelemetry/api` to the app's dependencies (for example, with
-`pnpm add @opentelemetry/api`) and commit the updated manifest and lockfile:
+Use the public `Tracer` facade from the Node runtime package. Add the runtime
+package to the app's dependencies and commit the updated manifest and lockfile:
+
+```sh
+pnpm add @sergiors/relay-runtime
+```
 
 ```ts
-import { trace } from "@opentelemetry/api";
 import type { HandlerContext } from "@sergiors/relay-runtime";
+import { Logger } from "@sergiors/relay-runtime/logging";
+import { Tracer } from "@sergiors/relay-runtime/tracing";
 
-const tracer = trace.getTracer("orders");
+const log = new Logger({ service: "orders" });
+const tracer = new Tracer("orders");
 
 export async function handler(
-  event: Record<string, unknown>,
+  event: { orderId: string; type?: string },
   context: HandlerContext,
 ): Promise<void> {
-  await tracer.startActiveSpan("process-order", async (span) => {
-    try {
-      span.setAttribute("relay.request_id", context.requestId);
-      span.setAttribute("event.type", String(event.type ?? "unknown"));
-    } finally {
-      span.end();
-    }
+  await tracer.span("orders.process", async (span) => {
+    log.info("Processing order", { order_id: event.orderId });
+    span.addEvent("order.processing.started", {
+      event_type: event.type ?? "unknown",
+    });
+    await processOrder(event.orderId);
   });
 }
 ```
 
 The handler's active span context is propagated from the incoming event or
-schedule when available. Relay replaces any app-installed
-`@opentelemetry/api` with version 1.10.0 in Node images. App-installed SDKs and
-instrumentation packages are not replaced: any provider or context manager they
-register with the OpenTelemetry global registry must use exactly
-`@opentelemetry/api` 1.10.0. The registry requires an exact version match, not
-just API compatibility. A second physical API installation is supported only
-when its version also matches the API version used for registration (1.10.0).
+schedule when available. Span options default to `SpanKind.INTERNAL`; prefer
+stable `<domain>.<action>` names and low-cardinality, non-sensitive attributes.
+Avoid putting request IDs or other high-cardinality values on spans. The
+`Tracer` facade owns span completion, and `Logger` automatically correlates
+records with the active span without Grafana-specific behavior. See the
+[Node SDK Tracing documentation](../packages/node/README.md#tracing) for API
+ownership, lifecycle, and detached-work guidance.
+
+Relay-managed Node images supply `@opentelemetry/api` 1.10.0, so managed apps
+need not add the API package themselves. Standalone applications must also
+install exactly `@opentelemetry/api@1.10.0` and configure their own SDK/provider;
+provider and context-manager registrations must use that version because
+OpenTelemetry's global registry requires an exact version match.
 
 Event handler names must be unique across an app's event rules. Every schedule
 and service also needs a unique, stable name within its app; names follow the

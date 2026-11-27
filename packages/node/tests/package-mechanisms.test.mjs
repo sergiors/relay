@@ -38,6 +38,10 @@ function jsonLines(text) {
 const REQUIRE_PROBE =
   'try { require("@sergiors/relay-runtime/logging"); process.exit(2); }' +
   'catch (e) { console.log(e.code); }';
+const MISSING_TRACING_PROBE =
+  'import("@sergiors/relay-runtime/tracing")' +
+  '.then(() => process.exit(2))' +
+  '.catch((e) => { console.log(e.message); });';
 
 test("ESM import and CommonJS dynamic import are supported, native require is not", () => {
   // ESM static import through the package's own name (self-reference)
@@ -46,12 +50,13 @@ test("ESM import and CommonJS dynamic import are supported, native require is no
       "--input-type=module",
       "-e",
       'import { Logger, JsonFormatter } from "@sergiors/relay-runtime/logging";' +
-        'console.log(typeof Logger + ":" + typeof JsonFormatter);',
+        'import { Tracer } from "@sergiors/relay-runtime/tracing";' +
+        'console.log(typeof Logger + ":" + typeof JsonFormatter + ":" + typeof Tracer);',
     ],
     packageRoot,
   );
   assert.equal(esm.status, 0, `ESM self-import failed:\n${esm.stderr}`);
-  assert.equal(esm.stdout.trim(), "function:function");
+  assert.equal(esm.stdout.trim(), "function:function:function");
 
   // CommonJS dynamic import() of the same subpath
   const dynamic = runNode(
@@ -65,6 +70,22 @@ test("ESM import and CommonJS dynamic import are supported, native require is no
   );
   assert.equal(dynamic.status, 0, `CommonJS dynamic import failed:\n${dynamic.stderr}`);
   assert.equal(dynamic.stdout.trim(), "function");
+
+  const dynamicTracing = runNode(
+    [
+      "-e",
+      'import("@sergiors/relay-runtime/tracing")' +
+        '.then((m) => console.log(typeof m.Tracer))' +
+        '.catch((e) => { console.error(e.code || e.message); process.exit(1); });',
+    ],
+    packageRoot,
+  );
+  assert.equal(
+    dynamicTracing.status,
+    0,
+    `CommonJS dynamic tracing import failed:\n${dynamicTracing.stderr}`,
+  );
+  assert.equal(dynamicTracing.stdout.trim(), "function");
 
   // native require() has no export — the documented ESM-only contract
   const native = runNode(["-e", REQUIRE_PROBE], packageRoot);
@@ -113,6 +134,7 @@ test("the packed package installs with npm and pnpm with working exports and typ
 
   const consumerContract =
     'import type { HandlerContext } from "@sergiors/relay-runtime";\n' +
+    'import { Tracer, type TracingSpanOptions } from "@sergiors/relay-runtime/tracing";\n' +
     'import {\n' +
     "  JsonFormatter,\n" +
     "  Logger,\n" +
@@ -134,8 +156,11 @@ test("the packed package installs with npm and pnpm with working exports and typ
     "declare const context: HandlerContext;\n" +
     "const requestId: string = context.requestId;\n" +
     "const remaining: number = context.getRemainingTimeMs();\n" +
+    'const tracer = new Tracer("packed");\n' +
+    "const spanOptions: TracingSpanOptions = { recordException: true };\n" +
+    'const traced: number = tracer.span("packed", spanOptions, () => 1);\n' +
     "\n" +
-    "export { line, requestId, remaining, log };\n";
+    "export { line, requestId, remaining, log, traced };\n";
 
   for (const manager of ["npm", "pnpm"]) {
     const consumer = join(workspace, manager);
@@ -181,6 +206,60 @@ test("the packed package installs with npm and pnpm with working exports and typ
     assert.ok(record, `${manager} consumer emitted no record; stderr:\n${esm.stderr}`);
     assert.equal(record.service, "packed");
     assert.deepEqual(record.attributes, { via: "consumer" });
+
+    const missingTracing = runNode(
+      ["--input-type=module", "-e", MISSING_TRACING_PROBE],
+      consumer,
+    );
+    assert.equal(
+      missingTracing.status,
+      0,
+      `${manager} missing optional API probe failed:\n${missingTracing.stderr}`,
+    );
+    assert.match(
+      missingTracing.stdout,
+      /Tracing requires the optional @opentelemetry\/api package/,
+    );
+
+    const installAPI =
+      manager === "npm"
+        ? spawnSync(
+            "npm",
+            [
+              "install",
+              "--no-audit",
+              "--no-fund",
+              "--loglevel=error",
+              "@opentelemetry/api@1.10.0",
+            ],
+            { cwd: consumer, encoding: "utf8" },
+          )
+        : spawnSync("pnpm", ["add", "@opentelemetry/api@1.10.0"], {
+            cwd: consumer,
+            encoding: "utf8",
+          });
+    assert.equal(
+      installAPI.status,
+      0,
+      `${manager} optional API install failed:\n${installAPI.stdout}\n${installAPI.stderr}`,
+    );
+
+    const tracing = runNode(
+      [
+        "--input-type=module",
+        "-e",
+        'import { Tracer } from "@sergiors/relay-runtime/tracing";' +
+          'new Tracer("packed").span("packed.span", () => {});' +
+          'console.log("tracing-ok");',
+      ],
+      consumer,
+    );
+    assert.equal(
+      tracing.status,
+      0,
+      `${manager} packed tracing import failed:\n${tracing.stderr}`,
+    );
+    assert.equal(tracing.stdout.trim(), "tracing-ok");
 
     // require() stays rejected from an installed copy too
     const native = runNode(["-e", REQUIRE_PROBE], consumer);

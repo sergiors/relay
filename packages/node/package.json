@@ -1,6 +1,6 @@
 {
   "name": "@sergiors/relay-runtime",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Official Node.js library and public handler interfaces for Relay applications",
   "keywords": [
     "relay",
@@ -23,6 +23,10 @@
     ".": {
       "types": "./dist/index.d.ts"
     },
+    "./tracing": {
+      "types": "./dist/tracing.d.ts",
+      "import": "./dist/tracing.js"
+    },
     "./logging": {
       "types": "./dist/logging.d.ts",
       "import": "./dist/logging.js"
@@ -37,14 +41,25 @@
   "scripts": {
     "build": "tsc --project tsconfig.json",
     "typecheck:jsdoc": "tsc --project tsconfig.jsdoc.json",
-    "check": "pnpm run build && pnpm run typecheck:jsdoc",
+    "typecheck:types": "tsc --target ES2024 --module ESNext --moduleResolution Bundler --strict --noEmit --types node tests/tracing-types.ts",
+    "check": "pnpm run build && pnpm run typecheck:jsdoc && pnpm run typecheck:types",
     "test": "pnpm run check && node --test",
     "prepack": "pnpm run build"
   },
   "devDependencies": {
     "@opentelemetry/api": "1.10.0",
+    "@opentelemetry/context-async-hooks": "3.1.1",
+    "@opentelemetry/sdk-trace-base": "npm:@opentelemetry/sdk-trace@3.1.1",
     "@types/node": "24.10.1",
     "typescript": "5.9.3"
+  },
+  "peerDependencies": {
+    "@opentelemetry/api": ">=1.10.0 <1.11.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentelemetry/api": {
+      "optional": true
+    }
   },
   "packageManager": "pnpm@12.15.0",
   "publishConfig": {
