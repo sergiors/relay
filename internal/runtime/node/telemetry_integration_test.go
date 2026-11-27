@@ -1553,6 +1553,173 @@ func TestNodeRuntimeRealOtelShutdownJoinsActiveInvocation(t *testing.T) {
 	}
 }
 
+// TestNodeRuntimeSamplerArgAbsentIsSilentAndInvalidWarns pins the sampler
+// argument contract: with OTEL_TRACES_SAMPLER=traceidratio and NO
+// OTEL_TRACES_SAMPLER_ARG the default ratio (1) applies with no diagnostic and
+// spans still export; an out-of-range arg warns with the fixed message, falls
+// back to the same default ratio, and never fails the invocation.
+func TestNodeRuntimeSamplerArgAbsentIsSilentAndInvalidWarns(t *testing.T) {
+	// absent: the ambient variable must be truly unset, not empty
+	t.Run("absent arg is silent", func(t *testing.T) {
+		pinOtelEnv(t)
+		unsetEnv(t, "OTEL_TRACES_SAMPLER_ARG")
+		rec := newHTTPOTLPReceiver(t)
+		root := appRootWithoutOtel(t)
+		writeRealOtelHandler(t, root)
+		p := startNodeRealOtel(t, root, nil)
+
+		r := p.invokeTrace(t, "index.work", `{"step":"1"}`, map[string]string{
+			"OTEL_EXPORTER_OTLP_ENDPOINT": rec.endpoint,
+			"OTEL_TRACES_SAMPLER":         "traceidratio",
+			"OTEL_BSP_SCHEDULE_DELAY":     "50",
+			"OTEL_SERVICE_NAME":           "sampler-absent",
+		}, nil)
+		if !r.OK {
+			t.Fatalf("invoke failed: %s", r.Err)
+		}
+
+		// the default ratio samples the span, and NO validation warning fires
+		spans := rec.waitForSpans(t, 1)
+		if spans[0].Name != "handler.work" {
+			t.Errorf("exported span = %q, want handler.work (ratio 1 must sample)", spans[0].Name)
+		}
+		if strings.Contains(p.stderrString(), "invalid OTEL_TRACES_SAMPLER_ARG") {
+			t.Errorf("an absent sampler arg must be silent; stderr:\n%s", p.stderrString())
+		}
+
+		if err := p.closeChannel(); err != nil {
+			t.Fatalf("close channel: %v", err)
+		}
+		if err := p.waitExit(t, 10*time.Second); err != nil {
+			t.Fatalf("bootstrap did not exit 0: %v; stderr:\n%s", err, p.stderrString())
+		}
+	})
+
+	// invalid: an out-of-range ratio warns with the fixed message, the default
+	// ratio still applies, and the invocation is unaffected
+	t.Run("invalid arg warns and defaults", func(t *testing.T) {
+		pinOtelEnv(t)
+		t.Setenv("OTEL_TRACES_SAMPLER_ARG", "-1")
+		rec := newHTTPOTLPReceiver(t)
+		root := appRootWithoutOtel(t)
+		writeRealOtelHandler(t, root)
+		p := startNodeRealOtel(t, root, nil)
+
+		r := p.invokeTrace(t, "index.work", `{"step":"1"}`, map[string]string{
+			"OTEL_EXPORTER_OTLP_ENDPOINT": rec.endpoint,
+			"OTEL_TRACES_SAMPLER":         "traceidratio",
+			"OTEL_BSP_SCHEDULE_DELAY":     "50",
+			"OTEL_SERVICE_NAME":           "sampler-invalid",
+		}, nil)
+		if !r.OK {
+			t.Fatalf("an invalid sampler arg must never fail the invocation: %s", r.Err)
+		}
+
+		spans := rec.waitForSpans(t, 1)
+		if spans[0].Name != "handler.work" {
+			t.Errorf("exported span = %q, want handler.work (fallback ratio 1 must sample)",
+				spans[0].Name)
+		}
+		if !strings.Contains(p.stderrString(),
+			"invalid OTEL_TRACES_SAMPLER_ARG; using the default ratio") {
+			t.Errorf("stderr = %q, want the fixed invalid-arg diagnostic", p.stderrString())
+		}
+
+		if err := p.closeChannel(); err != nil {
+			t.Fatalf("close channel: %v", err)
+		}
+		if err := p.waitExit(t, 10*time.Second); err != nil {
+			t.Fatalf("bootstrap did not exit 0: %v; stderr:\n%s", err, p.stderrString())
+		}
+	})
+}
+
+// TestNodeRuntimeProviderShutdownBoundedOnExporterOutage pins the Node half of
+// the cross-language shutdown budget against a STALLED collector: a black-hole
+// OTLP endpoint (accepts, never answers) keeps the batch export hanging, so
+// channel-close shutdown must abandon the flush at the coordinated 7.5s
+// provider bound — announced on stderr — and the process must still exit 0
+// within its 9.5s process-shutdown deadline, strictly inside Go's 10s
+// container grace. Telemetry stays best-effort: the invocation during the
+// outage succeeds.
+func TestNodeRuntimeProviderShutdownBoundedOnExporterOutage(t *testing.T) {
+	pinOtelEnv(t)
+
+	// a black-hole collector: it accepts connections and never responds, so
+	// every export attempt would block until the transport's own timeout
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for the black-hole collector: %v", err)
+	}
+	var heldMu sync.Mutex
+	var held []net.Conn
+	go func() {
+		for {
+			conn, acceptErr := lis.Accept()
+			if acceptErr != nil {
+				return
+			}
+			heldMu.Lock()
+			held = append(held, conn)
+			heldMu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = lis.Close()
+		heldMu.Lock()
+		for _, conn := range held {
+			_ = conn.Close()
+		}
+		heldMu.Unlock()
+	})
+
+	root := appRootWithoutOtel(t)
+	writeRealOtelHandler(t, root)
+	p := startNodeRealOtel(t, root, nil)
+
+	// the endpoint and a tiny batch delay arrive as per-invocation frame env,
+	// so an export is already hanging against the black hole at shutdown
+	r := p.invokeTrace(t, "index.work", `{"step":"1"}`, map[string]string{
+		"OTEL_EXPORTER_OTLP_ENDPOINT": "http://" + lis.Addr().String(),
+		"OTEL_BSP_SCHEDULE_DELAY":     "20",
+		"OTEL_SERVICE_NAME":           "node-outage",
+	}, nil)
+	if !r.OK {
+		t.Fatalf("an exporter outage must never fail the invocation: %s", r.Err)
+	}
+
+	// when Relay closes the authenticated channel with the export still hung
+	if err := p.closeChannel(); err != nil {
+		t.Fatalf("close channel: %v", err)
+	}
+
+	// then the flush is abandoned at the coordinated 7.5s provider bound...
+	if err := p.waitExit(t, 9500*time.Millisecond); err != nil {
+		t.Fatalf("bootstrap did not exit 0 within the 9.5s process-shutdown bound: %v; stderr:\n%s",
+			err, p.stderrString())
+	}
+	if !strings.Contains(p.stderrString(),
+		"provider shutdown timed out; abandoning pending export") {
+		t.Errorf("stderr = %q, want the provider-bounded-flush diagnostic", p.stderrString())
+	}
+}
+
+// unsetEnv clears name for one test and restores the prior value afterwards
+// (t.Setenv cannot remove an entry, and an empty string would not model an
+// absent variable).
+func unsetEnv(t *testing.T, name string) {
+	t.Helper()
+	value, ok := os.LookupEnv(name)
+	os.Unsetenv(name)
+	t.Cleanup(func() {
+		if ok {
+			_ = os.Setenv(name, value)
+		} else {
+			_ = os.Unsetenv(name)
+		}
+	})
+}
+
 // TestOtelApiVersionRegistrationBoundary pins the cross-version global
 // registry contract with two PHYSICALLY SEPARATE official API packages
 // (1.10.0 — Relay's pin — and 1.9.0 — a version an application can still

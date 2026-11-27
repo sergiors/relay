@@ -1,3 +1,5 @@
+import { types } from "node:util";
+
 export interface LogRecord {
   timestamp: string;
   level: string;
@@ -20,10 +22,20 @@ export interface LogRecord {
 const MAX_DEPTH = 16;
 const MAX_ITEMS = 10_000;
 const MAX_LINE_LENGTH = 1024 * 1024;
+const MAX_STACKTRACE_LENGTH = 64 * 1024;
+const NATIVE_ERROR_STACK_GETTER_SOURCE = "function () { [native code] }";
+// Node 24 and 26 use this exact default formatter implementation.
+const NODE_DEFAULT_PREPARE_STACK_TRACE =
+  "function ErrorPrepareStackTrace(error, trace) {\n" +
+  "  return internalPrepareStackTrace(error, trace);\n" +
+  "}";
 const FALLBACK_MESSAGE = "log record could not be serialized";
 const MINIMAL_FALLBACK_LINE =
   '{"level":"ERROR","logger":"relay.logging",' +
   '"message":"log record could not be serialized"}';
+const reflectApply = Reflect.apply;
+const functionToString = Function.prototype.toString;
+const nativeErrorStack = captureNativeErrorStack();
 
 export class JsonFormatter {
   format(record: LogRecord): string {
@@ -212,11 +224,7 @@ function errorRecord(
   }
 }
 
-function causeText(
-  cause: unknown,
-  depth: number,
-  active: Set<object>,
-): string {
+function causeText(cause: unknown, depth: number, active: Set<object>): string {
   if (depth >= MAX_DEPTH) return "[cause truncated]";
   if (cause !== null && typeof cause === "object" && active.has(cause)) {
     return "[circular cause]";
@@ -253,8 +261,138 @@ function errorMessage(error: Error): string {
 }
 
 function errorStack(error: Error): string | undefined {
-  const stack = ownDataProperty(error, "stack");
-  return typeof stack === "string" ? stack : undefined;
+  const descriptor = ownDescriptor(error, "stack");
+  if (descriptor === undefined) return undefined;
+  if (Object.hasOwn(descriptor, "value")) {
+    return typeof descriptor.value === "string"
+      ? boundedStacktrace(descriptor.value)
+      : undefined;
+  }
+
+  if (
+    nativeErrorStack === null ||
+    descriptor.get !== nativeErrorStack.getter ||
+    !hasNodeDefaultPrepareStackTrace(nativeErrorStack, error)
+  ) {
+    return undefined;
+  }
+
+  try {
+    const stack = reflectApply(nativeErrorStack.getter, error, []);
+    return typeof stack === "string" ? boundedStacktrace(stack) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function captureNativeErrorStack(): {
+  getter: () => unknown;
+  errorConstructor: Function;
+  prepareStackTrace: Function;
+} | null {
+  try {
+    const probe = new Error();
+    if (!types.isNativeError(probe)) return null;
+    const descriptor = ownDescriptor(probe, "stack");
+    if (
+      typeof descriptor?.get !== "function" ||
+      types.isProxy(descriptor.get) ||
+      ownDataProperty(descriptor.get, "name") !== "" ||
+      ownDataProperty(descriptor.get, "length") !== 0 ||
+      reflectApply(functionToString, descriptor.get, []) !==
+        NATIVE_ERROR_STACK_GETTER_SOURCE
+    ) {
+      return null;
+    }
+
+    const errorConstructor = nativeErrorConstructor(probe);
+    if (errorConstructor === null) return null;
+    const prepareStackTrace = ownDataProperty<unknown>(
+      errorConstructor,
+      "prepareStackTrace",
+    );
+    if (
+      typeof prepareStackTrace !== "function" ||
+      !isNodeDefaultPrepareStackTrace(prepareStackTrace)
+    ) {
+      return null;
+    }
+
+    return {
+      getter: descriptor.get,
+      errorConstructor,
+      prepareStackTrace,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function nativeErrorConstructor(error: object): Function | null {
+  let prototype: object | null;
+  try {
+    prototype = Object.getPrototypeOf(error);
+  } catch {
+    return null;
+  }
+
+  let found: Function | null = null;
+  while (prototype !== null) {
+    if (types.isProxy(prototype)) return null;
+    const constructor = ownDataProperty<unknown>(prototype, "constructor");
+    if (
+      typeof constructor === "function" &&
+      ownDataProperty(constructor, "prototype") === prototype &&
+      ownDataProperty(constructor, "name") === "Error"
+    ) {
+      found = constructor;
+    }
+    try {
+      prototype = Object.getPrototypeOf(prototype);
+    } catch {
+      return null;
+    }
+  }
+  return found;
+}
+
+function hasNodeDefaultPrepareStackTrace(
+  nativeStack: NonNullable<typeof nativeErrorStack>,
+  error: Error,
+): boolean {
+  if (nativeErrorConstructor(error) !== nativeStack.errorConstructor) {
+    return false;
+  }
+  const descriptor = ownDescriptor(
+    nativeStack.errorConstructor,
+    "prepareStackTrace",
+  );
+  return (
+    descriptor !== undefined &&
+    Object.hasOwn(descriptor, "value") &&
+    descriptor.value === nativeStack.prepareStackTrace &&
+    isNodeDefaultPrepareStackTrace(descriptor.value)
+  );
+}
+
+function isNodeDefaultPrepareStackTrace(value: unknown): value is Function {
+  if (typeof value !== "function" || types.isProxy(value)) return false;
+  try {
+    return (
+      ownDataProperty(value, "name") === "ErrorPrepareStackTrace" &&
+      ownDataProperty(value, "length") === 2 &&
+      reflectApply(functionToString, value, []) ===
+        NODE_DEFAULT_PREPARE_STACK_TRACE
+    );
+  } catch {
+    return false;
+  }
+}
+
+function boundedStacktrace(stack: string): string {
+  if (stack.length <= MAX_STACKTRACE_LENGTH) return stack;
+  const marker = "\n[stacktrace truncated]";
+  return stack.slice(0, MAX_STACKTRACE_LENGTH - marker.length) + marker;
 }
 
 function thrownMessage(value: unknown): string {
@@ -299,8 +437,10 @@ function aggregateErrors(error: Error): unknown {
 }
 
 function stringify(payload: Record<string, unknown>): string {
-  return JSON.stringify(payload).replace(/[^\x00-\x7f]/g, (character) =>
-    `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  return JSON.stringify(payload).replace(
+    /[^\x00-\x7f]/g,
+    (character) =>
+      `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
   );
 }
 

@@ -179,25 +179,26 @@ except ValueError:
 ```
 
 Fields added with `extra` are shallow-copied into a new mapping at record
-creation. They appear on the public `LogRecord.attributes` mapping and are
-available individually on the record to custom formatters. Nested mutable values
-remain references; changing a nested list or dictionary before a queued listener
-formats the record may change its later representation. Standard `LogRecord`
-field collisions raise `KeyError` as in Python logging. Relay-owned fields such as `service`,
-`request_id`, `trace_id`, `location`, and `attributes` are reserved, as are the
-logging option names `extra`, `exc_info`, `stack_info`, and `stacklevel`;
-attempting to replace them raises `ValueError`. Framework metadata always wins.
-`message_id` and `max_attempts` are not automatically populated and may be used
-as application attributes.
+creation and appear on the public `LogRecord.attributes` mapping. Non-reserved
+fields are also available individually on the record to custom formatters.
+Nested mutable values remain references; changing a nested list or dictionary
+before a queued listener formats the record may change its later representation.
+Actual `LogRecord` field collisions, such as `name`, still raise `KeyError` as in
+Python logging.
+Application fields that share names with Relay metadata, such as `service`,
+`request_id`, `trace_id`, `location`, or `attributes`, remain nested in
+`LogRecord.attributes` and do not replace the top-level Relay fields. The same
+applies to logging option names such as `extra`, `exc_info`, `stack_info`, and
+`stacklevel`. `message_id` and `max_attempts` are not automatically populated and
+may be used as application attributes.
 
 Appended fields can be set and removed with `append_keys(**fields)` and
 `remove_keys(names)`. `remove_keys` accepts an iterable such as a list; separate
 string arguments are also supported. These fields are scoped to the named
 stdlib logger identity: Logger instances for the same service share them, while
 different services remain isolated. `append_context_keys(**fields)` adds a
-temporary layer scoped to the same logger identity and current context. It
-returns a token-restoring scope that can be used with `with` when the fields
-should apply only inside a block:
+temporary layer scoped to the same logger identity and current context and
+returns a context manager for a block whose fields apply only inside it:
 
 ```python
 log.append_keys(component="payments")
@@ -206,14 +207,21 @@ with log.append_context_keys(operation="authorize"):
     log.info("starting")
 ```
 
+Child tasks inherit a scope's temporary layer in their own context; handler
+completion expires that layer and all invocation correlation.
+
 Each operation is copy-on-write and context-local, so concurrent tasks do not
 mutate shared mappings. If the same name is present at multiple levels,
 precedence is `extra` then temporary `append_context_keys` values, then appended
 values. For example, `log.remove_keys(["user_id", "organization_id"])` removes
-both appended values. Leaving the `with` block restores the previous temporary
-layer. Invocation-scoped fields reset when an invocation ends; appending keys
-outside Relay remains local to the current context until changed. Context
-inherited by a child task expires when its invocation ends.
+both appended values. Leaving the `with` block removes only that call's
+temporary layer: fields appended or removed inside the block, other loggers'
+temporary fields, and a newer invocation keep their current values. Nesting is
+independent, so scopes can be entered and left in any order. Invocation-scoped
+appended fields reset when an invocation ends; appending keys outside Relay
+remains local to the current context until changed. This differs from Node's
+per-Logger-instance `appendKeys`, which persists across invocations while that
+logger instance lives.
 
 ### JSON record
 
@@ -252,8 +260,11 @@ so mutations before a `QueueHandler` listener formats the record can affect
 their representation. Supported JSON values include primitives, finite
 numbers, lists, tuples, string-keyed mappings, dates/datetimes, UUIDs, and
 Decimals. Unsupported, circular, overly deep, or non-finite values become
-explicit marker objects. If serialization itself fails, a safe one-line
-fallback is emitted and the application call continues.
+explicit marker objects. A mapping contributes at most 10,000 entries (an
+oversized one becomes `$truncated`) and a sequence at most 10,000 items plus a
+trailing `$truncated` marker. If serialization itself fails or the rendered line
+would exceed 1 MiB, a safe one-line fallback is emitted and the application call
+continues.
 
 On CPython, the standard `QueueHandler.prepare` formats and copies a record,
 then clears `exc_info` and `exc_text`; traceback text is rendered into the
@@ -333,9 +344,12 @@ inherits the invocation's OpenTelemetry context.
 When the optional OpenTelemetry API is available, a valid active span is read at
 record creation in non-expired contexts both inside and outside Relay. The logger
 only reads the API: it does not install a provider, create spans, or export logs.
-The invocation trace ID is used only when there is no active valid span, so
-unrelated span and invocation IDs are never paired. Span discovery and
-application-field serialization are skipped when the log level is disabled.
+`trace_id` and `span_id` then come only from that valid span context. When the
+API is available but no span is current (including an explicit empty or root
+context), both are omitted instead of pairing the invocation frame's trace ID
+with a span that does not exist. The frame's validated `trace_id` is used only
+when the API is unavailable. Span discovery and application-field serialization
+are skipped when the log level is disabled.
 Relay collects application stderr as the container's native log. This logging
 API does not create spans, install a tracing provider, export logs, or integrate
 with dependency injection.
@@ -451,7 +465,10 @@ By default, an ordinary `Exception` marks the span with the generic OpenTelemetr
 `ERROR` status and no description, then is re-raised unchanged. The SDK disables
 OpenTelemetry's automatic exception recording and automatic status description,
 so an exception message or traceback is not attached to the span unless
-`record_exception=True` is set explicitly. An explicitly recorded exception uses
+`record_exception=True` is set explicitly. A failure inside the provider while
+setting the status, recording the event, ending the span, or detaching its
+context is ignored, so telemetry can never replace the block's own result or
+exception. An explicitly recorded exception uses
 the native event format, which includes the exception type, message, and
 traceback. Application exceptions and their messages may contain secrets;
 enable recording only when that output is acceptable.
@@ -479,10 +496,11 @@ shuts down an application-owned provider.
 
 ### Async background tasks and logging
 
-Native OpenTelemetry context is inherited by child asyncio tasks. A task that
-outlives its invocation can therefore create spans whose parent is the finished
-invocation span, even though the logging context is expired and no longer
-supplies stale log correlation. Relay does not cancel such tasks. Create
+The official OpenTelemetry context manager propagates active context to child
+asyncio tasks. A task that outlives its invocation can therefore create spans
+whose parent is the finished invocation span. The Logger's invocation lease
+still expires at handler completion, suppressing invocation metadata and
+log-correlation IDs on detached logs. Relay does not cancel such tasks. Create
 long-lived tasks outside an invocation, or detach them from the inherited
 context, when that parent relationship is undesirable.
 

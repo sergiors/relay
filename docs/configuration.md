@@ -278,3 +278,11 @@ not inherited from the worker; app-supplied `OTEL_*` values remain on the normal
 per-invocation environment frame. `RELAY_OTEL_PROVIDER` is an app-only
 provider-ownership setting, not a worker setting. See
 [Operations](operations.md#tracing).
+
+Relay's managed provider is enabled by an effective OTLP endpoint and does not
+use SDK auto-configuration for exporter selection. As a result,
+`OTEL_TRACES_EXPORTER=none` alone does not disable Relay-managed export when an
+endpoint is configured. To disable the managed provider, remove both
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and `OTEL_EXPORTER_OTLP_ENDPOINT` from the
+effective worker/app configuration, or set `OTEL_SDK_DISABLED=true`. Disabling
+the SDK does not disable W3C context propagation.

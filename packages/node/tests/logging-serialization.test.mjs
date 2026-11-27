@@ -1,12 +1,14 @@
 // Bounded, descriptor-safe JSON serialization: structured exception records
 // for Error (with cause and AggregateError details) and non-Error thrown
 // values, markers for circular/BigInt/undefined/non-finite/accessor/toJSON
-// values without invoking them, depth bounds, and the fallback lines emitted
-// when a record cannot be built, sized, or written.
+// values without invoking them, verified native stack frames only (custom
+// prepareStackTrace hooks and hostile stack accessors are skipped), depth
+// bounds, and the fallback lines emitted when a record cannot be built,
+// sized, or written.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { Logger } from "../dist/logging.js";
+import { JsonFormatter, Logger } from "../dist/logging.js";
 import { captureRecords, oneRecord } from "./helpers/logging.mjs";
 
 function freshLogger(service) {
@@ -118,6 +120,85 @@ test("an Error attribute serializes like an exception", async () => {
   assert.equal(record.attributes.err.type, "RangeError");
   assert.equal(record.attributes.err.message, "range");
   assert.ok(record.attributes.err.stacktrace.startsWith("RangeError: range"));
+});
+
+test("a custom Error.prepareStackTrace hook is never called while formatting", () => {
+  // given a custom hook installed on the shared Error constructor: the
+  // formatter must treat the stack as unverifiable instead of invoking it
+  const formatter = new JsonFormatter();
+  let hookCalls = 0;
+  const previousHook = Error.prepareStackTrace;
+  Error.prepareStackTrace = () => {
+    hookCalls += 1;
+    return "hooked";
+  };
+
+  let line;
+  try {
+    line = formatter.format({
+      message: "hooked-error",
+      level: "ERROR",
+      exception: new TypeError("hooked-path"),
+    });
+  } finally {
+    Error.prepareStackTrace = previousHook;
+  }
+
+  assert.equal(hookCalls, 0, "Error.prepareStackTrace must not be called");
+  const record = JSON.parse(line);
+  assert.equal(record.exception.type, "TypeError");
+  assert.equal(record.exception.message, "hooked-path");
+  // without verifiable native frames the exception keeps type and message
+  assert.equal(record.exception.stacktrace, "TypeError: hooked-path");
+});
+
+test("a hostile stack accessor is never invoked while formatting", () => {
+  const formatter = new JsonFormatter();
+  let getterCalls = 0;
+  const error = new Error("own-getter");
+  Object.defineProperty(error, "stack", {
+    configurable: true,
+    get() {
+      getterCalls += 1;
+      return "forbidden";
+    },
+  });
+
+  const line = formatter.format({
+    message: "getter-error",
+    level: "ERROR",
+    exception: error,
+  });
+
+  assert.equal(getterCalls, 0, "a custom stack accessor must not run");
+  const record = JSON.parse(line);
+  assert.equal(record.exception.type, "Error");
+  assert.equal(record.exception.message, "own-getter");
+  assert.equal(record.exception.stacktrace, "Error: own-getter");
+});
+
+test("an oversized own stack string is truncated at the stacktrace bound", () => {
+  const formatter = new JsonFormatter();
+  const error = new Error("oversized");
+  Object.defineProperty(error, "stack", {
+    configurable: true,
+    value: "x".repeat(70_000),
+  });
+
+  const record = JSON.parse(
+    formatter.format({
+      message: "oversized-error",
+      level: "ERROR",
+      exception: error,
+    }),
+  );
+
+  const stacktrace = record.exception.stacktrace;
+  assert.ok(stacktrace.endsWith("\n[stacktrace truncated]"), "marker missing");
+  assert.ok(
+    stacktrace.length <= 64 * 1024,
+    `stacktrace length ${stacktrace.length} must stay within 64 KiB`,
+  );
 });
 
 test("unsupported values are marked instead of thrown", async () => {

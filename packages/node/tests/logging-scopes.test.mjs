@@ -1,8 +1,8 @@
 // Scoped and persistent log attributes: appendKeys/removeKeys instance state
 // across scopes, invocations, and loggers, the documented merge precedence
-// (persistent < temporary < per-call), and withContext/withContextKeys/
-// appendContextKeys semantics — sync and async return passthrough, nesting,
-// concurrency, error propagation, and validation.
+// (persistent < temporary < per-call), and withContextKeys semantics — sync
+// and async return passthrough, nesting, concurrency, error propagation, and
+// validation. The former withContext/appendContextKeys aliases are gone.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
@@ -78,7 +78,7 @@ test("per-call attributes win over scoped fields, which win over persistent keys
   log.appendKeys({ source: "persistent", persistentOnly: true });
 
   const records = await captureRecords(() =>
-    log.withContext({ source: "temporary", temporaryOnly: true }, () => {
+    log.withContextKeys({ source: "temporary", temporaryOnly: true }, () => {
       log.info("precedence-inside", { source: "call", callOnly: true });
       log.info("precedence-scoped");
     }),
@@ -102,7 +102,7 @@ test("temporary scoped keys apply only to their logger instance and scope", asyn
   const bystander = freshLogger("scope-b");
 
   const records = await captureRecords(() => {
-    scoped.withContext({ operation: "only-a" }, () => {
+    scoped.withContextKeys({ operation: "only-a" }, () => {
       scoped.info("scoped-a");
       bystander.info("bystander-b");
     });
@@ -124,21 +124,15 @@ test("temporary scoped keys apply only to their logger instance and scope", asyn
   );
 });
 
-test("withContext variants return synchronous and asynchronous results", async () => {
+test("withContextKeys returns synchronous and asynchronous results", async () => {
   const log = freshLogger("returns");
   const returns = [];
 
   const records = await captureRecords(async () => {
     returns.push(
-      log.withContext({ variant: "sync" }, () => {
+      log.withContextKeys({ variant: "sync" }, () => {
         log.info("return-sync");
         return 42;
-      }),
-    );
-    returns.push(
-      log.appendContextKeys({ variant: "alias" }, () => {
-        log.info("return-alias");
-        return "alias-value";
       }),
     );
     returns.push(
@@ -150,12 +144,11 @@ test("withContext variants return synchronous and asynchronous results", async (
     );
   });
 
-  assert.deepEqual(returns, [42, "alias-value", "async-value"]);
+  assert.deepEqual(returns, [42, "async-value"]);
   assert.deepEqual(
     records.map((record) => [record.message, record.attributes.variant]),
     [
       ["return-sync", "sync"],
-      ["return-alias", "alias"],
       ["return-async", "async"],
     ],
   );
@@ -166,8 +159,8 @@ test("nested scopes restore outward state and return inner results", async () =>
 
   let result;
   const during = await captureRecords(() => {
-    result = log.withContext({ layer: "outer", outerOnly: "1" }, () => {
-      const inner = log.withContext(
+    result = log.withContextKeys({ layer: "outer", outerOnly: "1" }, () => {
+      const inner = log.withContextKeys(
         { layer: "inner", innerOnly: "2" },
         () => {
           log.info("nested-inner");
@@ -202,9 +195,9 @@ test("nested scopes merge their fields while active", async () => {
   log.appendKeys({ persistent: true });
 
   const records = await captureRecords(() =>
-    log.withContext({ layer: "outer", outerOnly: "1" }, () => {
+    log.withContextKeys({ layer: "outer", outerOnly: "1" }, () => {
       log.info("merge-outer");
-      log.withContext({ layer: "inner", innerOnly: "2" }, () => {
+      log.withContextKeys({ layer: "inner", innerOnly: "2" }, () => {
         log.info("merge-inner");
       });
       log.info("merge-outer-again");
@@ -263,7 +256,7 @@ test("a throwing scope callback propagates and leaks no fields", async () => {
 
   assert.throws(
     () =>
-      log.withContext({ leaked: true }, () => {
+      log.withContextKeys({ leaked: true }, () => {
         throw new Error("scope boom");
       }),
     /scope boom/,
@@ -288,14 +281,14 @@ test("invalid scope inputs fail before the callback runs", () => {
   const log = freshLogger("scope-validation");
 
   assert.throws(
-    () => log.withContext({ a: 1 }, null),
+    () => log.withContextKeys({ a: 1 }, null),
     { name: "TypeError", message: "callback must be a function" },
   );
 
   let ran = false;
   assert.throws(
     () =>
-      log.withContext(null, () => {
+      log.withContextKeys(null, () => {
         ran = true;
       }),
     { name: "TypeError", message: "fields must be an object" },
@@ -305,6 +298,27 @@ test("invalid scope inputs fail before the callback runs", () => {
   assert.throws(() => log.appendKeys(null), TypeError);
   assert.throws(() => log.appendKeys([]), TypeError);
   assert.throws(() => log.appendKeys("not-an-object"), TypeError);
+});
+
+test("the removed scope aliases are absent from the Logger", async () => {
+  const log = freshLogger("alias-gone");
+
+  // when the deprecated alias names are probed on a live instance
+  const records = await captureRecords(() =>
+    log.withContextKeys({ canonical: true }, () => log.info("alias-gone-record")),
+  );
+
+  // then only withContextKeys remains part of the public surface
+  assert.equal(typeof log.withContextKeys, "function");
+  assert.equal("withContext" in log, false, "withContext must stay removed");
+  assert.equal(
+    "appendContextKeys" in log,
+    false,
+    "appendContextKeys must stay removed",
+  );
+  assert.equal(Object.hasOwn(log, "withContext"), false);
+  assert.equal(Object.hasOwn(log, "appendContextKeys"), false);
+  assert.deepEqual(records[0].attributes, { canonical: true });
 });
 
 test("persistent keys and removals survive invocations and stay per logger", async () => {

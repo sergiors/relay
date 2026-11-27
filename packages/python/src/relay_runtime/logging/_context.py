@@ -32,8 +32,7 @@ __all__ = [
 
 _EMPTY_FIELDS: Mapping[str, object] = MappingProxyType({})
 _EMPTY_APPENDED: Mapping[object, Mapping[str, object]] = MappingProxyType({})
-_EMPTY_CONTEXT_FIELDS: Mapping[object, Mapping[str, object]] = MappingProxyType({})
-
+_EMPTY_LAYERS: Mapping[object, _Layer] = MappingProxyType({})
 
 @dataclass(frozen=True, slots=True)
 class Invocation:
@@ -57,11 +56,25 @@ class _Lease:
 
 
 @dataclass(frozen=True, slots=True)
+class _Layer:
+    """One temporary field layer.
+
+    The identity is an increasing id rather than the object: removing a layer
+    below the top rebuilds the layers above it, and a handle must still match
+    the rebuilt layer it created.
+    """
+
+    id: int
+    fields: Mapping[str, object]
+    parent: _Layer | None
+
+
+@dataclass(frozen=True, slots=True)
 class _State:
     invocation: Invocation | None
     lease: _Lease | None
     appended: Mapping[object, Mapping[str, object]]
-    temporary: Mapping[object, Mapping[str, object]]
+    temporary: Mapping[object, _Layer]
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,16 +83,26 @@ class _Handle:
     lease: _Lease
 
 
+@dataclass(frozen=True, slots=True)
+class _Scope:
+    """Handle for one temporary layer, bound to its owning invocation."""
+
+    lease: _Lease | None
+    scope: object
+    layer: _Layer
+
+
 _EMPTY = _State(
     invocation=None,
     lease=None,
     appended=_EMPTY_APPENDED,
-    temporary=_EMPTY_CONTEXT_FIELDS,
+    temporary=_EMPTY_LAYERS,
 )
 _CURRENT: contextvars.ContextVar[_State] = contextvars.ContextVar(
     "relay_logging_context", default=_EMPTY
 )
 _INVOCATIONS = itertools.count(1)
+_LAYERS = itertools.count(1)
 
 
 def begin(frame: object) -> _Handle | None:
@@ -93,7 +116,7 @@ def begin(frame: object) -> _Handle | None:
         invocation=invocation,
         lease=lease,
         appended=_EMPTY_APPENDED,
-        temporary=_EMPTY_CONTEXT_FIELDS,
+        temporary=_EMPTY_LAYERS,
     )
     return _Handle(token=_CURRENT.set(state), lease=lease)
 
@@ -106,7 +129,7 @@ def end(handle: object | None) -> None:
     handle.lease.active = False
     try:
         _CURRENT.reset(handle.token)
-    except ValueError, RuntimeError:
+    except (ValueError, RuntimeError):
         _CURRENT.set(_EMPTY)
 
 
@@ -120,8 +143,8 @@ def snapshot(scope: object | None = None) -> tuple[
     appended = _EMPTY_FIELDS if scope is None else state.appended.get(
         scope, _EMPTY_FIELDS
     )
-    temporary = _EMPTY_FIELDS if scope is None else state.temporary.get(
-        scope, _EMPTY_FIELDS
+    temporary = _EMPTY_FIELDS if scope is None else _merged_fields(
+        state.temporary.get(scope)
     )
     return state.invocation, appended, temporary, False
 
@@ -166,15 +189,55 @@ def remove_keys(scope: object, keys: tuple[str, ...]) -> None:
     )
 
 
-def bind_fields(
-    scope: object, fields: Mapping[str, object]
-) -> contextvars.Token[_State]:
-    """Layer fields into one logger's context, returning a reset token."""
+def bind_fields(scope: object, fields: Mapping[str, object]) -> _Scope:
+    """Layer fields into one logger's context, returning a reset handle."""
     state = _CURRENT.get()
+    layer = _Layer(
+        id=next(_LAYERS),
+        fields=MappingProxyType(dict(fields)),
+        parent=state.temporary.get(scope),
+    )
     temporary = dict(state.temporary)
-    merged = MappingProxyType({**temporary.get(scope, _EMPTY_FIELDS), **fields})
-    temporary[scope] = merged
-    return _CURRENT.set(
+    temporary[scope] = layer
+    _CURRENT.set(
+        _State(
+            invocation=state.invocation,
+            lease=state.lease,
+            appended=state.appended,
+            temporary=MappingProxyType(temporary),
+        )
+    )
+    return _Scope(lease=state.lease, scope=scope, layer=layer)
+
+
+def reset_fields(handle: object) -> None:
+    """Remove exactly the layer one :func:`bind_fields` call added.
+
+    Safe after the invocation that owned the state ended, and safe for a handle
+    whose scope was already reset or replaced: the current state must still
+    carry the same lease and that layer, otherwise the call is a no-op. Only
+    temporary fields are touched, so appended and removed keys, other scopes,
+    and a later invocation keep their current values.
+    """
+    if not isinstance(handle, _Scope):
+        return
+
+    state = _CURRENT.get()
+    if state.lease is not handle.lease:
+        return
+    top = state.temporary.get(handle.scope)
+    if top is None:
+        return
+    owned, remaining = _without_layer(top, handle.layer)
+    if not owned:
+        return
+
+    temporary = dict(state.temporary)
+    if remaining is None:
+        temporary.pop(handle.scope, None)
+    else:
+        temporary[handle.scope] = remaining
+    _CURRENT.set(
         _State(
             invocation=state.invocation,
             lease=state.lease,
@@ -184,12 +247,42 @@ def bind_fields(
     )
 
 
-def reset_fields(token: contextvars.Token[_State]) -> None:
-    """Restore the state captured before a :func:`bind_fields` call."""
-    try:
-        _CURRENT.reset(token)
-    except ValueError, RuntimeError:
-        pass
+def _merged_fields(layer: _Layer | None) -> Mapping[str, object]:
+    """Merge one logger's layer chain, oldest first, into one mapping."""
+    if layer is None:
+        return _EMPTY_FIELDS
+    if layer.parent is None:
+        return layer.fields
+
+    layers: list[Mapping[str, object]] = []
+    while layer is not None:
+        layers.append(layer.fields)
+        layer = layer.parent
+    merged: dict[str, object] = {}
+    for fields in reversed(layers):
+        merged.update(fields)
+    return MappingProxyType(merged)
+
+
+def _without_layer(top: _Layer, target: _Layer) -> tuple[bool, _Layer | None]:
+    """Return ``(owned, chain)`` with ``target`` unlinked from ``top``.
+
+    ``chain`` is the new top layer, or ``None`` when it became empty. ``owned``
+    is false when the target is not part of this chain, so the caller must not
+    modify the state.
+    """
+    layers: list[_Layer] = []
+    layer: _Layer | None = top
+    while layer is not None and layer.id != target.id:
+        layers.append(layer)
+        layer = layer.parent
+    if layer is None:
+        return False, None
+
+    remaining = layer.parent
+    for entry in reversed(layers):
+        remaining = _Layer(id=entry.id, fields=entry.fields, parent=remaining)
+    return True, remaining
 
 
 def _invocation_from_frame(frame: object) -> Invocation | None:

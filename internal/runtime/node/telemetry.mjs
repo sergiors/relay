@@ -8,12 +8,12 @@ const PROVIDER_OWNER = "RELAY_OTEL_PROVIDER";
 
 const appRequire = createRequire(BAKED_ROOT + "/package.json");
 const otelRequire = createRequire(OTEL_ROOT + "/package.json");
+const ownedShutdowns = new WeakMap();
 
 let started = false;
 let stopped = false;
 let provider = null;
 let shutdownPromise = null;
-const providerShutdowns = new WeakMap();
 const pendingProviderShutdowns = new Set();
 let api = null;
 let tracePropagator = null;
@@ -31,7 +31,11 @@ function diagnostic(level, message) {
 }
 
 function errorName(error) {
-  return error && typeof error.name === "string" ? error.name : "Error";
+  try {
+    return error && typeof error.name === "string" ? error.name : "Error";
+  } catch {
+    return "Error";
+  }
 }
 
 function loadApi() {
@@ -47,10 +51,9 @@ function loadPropagators() {
   propagatorsLoaded = true;
   if (tracePropagator !== null && baggagePropagator !== null) return true;
   try {
-    const {
-      W3CBaggagePropagator,
-      W3CTraceContextPropagator,
-    } = otelRequire("@opentelemetry/core");
+    const { W3CBaggagePropagator, W3CTraceContextPropagator } = otelRequire(
+      "@opentelemetry/core",
+    );
     tracePropagator = new W3CTraceContextPropagator();
     baggagePropagator = new W3CBaggagePropagator();
     return true;
@@ -141,14 +144,18 @@ function configuredSampler(core, sdkTrace) {
         root: new sdkTrace.TraceIdRatioBasedSampler(samplerRatio(core)),
       });
     default:
-      diagnostic("warning", "unsupported OTEL_TRACES_SAMPLER; using the default");
+      diagnostic(
+        "warning",
+        "unsupported OTEL_TRACES_SAMPLER; using the default",
+      );
       return undefined;
   }
 }
 
 function samplerRatio(core) {
   const value = core.getNumberFromEnv("OTEL_TRACES_SAMPLER_ARG");
-  if (value === undefined || value < 0 || value > 1) {
+  if (value === undefined) return 1;
+  if (!Number.isFinite(value) || value < 0 || value > 1) {
     diagnostic(
       "warning",
       "invalid OTEL_TRACES_SAMPLER_ARG; using the default ratio",
@@ -177,9 +184,9 @@ function batchProcessorOptions(core) {
 }
 
 function configuredResource(resources) {
-  const attributes = resources.resourceAttributesEnvDetector.detect().attributes;
-  const serviceName =
-    resources.serviceNameEnvDetector.detect().attributes;
+  const attributes =
+    resources.resourceAttributesEnvDetector.detect().attributes;
+  const serviceName = resources.serviceNameEnvDetector.detect().attributes;
   return resources
     .defaultResource()
     .merge(resources.resourceFromAttributes(attributes))
@@ -202,7 +209,7 @@ function createManagedProvider(endpoint) {
   if (protocol !== "grpc" && protocol !== "http/protobuf") {
     diagnostic(
       "warning",
-      "unsupported OTLP protocol; set the trace or generic protocol to \"grpc\" or \"http/protobuf\"",
+      'unsupported OTLP protocol; set the trace or generic protocol to "grpc" or "http/protobuf"',
     );
     return null;
   }
@@ -214,15 +221,26 @@ function createManagedProvider(endpoint) {
   const sampler = configuredSampler(core, sdkTrace);
   const batchOptions = batchProcessorOptions(core);
   const exporter = createExporter(protocol);
-  const processor = new sdkTrace.BatchSpanProcessor({
-    exporter,
-    ...batchOptions,
-  });
-  return new sdkTrace.TracerProvider({
-    resource,
-    sampler,
-    spanProcessors: [processor],
-  });
+  let processor = null;
+  try {
+    processor = new sdkTrace.BatchSpanProcessor({
+      exporter,
+      ...batchOptions,
+    });
+    return new sdkTrace.TracerProvider({
+      resource,
+      sampler,
+      spanProcessors: [processor],
+    });
+  } catch (error) {
+    // The processor owns the exporter once constructed, so clean up only the
+    // most-derived component and let its shutdown close the exporter.
+    void shutdownOwnedComponent(
+      processor ?? exporter,
+      processor === null ? "exporter" : "span processor",
+    );
+    throw error;
+  }
 }
 
 export function ensureStarted() {
@@ -234,7 +252,10 @@ export function ensureStarted() {
   try {
     otelApi = loadApi();
   } catch (error) {
-    diagnostic("warning", `OpenTelemetry API unavailable (${errorName(error)})`);
+    diagnostic(
+      "warning",
+      `OpenTelemetry API unavailable (${errorName(error)})`,
+    );
     return;
   }
 
@@ -245,7 +266,10 @@ export function ensureStarted() {
   }
 
   const owner = providerOwner();
-  if (owner !== "managed" || env("OTEL_SDK_DISABLED").toLowerCase() === "true") {
+  if (
+    owner !== "managed" ||
+    env("OTEL_SDK_DISABLED").toLowerCase() === "true"
+  ) {
     return;
   }
 
@@ -259,11 +283,11 @@ export function ensureStarted() {
     try {
       registered = otelApi.trace.setGlobalTracerProvider(managedProvider);
     } catch (error) {
-      void boundedSetupCleanup(managedProvider);
+      void shutdownOwnedProvider(managedProvider);
       throw error;
     }
     if (!registered) {
-      void boundedSetupCleanup(managedProvider);
+      void shutdownOwnedProvider(managedProvider);
       diagnostic("warning", "managed tracer provider registration failed");
       return;
     }
@@ -305,7 +329,10 @@ function warnExtractionFailure(kind, error) {
   const failure = `${kind}:${errorName(error)}`;
   if (extractionWarnings.has(failure)) return;
   extractionWarnings.add(failure);
-  diagnostic("warning", `${kind} context extraction failed (${errorName(error)})`);
+  diagnostic(
+    "warning",
+    `${kind} context extraction failed (${errorName(error)})`,
+  );
 }
 
 export function withParent(carrier, callback) {
@@ -358,48 +385,49 @@ function warnContextUnavailable(error) {
 }
 
 function shutdownOwnedProvider(managedProvider) {
-  let shutdown = providerShutdowns.get(managedProvider);
+  return shutdownOwnedComponent(managedProvider, "provider");
+}
+
+function shutdownOwnedComponent(component, kind) {
+  let shutdown = ownedShutdowns.get(component);
   if (shutdown !== undefined) return shutdown;
 
-  shutdown = Promise.resolve()
-    .then(() => managedProvider.shutdown())
+  // The pending set stores this bounded promise so final shutdown joins the
+  // existing deadline instead of starting another wait for the same component.
+  let timer;
+  const cleanup = Promise.resolve()
+    .then(() => component.shutdown())
     .catch((error) => {
-      diagnostic("warning", `provider shutdown failed (${errorName(error)})`);
+      diagnostic("warning", `${kind} shutdown failed (${errorName(error)})`);
     });
-  providerShutdowns.set(managedProvider, shutdown);
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      diagnostic(
+        "warning",
+        `${kind} shutdown timed out; abandoning pending export`,
+      );
+      resolve();
+    }, SHUTDOWN_TIMEOUT_MS);
+  });
+  shutdown = Promise.race([cleanup, deadline]).finally(() =>
+    clearTimeout(timer),
+  );
+  ownedShutdowns.set(component, shutdown);
   pendingProviderShutdowns.add(shutdown);
-  void shutdown.then(() => pendingProviderShutdowns.delete(shutdown));
+  void shutdown.then(
+    () => pendingProviderShutdowns.delete(shutdown),
+    () => pendingProviderShutdowns.delete(shutdown),
+  );
   return shutdown;
 }
 
-function boundedSetupCleanup(managedProvider) {
-  let timer;
-  const shutdown = shutdownOwnedProvider(managedProvider);
-  const deadline = new Promise((resolve) => {
-    timer = setTimeout(() => {
-      diagnostic("warning", "setup cleanup timed out; abandoning pending export");
-      resolve();
-    }, SHUTDOWN_TIMEOUT_MS);
-  });
-  return Promise.race([shutdown, deadline])
-    .finally(() => clearTimeout(timer));
-}
-
 function boundedFinalShutdown(managedProvider) {
-  const pending = Array.from(pendingProviderShutdowns);
+  const pending = new Set(pendingProviderShutdowns);
   if (managedProvider !== null) {
-    pending.push(shutdownOwnedProvider(managedProvider));
+    pending.add(shutdownOwnedProvider(managedProvider));
   }
 
-  let timer;
-  const shutdown = Promise.all(pending);
-  const deadline = new Promise((resolve) => {
-    timer = setTimeout(() => {
-      diagnostic("warning", "provider flush timed out; abandoning pending export");
-      resolve();
-    }, SHUTDOWN_TIMEOUT_MS);
-  });
-  return Promise.race([shutdown, deadline]).finally(() => clearTimeout(timer));
+  return Promise.all(pending);
 }
 
 export function shutdown() {

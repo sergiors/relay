@@ -26,6 +26,7 @@ _ExcInfo = (
 _SDK_HANDLER_FLAG = "_relay_structured_logging_handler"
 _CONFIGURED_HANDLER_ATTR = "_relay_configured_logging_handler"
 _CONFIG_LOCK = threading.RLock()
+# Application values using these keys stay nested under ``attributes``.
 _FRAMEWORK_FIELDS = frozenset(
     {
         "app",
@@ -210,7 +211,6 @@ class Logger:
 
     def append_keys(self, **keys: object) -> None:
         """Append fields for this named logger using copy-on-write context state."""
-        _validate_fields(keys)
         BRIDGE.append_keys(self.name, keys)
 
     def remove_keys(self, *keys: str | Iterable[str]) -> None:
@@ -239,13 +239,17 @@ class Logger:
 
     @contextmanager
     def append_context_keys(self, **keys: object) -> Iterator[None]:
-        """Temporarily add context-local fields for this named logger."""
-        _validate_fields(keys)
-        token = BRIDGE.bind_fields(self.name, keys)
+        """Temporarily add context-local fields for this named logger.
+
+        Leaving the block removes only this call's layer: keys appended or
+        removed inside it, other loggers' temporary fields, and a newer
+        invocation keep their current values.
+        """
+        handle = BRIDGE.bind_fields(self.name, keys)
         try:
             yield
         finally:
-            BRIDGE.reset_fields(token)
+            BRIDGE.reset_fields(handle)
 
     def _log(
         self,
@@ -265,12 +269,10 @@ class Logger:
             raise ValueError("stacklevel must be at least 1")
 
         call_fields = _copy_fields(extra)
-        _validate_fields(call_fields)
         invocation, appended, temporary, expired = BRIDGE.snapshot(self.name)
         fields: dict[str, object] = dict(appended)
         fields.update(temporary)
         fields.update(call_fields)
-        _validate_fields(fields)
 
         record_extra = _record_extra(
             self._service,
@@ -441,14 +443,18 @@ def _record_extra(
 ) -> dict[str, object]:
     trace_id: str | None = None
     span_id: str | None = None
-    active_trace, active_span = (
-        _active_span_ids() if include_active_span else (None, None)
-    )
-    if active_trace is not None:
-        trace_id = active_trace
-        span_id = active_span
-    elif invocation is not None:
-        trace_id = invocation.trace_id
+    if include_active_span:
+        trace_api = _trace_api()
+        if trace_api is None:
+            # Without the optional API there is no active-span source, so the
+            # invocation frame's validated trace ID is the only correlation.
+            trace_id = invocation.trace_id if invocation is not None else None
+        else:
+            # With the API available, only a valid current SpanContext
+            # correlates a record. No span, an explicit empty/root context, and
+            # an expired lease omit correlation instead of pairing the
+            # invocation ID with a span that does not exist.
+            trace_id, span_id = _active_span_ids(trace_api)
 
     extra: dict[str, object] = {
         "service": service,
@@ -470,20 +476,23 @@ def _record_extra(
         extra["span_id"] = span_id
 
     for name, value in fields.items():
-        extra[name] = value
+        if name not in _FRAMEWORK_FIELDS:
+            extra[name] = value
     return extra
 
 
-def _active_span_ids() -> tuple[str | None, str | None]:
+def _trace_api() -> Any:
     global _TRACE_API
     if _TRACE_API is _TRACE_API_UNSET:
         with _TRACE_API_LOCK:
             if _TRACE_API is _TRACE_API_UNSET:
                 _TRACE_API = _load_trace_api()
-    if _TRACE_API is None:
-        return None, None
+    return _TRACE_API
+
+
+def _active_span_ids(trace_api: Any) -> tuple[str | None, str | None]:
     try:
-        span = _TRACE_API.get_current_span()
+        span = trace_api.get_current_span()
         span_context = span.get_span_context()
         if not span_context.is_valid:
             return None, None
@@ -501,9 +510,3 @@ def _load_trace_api() -> Any:
     except Exception:
         return None
     return api if hasattr(api, "get_current_span") else None
-
-
-def _validate_fields(fields: Mapping[str, object]) -> None:
-    reserved = sorted(set(fields).intersection(_FRAMEWORK_FIELDS))
-    if reserved:
-        raise ValueError("reserved Relay log field name(s): " + ", ".join(reserved))

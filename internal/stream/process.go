@@ -301,10 +301,13 @@ func (c *Consumer) processMessage(
 }
 
 // acknowledgeMessage performs the single atomic source ACK and terminal
-// invocation-state retention for a message that needs no handler dispatch, such
-// as a confirmed tombstone. It applies the same group-generation fence as every
-// other ACK path.
-func (c *Consumer) acknowledgeMessage(ctx context.Context, msgID string, deliveryGen uint64) (terminalAckResult, error) {
+// invocation-state retention for a message whose handler work is already
+// settled, such as a confirmed tombstone or a resolved schedule occurrence. It
+// applies the same group-generation fence as every other ACK path and records
+// the failure on its own redis.ack span.
+func (c *Consumer) acknowledgeMessage(
+	ctx context.Context, msgID string, deliveryGen uint64,
+) (terminalAckResult, error) {
 	ackCtx, ackSpan := redisSpan(ctx, "redis.ack")
 	result, err := c.ackDelivery(ackCtx, msgID, deliveryGen, false)
 	if err != nil && !errors.Is(err, errDeliverySuperseded) {
@@ -455,7 +458,16 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 	handlerCtx = WithInvocationState(handlerCtx,
 		NewInvocationState(ctx, c.invStateStore, c.stream, c.group, msgID, c.log))
 
-	err := c.scheduleRunner(handlerCtx, msgID, occ, occ.Payload())
+	// Mirror the event path: a child span around the runner dispatch keeps the
+	// Redis bookkeeping of processMessage separate from invocation execution,
+	// which the runner instruments itself.
+	dispatchCtx, dispatchSpan := tracing.Start(handlerCtx, "stream.dispatch")
+	err := c.scheduleRunner(dispatchCtx, msgID, occ, occ.Payload())
+	if err != nil {
+		dispatchSpan.RecordError(err)
+		dispatchSpan.SetStatus(codes.Error, err.Error())
+	}
+	dispatchSpan.End()
 	if err != nil {
 		// Shutting down: not a real attempt; leave pending for a live consumer.
 		if ctx.Err() != nil {
@@ -466,7 +478,8 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 		// retry backoff) means the message stays pending, not a failed attempt:
 		// no retry accounting, no DLQ.
 		if errors.Is(err, ErrInvocationNotEligible) {
-			c.log.Debug("Schedule: invocation not eligible (running or waiting for retry); leaving pending",
+			c.log.Debug(
+				"Schedule: invocation not eligible (running or waiting for retry); leaving pending",
 				"message_id", msgID,
 				"delivery_attempt", deliveryNum,
 			)
@@ -482,7 +495,8 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 		// (exhaustion implies retries were attempted, which an obsolete
 		// occurrence never is).
 		if errors.Is(err, ErrInvocationObsolete) {
-			c.log.Debug("Schedule: occurrence obsolete (app or schedule removed); acknowledging",
+			c.log.Debug(
+				"Schedule: occurrence obsolete (app or schedule removed); acknowledging",
 				"message_id", msgID,
 				"delivery_attempt", deliveryNum,
 				"reason", err,
@@ -491,7 +505,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 			// one atomic script, exactly like the success tail. An ACK
 			// failure means the message stays pending (the script's staged marker is
 			// persistent, so a redelivery still resolves it and nothing expires).
-			result, ackErr := c.ackDelivery(ctx, msgID, deliveryGen, false)
+			result, ackErr := c.acknowledgeMessage(ctx, msgID, deliveryGen)
 			if ackErr != nil {
 				c.handleAckFailure(ctx, deliveryGen, msgID, ackErr)
 				if errors.Is(ackErr, errDeliverySuperseded) {
@@ -551,7 +565,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 		return "pending", nil
 	}
 
-	result, err := c.ackDelivery(ctx, msgID, deliveryGen, false)
+	result, err := c.acknowledgeMessage(ctx, msgID, deliveryGen)
 	if err != nil {
 		c.handleAckFailure(ctx, deliveryGen, msgID, err)
 		if errors.Is(err, errDeliverySuperseded) {

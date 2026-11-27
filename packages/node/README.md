@@ -69,10 +69,7 @@ lines.
 
 ```ts
 import type { HandlerContext } from "@sergiors/relay-runtime";
-import {
-  Logger,
-  type LoggerOptions,
-} from "@sergiors/relay-runtime/logging";
+import { Logger, type LoggerOptions } from "@sergiors/relay-runtime/logging";
 
 const loggerOptions: LoggerOptions = { service: "users", level: "INFO" };
 const log = new Logger(loggerOptions);
@@ -133,18 +130,25 @@ Level precedence is constructor option (including positional `level`),
 `ERROR`, and `CRITICAL`. An invalid, non-empty value throws during construction.
 
 `appendKeys(fields)` and `removeKeys(...names)` manage persistent attributes on
-that Logger instance. `withContextKeys(fields, callback)` (also available as
-`withContext`) adds temporary async-context attributes. Fields merge in this
-order: persistent values, temporary values, then per-call attributes.
-Concurrent async work gets isolated temporary scopes. Reserved names such as
-`service` and `trace_id` are valid application attributes; they stay nested and
-cannot replace Relay's top-level metadata. Relay binds `app`, `handler`,
-`request_id`, `attempt`, and `cold_start` before handler imports and expires
-inherited invocation context after the handler ends.
+that Logger instance. They remain attached to that instance across invocations
+while it lives. Unlike Python's invocation-context `append_keys`, Node's
+`appendKeys` state is per Logger instance. `withContextKeys(fields, callback)`
+adds temporary async-context attributes. Async resources created inside a scope
+inherit its temporary layer in their own context, while concurrent work keeps
+scopes isolated. Unlike persistent `appendKeys`, handler completion expires this
+layer and all invocation correlation. Fields merge in this order: persistent
+values, temporary values, then per-call attributes.
+Reserved names such as `service` and `trace_id` are valid application
+attributes; they stay nested and cannot replace Relay's top-level metadata. Relay
+binds `app`, `handler`, `request_id`, `attempt`, and `cold_start` before handler
+imports and expires inherited invocation context after the handler ends.
 
 Every JSON record includes `timestamp`, `level`, `service`, `message`, `logger`,
-and `location`. Active OpenTelemetry spans add `trace_id` and `span_id`;
-otherwise a valid invocation trace ID is used. `attributes` is omitted when
+and `location`. A valid active OpenTelemetry span context adds `trace_id` and
+`span_id`, including remote or non-recording spans. A valid invocation trace ID
+is used only when the optional OpenTelemetry API is unavailable. When the API is
+available but the active context has no valid span context (including
+`ROOT_CONTEXT`), trace and span IDs are omitted. `attributes` is omitted when
 empty. Records include `app`, `handler`, and `request_id` for Loki/Tempo
 correlation; no Grafana-specific behavior is assumed.
 
@@ -161,10 +165,16 @@ Error attributes and exceptions include bounded cause details; `AggregateError`
 also includes a bounded `errors` list. Serialization limits depth, collection
 size, and output line length. Circular, unsupported, and accessor values are
 marked; accessor properties and `toJSON` methods are not invoked.
+Native stack frames are included only when Relay can verify Node's default stack
+accessor and formatter. Custom or unknown stack accessors and
+`Error.prepareStackTrace` hooks are not invoked; in those cases exception
+diagnostics retain type and message but omit frames.
 
-Detached async work is not stopped when its handler returns. If it logs after
-the invocation ends, its inherited context lease is expired, so invocation
-fields and trace correlation are omitted.
+Detached async work is not stopped when its handler returns. Its async resources
+may continue inheriting OpenTelemetry context through the official context
+manager and can continue tracing. The Logger's invocation lease nevertheless
+expires, so detached logs omit invocation fields, scoped attributes, and
+trace/span correlation.
 
 The JSDoc example in `examples/jsdoc-handler.mjs` can be checked after building
 the declarations with `pnpm run check`. The corresponding TypeScript example is

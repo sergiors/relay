@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from typing import ParamSpec, TypeVar, cast, overload
 
+from opentelemetry import context as context_api
 from opentelemetry import trace
 from opentelemetry.trace import Span, SpanKind, Status, StatusCode
 from opentelemetry.util.types import AttributeValue
@@ -27,20 +28,44 @@ def _span_scope(
     kind: SpanKind,
     record_exception: bool,
 ) -> Iterator[Span]:
-    with native_tracer.start_as_current_span(
+    # The native ``start_as_current_span`` context manager re-raises anything
+    # its own ``set_status``, ``record_exception``, or ``end`` call raises, which
+    # would replace the block's exception (or its successful result) with a
+    # provider failure. This scope uses the official span/context API directly
+    # so each provider call is best effort while attach/detach ordering stays
+    # identical to the native helper: detach first, then end.
+    span = native_tracer.start_span(
         name,
         kind=kind,
         attributes=attributes,
         record_exception=False,
         set_status_on_exception=False,
-    ) as span:
+    )
+    token = context_api.attach(trace.set_span_in_context(span))
+    try:
         try:
             yield span
         except Exception as exc:
-            span.set_status(Status(StatusCode.ERROR))
+            _best_effort(span.set_status, Status(StatusCode.ERROR))
             if record_exception:
-                span.record_exception(exc)
+                _best_effort(span.record_exception, exc)
             raise
+    finally:
+        _best_effort(context_api.detach, token)
+        _best_effort(span.end)
+
+
+def _best_effort(call: Callable[..., object], *args: object) -> None:
+    """Run one provider call without letting it replace the block's outcome.
+
+    Only ``Exception`` is swallowed: a ``BaseException`` such as an
+    ``asyncio.CancelledError`` or ``KeyboardInterrupt`` keeps Python's
+    cancellation and control-flow semantics.
+    """
+    try:
+        call(*args)
+    except Exception:
+        pass
 
 
 class Tracer:
@@ -88,8 +113,7 @@ class Tracer:
         name: str | None = None,
         record_exception: bool = False,
     ) -> (
-        Callable[..., object]
-        | Callable[[Callable[..., object]], Callable[..., object]]
+        Callable[..., object] | Callable[[Callable[..., object]], Callable[..., object]]
     ):
         """Decorate a callable so each call runs inside a span.
 
@@ -99,14 +123,10 @@ class Tracer:
         time because their span would end before the body is iterated.
         """
         if func is not None:
-            return self._decorate(
-                func, name=name, record_exception=record_exception
-            )
+            return self._decorate(func, name=name, record_exception=record_exception)
 
         def decorator(inner: Callable[..., object]) -> Callable[..., object]:
-            return self._decorate(
-                inner, name=name, record_exception=record_exception
-            )
+            return self._decorate(inner, name=name, record_exception=record_exception)
 
         return decorator
 
@@ -124,7 +144,10 @@ class Tracer:
         native OpenTelemetry context manager is not asynchronous. An ordinary
         ``Exception`` marks the span as failed without a description and is
         re-raised. Process-control exceptions and cancellation propagate
-        without an exception event or status change.
+        without an exception event or status change. A provider failure while
+        setting the status, recording the exception, ending the span, or
+        detaching its context is swallowed, so it cannot mask the block's own
+        result or exception.
         """
         if not isinstance(name, str):
             raise TypeError("name must be a string")
@@ -164,9 +187,7 @@ class Tracer:
             coroutine_func = cast(Callable[_P, Awaitable[_R]], func)
 
             @functools.wraps(func)
-            async def async_wrapper(
-                *args: _P.args, **kwargs: _P.kwargs
-            ) -> _R:
+            async def async_wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
                 with _span_scope(
                     self._tracer,
                     span_name,

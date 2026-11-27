@@ -1,15 +1,18 @@
 // Optional OpenTelemetry correlation: standalone records carry no invocation
 // or trace fields, span ids — valid unsampled, nested, and dynamic — are read
-// through the shared global registry, an invocation without a span falls back
-// to the frame trace id, an expired detached lease drops correlation entirely,
-// and the logger never registers or replaces a provider. The absence of the
-// optional API is proven in a child process where its resolution fails.
+// through the shared global registry, an invocation with the API present but
+// no active span (including an explicit ROOT_CONTEXT) omits correlation
+// instead of falling back to the frame trace id, an expired detached lease
+// drops correlation, and without the API an invocation record falls back to
+// the frame trace id. The logger never registers or replaces a provider, and
+// the absence of the optional API is proven in child processes where its
+// resolution fails.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { context, trace } from "@opentelemetry/api";
+import { context, ROOT_CONTEXT, trace } from "@opentelemetry/api";
 
 import { runInvocation } from "../../../internal/runtime/node/logging-context.mjs";
 import { Logger } from "../dist/logging.js";
@@ -172,7 +175,10 @@ test("records never initialize, replace, or depend on a provider", async () => {
   }
 });
 
-test("an invocation without a span falls back to the frame trace id", async () => {
+test("an invocation with the API present but no active span omits correlation", async () => {
+  // with the API importable, only a valid active span context may correlate a
+  // record: the frame's trace id must never be paired with a span that does
+  // not exist, even for an explicit ROOT_CONTEXT
   const log = new Logger({ service: "invocation-trace", level: "INFO" });
   const frame = (traceId) => ({
     app: "trace-app",
@@ -185,6 +191,9 @@ test("an invocation without a span falls back to the frame trace id", async () =
   const records = await captureRecords(async () => {
     await runInvocation(frame("d".repeat(32)), async () => {
       log.info("frame-trace-only");
+      context.with(ROOT_CONTEXT, () => {
+        log.info("root-context-record");
+      });
       withSpan(spanContext(TRACE_ONE, SPAN_A), () => {
         log.info("span-wins");
       });
@@ -198,13 +207,21 @@ test("an invocation without a span falls back to the frame trace id", async () =
   });
 
   const fromFrame = oneRecord(records, "frame-trace-only");
-  assert.equal(fromFrame.trace_id, "d".repeat(32));
+  assert.ok(
+    !("trace_id" in fromFrame),
+    `a frame trace id must not pair with a missing span: ${JSON.stringify(fromFrame)}`,
+  );
   assert.ok(!("span_id" in fromFrame), "no span means no span id");
+  // the invocation's own correlation metadata is untouched by the omission
   assert.equal(fromFrame.app, "trace-app");
   assert.equal(fromFrame.request_id, "r-trace");
 
+  const root = oneRecord(records, "root-context-record");
+  assert.ok(!("trace_id" in root), "ROOT_CONTEXT must not correlate");
+  assert.ok(!("span_id" in root), "ROOT_CONTEXT must not correlate");
+
   const spanWins = oneRecord(records, "span-wins");
-  assert.equal(spanWins.trace_id, TRACE_ONE, "an active span overrides the frame trace id");
+  assert.equal(spanWins.trace_id, TRACE_ONE, "an active span correlates");
   assert.equal(spanWins.span_id, SPAN_A);
 
   const invalid = oneRecord(records, "invalid-frame-trace");
@@ -245,7 +262,13 @@ test("an expired detached lease drops invocation and span correlation", async ()
   const live = oneRecord(records, "live-invocation");
   assert.equal(live.app, "expired-app");
   assert.equal(live.request_id, "r-expired");
-  assert.equal(live.trace_id, "d".repeat(32));
+  // the API is present with no active span for this record: correlation is
+  // omitted rather than falling back to the frame trace id
+  assert.ok(
+    !("trace_id" in live),
+    "a live record without an active span must not correlate",
+  );
+  assert.ok(!("span_id" in live));
 
   const expired = oneRecord(records, "expired-span");
   for (const key of ["app", "handler", "request_id", "attempt", "cold_start", "trace_id", "span_id"]) {
@@ -288,6 +311,48 @@ test("logging without the OpenTelemetry API installed still emits records", () =
   assert.deepEqual(record.attributes, { standalone: true });
   assert.ok(!("trace_id" in record) && !("span_id" in record));
   assert.ok(!("app" in record));
+  assert.ok(
+    !child.stderr.includes("MODULE_NOT_FOUND"),
+    "the missing optional API must degrade silently",
+  );
+});
+
+test("without the API an invocation record falls back to the frame trace id", () => {
+  const child = spawnSync(
+    process.execPath,
+    [
+      "--require",
+      fileURLToPath(new URL("./helpers/block-otel.cjs", import.meta.url)),
+      fileURLToPath(new URL("./fixtures/no-otel-invocation.mjs", import.meta.url)),
+    ],
+    {
+      cwd: packageRoot,
+      encoding: "utf8",
+      env: Object.fromEntries(
+        Object.entries(process.env).filter(
+          ([name]) => name !== "LOG_LEVEL" && name !== "OTEL_SERVICE_NAME",
+        ),
+      ),
+    },
+  );
+
+  assert.equal(child.status, 0, `child process failed:\n${child.stderr}`);
+  const records = child.stderr
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("{"))
+    .map((line) => JSON.parse(line));
+  const [record] = records.filter(
+    (entry) => entry.message === "api-absent-invocation",
+  );
+  assert.ok(record, `child emitted no record; stderr:\n${child.stderr}`);
+
+  // with no span source available, the frame's validated trace id is the
+  // only correlation left — no span id can exist without a span
+  assert.equal(record.trace_id, "d".repeat(32));
+  assert.ok(!("span_id" in record), "no span means no span id");
+  assert.equal(record.app, "no-otel-app");
+  assert.equal(record.request_id, "r-no-otel");
   assert.ok(
     !child.stderr.includes("MODULE_NOT_FOUND"),
     "the missing optional API must degrade silently",

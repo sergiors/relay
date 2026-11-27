@@ -1063,6 +1063,72 @@ func TestPythonProviderShutdownBoundedOnExporterOutage(t *testing.T) {
 	}
 }
 
+// TestPythonProviderPartialInitIsDiscardedNotLeaked pins the partial-init
+// boundary: when provider registration fails AFTER the provider and its batch
+// processor were constructed (the processor's export worker already started,
+// never attached), the failure is reported once, only Relay's own objects are
+// released, the handler import observes NO registered provider, and neither
+// the invocation nor the channel-close exit is affected — best-effort
+// telemetry can never hang or fail the container.
+func TestPythonProviderPartialInitIsDiscardedNotLeaked(t *testing.T) {
+	otelDir := requireOtelPython(t)
+
+	dir := t.TempDir()
+	// fault injection at the process boundary: a sitecustomize on the test
+	// PYTHONPATH runs before the bootstrap and makes the registration step
+	// fail deterministically, without touching production code
+	if err := os.WriteFile(filepath.Join(dir, "sitecustomize.py"), []byte(`
+from opentelemetry.sdk.trace import TracerProvider
+
+
+def _fail_add_span_processor(self, span_processor):
+    raise RuntimeError("injected add_span_processor failure")
+
+
+TracerProvider.add_span_processor = _fail_add_span_processor
+`), 0o644); err != nil {
+		t.Fatalf("write sitecustomize fault injection: %v", err)
+	}
+	writeHandler(t, dir, "handler", providerHandlerSource)
+	p := startEmbeddedBootstrap(t, dir, Bootstrap, []string{
+		otelPythonEnv(otelDir, dir),
+		"OTEL_SERVICE_NAME=partial-svc",
+	})
+
+	// when the first invocation applies its endpoint so Relay attempts (and
+	// fails) provider registration
+	r := p.invoke(t, "handler.work", `{"step":"1"}`, map[string]string{
+		"OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:9",
+	})
+
+	// then the telemetry failure never fails the invocation
+	if !r.OK {
+		t.Fatalf("invoke failed despite best-effort telemetry: %s", r.Err)
+	}
+	if !strings.Contains(r.Out, "import-provider=ProxyTracerProvider") {
+		t.Errorf("out = %q, want the handler import to observe NO registered provider", r.Out)
+	}
+	if !strings.Contains(r.Out, "span-created step=1") {
+		t.Errorf("handler did not run: %q", r.Out)
+	}
+
+	// and the partial initialization is reported once
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(p.stderrString(), "provider registration failed (RuntimeError)") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !strings.Contains(p.stderrString(), "provider registration failed (RuntimeError)") {
+		t.Errorf("stderr = %q, want the registration-failure diagnostic", p.stderrString())
+	}
+
+	// and the discarded provider and unattached processor shut down without
+	// hanging: the channel-close exit stays inside the bounded budget
+	closeAndWait(t, p, 5*time.Second)
+}
+
 // TestPythonRelayOtelProviderInvalidValueFailsSafe proves the ownership
 // setting's safe failure mode: RELAY_OTEL_PROVIDER only accepts "managed" or
 // "application"; any other non-empty value is invalid, so Relay skips provider

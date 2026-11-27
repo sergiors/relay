@@ -1,6 +1,6 @@
 [project]
 name = "relay-runtime"
-version = "0.4.0"
+version = "0.4.1"
 description = "Official Python library and public handler interfaces for Relay applications."
 readme = "README.md"
 license = "GPL-3.0-or-later"

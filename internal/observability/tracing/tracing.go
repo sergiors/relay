@@ -34,9 +34,15 @@
 //   - OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES are applied by the
 //     resource env detector, with OTEL_SERVICE_NAME taking precedence.
 //
-// Known limitation: OTEL_PROPAGATORS is not honored. The pinned OTel core only
-// ships the W3C TraceContext and Baggage propagators, so Relay always installs
-// exactly those two rather than hand-rolling the other (b3/jaeger/xray) values.
+// Known limitations:
+//
+//   - OTEL_PROPAGATORS is not honored. The pinned OTel core only ships the W3C
+//     TraceContext and Baggage propagators, so Relay always installs exactly
+//     those two rather than hand-rolling the other (b3/jaeger/xray) values.
+//   - OTEL_TRACES_EXPORTER is not honored. Relay decides whether to build a
+//     managed exporter solely from the endpoint variables above, so
+//     OTEL_TRACES_EXPORTER=none does NOT disable export while an endpoint is
+//     configured. Use OTEL_SDK_DISABLED=true for the standard opt-out.
 //
 // The package also owns the process-configuration contract for managed app
 // runtimes (see ResolveManagedAppConfig): the allowlisted worker inheritance,

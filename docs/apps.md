@@ -244,6 +244,47 @@ install exactly `@opentelemetry/api@1.10.0` and configure their own SDK/provider
 provider and context-manager registrations must use that version because
 OpenTelemetry's global registry requires an exact version match.
 
+#### Python logging and tracing
+
+Add `relay-runtime` to a Python app's dependencies to use its logger. Relay's
+managed Python handler images supply the OpenTelemetry API, SDK, and OTLP
+exporters; standalone applications can install the optional tracing extra:
+
+```sh
+uv add relay-runtime
+# Standalone tracing:
+uv add "relay-runtime[tracing]"
+```
+
+```python
+from relay_runtime.logging import Logger
+from relay_runtime.tracing import Tracer
+from relay_runtime.typing import HandlerContext
+
+log = Logger(service="orders")
+tracer = Tracer("orders")
+
+
+async def handler(
+    event: dict[str, str],
+    context: HandlerContext,
+) -> None:
+    with tracer.span("orders.process") as span:
+        log.info(
+            "Processing order",
+            extra={
+                "order_id": event["order_id"],
+                "remaining_ms": context.get_remaining_time_ms(),
+            },
+        )
+        span.set_attribute("order.kind", event["kind"])
+        await process_order(event["order_id"])
+```
+
+See the Python package documentation for
+[structured logging](../packages/python/README.md#structured-logging) and
+[tracing](../packages/python/README.md#tracing).
+
 Event handler names must be unique across an app's event rules. Every schedule
 and service also needs a unique, stable name within its app; names follow the
 same format as app names (`[a-z0-9][a-z0-9._-]*`, up to 63 characters, no

@@ -237,8 +237,179 @@ test("the runtime and SDK module copies share one invocation context", async () 
   assert.equal(shared.handler, "index.shared");
   assert.equal(shared.request_id, "r-shared");
   assert.equal(shared.attempt, 7);
-  assert.equal(shared.trace_id, "c".repeat(32));
+  // with the API present and no active span, the shared invocation state must
+  // never fabricate a trace id from the frame
+  assert.ok(
+    !("trace_id" in shared),
+    "no active span means no trace id while the API is present",
+  );
   assert.equal(shared.cold_start, false, "the owner's invocation count is process-wide");
 
   assert.deepEqual(oneRecord(records, "shared-scoped").attributes, { scoped: true });
+});
+
+test("hostile thrown properties are never invoked and the channel recovers", async () => {
+  // given thrown values whose diagnostic surfaces are hostile: a plain object
+  // with a stack accessor, a native Error with its own stack accessor, and a
+  // custom Error.prepareStackTrace hook installed after module load
+  let objectGetterCalls = 0;
+  const plainThrow = { message: "plain-object" };
+  Object.defineProperty(plainThrow, "stack", {
+    configurable: true,
+    get() {
+      objectGetterCalls += 1;
+      return "forbidden";
+    },
+  });
+
+  let nativeGetterCalls = 0;
+  const nativeThrow = new Error("native-hostile");
+  Object.defineProperty(nativeThrow, "stack", {
+    configurable: true,
+    get() {
+      nativeGetterCalls += 1;
+      return "forbidden";
+    },
+  });
+
+  let hookCalls = 0;
+  const previousHook = Error.prepareStackTrace;
+  Error.prepareStackTrace = () => {
+    hookCalls += 1;
+    return "hooked";
+  };
+
+  const plainInvoker = createInvoker(async () => async () => {
+    throw plainThrow;
+  });
+  const nativeInvoker = createInvoker(async () => async () => {
+    throw nativeThrow;
+  });
+  const hookInvoker = createInvoker(async () => async () => {
+    throw new TypeError("hooked-path");
+  });
+  const healthy = createInvoker(async () => async () => {});
+
+  const results = [];
+  let stderr = "";
+  try {
+    stderr = await captureStderr(async () => {
+      results.push(
+        await plainInvoker({
+          id: "h1",
+          handler: "index.plain",
+          env: {},
+          context: contextFrame({ handler: "index.plain" }),
+        }),
+      );
+      results.push(
+        await nativeInvoker({
+          id: "h2",
+          handler: "index.native",
+          env: {},
+          context: contextFrame({ handler: "index.native" }),
+        }),
+      );
+      results.push(
+        await hookInvoker({
+          id: "h3",
+          handler: "index.hook",
+          env: {},
+          context: contextFrame({ handler: "index.hook" }),
+        }),
+      );
+    });
+  } finally {
+    Error.prepareStackTrace = previousHook;
+  }
+
+  // then no hostile accessor or hook is ever invoked, each failure maps to a
+  // stable single-prefixed error string, and the channel stays healthy
+  assert.equal(objectGetterCalls, 0, "a plain object's stack accessor must not run");
+  assert.equal(nativeGetterCalls, 0, "a custom stack accessor must not run");
+  assert.equal(hookCalls, 0, "Error.prepareStackTrace must not be called");
+
+  assert.equal(results[0].ok, false);
+  assert.equal(
+    results[0].error,
+    'handler "index.plain" failed: non-Error value thrown',
+  );
+  assert.equal(results[1].ok, false);
+  assert.equal(
+    results[1].error,
+    "handler \"index.native\" failed: Error: native-hostile",
+  );
+  assert.equal(results[2].ok, false);
+  assert.equal(
+    results[2].error,
+    "handler \"index.hook\" failed: TypeError: hooked-path",
+  );
+
+  // the operator-visible mirror carries the same single prefix, once
+  assert.equal(
+    stderr.split('handler "index.plain" failed:').length - 1,
+    1,
+    `stderr must carry exactly one prefix per failure; stderr:\n${stderr}`,
+  );
+  assert.ok(stderr.includes(results[1].error), `stderr:\n${stderr}`);
+
+  results.push(
+    await healthy({
+      id: "h4",
+      handler: "index.ok",
+      env: {},
+      context: contextFrame({ handler: "index.ok" }),
+    }),
+  );
+  assert.deepEqual(results[3], { type: "result", id: "h4", ok: true });
+});
+
+test("a scope does not extend the invocation lease for detached work", async () => {
+  const log = new Logger({ service: "detached-scope", level: "INFO" });
+  let detached;
+
+  const records = await captureRecords(async () => {
+    await runInvocation(
+      {
+        app: "detached-app",
+        handler: "index.detached",
+        requestId: "r-scope-detached",
+        attempt: 1,
+        traceId: "e".repeat(32),
+      },
+      async () => {
+        log.withContextKeys({ scoped: true }, () => {
+          log.info("detached-live");
+          // work deliberately outlives the invocation: the scope is entered
+          // here but the callback returns without awaiting it
+          detached = (async () => {
+            await sleep(20);
+            log.info("detached-late");
+          })();
+        });
+      },
+    );
+    await detached;
+  });
+
+  const live = oneRecord(records, "detached-live");
+  assert.deepEqual(live.attributes, { scoped: true });
+  assert.equal(live.app, "detached-app");
+
+  // when the detached work logs after its invocation ended
+  const late = oneRecord(records, "detached-late");
+  // then the expired lease drops the scope's fields together with every
+  // invocation field: a scope never extends the lease it was opened under
+  assert.equal(late.attributes, undefined, "scope fields must expire with the lease");
+  for (const key of [
+    "app",
+    "handler",
+    "request_id",
+    "attempt",
+    "cold_start",
+    "trace_id",
+    "span_id",
+  ]) {
+    assert.ok(!(key in late), `post-invocation logging must omit ${key}`);
+  }
 });

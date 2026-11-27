@@ -19,7 +19,16 @@ from uuid import UUID
 __all__ = ["JsonFormatter"]
 
 _MAX_DEPTH = 16
+_MAX_ITEMS = 10_000
+_MAX_LINE_LENGTH = 1024 * 1024
 _FALLBACK_MESSAGE = "log record could not be serialized"
+_MINIMAL_FALLBACK_LINE = (
+    '{"level":"ERROR","logger":"relay.logging",'
+    '"message":"log record could not be serialized"}'
+)
+# Shape parity with the Node SDK, which reports its line-length fallback with
+# this marker. It is a payload value, not a Python exception class.
+_LINE_OVERFLOW_ERROR = "RangeError"
 _EXCEPTION_FORMATTER = logging.Formatter()
 
 _STRING_METADATA = (
@@ -37,18 +46,24 @@ class JsonFormatter(logging.Formatter):
 
     The exact key set is documented in the package README. Application values
     are converted to a finite, JSON-native representation; a value outside the
-    supported set is replaced by a marker instead of failing the record.
+    supported set is replaced by a marker instead of failing the record. One
+    record is bounded: a mapping or sequence contributes at most 10,000 items,
+    and a rendered line longer than 1 MiB falls back to the safe fallback line.
     """
 
     def format(self, record: logging.LogRecord) -> str:
         try:
-            payload = _payload(record)
-            return _dumps(payload)
+            line = _dumps(_payload(record))
+            # ensure_ascii makes the line pure ASCII, so its length is also its
+            # UTF-8 byte length.
+            if len(line) > _MAX_LINE_LENGTH:
+                return _fallback_line(record, _LINE_OVERFLOW_ERROR)
+            return line
         except Exception as exc:
             # One malformed record must not break the handler chain or replace
             # the application's error with a logging error. BaseException is
             # deliberately not caught: process-control signals still propagate.
-            return _fallback_line(record, exc)
+            return _fallback_line(record, _error_name(exc))
 
 
 def _payload(record: logging.LogRecord) -> dict[str, object]:
@@ -152,6 +167,10 @@ def _json_value(value: object, depth: int = 0, seen: set[int] | None = None) -> 
                     # JSON object keys are strings. A mixed-key mapping is not
                     # converted with str() because that can collide and leak.
                     return {"$unsupported": type(value).__qualname__}
+                if len(result) >= _MAX_ITEMS:
+                    # Matches the Node SDK: an oversized mapping becomes one
+                    # truncation marker instead of a partial object.
+                    return {"$truncated": True}
                 result[key] = _json_value(item, depth + 1, active)
 
             return result
@@ -168,7 +187,13 @@ def _json_value(value: object, depth: int = 0, seen: set[int] | None = None) -> 
         active.add(id(value))
 
         try:
-            return [_json_value(item, depth + 1, active) for item in value]
+            items: list[object] = []
+            for item in value:
+                if len(items) >= _MAX_ITEMS:
+                    items.append({"$truncated": True})
+                    break
+                items.append(_json_value(item, depth + 1, active))
+            return items
         finally:
             active.discard(id(value))
 
@@ -186,7 +211,14 @@ def _dumps(payload: dict[str, object]) -> str:
     )
 
 
-def _fallback_line(record: logging.LogRecord, exc: Exception) -> str:
+def _error_name(exc: BaseException) -> str:
+    try:
+        return type(exc).__qualname__
+    except Exception:
+        return "Exception"
+
+
+def _fallback_line(record: logging.LogRecord, error_name: str) -> str:
     try:
         payload: dict[str, object] = {
             "timestamp": datetime.fromtimestamp(record.created, UTC)
@@ -195,7 +227,7 @@ def _fallback_line(record: logging.LogRecord, exc: Exception) -> str:
             "level": record.levelname if isinstance(record.levelname, str) else "ERROR",
             "logger": record.name if isinstance(record.name, str) else "relay.logging",
             "message": _FALLBACK_MESSAGE,
-            "error": type(exc).__qualname__,
+            "error": error_name,
         }
         service = getattr(record, "service", None)
         payload["service"] = (
@@ -205,9 +237,9 @@ def _fallback_line(record: logging.LogRecord, exc: Exception) -> str:
         if isinstance(record.module, str) and isinstance(record.funcName, str):
             payload["location"] = f"{record.module}.{record.funcName}:{record.lineno}"
 
-        return _dumps(payload)
+        line = _dumps(payload)
+        # Metadata can be application-controlled (a logger name or module is
+        # only bounded by the caller), so the fallback is bounded too.
+        return line if len(line) <= _MAX_LINE_LENGTH else _MINIMAL_FALLBACK_LINE
     except Exception:
-        return (
-            '{"level":"ERROR","logger":"relay.logging",'
-            '"message":"log record could not be serialized"}'
-        )
+        return _MINIMAL_FALLBACK_LINE

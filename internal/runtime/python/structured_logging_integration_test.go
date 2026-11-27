@@ -592,6 +592,130 @@ def emit(event, context):
 	requireRecordCount(t, p, "correlation-record", 1)
 }
 
+// TestPythonRuntimeStructuredLoggingWithoutActiveSpanOmitsCorrelation pins
+// the API-present root behavior: with the real OTel API importable and no
+// active span (no carrier extracted for this invocation), a record omits
+// trace_id and span_id instead of pairing the invocation frame's trace ID
+// with a span that does not exist.
+func TestPythonRuntimeStructuredLoggingWithoutActiveSpanOmitsCorrelation(t *testing.T) {
+	otelDir := requireOtelPython(t)
+	requirePython(t)
+	src := relayRuntimeSrc(t)
+	requireSDKImport(t, src)
+
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", `
+from relay_runtime.logging import Logger
+
+log = Logger("no-span-svc", level="INFO")
+
+
+def emit(event, context):
+    log.info("no-span-record")
+`)
+	p := startEmbeddedBootstrap(t, dir, Bootstrap,
+		[]string{otelPythonEnv(otelDir, dir, src)})
+
+	// an invocation whose frame carries a VALID W3C trace id but whose
+	// delivery carries no traceparent: the API is present, root is active
+	r := p.invokeFrame(t, "handler.emit", `{}`, nil, nil, map[string]any{
+		"requestId":   "req-no-span",
+		"attempt":     1,
+		"maxAttempts": 1,
+		"deadline":    "2031-01-01T00:00:00Z",
+		"traceId":     "4bf92f3577b34da6a3ce929d0e0e4736",
+		"app":         "shop",
+		"handler":     "handler.emit",
+	})
+	if !r.OK {
+		t.Fatalf("invoke failed: %s", r.Err)
+	}
+
+	record := awaitJSONRecord(t, p, "no-span-record")
+	requireCoreRecord(t, record, "no-span-svc", "INFO")
+	requireInvocationMetadata(t, record, "shop", "handler.emit", "req-no-span", 1, true)
+	if traceID, present := record["trace_id"]; present {
+		t.Errorf("record trace_id = %#v, want omitted: the API is present with no active span",
+			traceID)
+	}
+	if spanID, present := record["span_id"]; present {
+		t.Errorf("record span_id = %#v, want omitted: the API is present with no active span",
+			spanID)
+	}
+	requireRecordCount(t, p, "no-span-record", 1)
+}
+
+// TestPythonRuntimeStaleScopeExitFromEarlierInvocationIsNoop pins the stale
+// scope-handle guard at the runtime layer: a temporary scope opened by an
+// EARLIER (now expired) invocation and exited inside a LATER invocation must
+// be a no-op — the current invocation's own temporary fields survive it.
+func TestPythonRuntimeStaleScopeExitFromEarlierInvocationIsNoop(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", `
+from relay_runtime.logging import Logger
+
+log = Logger("stale-scope-svc", level="INFO")
+SAVED = []
+
+
+def emit(event, context):
+    if event.get("open"):
+        manager = log.append_context_keys(tenant="stale")
+        manager.__enter__()
+        SAVED.append(manager)
+        log.info("first-record")
+        return
+    with log.append_context_keys(tenant="current"):
+        log.info("before-stale-record")
+        SAVED.pop().__exit__(None, None, None)
+        log.info("after-stale-record")
+`)
+	p := startPythonWithSDK(t, dir)
+
+	frame := func(requestID string) map[string]any {
+		return map[string]any{
+			"requestId":   requestID,
+			"attempt":     1,
+			"maxAttempts": 3,
+			"deadline":    "2031-01-01T00:00:00Z",
+			"app":         "shop",
+			"handler":     "handler.emit",
+		}
+	}
+
+	// given a scope opened by the first invocation and left un-exited
+	r1 := p.invokeFrame(t, "handler.emit", `{"open":true}`, nil, nil, frame("req-one"))
+	if !r1.OK {
+		t.Fatalf("first invoke failed: %s", r1.Err)
+	}
+	first := awaitJSONRecord(t, p, "first-record")
+	requireInvocationMetadata(t, first, "shop", "handler.emit", "req-one", 1, true)
+	if got := requireAttributes(t, first)["tenant"]; got != "stale" {
+		t.Errorf("first record tenant = %v, want stale", got)
+	}
+
+	// when the second invocation exits that stale handle inside its own scope
+	r2 := p.invokeFrame(t, "handler.emit", `{}`, nil, nil, frame("req-two"))
+	if !r2.OK {
+		t.Fatalf("second invoke failed: %s", r2.Err)
+	}
+	before := awaitJSONRecord(t, p, "before-stale-record")
+	after := awaitJSONRecord(t, p, "after-stale-record")
+
+	// then the stale exit is a no-op: the current scope's field survives it,
+	// under the second invocation's own identity
+	requireInvocationMetadata(t, before, "shop", "handler.emit", "req-two", 1, false)
+	if got := requireAttributes(t, before)["tenant"]; got != "current" {
+		t.Errorf("before-stale record tenant = %v, want current", got)
+	}
+	requireInvocationMetadata(t, after, "shop", "handler.emit", "req-two", 1, false)
+	if got := requireAttributes(t, after)["tenant"]; got != "current" {
+		t.Errorf("after-stale record tenant = %v, want current (stale exit must be a no-op)", got)
+	}
+	requireRecordCount(t, p, "after-stale-record", 1)
+}
+
 // TestPythonRuntimeStructuredLoggingTraceFallbackValidatesW3C pins the frame
 // trace fallback: a frame traceId that is not a valid W3C trace id (32
 // lowercase hex digits, non-zero) is never fabricated into a record, while a

@@ -24,7 +24,9 @@ import uuid
 from pathlib import Path
 
 import pytest
+from opentelemetry import context as context_api
 from opentelemetry import trace
+from opentelemetry.context import Context
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
@@ -949,3 +951,157 @@ def test_capture_method_outside_bind_spans_resolution_and_body(
     assert span.status.status_code == StatusCode.UNSET
     assert list(inspect.signature(handler).parameters) == ["event", "context"]
     assert handler.__doc__ == "Handle arithmetic."
+
+
+# --- correlation without an active span ------------------------------------
+
+
+def test_records_without_an_active_span_omit_trace_correlation(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # given the API is importable (this suite runs with it) but no span is
+    # current: the default context and an explicit empty context
+    service = f"no-span-{uuid.uuid4().hex[:8]}"
+    buffer = io.StringIO()
+    log = Logger(
+        service,
+        "INFO",
+        logger_handler=logging.StreamHandler(buffer),
+        logger_formatter=JsonFormatter(),
+    )
+
+    log.info("no-span-record")
+    token = context_api.attach(Context())
+    try:
+        log.info("root-context-record")
+    finally:
+        context_api.detach(token)
+
+    records = {}
+    for line in buffer.getvalue().splitlines():
+        if line.startswith("{"):
+            record = json.loads(line)
+            records[record["message"]] = record
+    for message in ("no-span-record", "root-context-record"):
+        record = records[message]
+        assert "trace_id" not in record, f"{message} must not pair a span: {record!r}"
+        assert "span_id" not in record, f"{message} must not pair a span: {record!r}"
+
+
+# --- hostile provider failures ---------------------------------------------
+
+
+class _HostileSpan:
+    """A provider span whose telemetry operations all raise."""
+
+    def __init__(self, calls: list[str]) -> None:
+        self._calls = calls
+
+    def get_span_context(self) -> object:
+        return trace.INVALID_SPAN_CONTEXT
+
+    def is_recording(self) -> bool:
+        return False
+
+    def set_status(self, status: object) -> None:
+        self._calls.append("set_status")
+        raise RuntimeError("hostile-set-status")
+
+    def record_exception(self, exception: object) -> None:
+        self._calls.append("record_exception")
+        raise RuntimeError("hostile-record-exception")
+
+    def end(self) -> None:
+        self._calls.append("end")
+        raise RuntimeError("hostile-end")
+
+
+class _HostileTracer:
+    """A native tracer whose spans always fail their telemetry operations."""
+
+    def __init__(self) -> None:
+        self.names: list[str] = []
+        self.calls: list[str] = []
+
+    def start_span(self, name: str, **kwargs: object) -> _HostileSpan:
+        self.names.append(name)
+        return _HostileSpan(self.calls)
+
+
+def _hostile_tracer(monkeypatch: pytest.MonkeyPatch) -> _HostileTracer:
+    hostile = _HostileTracer()
+    monkeypatch.setattr(trace, "get_tracer", lambda *args, **kwargs: hostile)
+    return hostile
+
+
+@pytest.mark.parametrize("entry", ["manual", "decorated"])
+def test_provider_failures_never_replace_the_block_outcome(
+    monkeypatch: pytest.MonkeyPatch, entry: str
+) -> None:
+    # given a provider whose span operations all raise, wired in where the
+    # facade resolves its native tracer
+    hostile = _hostile_tracer(monkeypatch)
+    tracer = Tracer("hostile.provider")
+
+    # when the block succeeds and when it fails, through either entry point
+    if entry == "manual":
+
+        def run_success() -> str:
+            with tracer.span("hostile.success"):
+                return "block-result"
+
+        assert run_success() == "block-result"
+        failure = ValueError("application-failure")
+        with pytest.raises(ValueError) as caught:
+            with tracer.span("hostile.error", record_exception=True):
+                raise failure
+        # then the application's own result and exception survive unchanged:
+        # no provider failure escapes or replaces them
+        assert caught.value is failure
+    else:
+
+        @tracer.capture_method
+        def succeed() -> str:
+            return "decorated-result"
+
+        assert succeed() == "decorated-result"
+        with pytest.raises(KeyError, match="application-key") as caught:
+
+            @tracer.capture_method
+            def fail() -> None:
+                raise KeyError("application-key")
+
+            fail()
+        assert isinstance(caught.value, KeyError)
+
+    # and every failing provider call was attempted best effort, not skipped
+    assert "set_status" in hostile.calls
+    assert "end" in hostile.calls
+    if entry == "manual":
+        assert "record_exception" in hostile.calls
+
+
+def test_a_failing_context_detach_is_swallowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given a context detach that restores the context and then fails
+    hostile = _hostile_tracer(monkeypatch)
+    tracer = Tracer("hostile.detach")
+    real_detach = context_api.detach
+    attempts: list[str] = []
+
+    def failing_detach(token: object) -> None:
+        real_detach(token)
+        attempts.append("detach")
+        raise RuntimeError("hostile-detach")
+
+    monkeypatch.setattr(context_api, "detach", failing_detach)
+
+    # when a span block completes normally
+    with tracer.span("hostile.detach-span"):
+        pass
+
+    # then the detach failure is swallowed after restoring the context
+    assert attempts == ["detach"]
+    assert hostile.calls == ["end"]
+    assert not trace.get_current_span().get_span_context().is_valid

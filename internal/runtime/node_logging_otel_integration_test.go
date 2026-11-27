@@ -2,18 +2,19 @@
 
 package runtime
 
-// Real-manager managed-OTel LOGGING correlation acceptance for the Node
-// engine: ONE nodejs26.x invocation image driven by the production Manager →
-// Prepare → Execute path — production frame encoding of a REAL Go-managed
-// invocation trace, production execEnv, production /relay/otel install — with
-// the PACKAGED public SDK (@sergiors/relay-runtime) vendored into the app
-// source exactly as an application dependency would ship it. The handler
-// opens a NESTED active span through the SDK Tracer (never the raw OTel API)
-// under the injected trace context and logs once inside it through the SDK
-// Logger; the test asserts the stderr JSON record's trace_id/span_id
-// against BOTH exports: the Go in-process export of the worker-created
-// invocation span, and the container's OTLP export of the nested span as
-// received by a controlled local collector.
+// Real-manager managed-OTel correlation acceptance for the public packed SDK
+// on BOTH Node runtimes: nodejs24.x and nodejs26.x invocation images driven by
+// the production Manager → Prepare → Execute path — production frame encoding
+// of a REAL Go-managed invocation trace, production execEnv, production
+// /relay/otel install — with the SDK packed on the host into a local tarball
+// and unpacked into the app source exactly as an install produces, resolved
+// through the PUBLIC package name (@sergiors/relay-runtime/logging and
+// /tracing) by the app's own exports. The handler opens a NESTED active span
+// through the public Tracer (never the raw OTel API) under the injected trace
+// context and logs once inside it through the public Logger; the test asserts
+// the stderr JSON record's trace_id/span_id against BOTH exports: the Go
+// in-process export of the worker-created invocation span, and the container's
+// OTLP export of the nested span as received by a controlled local collector.
 //
 // The collector binds all interfaces and is advertised over the execution
 // network's gateway: the container reaches the host through its subnet
@@ -52,28 +53,33 @@ import (
 	"relay/internal/testutil"
 )
 
-// nodeLoggerCorrelationHandler is the application under test: it imports the
-// packaged structured logger and Tracer from its own vendored copy, opens one
-// nested active span under the frame's extracted trace context, logs once
-// inside it, and reports the span identity it observed on stdout.
-const nodeLoggerCorrelationHandler = `
-import { Logger } from "./vendor/relay-runtime/logging.js";
-import { Tracer } from "./vendor/relay-runtime/tracing.js";
+// nodePublicSDKCorrelationHandler is the application under test: it imports
+// the structured logger and Tracer through the PACKAGED PUBLIC package name
+// (resolved to the unpacked local artifact by the app's own exports), opens
+// one nested active span through the public Tracer under the frame's injected
+// trace context, logs once inside it through the public Logger, and reports
+// both the container's interpreter version and the observed span identity on
+// stdout.
+const nodePublicSDKCorrelationHandler = `
+import { Logger } from "@sergiors/relay-runtime/logging";
+import { Tracer } from "@sergiors/relay-runtime/tracing";
 
 const log = new Logger({ service: "otel-correlation", level: "INFO" });
 const tracer = new Tracer("otel-correlation");
 
-export async function check(event, context) {
+export async function on(event, context) {
   await tracer.span("app.work", async (span) => {
-    log.info("correlated-log", { step: event.step });
+    log.info("correlated-log", { artifact: event.event_id, step: event.step });
     const active = span.spanContext();
+    console.log("public-import ok id=" + event.event_id + " ver=v" + process.versions.node);
     console.log("nested-active=" + active.traceId + "/" + active.spanId);
   });
 }
 `
 
-// nodeRuntimeSDKFiles are the built SDK modules the vendored copy ships; they
-// are self-contained relative ESM imports of one another.
+// nodeRuntimeSDKFiles are the packaged SDK modules the packed artifact must
+// ship for these tests' installs; they are self-contained relative ESM
+// imports of one another.
 var nodeRuntimeSDKFiles = []string{
 	"logging.js",
 	"logging-context.js",
@@ -169,24 +175,6 @@ func copyFileOrDir(src, dst string) error {
 		}
 		return os.WriteFile(target, data, 0o644)
 	})
-}
-
-// writeVendoredNodeRuntime stages the packaged SDK into the app source's
-// vendor directory — a plain relative import in the container, independent of
-// any package-registry install.
-func writeVendoredNodeRuntime(t *testing.T, dir, distDir string) {
-	t.Helper()
-	vendorDir := filepath.Join(dir, "vendor", "relay-runtime")
-	if err := os.MkdirAll(vendorDir, 0o755); err != nil {
-		t.Fatalf("mkdir the vendored SDK directory: %v", err)
-	}
-	for _, name := range nodeRuntimeSDKFiles {
-		data, err := os.ReadFile(filepath.Join(distDir, name))
-		if err != nil {
-			t.Fatalf("read packaged SDK module %s: %v", name, err)
-		}
-		writeFile(t, dir, "vendor/relay-runtime/"+name, string(data))
-	}
 }
 
 // managerOtlpSpan is one exported span over the wire.
@@ -352,168 +340,292 @@ func jsonLogRecordsWithMessage(out, message string) []map[string]any {
 	return matched
 }
 
-// TestIntegrationNode26LoggerTraceCorrelatesWithExportedSpanOverManagerExecute
-// proves the full correlation chain through the REAL manager execution path:
-// a Go-managed invocation span (exported in-process) → production frame
-// encoding of its W3C context → the container's nested active span created
-// through the packaged SDK Tracer (exported over real OTLP to a controlled
-// collector) → the packaged Logger's JSON record on the container's stderr,
-// whose trace_id/span_id must match the exported spans on both sides while
-// carrying the invocation identity.
-func TestIntegrationNode26LoggerTraceCorrelatesWithExportedSpanOverManagerExecute(t *testing.T) {
+// packNodeRuntimeArtifact stages the packaged SDK's manifest and already-built
+// dist into a temp directory and packs THERE with lifecycle scripts ignored, so
+// the artifact is exactly what an install unpacks while the package's own
+// prepack (which needs its node_modules) never runs. Returns the tarball path.
+func packNodeRuntimeArtifact(t *testing.T, distDir string) string {
+	t.Helper()
+	npmPath, err := exec.LookPath("npm")
+	if err != nil {
+		t.Fatalf("environmental blocker: npm is required to pack the SDK: %v", err)
+	}
+	sourcePkg, err := filepath.Abs(filepath.Join("..", "..", "packages", "node"))
+	if err != nil {
+		t.Fatalf("resolve packages/node: %v", err)
+	}
+	stage := t.TempDir()
+	if err := copyFileOrDir(
+		filepath.Join(sourcePkg, "package.json"),
+		filepath.Join(stage, "package.json"),
+	); err != nil {
+		t.Fatalf("stage the SDK manifest for packing: %v", err)
+	}
+	if err := copyFileOrDir(distDir, filepath.Join(stage, "dist")); err != nil {
+		t.Fatalf("stage the built SDK dist for packing: %v", err)
+	}
+	pack := exec.Command(npmPath, "pack", "--ignore-scripts", "--pack-destination", stage)
+	pack.Dir = stage
+	if out, err := pack.CombinedOutput(); err != nil {
+		t.Fatalf("pack the SDK artifact: %v\n%s", err, out)
+	}
+	tarballs, globErr := filepath.Glob(filepath.Join(stage, "*.tgz"))
+	if globErr != nil || len(tarballs) != 1 {
+		t.Fatalf("packing produced %d tarballs (glob err %v)", len(tarballs), globErr)
+	}
+	return tarballs[0]
+}
+
+// unpackNodeRuntimeArtifact extracts the packed tarball's package/ subtree into
+// the app source's vendor/packed directory — the tree an install of the local
+// artifact would produce — so the app's own exports can route the public
+// package name to it.
+func unpackNodeRuntimeArtifact(t *testing.T, tarball, appDir string) {
+	t.Helper()
+	tarPath, err := exec.LookPath("tar")
+	if err != nil {
+		t.Fatalf("environmental blocker: tar is required to unpack the SDK: %v", err)
+	}
+	extract := t.TempDir()
+	unpack := exec.Command(tarPath, "-xzf", tarball, "-C", extract)
+	if out, err := unpack.CombinedOutput(); err != nil {
+		t.Fatalf("unpack the packed SDK: %v\n%s", err, out)
+	}
+	if err := copyFileOrDir(
+		filepath.Join(extract, "package"),
+		filepath.Join(appDir, "vendor", "packed"),
+	); err != nil {
+		t.Fatalf("vendor the unpacked artifact: %v", err)
+	}
+}
+
+// TestIntegrationNode24And26PublicPackageImportFromPackedSDKOverManagerExecute
+// proves the full public-SDK correlation chain through the REAL Manager on
+// BOTH Node runtimes: the packed local artifact resolves through the PUBLIC
+// package name (logging AND tracing), a REAL managed provider + controlled
+// OTLP receiver run under a real Go function.invoke span and the production
+// Manager.Execute frame, the public Tracer's app span shares the Go trace id
+// and parents to the actual frame-encoding runtime.invoke span, the public
+// Logger's record carries that exported span's ids plus the invocation
+// metadata, and each runtime's image runs its own interpreter major.
+//
+// Host constraint: like every newManager-based execution test this fails
+// closed on Docker Desktop / remote hosts (see newManager); it is validated by
+// vet plus the Linux CI integration run.
+func TestIntegrationNode24And26PublicPackageImportFromPackedSDKOverManagerExecute(t *testing.T) {
 	cli := testutil.RequireDocker(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
 
-	appName := "node26-logger-otel-" + runtime.GOARCH
-	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-"+appName+":"))
-
-	dir := t.TempDir()
-	fn := newAppFromTemplate(t, appName, dir, `
-runtime: nodejs26.x
-events:
-  - handler: handler.check
-    pattern:
-      status: [COMPLETED]
-`)
-	writeFile(t, dir, "handler.js", nodeLoggerCorrelationHandler)
 	distDir, temporary := requireNodeRuntimeDist(t)
 	if temporary {
 		t.Cleanup(func() { _ = os.RemoveAll(filepath.Dir(distDir)) })
 	}
-	writeVendoredNodeRuntime(t, dir, distDir)
+	tarball := packNodeRuntimeArtifact(t, distDir)
 
-	// The real Go invocation trace, exported in-process; its context is what
-	// the production frame encoder injects into the container.
-	goSpans := withSpanRecorder(t)
-
-	// The collector is reachable only once the execution network's gateway is
-	// known — that happens with the manager.
-	collector := newManagerOtlpReceiver(t)
-
-	m, _ := newManager(t)
-	if len(m.networks) == 0 {
-		t.Fatal("the test manager carries no execution network for the collector gateway")
+	cases := []struct {
+		spec          string
+		appName       string
+		eventID       string
+		wantNodeMajor string // node --version prefix inside the image
+		wantMarker    string // process.versions.node fragment in the handler line
+	}{
+		{"nodejs24.x", "node-packed24-" + runtime.GOARCH, "p24-0", "v24.", "ver=v24."},
+		{"nodejs26.x", "node-packed26-" + runtime.GOARCH, "p26-0", "v26.", "ver=v26."},
 	}
-	gateway := executionNetworkGateway(t, ctx, cli, m.networks[0])
-	endpoint := collector.endpoint(gateway)
+	for _, tc := range cases {
+		t.Run(tc.spec, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			t.Cleanup(cleanupImagePrefixes(cli, "relay-app-"+tc.appName+":"))
 
-	prepared, err := m.Prepare(ctx, fn)
-	if err != nil {
-		t.Fatalf("prepare nodejs26.x managed-otel app: %v", err)
-	}
-	if prepared.otelConfig == "" {
-		t.Fatal("prepared Node invocation image has no managed provider identity")
-	}
-	if !hasEntry(prepared.execEnv, "OTEL_SERVICE_NAME="+appName) {
-		t.Errorf("execEnv = %v, want the injected service default %q",
-			prepared.execEnv, "OTEL_SERVICE_NAME="+appName)
-	}
+			dir := t.TempDir()
+			unpackNodeRuntimeArtifact(t, tarball, dir)
+			// the app declares ITSELF as the public package: Node's native
+			// package self-reference resolves the public subpath to the
+			// unpacked artifact's own files
+			writeFile(t, dir, "package.json", `{
+  "name": "@sergiors/relay-runtime",
+  "type": "module",
+  "exports": {
+    "./logging": { "import": "./vendor/packed/dist/logging.js" },
+    "./tracing": { "import": "./vendor/packed/dist/tracing.js" }
+  }
+}
+`)
+			// the pnpm-only dependency policy demands manifest and lock
+			// together; the empty importer resolves nothing from any registry
+			writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockEmpty)
+			writeFile(t, dir, "handler.js", nodePublicSDKCorrelationHandler)
+			fn := newAppFromTemplate(t, tc.appName, dir, `
+runtime: `+tc.spec+`
+events:
+  - handler: handler.on
+    pattern:
+      status: [COMPLETED]
+`)
 
-	runCtx, span := tracing.Start(context.Background(), "function.invoke")
-	traceID := span.SpanContext().TraceID().String()
-	spanID := span.SpanContext().SpanID().String()
-	if !span.SpanContext().IsValid() {
-		t.Fatalf("the worker-created invocation span context is invalid: %+v", span.SpanContext())
-	}
+			// the worker-created invocation span, exported in-process, whose
+			// context the production frame encoder must propagate into the frame
+			goSpans := withSpanRecorder(t)
+			// the controlled OTLP collector; its endpoint is advertised over the
+			// execution network's gateway — the route proof is unchanged
+			collector := newManagerOtlpReceiver(t)
 
-	// The endpoint and the batch delay arrive as per-invocation frame env —
-	// the same production channel template env values and secrets take.
-	execErr := m.Execute(runCtx, prepared, "handler.check",
-		[]byte(`{"status":"COMPLETED","step":"a"}`),
-		[]string{
-			"OTEL_EXPORTER_OTLP_ENDPOINT=" + endpoint,
-			"OTEL_BSP_SCHEDULE_DELAY=50",
+			m, _ := newManager(t)
+			if len(m.networks) == 0 {
+				t.Fatal("the test manager carries no execution network for the collector gateway")
+			}
+			gateway := executionNetworkGateway(t, ctx, cli, m.networks[0])
+			endpoint := collector.endpoint(gateway)
+
+			dep := expectedDependencyRef(t, fn)
+			prepared, err := m.Prepare(ctx, fn)
+			if err != nil {
+				t.Fatalf("prepare %s packed-SDK app: %v", tc.spec, err)
+			}
+			if prepared.Dependency != dep {
+				t.Fatalf("dependency = %q, want %q", prepared.Dependency, dep)
+			}
+			// a REAL managed provider identity on the invocation image, with
+			// the production execEnv service default for this app
+			if prepared.otelConfig == "" {
+				t.Fatalf("prepared %s invocation image has no managed provider identity", tc.spec)
+			}
+			if !hasEntry(prepared.execEnv, "OTEL_SERVICE_NAME="+tc.appName) {
+				t.Errorf("execEnv = %v, want the injected service default %q",
+					prepared.execEnv, "OTEL_SERVICE_NAME="+tc.appName)
+			}
+
+			// the invocation image runs THIS runtime's own interpreter major
+			nodeOut, err := runImageCommand(ctx, t, prepared.Image,
+				[]string{"node", "--version"})
+			if err != nil {
+				t.Fatalf("probe node --version in image: %v", err)
+			}
+			if !strings.HasPrefix(strings.TrimSpace(nodeOut), tc.wantNodeMajor) {
+				t.Errorf("image node --version = %q, want a %s interpreter",
+					nodeOut, tc.wantNodeMajor)
+			}
+
+			// a REAL Go invocation span whose context the production frame
+			// encoder must carry into the container
+			runCtx, span := tracing.Start(context.Background(), "function.invoke")
+			traceID := span.SpanContext().TraceID().String()
+			spanID := span.SpanContext().SpanID().String()
+			if !span.SpanContext().IsValid() {
+				t.Fatalf("the worker-created invocation span context is invalid: %+v", span.SpanContext())
+			}
+
+			// the endpoint and batch delay arrive as per-invocation frame env —
+			// the same production channel-template env values take
+			execErr := m.Execute(runCtx, prepared, "handler.on",
+				[]byte(`{"status":"COMPLETED","event_id":"`+tc.eventID+`","step":"a"}`),
+				[]string{
+					"OTEL_EXPORTER_OTLP_ENDPOINT=" + endpoint,
+					"OTEL_BSP_SCHEDULE_DELAY=50",
+				})
+			span.End()
+			if execErr != nil {
+				t.Fatalf("execute under the worker-created invocation trace: %v", execErr)
+			}
+
+			// the Go side exported the invocation span under the injected ids
+			goList := goSpans.spans(t)
+			invocation := managerSpanByName(goList, "function.invoke", traceID)
+			if invocation == nil || invocation.SpanContext.SpanID().String() != spanID {
+				names := make([]string, 0, len(goList))
+				for _, stub := range goList {
+					names = append(names, stub.Name)
+				}
+				t.Fatalf("the worker-created function.invoke span %s/%s was not exported; span names: %v",
+					traceID, spanID, names)
+			}
+
+			// the stdout marker proves the public import AND this runtime's
+			// interpreter major; the stderr JSON record proves the public
+			// Logger ran inside the public Tracer's span
+			_, stderr := awaitAppStreamsFor(t, ctx, cli, tc.appName,
+				"public-import ok id="+tc.eventID+" "+tc.wantMarker,
+				`"message":"correlated-log"`)
+			records := jsonLogRecordsWithMessage(stderr, "correlated-log")
+			if len(records) != 1 {
+				t.Fatalf("correlated-log stderr records = %d, want exactly 1; stderr:\n%s",
+					len(records), stderr)
+			}
+			record := records[0]
+			if record["level"] != "INFO" || record["service"] != "otel-correlation" ||
+				record["logger"] != "relay_runtime.otel-correlation" {
+				t.Errorf("record identity = level %v service %v logger %v, want INFO/otel-correlation/relay_runtime.otel-correlation; record: %+v",
+					record["level"], record["service"], record["logger"], record)
+			}
+
+			// invocation metadata survives the packed public-name import
+			if record["app"] != tc.appName || record["handler"] != "handler.on" ||
+				record["attempt"] != float64(1) || record["cold_start"] != true {
+				t.Errorf("record invocation fields = app %v handler %v attempt %v cold_start %v, want the frame's identity on the cold start; record: %+v",
+					record["app"], record["handler"], record["attempt"], record["cold_start"], record)
+			}
+			requestID, _ := record["request_id"].(string)
+			if requestID == "" {
+				t.Errorf("record request_id = %v, want the generated per-invocation id",
+					record["request_id"])
+			}
+
+			// the log correlates through the NESTED app span on the Go trace —
+			// never through a worker parent id
+			recordTrace, _ := record["trace_id"].(string)
+			recordSpan, _ := record["span_id"].(string)
+			if recordTrace != traceID {
+				t.Errorf("record trace_id = %q, want the worker-created invocation trace %q",
+					recordTrace, traceID)
+			}
+			if recordSpan == "" || recordSpan == spanID {
+				t.Errorf("record span_id = %q, want the NESTED handler span (not a worker parent %q)",
+					recordSpan, spanID)
+			}
+			attributes, ok := record["attributes"].(map[string]any)
+			if !ok || attributes["step"] != "a" || attributes["artifact"] != tc.eventID {
+				t.Errorf("record attributes = %v, want {step: a, artifact: %s}",
+					record["attributes"], tc.eventID)
+			}
+
+			// the handler's own stdout observation agrees with the record
+			wantNested := "nested-active=" + traceID + "/" + recordSpan
+			stdout, _ := awaitAppStreamsFor(t, ctx, cli, tc.appName, wantNested)
+			if !strings.Contains(stdout, wantNested) {
+				t.Errorf("stdout must carry %q; stdout:\n%s", wantNested, stdout)
+			}
+
+			// the container's OTLP export: the record's ids are exactly the
+			// exported app span's ids, and the span parents to the span that
+			// was ACTIVE when the production invocation frame was encoded:
+			// Manager.Execute (runtime.execute) → container cache
+			// (runtime.acquire, already ended) → runtime.invoke → lease.invoke
+			// → encodeInvokeRequest renders the carrier from that ctx, so the
+			// nested span's ParentSpanID is runtime.invoke's span id.
+			collected := collector.waitForSpans(t, 1)
+			nested := collectorSpanByID(collected, "app.work", traceID, recordSpan)
+			if nested == nil {
+				names := make([]string, 0, len(collected))
+				for _, got := range collected {
+					names = append(names, got.Name+"/"+got.TraceID+"/"+got.SpanID)
+				}
+				t.Fatalf("no exported app span %s/%s; exported: %v",
+					traceID, recordSpan, names)
+			}
+			invoke := managerSpanByName(goList, "runtime.invoke", traceID)
+			if invoke == nil {
+				names := make([]string, 0, len(goList))
+				for _, stub := range goList {
+					names = append(names, stub.Name)
+				}
+				t.Fatalf("the frame-encoding runtime.invoke span was not exported for trace %s; span names: %v",
+					traceID, names)
+			}
+			invokeSpanID := invoke.SpanContext.SpanID().String()
+			if nested.ParentSpanID != invokeSpanID {
+				t.Errorf("exported app span parent = %q, want the frame-encoding runtime.invoke span %q (function.invoke %q)",
+					nested.ParentSpanID, invokeSpanID, spanID)
+			}
 		})
-	span.End()
-	if execErr != nil {
-		t.Fatalf("execute under the worker-created invocation trace: %v", execErr)
-	}
-
-	// Then the Go side exported the invocation span under the injected ids.
-	goList := goSpans.spans(t)
-	invocation := managerSpanByName(goList, "function.invoke", traceID)
-	if invocation == nil || invocation.SpanContext.SpanID().String() != spanID {
-		names := make([]string, 0, len(goList))
-		for _, stub := range goList {
-			names = append(names, stub.Name)
-		}
-		t.Fatalf("the worker-created function.invoke span %s/%s was not exported; span names: %v",
-			traceID, spanID, names)
-	}
-
-	// And the container emitted exactly one structured record for the log.
-	_, stderr := awaitAppStreamsFor(t, ctx, cli, fn.Name, "correlated-log")
-	records := jsonLogRecordsWithMessage(stderr, "correlated-log")
-	if len(records) != 1 {
-		t.Fatalf("structured records with message %q = %d, want 1; stderr:\n%s",
-			"correlated-log", len(records), stderr)
-	}
-	record := records[0]
-	if record["level"] != "INFO" || record["service"] != "otel-correlation" ||
-		record["logger"] != "relay_runtime.otel-correlation" {
-		t.Errorf("record identity = level %v service %v logger %v, want INFO/otel-correlation/relay_runtime.otel-correlation; record: %+v",
-			record["level"], record["service"], record["logger"], record)
-	}
-	if record["app"] != appName || record["handler"] != "handler.check" ||
-		record["attempt"] != float64(1) || record["cold_start"] != true {
-		t.Errorf("record invocation fields = app %v handler %v attempt %v cold_start %v, want the frame's identity on the cold start; record: %+v",
-			record["app"], record["handler"], record["attempt"], record["cold_start"], record)
-	}
-	requestID, _ := record["request_id"].(string)
-	if requestID == "" {
-		t.Errorf("record request_id = %v, want the generated per-invocation id", record["request_id"])
-	}
-	recordTrace, _ := record["trace_id"].(string)
-	recordSpan, _ := record["span_id"].(string)
-	if recordTrace != traceID {
-		t.Errorf("record trace_id = %q, want the worker-created invocation trace %q", recordTrace, traceID)
-	}
-	if recordSpan == "" || recordSpan == spanID {
-		t.Errorf("record span_id = %q, want the NESTED handler span (not a worker parent %q)", recordSpan, spanID)
-	}
-	attributes, ok := record["attributes"].(map[string]any)
-	if !ok || attributes["step"] != "a" {
-		t.Errorf("record attributes = %v, want {step: a}", record["attributes"])
-	}
-
-	// The handler's own stdout observation agrees with the record.
-	wantMarker := "nested-active=" + traceID + "/" + recordSpan
-	stdout, _ := awaitAppStreamsFor(t, ctx, cli, fn.Name, wantMarker)
-	if !strings.Contains(stdout, wantMarker) {
-		t.Errorf("stdout must carry %q; stdout:\n%s", wantMarker, stdout)
-	}
-
-	// When the container's OTLP export arrives, the record's ids are exactly
-	// the exported nested span's ids, and the nested span parents to the span
-	// that was ACTIVE when the production invocation frame was encoded:
-	// Manager.Execute (runtime.execute) → container cache (runtime.acquire,
-	// already ended) → runtime.invoke → lease.invoke → encodeInvokeRequest
-	// renders the trace carrier from that ctx, so the injected traceparent's
-	// parent-id — and therefore the Node nested span's ParentSpanID — is
-	// runtime.invoke's span id.
-	collected := collector.waitForSpans(t, 1)
-	nested := collectorSpanByID(collected, "app.work", traceID, recordSpan)
-	if nested == nil {
-		names := make([]string, 0, len(collected))
-		for _, got := range collected {
-			names = append(names, got.Name+"/"+got.TraceID+"/"+got.SpanID)
-		}
-		t.Fatalf("no exported app.work span %s/%s; exported: %v",
-			traceID, recordSpan, names)
-	}
-	invoke := managerSpanByName(goList, "runtime.invoke", traceID)
-	if invoke == nil {
-		names := make([]string, 0, len(goList))
-		for _, stub := range goList {
-			names = append(names, stub.Name)
-		}
-		t.Fatalf("the frame-encoding runtime.invoke span was not exported for trace %s; span names: %v",
-			traceID, names)
-	}
-	invokeSpanID := invoke.SpanContext.SpanID().String()
-	if nested.ParentSpanID != invokeSpanID {
-		t.Errorf("exported nested span parent = %q, want the frame-encoding runtime.invoke span %q (function.invoke %q)",
-			nested.ParentSpanID, invokeSpanID, spanID)
 	}
 }

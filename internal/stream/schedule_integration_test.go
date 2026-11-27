@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/codes"
+
 	"relay/internal/schedule"
 	"relay/internal/testutil"
 )
@@ -76,6 +78,7 @@ func (r *scriptedRunner) last() scheduleOccCall {
 // normal-event handler is never invoked for it (bypass confirmed).
 func TestIntegrationScheduleRoutedToRunnerAndAcked(t *testing.T) {
 	testutil.RequireRedis(t)
+	rec := withSpanRecorder(t)
 	rr := &scriptedRunner{}
 	e := newEnv(t, ConsumerConfig{ScheduleRunner: rr.Run})
 	o := schOcc()
@@ -114,6 +117,38 @@ func TestIntegrationScheduleRoutedToRunnerAndAcked(t *testing.T) {
 	e.stop(t)
 	if got := normalCalls.Load(); got != 0 {
 		t.Fatalf("normal handler invoked %d times for a schedule message; want 0 (bypass)", got)
+	}
+
+	// The REAL Redis ACK path emits the same span shape the unit tests pin:
+	// one UNSET stream.dispatch child for the runner dispatch and one UNSET
+	// redis.ack child of stream.message for the confirmed source ACK. The ack
+	// span is polled because the PEL removal can be observed a hair before the
+	// ended span reaches the exporter.
+	testutil.WaitFor(t, 2*time.Second, "redis.ack span exported", func() bool {
+		for _, span := range rec.spans(t) {
+			if span.Name == "redis.ack" {
+				return true
+			}
+		}
+		return false
+	})
+	streamSpan := spanByName(t, rec, "stream.message")
+	dispatch := spanByName(t, rec, "stream.dispatch")
+	if dispatch.Status.Code != codes.Unset {
+		t.Errorf("stream.dispatch status = %v, want UNSET for a successful dispatch",
+			dispatch.Status.Code)
+	}
+	if dispatch.Parent.SpanID() != streamSpan.SpanContext.SpanID() {
+		t.Errorf("dispatch parent = %s, want stream.message %s",
+			dispatch.Parent.SpanID(), streamSpan.SpanContext.SpanID())
+	}
+	ack := spanByName(t, rec, "redis.ack")
+	if ack.Status.Code != codes.Unset {
+		t.Errorf("redis.ack status = %v, want UNSET after a confirmed ACK", ack.Status.Code)
+	}
+	if ack.Parent.SpanID() != streamSpan.SpanContext.SpanID() {
+		t.Errorf("redis.ack parent = %s, want stream.message %s",
+			ack.Parent.SpanID(), streamSpan.SpanContext.SpanID())
 	}
 }
 

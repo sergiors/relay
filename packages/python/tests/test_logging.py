@@ -595,6 +595,91 @@ def test_context_key_scopes_nest_and_restore_after_exceptions(
     assert "layer" not in post_base_attributes
 
 
+def test_leaving_a_context_scope_keeps_mutations_made_inside_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    log = Logger(_service("scope-mutations"), "INFO")
+    log.append_keys(component="keep", obsolete="old", tier="bronze")
+
+    # when appended and removed keys change INSIDE the temporary scope
+    with log.append_context_keys(tenant="inside"):
+        log.append_keys(region="eu", tier="gold")
+        log.remove_keys(["obsolete"])
+
+    # then leaving the block removes only its own layer: the mutations made
+    # inside survive, and only the scope's temporary field expires
+    log.info("scope-mutations-record")
+    attributes = _attributes(
+        _one_record(capsys.readouterr().err, "scope-mutations-record")
+    )
+    assert attributes["component"] == "keep"
+    assert attributes["region"] == "eu"
+    assert attributes["tier"] == "gold"
+    assert "obsolete" not in attributes
+    assert "tenant" not in attributes
+
+
+def test_context_scopes_may_be_left_out_of_order(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    log = Logger(_service("scope-order"), "INFO")
+    outer = log.append_context_keys(outer_only="outer")
+    inner = log.append_context_keys(inner_only="inner")
+    outer.__enter__()
+    inner.__enter__()
+    log.info("order-both-record")
+
+    # when the OUTER scope leaves before the inner one
+    outer.__exit__(None, None, None)
+    log.info("order-inner-record")
+    inner.__exit__(None, None, None)
+    log.info("order-none-record")
+
+    # then each exit removed exactly its own layer, in any order
+    err = capsys.readouterr().err
+    both = _attributes(_one_record(err, "order-both-record"))
+    assert both["outer_only"] == "outer"
+    assert both["inner_only"] == "inner"
+    after_outer = _attributes(_one_record(err, "order-inner-record"))
+    assert "outer_only" not in after_outer
+    assert after_outer["inner_only"] == "inner"
+    after_inner = _one_record(err, "order-none-record")
+    after_inner_attributes = after_inner.get("attributes") or {}
+    assert isinstance(after_inner_attributes, dict)
+    assert "outer_only" not in after_inner_attributes
+    assert "inner_only" not in after_inner_attributes
+
+
+def test_exiting_a_scope_bound_to_another_context_is_a_noop(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    log = Logger(_service("stale-scope"), "INFO")
+    kept: list = []
+
+    def enter_and_keep() -> None:
+        manager = log.append_context_keys(tenant="detached")
+        manager.__enter__()
+        kept.append(manager)
+
+    # given a scope handle whose layer lives only in an isolated context
+    contextvars.copy_context().run(enter_and_keep)
+
+    # when that stale handle exits inside an active scope of the same logger
+    with log.append_context_keys(tenant="active"):
+        kept[0].__exit__(None, None, None)
+        log.info("stale-exit-record")
+    log.info("stale-after-record")
+
+    # then the stale exit must not remove the current context's layer
+    err = capsys.readouterr().err
+    during = _attributes(_one_record(err, "stale-exit-record"))
+    assert during["tenant"] == "active"
+    after = _one_record(err, "stale-after-record")
+    after_attributes = after.get("attributes") or {}
+    assert isinstance(after_attributes, dict)
+    assert "tenant" not in after_attributes
+
+
 def test_extra_values_are_preserved_as_nested_attributes(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -738,6 +823,91 @@ def test_unserializable_values_get_markers_without_breaking_records(
     assert attributes["opaque"] == {"$unsupported": "object"}
 
 
+def test_item_bounds_truncate_oversized_collections(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    log = Logger(_service("item-bounds"), "INFO")
+
+    # when a sequence and a mapping sit exactly at the 10,000-item bound and
+    # one item beyond it
+    log.info(
+        "item-bounds-record",
+        extra={
+            "list_at_bound": list(range(10_000)),
+            "list_over_bound": list(range(10_001)),
+            "map_at_bound": {f"k{i}": i for i in range(10_000)},
+            "map_over_bound": {f"k{i}": i for i in range(10_001)},
+        },
+    )
+
+    attributes = _attributes(
+        _one_record(capsys.readouterr().err, "item-bounds-record")
+    )
+    at_bound = attributes["list_at_bound"]
+    assert isinstance(at_bound, list)
+    assert len(at_bound) == 10_000
+    assert at_bound[0] == 0 and at_bound[-1] == 9_999
+
+    over = attributes["list_over_bound"]
+    assert isinstance(over, list)
+    assert len(over) == 10_001
+    assert over[-1] == {"$truncated": True}
+
+    map_at_bound = attributes["map_at_bound"]
+    assert isinstance(map_at_bound, dict)
+    assert len(map_at_bound) == 10_000
+
+    # an oversized mapping becomes one truncation marker, never a partial object
+    assert attributes["map_over_bound"] == {"$truncated": True}
+
+
+def test_a_line_over_one_mib_emits_the_safe_range_error_fallback(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service = _service("line-bound")
+    log = Logger(service, "INFO")
+
+    # when the rendered line would exceed 1 MiB
+    log.info("line-bound-record", extra={"blob": "x" * (1024 * 1024)})
+
+    # then one bounded fallback line is emitted and the call continues
+    lines = [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if line.startswith("{")
+    ]
+    assert len(lines) == 1, f"stderr lines = {len(lines)}, want exactly 1"
+    assert len(lines[0]) <= 1024 * 1024, "the fallback line must stay bounded"
+    record = json.loads(lines[0])
+    assert record["message"] == "log record could not be serialized"
+    assert record["error"] == "RangeError"
+    assert record["level"] == "INFO"
+    assert record["service"] == service
+
+
+def test_an_oversized_fallback_line_collapses_to_the_minimal_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # given application-controlled metadata (the service name) large enough
+    # that even the fallback line would exceed 1 MiB
+    log = Logger("s" * (1024 * 1024), "INFO")
+
+    log.info("minimal-fallback-record")
+
+    lines = [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if line.startswith("{")
+    ]
+    assert len(lines) == 1, f"stderr lines = {len(lines)}, want exactly 1"
+    record = json.loads(lines[0])
+    assert record == {
+        "level": "ERROR",
+        "logger": "relay.logging",
+        "message": "log record could not be serialized",
+    }
+
+
 def test_queue_listener_preserves_attributes_at_record_creation() -> None:
     log = Logger(_service("queue"), "INFO")
     log.append_keys(component="queued")
@@ -861,16 +1031,21 @@ def test_disabled_debug_does_not_format_message_arguments(
     assert "never formatted" not in capsys.readouterr().err
 
 
-def test_reserved_framework_field_in_extra_raises_documented_error(
+def test_reserved_framework_field_in_extra_stays_nested_and_never_hijacks(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    log = Logger(_service("reserved-extra"), "INFO")
+    service = _service("reserved-extra")
+    log = Logger(service, "INFO")
 
-    with pytest.raises(ValueError, match="reserved Relay log field name"):
-        log.info("reserved-extra-record", extra={"service": "hijack"})
+    # when an application field reuses a Relay-owned top-level name
+    log.info("reserved-extra-record", extra={"service": "hijack"})
 
-    # then the record is rejected before any output is produced
-    assert capsys.readouterr().err == ""
+    # then the record is emitted with that field nested under attributes while
+    # the top-level metadata keeps the Logger's own value
+    record = _one_record(capsys.readouterr().err, "reserved-extra-record")
+    _require_core_keys(record, service=service)
+    assert record["service"] == service
+    assert _attributes(record)["service"] == "hijack"
 
 
 def test_stdlib_reserved_record_collision_keeps_stdlib_error(

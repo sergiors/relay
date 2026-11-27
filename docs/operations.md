@@ -189,7 +189,9 @@ those changes take effect only in a new container. At shutdown Relay closes an
 idle container's execution channel first, giving the bootstrap a bounded grace
 to clean up and flush before the container is killed. The grace is capped to
 half of the remaining manager shutdown budget. Node bounds its provider shutdown
-to 7.5 seconds; Python bounds it to 8 seconds. A shorter container shutdown
+to 7.5 seconds; Python bounds it to 8 seconds and first waits at most 1 second
+for application container-dependency cleanup, so its combined shutdown wait
+stays inside that grace. A shorter container shutdown
 window or a timed-out export may abandon an unfinished flush, and a busy
 container (an invocation still in flight) keeps the immediate teardown, so it
 is not flushed.

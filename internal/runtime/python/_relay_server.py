@@ -30,6 +30,20 @@ from _relay_invocation import invoke
 HANDSHAKE_TIMEOUT_SECONDS = 2.0
 MAX_CONCURRENT_HANDSHAKES = 8
 
+# The worker allows this process up to 10s after its authenticated channel
+# closes before it kills the container (executionShutdownFlushGrace in the
+# runtime package, capped to half the remaining manager budget). Shutdown keeps
+# the managed tracer provider active while application container dependencies
+# close, and only then spends the provider's own bounded flush. This budget
+# bounds the wait for that cleanup; together with
+# _relay_telemetry.SHUTDOWN_TIMEOUT_SECONDS it stays below the worker grace
+# with room for interpreter exit. Both are named constants so the Go tests can
+# pin the combined budget. A synchronous, blocking, or cancellation-resistant
+# cleanup cannot be stopped safely from here: the budget bounds only this wait,
+# and such a callback can still delay exit until the worker kills the
+# container.
+DEPENDENCY_CLEANUP_TIMEOUT_SECONDS = 1.0
+
 
 class ConnectionAdmission:
     """Process-local admission for the container's single execution channel.
@@ -164,7 +178,9 @@ async def serve_invocations(reader, writer):
         report.report_invocation(request_id, duration_ms, memory_usage)
 
         if error is not None:
-            print(f"handler {handler!r} failed: {error}", file=sys.stderr)
+            # ``invoke`` already formatted the complete operator-visible text;
+            # the same string is mirrored here and returned in the result.
+            print(error, file=sys.stderr)
 
         await protocol.write_frame(
             writer,
@@ -236,8 +252,15 @@ async def _shutdown_optional_dependencies():
 
     The SDK is not a runtime dependency, so an import failure simply means the
     app did not use it. Cleanup runs on the container-lifetime loop before
-    asyncio.run closes it; an individual provider failure is reported and never
-    prevents the remaining cleanup or the container exit.
+    asyncio.run closes it, while the managed tracer provider is still active, so
+    spans and records it produces still export; an individual provider failure
+    is reported and never prevents the remaining cleanup or the provider flush.
+
+    The wait is bounded by DEPENDENCY_CLEANUP_TIMEOUT_SECONDS: cleanup that is
+    still running then is cancelled and abandoned so the provider flush and
+    process exit still fit inside the worker's drain grace. Cancelling cannot
+    stop a synchronous, blocking, or cancellation-resistant cleanup, which can
+    still delay exit until the worker kills the container.
     """
     # A handler that never imported the SDK cannot own container dependencies.
     # Do not import it merely to discover that there is nothing to clean up.
@@ -259,10 +282,33 @@ async def _shutdown_optional_dependencies():
     if shutdown_cleanup is None:
         return
 
+    cleanup = asyncio.create_task(shutdown_cleanup())
     try:
-        errors = await shutdown_cleanup()
+        await asyncio.wait({cleanup}, timeout=DEPENDENCY_CLEANUP_TIMEOUT_SECONDS)
     except asyncio.CancelledError:
+        # Cancellation is control flow: stop the abandoned cleanup best effort
+        # and let the caller's finally still attempt the bounded provider flush.
+        cleanup.cancel()
+        cleanup.add_done_callback(_consume_abandoned_cleanup)
         raise
+
+    if not cleanup.done():
+        cleanup.cancel()
+        cleanup.add_done_callback(_consume_abandoned_cleanup)
+        print(
+            "execution channel: dependency cleanup abandoned after "
+            f"{DEPENDENCY_CLEANUP_TIMEOUT_SECONDS:g}s",
+            file=sys.stderr,
+        )
+        return
+
+    try:
+        errors = cleanup.result()
+    except asyncio.CancelledError:
+        # The cleanup task itself was cancelled; it is already finished, so
+        # there is nothing left to report and the caller keeps its own control
+        # flow.
+        return
     except BaseException as exc:
         errors = [exc]
 
@@ -273,16 +319,24 @@ async def _shutdown_optional_dependencies():
         )
 
 
+def _consume_abandoned_cleanup(task: asyncio.Task) -> None:
+    try:
+        task.exception()
+    except BaseException:
+        pass
+
+
 async def runtime_loop(config: ExecutionConfig):
     """Bind the execution listener and run until the authenticated channel ends.
 
     The listener starts before any handler module is imported, so Relay's
     handshake is also the container's readiness signal. Container-scoped SDK
     dependencies are closed after the channel ends, while the container's event
-    loop that created them is still running; the managed OpenTelemetry provider
-    stays active through that cleanup and is flushed afterwards, before the loop
-    exits. Cleanup is best-effort but ordered: a cancelled cleanup still leaves
-    the provider one bounded shutdown attempt.
+    loop that created them is still running and the managed OpenTelemetry
+    provider is still active; that cleanup is waited for at most
+    DEPENDENCY_CLEANUP_TIMEOUT_SECONDS. The provider is flushed afterwards,
+    before the loop exits. Cleanup is best-effort but ordered: a cancelled or
+    abandoned cleanup still leaves the provider one bounded shutdown attempt.
     """
     admission = ConnectionAdmission()
     shutdown = asyncio.Event()

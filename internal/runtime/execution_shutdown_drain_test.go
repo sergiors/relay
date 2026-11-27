@@ -374,6 +374,108 @@ func TestShutdownFlushGraceOutlivesPythonProviderFlush(t *testing.T) {
 	}
 }
 
+// TestCombinedRuntimeShutdownBudgetFitsContainerGrace pins the cross-language
+// shutdown budget statically: the Python dependency-cleanup wait + provider
+// flush, and the Node provider flush + exit-stream flush inside its process
+// shutdown deadline, must each fit strictly inside the worker's drain grace,
+// so an idle container's shutdown can never be truncated by the force-kill.
+// Every constant is read from its module source, so a coordinated change on
+// any side fails here instead of silently narrowing the margin.
+func TestCombinedRuntimeShutdownBudgetFitsContainerGrace(t *testing.T) {
+	readSource := func(path string) string {
+		t.Helper()
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		return string(raw)
+	}
+	// seconds parses a floating-point seconds constant from a module source.
+	seconds := func(path, pattern, label string) time.Duration {
+		t.Helper()
+		match := regexp.MustCompile(pattern).FindStringSubmatch(readSource(path))
+		if match == nil {
+			t.Fatalf("%s not found in %s", label, path)
+		}
+		value, err := strconv.ParseFloat(match[1], 64)
+		if err != nil {
+			t.Fatalf("parse %s %q: %v", label, match[1], err)
+		}
+		return time.Duration(value * float64(time.Second))
+	}
+	// millis parses a whole-millisecond constant from a module source.
+	millis := func(path, pattern, label string) time.Duration {
+		t.Helper()
+		match := regexp.MustCompile(pattern).FindStringSubmatch(readSource(path))
+		if match == nil {
+			t.Fatalf("%s not found in %s", label, path)
+		}
+		value, err := strconv.ParseInt(match[1], 10, 64)
+		if err != nil {
+			t.Fatalf("parse %s %q: %v", label, match[1], err)
+		}
+		return time.Duration(value) * time.Millisecond
+	}
+
+	pythonServer := filepath.Join("python", "_relay_server.py")
+	pythonTelemetry := filepath.Join("python", "_relay_telemetry.py")
+	nodeTelemetry := filepath.Join("node", "telemetry.mjs")
+	nodeProtocol := filepath.Join("node", "protocol.mjs")
+
+	pythonCleanup := seconds(pythonServer,
+		`DEPENDENCY_CLEANUP_TIMEOUT_SECONDS\s*=\s*([0-9.]+)`,
+		"DEPENDENCY_CLEANUP_TIMEOUT_SECONDS")
+	pythonFlush := seconds(pythonTelemetry,
+		`SHUTDOWN_TIMEOUT_SECONDS\s*=\s*([0-9.]+)`, "SHUTDOWN_TIMEOUT_SECONDS")
+	nodeProvider := millis(nodeTelemetry,
+		`SHUTDOWN_TIMEOUT_MS\s*=\s*([0-9]+)`, "SHUTDOWN_TIMEOUT_MS")
+	nodeProcess := millis(nodeProtocol,
+		`PROCESS_SHUTDOWN_TIMEOUT_MS\s*=\s*([0-9]+)`, "PROCESS_SHUTDOWN_TIMEOUT_MS")
+	nodeExitFlush := millis(nodeProtocol,
+		`PROCESS_EXIT_FLUSH_TIMEOUT_MS\s*=\s*([0-9]+)`, "PROCESS_EXIT_FLUSH_TIMEOUT_MS")
+
+	// the coordinated values, pinned so any side's re-budgeting is deliberate
+	if pythonCleanup != time.Second {
+		t.Errorf("Python dependency-cleanup bound = %v, want the coordinated 1s", pythonCleanup)
+	}
+	if pythonFlush != 8*time.Second {
+		t.Errorf("Python provider flush bound = %v, want the coordinated 8s", pythonFlush)
+	}
+	if nodeProvider != 7500*time.Millisecond {
+		t.Errorf("Node provider flush bound = %v, want the coordinated 7.5s", nodeProvider)
+	}
+	if nodeProcess != 9500*time.Millisecond {
+		t.Errorf("Node process shutdown bound = %v, want the coordinated 9.5s", nodeProcess)
+	}
+	if nodeExitFlush != 250*time.Millisecond {
+		t.Errorf("Node exit-stream flush bound = %v, want the coordinated 250ms", nodeExitFlush)
+	}
+
+	// Python: the cleanup wait spent before the flush plus the provider flush
+	// must fit strictly inside the container grace
+	pythonTotal := pythonCleanup + pythonFlush
+	if pythonTotal >= executionShutdownFlushGrace {
+		t.Errorf("Python combined shutdown wait %v must fit strictly inside the drain grace %v, "+
+			"or an idle container's provider flush is always killed mid-export",
+			pythonTotal, executionShutdownFlushGrace)
+	}
+
+	// Node: the provider flush bound plus the 250ms exit-stream flush must fit
+	// inside the process shutdown deadline...
+	nodeTotal := nodeProvider + nodeExitFlush
+	if nodeTotal > nodeProcess {
+		t.Errorf("Node provider flush %v + exit-stream flush %v = %v exceeds the process shutdown deadline %v",
+			nodeProvider, nodeExitFlush, nodeTotal, nodeProcess)
+	}
+	// ...and the whole process deadline must fit strictly inside the same
+	// container grace
+	if nodeProcess >= executionShutdownFlushGrace {
+		t.Errorf("Node process shutdown bound %v must fit strictly inside the drain grace %v, "+
+			"or the container is force-killed before the process can exit",
+			nodeProcess, executionShutdownFlushGrace)
+	}
+}
+
 // TestNonShutdownTeardownsStayImmediate proves every non-shutdown discard
 // reason keeps the historical kill-then-remove order even when the container
 // is idle and the Manager is in the cache-teardown phase: no drain wait is

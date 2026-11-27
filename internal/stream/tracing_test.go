@@ -364,3 +364,111 @@ func TestScheduleRedeliveryDistinctSpansSameUpstreamTrace(t *testing.T) {
 		}
 	}
 }
+
+// TestScheduleDispatchAndAckSpanShapeParity pins the schedule path's span
+// shape against the event path: a failed schedule dispatch records its error
+// on the same stream.dispatch child span the event handler uses and leaves no
+// ACK behind, a successful dispatch stays UNSET, and both paths acknowledge on
+// their own redis.ack child of stream.message.
+func TestScheduleDispatchAndAckSpanShapeParity(t *testing.T) {
+	occ := schedule.Occurrence{
+		App:         "courses",
+		Schedule:    "cleanup",
+		Handler:     "jobs.cleanup.handler",
+		ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC),
+	}
+	neverDispatch := func(context.Context, string, map[string]any) error {
+		t.Fatal("the event handler must not run for a schedule message")
+		return nil
+	}
+
+	t.Run("failed schedule dispatch", func(t *testing.T) {
+		rec := withSpanRecorder(t)
+		store := newFakeInvocationStore(nil)
+		c := processMessageConsumer(store)
+		c.scheduleRunner = func(context.Context, string, schedule.Occurrence, []byte) error {
+			return errors.New("retryable schedule failure")
+		}
+		msg := redis.XMessage{ID: "9-0", Values: scheduleMessageValues(t, occ)}
+
+		c.processMessage(processMessageContext(c), msg, 1, neverDispatch)
+
+		// the dispatch span mirrors the event path: same name, child of the
+		// delivery span, error status recorded on the dispatch itself
+		streamSpan := spanByName(t, rec, "stream.message")
+		dispatch := spanByName(t, rec, "stream.dispatch")
+		if dispatch.Status.Code != codes.Error {
+			t.Errorf("stream.dispatch status = %v, want codes.Error", dispatch.Status.Code)
+		}
+		if dispatch.Parent.SpanID() != streamSpan.SpanContext.SpanID() {
+			t.Errorf("dispatch parent = %s, want stream.message %s",
+				dispatch.Parent.SpanID(), streamSpan.SpanContext.SpanID())
+		}
+
+		// a retryable schedule failure leaves the message pending: no ACK span
+		// and no atomic ACK call
+		for _, span := range rec.spans(t) {
+			if span.Name == "redis.ack" {
+				t.Errorf("a pending schedule message must not emit redis.ack: %+v", span)
+			}
+		}
+		if store.ackRetainCalls != 0 {
+			t.Errorf("ackAndRetainTerminal calls = %d, want 0 (message stays pending)",
+				store.ackRetainCalls)
+		}
+	})
+
+	t.Run("successful schedule dispatch", func(t *testing.T) {
+		rec := withSpanRecorder(t)
+		c := processMessageConsumer(newFakeInvocationStore(nil))
+		c.scheduleRunner = func(context.Context, string, schedule.Occurrence, []byte) error {
+			return nil
+		}
+		msg := redis.XMessage{ID: "9-1", Values: scheduleMessageValues(t, occ)}
+
+		c.processMessage(processMessageContext(c), msg, 1, neverDispatch)
+
+		streamSpan := spanByName(t, rec, "stream.message")
+		dispatch := spanByName(t, rec, "stream.dispatch")
+		if dispatch.Status.Code != codes.Unset {
+			t.Errorf("stream.dispatch status = %v, want UNSET for a successful dispatch",
+				dispatch.Status.Code)
+		}
+		if dispatch.Parent.SpanID() != streamSpan.SpanContext.SpanID() {
+			t.Errorf("dispatch parent = %s, want stream.message %s",
+				dispatch.Parent.SpanID(), streamSpan.SpanContext.SpanID())
+		}
+		// the resolved occurrence acknowledges on its own child span
+		ack := spanByName(t, rec, "redis.ack")
+		if ack.Status.Code != codes.Unset {
+			t.Errorf("redis.ack status = %v, want UNSET after a confirmed ACK",
+				ack.Status.Code)
+		}
+		if ack.Parent.SpanID() != streamSpan.SpanContext.SpanID() {
+			t.Errorf("redis.ack parent = %s, want stream.message %s",
+				ack.Parent.SpanID(), streamSpan.SpanContext.SpanID())
+		}
+	})
+
+	t.Run("successful event dispatch", func(t *testing.T) {
+		rec := withSpanRecorder(t)
+		c := processMessageConsumer(newFakeInvocationStore(nil))
+		msg := redis.XMessage{ID: "1-0", Values: map[string]any{"value": `{"event_name":"X"}`}}
+
+		c.processMessage(processMessageContext(c), msg, 1,
+			func(context.Context, string, map[string]any) error { return nil })
+
+		// the event path's ACK carries the identical shape: one UNSET
+		// redis.ack child of the same stream.message span
+		streamSpan := spanByName(t, rec, "stream.message")
+		ack := spanByName(t, rec, "redis.ack")
+		if ack.Status.Code != codes.Unset {
+			t.Errorf("redis.ack status = %v, want UNSET after a confirmed ACK",
+				ack.Status.Code)
+		}
+		if ack.Parent.SpanID() != streamSpan.SpanContext.SpanID() {
+			t.Errorf("redis.ack parent = %s, want stream.message %s",
+				ack.Parent.SpanID(), streamSpan.SpanContext.SpanID())
+		}
+	})
+}

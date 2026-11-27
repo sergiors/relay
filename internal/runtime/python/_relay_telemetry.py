@@ -71,10 +71,18 @@ Shutdown semantics (verified against installed SDK sources, not assumed):
     at a fixed default, while older ones join without a timeout.
   - Relay therefore runs the SDK shutdown on a daemon thread and waits a fixed
     ``SHUTDOWN_TIMEOUT_SECONDS``. If the SDK is still exporting at that point,
-    the process exits and the daemon thread/export is abandoned. This bounds
-    the flush opportunity; it cannot guarantee delivery to an unreachable
-    collector. The container's own lifecycle must still give the process a
-    moment to run this before it is killed.
+    the process exits and the daemon thread/export is abandoned; if the daemon
+    cannot be started, the flush is abandoned rather than run unbounded in
+    place. This bounds the flush opportunity; it cannot guarantee delivery to an
+    unreachable collector. The container's own lifecycle must still give the
+    process a moment to run this before it is killed.
+  - Application container-dependency cleanup runs first, while this provider is
+    still active, and is itself bounded by
+    ``DEPENDENCY_CLEANUP_TIMEOUT_SECONDS`` in ``_relay_server``. That budget plus
+    this one stays below the worker's 10s shutdown drain grace, leaving room for
+    interpreter exit. Neither bound can stop a synchronous or blocking
+    application callback; such a callback can still delay exit until the worker
+    kills the container.
 """
 
 import logging
@@ -102,8 +110,12 @@ DEFAULT_PROTOCOL = PROTOCOL_HTTP_PROTOBUF
 # The SDK's own shutdown join is not configurable through the public provider
 # or batch-processor API, so Relay bounds the whole call on a daemon thread.
 # The runtime's shutdown drain allows 10s for this process to exit after its
-# channel closes (capped to half the remaining manager shutdown budget), so
-# this bound stays below that grace to leave room for interpreter exit.
+# channel closes (capped to half the remaining manager shutdown budget). The
+# bootstrap spends at most _relay_server.DEPENDENCY_CLEANUP_TIMEOUT_SECONDS (1s)
+# waiting for application container-dependency cleanup BEFORE this flush, so
+# this bound plus that one stays below the drain grace with margin for
+# interpreter exit. Both are named constants so the Go tests can pin the
+# combined budget.
 SHUTDOWN_TIMEOUT_SECONDS = 8.0
 
 _started = False
@@ -184,29 +196,59 @@ def _start():
     protocol = _resolve_protocol()
     if protocol is None:
         return None
-    exporter = _build_exporter(protocol)
-    if exporter is None:
-        return None
-
     sdk = _load_sdk()
     if sdk is None:
         return None
     Resource, TracerProvider, BatchSpanProcessor = sdk
+    resource = Resource.create({})
 
     # Build the provider before the batch processor: the processor starts its
     # export worker immediately, and a provider configuration error must not
     # leave that worker running without an owner.
-    provider = TracerProvider(resource=Resource.create({}), shutdown_on_exit=False)
-    processor = BatchSpanProcessor(exporter)
-    provider.add_span_processor(processor)
+    exporter = _build_exporter(protocol)
+    if exporter is None:
+        return None
+    try:
+        provider = TracerProvider(resource=resource, shutdown_on_exit=False)
+    except Exception:
+        _discard_provider(exporter=exporter)
+        raise
 
-    trace_api.set_tracer_provider(provider)
+    try:
+        processor = BatchSpanProcessor(exporter)
+    except Exception:
+        _discard_provider(exporter=exporter)
+        raise
+
+    processor_attached = False
+    try:
+        provider.add_span_processor(processor)
+        processor_attached = True
+        trace_api.set_tracer_provider(provider)
+    except Exception as exc:
+        # A registration failure after construction must not leak a started
+        # export worker. Only the provider Relay just created is released; an
+        # application-owned global provider is never touched.
+        _LOGGER.warning(
+            "telemetry: provider registration failed (%s)", type(exc).__name__
+        )
+        _discard_provider(
+            provider,
+            processor,
+            processor_attached=processor_attached,
+        )
+        return None
+
     if not _registered_provider_is(trace_api, provider):
         # Another writer won the API's single global registration between the
         # check above and this call. Reload is impossible, so release only the
         # exporter/processor Relay just created and keep the other provider.
         _LOGGER.warning("telemetry: another tracer provider is already registered")
-        _bounded_shutdown(provider)
+        _discard_provider(
+            provider,
+            processor,
+            processor_attached=processor_attached,
+        )
         return None
     _LOGGER.debug("telemetry: provider enabled")
     return provider
@@ -378,29 +420,67 @@ def _build_exporter(protocol):
     return OTLPSpanExporter()
 
 
+def _discard_provider(
+    provider=None,
+    processor=None,
+    *,
+    processor_attached=False,
+    exporter=None,
+):
+    """Bound cleanup to one Relay-owned component.
+
+    Provider shutdown owns an attached processor; otherwise clean up the
+    unattached processor or the exporter created before it.
+    """
+    if processor_attached and provider is not None:
+        _bounded_shutdown(provider)
+    elif processor is not None:
+        _run_bounded_shutdown(processor.shutdown, "span processor shutdown")
+    elif exporter is not None:
+        _run_bounded_shutdown(exporter.shutdown, "exporter shutdown")
+
+
 def _bounded_shutdown(provider):
     """Run the SDK's synchronous provider shutdown within a fixed window.
 
     ``TracerProvider.shutdown()`` has no timeout and joins the batch worker
     with the SDK's own fixed default, so it runs on a daemon thread. If it is
     still exporting at the deadline, process exit abandons the daemon. Never
-    raises.
+    raises, including when the daemon thread cannot start.
+    """
+    _run_bounded_shutdown(provider.shutdown, "provider shutdown")
+
+
+def _run_bounded_shutdown(close, label):
+    """Run one synchronous SDK shutdown call boundedly and never raise.
+
+    If the daemon thread cannot start, the call has no timeout and cannot be
+    run safely in place, so it is abandoned: a failed flush must not block
+    container exit.
     """
     finished = threading.Event()
 
-    def close():
+    def run():
         try:
-            provider.shutdown()
+            close()
         except Exception as exc:
-            _LOGGER.warning(
-                "telemetry: provider shutdown failed (%s)", type(exc).__name__
-            )
+            _LOGGER.warning("telemetry: %s failed (%s)", label, type(exc).__name__)
         finally:
             finished.set()
 
-    threading.Thread(target=close, name="relay-otel-shutdown", daemon=True).start()
+    try:
+        threading.Thread(target=run, name="relay-otel-shutdown", daemon=True).start()
+    except Exception as exc:
+        _LOGGER.warning(
+            "telemetry: %s could not be started (%s); abandoning the flush",
+            label,
+            type(exc).__name__,
+        )
+        return
+
     if not finished.wait(SHUTDOWN_TIMEOUT_SECONDS):
         _LOGGER.warning(
-            "telemetry: provider shutdown exceeded %gs; abandoning the flush",
+            "telemetry: %s exceeded %gs; abandoning the flush",
+            label,
             SHUTDOWN_TIMEOUT_SECONDS,
         )

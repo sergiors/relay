@@ -1025,6 +1025,115 @@ def boom(event, context):
 	}
 }
 
+// TestPythonRuntimeHostileErrorTextIsFormattedOnce pins the operator-facing
+// error contract: an exception whose own __str__ raises (and a SystemExit
+// whose code cannot be rendered) maps to fixed generic text instead of
+// breaking the channel, the result error and the stderr mirror carry the SAME
+// single text, and each failure line carries exactly ONE "handler ...
+// failed:" prefix — the formatter inside invoke must not be applied twice.
+func TestPythonRuntimeHostileErrorTextIsFormattedOnce(t *testing.T) {
+	requirePython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", `
+_counter = {"n": 0}
+
+
+class HostileError(Exception):
+    def __str__(self):
+        raise ValueError("renderer boom")
+
+
+class HostileExitCode:
+    def __str__(self):
+        raise ValueError("renderer boom")
+
+
+def count(event, context):
+    _counter["n"] += 1
+    print("count=%d" % _counter["n"])
+
+
+def plain(event, context):
+    raise ValueError("plain failure")
+
+
+def hostile(event, context):
+    raise HostileError("detail")
+
+
+def hostile_exit(event, context):
+    raise SystemExit(HostileExitCode())
+`)
+	p := startPython(t, dir)
+
+	plainPrefix := "handler 'handler.plain' failed:"
+	hostilePrefix := "handler 'handler.hostile' failed:"
+	hostileExitPrefix := "handler 'handler.hostile_exit'"
+
+	// when an ordinary handler fails, the result carries the whole error once
+	rPlain := p.invoke(t, "handler.plain", `{}`, nil)
+	if rPlain.OK {
+		t.Fatal("a raising handler must fail the invocation")
+	}
+	wantPlain := "handler 'handler.plain' failed: plain failure"
+	if rPlain.Err != wantPlain {
+		t.Errorf("plain error = %q, want %q", rPlain.Err, wantPlain)
+	}
+	if strings.Count(rPlain.Err, plainPrefix) != 1 {
+		t.Errorf("result error %q must carry exactly one prefix", rPlain.Err)
+	}
+
+	// when the exception's own rendering fails, the fixed fallback text is used
+	rHostile := p.invoke(t, "handler.hostile", `{}`, nil)
+	if rHostile.OK {
+		t.Fatal("a hostile exception must still fail as an ordinary error")
+	}
+	wantHostile := "handler 'handler.hostile' failed: an unprintable error"
+	if rHostile.Err != wantHostile {
+		t.Errorf("hostile error = %q, want %q", rHostile.Err, wantHostile)
+	}
+
+	// when a SystemExit carries an unrenderable code, the code is dropped
+	rExit := p.invoke(t, "handler.hostile_exit", `{}`, nil)
+	if rExit.OK {
+		t.Fatal("a SystemExit must fail as an ordinary error")
+	}
+	wantExit := "handler 'handler.hostile_exit' exited"
+	if rExit.Err != wantExit {
+		t.Errorf("exit error = %q, want %q", rExit.Err, wantExit)
+	}
+
+	// then the stderr mirror reaches the same texts; the harness mirror is
+	// asynchronous, so poll briefly for the last line
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(p.stderrString(), wantExit) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	stderr := p.stderrString()
+	for _, want := range []string{wantPlain, wantHostile, wantExit} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr missing %q:\n%s", want, stderr)
+		}
+	}
+	// and every line carries its prefix exactly once: the pre-formatting inside
+	// invoke and the stderr mirror must never stack two prefixes
+	for _, prefix := range []string{plainPrefix, hostilePrefix, hostileExitPrefix} {
+		if count := strings.Count(stderr, prefix); count != 1 {
+			t.Errorf("stderr prefix %q appears %d times, want exactly 1:\n%s",
+				prefix, count, stderr)
+		}
+	}
+
+	// the channel stays healthy after every hostile failure
+	r2 := p.invoke(t, "handler.count", `{}`, nil)
+	if !r2.OK || !strings.Contains(r2.Out, "count=1") {
+		t.Fatalf("post-hostile invoke = %+v, want count=1 on a healthy container", r2)
+	}
+}
+
 func TestPythonRuntimeEnvRotation(t *testing.T) {
 	requirePython(t)
 	dir := t.TempDir()

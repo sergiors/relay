@@ -321,3 +321,55 @@ async def serve(event, context, conn=Depends(provide_conn, scope="container")):
 		t.Errorf("async cleanup must run during graceful shutdown, after the last invocation:\n%s", out)
 	}
 }
+
+// TestPythonRuntimeDependencyCleanupIsBoundedAtShutdown pins the cleanup half
+// of the combined shutdown budget: a container-scoped cleanup that never
+// completes is abandoned at the coordinated 1s bound (announced on stderr) so
+// the process still exits 0 far inside the worker's 10s drain grace instead of
+// waiting out the application's own sleep. The static budget pin lives in
+// internal/runtime; this is the behavioral half.
+func TestPythonRuntimeDependencyCleanupIsBoundedAtShutdown(t *testing.T) {
+	requirePython(t)
+	src := relayRuntimeSrc(t)
+	dir := t.TempDir()
+	writeOtelStub(t, dir)
+	writeHandler(t, dir, "handler", `
+import asyncio
+
+from relay_runtime import Depends, bind
+
+
+async def provide_conn():
+    yield "conn"
+    # a cleanup that never completes must not hold the exit hostage
+    await asyncio.sleep(3600)
+
+
+@bind
+async def serve(event, context, conn=Depends(provide_conn, scope="container")):
+    print("serve %s" % conn)
+`)
+	p := startEmbeddedBootstrap(t, dir, Bootstrap,
+		dependencyInjectionEnv(t, dir, src))
+
+	r := p.invoke(t, "handler.serve", `{}`, nil)
+	if !r.OK {
+		t.Fatalf("invoke failed: %s", r.Err)
+	}
+	if !strings.Contains(r.Out, "serve conn") {
+		t.Fatalf("handler did not run: %q", r.Out)
+	}
+
+	// when Relay is done while the stuck cleanup is still running
+	elapsed := closeAndWait(t, p, 5*time.Second)
+
+	// then the process exits 0 promptly: the 3600s sleep never delays exit
+	if elapsed > 3*time.Second {
+		t.Errorf("shutdown took %v, want the stuck cleanup abandoned at the 1s bound", elapsed)
+	}
+	if !strings.Contains(p.stderrString(),
+		"dependency cleanup abandoned after 1s") {
+		t.Errorf("stderr = %q, want the bounded-cleanup abandonment line",
+			p.stderrString())
+	}
+}

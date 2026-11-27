@@ -64,6 +64,16 @@ let traceAPI:
   | null
   | undefined;
 
+interface ActiveSpanContext {
+  traceId: string;
+  spanId: string;
+}
+
+interface ActiveSpanLookup {
+  apiAvailable: boolean;
+  span: ActiveSpanContext | null;
+}
+
 export class Logger {
   readonly name: string;
   readonly service: string;
@@ -194,7 +204,7 @@ export class Logger {
     this.persistentFields = remaining;
   }
 
-  withContext<T>(
+  withContextKeys<T>(
     fields: Readonly<Record<string, unknown>>,
     callback: () => T,
   ): T {
@@ -207,20 +217,6 @@ export class Logger {
       snapshotFields(fields),
       callback,
     );
-  }
-
-  withContextKeys<T>(
-    fields: Readonly<Record<string, unknown>>,
-    callback: () => T,
-  ): T {
-    return this.withContext(fields, callback);
-  }
-
-  appendContextKeys<T>(
-    fields: Readonly<Record<string, unknown>>,
-    callback: () => T,
-  ): T {
-    return this.withContext(fields, callback);
   }
 
   private write(
@@ -261,11 +257,12 @@ export class Logger {
         ...snapshot.temporary,
         ...applicationFields,
       };
-      const span = snapshot.expired ? null : activeSpan();
+      const active = snapshot.expired ? null : activeSpan();
+      const span = active?.span ?? null;
       const invocation = snapshot.invocation;
       const traceId =
         span?.traceId ??
-        (invocation === null ? undefined : invocation.trace_id);
+        (active?.apiAvailable === false ? invocation?.trace_id : undefined);
       const stack = new Error().stack;
       const stackInfo = options.stackInfo
         ? applicationStackInfo(stack)
@@ -507,7 +504,7 @@ function invocationFields(
   };
 }
 
-function activeSpan(): { traceId?: string; spanId?: string } | null {
+function activeSpan(): ActiveSpanLookup {
   if (traceAPI === undefined) {
     try {
       traceAPI = require("@opentelemetry/api") as typeof traceAPI;
@@ -515,6 +512,8 @@ function activeSpan(): { traceId?: string; spanId?: string } | null {
       traceAPI = null;
     }
   }
+  if (traceAPI === null) return { apiAvailable: false, span: null };
+
   try {
     const activeContext = traceAPI?.context?.active?.();
     const span = traceAPI?.trace?.getSpan?.(activeContext) as
@@ -525,7 +524,7 @@ function activeSpan(): { traceId?: string; spanId?: string } | null {
       context === undefined ||
       traceAPI?.trace?.isSpanContextValid?.(context) !== true
     ) {
-      return null;
+      return { apiAvailable: true, span: null };
     }
     const traceId =
       typeof context?.traceId === "string" &&
@@ -539,11 +538,15 @@ function activeSpan(): { traceId?: string; spanId?: string } | null {
       !/^0{16}$/.test(context.spanId)
         ? context.spanId
         : undefined;
-    return traceId === undefined || spanId === undefined
-      ? null
-      : { traceId, spanId };
+    return {
+      apiAvailable: true,
+      span:
+        traceId === undefined || spanId === undefined
+          ? null
+          : { traceId, spanId },
+    };
   } catch {
-    return null;
+    return { apiAvailable: true, span: null };
   }
 }
 
