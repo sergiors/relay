@@ -188,10 +188,50 @@ keep the plain function form. See the
 for the rules, scopes, and limitations.
 
 OpenTelemetry trace propagation remains available ambiently during the handler
-call in both runtimes. Python invocation images additionally ship the
-OpenTelemetry SDK and OTLP exporters and run a managed provider configured from
-the app's standard `OTEL_*` environment and the worker's allowlisted tracing
-configuration; see [Operations](operations.md#tracing).
+call in both runtimes. Python and Node.js invocation images can also run a
+Relay-managed trace provider configured from the app's standard `OTEL_*`
+environment and the worker's allowlisted tracing configuration. Node.js
+`nodejs24.x` and `nodejs26.x` invocation images include the OpenTelemetry SDK
+and OTLP trace exporters. Node.js service-only images include the API but not
+the managed SDK or provider; a service process does not initialize Relay's
+managed provider. See
+[Operations](operations.md#tracing).
+
+#### Node.js spans
+
+Node.js handlers can create spans with the native OpenTelemetry API. Add
+`@opentelemetry/api` to the app's dependencies (for example, with
+`pnpm add @opentelemetry/api`) and commit the updated manifest and lockfile:
+
+```ts
+import { trace } from "@opentelemetry/api";
+import type { HandlerContext } from "@sergiors/relay-runtime";
+
+const tracer = trace.getTracer("orders");
+
+export async function handler(
+  event: Record<string, unknown>,
+  context: HandlerContext,
+): Promise<void> {
+  await tracer.startActiveSpan("process-order", async (span) => {
+    try {
+      span.setAttribute("relay.request_id", context.requestId);
+      span.setAttribute("event.type", String(event.type ?? "unknown"));
+    } finally {
+      span.end();
+    }
+  });
+}
+```
+
+The handler's active span context is propagated from the incoming event or
+schedule when available. Relay replaces any app-installed
+`@opentelemetry/api` with version 1.10.0 in Node images. App-installed SDKs and
+instrumentation packages are not replaced: any provider or context manager they
+register with the OpenTelemetry global registry must use exactly
+`@opentelemetry/api` 1.10.0. The registry requires an exact version match, not
+just API compatibility. A second physical API installation is supported only
+when its version also matches the API version used for registration (1.10.0).
 
 Event handler names must be unique across an app's event rules. Every schedule
 and service also needs a unique, stable name within its app; names follow the

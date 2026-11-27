@@ -39,6 +39,14 @@ func engineFor(spec plan.Spec) (interface {
 	}
 }
 
+// engineUsesManagedOtel reports whether the runtime's invocation bootstrap
+// supports Relay's managed process-lifetime OpenTelemetry provider. Only an
+// image that serves event or schedule handlers resolves this configuration; a
+// service-only image never runs the invocation bootstrap.
+func engineUsesManagedOtel(engine plan.Engine) bool {
+	return engine == plan.EnginePython || engine == plan.EngineNode
+}
+
 // errBuildSlotWait marks a build that never started because the caller's
 // context was cancelled before a permit became available. Shared dependency
 // builds use it to distinguish "the leader never built" (safe to retry) from a
@@ -163,9 +171,10 @@ type Prepared struct {
 	Env []string
 	// execEnv is the environment for EXECUTION containers only: Env plus the
 	// allowlisted non-secret OpenTelemetry process configuration for a managed
-	// Python invocation image. It is nil when no managed configuration applies,
-	// in which case Execute uses Env. Keeping it separate is what stops Relay's
-	// tracing configuration from being inherited by service processes or Node.
+	// Python or Node invocation image. It is nil when no managed configuration
+	// applies, in which case Execute uses Env. Keeping it separate is what stops
+	// Relay's tracing configuration from being inherited by service processes
+	// or service-only images.
 	execEnv []string
 	// Concurrency is the app's EFFECTIVE per-app concurrency: the
 	// template's resolved `concurrency` clipped to the worker-global
@@ -526,13 +535,14 @@ func (m *Manager) prepare(
 	}
 
 	handlers := templateHandlers(fn)
-	// Managed Python function execution gets Relay's worker-inherited
-	// OpenTelemetry defaults plus the app-name service default. The app's own
-	// OTEL values stay on the normal per-invocation frame; only a private
-	// identity merges them, so a template change still rotates warm processes.
-	// Services and Node never receive execEnv and get no managed provider.
+	// Managed function execution for every invocation-capable engine gets
+	// Relay's worker-inherited OpenTelemetry defaults plus the app-name service
+	// default. The app's own OTEL values stay on the normal per-invocation
+	// frame; only a private identity merges them, so a template change still
+	// rotates warm processes. Services and service-only images never receive
+	// execEnv and get no managed provider.
 	managedOtel := tracing.ManagedAppConfig{}
-	if spec.Engine == plan.EnginePython && len(handlers) > 0 {
+	if len(handlers) > 0 && engineUsesManagedOtel(spec.Engine) {
 		var appEnv map[string]string
 		if fn.Template != nil {
 			appEnv = fn.Template.Env

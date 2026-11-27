@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
@@ -277,6 +280,338 @@ func TestPlanOtelInstallUsesPnpm(t *testing.T) {
 	}
 }
 
+// otelManifestPath is the staged private managed-OTel manifest location.
+func otelManifestPath() string { return path.Join(otelProjectDir, "package.json") }
+
+// otelLockPath is the staged private managed-OTel lock location.
+func otelLockPath() string { return path.Join(otelProjectDir, pnpmLockFile) }
+
+// findPlanFile returns the planned file at filePath, or false when the plan
+// does not carry it.
+func findPlanFile(p plan.BuildPlan, filePath string) (plan.File, bool) {
+	for _, f := range p.Files {
+		if f.Path == filePath {
+			return f, true
+		}
+	}
+	return plan.File{}, false
+}
+
+// planFile returns the planned file at filePath, failing when the plan omits
+// it and listing the planned paths for diagnostics.
+func planFile(t *testing.T, p plan.BuildPlan, filePath string) plan.File {
+	t.Helper()
+	if f, ok := findPlanFile(p, filePath); ok {
+		return f
+	}
+	paths := make([]string, 0, len(p.Files))
+	for _, f := range p.Files {
+		paths = append(paths, f.Path)
+	}
+	t.Fatalf("plan has no %s; planned paths: %v", filePath, paths)
+	return plan.File{}
+}
+
+// runtimeOtelImports returns every @opentelemetry package specifier the
+// embedded runtime modules import or require — the exact set the private
+// managed-OTel manifest must declare so the bootstrap can resolve each one
+// from /relay/otel (pnpm exposes only declared dependencies at the project
+// root).
+func runtimeOtelImports(t *testing.T) []string {
+	t.Helper()
+	re := regexp.MustCompile(`"(@opentelemetry/[^"]+)"`)
+	found := map[string]bool{}
+	for _, src := range embeddedModuleSources(t) {
+		for _, match := range re.FindAllStringSubmatch(src, -1) {
+			found[match[1]] = true
+		}
+	}
+	if len(found) == 0 {
+		t.Fatal("no @opentelemetry package specifier found in the embedded runtime modules")
+	}
+	imports := make([]string, 0, len(found))
+	for name := range found {
+		imports = append(imports, name)
+	}
+	sort.Strings(imports)
+	return imports
+}
+
+// otelEnginePins maps each managed package name to its exact engine pin: the
+// API version constant plus the pinned trace-stack package list.
+func otelEnginePins(t *testing.T) map[string]string {
+	t.Helper()
+	pins := map[string]string{"@opentelemetry/api": otelAPIVersion}
+	for _, pkg := range otelTracePackages {
+		i := strings.LastIndex(pkg, "@")
+		if i <= 0 || i == len(pkg)-1 {
+			t.Fatalf("trace package %q is not in name@version form", pkg)
+		}
+		pins[pkg[:i]] = pkg[i+1:]
+	}
+	return pins
+}
+
+// TestPlanManagedOtelManifestScopedToInvocationImages pins where the private
+// managed-OTel package.json + pnpm-lock.yaml land: an image that serves event
+// or schedule handlers stages BOTH under /relay/otel (the private project the
+// bootstrap resolves through), while a service-only image — which never runs
+// the invocation bootstrap — stages NEITHER and stays API-only. The staging
+// must hold for baked and source-mounted layouts alike.
+func TestPlanManagedOtelManifestScopedToInvocationImages(t *testing.T) {
+	dir := t.TempDir()
+	writeSource(t, dir, "index.js", "export function handler(e, context) {}\n")
+
+	for _, tc := range []struct {
+		name          string
+		sourceMounted bool
+	}{
+		{name: "baked"},
+		{name: "source-mounted", sourceMounted: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := specByName(t, "nodejs24.x")
+			spec.SourceMounted = tc.sourceMounted
+
+			invocation, err := Engine{}.Plan(spec, dir, []string{"index"})
+			if err != nil {
+				t.Fatalf("invocation plan: %v", err)
+			}
+			serviceOnly, err := Engine{}.Plan(spec, dir, nil)
+			if err != nil {
+				t.Fatalf("service-only plan: %v", err)
+			}
+
+			manifest := planFile(t, invocation, otelManifestPath())
+			lock := planFile(t, invocation, otelLockPath())
+			if manifest.Mode != fs.FileMode(0o644) || lock.Mode != fs.FileMode(0o644) {
+				t.Errorf("staged OTel file modes = manifest %v lock %v, want 0644",
+					manifest.Mode, lock.Mode)
+			}
+			var doc map[string]json.RawMessage
+			if err := json.Unmarshal(manifest.Content, &doc); err != nil {
+				t.Errorf("staged %s is not a JSON object: %v", otelManifestPath(), err)
+			}
+			if len(lock.Content) == 0 || !strings.Contains(string(lock.Content), "lockfileVersion") {
+				t.Errorf("staged %s = %q, want a non-empty pnpm lockfile", otelLockPath(), lock.Content)
+			}
+
+			// A service-only image must not carry the SDK's manifest or lock:
+			// it installs only the managed API singleton and never pays for
+			// the SDK tree.
+			for _, filePath := range []string{otelManifestPath(), otelLockPath()} {
+				if f, ok := findPlanFile(serviceOnly, filePath); ok {
+					t.Errorf("service-only image stages %s (%d bytes); only invocation images may",
+						filePath, len(f.Content))
+				}
+			}
+		})
+	}
+}
+
+// TestPlanManagedOtelInstallFrozenAndScopedToPrivateProject pins the install
+// contract the staged lock exists for: the invocation image installs the
+// private OTel project with --frozen-lockfile (a manifest/lock disagreement
+// fails the build instead of resolving fresh) and the protobufjs build
+// allowlist its transformer dependency needs, and NO install step can rewrite
+// the APPLICATION's manifests or locks — a saving `pnpm add` must always name
+// a private -C directory, never run in the /app workdir, and the invocation
+// plan must add no /app file the service-only plan lacks.
+func TestPlanManagedOtelInstallFrozenAndScopedToPrivateProject(t *testing.T) {
+	dir := t.TempDir()
+	writeSource(t, dir, "index.js", "export function handler(e, context) {}\n")
+
+	for _, tc := range []struct {
+		name          string
+		sourceMounted bool
+	}{
+		{name: "baked"},
+		{name: "source-mounted", sourceMounted: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := specByName(t, "nodejs24.x")
+			spec.SourceMounted = tc.sourceMounted
+
+			invocation, err := Engine{}.Plan(spec, dir, []string{"index"})
+			if err != nil {
+				t.Fatalf("invocation plan: %v", err)
+			}
+			serviceOnly, err := Engine{}.Plan(spec, dir, nil)
+			if err != nil {
+				t.Fatalf("service-only plan: %v", err)
+			}
+
+			var frozenStep string
+			for _, cmd := range invocation.Install {
+				if strings.Contains(cmd, otelProjectDir) && strings.Contains(cmd, "--frozen-lockfile") {
+					frozenStep = cmd
+				}
+			}
+			if frozenStep == "" {
+				t.Fatalf("invocation Install = %v, want a frozen install of %s",
+					invocation.Install, otelProjectDir)
+			}
+			if !strings.Contains(frozenStep, "protobufjs") {
+				t.Errorf("frozen OTel install is missing the protobufjs build allowlist:\n%s",
+					frozenStep)
+			}
+			// A saving add would rewrite the staged manifest the lock was
+			// frozen against; the install must read, never save — and no
+			// build-time printf may clobber the staged manifest either (the
+			// frozen lock is only in sync with the staged bytes).
+			if strings.Contains(frozenStep, "pnpm add") {
+				t.Errorf("the frozen OTel install must not be a saving `pnpm add`:\n%s", frozenStep)
+			}
+			if strings.Contains(frozenStep, "printf") {
+				t.Errorf("the frozen OTel install must not rewrite the staged manifest:\n%s",
+					frozenStep)
+			}
+			// The API singleton contract survives the install swap: the
+			// project's API is linked into /app by replacing only the package
+			// path, never via ln -sfn (which links INSIDE an existing real
+			// directory) and never by removing the parent @opentelemetry
+			// scope (which may hold the application's sibling packages).
+			linkStep := "rm -rf " + workDir + "/node_modules/@opentelemetry/api" +
+				" && ln -s " + otelProjectDir + "/node_modules/@opentelemetry/api " +
+				workDir + "/node_modules/@opentelemetry/api"
+			if !strings.Contains(frozenStep, linkStep) {
+				t.Errorf("frozen OTel install is missing the exact API link step, want %q:\n%s",
+					linkStep, frozenStep)
+			}
+			if strings.Contains(frozenStep, "ln -sfn") {
+				t.Errorf("frozen OTel install must not use ln -sfn (fails on an existing real directory):\n%s",
+					frozenStep)
+			}
+			if strings.Contains(frozenStep, "rm -rf "+workDir+"/node_modules/@opentelemetry &&") {
+				t.Errorf("frozen OTel install must not remove the parent @opentelemetry scope:\n%s",
+					frozenStep)
+			}
+
+			// Nothing may install into the app workdir or name /app as its
+			// target: the application's package.json/pnpm-lock.yaml are the
+			// app's own and are never rewritten by Relay's managed installs.
+			for _, cmd := range invocation.Install {
+				if strings.Contains(cmd, "-C /app") || strings.Contains(cmd, "--dir /app") {
+					t.Errorf("install step targets the application workdir:\n%s", cmd)
+				}
+				if i := strings.Index(cmd, "pnpm add"); i >= 0 && !strings.Contains(cmd, "pnpm add -C ") {
+					t.Errorf("a `pnpm add` without a private -C target runs in /app and saves over"+
+						" the application manifest:\n%s", cmd)
+				}
+			}
+
+			// The invocation plan adds only private /relay/otel files beside
+			// the service-only plan: no /app file appears, changes, or grows.
+			if got, want := appPlanFiles(invocation), appPlanFiles(serviceOnly); !sameStringMaps(got, want) {
+				t.Errorf("invocation plan changed the /app file set:\n invocation %v\n service-only %v",
+					got, want)
+			}
+
+			// The service-only image keeps the API-only install: no frozen
+			// private-project step and no SDK tree.
+			for _, cmd := range serviceOnly.Install {
+				if strings.Contains(cmd, otelProjectDir) && strings.Contains(cmd, "--frozen-lockfile") {
+					t.Errorf("service-only image must not install a frozen private OTel project:\n%s", cmd)
+				}
+			}
+		})
+	}
+}
+
+// TestPlanManagedOtelManifestCoversRuntimeImports pins the dependency/ import
+// sync: every @opentelemetry package the embedded runtime modules import or
+// require is declared in the staged private manifest at its exact engine pin,
+// and every declared dependency is an exact version — a frozen install whose
+// manifest drifts from what the bootstrap resolves would fail at invocation
+// time (pnpm exposes only declared dependencies from the project root).
+func TestPlanManagedOtelManifestCoversRuntimeImports(t *testing.T) {
+	dir := t.TempDir()
+	writeSource(t, dir, "index.js", "export function handler(e, context) {}\n")
+
+	p, err := Engine{}.Plan(specByName(t, "nodejs24.x"), dir, []string{"index"})
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	manifest := planFile(t, p, otelManifestPath())
+	var doc struct {
+		Dependencies map[string]string `json:"dependencies"`
+	}
+	if err := json.Unmarshal(manifest.Content, &doc); err != nil {
+		t.Fatalf("staged manifest is not a JSON object: %v", err)
+	}
+	pins := otelEnginePins(t)
+
+	for _, name := range runtimeOtelImports(t) {
+		want, pinned := pins[name]
+		if !pinned {
+			t.Errorf("runtime import %s has no exact engine pin (otelAPIVersion/otelTracePackages);"+
+				" the staged manifest cannot pin what the bootstrap imports", name)
+			continue
+		}
+		got, ok := doc.Dependencies[name]
+		if !ok {
+			t.Errorf("staged manifest is missing the runtime import %s (the bootstrap resolves it"+
+				" from %s; declared: %v)", name, otelProjectDir, doc.Dependencies)
+			continue
+		}
+		if got != want {
+			t.Errorf("staged manifest %s = %q, want the engine pin %q", name, got, want)
+		}
+	}
+	for name, version := range doc.Dependencies {
+		if !isExactVersion(version) {
+			t.Errorf("staged manifest %s = %q, want an exact version pin", name, version)
+		}
+	}
+	if len(doc.Dependencies) == 0 {
+		t.Error("staged manifest declares no dependencies")
+	}
+}
+
+// appPlanFiles returns the /app file set of a plan as path → content.
+func appPlanFiles(p plan.BuildPlan) map[string]string {
+	out := map[string]string{}
+	for _, f := range p.Files {
+		if strings.HasPrefix(f.Path, "/app/") {
+			out[f.Path] = string(f.Content)
+		}
+	}
+	return out
+}
+
+// sameStringMaps reports whether two path → content maps are equal.
+func sameStringMaps(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// isExactVersion reports whether v is a plain major.minor.patch pin with no
+// range syntax (caret, tilde, comparison operator, wildcard, or tag).
+func isExactVersion(v string) bool {
+	parts := strings.Split(v, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // writeSource puts a handler source file under dir, creating parent
 // directories. It fails the test on error.
 func writeSource(t *testing.T, dir, rel, content string) {
@@ -315,17 +650,20 @@ func requireInstall(t *testing.T, p plan.BuildPlan) string {
 	return ""
 }
 
-// requireOTelInstall returns the managed OpenTelemetry API install command,
-// failing when the plan omits it. It is not necessarily the first Install entry:
-// a TypeScript build appends an esbuild step after it.
+// requireOTelInstall returns the managed OpenTelemetry install command,
+// failing when the plan omits it. Its shape differs by image: a service-only
+// image saves the API pin with `pnpm add`, while an invocation image installs
+// the staged frozen tree (the pins live in the staged manifest, not the
+// command). It is not necessarily the first Install entry: a TypeScript build
+// appends an esbuild step after it.
 func requireOTelInstall(t *testing.T, p plan.BuildPlan) string {
 	t.Helper()
 	for _, cmd := range p.Install {
-		if strings.Contains(cmd, "@opentelemetry/api@"+otelAPIVersion) {
+		if strings.Contains(cmd, otelProjectDir) {
 			return cmd
 		}
 	}
-	t.Fatalf("Install = %v, want the managed OTel API install", p.Install)
+	t.Fatalf("Install = %v, want the managed OTel install of %s", p.Install, otelProjectDir)
 	return ""
 }
 

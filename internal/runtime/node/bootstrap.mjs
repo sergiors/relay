@@ -13,6 +13,7 @@ import {
   writeInvocationReport,
   writeInvocationStart,
 } from "./lifecycle.mjs";
+import * as telemetry from "./telemetry.mjs";
 
 initializeLifecycle();
 initializeCgroupMemory();
@@ -51,4 +52,4 @@ await runProtocol(async (request) => {
   writeInvocationEnd(request.context.requestId);
   writeInvocationReport(request.context.requestId, durationMs, memory);
   return result;
-});
+}, telemetry.shutdown);

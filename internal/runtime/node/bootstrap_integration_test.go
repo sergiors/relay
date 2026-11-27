@@ -165,6 +165,19 @@ func (p *nodeProc) waitExit(t *testing.T, bound time.Duration) error {
 
 func appRoot(t *testing.T) string {
 	t.Helper()
+	root := appRootWithoutOtel(t)
+	writeOTelAPIStub(t, root)
+	return root
+}
+
+// appRootWithoutOtel returns the same fake in-image layout as appRoot but with
+// NO @opentelemetry/api package at all: a real-OpenTelemetry test links the
+// official API singleton there instead of the stub, and
+// TestNodeRuntimeHandlerWithoutOtelAPIIsBestEffort pins the fully-uninstalled
+// application shape where telemetry must degrade best-effort without failing
+// valid handlers.
+func appRootWithoutOtel(t *testing.T) string {
+	t.Helper()
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "app"), 0o755); err != nil {
 		t.Fatalf("mkdir app: %v", err)
@@ -175,7 +188,6 @@ func appRoot(t *testing.T) string {
 	if err := os.WriteFile(filepath.Join(root, "app", "package.json"), []byte(`{"type":"module"}`), 0o644); err != nil {
 		t.Fatalf("write app package: %v", err)
 	}
-	writeOTelAPIStub(t, root)
 	return root
 }
 
@@ -274,6 +286,17 @@ func rewriteModuleLayout(content, root string, mounted bool) string {
 		`const BAKED_ROOT = "/app";`,
 		fmt.Sprintf(`const BAKED_ROOT = %s;`, quote(filepath.Join(root, "app"))),
 		-1,
+	)
+	// The telemetry module's private OTel project root is re-anchored under
+	// the test root, mirroring the image's /relay/otel directory. A real-
+	// package test materializes the official install there and verifies this
+	// rewrite happened (a renamed production anchor must fail loudly rather
+	// than silently fall back to /relay/otel on the host).
+	content = strings.Replace(
+		content,
+		`const OTEL_ROOT = "/relay/otel";`,
+		fmt.Sprintf(`const OTEL_ROOT = %s;`, quote(filepath.Join(root, "relay", "otel"))),
+		1,
 	)
 	content = strings.Replace(
 		content,
@@ -383,6 +406,15 @@ func startNodeScript(t *testing.T, root, bs string) *nodeProc {
 // package.
 func startNodeScriptArgs(t *testing.T, root, bs string, args ...string) *nodeProc {
 	t.Helper()
+	return startNodeScriptEnv(t, root, bs, nil, args...)
+}
+
+// startNodeScriptEnv is startNodeScriptArgs with extra process environment
+// entries appended after the channel environment, so a test can pin
+// worker-tier process configuration (the equivalent of execEnv) before the
+// child starts. Later entries win on a duplicate name.
+func startNodeScriptEnv(t *testing.T, root, bs string, extraEnv []string, args ...string) *nodeProc {
+	t.Helper()
 	mounted := slices.Contains(args, sourceMountFlag)
 	writeRuntimeModules(t, root, mounted)
 	bsPath := filepath.Join(root, "relay", "bootstrap.mjs")
@@ -391,7 +423,7 @@ func startNodeScriptArgs(t *testing.T, root, bs string, args ...string) *nodePro
 	}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		p := spawnNodeProcess(t, bsPath, args)
+		p := spawnNodeProcess(t, bsPath, args, extraEnv...)
 		conn := p.dialChannel(t, 10*time.Second)
 		if err := clientHandshake(t, conn, p.secret); err != nil {
 			_ = conn.Close()
@@ -427,9 +459,10 @@ func startNodeUnauthenticated(t *testing.T, root string) *nodeProc {
 }
 
 // spawnNodeProcess starts node <bsPath> with the Relay-owned channel
-// environment plus the test's controlled baseline/system env. Exit is tracked
-// exactly once; no connection is made yet.
-func spawnNodeProcess(t *testing.T, bsPath string, args []string) *nodeProc {
+// environment plus the test's controlled baseline/system env and any extra
+// environment entries (later entries win). Exit is tracked exactly once; no
+// connection is made yet.
+func spawnNodeProcess(t *testing.T, bsPath string, args []string, extraEnv ...string) *nodeProc {
 	t.Helper()
 	port := reserveLoopbackPort(t)
 	secret := testSecret(t)
@@ -440,6 +473,7 @@ func spawnNodeProcess(t *testing.T, bsPath string, args []string) *nodeProc {
 		"RELAY_TEST_BASELINE=process-baseline",
 		"RELAY_TEST_SYSTEM=system-value",
 	)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatalf("stdout pipe: %v", err)
@@ -1671,6 +1705,72 @@ export async function inspect(event, context) {
 	r3 := p.invoke(t, "index.inspect", `{}`, nil)
 	if !r3.OK || !strings.Contains(r3.Out, "trace=root") {
 		t.Fatalf("post-failure context = %+v, want restored root context", r3)
+	}
+}
+
+// TestNodeRuntimeHandlerWithoutOtelAPIIsBestEffort pins the fully-uninstalled
+// degradation contract: an application tree with NO @opentelemetry/api
+// package at all must not fail valid handlers — telemetry setup degrades
+// best-effort (withParent runs the callback without context when the
+// API/context setup is unavailable), the handler's own output is unaffected,
+// the warm channel keeps serving with persisted module state, and the process
+// still exits 0 when Relay closes the channel.
+func TestNodeRuntimeHandlerWithoutOtelAPIIsBestEffort(t *testing.T) {
+	requireNode(t)
+	// Deliberately NO API package: neither the stub nor the official
+	// singleton — the fully-uninstalled application shape.
+	root := appRootWithoutOtel(t)
+	writeModule(t, root, "index.mjs", `
+const counter = { n: 0 };
+
+export function plain(event, context) {
+  counter.n += 1;
+  console.log("plain-ok " + event.msg + " n=" + counter.n);
+}
+
+export async function asyncPlain(event, context) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  console.log("async-ok " + event.msg);
+}
+`)
+	p := startNode(t, root)
+
+	// Given no API package anywhere, when a valid handler is invoked, then it
+	// succeeds and its output is untouched.
+	r1 := p.invoke(t, "index.plain", `{"msg":"one"}`, nil)
+	if !r1.OK {
+		t.Fatalf("a valid handler must succeed without the OTel API: %s", r1.Err)
+	}
+	if !strings.Contains(r1.Out, "plain-ok one n=1") {
+		t.Errorf("out = %q, want the handler's own output", r1.Out)
+	}
+	// The degradation is observable and best-effort: telemetry announces the
+	// missing API as a warning, never as an invocation failure.
+	if !strings.Contains(p.stderrString(), "OpenTelemetry API unavailable") {
+		t.Errorf("stderr = %q, want the best-effort missing-API warning", p.stderrString())
+	}
+
+	// An async handler also runs: no context carrier is available, but the
+	// callback still executes across the await boundary.
+	r2 := p.invoke(t, "index.asyncPlain", `{"msg":"two"}`, nil)
+	if !r2.OK {
+		t.Fatalf("a valid async handler must succeed without the OTel API: %s", r2.Err)
+	}
+	if !strings.Contains(r2.Out, "async-ok two") {
+		t.Errorf("async out = %q, want the handler's own output", r2.Out)
+	}
+
+	// Channel health: the same warm process keeps serving with persisted
+	// module state, and the only exit is the clean channel close.
+	r3 := p.invoke(t, "index.plain", `{"msg":"three"}`, nil)
+	if !r3.OK || !strings.Contains(r3.Out, "plain-ok three n=2") {
+		t.Errorf("third invoke = %+v, want the warm process still serving with persisted module state", r3)
+	}
+	if err := p.closeChannel(); err != nil {
+		t.Fatalf("close channel: %v", err)
+	}
+	if err := p.waitExit(t, 10*time.Second); err != nil {
+		t.Fatalf("bootstrap did not exit 0 on channel close: %v; stderr:\n%s", err, p.stderrString())
 	}
 }
 

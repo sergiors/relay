@@ -272,7 +272,9 @@ configuration:
 Tracing is disabled by default. Configure an OTLP endpoint to enable it; setup
 errors are non-fatal and Relay continues untraced. Relay uses W3C TraceContext
 and Baggage propagation. An allowlisted, non-secret subset of these variables is
-also inherited by managed Python invocation containers. Relay's own service
-name and resource attributes, and exporter authentication values, are not
-inherited from the worker; app-supplied `OTEL_*` values remain on the normal
-per-invocation environment frame. See [Operations](operations.md#tracing).
+also inherited by managed Python and Node.js invocation containers. Relay's own
+service name and resource attributes, and exporter authentication values, are
+not inherited from the worker; app-supplied `OTEL_*` values remain on the normal
+per-invocation environment frame. `RELAY_OTEL_PROVIDER` is an app-only
+provider-ownership setting, not a worker setting. See
+[Operations](operations.md#tracing).

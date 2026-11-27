@@ -7,6 +7,8 @@ const MAX_INVOKE_BYTES = 8 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const HANDSHAKE_TIMEOUT_MS = 2000;
 const MAX_PENDING_HANDSHAKES = 8;
+const PROCESS_SHUTDOWN_TIMEOUT_MS = 9500;
+const PROCESS_EXIT_FLUSH_TIMEOUT_MS = 250;
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
 class ProtocolError extends Error {}
@@ -152,7 +154,7 @@ function validMac(candidate, expected) {
   return timingSafeEqual(Buffer.from(candidate, "hex"), expected);
 }
 
-export async function runProtocol(invoke) {
+export async function runProtocol(invoke, onShutdown = () => {}) {
   const executionSecretValue = process.env.RELAY_EXECUTION_SECRET;
   const executionPortValue = process.env.RELAY_EXECUTION_PORT;
   delete process.env.RELAY_EXECUTION_SECRET;
@@ -176,15 +178,89 @@ export async function runProtocol(invoke) {
   let activeSocket = null;
   let shuttingDown = false;
   let pendingHandshakes = 0;
+  let shutdownPromise = null;
+  let activeInvocation = null;
+  let shutdownTimer = null;
+  let exitFlushTimer = null;
+  let exitFlushStarted = false;
+  let processExitRequested = false;
   const sockets = new Set();
+
+  function terminateProcess() {
+    if (processExitRequested) return;
+    processExitRequested = true;
+    clearTimeout(shutdownTimer);
+    clearTimeout(exitFlushTimer);
+    process.exit(process.exitCode ?? 0);
+  }
+
+  function exitProcess(force = false) {
+    if (processExitRequested) return;
+    if (force) {
+      terminateProcess();
+      return;
+    }
+    if (exitFlushStarted) return;
+    exitFlushStarted = true;
+
+    let pendingStreams = 2;
+    const flushed = () => {
+      pendingStreams--;
+      if (pendingStreams === 0) terminateProcess();
+    };
+    exitFlushTimer = setTimeout(
+      terminateProcess,
+      PROCESS_EXIT_FLUSH_TIMEOUT_MS,
+    );
+    for (const stream of [process.stdout, process.stderr]) {
+      let callbackCalled = false;
+      try {
+        stream.write("", () => {
+          if (callbackCalled) return;
+          callbackCalled = true;
+          flushed();
+        });
+      } catch {
+        if (callbackCalled) continue;
+        callbackCalled = true;
+        flushed();
+      }
+    }
+  }
+
+  function finishShutdown() {
+    if (shutdownPromise !== null) return shutdownPromise;
+    shutdownPromise = (async () => {
+      const invocation = activeInvocation;
+      if (invocation !== null) await invocation.catch(() => {});
+      try {
+        await onShutdown();
+      } catch {
+        // Telemetry shutdown is best-effort and must not change termination.
+      }
+      exitProcess();
+    })();
+    return shutdownPromise;
+  }
 
   function stop(exitCode) {
     if (shuttingDown) return;
     shuttingDown = true;
     process.exitCode = exitCode;
+    shutdownTimer = setTimeout(() => {
+      try {
+        process.stderr.write(
+          "execution channel: shutdown timed out; forcing process exit\n",
+        );
+      } catch {}
+      exitProcess(true);
+    }, PROCESS_SHUTDOWN_TIMEOUT_MS);
     if (server.listening) server.close();
     for (const socket of sockets) socket.destroy();
+    void finishShutdown();
   }
+
+  process.once("SIGTERM", () => stop(143));
 
   async function serve(socket, onAuthenticated) {
     socket.setNoDelay(true);
@@ -243,8 +319,16 @@ export async function runProtocol(invoke) {
       while (!socket.destroyed) {
         const raw = await readFrame(reader, MAX_INVOKE_BYTES, true);
         if (raw === null) return;
+        if (shuttingDown) return;
         const req = parseInvoke(raw);
-        const result = await invoke(req);
+        const invocation = Promise.resolve().then(() => invoke(req));
+        activeInvocation = invocation;
+        let result;
+        try {
+          result = await invocation;
+        } finally {
+          if (activeInvocation === invocation) activeInvocation = null;
+        }
         await writeFrame(socket, result, MAX_RESPONSE_BYTES);
       }
     } finally {
@@ -270,7 +354,7 @@ export async function runProtocol(invoke) {
       pendingHandshakes--;
     })
       .catch(() => {
-        if (activeSocket === socket) stop(1);
+        if (activeSocket === socket) stop(socket.destroyed ? 0 : 1);
         else socket.destroy();
       })
       .finally(() => {

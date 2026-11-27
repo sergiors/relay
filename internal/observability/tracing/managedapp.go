@@ -11,7 +11,7 @@ import (
 )
 
 // ManagedAppConfig is the resolved OpenTelemetry process configuration for a
-// managed application process (currently the Python invocation bootstrap).
+// managed application process (the Python or Node invocation bootstrap).
 //
 // Env is the worker-inherited, non-secret subset of OTEL_* variables plus the
 // app-name service-name default. Application-specific OTEL values (including
@@ -361,10 +361,11 @@ const envServiceNameKey = "service.name"
 
 // ManagedAppInvocationFingerprint extends the prepared managed-config
 // fingerprint with the per-invocation OTEL values carried by the application
-// environment frame (including secret exporter authentication). The managed
-// Python provider reads the process environment after the first invocation's
-// application environment is applied, so those values are part of its effective
-// configuration even though they are never placed in Docker Config.Env.
+// environment frame (including secret exporter authentication). A managed
+// invocation provider reads the process environment after the first
+// invocation's application environment is applied, so those values are part of
+// its effective configuration even though they are never placed in Docker
+// Config.Env.
 //
 // The result is a private in-memory identity: values are hashed, never stored,
 // logged, or exposed. An extraEnv with no relevant OTEL name returns base

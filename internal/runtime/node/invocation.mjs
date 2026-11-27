@@ -1,12 +1,7 @@
-import { createRequire } from "node:module";
+import * as telemetry from "./telemetry.mjs";
 
-const BAKED_ROOT = "/app";
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const MAX_ERROR_BYTES = 64 * 1024;
-const { context, propagation } = createRequire(BAKED_ROOT + "/package.json")(
-  "@opentelemetry/api",
-);
-
 class HandlerContext {
   constructor({
     requestId,
@@ -147,6 +142,7 @@ async function invoke(req, loadHandler) {
   // OS/system/container variable is preserved.
   applyEnv(req.env);
   process.env.RELAY_HANDLER = handler;
+  telemetry.ensureStarted();
 
   let error = null;
   try {
@@ -158,14 +154,11 @@ async function invoke(req, loadHandler) {
       throw new Error("invalid request context: expected an object");
     }
 
-    const fn = await loadHandler(handler);
-
-    // Extract and install the remote context only for this handler promise.
-    // context.with restores the warm process's previous context on both
-    // resolution and rejection, so one invocation cannot leak into the next.
-    const parent = propagation.extract(context.active(), req.trace ?? {});
     const handlerContext = new HandlerContext(req.context);
-    await context.with(parent, () => fn(req.event ?? null, handlerContext));
+    await telemetry.withParent(req.trace ?? {}, async () => {
+      const fn = await loadHandler(handler);
+      return fn(req.event ?? null, handlerContext);
+    });
   } catch (e) {
     // Module resolution, import errors, and handler errors are all
     // invocation failures (ok:false): the container stays healthy.

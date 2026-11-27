@@ -98,7 +98,45 @@ const esbuildVersion = "0.28.2"
 
 // The bootstrap and user instrumentation must resolve the same API singleton
 // from /app so a user-installed SDK observes the managed invocation context.
-const otelAPIVersion = "1.9.0"
+// 1.10.0 is the first API release accepted by the current trace SDK and
+// exporter peer ranges (>=1.10.0 <1.11.0 and ^1.10.0) while staying on the
+// stable 1.x API line.
+const otelAPIVersion = "1.10.0"
+
+// The managed trace stack is installed only into invocation images from the
+// Relay-owned private manifest (otel/package.json) and committed pnpm lock
+// (otel/pnpm-lock.yaml), staged at otelProjectDir. The exact direct set is API
+// 1.10.0, sdk-trace 3.1.1, context-async-hooks/core/resources 3.1.1, and the
+// OTLP gRPC/proto exporters 0.301.2. Those are exactly the modules the runtime
+// imports. The direct set is trace-only: it replaces sdk-node's broad
+// logs/metrics/Zipkin/auto-instrumentation graph with the trace components the
+// runtime actually uses. The OTLP transformer still brings sdk-logs and
+// sdk-metrics transitively, but the runtime creates no LoggerProvider,
+// MeterProvider, or instrumentation pipeline. The frozen lock pins every
+// transitive version and integrity hash, so rebuilds never re-resolve the tree.
+// Service-only images stage neither file and install only the API.
+//
+// Node 24/26 satisfy the packages' Node >=22.15 engine requirement. Regenerate
+// the lock from this directory with the runtime's pinned pnpm when changing the
+// set.
+//
+//go:embed otel/package.json
+var otelPackageJSON []byte
+
+//go:embed otel/pnpm-lock.yaml
+var otelLockfile []byte
+
+// otelTracePackages is the test-visible expectation for the direct dependency
+// set in otel/package.json. The embedded manifest and frozen lock are the
+// install authority; this list is not used to construct the install command.
+var otelTracePackages = []string{
+	"@opentelemetry/context-async-hooks@3.1.1",
+	"@opentelemetry/core@3.1.1",
+	"@opentelemetry/exporter-trace-otlp-grpc@0.301.2",
+	"@opentelemetry/exporter-trace-otlp-proto@0.301.2",
+	"@opentelemetry/resources@3.1.1",
+	"@opentelemetry/sdk-trace@3.1.1",
+}
 
 // pnpmStoreDir is the single scratch content-addressable store every pnpm
 // install uses. It is created and removed in the same RUN as the install that
@@ -107,10 +145,13 @@ const otelAPIVersion = "1.9.0"
 // working after the store directory is removed.
 const pnpmStoreDir = "/tmp/relay-pnpm-store"
 
-// otelProjectDir is the private pnpm project the managed OpenTelemetry API is
-// installed into. It is kept separate from /app so the managed install never
-// rewrites the app's package.json or pnpm-lock.yaml (pnpm add always saves), and
-// its single package is linked into /app/node_modules (see otelInstall).
+// otelProjectDir is the private pnpm project the managed OpenTelemetry packages
+// are installed into. It is kept separate from /app so the managed install never
+// rewrites the app's package.json or pnpm-lock.yaml. A service-only image creates
+// an API-only manifest here; an invocation image stages the committed private
+// manifest and lock, installs the frozen tree, and links this project's API into
+// /app/node_modules. The runtime resolves the trace packages directly from here,
+// leaving the application's own OTel dependencies alone.
 const otelProjectDir = "/relay/otel"
 
 // pnpmBin is the directly-executable pnpm the runtime image exposes. It is the
@@ -204,19 +245,20 @@ const (
 	mountedEsbuildBin = mountedEsbuildPrefix + "/node_modules/.bin/esbuild"
 )
 
-// otelInstall is the managed OpenTelemetry API install, applied to EVERY Node
-// image (mounted or baked) so the bootstrap and user modules resolve one shared
-// API singleton from /app/node_modules.
+// otelInstall is the managed OpenTelemetry API install for a SERVICE-ONLY Node
+// image (mounted or baked) so user modules resolve one shared API singleton from
+// /app/node_modules. Invocation images use the frozen private trace manifest
+// instead (see otelInvocationInstall), which installs the API in the same tree.
 //
 // It installs with pnpm into a PRIVATE project (otelProjectDir) and links the
-// single package into /app/node_modules rather than running `pnpm add` in /app:
+// API package into /app/node_modules rather than running `pnpm add` in /app:
 // pnpm add always saves, so installing in /app would rewrite the app's
 // package.json and pnpm-lock.yaml. @opentelemetry/api has no dependencies, so
-// one symlink is the whole install and the bootstrap's createRequire from /app
-// resolves the same singleton user modules do. The store is removed in the same
-// RUN. This preserves the previous npm `--no-save` behavior (the managed version
-// wins over a declared one) without touching the app's manifest. It invokes the
-// standalone pnpm binary the runtime tool materialized at pnpmBin.
+// one symlink is the whole API install and the bootstrap's createRequire from
+// /app resolves the same singleton user modules do. The store is removed in the
+// same RUN. This preserves the previous npm `--no-save` behavior (the managed
+// version wins over a declared one) without touching the app's manifest. It
+// invokes the standalone pnpm binary the runtime tool materialized at pnpmBin.
 //
 // The target package path is removed before the link is created: the app's
 // vendored node_modules may already carry a REAL @opentelemetry/api directory,
@@ -229,6 +271,27 @@ const (
 const otelInstall = "mkdir -p " + otelProjectDir +
 	" && printf '%s' '{\"name\":\"relay-otel\",\"private\":true}' > " + otelProjectDir + "/package.json" +
 	" && pnpm add -C " + otelProjectDir + " --store-dir " + pnpmStoreDir + " --save-exact @opentelemetry/api@" + otelAPIVersion +
+	" && mkdir -p " + workDir + "/node_modules/@opentelemetry" +
+	" && rm -rf " + workDir + "/node_modules/@opentelemetry/api" +
+	" && ln -s " + otelProjectDir + "/node_modules/@opentelemetry/api " + workDir + "/node_modules/@opentelemetry/api" +
+	" && rm -rf " + pnpmStoreDir
+
+// otelInvocationInstall installs the managed trace stack for an INVOCATION
+// image from the staged private manifest and committed lock. --frozen-lockfile
+// is what makes every transitive version and integrity hash reproducible: the
+// install never resolves a floating dependency on rebuild. --prod excludes any
+// development tree, and --allow-build=protobufjs ensures the postinstall the
+// locked OTLP transformer needs actually runs; without it pnpm may omit the
+// dependency build script, or reject it when strict build handling is enabled.
+// The store is removed in the same RUN.
+//
+// The API symlink is the same one the service-only install creates, so user
+// modules resolve the singleton installed in the private project. No trace
+// package is linked into /app: the runtime resolves them directly from
+// otelProjectDir, leaving an application's own declared OTel packages alone.
+var otelInvocationInstall = "pnpm install -C " + otelProjectDir +
+	" --frozen-lockfile --prod --store-dir " + pnpmStoreDir +
+	" --allow-build=protobufjs" +
 	" && mkdir -p " + workDir + "/node_modules/@opentelemetry" +
 	" && rm -rf " + workDir + "/node_modules/@opentelemetry/api" +
 	" && ln -s " + otelProjectDir + "/node_modules/@opentelemetry/api " + workDir + "/node_modules/@opentelemetry/api" +
@@ -381,6 +444,24 @@ func (Engine) Plan(spec plan.Spec, fnDir string, handlers []string) (plan.BuildP
 		return plan.BuildPlan{}, err
 	}
 
+	// An invocation image stages the Relay-owned private manifest and lock so
+	// its trace stack install is frozen and reproducible. A service-only image
+	// stages neither file and never installs the trace tree.
+	if len(handlers) > 0 {
+		files = append(files,
+			plan.File{
+				Path:    path.Join(otelProjectDir, pkgFile),
+				Content: otelPackageJSON,
+				Mode:    fs.FileMode(0o644),
+			},
+			plan.File{
+				Path:    path.Join(otelProjectDir, pnpmLockFile),
+				Content: otelLockfile,
+				Mode:    fs.FileMode(0o644),
+			},
+		)
+	}
+
 	// entry is the image ENTRYPOINT. A source-mounted image adds the
 	// --source-mount flag so the bootstrap resolves from the mounted root and
 	// bundles TypeScript on demand; a baked image keeps the two-element form
@@ -397,9 +478,13 @@ func (Engine) Plan(spec plan.Spec, fnDir string, handlers []string) (plan.BuildP
 	// read-only filesystem so the whole-directory bind cannot shadow them.
 	var mountMasks []string
 	// The runtime tool materializes the standalone pnpm binary at pnpmBin before
-	// any Install RUN; the app image then installs the managed API and any build
-	// tooling through it.
+	// any Install RUN. An invocation image installs the frozen private trace
+	// tree; a service-only image installs only the managed API and pays for
+	// neither the SDK, the exporters, nor the private lock tree.
 	install := []string{otelInstall}
+	if len(handlers) > 0 {
+		install = []string{otelInvocationInstall}
+	}
 	if spec.SourceMounted {
 		entry = []string{"node", "/relay/bootstrap.mjs", sourceMountFlag}
 		mountTarget = SourceMountTarget

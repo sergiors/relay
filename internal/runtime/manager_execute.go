@@ -256,12 +256,13 @@ func (m *Manager) Execute(
 	// without a rebuild.
 	limits := m.containers.appResources(prepared.Name)
 	// The generation's config half also carries the managed process-config
-	// identity (the Python OTel configuration). An effective change therefore
-	// supersedes the warm generation before the next invocation rather than
-	// mutating a running provider; an app with no managed provider keeps the
-	// historical resources-only identity. The per-invocation OTEL values
-	// (including exporter auth secrets, which are never written to Config.Env)
-	// join only this private fingerprint, so rotating one rotates the process.
+	// identity (the Python or Node OTel configuration). An effective change
+	// therefore supersedes the warm generation before the next invocation
+	// rather than mutating a running provider; an app with no managed provider
+	// keeps the historical resources-only identity. The per-invocation OTEL
+	// values (including exporter auth secrets, which are never written to
+	// Config.Env) join only this private fingerprint, so rotating one rotates
+	// the process.
 	// The EXECUTING Prepared's immutable identity is authoritative. It is
 	// paired with that same Prepared's execEnv; reading the cache's last
 	// activation here could pair an old generation's environment with a newer
@@ -297,8 +298,8 @@ func (m *Manager) Execute(
 	if prepared.otelConfig != "" {
 		// Only a managed-provider execution has the injected service-name
 		// default and inherited trace-specific values these overlays resolve.
-		// Node and hand-built non-managed Prepared executions must keep their
-		// request frame byte-for-byte unchanged.
+		// Hand-built non-managed Prepared executions must keep their request
+		// frame byte-for-byte unchanged.
 		if overrides := tracing.ManagedAppInvocationEnvOverrides(
 			prepared.Name, prepared.otelInheritedTraceSpecific, extraEnv,
 		); len(overrides) > 0 {

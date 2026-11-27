@@ -45,7 +45,7 @@ func joinedModuleSources(t *testing.T) string {
 	t.Helper()
 	sources := embeddedModuleSources(t)
 	joined := make([]string, 0, len(sources))
-	for _, name := range []string{"bootstrap.mjs", "lifecycle.mjs", "protocol.mjs", "invocation.mjs", "handler-loader.mjs"} {
+	for _, name := range []string{"bootstrap.mjs", "lifecycle.mjs", "protocol.mjs", "invocation.mjs", "handler-loader.mjs", "telemetry.mjs"} {
 		content, ok := sources[name]
 		if !ok {
 			t.Fatalf("the shared module set is missing %s, got %v", name, moduleNames(sources))
@@ -162,9 +162,27 @@ func TestBootstrapImportsOnlyEmbeddedModules(t *testing.T) {
 			t.Errorf("bootstrap imports ./%s, which is not embedded beside it (embedded: %v)", name, moduleNames(sources))
 		}
 	}
-	for _, required := range []string{"lifecycle.mjs", "protocol.mjs", "invocation.mjs", "handler-loader.mjs"} {
+	for _, required := range []string{"lifecycle.mjs", "protocol.mjs", "invocation.mjs", "handler-loader.mjs", "telemetry.mjs"} {
 		if !found[required] {
 			t.Errorf("bootstrap must import the split module %s, found imports %v", required, found)
 		}
+	}
+}
+
+// TestTelemetryModuleNeverTerminatesTheProcess pins the exit boundary across
+// the shared module set: telemetry setup, provider setup cleanup, export
+// flushing, and context degradation are all best-effort and must never call
+// process.exit — termination belongs solely to the protocol's final bounded
+// shutdown. The telemetry module is part of the joined invariant set, so this
+// holds for every embedded runtime module the bootstrap loads.
+func TestTelemetryModuleNeverTerminatesTheProcess(t *testing.T) {
+	sources := embeddedModuleSources(t)
+	telemetry, ok := sources["telemetry.mjs"]
+	if !ok {
+		t.Fatalf("the shared module set is missing telemetry.mjs, got %v", moduleNames(sources))
+	}
+	if strings.Contains(telemetry, "process.exit(") || strings.Contains(telemetry, "process.abort(") {
+		t.Error("telemetry.mjs must never terminate the process; " +
+			"exit belongs to the protocol's final bounded shutdown only")
 	}
 }

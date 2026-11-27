@@ -9,7 +9,7 @@ import (
 	"relay/internal/app"
 )
 
-// These tests pin the runtime half of the managed Python OpenTelemetry
+// These tests pin the runtime half of the managed Python and Node OpenTelemetry
 // configuration: which environment reaches an execution container's create
 // (provider configuration) versus the per-invocation request frame (application
 // values and standard-precedence overlays), and how the private process-config
@@ -367,12 +367,13 @@ func TestExecuteStalePreparedKeepsOwnProviderConfigIdentity(t *testing.T) {
 }
 
 // TestExecuteProviderEnvScopedToManagedExecution pins the environment
-// boundary: a managed Python execution's container is created with the plan env
-// PLUS the injected provider configuration, while an app without a managed
-// provider (a Node app, or a Python service-only app) keeps the historical
-// plan-only create environment — which is also the only environment the service
-// path consumes (worker services read Prepared.Env), so a service process never
-// receives the provider configuration.
+// boundary: a managed invocation execution's container is created with the
+// plan env PLUS the injected provider configuration, while an app without a
+// managed provider (a service-only image, or a hand-built Prepared with no
+// provider identity) keeps the historical plan-only create environment —
+// which is also the only environment the service path consumes (worker
+// services read Prepared.Env), so a service process never receives the
+// provider configuration.
 func TestExecuteProviderEnvScopedToManagedExecution(t *testing.T) {
 	t.Run("managed python execution", func(t *testing.T) {
 		f := newOtelExecuteFixture()
@@ -405,8 +406,8 @@ func TestExecuteProviderEnvScopedToManagedExecution(t *testing.T) {
 	t.Run("app without a managed provider", func(t *testing.T) {
 		f := newOtelExecuteFixture()
 		prepared := &Prepared{
-			Name:        "fn-node",
-			Image:       "relay-app-fn-node:tag",
+			Name:        "svc",
+			Image:       "relay-app-svc:tag",
 			Fingerprint: "fp",
 			Env:         []string{"NODE_ENV=production"},
 			Concurrency: 1,
@@ -587,17 +588,18 @@ func TestExecuteAppOtelValuesStayOnFrame(t *testing.T) {
 // overlay gate (F1): the standard-precedence frame overlays resolve values
 // that ONLY a managed-provider execution injects (the app-name service
 // default, inherited trace-specific provenance). A non-managed execution — a
-// Node app or a hand-built Prepared with no provider identity — must pass its
-// request frame through VERBATIM: an application's explicit empty
-// OTEL_SERVICE_NAME stays empty instead of being rewritten to an app name
-// Relay does not manage tracing for. A managed Python execution keeps
-// applying the app-name default.
+// hand-built Prepared with no provider identity, such as a service-only
+// image — must pass its request frame through VERBATIM: an application's
+// explicit empty OTEL_SERVICE_NAME stays empty instead of being rewritten to
+// an app name Relay does not manage tracing for. A managed execution keeps
+// applying the app-name default, whichever invocation-capable engine (Python
+// or Node) produced the Prepared.
 func TestExecuteFrameOverlayGatedOnManagedIdentity(t *testing.T) {
 	t.Run("non-managed prepared keeps the empty frame value unchanged", func(t *testing.T) {
 		f := newOtelExecuteFixture()
 		prepared := &Prepared{
-			Name:        "fn-node",
-			Image:       "relay-app-fn-node:tag",
+			Name:        "svc",
+			Image:       "relay-app-svc:tag",
 			Fingerprint: "fp",
 			Env:         []string{"NODE_ENV=production"},
 			Concurrency: 1,
@@ -638,6 +640,41 @@ func TestExecuteFrameOverlayGatedOnManagedIdentity(t *testing.T) {
 		if frame["OTEL_SERVICE_NAME"] != "fn" {
 			t.Errorf("frame OTEL_SERVICE_NAME = %q, want the managed app-name default %q",
 				frame["OTEL_SERVICE_NAME"], "fn")
+		}
+	})
+
+	t.Run("node-shaped managed prepared applies the app-name default", func(t *testing.T) {
+		// The gate is the private provider identity, not the engine: a Node
+		// invocation image resolves one at Prepare and therefore receives the
+		// same standard-precedence overlays a Python image does.
+		f := newOtelExecuteFixture()
+		prepared := &Prepared{
+			Name:        "web",
+			Image:       "relay-app-web:tag",
+			Fingerprint: "fp",
+			Env:         []string{},
+			execEnv: []string{
+				"OTEL_SERVICE_NAME=web",
+				"OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318",
+			},
+			otelConfig:  "cfg",
+			Concurrency: 1,
+		}
+		f.m.containers.setAppManagedConfig(prepared.Name, prepared.otelConfig)
+
+		if err := f.m.Execute(context.Background(), prepared, "h", []byte(`{}`),
+			[]string{"OTEL_SERVICE_NAME="}); err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+		frame := f.lastFrameEnv()
+		if frame["OTEL_SERVICE_NAME"] != "web" {
+			t.Errorf("frame OTEL_SERVICE_NAME = %q, want the managed app-name default %q",
+				frame["OTEL_SERVICE_NAME"], "web")
+		}
+		// The overlay stays frame-only: the create environment already carries
+		// the injected default and must not gain a second copy or the overlay.
+		if got := f.lastCreateEnv(); !hasEntry(got, "OTEL_SERVICE_NAME=web") {
+			t.Errorf("create env = %v, want the injected app-name default", got)
 		}
 	})
 }
