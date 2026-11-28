@@ -282,11 +282,18 @@ func TestStartExecutionContainerSerializesSourceMount(t *testing.T) {
 		t.Fatal("expected the scripted create failure")
 	}
 	req := decodeCreateRequest(t, createBody)
-	if req.HostConfig == nil || len(req.HostConfig.Mounts) != 1 {
-		t.Fatalf("HostConfig.Mounts = %+v, want one source bind", req.HostConfig)
+	if req.HostConfig == nil {
+		t.Fatal("HostConfig missing")
 	}
-	mm := req.HostConfig.Mounts[0]
-	if mm.Type != mount.TypeBind || mm.Source != "/apps/fn" || mm.Target != "/app" || !mm.ReadOnly {
+	if len(req.HostConfig.Mounts) != 2 {
+		t.Fatalf("HostConfig.Mounts = %+v, want the baseline /tmp volume plus one source bind", req.HostConfig.Mounts)
+	}
+	assertBaselineTmpVolume(t, req.HostConfig.Mounts)
+	mm, ok := mountAt(req.HostConfig.Mounts, "/app")
+	if !ok {
+		t.Fatalf("mounts = %+v, want a bind at /app", req.HostConfig.Mounts)
+	}
+	if mm.Type != mount.TypeBind || mm.Source != "/apps/fn" || !mm.ReadOnly {
 		t.Fatalf("mount = %+v, want read-only bind /apps/fn -> /app", mm)
 	}
 	if mm.BindOptions == nil || !mm.BindOptions.ReadOnlyForceRecursive {
@@ -328,11 +335,15 @@ func TestStartExecutionContainerSerializesNodeSourceMountConfig(t *testing.T) {
 	if req.Config.WorkingDir != "/app/src" {
 		t.Fatalf("WorkingDir = %q, want /app/src", req.Config.WorkingDir)
 	}
-	if req.HostConfig == nil || len(req.HostConfig.Mounts) != 2 {
-		t.Fatalf("HostConfig.Mounts = %+v, want the source bind plus the node_modules mask", req.HostConfig)
+	if req.HostConfig == nil || len(req.HostConfig.Mounts) != 3 {
+		t.Fatalf("HostConfig.Mounts = %+v, want /tmp, the source bind, and the node_modules mask", req.HostConfig)
 	}
-	mask := req.HostConfig.Mounts[1]
-	if mask.Type != mount.TypeTmpfs || mask.Target != "/app/src/node_modules" || !mask.ReadOnly {
+	assertBaselineTmpVolume(t, req.HostConfig.Mounts)
+	mask, ok := mountAt(req.HostConfig.Mounts, "/app/src/node_modules")
+	if !ok {
+		t.Fatalf("mount = %+v, want a mask at /app/src/node_modules", req.HostConfig.Mounts)
+	}
+	if mask.Type != mount.TypeTmpfs || !mask.ReadOnly {
 		t.Fatalf("mask = %+v, want a read-only tmpfs at /app/src/node_modules", mask)
 	}
 }
@@ -543,11 +554,15 @@ func TestStartServiceSerializesSourceMountAndLabel(t *testing.T) {
 		Env:         []string{"PORT=8000"},
 		SourceMount: &SourceMount{HostPath: "/apps/fn", Target: "/app", Identity: "fp1"},
 	}))
-	if withMount.HostConfig == nil || len(withMount.HostConfig.Mounts) != 1 {
-		t.Fatalf("HostConfig.Mounts = %+v, want one source bind", withMount.HostConfig)
+	if withMount.HostConfig == nil || len(withMount.HostConfig.Mounts) != 2 {
+		t.Fatalf("HostConfig.Mounts = %+v, want /tmp plus one source bind", withMount.HostConfig)
 	}
-	mm := withMount.HostConfig.Mounts[0]
-	if mm.Type != mount.TypeBind || mm.Source != "/apps/fn" || mm.Target != "/app" || !mm.ReadOnly {
+	assertBaselineTmpVolume(t, withMount.HostConfig.Mounts)
+	mm, ok := mountAt(withMount.HostConfig.Mounts, "/app")
+	if !ok {
+		t.Fatalf("mounts = %+v, want a bind at /app", withMount.HostConfig.Mounts)
+	}
+	if mm.Type != mount.TypeBind || mm.Source != "/apps/fn" || !mm.ReadOnly {
 		t.Fatalf("mount = %+v, want read-only bind /apps/fn -> /app", mm)
 	}
 	if mm.BindOptions == nil || !mm.BindOptions.ReadOnlyForceRecursive {
@@ -579,11 +594,13 @@ func TestStartServiceSerializesSourceMountAndLabel(t *testing.T) {
 	if len(nodeMount.Config.Entrypoint) != 4 || nodeMount.Config.Entrypoint[1] != "--import" || nodeMount.Config.Entrypoint[2] != node.ResolveHookPath {
 		t.Fatalf("Entrypoint = %v, want the shared resolve hook preloaded", nodeMount.Config.Entrypoint)
 	}
-	if nodeMount.HostConfig == nil || len(nodeMount.HostConfig.Mounts) != 2 {
-		t.Fatalf("HostConfig.Mounts = %+v, want the source bind plus the node_modules mask", nodeMount.HostConfig)
+	if nodeMount.HostConfig == nil || len(nodeMount.HostConfig.Mounts) != 3 {
+		t.Fatalf("HostConfig.Mounts = %+v, want /tmp, the source bind, and the node_modules mask", nodeMount.HostConfig)
 	}
-	if mask := nodeMount.HostConfig.Mounts[1]; mask.Type != mount.TypeTmpfs || mask.Target != "/app/src/node_modules" {
-		t.Fatalf("mask = %+v, want a tmpfs at /app/src/node_modules", mask)
+	assertBaselineTmpVolume(t, nodeMount.HostConfig.Mounts)
+	mask, ok := mountAt(nodeMount.HostConfig.Mounts, "/app/src/node_modules")
+	if !ok || mask.Type != mount.TypeTmpfs || !mask.ReadOnly {
+		t.Fatalf("mask = %+v, want a read-only tmpfs at /app/src/node_modules", mask)
 	}
 
 	withoutMount := decodeCreateRequest(t, captureServiceCreate(t, ServiceSpec{
@@ -591,9 +608,10 @@ func TestStartServiceSerializesSourceMountAndLabel(t *testing.T) {
 		Image: "relay-app-fn:tag", Entry: []string{"python", "-u", "/relay/bootstrap.py"},
 		Env: []string{"PORT=8000"},
 	}))
-	if len(withoutMount.HostConfig.Mounts) != 0 {
-		t.Fatalf("a service without a source mount must have no binds: %+v", withoutMount.HostConfig.Mounts)
+	if len(withoutMount.HostConfig.Mounts) != 1 {
+		t.Fatalf("a service without a source mount must have only the baseline /tmp volume: %+v", withoutMount.HostConfig.Mounts)
 	}
+	assertBaselineTmpVolume(t, withoutMount.HostConfig.Mounts)
 	if _, ok := withoutMount.Config.Labels[labelSource]; ok {
 		t.Fatal("a service without a source mount must not carry relay.source")
 	}

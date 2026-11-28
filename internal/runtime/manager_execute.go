@@ -118,10 +118,45 @@ func (m *Manager) createExecutionContainer(
 	if err != nil {
 		return nil, fmt.Errorf("docker run: %w", err)
 	}
+	// Validate the image's writable destinations BEFORE create. Execution
+	// containers always receive Relay's anonymous /tmp volume, and Docker
+	// follows a rootfs symlink at the mount destination even under
+	// ReadonlyRootfs. Pin the immutable image ID here so the target validation
+	// and the subsequent create cannot describe different bytes, and use the
+	// Manager-scoped cache so warm-pool replicas of one image stream its archive
+	// at most once.
+	pinnedImage, err := m.validateExecutionImage(ctx, image)
+	if err != nil {
+		return nil, fmt.Errorf("docker run: %w", err)
+	}
 	return startExecutionContainer(
-		ctx, ops, cli, log, fn, image, env, networks, limits, meta,
+		ctx, ops, cli, log, fn, pinnedImage, env, networks, limits, meta,
 		workDir, sourceRoot, mounts...,
 	)
+}
+
+// validateExecutionImage inspects image to its immutable content ID, enforces
+// Relay's image-declared VOLUME contract with /tmp coverage, and proves that the
+// implicit /tmp volume target is an existing, non-symlink directory in that
+// exact image. The returned ID is what the caller creates from, so validation
+// and create cannot race a moving reference. Successful target validations are
+// reused per immutable image ID through the Manager cache; a warm-pool replica
+// therefore does not re-stream the image archive.
+func (m *Manager) validateExecutionImage(
+	ctx context.Context,
+	image string,
+) (string, error) {
+	imageID, err := validateImageDeclaredVolumes(
+		ctx, m.cli, image, tmpVolumeTarget)
+	if err != nil {
+		return "", err
+	}
+	if err := m.validateImageEphemeralTargetsCached(
+		ctx, imageID, []string{tmpVolumeTarget},
+	); err != nil {
+		return "", err
+	}
+	return imageID, nil
 }
 
 // containerOps returns the manager-owned lifecycle an execution container uses

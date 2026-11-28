@@ -34,9 +34,9 @@
 //     source, so FingerprintApp narrows its fingerprint to template.yaml
 //     ALONE — an irrelevant source edit can never look like a desired-state
 //     change, and the tree is not scanned. Runtime-only configuration (the
-//     top-level `resources` mapping and service `tmpfs`/`healthcheck` settings)
-//     is excluded from BOTH fingerprint paths (stripTemplateResources), so
-//     editing it never changes the digest and never triggers a rebuild.
+//     top-level `resources` mapping and service `ephemeral`/`healthcheck`
+//     settings) is excluded from BOTH fingerprint paths (stripTemplateResources),
+//     so editing it never changes the digest and never triggers a rebuild.
 //
 // Resource limits:
 //   - `resources` (optional) declares per-container memory/CPU/PID limits for
@@ -115,7 +115,7 @@
 //     Relay's defaults. (Other template mappings keep yaml.v3's
 //     ignore-unknown-fields behavior.)
 //   - Healthcheck settings (like the top-level `resources` mapping and service
-//     `tmpfs`) are runtime-only and excluded from the image fingerprint.
+//     `ephemeral`) are runtime-only and excluded from the image fingerprint.
 //
 // The package reads the /apps tree and has no filesystem side effects beyond
 // that read except CaptureSourceSnapshot (and CaptureSourceSnapshotIn), which

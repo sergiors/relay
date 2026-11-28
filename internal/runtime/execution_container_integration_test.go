@@ -997,8 +997,22 @@ events:
     pattern:
       event_name: [INSERT]
 `)
+	// The handler proves /tmp state survives warm-container reuse: the first
+	// invocation writes a marker into Relay's anonymous /tmp volume, the second
+	// invocation (same container) must read it back.
 	writeFile(t, dir, "index.js", `
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+
+const marker = "/tmp/relay-warm-marker";
+
 export function ok(event, context) {
+  if (event.event_id === "evt_1") {
+    writeFileSync(marker, "persisted");
+    console.log("tmp-wrote");
+  } else {
+    const seen = existsSync(marker) ? readFileSync(marker, "utf8") : "missing";
+    console.log("tmp-seen " + seen);
+  }
   console.log("ok " + event.event_id);
 }
 `)
@@ -1037,7 +1051,10 @@ export function ok(event, context) {
 	if id2 != id1 {
 		t.Errorf("second invocation must REUSE the same container: id1=%s id2=%s", id1, id2)
 	}
-	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "ok evt_2")
+	// The reused container's anonymous /tmp volume persisted between
+	// invocations: the marker written by the first invocation is still there.
+	// awaitAppLogsFor fails the test if the readback never appears.
+	_ = awaitAppLogsFor(t, ctx, m.cli, fn.Name, "ok evt_2", "tmp-seen persisted")
 
 	// Close discards (reason "shutdown"); the container must then vanish.
 	if err := m.Close(); err != nil {
@@ -1409,13 +1426,13 @@ def check(event, context):
         if e.errno != 30:  # EROFS
             raise SystemExit("expected EROFS writing to /, got errno %d" % e.errno)
 
-    # /tmp is the writable tmpfs: write, read back, unlink.
+    # /tmp is the writable anonymous volume: write, read back, unlink.
     fd, path = tempfile.mkstemp(dir="/tmp")
     with os.fdopen(fd, "w") as f:
         f.write("tmp-ok")
     with open(path) as f:
         if f.read() != "tmp-ok":
-            raise SystemExit("tmpfs readback mismatch")
+            raise SystemExit("volume readback mismatch")
     os.unlink(path)
 
     # Dropped capabilities: CapEff must be 0 (CapDrop ALL).
@@ -1431,7 +1448,7 @@ def check(event, context):
     print("python hardening ok")
 `)
 	// No requirements.txt: this test's subject is the container hardening applied
-	// by the daemon (uid, read-only rootfs, tmpfs, caps), not the dependency
+	// by the daemon (uid, read-only rootfs, volumes, caps), not the dependency
 	// install path. An empty requirements.txt would still force a full relay-dep-*
 	// layer build (a 217MB python base export) whose only effect here is a
 	// slower image with identical hardening; the dependency-layer contract has
@@ -1469,12 +1486,12 @@ export function check(event, context) {
     }
   }
 
-  // /tmp is the writable tmpfs: write, read back, unlink.
+  // /tmp is the writable anonymous volume: write, read back, unlink.
   const dir = mkdtempSync(join(tmpdir(), "relay-"));
   const p = join(dir, "f");
   writeFileSync(p, "tmp-ok");
   if (readFileSync(p, "utf8") !== "tmp-ok") {
-    throw new Error("tmpfs readback mismatch");
+    throw new Error("volume readback mismatch");
   }
   unlinkSync(p);
 

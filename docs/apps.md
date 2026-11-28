@@ -78,7 +78,7 @@ services: # persistent long-running containers
       interval: 10s
   - name: cache
     image: nginxinc/nginx-unprivileged:1.27-alpine
-    tmpfs: [/run, /var/cache/nginx] # optional additional writable tmpfs
+    ephemeral: [/run, /var/cache/nginx] # optional additional disk-backed volumes
 ```
 
 A template must declare **at least one event rule or one service**. `schedules`
@@ -377,6 +377,39 @@ included. When all pooled containers are busy at the cap, work remains pending
 until capacity is available. See
 [Configuration](configuration.md#warm-container-bound).
 
+Functions do not configure `/tmp`; Relay always provides it. Data written there
+belongs to one warm container and persists only while that container lives. It
+is discarded when the container is replaced or evicted, so do not treat it as
+durable or as state shared between invocations that may land on another
+container.
+
+For large downloads or archives, stream into `/tmp` rather than holding the
+whole payload in memory, but process archives incrementally as well:
+
+```python
+import tempfile
+import zipfile
+
+
+def handle_archive(event, context):
+    with tempfile.TemporaryFile(dir="/tmp") as spool:
+        s3.download_fileobj(event["bucket"], event["key"], spool)
+        spool.seek(0)
+        with zipfile.ZipFile(spool) as archive:
+            for member in archive.infolist():
+                with archive.open(member) as src:
+                    for chunk in iter(lambda: src.read(64 * 1024), b""):
+                        process_chunk(member.filename, chunk)
+```
+
+`TemporaryFile(dir="/tmp")`, `download_fileobj`, and `ZipFile` keep the payload
+streamable and seekable without first loading the object into one Python
+`bytes` value. Prefer streaming or incremental member processing, bound archive
+member counts and sizes, and close each member promptly. Disk-backed staging
+does not eliminate memory use: Python buffers, decompression buffers, and the
+kernel page cache charged to the container still count against the per-container
+memory limit.
+
 Python handlers in a reused process share its event loop. Async handlers are
 supported; a synchronous handler must not try to drive a coroutine with
 `asyncio.run()` while that loop is running. Use an async handler for asynchronous
@@ -386,10 +419,14 @@ Handlers share the execution container's trust boundary and are not isolated
 from that container's runtime bootstrap. Treat handlers within an app as trusted
 code.
 
-Execution containers run as non-root with a read-only root filesystem, bounded
-`/tmp`, and per-container memory, CPU, and PID limits. Images declaring Docker
-`VOLUME` destinations are rejected because they would add writable storage
-outside those limits.
+Execution containers run as non-root with a read-only root filesystem, a
+disk-backed `/tmp` volume, and per-container memory, CPU, and PID limits. Relay
+requires `/tmp` to exist as a non-symlink directory in the image and fails the
+create otherwise; managed runtime images provide it with non-root write access.
+Images declaring other Docker `VOLUME` destinations are rejected unless the
+declaration is exactly `/tmp`, which Relay already mounts, because other
+destinations would add writable storage outside that baseline. Additional
+ephemeral volumes are a service-only setting.
 
 ### Docker networks
 

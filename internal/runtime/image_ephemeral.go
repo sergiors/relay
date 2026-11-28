@@ -18,11 +18,11 @@ import (
 	"github.com/moby/moby/client"
 )
 
-// serviceTmpfsImageInspectTimeout bounds the ImageSave stream used to prove a
-// service tmpfs target is safe. The image archive can be large, so the bound is
-// deliberately generous; a daemon that cannot deliver it in time fails the
+// ephemeralImageInspectTimeout bounds the ImageSave stream used to prove a
+// service ephemeral target is safe. The image archive can be large, so the bound
+// is deliberately generous; a daemon that cannot deliver it in time fails the
 // create closed rather than letting the check block indefinitely.
-const serviceTmpfsImageInspectTimeout = 5 * time.Minute
+const ephemeralImageInspectTimeout = 5 * time.Minute
 
 // maxImageManifestBytes bounds the in-memory image manifest read from a Docker
 // image archive. Real manifests are a few KiB; anything larger is malformed or
@@ -42,10 +42,10 @@ const (
 // errImageLayerTooManyRecords fails closed when a layer repeats relevant paths
 // beyond the inspection bound. Real layers have only a handful.
 var errImageLayerTooManyRecords = fmt.Errorf(
-	"image layer exceeds %d tmpfs-relevant entries", maxImageLayerRecords)
+	"image layer exceeds %d ephemeral-relevant entries", maxImageLayerRecords)
 
 var errImageArchiveTooManyRecords = fmt.Errorf(
-	"image archive exceeds %d tmpfs-relevant entries",
+	"image archive exceeds %d ephemeral-relevant entries",
 	maxImageArchiveRelevantRecords)
 
 // layerRecordLimitReached reports whether one layer's retained records have hit
@@ -55,7 +55,7 @@ func layerRecordLimitReached(scan *imageLayerScan) bool {
 }
 
 // imageFSEntryKind is the only filesystem information Relay needs about the
-// components leading to a service tmpfs target.
+// components leading to a service ephemeral target.
 type imageFSEntryKind uint8
 
 const (
@@ -91,21 +91,23 @@ type imageSaveManifestEntry struct {
 	Layers []string `json:"Layers"`
 }
 
-// validateImageTmpfsTargets proves, using the exact immutable image content ID
-// and BEFORE the service ContainerCreate, that every configured tmpfs target
-// and each parent component is not a symlink (and every existing component is a
-// directory). Docker follows symlinks in the container rootfs when applying
-// HostConfig.Tmpfs; without this check an image containing
-// `/var/cache -> /etc` could turn a configured tmpfs at `/var/cache` into a
-// writable mount over `/etc`, defeating ReadonlyRootfs.
+// validateImageEphemeralTargets proves, using the exact immutable image content
+// ID and BEFORE any workload ContainerCreate, that every writable volume target
+// (Relay's implicit /tmp and configured service ephemeral destinations) and each
+// parent component is not a symlink, and that every existing component is a
+// directory. Docker follows symlinks in the container rootfs when applying mount
+// destinations; without this check an image containing `/tmp -> /etc` or
+// `/var/cache -> /etc` could turn Relay's writable volume into a writable mount
+// over `/etc`, defeating ReadonlyRootfs.
 //
 // The image filesystem is inspected from its Docker save archive. No image code
 // is executed: Relay only reads layer tar headers and rejects any symlink or
-// non-directory component on the path. Missing components are allowed (the
-// daemon may create the mountpoint), but every component that exists must be a
-// directory, so no existing path redirection can be followed. An archive that
-// cannot be read or decoded fails closed.
-func validateImageTmpfsTargets(
+// non-directory component on the path. The target itself must already exist as a
+// directory: an anonymous volume inherits the destination directory's owner and
+// mode only when Docker can copy it from the image, so a missing target would
+// remain a root-owned volume that the image's non-root user cannot write. An
+// archive that cannot be read or decoded fails closed.
+func validateImageEphemeralTargets(
 	ctx context.Context,
 	cli *client.Client,
 	imageID string,
@@ -115,12 +117,12 @@ func validateImageTmpfsTargets(
 		return nil
 	}
 	if strings.TrimSpace(imageID) == "" {
-		return errors.New("tmpfs validation: immutable image ID is missing")
+		return errors.New("writable mount validation: immutable image ID is missing")
 	}
-	relevant := tmpfsRelevantPaths(destinations)
+	relevant := ephemeralRelevantPaths(destinations)
 
 	inspectCtx, cancel := context.WithTimeout(
-		ctx, serviceTmpfsImageInspectTimeout)
+		ctx, ephemeralImageInspectTimeout)
 	defer cancel()
 	saved, err := cli.ImageSave(inspectCtx, []string{imageID})
 	if err != nil {
@@ -132,69 +134,78 @@ func validateImageTmpfsTargets(
 		return fmt.Errorf("inspect image filesystem %q: %w", imageID, err)
 	}
 	for _, destination := range destinations {
-		for _, component := range tmpfsPathAndAncestors(destination) {
+		for _, component := range ephemeralPathAndAncestors(destination) {
 			kind, ok := state[component]
 			if !ok {
-				// Missing components are safe: they cannot redirect anything,
-				// and the daemon creates the mountpoint beneath checked parents.
+				// Missing ancestors cannot redirect anything; the final
+				// component is checked separately below because the volume
+				// must inherit a real directory's ownership and mode.
 				continue
 			}
 			display := "/" + component
 			switch kind {
 			case imageFSSymlink:
 				return fmt.Errorf(
-					"tmpfs destination %q is redirected through symlink %q "+
+					"writable destination %q is redirected through symlink %q "+
 						"in image %q",
 					destination, display, imageID)
 			case imageFSDir:
 			default:
 				return fmt.Errorf(
-					"tmpfs destination %q has non-directory component %q "+
+					"writable destination %q has non-directory component %q "+
 						"in image %q",
 					destination, display, imageID)
 			}
+		}
+		target := strings.TrimPrefix(path.Clean(destination), "/")
+		if _, ok := state[target]; !ok {
+			return fmt.Errorf(
+				"writable destination %q must already exist as a directory "+
+					"in image %q so its ownership and mode can be copied into "+
+					"the anonymous volume",
+				destination, imageID)
 		}
 	}
 	return nil
 }
 
-// tmpfsImageValidationKey identifies one reusable image-filesystem validation.
+// ephemeralImageValidationKey identifies one reusable image-filesystem validation.
 // Both fields are required: the same image validated for one destination set
 // says nothing about another set, and the same set against different image
 // content says nothing about that content. targets is a NUL-joined, sorted copy
 // of the destinations; a NUL cannot occur in a container path, so components
 // cannot run together across the join.
-type tmpfsImageValidationKey struct {
+type ephemeralImageValidationKey struct {
 	imageID string
 	targets string
 }
 
-// tmpfsImageValidation is one in-flight or completed validation. done is closed
+// ephemeralImageValidation is one in-flight or completed validation. done is closed
 // after err is set. A successful validation stays in the cache; a failed one is
 // removed so the next request re-inspects. Waiters already holding a pointer to
 // a removed entry still observe its result.
-type tmpfsImageValidation struct {
+type ephemeralImageValidation struct {
 	done chan struct{}
 	err  error
 }
 
-// imageTmpfsValidationCache coalesces concurrent validations of the same
+// imageEphemeralValidationCache coalesces concurrent validations of the same
 // (immutable image ID, destination set) and reuses successful outcomes for the
 // life of the Manager. It is deliberately in-memory only: an image ID is
 // content-addressed, so an entry can never describe different bytes, and a
 // worker restart simply validates again once.
-type imageTmpfsValidationCache struct {
+type imageEphemeralValidationCache struct {
 	mu      sync.Mutex
-	entries map[tmpfsImageValidationKey]*tmpfsImageValidation
+	entries map[ephemeralImageValidationKey]*ephemeralImageValidation
 }
 
 // validate runs fn unless a successful validation for key is already known, and
 // coalesces concurrent callers onto one invocation. fn runs on the leader's
 // context; a waiter honors its own cancellation. A failure is reported to every
 // caller coalesced onto it and is then forgotten, never reused.
-func (c *imageTmpfsValidationCache) validate(
+func (c *imageEphemeralValidationCache) validate(
 	ctx context.Context,
-	key tmpfsImageValidationKey,
+	key ephemeralImageValidationKey,
 	fn func(context.Context) error,
 ) error {
 	c.mu.Lock()
@@ -207,9 +218,9 @@ func (c *imageTmpfsValidationCache) validate(
 			return ctx.Err()
 		}
 	}
-	entry := &tmpfsImageValidation{done: make(chan struct{})}
+	entry := &ephemeralImageValidation{done: make(chan struct{})}
 	if c.entries == nil {
-		c.entries = make(map[tmpfsImageValidationKey]*tmpfsImageValidation)
+		c.entries = make(map[ephemeralImageValidationKey]*ephemeralImageValidation)
 	}
 	c.entries[key] = entry
 	c.mu.Unlock()
@@ -228,14 +239,14 @@ func (c *imageTmpfsValidationCache) validate(
 	return err
 }
 
-// validateImageTmpfsTargetsCached is the Manager-scoped form of
-// validateImageTmpfsTargets used by service creates. Successful validations are
+// validateImageEphemeralTargetsCached is the Manager-scoped form of
+// validateImageEphemeralTargets used by service creates. Successful validations are
 // reused per immutable image content ID and exact destination set, and
 // concurrent requests for the same pair coalesce onto one archive read, so
 // repeated replicas do not each stream the same image. Failures are never
 // reused, and a missing immutable ID still fails closed before any cache
 // lookup.
-func (m *Manager) validateImageTmpfsTargetsCached(
+func (m *Manager) validateImageEphemeralTargetsCached(
 	ctx context.Context,
 	imageID string,
 	destinations []string,
@@ -244,47 +255,47 @@ func (m *Manager) validateImageTmpfsTargetsCached(
 		return nil
 	}
 	if strings.TrimSpace(imageID) == "" {
-		return errors.New("tmpfs validation: immutable image ID is missing")
+		return errors.New("writable mount validation: immutable image ID is missing")
 	}
-	key := tmpfsImageValidationKey{
+	key := ephemeralImageValidationKey{
 		imageID: imageID,
-		targets: tmpfsTargetsKey(destinations),
+		targets: ephemeralTargetsKey(destinations),
 	}
-	return m.tmpfsChecks.validate(
+	return m.ephemeralChecks.validate(
 		ctx, key, func(validateCtx context.Context) error {
-			return validateImageTmpfsTargets(
+			return validateImageEphemeralTargets(
 				validateCtx, m.cli, imageID, destinations)
 		})
 }
 
-// tmpfsTargetsKey renders the exact destination set as a cache-key component.
+// ephemeralTargetsKey renders the exact destination set as a cache-key component.
 // Sorting removes declaration-order sensitivity; NUL joining keeps ["/a",
 // "/b"] distinct from ["/a/b"]. It does not deduplicate: an invalid duplicate
 // is rejected before this point, and preserving it means the key never hides a
 // caller's input.
-func tmpfsTargetsKey(destinations []string) string {
+func ephemeralTargetsKey(destinations []string) string {
 	sorted := append([]string(nil), destinations...)
 	sort.Strings(sorted)
 	return strings.Join(sorted, "\x00")
 }
 
-// tmpfsRelevantPaths returns the container path components (without leading
-// slash) whose final image filesystem type can affect a configured tmpfs
+// ephemeralRelevantPaths returns the container path components (without leading
+// slash) whose final image filesystem type can affect a configured ephemeral volume
 // target: every target and each of its ancestors.
-func tmpfsRelevantPaths(destinations []string) map[string]struct{} {
+func ephemeralRelevantPaths(destinations []string) map[string]struct{} {
 	relevant := make(map[string]struct{}, len(destinations)*4)
 	for _, destination := range destinations {
-		for _, component := range tmpfsPathAndAncestors(destination) {
+		for _, component := range ephemeralPathAndAncestors(destination) {
 			relevant[component] = struct{}{}
 		}
 	}
 	return relevant
 }
 
-// tmpfsPathAndAncestors returns the slash-separated components of a canonical
+// ephemeralPathAndAncestors returns the slash-separated components of a canonical
 // absolute container path, from the first component through the target itself.
 // The root component is omitted because it is always a directory.
-func tmpfsPathAndAncestors(containerPath string) []string {
+func ephemeralPathAndAncestors(containerPath string) []string {
 	trimmed := strings.TrimPrefix(path.Clean(containerPath), "/")
 	if trimmed == "" || trimmed == "." {
 		return nil

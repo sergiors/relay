@@ -642,6 +642,7 @@ func TestServiceLabelsSpecMergedOwnershipWins(t *testing.T) {
 			labelApp:         "spoofed",
 			labelPort:        "9999",
 			labelEnvironment: "spoofedhash",
+			labelEphemeral:   "/run/spoofed",
 			"custom.key":     "custom-value",
 		},
 	}
@@ -658,6 +659,10 @@ func TestServiceLabelsSpecMergedOwnershipWins(t *testing.T) {
 	}
 	if got[labelEnvironment] != EnvironmentFingerprint(nil) {
 		t.Fatalf("relay.environment = %q, want the authoritative environment fingerprint (ownership must win)", got[labelEnvironment])
+	}
+	if value, ok := got[labelEphemeral]; ok {
+		t.Fatalf("relay.ephemeral = %q, want the label absent for a service "+
+			"declaring no ephemeral destinations (spoofed value must be cleared)", value)
 	}
 	if got["custom.routing"] != "true" {
 		t.Fatalf("caller-supplied extra label missing: %v", got)

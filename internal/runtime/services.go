@@ -83,13 +83,14 @@ type ServiceSpec struct {
 	// stamps their fingerprint as relay.resources so a changed spec is detected
 	// and the container replaced.
 	Resources app.ResourceLimits
-	// Tmpfs is the service's configured additional tmpfs destinations (the
-	// template service's `tmpfs` list), beyond Relay's always-present /tmp. Each
-	// entry is an absolute container path; StartService validates the same
-	// policy as template parsing (see app.ValidateServiceTmpfs) and builds the
-	// bounded, safe mount options itself, so a direct caller cannot inject mount
-	// options. An empty list preserves the historical /tmp-only HostConfig.
-	Tmpfs []string
+	// Ephemeral is the service's configured additional ephemeral-volume
+	// destinations (the template service's `ephemeral` list), beyond Relay's
+	// always-present /tmp. Each entry is an absolute container path; StartService
+	// validates the same policy as template parsing (see
+	// app.ValidateServiceEphemeral) and creates one anonymous Docker volume per
+	// destination itself, so a direct caller cannot inject a volume name, driver,
+	// or mount options. An empty list keeps the /tmp-only HostConfig.
+	Ephemeral []string
 	// Labels are EXTRA labels the caller wants on the container. They are
 	// merged onto the relay ownership set, with Relay ownership keys always
 	// winning: a caller can never spoof or clobber relay.* labels, which define
@@ -177,20 +178,19 @@ type ServiceContainer struct {
 	// container created before the label existed, which never equals a desired
 	// fingerprint, so such a container is replaced once.
 	Resources string
-	// Tmpfs is the canonical, sorted, comma-separated list of additional tmpfs
-	// destinations the container was created with, parsed from relay.tmpfs. It
-	// is "" for a service with no additional tmpfs (the historical /tmp-only
-	// case). The service reconciler compares it to the desired configured list
-	// and replaces the container when it differs; /tmp is always present and is
-	// deliberately not part of this value.
+	// Ephemeral is the canonical, sorted, comma-separated list of additional
+	// ephemeral-volume destinations the container was created with, parsed from
+	// relay.ephemeral. It is "" for a service with no additional ephemeral
+	// volumes. The service reconciler compares it to the desired configured list
+	// and replaces the container when it differs; the always-present /tmp volume
+	// is deliberately not part of this value.
 	//
 	// The label is the only configuration identity discovery can compare here:
-	// a ContainerList summary exposes only HostConfig.NetworkMode/Annotations —
-	// not HostConfig.Tmpfs — and ContainerInspect.Mounts does not report tmpfs
-	// mounts on every Engine, so observing the live mount table would require an
-	// extra inspect per container on every reconcile. The immutable label is
-	// stamped from the exact destinations StartService applied.
-	Tmpfs string
+	// a ContainerList summary does not expose HostConfig.Mounts, so observing the
+	// live mount table would require an extra inspect per container on every
+	// reconcile. The immutable label is stamped from the exact destinations
+	// StartService applied.
+	Ephemeral string
 	// Networks is the canonical, sorted, comma-separated set of Docker
 	// networks the container was created attached to (the worker-global
 	// NETWORKS set), parsed from relay.networks. It is "" for a container with
@@ -451,15 +451,16 @@ func EnvironmentFingerprint(env []string) string {
 	return hex.EncodeToString(h.Sum(nil))[:serviceIdentityHashLen]
 }
 
-// ServiceTmpfsLabel returns the canonical value of a service's relay.tmpfs
-// label: the sorted, de-duplicated, comma-separated list of additional tmpfs
-// destinations. An empty result means the service declares no additional tmpfs
-// and the label is omitted, so an unaffected service keeps its historical label
-// set. Container paths cannot contain a comma under the template policy (only
-// /run and /var/cache subtrees are accepted), so the joined form is
-// unambiguous. The value is the configuration itself — not security state and
-// not a version marker — so the reconciler can compare it directly.
-func ServiceTmpfsLabel(destinations []string) string {
+// ServiceEphemeralLabel returns the canonical value of a service's
+// relay.ephemeral label: the sorted, de-duplicated, comma-separated list of
+// additional ephemeral-volume destinations. An empty result means the service
+// declares no additional ephemeral volumes and the label is omitted, so an
+// unaffected service's label set is unchanged. Container paths cannot contain a
+// comma under the template policy (only /run and /var/cache subtrees are
+// accepted), so the joined form is unambiguous. The value is the configuration
+// itself — not security state and not a version marker — so the reconciler can
+// compare it directly.
+func ServiceEphemeralLabel(destinations []string) string {
 	if len(destinations) == 0 {
 		return ""
 	}
@@ -492,11 +493,12 @@ func ServiceTmpfsLabel(destinations []string) string {
 // content-addressed), so a moved external tag is detected. relay.environment pins
 // the effective environment fingerprint so an env/secret change replaces a
 // container whose image reference is unchanged (see labelEnvironment).
-// relay.resources and relay.tmpfs pin the effective per-container resources and
-// the configured additional tmpfs destinations, so a change to either replaces
-// a running service. relay.healthcheck pins the configured healthcheck identity
-// (path and timings) so a probe-only change replaces the running container
-// without a rebuild; it is omitted for a service with no healthcheck.
+// relay.resources and relay.ephemeral pin the effective per-container resources
+// and the configured additional ephemeral-volume destinations, so a change to
+// either replaces a running service. relay.healthcheck pins the configured
+// healthcheck identity (path and timings) so a probe-only change replaces the
+// running container without a rebuild; it is omitted for a service with no
+// healthcheck.
 //
 // Extra caller-supplied labels (spec.Labels, e.g. routing labels) are merged
 // on top, then the relay ownership keys are RE-applied last so Relay's
@@ -505,7 +507,7 @@ func ServiceTmpfsLabel(destinations []string) string {
 func serviceLabels(spec ServiceSpec, nodeID string, replica int) map[string]string {
 	environmentFingerprint := EnvironmentFingerprint(spec.Env)
 	resourceHash := spec.Resources.OrDefault().Fingerprint()
-	tmpfsLabel := ServiceTmpfsLabel(spec.Tmpfs)
+	ephemeralLabel := ServiceEphemeralLabel(spec.Ephemeral)
 	// A HOT_RELOAD source mount bypasses Relay healthcheck behavior entirely:
 	// no Docker healthcheck configuration and no healthcheck metadata are
 	// stamped, so a healthcheck-only template edit cannot make the container
@@ -564,12 +566,13 @@ func serviceLabels(spec ServiceSpec, nodeID string, replica int) map[string]stri
 	labels[labelReplica] = strconv.Itoa(replica)
 	labels[labelEnvironment] = environmentFingerprint
 	labels[labelResources] = resourceHash
-	// The tmpfs configuration is identity metadata too; re-apply it last and
-	// clear a spoofed value when the service declares no additional tmpfs.
-	if tmpfsLabel != "" {
-		labels[labelTmpfs] = tmpfsLabel
+	// The ephemeral configuration is identity metadata too; re-apply it last and
+	// clear a spoofed value when the service declares no additional ephemeral
+	// volumes.
+	if ephemeralLabel != "" {
+		labels[labelEphemeral] = ephemeralLabel
 	} else {
-		delete(labels, labelTmpfs)
+		delete(labels, labelEphemeral)
 	}
 	// The healthcheck configuration is identity metadata too; re-apply it last
 	// and clear a spoofed value when the service declares no healthcheck. The
@@ -812,10 +815,10 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 	}
 
 	// The resolved resource limits apply exactly as they do to an invocation
-	// container. A declared privileged port adds only NET_BIND_SERVICE on top
-	// of the shared CapDrop ALL baseline. Additional service tmpfs mounts are
+	// container. A declared privileged port adds only NET_BIND_SERVICE on top of
+	// the shared CapDrop ALL baseline. Additional service ephemeral volumes are
 	// added here, before create: StartService validates the same destination
-	// policy as template parsing and builds the bounded option strings itself.
+	// policy as template parsing and creates the anonymous volumes itself.
 	hostConfig := hardenedServiceHostConfig(spec.Resources, spec.Port)
 	if bindAddr.IsValid() {
 		// Publish the service's TCP port on the configured static host IP.
@@ -827,8 +830,8 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 			},
 		}
 	}
-	if err := applyServiceTmpfs(
-		hostConfig, spec.Tmpfs, spec.Resources,
+	if err := applyServiceEphemeral(
+		hostConfig, spec.Ephemeral,
 	); err != nil {
 		return "", fmt.Errorf("service: %w", err)
 	}
@@ -846,11 +849,11 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 	if spec.SourceMount != nil {
 		sourceRoot = spec.SourceMount.HostPath
 	}
-	// A HOT_RELOAD entrypoint service mounts its live source read-only; an
-	// external `image` service never does, so its HostConfig is byte-for-byte the
-	// pre-HOT_RELOAD shape.
+	// A HOT_RELOAD entrypoint service appends its live source read-only mount to
+	// the baseline /tmp and configured ephemeral volumes; an external `image`
+	// service never does, so its HostConfig has no source mount.
 	if len(sourceMounts) > 0 {
-		createOps.HostConfig.Mounts = sourceMounts
+		createOps.HostConfig.Mounts = append(createOps.HostConfig.Mounts, sourceMounts...)
 	}
 	if err := validateContainerHostConfig(
 		createOps.HostConfig, sourceMounts, spec.Port, sourceRoot,
@@ -859,8 +862,9 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 	}
 	// Docker materializes an image-declared VOLUME as an anonymous writable
 	// mount even under ReadonlyRootfs, so refuse it before create just like an
-	// unsafe HostConfig. This is the enforcement point for external `image`
-	// services as well as Relay-built service images.
+	// unsafe HostConfig, unless Relay explicitly mounts that exact target (/tmp
+	// or a configured ephemeral destination). This is the enforcement point for
+	// external `image` services as well as Relay-built service images.
 	inspectImage := spec.Image
 	if spec.ImageID != "" {
 		// Mutable external references are resolved by the reconciler before the
@@ -868,22 +872,26 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		// tag that could move between validation and ContainerCreate.
 		inspectImage = spec.ImageID
 	}
+	coveredVolumes := append([]string{tmpVolumeTarget}, spec.Ephemeral...)
 	createImage, err := validateImageDeclaredVolumes(
-		ctx, m.cli, inspectImage, spec.Tmpfs...)
+		ctx, m.cli, inspectImage, coveredVolumes...)
 	if err != nil {
 		return "", fmt.Errorf("service: %w", err)
 	}
-	// Docker follows container-rootfs symlinks when applying HostConfig.Tmpfs,
+	// Docker follows container-rootfs symlinks when applying mount destinations,
 	// so a path allowlist alone is not sufficient. Prove against the exact
-	// immutable image content that no configured tmpfs target (or parent) is a
-	// symlink or other non-directory redirection before create. This runs after
-	// the image identity is pinned and before ContainerCreate; no image code is
-	// executed, and an unreadable/undecodable archive fails closed. Successful
-	// results are reused per immutable image ID and exact destination set, and
-	// concurrent same-pair requests coalesce, so replicas do not each stream the
-	// image archive. Failures are never reused.
-	if err := m.validateImageTmpfsTargetsCached(
-		ctx, createImage, spec.Tmpfs,
+	// immutable image content that the always-present /tmp volume and every
+	// configured ephemeral target (or parent) is a non-symlink directory, and
+	// that each target directory exists so its ownership/mode can be copied
+	// into the anonymous volume. This runs after the image identity is pinned
+	// and before ContainerCreate; no image code is executed, and an
+	// unreadable/undecodable archive fails closed. Successful results are reused
+	// per immutable image ID and exact destination set, and concurrent same-pair
+	// requests coalesce, so replicas do not each stream the image archive.
+	// Failures are never reused.
+	volumeTargets := append([]string{tmpVolumeTarget}, spec.Ephemeral...)
+	if err := m.validateImageEphemeralTargetsCached(
+		ctx, createImage, volumeTargets,
 	); err != nil {
 		return "", fmt.Errorf("service: %w", err)
 	}
@@ -1188,7 +1196,7 @@ func (m *Manager) serviceContainerList(ctx context.Context, admit dockerOpAdmitt
 			BindAddr:               c.Labels[labelBindAddr],
 			EnvironmentFingerprint: c.Labels[labelEnvironment],
 			Resources:              c.Labels[labelResources],
-			Tmpfs:                  c.Labels[labelTmpfs],
+			Ephemeral:              c.Labels[labelEphemeral],
 			Networks:               c.Labels[labelNetworks],
 			Healthcheck:            c.Labels[labelHealthcheck],
 			HealthcheckAttempt:     healthcheckAttempt,

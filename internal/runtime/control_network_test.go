@@ -1567,10 +1567,13 @@ func TestStartContainerJoinsControlNetworkPlusNetworks(t *testing.T) {
 		return m, &networkCreates
 	}
 	// failingCreate scripts image inspect + a create failure so the test can
-	// capture the exact request body without starting anything.
+	// capture the exact request body without starting anything. The create path
+	// pins the immutable ID before create, so the pinned-ID re-inspect is
+	// modeled too; the default ImageSave route validates the baseline /tmp.
 	failingCreate := func(body *[]byte) []dockerRoute {
 		return []dockerRoute{
 			imageWithoutDeclaredVolumesRoute("img"),
+			imageWithoutDeclaredVolumesRoute("sha256:clean"),
 			dockerRoute{
 				method: http.MethodPost, path: "/containers/create",
 				status: http.StatusInternalServerError,

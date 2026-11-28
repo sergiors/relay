@@ -46,7 +46,7 @@ type fakeContainer struct {
 	entry                  []string // the long-lived process command passed to StartService
 	environmentFingerprint string   // relay.environment as stamped at create (spec.Env's fingerprint); "" = unlabeled
 	resources              string   // relay.resources as stamped at create (spec.Resources' fingerprint); "" = legacy/unlabeled
-	tmpfs                  string   // relay.tmpfs as stamped at create (canonical additional destinations)
+	ephemeral              string   // relay.ephemeral as stamped at create (canonical additional destinations)
 	sourceID               string   // relay.source as stamped at create (spec.SourceMount.Identity); "" = no mount
 	// ready is the backend's readiness observation reported through
 	// ServiceContainerList; nil reports no signal (Docker's historical
@@ -201,7 +201,7 @@ func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, r
 		// stamped too, so a resource-only change replaces the container.
 		environmentFingerprint: runtime.EnvironmentFingerprint(spec.Env),
 		resources:              spec.Resources.OrDefault().Fingerprint(),
-		tmpfs:                  runtime.ServiceTmpfsLabel(spec.Tmpfs),
+		ephemeral:              runtime.ServiceEphemeralLabel(spec.Ephemeral),
 		sourceID:               sourceMountIdentity(spec),
 		labels:                 spec.Labels,
 		networks:               append([]string(nil), spec.Networks...),
@@ -251,7 +251,7 @@ func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceCon
 			NodeID:                 c.nodeID,
 			EnvironmentFingerprint: c.environmentFingerprint,
 			Resources:              c.resources,
-			Tmpfs:                  c.tmpfs,
+			Ephemeral:              c.ephemeral,
 			Networks:               runtime.NetworksLabel(c.networks...),
 			SourceID:               c.sourceID,
 			Ready:                  c.ready,
@@ -549,19 +549,19 @@ func TestReconcileInitialCreation(t *testing.T) {
 	}
 }
 
-func TestReconcileServiceTmpfsChangeReplacesAndUnchangedDoesNotChurn(t *testing.T) {
+func TestReconcileServiceEphemeralChangeReplacesAndUnchangedDoesNotChurn(t *testing.T) {
 	f := newFakeDocker()
 	svc := app.Service{
 		Name: "cache", Entrypoint: "service.js", Port: 8080, Replicas: 1,
-		Tmpfs: []string{"/run/cache"},
+		Ephemeral: []string{"/run/cache"},
 	}
 	tmpl := serviceTemplate("nodejs24.x", svc)
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1"); err != nil {
 		t.Fatalf("initial reconcile: %v", err)
 	}
 	first := fakeServiceContainers(f, "fn", "cache")
-	if len(first) != 1 || first[0].tmpfs != "/run/cache" {
-		t.Fatalf("initial container(s) = %+v, want one with /run/cache tmpfs", first)
+	if len(first) != 1 || first[0].ephemeral != "/run/cache" {
+		t.Fatalf("initial container(s) = %+v, want one with /run/cache ephemeral", first)
 	}
 
 	transitions := len(f.order())
@@ -569,20 +569,20 @@ func TestReconcileServiceTmpfsChangeReplacesAndUnchangedDoesNotChurn(t *testing.
 		t.Fatalf("unchanged reconcile: %v", err)
 	}
 	if got := len(f.order()); got != transitions {
-		t.Fatalf("unchanged tmpfs caused %d new transition(s), want no churn", got-transitions)
+		t.Fatalf("unchanged ephemeral caused %d new transition(s), want no churn", got-transitions)
 	}
 	if after := fakeServiceContainers(f, "fn", "cache"); len(after) != 1 || after[0].id != first[0].id {
-		t.Fatalf("unchanged tmpfs replaced the container: before=%+v after=%+v", first, after)
+		t.Fatalf("unchanged ephemeral replaced the container: before=%+v after=%+v", first, after)
 	}
 
-	svc.Tmpfs = []string{"/var/cache/data"}
+	svc.Ephemeral = []string{"/var/cache/data"}
 	changed := serviceTemplate("nodejs24.x", svc)
 	if _, err := reconcile(t, f, "fn", changed, "img-1"); err != nil {
-		t.Fatalf("tmpfs-change reconcile: %v", err)
+		t.Fatalf("ephemeral-change reconcile: %v", err)
 	}
 	current := fakeServiceContainers(f, "fn", "cache")
-	if len(current) != 1 || current[0].id == first[0].id || current[0].tmpfs != "/var/cache/data" {
-		t.Fatalf("changed tmpfs container(s) = %+v, want replacement with /var/cache/data", current)
+	if len(current) != 1 || current[0].id == first[0].id || current[0].ephemeral != "/var/cache/data" {
+		t.Fatalf("changed ephemeral container(s) = %+v, want replacement with /var/cache/data", current)
 	}
 	order := f.order()
 	if len(order) < transitions+2 || !strings.HasPrefix(order[transitions], "start:") || order[transitions+1] != "stop:"+first[0].id {

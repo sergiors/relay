@@ -6,32 +6,32 @@ import (
 	"testing"
 )
 
-func TestParseServiceTmpfsCanonicalAndDefault(t *testing.T) {
+func TestParseServiceEphemeralCanonicalAndDefault(t *testing.T) {
 	tmpl := mustParse(t, `
 runtime: nodejs24.x
 services:
   - name: cache
     entrypoint: service.js
-    tmpfs:
+    ephemeral:
       - /var/cache/z
       - /run/cache
 `)
-	if got, want := tmpl.Services[0].Tmpfs, []string{"/run/cache", "/var/cache/z"}; !equalStrings(got, want) {
-		t.Fatalf("tmpfs = %v, want canonical sorted %v", got, want)
+	if got, want := tmpl.Services[0].Ephemeral, []string{"/run/cache", "/var/cache/z"}; !equalStrings(got, want) {
+		t.Fatalf("ephemeral = %v, want canonical sorted %v", got, want)
 	}
 
-	withoutTmpfs := mustParse(t, `
+	withoutEphemeral := mustParse(t, `
 runtime: nodejs24.x
 services:
   - name: default
     entrypoint: service.js
 `)
-	if got := withoutTmpfs.Services[0].Tmpfs; len(got) != 0 {
-		t.Fatalf("omitted tmpfs = %v, want empty", got)
+	if got := withoutEphemeral.Services[0].Ephemeral; len(got) != 0 {
+		t.Fatalf("omitted ephemeral = %v, want empty", got)
 	}
 }
 
-func TestParseServiceTmpfsRejectsInvalidPaths(t *testing.T) {
+func TestParseServiceEphemeralRejectsInvalidPaths(t *testing.T) {
 	cases := []struct {
 		name, destination string
 	}{
@@ -47,15 +47,15 @@ func TestParseServiceTmpfsRejectsInvalidPaths(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := ParseTemplate([]byte("runtime: nodejs24.x\nservices:\n  - name: svc\n    entrypoint: service.js\n    tmpfs: [" + tc.destination + "]\n"))
-			if err == nil || !strings.Contains(err.Error(), "tmpfs") {
-				t.Fatalf("parse error = %v, want tmpfs path rejection", err)
+			_, err := ParseTemplate([]byte("runtime: nodejs24.x\nservices:\n  - name: svc\n    entrypoint: service.js\n    ephemeral: [" + tc.destination + "]\n"))
+			if err == nil || !strings.Contains(err.Error(), "ephemeral") {
+				t.Fatalf("parse error = %v, want ephemeral path rejection", err)
 			}
 		})
 	}
 }
 
-func TestParseServiceTmpfsRejectsDuplicateOverlapAndProtectedPaths(t *testing.T) {
+func TestParseServiceEphemeralRejectsDuplicateOverlapAndProtectedPaths(t *testing.T) {
 	cases := []struct {
 		name string
 		list string
@@ -72,58 +72,43 @@ func TestParseServiceTmpfsRejectsDuplicateOverlapAndProtectedPaths(t *testing.T)
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := ParseTemplate([]byte("runtime: nodejs24.x\nservices:\n  - name: svc\n    entrypoint: service.js\n    tmpfs: " + tc.list + "\n"))
-			if err == nil || !strings.Contains(err.Error(), "tmpfs") {
-				t.Fatalf("parse error = %v, want tmpfs rejection", err)
+			_, err := ParseTemplate([]byte("runtime: nodejs24.x\nservices:\n  - name: svc\n    entrypoint: service.js\n    ephemeral: " + tc.list + "\n"))
+			if err == nil || !strings.Contains(err.Error(), "ephemeral") {
+				t.Fatalf("parse error = %v, want ephemeral rejection", err)
 			}
 		})
 	}
 }
 
-func TestParseServiceTmpfsAggregateMemoryBudget(t *testing.T) {
-	// The default effective memory is 128 MiB, so two 16 MiB mounts fit the
-	// one-quarter budget exactly; a third exceeds it.
-	valid := mustParse(t, `
-runtime: nodejs24.x
-services:
-  - name: svc
-    entrypoint: service.js
-    tmpfs: [/run/a, /var/cache/b]
-`)
-	if len(valid.Services[0].Tmpfs) != 2 {
-		t.Fatalf("tmpfs = %v, want both mounts", valid.Services[0].Tmpfs)
-	}
-
+func TestParseServiceRejectsRemovedTmpfsKey(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
 runtime: nodejs24.x
-resources:
-  memory: 128MiB
 services:
   - name: svc
     entrypoint: service.js
-    tmpfs: [/run/a, /run/b, /run/c]
+    tmpfs: [/run/cache]
 `))
-	if err == nil || !strings.Contains(err.Error(), "aggregate budget") {
-		t.Fatalf("parse error = %v, want aggregate memory budget rejection", err)
+	if err == nil || !strings.Contains(err.Error(), "tmpfs is no longer supported") {
+		t.Fatalf("parse error = %v, want a tmpfs migration rejection", err)
 	}
 }
 
-// TestFingerprintIgnoresServiceTmpfs pins that tmpfs is treated like resources:
-// it is applied to a container at create time, never baked into a built image,
-// so a tmpfs-only edit must not change either fingerprint path. The service
-// reconciler still detects the change through relay.tmpfs.
-func TestFingerprintIgnoresServiceTmpfs(t *testing.T) {
+// TestFingerprintIgnoresServiceEphemeral pins that ephemeral is treated like
+// resources: it is applied to a container at create time, never baked into a
+// built image, so an ephemeral-only edit must not change either fingerprint path.
+// The service reconciler still detects the change through relay.ephemeral.
+func TestFingerprintIgnoresServiceEphemeral(t *testing.T) {
 	const base = `runtime: nodejs24.x
 services:
   - name: web
     entrypoint: service.js
-    tmpfs: [/run/cache]
+    ephemeral: [/run/cache]
 `
 	const changed = `runtime: nodejs24.x
 services:
   - name: web
     entrypoint: service.js
-    tmpfs: [/var/cache/nginx]
+    ephemeral: [/var/cache/nginx]
 `
 	const without = `runtime: nodejs24.x
 services:
@@ -138,7 +123,7 @@ services:
 	for _, next := range []string{changed, without} {
 		writeFile(t, filepath.Join(dir, "template.yaml"), next)
 		if got := fp(t, dir); got != baseline {
-			t.Fatalf("tmpfs-only edit changed the full-source fingerprint: "+
+			t.Fatalf("ephemeral-only edit changed the full-source fingerprint: "+
 				"%s != %s", got, baseline)
 		}
 	}
@@ -146,19 +131,19 @@ services:
 	writeFile(t, filepath.Join(dir, "template.yaml"),
 		strings.Replace(base, "name: web", "name: web2", 1))
 	if got := fp(t, dir); got == baseline {
-		t.Fatal("a non-tmpfs template edit must change the fingerprint")
+		t.Fatal("a non-ephemeral template edit must change the fingerprint")
 	}
 
-	// The template-only (no-runtime) path must ignore tmpfs too.
+	// The template-only (no-runtime) path must ignore ephemeral too.
 	const noRuntimeBase = `services:
   - name: web
     image: nginx:1.27
-    tmpfs: [/run]
+    ephemeral: [/run]
 `
 	const noRuntimeChanged = `services:
   - name: web
     image: nginx:1.27
-    tmpfs: [/var/cache/nginx]
+    ephemeral: [/var/cache/nginx]
 `
 	noRuntimeDir := t.TempDir()
 	writeFile(t, filepath.Join(noRuntimeDir, "template.yaml"), noRuntimeBase)
@@ -181,7 +166,7 @@ services:
 		t.Fatalf("fingerprint changed no-runtime: %v", err)
 	}
 	if after != before {
-		t.Fatalf("tmpfs-only edit changed the template-only fingerprint: "+
+		t.Fatalf("ephemeral-only edit changed the template-only fingerprint: "+
 			"%s != %s", after, before)
 	}
 }

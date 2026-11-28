@@ -1172,16 +1172,15 @@ func reconcileWithObserver(
 		// even though the image reference (and image fingerprint) are unchanged.
 		resources := tmpl.ResourceLimits()
 		resourceHash := resources.Fingerprint()
-		// desiredTmpfs is the canonical identity of the service's configured
-		// additional tmpfs destinations. It is compared against each container's
-		// relay.tmpfs label below, so a tmpfs-configuration change replaces the
-		// running service even though neither the image nor any other label
-		// changes. The label is the only observable identity here: ContainerList
-		// summaries omit HostConfig.Tmpfs and inspected Mounts omit tmpfs entries
-		// on some Engines, so comparing the live mount table would add an inspect
-		// per discovered container each pass. The always-present /tmp mount is
-		// constant and not encoded.
-		desiredTmpfs := runtime.ServiceTmpfsLabel(svc.Tmpfs)
+		// desiredEphemeral is the canonical identity of the service's configured
+		// additional ephemeral-volume destinations. It is compared against each
+		// container's relay.ephemeral label below, so an ephemeral-configuration
+		// change replaces the running service even though neither the image nor
+		// any other label changes. The label is the only observable identity here:
+		// ContainerList summaries omit HostConfig.Mounts, so comparing the live
+		// mount table would add an inspect per discovered container each pass. The
+		// always-present /tmp volume is constant and not encoded.
+		desiredEphemeral := runtime.ServiceEphemeralLabel(svc.Ephemeral)
 		// A HOT_RELOAD source mount bypasses Relay healthcheck behavior entirely.
 		// No Docker probe, no healthcheck/attempt labels, and no readiness gate are
 		// applied, so a healthcheck-only template edit cannot force a replacement
@@ -1207,13 +1206,13 @@ func reconcileWithObserver(
 		// A container is CONVERGED (a keep candidate) only when it is both
 		// healthy (running) and currently configured correctly (source reference,
 		// image, image content, port, host bind address, effective environment,
-		// resources, additional tmpfs destinations, source mount, and Docker
+		// resources, additional ephemeral-volume destinations, source mount, and Docker
 		// networks all match the desired values) and carries a real replica label.
 		// Anything else —
 		// exited/dead/removing, a changed source, a changed image, a moved
 		// external tag (image content changed), a changed port, a changed
 		// env/secret (environment fingerprint mismatch), changed resource
-		// configuration, tmpfs list, network set, mounted source
+		// configuration, ephemeral list, network set, mounted source
 		// (relay.source), or an unlabeled legacy container (Replica == -1) — is a
 		// non-converged generation that a converged replacement supersedes.
 		// Routing host/path is deliberately NOT part of container identity:
@@ -1237,7 +1236,7 @@ func reconcileWithObserver(
 		// active while this identity still matches.
 		desiredGeneration := serviceGenerationIdentity(
 			sourceRef, resolved.Ref, resolved.ID, svc.Port,
-			environmentFingerprint, resourceHash, desiredTmpfs, desiredNetworks,
+			environmentFingerprint, resourceHash, desiredEphemeral, desiredNetworks,
 			desiredBindAddr, desiredHealthcheck, desiredSourceID, resolved.Entry,
 		)
 		// configured reports every immutable configuration comparison except
@@ -1258,7 +1257,7 @@ func reconcileWithObserver(
 				ctr.BindAddr == desiredBindAddr &&
 				ctr.EnvironmentFingerprint == environmentFingerprint &&
 				ctr.Resources == resourceHash &&
-				ctr.Tmpfs == desiredTmpfs &&
+				ctr.Ephemeral == desiredEphemeral &&
 				healthcheckMatches &&
 				ctr.Networks == desiredNetworks &&
 				ctr.Replica >= 0
@@ -1296,7 +1295,7 @@ func reconcileWithObserver(
 		// EXCEPT for its live source fingerprint: the exact case an in-place
 		// restart resolves under HOT_RELOAD. It requires a real source mount
 		// (desiredSourceID != "") and an immutable relay.source label that differs;
-		// every other field — image, image content, port, env, resources, tmpfs,
+		// every other field — image, image content, port, env, resources, ephemeral,
 		// networks, replica slot, routing labels — must already match, so a
 		// configuration or dependency change still replaces rather than restarts.
 		// Under HOT_RELOAD effectiveHealthcheck is nil, so health never gates the
@@ -1323,7 +1322,7 @@ func reconcileWithObserver(
 				Entry:              resolved.Entry,
 				Env:                env,
 				Resources:          resources,
-				Tmpfs:              svc.Tmpfs,
+				Ephemeral:          svc.Ephemeral,
 				Networks:           desiredNetworkSet,
 				SourceMount:        resolved.Mount,
 				Runtime:            tmpl.Runtime,
@@ -2646,7 +2645,7 @@ func removeStaleSlot(
 func serviceGenerationIdentity(
 	sourceRef, image, imageID string,
 	port int,
-	environment, resources, tmpfs, networks, bindAddr, healthcheck, sourceID string,
+	environment, resources, ephemeral, networks, bindAddr, healthcheck, sourceID string,
 	entry []string,
 ) string {
 	fields := []string{
@@ -2656,7 +2655,7 @@ func serviceGenerationIdentity(
 		fmt.Sprintf("%d", port),
 		environment,
 		resources,
-		tmpfs,
+		ephemeral,
 		networks,
 		bindAddr,
 		healthcheck,
@@ -2671,7 +2670,7 @@ func serviceGenerationIdentity(
 // generation can change at that point: source descriptor, the app image an
 // `entrypoint` service runs (a Git source update changes it while the service
 // template stays byte-identical), port, replica count, the host bind address,
-// the EFFECTIVE probe, tmpfs, resources, runtime, env/secret bindings, and the
+// the EFFECTIVE probe, ephemeral, resources, runtime, env/secret bindings, and the
 // desired network set. It deliberately excludes routing host/path and the
 // advertised service address: routing is served from discovery and must never
 // replace a container. A new desired generation therefore resets a persisted
@@ -2694,7 +2693,7 @@ func servicePreparationIdentity(
 		fmt.Sprintf("%d", svc.Port),
 		fmt.Sprintf("%d", svc.Replicas),
 		bindAddr,
-		runtime.ServiceTmpfsLabel(svc.Tmpfs),
+		runtime.ServiceEphemeralLabel(svc.Ephemeral),
 		tmpl.ResourceLimits().Fingerprint(),
 		tmpl.Runtime,
 		runtime.NetworksLabel(networkSet...),

@@ -251,12 +251,13 @@ Per-container `resources` apply to service containers too. The hardening is the
 same as invocation containers: non-root (from the managed runtime image or the
 external image's own `USER`; Relay never forces a UID on an external image),
 all capabilities dropped, `no-new-privileges`, Docker's default seccomp profile,
-private PID/IPC/network namespaces, read-only rootfs, bounded `/tmp`, and
-memory/CPU/pids limits. A service whose declared `port` is below 1024 gets only
-`NET_BIND_SERVICE` added on top of the dropped set, so managed non-root services
-can bind a privileged port even when the daemon sets a nonzero unprivileged-port
-floor. Workload containers never receive device access, arbitrary host mounts,
-writable app source, or a container-runtime socket.
+private PID/IPC/network namespaces, read-only rootfs, a disk-backed `/tmp`
+volume, and memory/CPU/pids limits. A service whose declared `port` is below
+1024 gets only `NET_BIND_SERVICE` added on top of the dropped set, so managed
+non-root services can bind a privileged port even when the daemon sets a
+nonzero unprivileged-port floor. Workload containers never receive device
+access, arbitrary host mounts, writable app source, or a container-runtime
+socket.
 
 External images must run under those constraints. Prefer images that already run
 as a non-root user and listen on an unprivileged port (for example
@@ -264,39 +265,70 @@ as a non-root user and listen on an unprivileged port (for example
 cache directories and setuid its workers). An image whose config declares Docker
 `VOLUME` destinations is refused before create by default: the daemon would
 materialize those as implicit anonymous writable volumes even with a read-only
-rootfs. A declared destination is accepted only when the service explicitly
-covers it with an additional `tmpfs` at the exact path (see below); Relay never
-adds one automatically.
+rootfs. A declared `/tmp` is accepted because Relay always mounts `/tmp`; any
+other declared destination is accepted only when the service explicitly covers
+it with an `ephemeral` entry at the exact path (see below). Relay never adds one
+automatically.
 
 Services use the optional worker-wide `NETWORKS` list for additional
 connectivity. These operator-managed networks must already exist. See
 [Configuration](configuration.md).
 
-## Additional writable tmpfs
+## Ephemeral writable storage
 
-A read-only rootfs leaves `/tmp` as the only writable path by default. A service
-that also needs an ephemeral cache or runtime directory can declare a `tmpfs`
-list:
+A read-only rootfs leaves `/tmp` as the only writable path by default. Relay
+provides `/tmp` as a Docker anonymous volume, so its contents live on disk and
+are removed with the container; `/tmp` does not consume the service's memory
+limit. A service that also needs an ephemeral cache or runtime directory can
+declare an `ephemeral` list:
 
 ```yaml
 services:
   - name: web
     image: nginxinc/nginx-unprivileged:1.27-alpine
     port: 8080
-    tmpfs: [/var/cache/nginx, /run]
+    ephemeral: [/var/cache/nginx]
 ```
 
 Each entry must be a canonical absolute container path under `/run` or
 `/var/cache`; `/tmp` is already writable and cannot be redeclared. Duplicate or
-overlapping paths are rejected. Relay rejects targets that are symlinks or
-non-directories in the image. Additional tmpfs is available only to services;
-execution containers retain their `/tmp`-only configuration.
+overlapping paths are rejected. Each entry becomes its own anonymous Docker
+volume, so it is disk-backed rather than memory-backed. Relay rejects targets
+that are missing, symlinks, or non-directories in the image. The older `tmpfs`
+service key is no longer supported and is rejected at parse time; use
+`ephemeral`.
 
-Each additional mount is capped at 16 MiB, and the total must not exceed one
-quarter of the service's memory limit (default `128MiB`). The memory limit
-includes tmpfs usage. An image-declared `VOLUME` destination is accepted only
-when the service explicitly configures tmpfs at that exact path; Relay does not
-add one automatically.
+The target directory must already exist in the image and be writable by the
+image's user. Docker copies the directory's ownership and mode into the empty
+volume; a missing directory would leave a root-owned volume the non-root process
+cannot write. Relay's managed runtime images pre-create `/tmp`, `/run`, and
+`/var/cache` for the runtime user. External images must provide a writable
+`/tmp` directory as well as any additional ephemeral directory themselves.
+Relay validates that `/tmp` and every configured ephemeral target exist as
+non-symlink directories in the image and fails before create otherwise.
+
+### Storage lifetime and isolation
+
+Each service container, including each replica, gets its own private ephemeral
+storage. It remains available for the lifetime of that running container,
+including an in-place service restart, and Relay's warm function containers keep
+their storage across invocations while the same container is reused. Ephemeral
+storage is never shared between containers, replicas, or nodes, and it is not
+durable: replacing or removing the container discards it. `/tmp` is always
+available; additional service paths use `ephemeral`.
+
+Ephemeral storage currently uses Docker-managed anonymous volumes without
+per-container disk quotas. Storage consumption is limited by the available
+capacity of the host filesystem. Per-container storage quotas and disk pressure
+protection are deferred to a future implementation.
+
+These are ordinary Docker volumes, so the tmpfs-specific `noexec`, `nosuid`,
+and `nodev` mount flags do not apply; the read-only rootfs, non-root user,
+dropped capabilities, and `no-new-privileges` defenses still do. Additional
+ephemeral storage is available only to services; execution containers retain
+their `/tmp`-only configuration. Relay removes the anonymous volumes when it
+removes the container (and Docker removes them automatically when a one-shot
+invocation container exits).
 
 ## Convergence and lifecycle
 
@@ -307,7 +339,7 @@ before stopping the old container, so a failed update does not take the service
 to zero replicas.
 
 Changing a service's image, environment (including a rotated secret), resources,
-networks, port, host bind address, tmpfs settings, or healthcheck updates its
+networks, port, host bind address, ephemeral settings, or healthcheck updates its
 containers. A routing `host`/`path` change does not replace a container: the
 route is read from the current template when discovery builds its response.
 Scaling starts

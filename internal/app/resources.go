@@ -241,7 +241,7 @@ func numericToFloat(raw any) (float64, bool) {
 
 // stripTemplateResources removes the RUNTIME-ONLY configuration that must not
 // participate in an app's image fingerprint: the top-level `resources` key and
-// each service's `tmpfs` and `healthcheck` settings. They are applied to
+// each service's `ephemeral` and `healthcheck` settings. They are applied to
 // containers at create time, never baked into a built image, so editing only
 // this configuration must not look like a source change (and therefore must not
 // trigger a rebuild).
@@ -284,13 +284,13 @@ func stripTemplateResources(raw []byte) []byte {
 	return out
 }
 
-// stripServiceRuntimeKeys removes the runtime-only per-service keys `tmpfs` and
-// `healthcheck` from every mapping in a top-level `services` sequence. Neither
-// is baked into the image: a change to either replaces/updates containers at the
-// reconciler layer, so it must not look like a source change and trigger a
-// rebuild. The strip is deliberately narrow: the same key elsewhere in the
-// document is not runtime-only service configuration and still participates in
-// the fingerprint.
+// stripServiceRuntimeKeys removes the runtime-only per-service keys `ephemeral`
+// and `healthcheck` from every mapping in a top-level `services` sequence.
+// Neither is baked into the image: a change to either replaces/updates
+// containers at the reconciler layer, so it must not look like a source change
+// and trigger a rebuild. The strip is deliberately narrow: the same key
+// elsewhere in the document is not runtime-only service configuration and still
+// participates in the fingerprint.
 func stripServiceRuntimeKeys(services *yaml.Node) {
 	if services == nil || services.Kind != yaml.SequenceNode {
 		return
@@ -302,7 +302,7 @@ func stripServiceRuntimeKeys(services *yaml.Node) {
 		kept := make([]*yaml.Node, 0, len(service.Content))
 		for i := 0; i+1 < len(service.Content); i += 2 {
 			switch service.Content[i].Value {
-			case "tmpfs", "healthcheck":
+			case "ephemeral", "healthcheck":
 				continue
 			}
 			kept = append(kept, service.Content[i], service.Content[i+1])

@@ -311,8 +311,16 @@ const (
 	userName = "app"
 	// userSetup runs as root at build time. /relay holds the bootstrap, which the
 	// user only needs to read. chown uses the numeric id so it is independent of
-	// the user/group name.
-	userSetup = "addgroup -g 10001 app && adduser -D -u 10001 -G app -h /home/app -s /sbin/nologin app && chown -R 10001:10001 /app /relay"
+	// the user/group name. The writable roots Relay may mount an anonymous volume
+	// over are pre-created with runtime-user ownership: Docker copies a mount
+	// target's mode and ownership into an empty volume, so a missing directory
+	// would leave a root-owned, non-writable volume.
+	userSetup = "addgroup -g 10001 app && adduser -D -u 10001 -G app -h /home/app -s /sbin/nologin app" +
+		" && chown -R 10001:10001 /app /relay" +
+		" && mkdir -p /tmp /run /var/cache" +
+		" && chmod 1777 /tmp" +
+		" && chown 10001:10001 /run /var/cache" +
+		" && chmod 0775 /run /var/cache"
 )
 
 // esmPackageJSON is a minimal package.json injected when the app has none,

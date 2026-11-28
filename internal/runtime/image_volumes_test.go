@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/moby/moby/api/types/mount"
+
 	"relay/internal/app"
 	"relay/internal/testutil"
 )
@@ -59,24 +61,34 @@ func TestExecutionContainerCreatesFromInspectedImageID(t *testing.T) {
 }
 
 func TestValidateImageDeclaredVolumes(t *testing.T) {
-	t.Run("exact configured tmpfs coverage is accepted", func(t *testing.T) {
+	t.Run("exact configured ephemeral coverage is accepted", func(t *testing.T) {
 		cli := newScriptedDockerClient(t, dockerRoute{
 			method: http.MethodGet,
 			path:   "/images/test-image/json",
 			body:   `{"Id":"sha256:with-volume","Config":{"Volumes":{"/run/cache":{}}}}`,
 		})
 		if got, err := validateImageDeclaredVolumes(context.Background(), cli, "test-image", "/run/cache"); err != nil || got != "sha256:with-volume" {
-			t.Fatalf("exact tmpfs coverage: id=%q err=%v, want immutable ID and no error", got, err)
+			t.Fatalf("exact ephemeral coverage: id=%q err=%v, want immutable ID and no error", got, err)
 		}
 	})
-	t.Run("ancestor tmpfs does not cover a declared volume", func(t *testing.T) {
+	t.Run("baseline /tmp mount covers a declared /tmp volume", func(t *testing.T) {
+		cli := newScriptedDockerClient(t, dockerRoute{
+			method: http.MethodGet,
+			path:   "/images/test-image/json",
+			body:   `{"Id":"sha256:with-tmp-volume","Config":{"Volumes":{"/tmp":{}}}}`,
+		})
+		if got, err := validateImageDeclaredVolumes(context.Background(), cli, "test-image", tmpVolumeTarget); err != nil || got != "sha256:with-tmp-volume" {
+			t.Fatalf("/tmp coverage: id=%q err=%v, want immutable ID and no error", got, err)
+		}
+	})
+	t.Run("ancestor ephemeral destination does not cover a declared volume", func(t *testing.T) {
 		cli := newScriptedDockerClient(t, dockerRoute{
 			method: http.MethodGet,
 			path:   "/images/test-image/json",
 			body:   `{"Id":"sha256:with-volume","Config":{"Volumes":{"/run/cache":{}}}}`,
 		})
 		if _, err := validateImageDeclaredVolumes(context.Background(), cli, "test-image", "/run"); err == nil || !strings.Contains(err.Error(), "/run/cache") {
-			t.Fatalf("ancestor-only tmpfs coverage error = %v, want uncovered destination", err)
+			t.Fatalf("ancestor-only ephemeral coverage error = %v, want uncovered destination", err)
 		}
 	})
 
@@ -144,7 +156,7 @@ func TestValidateImageDeclaredVolumes(t *testing.T) {
 	})
 }
 
-func TestStartServiceAcceptsExactlyCoveredDeclaredVolumeAndSerializesTmpfs(t *testing.T) {
+func TestStartServiceAcceptsExactlyCoveredDeclaredVolumeAndSerializesEphemeral(t *testing.T) {
 	const image = "registry.example/service:with-volume"
 	var createBody []byte
 	cli := newScriptedDockerClient(t,
@@ -156,6 +168,7 @@ func TestStartServiceAcceptsExactlyCoveredDeclaredVolumeAndSerializesTmpfs(t *te
 		imageSaveRoute(imageSaveBody(t, archiveLayer{
 			name: "blobs/sha256/layer0", gzip: true,
 			body: layerTar(t,
+				archiveEntry{name: "tmp", typ: tar.TypeDir},
 				archiveEntry{name: "run", typ: tar.TypeDir},
 				archiveEntry{name: "run/cache", typ: tar.TypeDir},
 			),
@@ -170,7 +183,7 @@ func TestStartServiceAcceptsExactlyCoveredDeclaredVolumeAndSerializesTmpfs(t *te
 	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "test-host"}
 	if _, err := m.StartService(context.Background(), ServiceSpec{
 		App: "fn", Name: "svc", SourceRef: image, Image: image, Port: 8080,
-		Tmpfs: []string{"/run/cache"},
+		Ephemeral: []string{"/run/cache"},
 	}, 0); err != nil {
 		t.Fatalf("StartService with exact declared-volume coverage: %v", err)
 	}
@@ -178,18 +191,24 @@ func TestStartServiceAcceptsExactlyCoveredDeclaredVolumeAndSerializesTmpfs(t *te
 		t.Fatal("no /containers/create request was captured")
 	}
 	req := decodeCreateRequest(t, createBody)
-	if got, want := req.HostConfig.Tmpfs["/run/cache"], serviceTmpfsOptions(); got != want {
-		t.Fatalf("serialized HostConfig.Tmpfs[/run/cache] = %q, want %q", got, want)
+	volume, ok := mountAt(req.HostConfig.Mounts, "/run/cache")
+	if !ok || volume.Type != mount.TypeVolume || volume.Source != "" ||
+		volume.ReadOnly || volume.VolumeOptions != nil {
+		t.Fatalf("serialized volume at /run/cache = %+v (present=%v), want an anonymous writable volume without options", volume, ok)
 	}
-	if req.Config.Labels[labelTmpfs] != "/run/cache" {
-		t.Fatalf("relay.tmpfs label = %q, want /run/cache", req.Config.Labels[labelTmpfs])
+	assertBaselineTmpVolume(t, req.HostConfig.Mounts)
+	if len(req.HostConfig.Tmpfs) != 0 {
+		t.Fatalf("serialized HostConfig.Tmpfs = %v, want none", req.HostConfig.Tmpfs)
+	}
+	if req.Config.Labels[labelEphemeral] != "/run/cache" {
+		t.Fatalf("relay.ephemeral label = %q, want /run/cache", req.Config.Labels[labelEphemeral])
 	}
 	if !req.HostConfig.ReadonlyRootfs {
 		t.Fatal("serialized service HostConfig must retain ReadonlyRootfs")
 	}
 }
 
-func TestStartServiceRejectsInvalidDirectTmpfsSpecBeforeCreate(t *testing.T) {
+func TestStartServiceRejectsInvalidDirectEphemeralSpecBeforeCreate(t *testing.T) {
 	creates := 0
 	const image = "registry.example/service:direct-spec"
 	cli := newScriptedDockerClient(t,
@@ -203,10 +222,10 @@ func TestStartServiceRejectsInvalidDirectTmpfsSpecBeforeCreate(t *testing.T) {
 	_, err := m.StartService(context.Background(), ServiceSpec{
 		App: "fn", Name: "svc", SourceRef: image, Image: image, Port: 8080,
 		// Bypass template parsing deliberately: runtime create must enforce policy.
-		Tmpfs: []string{"/etc"},
+		Ephemeral: []string{"/etc"},
 	}, 0)
 	if err == nil || !strings.Contains(err.Error(), "not allowed") {
-		t.Fatalf("StartService error = %v, want direct-spec tmpfs rejection", err)
+		t.Fatalf("StartService error = %v, want direct-spec ephemeral rejection", err)
 	}
 	if creates != 0 {
 		t.Fatalf("Docker ContainerCreate calls = %d, want none", creates)
@@ -261,6 +280,97 @@ func TestWorkloadCreateRejectsImageDeclaredVolumesBeforeCreate(t *testing.T) {
 			}
 			if creates != 0 {
 				t.Fatalf("Docker ContainerCreate was issued %d time(s), want none", creates)
+			}
+		})
+	}
+}
+
+// TestWorkloadDeclaredTmpVolumeIsCoveredByBaselineMount pins the documented
+// exception: an image-declared VOLUME at /tmp is accepted on both workload
+// paths because Relay's baseline anonymous volume mounts that exact target,
+// while any other declared destination still fails before create and is
+// reported without the /tmp exemption.
+func TestWorkloadDeclaredTmpVolumeIsCoveredByBaselineMount(t *testing.T) {
+	const tmpOnly = `{"Id":"sha256:tmp-only","Config":{"Volumes":{"/tmp":{}}}}`
+	const mixed = `{"Id":"sha256:mixed","Config":{"Volumes":{"/tmp":{},"/data":{}}}}`
+	for _, tc := range []struct {
+		name    string
+		image   string
+		inspect string
+		start   func(*testing.T, *Manager) error
+		wantErr string // "" means the create must be attempted and fail there
+	}{
+		{
+			name:    "execution accepts declared /tmp",
+			image:   "relay-app-fn:tmp-volume",
+			inspect: tmpOnly,
+			start: func(t *testing.T, m *Manager) error {
+				_, err := startExecutionContainer(context.Background(),
+					containerOps{controlNetwork: unitControlNetwork}, m.cli, m.log,
+					"fn", "relay-app-fn:tmp-volume", nil, nil,
+					app.ResourceLimits{}, RunMeta{}, "", "")
+				return err
+			},
+		},
+		{
+			name:    "service accepts declared /tmp without ephemeral",
+			image:   "registry.example/service:tmp-volume",
+			inspect: tmpOnly,
+			start: func(t *testing.T, m *Manager) error {
+				_, err := m.StartService(context.Background(), ServiceSpec{
+					App: "fn", Name: "svc",
+					SourceRef: "registry.example/service:tmp-volume",
+					Image:     "registry.example/service:tmp-volume", Port: 8080,
+				}, 0)
+				return err
+			},
+		},
+		{
+			name:    "service still rejects an uncovered declared volume",
+			image:   "registry.example/service:mixed-volume",
+			inspect: mixed,
+			start: func(t *testing.T, m *Manager) error {
+				_, err := m.StartService(context.Background(), ServiceSpec{
+					App: "fn", Name: "svc",
+					SourceRef: "registry.example/service:mixed-volume",
+					Image:     "registry.example/service:mixed-volume", Port: 8080,
+				}, 0)
+				return err
+			},
+			wantErr: `declares writable volumes [/data]`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			creates := 0
+			cli := newScriptedDockerClient(t,
+				dockerRoute{
+					method: http.MethodGet, path: "/images/" + tc.image + "/json",
+					body: tc.inspect,
+				},
+				dockerRoute{
+					method: http.MethodPost, path: "/containers/create",
+					status:  http.StatusInternalServerError,
+					body:    `{"message":"scripted create failure"}`,
+					onMatch: func() { creates++ },
+				},
+			)
+			m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "test-host"}
+			err := tc.start(t, m)
+			if tc.wantErr == "" {
+				if err == nil || !strings.Contains(err.Error(), "scripted create failure") {
+					t.Fatalf("start error = %v, want the declared /tmp volume to pass "+
+						"validation and reach ContainerCreate", err)
+				}
+				if creates != 1 {
+					t.Fatalf("Docker ContainerCreate calls = %d, want 1", creates)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("start error = %v, want it to contain %q", err, tc.wantErr)
+			}
+			if creates != 0 {
+				t.Fatalf("Docker ContainerCreate calls = %d, want none", creates)
 			}
 		})
 	}

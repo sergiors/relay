@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"relay/internal/app"
 	"relay/internal/testutil"
 )
 
@@ -123,7 +124,7 @@ func imageSaveRoute(body string) dockerRoute {
 	}
 }
 
-func TestValidateImageTmpfsTargetsRejectsSymlinkRedirection(t *testing.T) {
+func TestValidateImageEphemeralTargetsRejectsSymlinkRedirection(t *testing.T) {
 	tests := []struct {
 		name   string
 		layers []archiveLayer
@@ -229,7 +230,7 @@ func TestValidateImageTmpfsTargetsRejectsSymlinkRedirection(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cli := newScriptedDockerClient(t, imageSaveRoute(
 				imageSaveBody(t, tc.layers...)))
-			err := validateImageTmpfsTargets(
+			err := validateImageEphemeralTargets(
 				context.Background(), cli, "sha256:test-image",
 				[]string{tc.target})
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
@@ -239,7 +240,7 @@ func TestValidateImageTmpfsTargetsRejectsSymlinkRedirection(t *testing.T) {
 	}
 }
 
-func TestValidateImageTmpfsTargetsAllowsSafeLayouts(t *testing.T) {
+func TestValidateImageEphemeralTargetsAllowsSafeLayouts(t *testing.T) {
 	targetExists := []archiveLayer{{
 		name: "blobs/sha256/layer0", gzip: true,
 		body: layerTar(t,
@@ -271,6 +272,7 @@ func TestValidateImageTmpfsTargetsAllowsSafeLayouts(t *testing.T) {
 			body: layerTar(t,
 				archiveEntry{name: ".wh.run", typ: tar.TypeReg},
 				archiveEntry{name: "run", typ: tar.TypeDir},
+				archiveEntry{name: "run/cache", typ: tar.TypeDir},
 			),
 		},
 	}
@@ -278,6 +280,7 @@ func TestValidateImageTmpfsTargetsAllowsSafeLayouts(t *testing.T) {
 		name: "abc/layer.tar",
 		body: layerTar(t,
 			archiveEntry{name: "run", typ: tar.TypeDir},
+			archiveEntry{name: "run/cache", typ: tar.TypeDir},
 		),
 	}}
 	for _, tc := range []struct {
@@ -286,19 +289,26 @@ func TestValidateImageTmpfsTargetsAllowsSafeLayouts(t *testing.T) {
 		target string
 	}{
 		{"existing target", targetExists, "/var/cache/nginx"},
-		{"missing target", targetMissing, "/var/cache/nginx"},
 		{"symlink replaced by directory", symlinkReplacedByDirectory, "/run/cache"},
 		{"legacy uncompressed layer", legacyUncompressed, "/run/cache"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cli := newScriptedDockerClient(t, imageSaveRoute(
 				imageSaveBody(t, tc.layers...)))
-			if err := validateImageTmpfsTargets(
+			if err := validateImageEphemeralTargets(
 				context.Background(), cli, "sha256:safe", []string{tc.target},
 			); err != nil {
 				t.Fatalf("safe image rejected: %v", err)
 			}
 		})
+	}
+
+	cli := newScriptedDockerClient(t, imageSaveRoute(
+		imageSaveBody(t, targetMissing...)))
+	err := validateImageEphemeralTargets(
+		context.Background(), cli, "sha256:safe", []string{"/var/cache/nginx"})
+	if err == nil || !strings.Contains(err.Error(), "must already exist as a directory") {
+		t.Fatalf("missing target error = %v, want a required-directory rejection", err)
 	}
 }
 
@@ -327,14 +337,108 @@ func TestReadImageFilesystemBoundsRelevantRecordsAcrossLayers(t *testing.T) {
 	}
 }
 
-func TestValidateImageTmpfsTargetsFailsClosed(t *testing.T) {
+func TestReadImageFilesystemBoundsRelevantRecordsWithinLayer(t *testing.T) {
+	entries := make([]archiveEntry, maxImageLayerRecords+1)
+	for i := range entries {
+		entries[i] = archiveEntry{name: "run", typ: tar.TypeDir}
+	}
+	archive := imageSaveBody(t, archiveLayer{
+		name: "blobs/sha256/layer0", body: layerTar(t, entries...),
+	})
+	_, err := readImageFilesystem(
+		context.Background(),
+		strings.NewReader(archive),
+		map[string]struct{}{"run": {}},
+	)
+	if err == nil || !strings.Contains(err.Error(), errImageLayerTooManyRecords.Error()) {
+		t.Fatalf("readImageFilesystem error = %v, want the per-layer record bound", err)
+	}
+}
+
+// TestReadImageFilesystemRejectsUnsafeEntryNames pins that untrusted archive
+// input fails closed wherever a `..` or absolute component appears: in an
+// outer entry, inside a layer tar (even for a path irrelevant to the
+// validation), and in the manifest's layer list. Parser and daemon semantics
+// must never disagree about which filesystem path an entry names.
+func TestReadImageFilesystemRejectsUnsafeEntryNames(t *testing.T) {
+	relevant := map[string]struct{}{"run": {}}
+
+	t.Run("outer archive entry", func(t *testing.T) {
+		var archive bytes.Buffer
+		tw := tar.NewWriter(&archive)
+		if err := tw.WriteHeader(&tar.Header{
+			Name: "../evil", Typeflag: tar.TypeReg, Mode: 0o644, Size: 0,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		_, err := readImageFilesystem(
+			context.Background(), bytes.NewReader(archive.Bytes()), relevant)
+		if err == nil || !strings.Contains(err.Error(), "unsafe path") {
+			t.Fatalf("error = %v, want an unsafe-entry rejection", err)
+		}
+	})
+
+	t.Run("entry inside a layer", func(t *testing.T) {
+		archive := imageSaveBody(t, archiveLayer{
+			name: "blobs/sha256/layer0",
+			body: layerTar(t,
+				archiveEntry{name: "run", typ: tar.TypeDir},
+				archiveEntry{name: "usr/../../evil", typ: tar.TypeReg},
+			),
+		})
+		_, err := readImageFilesystem(
+			context.Background(), strings.NewReader(archive), relevant)
+		if err == nil || !strings.Contains(err.Error(), "unsafe path") {
+			t.Fatalf("error = %v, want an unsafe-entry rejection", err)
+		}
+	})
+
+	t.Run("layer listed by the manifest", func(t *testing.T) {
+		var archive bytes.Buffer
+		tw := tar.NewWriter(&archive)
+		body := layerTar(t, archiveEntry{name: "run", typ: tar.TypeDir})
+		if err := tw.WriteHeader(&tar.Header{
+			Name: "blobs/sha256/layer0", Typeflag: tar.TypeReg,
+			Mode: 0o644, Size: int64(len(body)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(body); err != nil {
+			t.Fatal(err)
+		}
+		manifest := []byte(
+			`[{"Config":"blobs/sha256/config","Layers":["../layer0"]}]`)
+		if err := tw.WriteHeader(&tar.Header{
+			Name: "manifest.json", Typeflag: tar.TypeReg,
+			Mode: 0o644, Size: int64(len(manifest)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(manifest); err != nil {
+			t.Fatal(err)
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		_, err := readImageFilesystem(
+			context.Background(), bytes.NewReader(archive.Bytes()), relevant)
+		if err == nil || !strings.Contains(err.Error(), "unsafe path") {
+			t.Fatalf("error = %v, want an unsafe manifest-layer rejection", err)
+		}
+	})
+}
+
+func TestValidateImageEphemeralTargetsFailsClosed(t *testing.T) {
 	t.Run("image save failure", func(t *testing.T) {
 		cli := newScriptedDockerClient(t, dockerRoute{
 			method: http.MethodGet, path: "/images/get",
 			status: http.StatusInternalServerError,
 			body:   `{"message":"daemon unavailable"}`,
 		})
-		err := validateImageTmpfsTargets(
+		err := validateImageEphemeralTargets(
 			context.Background(), cli, "sha256:test", []string{"/run/cache"})
 		if err == nil || !strings.Contains(err.Error(), "inspect image filesystem") {
 			t.Fatalf("error = %v, want a filesystem-inspection failure", err)
@@ -358,7 +462,7 @@ func TestValidateImageTmpfsTargetsFailsClosed(t *testing.T) {
 		}
 		cli := newScriptedDockerClient(t,
 			imageSaveRoute(archive.String()))
-		err := validateImageTmpfsTargets(
+		err := validateImageEphemeralTargets(
 			context.Background(), cli, "sha256:test", []string{"/run/cache"})
 		if err == nil || !strings.Contains(err.Error(), "manifest") {
 			t.Fatalf("error = %v, want a missing-manifest failure", err)
@@ -366,7 +470,7 @@ func TestValidateImageTmpfsTargetsFailsClosed(t *testing.T) {
 	})
 	t.Run("missing immutable ID", func(t *testing.T) {
 		cli := newScriptedDockerClient(t)
-		err := validateImageTmpfsTargets(
+		err := validateImageEphemeralTargets(
 			context.Background(), cli, "", []string{"/run/cache"})
 		if err == nil || !strings.Contains(err.Error(), "immutable image ID") {
 			t.Fatalf("error = %v, want a missing-image-ID failure", err)
@@ -374,7 +478,7 @@ func TestValidateImageTmpfsTargetsFailsClosed(t *testing.T) {
 	})
 }
 
-func TestStartServiceRejectsSymlinkedTmpfsTargetBeforeCreate(t *testing.T) {
+func TestStartServiceRejectsSymlinkedEphemeralTargetBeforeCreate(t *testing.T) {
 	const image = "registry.example/service:symlink"
 	creates := 0
 	cli := newScriptedDockerClient(t,
@@ -385,6 +489,7 @@ func TestStartServiceRejectsSymlinkedTmpfsTargetBeforeCreate(t *testing.T) {
 		imageSaveRoute(imageSaveBody(t, archiveLayer{
 			name: "blobs/sha256/layer0", gzip: true,
 			body: layerTar(t,
+				archiveEntry{name: "tmp", typ: tar.TypeDir},
 				archiveEntry{name: "var", typ: tar.TypeDir},
 				archiveEntry{
 					name: "var/cache", typ: tar.TypeSymlink,
@@ -403,26 +508,32 @@ func TestStartServiceRejectsSymlinkedTmpfsTargetBeforeCreate(t *testing.T) {
 	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "test-host"}
 	_, err := m.StartService(context.Background(), ServiceSpec{
 		App: "fn", Name: "svc", SourceRef: image, Image: image, Port: 8080,
-		Tmpfs: []string{"/var/cache/nginx"},
+		Ephemeral: []string{"/var/cache/nginx"},
 	}, 0)
-	if err == nil || !strings.Contains(err.Error(), "symlink") {
-		t.Fatalf("StartService error = %v, want a symlink rejection", err)
+	if err == nil || !strings.Contains(err.Error(),
+		`redirected through symlink "/var/cache"`) {
+		t.Fatalf("StartService error = %v, want the /var/cache symlink rejection", err)
 	}
 	if creates != 0 {
 		t.Fatalf("Docker ContainerCreate calls = %d, want none", creates)
 	}
 }
 
-func TestStartServiceSkipsImageFilesystemWithoutTmpfs(t *testing.T) {
-	const image = "registry.example/service:no-tmpfs"
+// TestStartServiceValidatesBaselineTmpWithoutConfiguredEphemeral proves the
+// baseline /tmp volume is image-filesystem-validated on EVERY service create:
+// even a service with no configured ephemeral destinations streams its image
+// archive once, and the create is reached only after that validation passes.
+func TestStartServiceValidatesBaselineTmpWithoutConfiguredEphemeral(t *testing.T) {
+	const image = "registry.example/service:no-ephemeral"
 	saves := 0
 	cli := newScriptedDockerClient(t,
 		dockerRoute{
 			method: http.MethodGet, path: "/images/" + image + "/json",
-			body: `{"Id":"sha256:no-tmpfs","Config":{}}`,
+			body: `{"Id":"sha256:no-ephemeral","Config":{}}`,
 		},
 		dockerRoute{
 			method: http.MethodGet, path: "/images/get",
+			body:    safeWritableTargetsArchive(t),
 			onMatch: func() { saves++ },
 		},
 		dockerRoute{
@@ -432,21 +543,239 @@ func TestStartServiceSkipsImageFilesystemWithoutTmpfs(t *testing.T) {
 		},
 	)
 	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "test-host"}
-	_, _ = m.StartService(context.Background(), ServiceSpec{
+	_, err := m.StartService(context.Background(), ServiceSpec{
 		App: "fn", Name: "svc", SourceRef: image, Image: image, Port: 8080,
 	}, 0)
-	if saves != 0 {
-		t.Fatalf("ImageSave calls = %d, want none without configured tmpfs", saves)
+	if err == nil || !strings.Contains(err.Error(), "scripted create failure") {
+		t.Fatalf("StartService error = %v, want the create to be reached "+
+			"after baseline /tmp validation", err)
+	}
+	if saves != 1 {
+		t.Fatalf("ImageSave calls = %d, want 1 (baseline /tmp is always validated)",
+			saves)
 	}
 }
 
-// safeTmpfsTargetArchive is an image archive whose /run and /var/cache trees
-// are ordinary directories, so validating either as a tmpfs target succeeds.
-func safeTmpfsTargetArchive(t *testing.T) string {
+// TestStartServiceRejectsSymlinkedOrMissingTmpBeforeCreate pins the baseline
+// /tmp volume against the same image-filesystem proof as configured ephemeral
+// targets, on a service that declares NO ephemeral destinations: a rootfs
+// symlink at /tmp would let Docker mount the anonymous volume over /etc despite
+// ReadonlyRootfs, and a missing /tmp would leave a root-owned volume the
+// non-root image user cannot write. Both fail closed before ContainerCreate.
+func TestStartServiceRejectsSymlinkedOrMissingTmpBeforeCreate(t *testing.T) {
+	const image = "registry.example/service:hostile-tmp"
+	for _, tc := range []struct {
+		name        string
+		archiveBody string
+		want        string
+	}{
+		{
+			name: "symlinked /tmp",
+			archiveBody: imageSaveBody(t, archiveLayer{
+				name: "blobs/sha256/layer0", gzip: true,
+				body: layerTar(t,
+					archiveEntry{name: "etc", typ: tar.TypeDir},
+					archiveEntry{
+						name: "tmp", typ: tar.TypeSymlink, linkname: "/etc",
+					},
+				),
+			}),
+			want: `redirected through symlink "/tmp"`,
+		},
+		{
+			name: "file at /tmp",
+			archiveBody: imageSaveBody(t, archiveLayer{
+				name: "blobs/sha256/layer0", gzip: true,
+				body: layerTar(t, archiveEntry{name: "tmp", typ: tar.TypeReg}),
+			}),
+			want: `writable destination "/tmp" has non-directory component "/tmp"`,
+		},
+		{
+			name: "missing /tmp",
+			archiveBody: imageSaveBody(t, archiveLayer{
+				name: "blobs/sha256/layer0", gzip: true,
+				body: layerTar(t, archiveEntry{name: "run", typ: tar.TypeDir}),
+			}),
+			want: `writable destination "/tmp" must already exist as a directory`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			creates := 0
+			cli := newScriptedDockerClient(t,
+				dockerRoute{
+					method: http.MethodGet, path: "/images/" + image + "/json",
+					body: `{"Id":"sha256:hostile-tmp","Config":{}}`,
+				},
+				imageSaveRoute(tc.archiveBody),
+				dockerRoute{
+					method: http.MethodPost, path: "/containers/create",
+					body:    `{"Id":"unexpected"}`,
+					onMatch: func() { creates++ },
+				},
+			)
+			m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "test-host"}
+			_, err := m.StartService(context.Background(), ServiceSpec{
+				App: "fn", Name: "svc", SourceRef: image, Image: image, Port: 8080,
+			}, 0)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("StartService error = %v, want it to contain %q",
+					err, tc.want)
+			}
+			if creates != 0 {
+				t.Fatalf("Docker ContainerCreate calls = %d, want none", creates)
+			}
+		})
+	}
+}
+
+// TestExecutionCreateRejectsSymlinkedOrMissingTmpBeforeCreate pins the same
+// baseline /tmp proof on the execution create path, through the production
+// Manager entry: execution containers never configure additional ephemeral
+// destinations, but their always-present /tmp volume is validated against the
+// immutable image before any container is created. A final subtest proves a
+// normal image still passes validation and reaches ContainerCreate.
+func TestExecutionCreateRejectsSymlinkedOrMissingTmpBeforeCreate(t *testing.T) {
+	const image = "executor:hostile-tmp"
+	newSUT := func(t *testing.T, routes ...dockerRoute) (*Manager, *int) {
+		t.Helper()
+		creates := 0
+		control := controlNetworkName("unit-node")
+		routes = append(routes,
+			networkInspectRoute("/networks/"+control,
+				defaultControlNetFixture(control, "unit-node", "172.30.0.0/16").json(t)),
+			dockerRoute{
+				method: http.MethodPost, path: "/containers/create",
+				body:    `{"Id":"unexpected"}`,
+				onMatch: func() { creates++ },
+			},
+		)
+		m := &Manager{
+			cli:            newScriptedDockerClient(t, routes...),
+			log:            testutil.DiscardLogger(),
+			nodeID:         "unit-node",
+			controlNetwork: control,
+		}
+		return m, &creates
+	}
+	start := func(m *Manager) error {
+		_, err := m.createExecutionContainer(context.Background(),
+			containerOps{controlNetwork: controlNetworkName("unit-node")},
+			m.cli, m.log, "fn", image, nil, nil,
+			app.ResourceLimits{}, RunMeta{}, "", "")
+		return err
+	}
+
+	t.Run("symlinked /tmp", func(t *testing.T) {
+		m, creates := newSUT(t,
+			dockerRoute{
+				method: http.MethodGet, path: "/images/" + image + "/json",
+				body: `{"Id":"sha256:hostile-tmp","Config":{}}`,
+			},
+			imageSaveRoute(imageSaveBody(t, archiveLayer{
+				name: "blobs/sha256/layer0", gzip: true,
+				body: layerTar(t,
+					archiveEntry{name: "etc", typ: tar.TypeDir},
+					archiveEntry{
+						name: "tmp", typ: tar.TypeSymlink, linkname: "/etc",
+					},
+				),
+			})),
+		)
+		err := start(m)
+		if err == nil || !strings.Contains(err.Error(),
+			`redirected through symlink "/tmp"`) {
+			t.Fatalf("createExecutionContainer error = %v, want the /tmp symlink rejection", err)
+		}
+		if *creates != 0 {
+			t.Fatalf("Docker ContainerCreate calls = %d, want none", *creates)
+		}
+	})
+
+	t.Run("file at /tmp", func(t *testing.T) {
+		m, creates := newSUT(t,
+			dockerRoute{
+				method: http.MethodGet, path: "/images/" + image + "/json",
+				body: `{"Id":"sha256:hostile-tmp","Config":{}}`,
+			},
+			imageSaveRoute(imageSaveBody(t, archiveLayer{
+				name: "blobs/sha256/layer0", gzip: true,
+				body: layerTar(t, archiveEntry{name: "tmp", typ: tar.TypeReg}),
+			})),
+		)
+		err := start(m)
+		if err == nil || !strings.Contains(err.Error(),
+			`writable destination "/tmp" has non-directory component "/tmp"`) {
+			t.Fatalf("createExecutionContainer error = %v, want the non-directory-/tmp rejection", err)
+		}
+		if *creates != 0 {
+			t.Fatalf("Docker ContainerCreate calls = %d, want none", *creates)
+		}
+	})
+
+	t.Run("missing /tmp", func(t *testing.T) {
+		m, creates := newSUT(t,
+			dockerRoute{
+				method: http.MethodGet, path: "/images/" + image + "/json",
+				body: `{"Id":"sha256:hostile-tmp","Config":{}}`,
+			},
+			imageSaveRoute(imageSaveBody(t, archiveLayer{
+				name: "blobs/sha256/layer0", gzip: true,
+				body: layerTar(t, archiveEntry{name: "run", typ: tar.TypeDir}),
+			})),
+		)
+		err := start(m)
+		if err == nil || !strings.Contains(err.Error(),
+			`writable destination "/tmp" must already exist as a directory`) {
+			t.Fatalf("createExecutionContainer error = %v, want the missing-/tmp rejection", err)
+		}
+		if *creates != 0 {
+			t.Fatalf("Docker ContainerCreate calls = %d, want none", *creates)
+		}
+	})
+
+	t.Run("image with a real /tmp reaches create", func(t *testing.T) {
+		control := controlNetworkName("unit-node")
+		creates := 0
+		m := &Manager{
+			cli: newScriptedDockerClient(t,
+				// The default ImageSave answer validates; both the ref inspect
+				// and the pinned-ID re-inspect before create must be modeled.
+				imageWithoutDeclaredVolumesRoute(image),
+				imageWithoutDeclaredVolumesRoute("sha256:clean"),
+				networkInspectRoute("/networks/"+control,
+					defaultControlNetFixture(control, "unit-node", "172.30.0.0/16").json(t)),
+				dockerRoute{
+					method: http.MethodPost, path: "/containers/create",
+					status:  http.StatusInternalServerError,
+					body:    `{"message":"scripted create failure"}`,
+					onMatch: func() { creates++ },
+				},
+			),
+			log:            testutil.DiscardLogger(),
+			nodeID:         "unit-node",
+			controlNetwork: control,
+		}
+		err := start(m)
+		if err == nil || !strings.Contains(err.Error(), "scripted create failure") {
+			t.Fatalf("createExecutionContainer error = %v, want the create to be "+
+				"reached after baseline /tmp validation", err)
+		}
+		if creates != 1 {
+			t.Fatalf("Docker ContainerCreate calls = %d, want 1", creates)
+		}
+	})
+}
+
+// safeWritableTargetsArchive is an image archive whose /tmp, /run, and
+// /var/cache trees are ordinary directories, so validating any path Relay
+// mounts an anonymous volume over against it succeeds. It doubles as the
+// scripted daemon's default ImageSave answer (see newScriptedDockerClient).
+func safeWritableTargetsArchive(t *testing.T) string {
 	t.Helper()
 	return imageSaveBody(t, archiveLayer{
 		name: "blobs/sha256/layer0", gzip: true,
 		body: layerTar(t,
+			archiveEntry{name: "tmp", typ: tar.TypeDir},
 			archiveEntry{name: "run", typ: tar.TypeDir},
 			archiveEntry{name: "run/cache", typ: tar.TypeDir},
 			archiveEntry{name: "var", typ: tar.TypeDir},
@@ -456,17 +785,17 @@ func safeTmpfsTargetArchive(t *testing.T) string {
 	})
 }
 
-func TestImageTmpfsValidationCacheKeysByImageAndTargetSet(t *testing.T) {
-	var cache imageTmpfsValidationCache
+func TestImageEphemeralValidationCacheKeysByImageAndTargetSet(t *testing.T) {
+	var cache imageEphemeralValidationCache
 	var calls atomic.Int32
 	fn := func(context.Context) error {
 		calls.Add(1)
 		return nil
 	}
-	key := func(imageID string, destinations ...string) tmpfsImageValidationKey {
-		return tmpfsImageValidationKey{
+	key := func(imageID string, destinations ...string) ephemeralImageValidationKey {
+		return ephemeralImageValidationKey{
 			imageID: imageID,
-			targets: tmpfsTargetsKey(destinations),
+			targets: ephemeralTargetsKey(destinations),
 		}
 	}
 	// A successful validation is reused for the same image and target set.
@@ -516,11 +845,11 @@ func TestImageTmpfsValidationCacheKeysByImageAndTargetSet(t *testing.T) {
 	}
 }
 
-func TestImageTmpfsValidationCacheCoalescesConcurrentCallers(t *testing.T) {
-	var cache imageTmpfsValidationCache
-	key := tmpfsImageValidationKey{
+func TestImageEphemeralValidationCacheCoalescesConcurrentCallers(t *testing.T) {
+	var cache imageEphemeralValidationCache
+	key := ephemeralImageValidationKey{
 		imageID: "sha256:same",
-		targets: tmpfsTargetsKey([]string{"/run/cache"}),
+		targets: ephemeralTargetsKey([]string{"/run/cache"}),
 	}
 	var calls atomic.Int32
 	started := make(chan struct{})
@@ -557,11 +886,11 @@ func TestImageTmpfsValidationCacheCoalescesConcurrentCallers(t *testing.T) {
 	}
 }
 
-func TestImageTmpfsValidationCacheDoesNotRetainFailure(t *testing.T) {
-	var cache imageTmpfsValidationCache
-	key := tmpfsImageValidationKey{
+func TestImageEphemeralValidationCacheDoesNotRetainFailure(t *testing.T) {
+	var cache imageEphemeralValidationCache
+	key := ephemeralImageValidationKey{
 		imageID: "sha256:flaky",
-		targets: tmpfsTargetsKey([]string{"/run/cache"}),
+		targets: ephemeralTargetsKey([]string{"/run/cache"}),
 	}
 	transient := errors.New("transient image save failure")
 	var calls atomic.Int32
@@ -584,27 +913,27 @@ func TestImageTmpfsValidationCacheDoesNotRetainFailure(t *testing.T) {
 	}
 }
 
-func TestValidateImageTmpfsTargetsCachedFailsClosedWithoutImageID(t *testing.T) {
+func TestValidateImageEphemeralTargetsCachedFailsClosedWithoutImageID(t *testing.T) {
 	m := &Manager{log: testutil.DiscardLogger()}
-	err := m.validateImageTmpfsTargetsCached(
+	err := m.validateImageEphemeralTargetsCached(
 		context.Background(), "", []string{"/run/cache"})
 	if err == nil || !strings.Contains(err.Error(), "immutable image ID") {
 		t.Fatalf("error = %v, want a missing-image-ID failure", err)
 	}
 }
 
-// TestStartServiceReusesImageTmpfsValidationAcrossReplicas proves the
+// TestStartServiceReusesImageEphemeralValidationAcrossReplicas proves the
 // Manager-scoped reuse against the real create path: replicas of one image and
 // one target set stream the image archive once, while a different target set
 // is validated separately.
-func TestStartServiceReusesImageTmpfsValidationAcrossReplicas(t *testing.T) {
+func TestStartServiceReusesImageEphemeralValidationAcrossReplicas(t *testing.T) {
 	const image = "registry.example/service:cached"
 	saves := 0
 	cli := newScriptedDockerClient(t,
 		imageWithoutDeclaredVolumesRoute(image),
 		dockerRoute{
 			method: http.MethodGet, path: "/images/get",
-			body:    safeTmpfsTargetArchive(t),
+			body:    safeWritableTargetsArchive(t),
 			onMatch: func() { saves++ },
 		},
 		dockerRoute{
@@ -621,7 +950,7 @@ func TestStartServiceReusesImageTmpfsValidationAcrossReplicas(t *testing.T) {
 	for replica := 0; replica < 2; replica++ {
 		if _, err := m.StartService(context.Background(), ServiceSpec{
 			App: "fn", Name: "svc", SourceRef: image, Image: image, Port: 8080,
-			Tmpfs: []string{"/run/cache"},
+			Ephemeral: []string{"/run/cache"},
 		}, replica); err != nil {
 			t.Fatalf("replica %d: %v", replica, err)
 		}
@@ -631,7 +960,7 @@ func TestStartServiceReusesImageTmpfsValidationAcrossReplicas(t *testing.T) {
 	}
 	if _, err := m.StartService(context.Background(), ServiceSpec{
 		App: "fn", Name: "svc", SourceRef: image, Image: image, Port: 8080,
-		Tmpfs: []string{"/var/cache/data"},
+		Ephemeral: []string{"/var/cache/data"},
 	}, 2); err != nil {
 		t.Fatalf("different target set: %v", err)
 	}
@@ -640,10 +969,10 @@ func TestStartServiceReusesImageTmpfsValidationAcrossReplicas(t *testing.T) {
 	}
 }
 
-// TestStartServiceImageTmpfsValidationDistinguishesImageIDs pins that moving
+// TestStartServiceImageEphemeralValidationDistinguishesImageIDs pins that moving
 // external content is validated again under its new immutable ID, never served
 // from the previous ID's success entry.
-func TestStartServiceImageTmpfsValidationDistinguishesImageIDs(t *testing.T) {
+func TestStartServiceImageEphemeralValidationDistinguishesImageIDs(t *testing.T) {
 	const image = "registry.example/service:moving"
 	saves := 0
 	cli := newScriptedDockerClient(t,
@@ -657,7 +986,7 @@ func TestStartServiceImageTmpfsValidationDistinguishesImageIDs(t *testing.T) {
 		},
 		dockerRoute{
 			method: http.MethodGet, path: "/images/get",
-			body:    safeTmpfsTargetArchive(t),
+			body:    safeWritableTargetsArchive(t),
 			onMatch: func() { saves++ },
 		},
 		dockerRoute{
@@ -674,7 +1003,7 @@ func TestStartServiceImageTmpfsValidationDistinguishesImageIDs(t *testing.T) {
 	for _, id := range []string{"sha256:one", "sha256:two"} {
 		if _, err := m.StartService(context.Background(), ServiceSpec{
 			App: "fn", Name: "svc", SourceRef: image, Image: image, ImageID: id,
-			Port: 8080, Tmpfs: []string{"/run/cache"},
+			Port: 8080, Ephemeral: []string{"/run/cache"},
 		}, 0); err != nil {
 			t.Fatalf("image %s: %v", id, err)
 		}
@@ -684,16 +1013,16 @@ func TestStartServiceImageTmpfsValidationDistinguishesImageIDs(t *testing.T) {
 	}
 }
 
-// TestStartServiceRetriesImageTmpfsValidationAfterFailure proves a failed
+// TestStartServiceRetriesImageEphemeralValidationAfterFailure proves a failed
 // archive inspection is not cached: the next create retries and succeeds.
-func TestStartServiceRetriesImageTmpfsValidationAfterFailure(t *testing.T) {
+func TestStartServiceRetriesImageEphemeralValidationAfterFailure(t *testing.T) {
 	const image = "registry.example/service:transient"
 	saves := 0
 	cli := newScriptedDockerClient(t,
 		imageWithoutDeclaredVolumesRoute(image),
 		dockerRoute{
 			method: http.MethodGet, path: "/images/get",
-			body: safeTmpfsTargetArchive(t),
+			body: safeWritableTargetsArchive(t),
 			serve: func(*http.Request) (int, string) {
 				saves++
 				if saves == 1 {
@@ -716,14 +1045,14 @@ func TestStartServiceRetriesImageTmpfsValidationAfterFailure(t *testing.T) {
 	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "test-host"}
 	if _, err := m.StartService(context.Background(), ServiceSpec{
 		App: "fn", Name: "svc", SourceRef: image, Image: image, Port: 8080,
-		Tmpfs: []string{"/run/cache"},
+		Ephemeral: []string{"/run/cache"},
 	}, 0); err == nil ||
 		!strings.Contains(err.Error(), "inspect image filesystem") {
 		t.Fatalf("first StartService error = %v, want an inspection failure", err)
 	}
 	if _, err := m.StartService(context.Background(), ServiceSpec{
 		App: "fn", Name: "svc", SourceRef: image, Image: image, Port: 8080,
-		Tmpfs: []string{"/run/cache"},
+		Ephemeral: []string{"/run/cache"},
 	}, 0); err != nil {
 		t.Fatalf("StartService after a validation failure: %v", err)
 	}

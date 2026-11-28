@@ -396,8 +396,9 @@ func assertHardenedHostConfig(t *testing.T, hc *container.HostConfig) {
 	if !hc.ReadonlyRootfs {
 		t.Error("expected read-only rootfs")
 	}
-	if hc.Tmpfs["/tmp"] != "rw,nosuid,noexec,size=64m" {
-		t.Errorf("tmpfs = %v, want /tmp rw,nosuid,noexec,size=64m", hc.Tmpfs)
+	assertBaselineTmpVolume(t, hc.Mounts)
+	if len(hc.Tmpfs) != 0 {
+		t.Errorf("HostConfig.Tmpfs = %v, want none", hc.Tmpfs)
 	}
 	// A service may add only NET_BIND_SERVICE for a privileged declared port.
 	// Docker's inspect normalizes the capability to its CAP_ form.
@@ -503,6 +504,47 @@ func fetchAppLogs(ctx context.Context, cli *client.Client, id string) (stdout, s
 		return outBuf.String(), errBuf.String(), err
 	}
 	return outBuf.String(), errBuf.String(), nil
+}
+
+// execInContainer runs cmd inside the running container as the image's own
+// configured user and returns the demultiplexed combined output plus the
+// exec's exit code. It is how integration tests observe in-container state the
+// daemon does not report: file contents inside a volume, or an HTTP response
+// served only on a container-local address.
+func execInContainer(
+	t *testing.T, ctx context.Context,
+	cli *client.Client, id string, cmd ...string,
+) (string, int) {
+	t.Helper()
+	created, err := cli.ExecCreate(ctx, id, client.ExecCreateOptions{
+		AttachStdout: true, AttachStderr: true, Cmd: cmd,
+	})
+	if err != nil {
+		t.Fatalf("exec create on %s: %v", id, err)
+	}
+	attached, err := cli.ExecAttach(ctx, created.ID, client.ExecAttachOptions{})
+	if err != nil {
+		t.Fatalf("exec attach on %s: %v", id, err)
+	}
+	var stdout, stderr bytes.Buffer
+	_, copyErr := stdcopy.StdCopy(&stdout, &stderr, attached.Reader)
+	attached.Close()
+	if copyErr != nil {
+		t.Fatalf("read exec output on %s: %v", id, copyErr)
+	}
+	var exitCode int
+	if !pollUntil(ctx, 15*time.Second, func() bool {
+		inspected, inspectErr := cli.ExecInspect(
+			ctx, created.ID, client.ExecInspectOptions{})
+		if inspectErr != nil || inspected.Running {
+			return false
+		}
+		exitCode = inspected.ExitCode
+		return true
+	}) {
+		t.Fatalf("exec %v on %s did not finish", cmd, id)
+	}
+	return stdout.String() + stderr.String(), exitCode
 }
 
 // awaitAppLogsFor polls the app's native logs until every wanted substring

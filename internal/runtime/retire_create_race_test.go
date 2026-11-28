@@ -72,6 +72,9 @@ func TestExecuteContainerCreateVsRetire(t *testing.T) {
 				return http.StatusOK, `{"Id":"sha256:relay-app-a","Config":{}}`
 			},
 		},
+		// The create path pins the immutable ID after that inspect, so the
+		// pinned-ID re-inspect before ContainerCreate is modeled separately.
+		imageWithoutDeclaredVolumesRoute("sha256:relay-app-a"),
 		dockerRoute{method: http.MethodDelete, path: "/images/", body: "[]", onMatch: func() { dels++ }},
 	)
 	m.nodeID = "test-host"

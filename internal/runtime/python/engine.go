@@ -231,9 +231,17 @@ const (
 const (
 	userID   = "10001:10001"
 	userName = "app"
-	// Create the non-root runtime user and make application files readable
-	// under the same ownership used by the container process.
-	userSetup = "groupadd -g 10001 app && useradd -u 10001 -g 10001 -m -d /home/app -s /usr/sbin/nologin app && chown -R 10001:10001 /app /relay"
+	// Create the non-root runtime user, make application files readable under
+	// the same ownership, and pre-create the writable roots Relay may mount an
+	// anonymous volume over. Docker copies a mount target's ownership and mode
+	// into an empty volume, so these directories must exist and be writable by
+	// the runtime user before the container starts.
+	userSetup = "groupadd -g 10001 app && useradd -u 10001 -g 10001 -m -d /home/app -s /usr/sbin/nologin app" +
+		" && chown -R 10001:10001 /app /relay" +
+		" && mkdir -p /tmp /run /var/cache" +
+		" && chmod 1777 /tmp" +
+		" && chown 10001:10001 /run /var/cache" +
+		" && chmod 0775 /run /var/cache"
 	// Disable Python bytecode writes because /app runs on a read-only rootfs.
 	noBytecodeEnv = "PYTHONDONTWRITEBYTECODE=1"
 )

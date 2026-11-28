@@ -1204,7 +1204,7 @@ func (r *Reconciler) reconcileApp(name string) {
 // serviceDesiredConfigurationChanged reports whether the parsed template's
 // service-runtime configuration differs from the currently published generation.
 // Such changes are NOT part of the image fingerprint (top-level resources and
-// per-service tmpfs/healthcheck are deliberately stripped), so they reach the
+// per-service ephemeral/healthcheck are deliberately stripped), so they reach the
 // unchanged-app skip path. They are desired coordinator state and must supersede
 // a pending request instead of being coalesced as an observation.
 func serviceDesiredConfigurationChanged(previous, next *app.Template) bool {
@@ -1236,11 +1236,11 @@ func serviceConfigurationEqual(a, b app.Service) bool {
 		a.Replicas != b.Replicas {
 		return false
 	}
-	if len(a.Tmpfs) != len(b.Tmpfs) {
+	if len(a.Ephemeral) != len(b.Ephemeral) {
 		return false
 	}
-	for i := range a.Tmpfs {
-		if a.Tmpfs[i] != b.Tmpfs[i] {
+	for i := range a.Ephemeral {
+		if a.Ephemeral[i] != b.Ephemeral[i] {
 			return false
 		}
 	}

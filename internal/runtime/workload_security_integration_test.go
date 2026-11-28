@@ -119,22 +119,23 @@ CMD []
 	}
 }
 
-// TestIntegrationDeclaredVolumeCoveredByServiceTmpfs proves on a real Engine
-// that an exactly configured tmpfs masks an image-declared VOLUME without
-// creating an anonymous Docker volume. The non-root image writes beneath that
-// tmpfs while its separately owned rootfs directory remains unwritable under
-// ReadonlyRootfs.
-func TestIntegrationDeclaredVolumeCoveredByServiceTmpfs(t *testing.T) {
+// TestIntegrationDeclaredVolumeCoveredByServiceEphemeral proves on a real Engine
+// that an exactly configured ephemeral anonymous volume covers an image-declared
+// VOLUME without creating a second implicit volume. The non-root image writes
+// beneath that volume while its separately owned rootfs directory remains
+// unwritable under ReadonlyRootfs, and an explicit container delete reclaims the
+// anonymous volumes.
+func TestIntegrationDeclaredVolumeCoveredByServiceEphemeral(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	image := "relay-test-volume-tmpfs-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	image := "relay-test-volume-ephemeral-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	buildTestImage(ctx, t, image, `FROM alpine:3.20
-RUN mkdir -p /relay-root-check && chown 10001:10001 /relay-root-check
+RUN mkdir -p /run/cache /relay-root-check && chown 10001:10001 /run/cache /relay-root-check
 VOLUME ["/run/cache"]
 USER 10001:10001
-CMD ["sh", "-c", "printf tmpfs-ok > /run/cache/relay-proof || exit 21; test \"$(cat /run/cache/relay-proof)\" = tmpfs-ok || exit 22; if awk '$2 == \"/run/cache\" && $3 == \"tmpfs\" { found=1 } END { exit !found }' /proc/mounts; then echo TMPFS_PROC_MOUNTS_OK; else echo TMPFS_PROC_MOUNTS_MISSING; exit 24; fi; if printf bad > /relay-root-check/should-not-write 2>/dev/null; then echo ROOTFS_WRITABLE; exit 23; fi; echo TMPFS_WRITE_OK_ROOTFS_READONLY; exec sleep 3600"]
+CMD ["sh", "-c", "printf volume-ok > /run/cache/relay-proof || exit 21; test \"$(cat /run/cache/relay-proof)\" = volume-ok || exit 22; if printf bad > /relay-root-check/should-not-write 2>/dev/null; then echo ROOTFS_WRITABLE; exit 23; fi; echo VOLUME_WRITE_OK_ROOTFS_READONLY; exec sleep 3600"]
 `)
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -160,15 +161,15 @@ CMD ["sh", "-c", "printf tmpfs-ok > /run/cache/relay-proof || exit 21; test \"$(
 	t.Cleanup(func() {
 		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
-		_, _ = m.RemoveAppServiceContainers(cc, "svc-volume-tmpfs")
+		_, _ = m.RemoveAppServiceContainers(cc, "svc-volume-ephemeral")
 	})
 
 	id, err := m.StartService(ctx, ServiceSpec{
-		App: "svc-volume-tmpfs", Name: "external", SourceRef: image,
-		Image: image, Port: 8080, Tmpfs: []string{"/run/cache"},
+		App: "svc-volume-ephemeral", Name: "external", SourceRef: image,
+		Image: image, Port: 8080, Ephemeral: []string{"/run/cache"},
 	}, 0)
 	if err != nil {
-		t.Fatalf("start external service with exact VOLUME tmpfs coverage: %v", err)
+		t.Fatalf("start external service with exact VOLUME ephemeral coverage: %v", err)
 	}
 	waitForContainerRunning(t, ctx, cli, id)
 
@@ -180,22 +181,30 @@ CMD ["sh", "-c", "printf tmpfs-ok > /run/cache/relay-proof || exit 21; test \"$(
 	if !insp.Container.HostConfig.ReadonlyRootfs {
 		t.Error("ReadonlyRootfs = false, want true")
 	}
-	if got, want := insp.Container.HostConfig.Tmpfs["/run/cache"], serviceTmpfsOptions(); got != want {
-		t.Errorf("HostConfig.Tmpfs[/run/cache] = %q, want %q", got, want)
+	if len(insp.Container.HostConfig.Tmpfs) != 0 {
+		t.Errorf("HostConfig.Tmpfs = %v, want none", insp.Container.HostConfig.Tmpfs)
 	}
 	if insp.Container.Config == nil || insp.Container.Config.User != "10001:10001" {
 		t.Errorf("container user = %v, want image's non-root 10001:10001", insp.Container.Config)
 	}
-	var mountDescriptions []string
+	volumeNames := make(map[string]string)
 	for _, mounted := range insp.Container.Mounts {
-		mountDescriptions = append(mountDescriptions, string(mounted.Type)+":"+mounted.Destination+":"+mounted.Name)
-		if mounted.Destination == "/run/cache" && mounted.Type == "volume" {
-			t.Errorf("ContainerInspect.Mounts contains Docker volume at /run/cache: %v", mountDescriptions)
+		if mounted.Type != "volume" {
+			continue
+		}
+		volumeNames[mounted.Destination] = mounted.Name
+		if !mounted.RW {
+			t.Errorf("volume at %s is not writable", mounted.Destination)
 		}
 	}
-	// This Engine's ContainerInspect.Mounts omits tmpfs entries. The inspected
-	// HostConfig plus the in-container mount table and Docker volume inventory
-	// establish the effective mount and absence of an anonymous volume.
+	for _, destination := range []string{tmpVolumeTarget, "/run/cache"} {
+		if volumeNames[destination] == "" {
+			t.Errorf("ContainerInspect.Mounts = %+v, want an anonymous volume at %s", insp.Container.Mounts, destination)
+		}
+	}
+	if len(volumeNames) != 2 {
+		t.Errorf("container volume mounts = %v, want exactly /tmp and /run/cache", volumeNames)
+	}
 
 	var logs string
 	if !pollUntil(ctx, 30*time.Second, func() bool {
@@ -207,15 +216,12 @@ CMD ["sh", "-c", "printf tmpfs-ok > /run/cache/relay-proof || exit 21; test \"$(
 		_, _ = io.Copy(&buf, rc)
 		_ = rc.Close()
 		logs = buf.String()
-		return strings.Contains(logs, "TMPFS_PROC_MOUNTS_OK") || strings.Contains(logs, "TMPFS_PROC_MOUNTS_MISSING") || strings.Contains(logs, "TMPFS_WRITE_OK_ROOTFS_READONLY") || strings.Contains(logs, "ROOTFS_WRITABLE")
+		return strings.Contains(logs, "VOLUME_WRITE_OK_ROOTFS_READONLY") || strings.Contains(logs, "ROOTFS_WRITABLE")
 	}) {
-		t.Fatalf("service did not report tmpfs mount-table/write checks; logs:\n%s", logs)
+		t.Fatalf("service did not report volume write/rootfs checks; logs:\n%s", logs)
 	}
-	if !strings.Contains(logs, "TMPFS_PROC_MOUNTS_OK") {
-		t.Errorf("in-container /proc/mounts did not show tmpfs mounted exactly at /run/cache; logs:\n%s", logs)
-	}
-	if !strings.Contains(logs, "TMPFS_WRITE_OK_ROOTFS_READONLY") {
-		t.Errorf("service did not prove writable tmpfs plus unwritable rootfs; logs:\n%s", logs)
+	if !strings.Contains(logs, "VOLUME_WRITE_OK_ROOTFS_READONLY") {
+		t.Errorf("service did not prove a writable ephemeral volume plus unwritable rootfs; logs:\n%s", logs)
 	}
 	t.Logf("non-root service write checks passed; logs=%q", logs)
 
@@ -226,9 +232,69 @@ CMD ["sh", "-c", "printf tmpfs-ok > /run/cache/relay-proof || exit 21; test \"$(
 			createdVolumes = append(createdVolumes, name)
 		}
 	}
+	sort.Strings(createdVolumes)
 	t.Logf("Docker volume inventory around service create: before=%d after=%d newly-created=%v", len(volumesBefore), len(volumesAfter), createdVolumes)
-	if len(createdVolumes) != 0 {
-		t.Errorf("Docker volume inventory gained %v after service create; exact tmpfs coverage must suppress anonymous VOLUME creation (before=%v after=%v)", createdVolumes, sortedVolumeNames(volumesBefore), sortedVolumeNames(volumesAfter))
+	if len(createdVolumes) != 2 {
+		t.Errorf("Docker volume inventory gained %v after service create, want exactly the /tmp and /run/cache anonymous volumes", createdVolumes)
+	}
+
+	// Volume independence: a second replica of the same image and the same
+	// ephemeral set must receive its OWN anonymous volumes rather than share
+	// the first replica's, so one replica's state can never leak sideways.
+	id2, err := m.StartService(ctx, ServiceSpec{
+		App: "svc-volume-ephemeral", Name: "external", SourceRef: image,
+		Image: image, Port: 8080, Ephemeral: []string{"/run/cache"},
+	}, 1)
+	if err != nil {
+		t.Fatalf("start second replica: %v", err)
+	}
+	waitForContainerRunning(t, ctx, cli, id2)
+	insp2, err := cli.ContainerInspect(ctx, id2, client.ContainerInspectOptions{})
+	if err != nil {
+		t.Fatalf("inspect second replica: %v", err)
+	}
+	replica2Volumes := make(map[string]string)
+	for _, mounted := range insp2.Container.Mounts {
+		if mounted.Type == "volume" {
+			replica2Volumes[mounted.Destination] = mounted.Name
+		}
+	}
+	for _, destination := range []string{tmpVolumeTarget, "/run/cache"} {
+		name2 := replica2Volumes[destination]
+		if name2 == "" {
+			t.Fatalf("second replica mounts = %+v, want an anonymous volume at %s",
+				insp2.Container.Mounts, destination)
+		}
+		if name2 == volumeNames[destination] {
+			t.Errorf("second replica shares anonymous volume %q at %s with the "+
+				"first replica", name2, destination)
+		}
+	}
+	volumesAfterReplica2 := dockerVolumeNames(t, ctx, cli)
+	gainedAfterReplica2 := 0
+	for name := range volumesAfterReplica2 {
+		if _, existed := volumesBefore[name]; !existed {
+			gainedAfterReplica2++
+		}
+	}
+	if gainedAfterReplica2 != 4 {
+		t.Errorf("volume inventory gained %d volumes after two replicas, want 4 "+
+			"(an independent /tmp and /run/cache pair per replica)", gainedAfterReplica2)
+	}
+
+	// Explicit removal must reclaim the anonymous volumes of BOTH replicas, not
+	// only the containers. AutoRemove covers one-shot containers; this covers
+	// services.
+	if _, err := m.RemoveAppServiceContainers(ctx, "svc-volume-ephemeral"); err != nil {
+		t.Fatalf("remove service containers: %v", err)
+	}
+	volumesRemoved := dockerVolumeNames(t, ctx, cli)
+	for _, volumes := range []map[string]string{volumeNames, replica2Volumes} {
+		for destination, name := range volumes {
+			if _, exists := volumesRemoved[name]; exists {
+				t.Errorf("anonymous volume %q at %s still exists after explicit service removal", name, destination)
+			}
+		}
 	}
 }
 
@@ -243,15 +309,6 @@ func dockerVolumeNames(t *testing.T, ctx context.Context, cli *client.Client) ma
 		names[item.Name] = struct{}{}
 	}
 	return names
-}
-
-func sortedVolumeNames(names map[string]struct{}) []string {
-	result := make([]string, 0, len(names))
-	for name := range names {
-		result = append(result, name)
-	}
-	sort.Strings(result)
-	return result
 }
 
 // TestIntegrationExecutionControlNetworkRejected proves the shared execution
@@ -403,7 +460,10 @@ func TestIntegrationUnprivilegedExternalImageService(t *testing.T) {
 	id, err := m.StartService(ctx, ServiceSpec{
 		App: "svc-nginx", Name: "web", SourceRef: image, Port: 8080,
 		Image: image, Env: []string{"PORT=8080"},
-		Tmpfs: []string{"/var/cache/nginx", "/run"},
+		// Both explicit writable mounts the shipped examples have used for
+		// this image: the cache directory nginx itself owns and the runtime
+		// directory.
+		Ephemeral: []string{"/run", "/var/cache/nginx"},
 	}, 0)
 	if err != nil {
 		t.Fatalf("start external image service: %v", err)
@@ -415,9 +475,9 @@ func TestIntegrationUnprivilegedExternalImageService(t *testing.T) {
 		t.Fatalf("inspect: %v", err)
 	}
 	assertHardenedHostConfig(t, insp.Container.HostConfig)
-	for _, destination := range []string{"/var/cache/nginx", "/run"} {
-		if got, want := insp.Container.HostConfig.Tmpfs[destination], serviceTmpfsOptions(); got != want {
-			t.Errorf("HostConfig.Tmpfs[%s] = %q, want fixed secure options %q", destination, got, want)
+	for _, destination := range []string{tmpVolumeTarget, "/run", "/var/cache/nginx"} {
+		if _, ok := mountAt(insp.Container.HostConfig.Mounts, destination); !ok {
+			t.Errorf("HostConfig.Mounts = %v, want an anonymous volume at %s", insp.Container.HostConfig.Mounts, destination)
 		}
 	}
 	if len(insp.Container.HostConfig.CapAdd) != 0 {
@@ -428,5 +488,239 @@ func TestIntegrationUnprivilegedExternalImageService(t *testing.T) {
 	}
 	if insp.Container.State == nil || insp.Container.State.Status != container.StateRunning {
 		t.Fatalf("container state = %+v, want running", insp.Container.State)
+	}
+
+	// The image's own non-root user must be able to write the paths Relay made
+	// writable for it: the cache mount nginx owns and the baseline /tmp. /run
+	// is root-owned in the image, so only its mounted presence is asserted
+	// above — Docker copies the image directory's ownership into the volume.
+	writeOut, writeCode := execInContainer(t, ctx, cli, id, "/bin/sh", "-c",
+		`printf cache > /var/cache/nginx/relay-proof || exit 71; `+
+			`printf tmp > /tmp/relay-proof || exit 72; `+
+			`printf 'UID=%s CACHE=%s TMP=%s' "$(id -u)" `+
+			`"$(cat /var/cache/nginx/relay-proof)" "$(cat /tmp/relay-proof)"`)
+	if writeCode != 0 {
+		t.Fatalf("non-root write exec failed (exit %d): %s", writeCode, writeOut)
+	}
+	if !strings.Contains(writeOut, "UID=101") {
+		t.Errorf("write exec = %q, want the image's non-root uid 101", writeOut)
+	}
+	if !strings.Contains(writeOut, "CACHE=cache TMP=tmp") {
+		t.Errorf("write exec = %q, want both writes read back", writeOut)
+	}
+
+	// The service must actually serve HTTP on its declared port inside the
+	// container. nginx may still be starting when the container first reports
+	// running, so the request is polled.
+	var httpBody string
+	if !pollUntil(ctx, 30*time.Second, func() bool {
+		out, code := execInContainer(t, ctx, cli, id, "/bin/sh", "-c",
+			"wget -qO- http://127.0.0.1:8080/")
+		httpBody = out
+		return code == 0
+	}) {
+		t.Fatalf("in-container HTTP request never succeeded; last response: %q",
+			httpBody)
+	}
+	if !strings.Contains(httpBody, "nginx") {
+		t.Errorf("HTTP response = %q, want it to identify nginx", httpBody)
+	}
+}
+
+// TestIntegrationImageValidationRejectsHostileTmpTargets proves the baseline
+// /tmp target validation against REAL daemon image archives: the scripted
+// fixtures cannot prove the daemon's actual save format. A real image whose
+// /tmp is a symlink — which Docker would follow when mounting the anonymous
+// volume, redirecting it over /etc despite ReadonlyRootfs — and a real image
+// with no /tmp at all both fail closed before any container exists, on both
+// the service and execution create paths, while a normal image passes.
+//
+// The execution path is driven through the Manager's execution-image
+// validation seam: the full create entry requires a provisioned control
+// network whose route proof needs a Linux Docker host (see
+// ensureControlNetwork), so this test deliberately avoids newManager and runs
+// on hosts where those manager-driven integration tests cannot.
+func TestIntegrationImageValidationRejectsHostileTmpTargets(t *testing.T) {
+	cli := testutil.RequireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), nodeID: "test-node"}
+
+	buildFixture := func(name, dockerfile string) string {
+		ref := "relay-test-tmp-target-" + name + "-" +
+			strconv.FormatInt(time.Now().UnixNano(), 36)
+		buildTestImage(ctx, t, ref, dockerfile)
+		t.Cleanup(func() {
+			cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer ccancel()
+			cleanupImage(cli, cc, ref)
+		})
+		return ref
+	}
+	symlinkImage := buildFixture("symlink", `FROM alpine:3.20
+RUN rm -rf /tmp && ln -s /etc /tmp
+CMD ["sleep", "3600"]
+`)
+	missingImage := buildFixture("missing", `FROM alpine:3.20
+RUN rm -rf /tmp
+CMD ["sleep", "3600"]
+`)
+	normalImage := buildFixture("normal", `FROM alpine:3.20
+CMD ["sleep", "3600"]
+`)
+
+	for _, tc := range []struct{ name, image, want string }{
+		{"symlinked /tmp fails closed", symlinkImage,
+			`redirected through symlink "/tmp"`},
+		{"missing /tmp fails closed", missingImage,
+			`must already exist as a directory`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Service path: the full StartService create path against the
+			// real archive.
+			_, err := m.StartService(ctx, ServiceSpec{
+				App: "svc-tmp-target", Name: "web", SourceRef: tc.image,
+				Image: tc.image, Port: 8080,
+			}, 0)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("StartService error = %v, want it to contain %q",
+					err, tc.want)
+			}
+			// Execution path: the Manager's execution image validation.
+			if _, err := m.validateExecutionImage(ctx, tc.image); err == nil ||
+				!strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("validateExecutionImage error = %v, want it to contain %q",
+					err, tc.want)
+			}
+		})
+	}
+
+	// Both rejections happened before ContainerCreate: the daemon never held a
+	// container for this app.
+	containers, err := cli.ContainerList(ctx, client.ContainerListOptions{All: true})
+	if err != nil {
+		t.Fatalf("list containers: %v", err)
+	}
+	for _, listed := range containers.Items {
+		if listed.Labels[labelApp] == "svc-tmp-target" {
+			t.Fatalf("rejected service still has container %s", listed.ID)
+		}
+	}
+
+	t.Run("image with a real /tmp directory passes", func(t *testing.T) {
+		id, err := m.validateExecutionImage(ctx, normalImage)
+		if err != nil {
+			t.Fatalf("validation of a normal image: %v", err)
+		}
+		if !strings.HasPrefix(id, "sha256:") {
+			t.Fatalf("validated image ID = %q, want an immutable sha256 ID", id)
+		}
+	})
+}
+
+// TestIntegrationTmpVolumeHolds256MiBUnderMemoryLimit proves Relay's /tmp is
+// disk-backed, not memory-backed: a non-root, read-only-rootfs container
+// capped at the default 128 MiB streams a 256 MiB file into the anonymous /tmp
+// volume — dd reads /dev/zero in 1 MiB blocks, so neither the container nor
+// this test ever holds the payload in memory — and the resulting size is
+// verified inside the container. A tmpfs /tmp could not do this: its pages are
+// unreclaimable and would exhaust both a size-capped mount and the memory
+// cgroup. The container is created from the production hardenedHostConfig
+// baseline exactly as service creates use it.
+func TestIntegrationTmpVolumeHolds256MiBUnderMemoryLimit(t *testing.T) {
+	cli := testutil.RequireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	image := "relay-test-tmp256-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	buildTestImage(ctx, t, image, `FROM alpine:3.20
+USER 10001:10001
+CMD ["sh", "-c", "dd if=/dev/zero of=/tmp/big bs=1048576 count=256 2>&1 || exit 41; sz=$(stat -c %s /tmp/big) || exit 42; [ \"$sz\" = 268435456 ] || { echo SIZE_MISMATCH=$sz; exit 43; }; echo TMP256_OK size=$sz; exec sleep 3600"]
+`)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		cleanupImage(cli, cleanupCtx, image)
+	})
+
+	hc := hardenedHostConfig(false, app.DefaultResourceLimits())
+	if hc.Memory != 128<<20 {
+		t.Fatalf("HostConfig memory = %d, want the 128 MiB default", hc.Memory)
+	}
+	if hc.AutoRemove {
+		t.Fatal("AutoRemove = true, want the persistent shape so the test owns removal")
+	}
+	assertBaselineTmpVolume(t, hc.Mounts)
+
+	resp, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config:     &container.Config{Image: image},
+		HostConfig: hc,
+	})
+	if err != nil {
+		t.Fatalf("create container: %v", err)
+	}
+	id := resp.ID
+	// The production removal helper reclaims the anonymous volume together
+	// with the container (Force + RemoveVolumes).
+	t.Cleanup(func() {
+		_ = removeContainer(cli, id)
+	})
+	if _, err := cli.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
+		t.Fatalf("start container: %v", err)
+	}
+	waitForContainerRunning(t, ctx, cli, id)
+
+	var logs string
+	if !pollUntil(ctx, 2*time.Minute, func() bool {
+		stdout, stderr, logErr := fetchAppLogs(ctx, cli, id)
+		if logErr != nil {
+			return false
+		}
+		logs = stdout + stderr
+		return strings.Contains(logs, "TMP256_OK") ||
+			strings.Contains(logs, "SIZE_MISMATCH")
+	}) {
+		t.Fatalf("container did not report the 256 MiB /tmp write; logs:\n%s", logs)
+	}
+	if !strings.Contains(logs, "TMP256_OK size=268435456") {
+		t.Fatalf("write result = logs %q, want the verified 268435456-byte file", logs)
+	}
+
+	// The size is verified a second time through an in-container exec, running
+	// as the image's non-root user, against the live volume.
+	out, code := execInContainer(t, ctx, cli, id, "/bin/sh", "-c",
+		"stat -c %s /tmp/big")
+	if code != 0 {
+		t.Fatalf("in-container stat exit code = %d, output: %s", code, out)
+	}
+	if !strings.Contains(out, "268435456") {
+		t.Fatalf("in-container stat = %q, want 268435456", strings.TrimSpace(out))
+	}
+
+	// The effective runtime hardening still holds with the payload resident on
+	// the volume: 128 MiB cap, read-only rootfs, no HostConfig.Tmpfs anywhere,
+	// the image's non-root user, and exactly the baseline /tmp volume.
+	insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
+	if err != nil {
+		t.Fatalf("inspect container: %v", err)
+	}
+	assertHardenedHostConfig(t, insp.Container.HostConfig)
+	if insp.Container.Config == nil || insp.Container.Config.User != "10001:10001" {
+		t.Errorf("container user = %v, want the image's non-root 10001:10001",
+			insp.Container.Config)
+	}
+	volumeMounts := 0
+	for _, mounted := range insp.Container.Mounts {
+		if mounted.Type != "volume" {
+			continue
+		}
+		volumeMounts++
+		if !mounted.RW {
+			t.Errorf("volume at %s is not writable", mounted.Destination)
+		}
+	}
+	if volumeMounts != 1 {
+		t.Errorf("volume mounts = %d, want exactly the baseline /tmp volume",
+			volumeMounts)
 	}
 }

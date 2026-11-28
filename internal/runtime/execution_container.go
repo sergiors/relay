@@ -237,10 +237,11 @@ func startExecutionContainer(
 			"docker run: internal control network is not configured")
 	}
 	hostConfig := hardenedHostConfig(true, limits)
-	// A HOT_RELOAD app mounts its live source read-only at the engine workdir
-	// (managed by the caller). An empty list is the historical no-mount shape.
+	// A HOT_RELOAD app appends its live source read-only mount (managed by the
+	// caller) to the baseline /tmp volume. An empty list is the historical
+	// no-mount shape.
 	if len(mounts) > 0 {
-		hostConfig.Mounts = mounts
+		hostConfig.Mounts = append(hostConfig.Mounts, mounts...)
 	}
 	// An invocation container declares no service port, so it can never carry
 	// the low-port capability.
@@ -251,8 +252,10 @@ func startExecutionContainer(
 	}
 	// Docker materializes an image-declared VOLUME as an anonymous writable
 	// mount even under ReadonlyRootfs, so refuse it before create just like an
-	// unsafe HostConfig. An image without declared volumes is unchanged.
-	createImage, err := validateImageDeclaredVolumes(ctx, cli, image)
+	// unsafe HostConfig. The baseline /tmp volume explicitly covers an image
+	// VOLUME at /tmp; every other declared destination is still rejected.
+	createImage, err := validateImageDeclaredVolumes(
+		ctx, cli, image, tmpVolumeTarget)
 	if err != nil {
 		return nil, fmt.Errorf("docker run: %w", err)
 	}
@@ -283,11 +286,11 @@ func startExecutionContainer(
 			Labels: runLabels(meta),
 		},
 		// hardenedHostConfig(true, limits) unchanged in its SECURITY baseline:
-		// AutoRemove still removes the container the moment it exits (crash
-		// recovery is free), and during its idle lifetime it simply stays
-		// running. The read-only rootfs, dropped caps, bounded /tmp tmpfs, and
-		// non-root user baked into the image are identical to the one-shot
-		// containers; only the memory/CPU/pids limits follow the app's
+		// AutoRemove still removes the container and its anonymous volumes the
+		// moment it exits (crash recovery is free), and during its idle lifetime
+		// it simply stays running. The read-only rootfs, dropped caps, disk-backed
+		// /tmp volume, and non-root user baked into the image are identical to
+		// one-shot containers; only the memory/CPU/pids limits follow the app's
 		// effective resource configuration. The optional HOT_RELOAD bind is
 		// read-only and adds no writable surface.
 		HostConfig: hostConfig,

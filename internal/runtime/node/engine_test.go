@@ -92,6 +92,29 @@ func TestPlanBootstrapAndBase(t *testing.T) {
 	}
 }
 
+// TestPlanUserSetupPreparesWritableEphemeralRoots pins that the managed Node
+// image pre-creates every path Relay may mount an anonymous volume over with
+// runtime-user ownership. Docker copies a mount target's mode and ownership
+// into an empty volume, so a missing or root-owned directory would leave a
+// volume the non-root process cannot write.
+func TestPlanUserSetupPreparesWritableEphemeralRoots(t *testing.T) {
+	p, err := Engine{}.Plan(testSpecs[0], t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	for _, fragment := range []string{
+		"mkdir -p /tmp /run /var/cache",
+		"chmod 1777 /tmp",
+		"chown 10001:10001 /run /var/cache",
+		"chmod 0775 /run /var/cache",
+	} {
+		if !strings.Contains(p.UserSetup, fragment) {
+			t.Errorf("user setup = %q, want it to contain %q",
+				p.UserSetup, fragment)
+		}
+	}
+}
+
 // TestPlanCarriesRuntimeTools verifies the engine passes the spec's runtime
 // tools (the pnpm archive artifact) through to the plan unchanged, including
 // the artifact variant data: the builder, not the engine, materializes them.

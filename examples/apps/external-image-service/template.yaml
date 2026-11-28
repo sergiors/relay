@@ -5,11 +5,14 @@
 #
 # The image must fit the shared hardening: non-root, no added capabilities, and
 # a read-only rootfs. nginx-unprivileged runs as UID 101 and listens on 8080.
+# Both ephemeral directories must already exist in the image, owned and writable
+# by its user. Docker copies each directory's ownership and mode into the
+# anonymous volume; Relay rejects a missing, symlinked, or non-directory target.
 services:
   - name: web
     image: nginxinc/nginx-unprivileged:1.27-alpine
     port: 8080
     replicas: 1
-    tmpfs:
+    ephemeral:
       - /run
       - /var/cache/nginx

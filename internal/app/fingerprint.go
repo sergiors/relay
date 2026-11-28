@@ -18,7 +18,7 @@ import (
 // Fingerprint returns a deterministic SHA-256 over the complete contents of the
 // app's SELECTED source: every included file's slash-separated relative path
 // plus its bytes, sorted by path. template.yaml is hashed with its runtime-only
-// configuration (top-level `resources` and service `tmpfs`/`healthcheck`)
+// configuration (top-level `resources` and service `ephemeral`/`healthcheck`)
 // removed, so an edit to any of them is deliberately invisible to the digest:
 // they are applied to containers, not baked into the image (see
 // stripTemplateResources).
@@ -113,7 +113,7 @@ func SelectAndFingerprintApp(dir string, tmpl *Template) (*source.Selection, str
 // regardless of .gitignore rules, and for a no-runtime template it is the only
 // input that matters.
 //
-// Runtime-only configuration (top-level `resources` and service `tmpfs`) is
+// Runtime-only configuration (top-level `resources` and service `ephemeral`) is
 // stripped before hashing (see stripTemplateResources), so an edit to it never
 // changes the digest. The strip re-serializes the YAML node tree, which means
 // the FIRST fingerprint computed after a strip change may differ from one

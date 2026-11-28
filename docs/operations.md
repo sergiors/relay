@@ -417,5 +417,14 @@ handlers should be idempotent. See [CLI](cli.md#relay-dlq).
   [Schedules](schedules.md#recovery-and-availability).
 - Resource limits apply per container. Increasing concurrency or service
   replicas increases aggregate resource use.
+- Ephemeral storage is backed by Docker-managed anonymous volumes on the host's
+  Docker storage. Relay enforces no per-container disk quota and provides no
+  disk-pressure protection; provision host capacity for all concurrently running
+  containers and services. See
+  [Services](services.md#storage-lifetime-and-isolation).
+- Relay reclaims anonymous volumes through Docker container removal. If the
+  Docker daemon leaves an anonymous volume after a create fails before returning
+  a container ID, Relay cannot correlate or remove that unattached volume; Relay
+  does not globally prune volumes, so operator cleanup may be needed.
 - Workload network policy is not implemented. Relay verifies configured Docker
   networks but does not create or remove them.

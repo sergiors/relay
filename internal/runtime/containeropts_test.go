@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"errors"
+	"net/http"
 	"testing"
 
 	cerrdefs "github.com/containerd/errdefs"
@@ -47,6 +48,31 @@ func TestRemoveContainerErrorsTreatedAsBenign(t *testing.T) {
 	}
 }
 
+// TestRemoveContainerRemovesAnonymousVolumes proves every explicit delete path
+// asks the daemon to reclaim the container's anonymous volumes. AutoRemove does
+// the same on normal one-shot exit; this covers services and every
+// reconciler/sweep/runner-initiated removal.
+func TestRemoveContainerRemovesAnonymousVolumes(t *testing.T) {
+	var removeVolumes, force bool
+	cli := newScriptedDockerClient(t, dockerRoute{
+		method: http.MethodDelete,
+		path:   "/containers/cid",
+		onRequest: func(req *http.Request) {
+			removeVolumes = req.URL.Query().Get("v") == "1"
+			force = req.URL.Query().Get("force") == "1"
+		},
+	})
+	if err := removeContainer(cli, "cid"); err != nil {
+		t.Fatalf("removeContainer: %v", err)
+	}
+	if !removeVolumes {
+		t.Error("ContainerRemove did not request anonymous volume removal (v=1)")
+	}
+	if !force {
+		t.Error("ContainerRemove did not retain Force")
+	}
+}
+
 // TestHardenedHostConfigSecurityBaseline pins the complete security/resource
 // baseline every Relay container is created with, so the contract is checked
 // without a Docker daemon (the integration hardening test still proves the
@@ -73,9 +99,7 @@ func TestHardenedHostConfigSecurityBaseline(t *testing.T) {
 	if !hc.ReadonlyRootfs {
 		t.Error("ReadonlyRootfs = false, want true")
 	}
-	if got, want := hc.Tmpfs["/tmp"], "rw,nosuid,noexec,size=64m"; got != want {
-		t.Errorf("Tmpfs[/tmp] = %q, want %q", got, want)
-	}
+	assertBaselineTmpVolume(t, hc.Mounts)
 	if !hc.AutoRemove {
 		t.Error("AutoRemove = false for an invocation container, want true")
 	}
@@ -145,10 +169,10 @@ func TestResourceHostConfigMapsEffectiveLimits(t *testing.T) {
 		t.Fatalf("HostConfig resources = mem %d nano %d pids %v; want 256MiB/0.5CPU/64",
 			hc.Memory, hc.NanoCPUs, hc.PidsLimit)
 	}
-	if len(hc.CapDrop) != 1 || hc.CapDrop[0] != "ALL" || !hc.ReadonlyRootfs ||
-		hc.Tmpfs["/tmp"] != "rw,nosuid,noexec,size=64m" {
+	if len(hc.CapDrop) != 1 || hc.CapDrop[0] != "ALL" || !hc.ReadonlyRootfs {
 		t.Fatalf("hardening baseline must be preserved, got %+v", hc)
 	}
+	assertBaselineTmpVolume(t, hc.Mounts)
 
 	// A zero value normalizes field-by-field to the defaults.
 	zero := resourceHostConfig(app.ResourceLimits{})
@@ -159,48 +183,46 @@ func TestResourceHostConfigMapsEffectiveLimits(t *testing.T) {
 	}
 }
 
-func TestApplyServiceTmpfsUsesFixedBoundedOptions(t *testing.T) {
+func TestApplyServiceEphemeralAddsAnonymousVolumes(t *testing.T) {
 	hc := hardenedServiceHostConfig(app.DefaultResourceLimits(), 3000)
-	if err := applyServiceTmpfs(hc, []string{"/var/cache/data", "/run/cache"}, app.DefaultResourceLimits()); err != nil {
-		t.Fatalf("applyServiceTmpfs: %v", err)
+	if err := applyServiceEphemeral(hc, []string{"/var/cache/data", "/run/cache"}); err != nil {
+		t.Fatalf("applyServiceEphemeral: %v", err)
 	}
-	want := serviceTmpfsOptions()
-	if want != "rw,nosuid,nodev,noexec,size=16m,mode=1777" {
-		t.Fatalf("serviceTmpfsOptions() = %q, want fixed bounded non-root-writable options", want)
-	}
-	for _, destination := range []string{"/tmp", "/run/cache", "/var/cache/data"} {
-		if got := hc.Tmpfs[destination]; got == "" {
-			t.Errorf("HostConfig.Tmpfs[%q] missing", destination)
-		} else if destination != "/tmp" && got != want {
-			t.Errorf("HostConfig.Tmpfs[%q] = %q, want %q", destination, got, want)
+	assertBaselineTmpVolume(t, hc.Mounts)
+	for _, destination := range []string{"/run/cache", "/var/cache/data"} {
+		m, ok := mountAt(hc.Mounts, destination)
+		if !ok {
+			t.Fatalf("anonymous volume %q missing from %v", destination, hc.Mounts)
+		}
+		if m.Type != mount.TypeVolume || m.Source != "" ||
+			m.ReadOnly || m.VolumeOptions != nil {
+			t.Errorf("volume at %q = %+v, want an anonymous writable volume without options", destination, m)
 		}
 	}
-	if hc.Tmpfs["/tmp"] != baseTmpfsOptions {
-		t.Errorf("base /tmp options changed to %q", hc.Tmpfs["/tmp"])
+	if len(hc.Tmpfs) != 0 {
+		t.Errorf("HostConfig.Tmpfs = %v, want none", hc.Tmpfs)
 	}
 	if !hc.ReadonlyRootfs {
-		t.Fatal("service tmpfs disabled ReadonlyRootfs")
+		t.Fatal("service ephemeral volume disabled ReadonlyRootfs")
 	}
 	if got := hc.Memory; got != 128<<20 {
 		t.Fatalf("HostConfig memory = %d, want default 128 MiB", got)
 	}
-
-	// Zero resource values are normalized before calculating the aggregate budget.
-	if err := applyServiceTmpfs(hardenedServiceHostConfig(app.ResourceLimits{}, 3000), []string{"/run/a", "/run/b"}, app.ResourceLimits{}); err != nil {
-		t.Fatalf("two mounts at default memory limit: %v", err)
-	}
-	if err := applyServiceTmpfs(hardenedServiceHostConfig(app.ResourceLimits{}, 3000), []string{"/run/a", "/run/b", "/run/c"}, app.ResourceLimits{}); err == nil {
-		t.Fatal("three mounts exceeding the default aggregate memory budget were accepted")
+	if err := applyServiceEphemeral(
+		hardenedServiceHostConfig(app.ResourceLimits{}, 3000),
+		[]string{"/etc"},
+	); err == nil {
+		t.Fatal("an unapproved ephemeral destination was accepted")
 	}
 }
 
-func TestValidateContainerHostConfigServiceTmpfs(t *testing.T) {
+func TestValidateContainerHostConfigServiceEphemeral(t *testing.T) {
 	valid := hardenedServiceHostConfig(app.DefaultResourceLimits(), 3000)
-	if err := applyServiceTmpfs(valid, []string{"/run/cache"}, app.DefaultResourceLimits()); err != nil {
+	if err := applyServiceEphemeral(valid, []string{"/run/cache"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := validateContainerHostConfig(valid, nil, 3000, ""); err != nil {
-		t.Fatalf("valid service tmpfs rejected: %v", err)
+		t.Fatalf("valid service ephemeral volume rejected: %v", err)
 	}
 
 	for _, tc := range []struct {
@@ -209,41 +231,79 @@ func TestValidateContainerHostConfigServiceTmpfs(t *testing.T) {
 		mounts []mount.Mount
 	}{
 		{
-			name: "caller supplied options",
+			name: "legacy tmpfs map",
 			mutate: func(hc *container.HostConfig) {
-				hc.Tmpfs["/run/cache"] = "rw,size=1g,mode=0777"
+				hc.Tmpfs = map[string]string{"/tmp": "rw,size=64m"}
 			},
 		},
 		{
 			name: "unapproved path",
 			mutate: func(hc *container.HostConfig) {
-				hc.Tmpfs["/etc"] = serviceTmpfsOptions()
+				hc.Mounts = append(hc.Mounts, ephemeralVolumeMount("/etc"))
 			},
 		},
 		{
-			name: "overlaps base tmpfs",
+			name: "named volume",
 			mutate: func(hc *container.HostConfig) {
-				hc.Tmpfs["/tmp/cache"] = serviceTmpfsOptions()
+				hc.Mounts = append(hc.Mounts, mount.Mount{
+					Type: mount.TypeVolume, Source: "named", Target: "/run/cache",
+				})
+			},
+		},
+		{
+			name: "read-only volume",
+			mutate: func(hc *container.HostConfig) {
+				hc.Mounts = append(hc.Mounts, mount.Mount{
+					Type: mount.TypeVolume, Target: "/run/cache", ReadOnly: true,
+				})
+			},
+		},
+		{
+			name: "volume options",
+			mutate: func(hc *container.HostConfig) {
+				hc.Mounts = append(hc.Mounts, mount.Mount{
+					Type:          mount.TypeVolume,
+					Target:        "/run/cache",
+					VolumeOptions: &mount.VolumeOptions{NoCopy: true},
+				})
+			},
+		},
+		{
+			name: "overlaps base volume",
+			mutate: func(hc *container.HostConfig) {
+				hc.Mounts = append(hc.Mounts, ephemeralVolumeMount("/tmp/cache"))
+			},
+		},
+		{
+			name: "duplicate /tmp volume",
+			mutate: func(hc *container.HostConfig) {
+				hc.Mounts = append(hc.Mounts, ephemeralVolumeMount("/tmp"))
+			},
+		},
+		{
+			name: "missing /tmp volume",
+			mutate: func(hc *container.HostConfig) {
+				hc.Mounts = nil
 			},
 		},
 		{
 			name: "overlaps protected source mount",
 			mutate: func(hc *container.HostConfig) {
-				hc.Tmpfs["/var/cache"] = serviceTmpfsOptions()
+				hc.Mounts = append(hc.Mounts, ephemeralVolumeMount("/var/cache"))
 			},
 			mounts: []mount.Mount{{Type: mount.TypeBind, Source: "/apps/fn", Target: "/var/cache", ReadOnly: true, BindOptions: &mount.BindOptions{ReadOnlyForceRecursive: true}}},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			hc := hardenedServiceHostConfig(app.DefaultResourceLimits(), 3000)
-			if err := applyServiceTmpfs(hc, []string{"/run/cache"}, app.DefaultResourceLimits()); err != nil {
+			if err := applyServiceEphemeral(hc, []string{"/run/cache"}); err != nil {
 				t.Fatal(err)
 			}
 			if tc.mutate != nil {
 				tc.mutate(hc)
 			}
 			if err := validateContainerHostConfig(hc, tc.mounts, 3000, "/apps/fn"); err == nil {
-				t.Fatal("unsafe final HostConfig tmpfs was accepted")
+				t.Fatal("unsafe final HostConfig mount set was accepted")
 			}
 		})
 	}
@@ -426,7 +486,7 @@ func TestValidateContainerHostConfig(t *testing.T) {
 			},
 		},
 		{
-			name: "volume mount",
+			name: "unapproved volume",
 			mutate: func(*container.HostConfig) []mount.Mount {
 				return []mount.Mount{{Type: mount.TypeVolume, Target: "/data", ReadOnly: true}}
 			},
@@ -449,6 +509,28 @@ func TestValidateContainerHostConfig(t *testing.T) {
 				t.Fatal("unsafe host config was accepted")
 			}
 		})
+	}
+}
+
+// mountAt returns the mount at target, if any.
+func mountAt(mounts []mount.Mount, target string) (mount.Mount, bool) {
+	for _, m := range mounts {
+		if m.Target == target {
+			return m, true
+		}
+	}
+	return mount.Mount{}, false
+}
+
+// assertBaselineTmpVolume checks Relay's always-present /tmp anonymous volume.
+func assertBaselineTmpVolume(t *testing.T, mounts []mount.Mount) {
+	t.Helper()
+	m, ok := mountAt(mounts, tmpVolumeTarget)
+	if !ok {
+		t.Fatalf("baseline mounts = %v, want an anonymous volume at %s", mounts, tmpVolumeTarget)
+	}
+	if m.Type != mount.TypeVolume || m.Source != "" || m.ReadOnly || m.VolumeOptions != nil {
+		t.Errorf("baseline /tmp mount = %+v, want an anonymous writable volume without options", m)
 	}
 }
 

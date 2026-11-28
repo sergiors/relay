@@ -1314,7 +1314,7 @@ func (c *Coordinator) checkDrift(ctx context.Context) {
 		present[fn.Name] = true
 		if expected, authorized := applied.Fingerprints[fn.Name]; authorized {
 			// The content fingerprint deliberately excludes runtime-only service
-			// configuration (resources, tmpfs, healthcheck) so those edits do not
+			// configuration (resources, ephemeral, healthcheck) so those edits do not
 			// rebuild an image. The raw template identity is the authorization
 			// identity for ALL template bytes, including healthcheck, so compare it
 			// before the cached-verification shortcut; otherwise a healthcheck-only

@@ -122,7 +122,11 @@ COPY . /app
 // pythonUserSetup is the runtime-user provisioning command the python plans
 // emit; kept as a fixture so the long line does not repeat inline.
 const pythonUserSetup = "groupadd -g 10001 app && useradd -u 10001 -g 10001 -m -d /home/app " +
-	"-s /usr/sbin/nologin app && chown -R 10001:10001 /app /relay"
+	"-s /usr/sbin/nologin app && chown -R 10001:10001 /app /relay" +
+	" && mkdir -p /tmp /run /var/cache" +
+	" && chmod 1777 /tmp" +
+	" && chown 10001:10001 /run /var/cache" +
+	" && chmod 0775 /run /var/cache"
 
 func TestRenderDockerfileHardening(t *testing.T) {
 	p := plan.BuildPlan{

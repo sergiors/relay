@@ -6,7 +6,7 @@ import (
 )
 
 // TestFingerprintIgnoresServiceHealthcheck pins that a healthcheck is treated
-// like resources and tmpfs: it is applied to containers at create time, never
+// like resources and ephemeral: it is applied to containers at create time, never
 // baked into a built image, so a healthcheck-only edit must not change the
 // image fingerprint. The service reconciler still detects the change through
 // the container's relay.healthcheck identity, and the deployment drift

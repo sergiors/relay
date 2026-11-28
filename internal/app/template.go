@@ -359,14 +359,13 @@ type Service struct {
 	Path     string
 	Port     int
 	Replicas int
-	// Tmpfs lists additional writable tmpfs destinations for the container,
-	// beyond Relay's always-present /tmp. After ParseTemplate it is nil or a
-	// canonical (sorted) list of absolute paths, each validated against the
-	// narrow ephemeral-root policy and the per-container memory budget (see
-	// ValidateServiceTmpfs). Relay builds every mount with a fixed bounded
-	// size and safe nosuid,nodev,noexec options; callers cannot supply mount
-	// options.
-	Tmpfs []string
+	// Ephemeral lists additional writable ephemeral-volume destinations for the
+	// container, beyond Relay's always-present /tmp. After ParseTemplate it is
+	// nil or a canonical (sorted) list of absolute paths, each validated against
+	// the narrow ephemeral-root policy (see ValidateServiceEphemeral). Relay
+	// creates one anonymous Docker volume per destination; callers cannot supply
+	// a volume name, driver, or mount options.
+	Ephemeral []string
 	// Healthcheck is the optional Docker-native HTTP health probe. It is nil
 	// when the service declares no `healthcheck`; a declared probe is resolved
 	// with the defaults documented on ServiceHealthcheck. It is supported only
@@ -707,10 +706,14 @@ func ParseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 			// resolveServiceReplicas).
 			Port     any `yaml:"port"`
 			Replicas any `yaml:"replicas"`
-			// Tmpfs is the optional additional-writable-path list. It stays a
-			// plain string slice so a non-list or non-string entry fails the
-			// YAML decode; path policy and memory bounds are validated below
-			// (see resolveServiceTmpfs).
+			// Ephemeral is the optional additional-writable-path list. It stays
+			// a plain string slice so a non-list or non-string entry fails the
+			// YAML decode; path policy is validated below (see
+			// resolveServiceEphemeral).
+			Ephemeral []string `yaml:"ephemeral"`
+			// Tmpfs is the removed pre-ephemeral key. It is decoded only so an
+			// existing template fails with a migration error instead of silently
+			// losing its writable paths to yaml.v3's ignore-unknown-fields rule.
 			Tmpfs []string `yaml:"tmpfs"`
 			// Healthcheck is the optional Docker-native HTTP health probe. The
 			// pointer distinguishes an omitted key from a declared (possibly
@@ -995,12 +998,17 @@ func ParseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 			}
 			seenServiceRoutes[key] = s.Name
 		}
-		// Additional tmpfs destinations are validated against the narrow
-		// ephemeral-path policy and the app's effective per-container memory
-		// budget. The runtime revalidates the same policy (and the final
+		// Additional ephemeral destinations are validated against the narrow
+		// path policy. The runtime revalidates the same policy (and the final
 		// HostConfig) before create, so a direct ServiceSpec caller cannot
-		// bypass it.
-		tmpfs, err := resolveServiceTmpfs(s.Tmpfs, resources.MemoryBytes)
+		// bypass it. The removed tmpfs key fails closed rather than being
+		// silently ignored.
+		if s.Tmpfs != nil {
+			return nil, fmt.Errorf(
+				"service %q: tmpfs is no longer supported; use ephemeral for disk-backed writable paths",
+				s.Name)
+		}
+		ephemeral, err := resolveServiceEphemeral(s.Ephemeral)
 		if err != nil {
 			return nil, fmt.Errorf("service %q: %w", s.Name, err)
 		}
@@ -1012,7 +1020,7 @@ func ParseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 			Path:        path,
 			Port:        port,
 			Replicas:    replicas,
-			Tmpfs:       tmpfs,
+			Ephemeral:   ephemeral,
 			Healthcheck: healthcheck,
 		})
 	}

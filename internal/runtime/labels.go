@@ -108,21 +108,19 @@ const (
 	// replaced once.
 	labelResources = "relay.resources"
 
-	// labelTmpfs records the service's configured additional tmpfs destinations
-	// as a canonical, comma-joined, sorted list (the template's `tmpfs` field).
-	// It is configuration identity, not security state: it lets the reconciler
-	// replace a service when its additional writable paths change, exactly as a
-	// changed env or resource configuration does. The always-present /tmp mount
-	// is not listed. It is omitted when the service declares no additional
-	// tmpfs, so an unchanged service's label set is byte-for-byte the pre-tmpfs
-	// shape.
+	// labelEphemeral records the service's configured additional ephemeral-volume
+	// destinations as a canonical, comma-joined, sorted list (the template's
+	// `ephemeral` field). It is configuration identity, not security state: it
+	// lets the reconciler replace a service when its additional writable paths
+	// change, exactly as a changed env or resource configuration does. The
+	// always-present /tmp volume is not listed. It is omitted when the service
+	// declares no additional ephemeral volumes.
 	//
-	// This is the sole observable tmpfs configuration identity on discovery:
-	// ContainerList summaries do not include HostConfig.Tmpfs and
-	// ContainerInspect.Mounts omits tmpfs entries on some Engines. Comparing the
+	// This is the sole observable ephemeral configuration identity on discovery:
+	// ContainerList summaries do not include HostConfig.Mounts. Comparing the
 	// live mount table would therefore need an extra inspect per container per
 	// reconcile; the label instead pins exactly what StartService applied.
-	labelTmpfs = "relay.tmpfs"
+	labelEphemeral = "relay.ephemeral"
 
 	// labelHealthcheck pins the canonical identity of a service's healthcheck
 	// configuration (path and probe timings). It lets the service reconciler

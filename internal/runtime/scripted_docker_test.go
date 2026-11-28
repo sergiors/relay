@@ -118,13 +118,22 @@ func (s *scriptedDocker) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 // newScriptedDockerClient returns a client wired to the scripted routes. The
-// ping route every Relay client issues first is always provided.
+// ping route every Relay client issues first is always provided. So is a
+// default ImageSave answer: every create path streams the image archive to
+// validate Relay's baseline /tmp target against the immutable image content,
+// so a test whose subject is not image validation receives an archive where
+// every Relay-mounted writable path (/tmp, /run, /var/cache) is an ordinary
+// directory. Routes are matched in order, so an explicit /images/get route
+// passed by a test overrides this default.
 func newScriptedDockerClient(t *testing.T, routes ...dockerRoute) *client.Client {
 	t.Helper()
-	s := &scriptedDocker{t: t, routes: append([]dockerRoute{
+	s := &scriptedDocker{t: t, routes: append(append([]dockerRoute{
 		{method: http.MethodHead, path: "/_ping", body: ""},
 		{method: http.MethodGet, path: "/_ping", body: "OK"},
-	}, routes...)}
+	}, routes...), dockerRoute{
+		method: http.MethodGet, path: "/images/get",
+		body: safeWritableTargetsArchive(t),
+	})}
 	cli, err := client.New(client.WithHTTPClient(&http.Client{Transport: s}))
 	if err != nil {
 		t.Fatalf("scripted docker client: %v", err)

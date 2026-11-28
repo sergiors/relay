@@ -208,25 +208,29 @@
 // User/UserSetup; external images keep their own USER), drops all Linux
 // capabilities, enables no-new-privileges while preserving Docker's default
 // seccomp profile, uses private PID/IPC/network namespaces, is
-// memory/CPU/pids-limited, has a read-only rootfs, and gets a bounded /tmp tmpfs
-// as its baseline writable path. A service declaring a port below 1024 adds only
-// NET_BIND_SERVICE. A persistent service may declare additional bounded,
-// nosuid,nodev,noexec tmpfs destinations (validated against the same narrow path
-// policy as template parsing); each target and existing parent component is
-// proven from the immutable image layers to be a non-symlink directory before
-// create, because Docker follows rootfs symlinks when applying HostConfig.Tmpfs.
-// Execution containers never add tmpfs destinations. An operator-selected
+// memory/CPU/pids-limited, has a read-only rootfs, and gets a disk-backed
+// anonymous Docker volume at /tmp as its baseline writable path. Relay proves
+// from the immutable image content that /tmp and every configured ephemeral
+// target exist as non-symlink directories before any container create, so an
+// image symlink cannot redirect the writable volume over another path under
+// ReadonlyRootfs. A service
+// declaring a port below 1024 adds only NET_BIND_SERVICE. A persistent service
+// may declare additional anonymous ephemeral volumes under /run or /var/cache
+// (validated against the same narrow path policy as template parsing); each
+// target must already exist as a directory in the immutable image, with no
+// symlink or non-directory component on the path, so its ownership and mode can
+// be copied into the volume for the image's non-root user. Execution containers
+// never add ephemeral destinations beyond /tmp. An operator-selected
 // network carrying the execution-control role label, and the reserved host /
 // container:<id> pseudo-networks, are refused before create; the internally
 // owned control network is the only execution-container exception. Mounts are
-// limited
-// to the read-only HOT_RELOAD source bind and its read-only tmpfs masks; a
-// container-runtime socket mount is rejected. An image whose Config declares
-// Docker VOLUME destinations is refused before create, because the daemon would
-// materialize them as implicit anonymous writable mounts outside the bounded
-// /tmp contract; a service volume is allowed only when an explicitly configured
-// tmpfs covers that exact destination. These are internal defaults, not
-// configuration. Outbound
+// limited to the read-only HOT_RELOAD source bind, its read-only tmpfs masks, and
+// the anonymous volumes above; a container-runtime socket or named volume is
+// rejected. An image whose Config declares Docker VOLUME destinations is refused
+// before create unless Relay explicitly mounts that exact target (/tmp or a
+// configured ephemeral destination), because the daemon would otherwise
+// materialize an implicit anonymous writable mount. These are internal defaults,
+// not configuration. Outbound
 // networking stays enabled (a legitimate app need;
 // network policy beyond control-plane isolation is a documented residual
 // limitation). The app code is unaware of all of this: the hardening is applied
